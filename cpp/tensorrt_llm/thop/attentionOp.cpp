@@ -18,7 +18,6 @@
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -437,8 +436,6 @@ public:
         std::optional<torch::Tensor> flash_mla_num_splits,
         std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
     {
-        NVTX3_SCOPED_RANGE_WITH_NAME(
-            thopAttentionRunRange, is_context ? "thop.attention.run.context" : "thop.attention.run.generation");
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
         T* k_ptr = nullptr;
@@ -577,7 +574,6 @@ public:
         int32_t max_context_q_len = 0;
         int32_t max_past_kv_length = 0;
         {
-            NVTX3_SCOPED_RANGE_WITH_NAME(lengthMetadataRange, "thop.attention.length_metadata");
             max_context_q_len = host_context_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
             max_past_kv_length
                 = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
@@ -600,7 +596,6 @@ public:
         bool use_kv_cache = false;
         KvCachePoolPointers pool_pointers;
         {
-            NVTX3_SCOPED_RANGE_WITH_NAME(kvMetadataRange, "thop.attention.kv_metadata");
             max_blocks_per_sequence
                 = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
             pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
@@ -767,8 +762,6 @@ public:
             common_enqueue_params.input_seq_length = max_context_q_len;
             AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
             {
-                NVTX3_SCOPED_RANGE_WITH_NAME(
-                    thopAttentionBuildContextParamsRange, "thop.attention.build_context_params");
                 enqueue_params.batch_size = num_seqs;
                 enqueue_params.k_ptr = k_ptr;
                 enqueue_params.v_ptr = v_ptr;
@@ -794,7 +787,6 @@ public:
                 extractHelixParams(enqueue_params);
             }
             {
-                NVTX3_SCOPED_RANGE_WITH_NAME(thopAttentionEnqueueContextRange, "thop.attention.enqueue_context");
                 op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
             }
         }
@@ -811,8 +803,6 @@ public:
             common_enqueue_params.input_seq_length = input_seq_length;
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
             {
-                NVTX3_SCOPED_RANGE_WITH_NAME(
-                    thopAttentionBuildGenerationParamsRange, "thop.attention.build_generation_params");
                 enqueue_params.layer_idx = op.mLayerIdx;
                 enqueue_params.beam_width = beam_width;
                 enqueue_params.num_requests = num_requests;
@@ -901,7 +891,6 @@ public:
                 }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
                 {
-                    NVTX3_SCOPED_RANGE_WITH_NAME(thopAttentionMlaGenerationRange, "thop.attention.mla_generation");
                     op.mlaGeneration<T>(mla_params, enqueue_params, stream);
                 }
             }
@@ -909,8 +898,6 @@ public:
             {
                 extractHelixParams(enqueue_params);
                 {
-                    NVTX3_SCOPED_RANGE_WITH_NAME(
-                        thopAttentionEnqueueGenerationRange, "thop.attention.enqueue_generation");
                     op.enqueueGeneration<T, KVBlockArray>(enqueue_params, stream);
                 }
             }
@@ -983,7 +970,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
     std::optional<int64_t> compressed_kv_cache_pool_ptr)
 {
-    NVTX3_SCOPED_RANGE_WITH_NAME(thopAttentionRange, "thop.attention");
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
@@ -1474,7 +1460,7 @@ at::Tensor buildFlashinferTrtllmGenPagedKvCacheBuffers(at::Tensor host_kv_cache_
 void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits,
     int64_t batch_size, int64_t s_q, int64_t num_q_heads, int64_t num_kv_heads, int64_t head_size_v)
 {
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(seqlens_k.get_device());
     static constexpr int block_size_n = 64;
     static constexpr int fixed_overhead_num_blocks = 5;
     int const num_sm_parts = tensorrt_llm::common::op::AttentionOp::getFlashMlaNumSmPartsStatic(static_cast<int>(s_q),

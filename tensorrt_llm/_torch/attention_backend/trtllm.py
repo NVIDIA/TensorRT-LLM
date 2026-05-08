@@ -26,7 +26,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 
-# Enable TRTLLM-Gen attention backend via environment variable (default: off).
+# Enable TRTLLM-Gen attention backend via environment variable (default: on).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1") == "1")
 
@@ -1356,15 +1356,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn:
             trtllm_gen_backend = self._get_trtllm_gen_backend()
 
-        trtllm_gen_forward_args = replace(forward_args,
-                                          output=output,
-                                          output_sf=output_sf)
-        if trtllm_gen_backend is not None and trtllm_gen_backend.is_supported(
+        trtllm_gen_forward_args = None
+        use_trtllm_gen = False
+        if trtllm_gen_backend is not None and is_fused_qkv:
+            trtllm_gen_forward_args = replace(forward_args,
+                                              output=output,
+                                              output_sf=output_sf)
+            use_trtllm_gen = trtllm_gen_backend.is_supported(
                 q,
                 metadata=metadata,
                 forward_args=trtllm_gen_forward_args,
                 mask_type=int(mask_type),
-        )[0]:
+            )[0]
+
+        if use_trtllm_gen:
+            assert trtllm_gen_forward_args is not None
             trtllm_gen_backend.attention(
                 q,
                 metadata=metadata,

@@ -21,7 +21,6 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/sageQuant.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
@@ -1406,7 +1405,6 @@ MLA_FUNC_DEFINE(__nv_bfloat16)
 template <typename T, typename KVCacheBuffer>
 int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream)
 {
-    NVTX3_SCOPED_RANGE_WITH_NAME(attentionOpEnqueueContextRange, "AttentionOp.enqueueContext");
     int const headSize = getHeadSize();
 
     int const local_hidden_units_qo = mNumHeads * headSize;
@@ -1421,7 +1419,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
     if (useKVCache())
     {
-        NVTX3_SCOPED_RANGE_WITH_NAME(kvCacheBuffersRange, "AttentionOp.context.kv_cache_buffers");
         auto buffers = buildKvCacheBuffers<KVCacheBuffer>(params.batch_size, params.max_blocks_per_sequence,
             mTokensPerBlock, sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
             params.sink_token_length, params.can_use_one_more_block, params.host_primary_pool_pointer,
@@ -1639,7 +1636,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
 
     {
-        NVTX3_SCOPED_RANGE_WITH_NAME(buildDecoderInfoRange, "AttentionOp.context.build_decoder_info");
         invokeBuildDecoderInfo(decoder_params, stream);
         sync_check_cuda_error(stream);
     }
@@ -1800,7 +1796,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         if (mIsMLAEnabled)
         {
-            NVTX3_SCOPED_RANGE_WITH_NAME(mlaPreprocessRange, "AttentionOp.context.mla_preprocess");
             TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
             params.mla_param->cache_type = cache_type;
             params.mla_param->cu_q_seqlens = workspaceViews.cuQSeqlens;
@@ -1832,7 +1827,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
         else if (useSageAttnSeparateQkv)
         {
-            NVTX3_SCOPED_RANGE_WITH_NAME(sagePreprocessRange, "AttentionOp.context.sage_preprocess");
             TLLM_CHECK_WITH_INFO(mFP8ContextFMHA, "SageAttention kernel runs under mFP8ContextFMHA option.");
             TLLM_CHECK_WITH_INFO(mFmhaDispatcher->isSupported(), "SageAttention has no unfused fallback implemented.");
             TLLM_CHECK_WITH_INFO(
@@ -1878,7 +1872,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
         else
         {
-            NVTX3_SCOPED_RANGE_WITH_NAME(qkvPreprocessRange, "AttentionOp.context.qkv_preprocess");
             invokeQKVPreprocessing(preprocessingParams, stream);
         }
         sync_check_cuda_error(stream);
@@ -2034,7 +2027,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Run the fmha kernel.
         {
-            NVTX3_SCOPED_RANGE_WITH_NAME(fmhaRange, "AttentionOp.context.fmha");
             mFmhaDispatcher->run(fmhaParams);
             sync_check_cuda_error(stream);
         }
@@ -2049,7 +2041,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         if (!mIsMLAEnabled) // Only for non-MLA attention
         {
-            NVTX3_SCOPED_RANGE_WITH_NAME(kvCachePostprocessRange, "AttentionOp.context.kv_cache_postprocess");
             invokeKvCachePostprocessing(preprocessingParams, stream);
             sync_check_cuda_error(stream);
         }
@@ -2360,7 +2351,6 @@ template int AttentionOp::enqueueContext<__nv_bfloat16, KVBlockArray>(
 template <typename T, typename KVCacheBuffer>
 int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cudaStream_t stream)
 {
-    NVTX3_SCOPED_RANGE_WITH_NAME(attentionOpEnqueueGenerationRange, "AttentionOp.enqueueGeneration");
     int const headSize = getHeadSize();
     float const q_scaling = mQScaling;
     float const* logn_scaling_ptr = isLognScaling() ? params.logn_scaling_ptr : nullptr;
@@ -2385,7 +2375,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
 
     if (useKVCache())
     {
-        NVTX3_SCOPED_RANGE_WITH_NAME(kvCacheBuffersRange, "AttentionOp.generation.kv_cache_buffers");
         auto buffers = buildKvCacheBuffers<KVCacheBuffer>(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock,
             sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
             params.sink_token_length, params.can_use_one_more_block, params.host_primary_pool_pointer,
@@ -2453,7 +2442,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
 
     // Try XQA optimization first.
     {
-        NVTX3_SCOPED_RANGE_WITH_NAME(xqaTryRange, "AttentionOp.generation.xqa_try");
         // NOTE: input_seq_length = num_medusa_tokens + 1 (new generated one from the original LM head)
         // self attn
         XQAParams xqaParams{};
@@ -2469,7 +2457,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
                 xqaParams.qkv = attention_input;
             }
             {
-                NVTX3_SCOPED_RANGE_WITH_NAME(xqaRunRange, "AttentionOp.generation.xqa_run");
                 mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
             }
             if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
@@ -2630,7 +2617,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
 
     using DataType = typename SATypeConverter<T>::Type;
     {
-        NVTX3_SCOPED_RANGE_WITH_NAME(mmhaRange, "AttentionOp.generation.mmha");
         if (!isCrossAttention())
         {
             // self attn
