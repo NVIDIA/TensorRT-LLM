@@ -329,7 +329,7 @@ def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
 
     indexer_init = inspect.getsource(DeepseekV4Indexer.__init__)
     assert "is_neox=False" in indexer_init
-    assert "rotate_activation=True" in indexer_init
+    assert "rotate_activation=HAS_FAST_HADAMARD" in indexer_init
 
     attention_init = inspect.getsource(DeepseekV4TrtllmAttention.__init__)
     assert "rotate_activation=False" in attention_init
