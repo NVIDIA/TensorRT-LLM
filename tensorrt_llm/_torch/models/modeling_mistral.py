@@ -309,7 +309,7 @@ class MistralCommonImageProcessor:
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
 
-    def __call__(self, text, images, **kwargs):
+    def __call__(self, text, images=[], **kwargs):
         mm_items = []
         if images:
             mm_items = [{
