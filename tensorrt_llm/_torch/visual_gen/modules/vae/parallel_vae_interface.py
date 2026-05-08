@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Tuple, Type
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -30,7 +30,7 @@ class ParallelVAEBase(nn.Module):
         vae_backend: nn.Module,
         pg: dist.ProcessGroup,
         spec: SplitSpec,
-        adj_groups: List[dist.ProcessGroup],
+        adj_groups: List[Optional[dist.ProcessGroup]],
     ) -> None:
         super().__init__()
         self.vae_backend = vae_backend
@@ -144,7 +144,7 @@ class ParallelVAEFactory:
         vae: nn.Module,
         split_dim: Literal["height", "width"],
         pg: dist.ProcessGroup,
-        adj_groups: List[dist.ProcessGroup],
+        adj_groups: List[Optional[dist.ProcessGroup]],
     ) -> ParallelVAEBase:
         parallel_cls = cls._resolve(type(vae))
         if parallel_cls is None:

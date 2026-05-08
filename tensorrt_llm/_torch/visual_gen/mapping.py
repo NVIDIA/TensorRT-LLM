@@ -123,7 +123,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self.parallel_vae_size = parallel_vae_size
         self._vae_ranks = list(range(self.parallel_vae_size))
         self._vae_group: Optional[ProcessGroup] = None
-        self._vae_adj_groups: list[ProcessGroup] = []
+        self._vae_adj_groups: list[Optional[ProcessGroup]] = []
         self._attn2d_row_group: Optional[ProcessGroup] = None
         self._attn2d_col_group: Optional[ProcessGroup] = None
         self._order = order
@@ -212,18 +212,19 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         """Create the process group used by parallel VAE."""
         if self.parallel_vae_size <= 1:
             return
-        if self.parallel_vae_size == self.world_size:
-            self._vae_group = dist.group.WORLD
-        else:
-            pg = dist.new_group(self._vae_ranks, use_local_synchronization=True)
-            if self._rank in self._vae_ranks:
-                self._vae_group = pg
 
+        pg = dist.new_group(self._vae_ranks, use_local_synchronization=False)
+        if self._rank in self._vae_ranks:
+            self._vae_group = pg
+
+        adj_groups: list[Optional[ProcessGroup]] = [None] * (self.parallel_vae_size - 1)
         for i in range(self.parallel_vae_size - 1):
             ranks = [self._vae_ranks[i], self._vae_ranks[i + 1]]
-            pg = dist.new_group(ranks, use_local_synchronization=True)
+            pg = dist.new_group(ranks, use_local_synchronization=False)
             if self._rank in ranks:
-                self._vae_adj_groups.append(pg)
+                adj_groups[i] = pg
+        if self._rank in self._vae_ranks:
+            self._vae_adj_groups = adj_groups
 
     # ------------------------------------------------------------------
     # Rank decomposition
@@ -308,7 +309,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         return self._vae_group
 
     @property
-    def vae_adj_groups(self) -> list[ProcessGroup]:
+    def vae_adj_groups(self) -> list[Optional[ProcessGroup]]:
         return self._vae_adj_groups
 
     # ------------------------------------------------------------------

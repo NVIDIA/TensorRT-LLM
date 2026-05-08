@@ -374,7 +374,7 @@ def _logic_attn2d_mesh_rank_and_group(rank, world_size):
 
 
 def _logic_vae_group_and_adj_groups(rank, world_size):
-    """VAE group uses the first N ranks and stores adjacent groups only on member ranks."""
+    """VAE group uses the first N ranks and stores adjacent groups by pair index."""
     from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 
     DeviceMeshTopologyImpl.device_mesh = None
@@ -390,13 +390,50 @@ def _logic_vae_group_and_adj_groups(rank, world_size):
     if rank < 3:
         assert vgm.vae_group is not None
         assert dist.get_world_size(vgm.vae_group) == 3
-        expected_adj_groups = 1 if rank in (0, 2) else 2
-        assert len(vgm.vae_adj_groups) == expected_adj_groups
-        for adj_group in vgm.vae_adj_groups:
-            assert dist.get_world_size(adj_group) == 2
+        assert len(vgm.vae_adj_groups) == 2
+        for i, adj_group in enumerate(vgm.vae_adj_groups):
+            if rank in (i, i + 1):
+                assert adj_group is not None
+                assert dist.get_world_size(adj_group) == 2
+            else:
+                assert adj_group is None
     else:
         assert vgm.vae_group is None
         assert vgm.vae_adj_groups == []
+
+
+def _logic_vae_group_full_world_cfg2_ulysses2(rank, world_size):
+    """Regression: full-world VAE group works for cfg=2, ulysses=2."""
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    DeviceMeshTopologyImpl.device_mesh = None
+
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        cfg_size=2,
+        ulysses_size=2,
+        parallel_vae_size=4,
+    )
+
+    assert vgm.vae_ranks == [0, 1, 2, 3]
+    assert vgm.vae_group is not None
+    assert dist.get_world_size(vgm.vae_group) == 4
+    assert len(vgm.vae_adj_groups) == 3
+
+    for i, adj_group in enumerate(vgm.vae_adj_groups):
+        if rank in (i, i + 1):
+            assert adj_group is not None
+            assert dist.get_world_size(adj_group) == 2
+        else:
+            assert adj_group is None
+
+    device = torch.device(f"cuda:{rank}")
+    tensor = torch.ones(1, device=device)
+    dist.all_reduce(tensor, group=vgm.vae_group)
+    assert tensor.item() == float(world_size), (
+        f"Rank {rank}: expected all_reduce sum {world_size}, got {tensor.item()}"
+    )
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
@@ -416,3 +453,6 @@ class TestMultiGPU:
 
     def test_vae_group_and_adj_groups(self):
         _run_multi_gpu(4, _logic_vae_group_and_adj_groups)
+
+    def test_vae_group_full_world_cfg2_ulysses2(self):
+        _run_multi_gpu(4, _logic_vae_group_full_world_cfg2_ulysses2)

@@ -111,9 +111,9 @@ def _create_small_vae(device):
 
 def _create_parallel_vae(vae, world_size, split_dim):
     ranks = list(range(world_size))
-    pg = dist.new_group(ranks, use_local_synchronization=True)
+    pg = dist.new_group(ranks, use_local_synchronization=False)
     adj_groups = [
-        dist.new_group([ranks[i], ranks[i + 1]], use_local_synchronization=True)
+        dist.new_group([ranks[i], ranks[i + 1]], use_local_synchronization=False)
         for i in range(world_size - 1)
     ]
     return ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec(split_dim), adj_groups)
