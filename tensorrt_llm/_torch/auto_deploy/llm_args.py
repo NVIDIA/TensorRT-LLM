@@ -322,6 +322,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if cg.batch_sizes:
             self.transforms["compile_model"]["cuda_graph_batch_sizes"] = cg.batch_sizes
 
+        # Propagate AutoDeploy-only ``layers_per_chunk`` to the compile_model
+        # transform so PerNLayersCapturedGraph picks it up.  Env var
+        # ``AD_LAYERS_PER_CHUNK`` later takes precedence at runtime.
+        if getattr(cg, "layers_per_chunk", None) is not None:
+            self.transforms["compile_model"]["layers_per_chunk"] = cg.layers_per_chunk
+
         return self
 
     @model_validator(mode="after")

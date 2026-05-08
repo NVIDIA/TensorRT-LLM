@@ -3,6 +3,13 @@
 1. Monolithic CUDA graph: captures entire model as one graph for decode-only.
 2. Piecewise CUDA graph: splits model at dynamic ops, captures static segments
    individually. Used for prefill/mixed batches when piecewise_enabled=True.
+3. Per-N-layers CUDA graph: splits the decode-only graph at every Nth fused
+   allreduce-residual-rmsnorm op (one-per-half-layer for transformer blocks),
+   captures one CUDA graph per segment.  Each ``cudaGraphLaunch`` boundary
+   acts as an implicit cross-rank re-sync, which prevents per-layer skew on
+   spin-wait collectives (e.g., lamport one-shot AR) from accumulating across
+   the full iteration.  Selectable via ``AD_LAYERS_PER_CHUNK`` env var or the
+   ``cuda_graph_config.layers_per_chunk`` YAML field.
 
 When piecewise_enabled=True, a DualModeCapturedGraph is returned that dispatches:
   - Decode-only batches → monolithic CapturedGraph (fastest, single graph replay)
@@ -11,14 +18,16 @@ When piecewise_enabled=True, a DualModeCapturedGraph is returned that dispatches
 
 import copy  # noqa: I001
 import gc
+import os
 from collections import abc
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 from torch.fx._pytree import tree_flatten_spec
+from torch.fx.passes.split_module import split_module
 from torch.utils._pytree import PyTree, TreeSpec, tree_flatten
 
 try:
@@ -349,6 +358,483 @@ class CapturedGraph(nn.Module):
         bs = args_batched[0].shape[self.dynamic_dims[0]]
         out_flat = [o_b.narrow(od, 0, bs) for o_b in self._out_buffer_flat]
         return self._out_spec.unflatten(out_flat)
+
+
+# ============================================================================
+# PerNLayersCudaGraphWrapper helpers
+# ============================================================================
+
+
+# Fused (allreduce + residual + RMSNorm) op inserted by
+# ``fuse_allreduce_residual_rmsnorm``.  Each transformer layer with TP > 1
+# normally produces two of these: one after attention, one after MoE/MLP.
+# We anchor the per-N-layers split on this op so that splits land on
+# half-layer boundaries, which is exactly where cross-rank skew on the
+# spin-wait one-shot AR can accumulate.
+def _get_ar_boundary_op():
+    """Resolve the fused AR op lazily.
+
+    The op is registered by ``trtllm_dist.py`` when AutoDeploy's distributed
+    custom ops are imported; resolving lazily avoids import-order issues.
+    Returns ``None`` if the op is not registered (e.g. world_size==1 or
+    AutoDeploy distributed ops not loaded).
+    """
+    try:
+        return torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm.default
+    except (AttributeError, RuntimeError):
+        return None
+
+
+_AR_OP_NAME_PREFIX = "dist::trtllm_fused_allreduce_residual_rmsnorm"
+
+
+def _is_ar_boundary_node(node: Node) -> bool:
+    """Return True if ``node`` is a fused AR-residual-rmsnorm call.
+
+    Tolerant of both ``OpOverload`` (e.g. ``...op.default``) and
+    ``OpOverloadPacket`` (the bare ``torch.ops.dist.<name>``) targets, since
+    different FX tracers record one or the other.
+    """
+    if node.op != "call_function":
+        return False
+    target = node.target
+
+    # OpOverload: target.name() returns "ns::op.overload"
+    name_attr = getattr(target, "name", None)
+    if callable(name_attr):
+        try:
+            n = name_attr()
+        except Exception:
+            n = None
+        if isinstance(n, str) and n.startswith(_AR_OP_NAME_PREFIX):
+            return True
+
+    # OpOverloadPacket: target._qualified_op_name returns "ns::op"
+    qname = getattr(target, "_qualified_op_name", None)
+    if isinstance(qname, str) and qname.startswith(_AR_OP_NAME_PREFIX):
+        return True
+
+    # Identity / overloadpacket comparison fall-back.
+    boundary_op = _get_ar_boundary_op()
+    if boundary_op is None:
+        return False
+    if target is boundary_op:
+        return True
+    bp_packet = getattr(boundary_op, "_overloadpacket", None)
+    t_packet = getattr(target, "_overloadpacket", None)
+    if bp_packet is not None and (target is bp_packet or t_packet is bp_packet):
+        return True
+    return False
+
+
+def _split_gm_at_ar_boundaries(gm: GraphModule, layers_per_chunk: int) -> Tuple[GraphModule, int]:
+    """Split ``gm`` into N submodules using fused AR ops as cut points.
+
+    For gpt-oss-120b each transformer layer contains two AR ops (post-attn,
+    post-MoE).  ``layers_per_chunk=N`` therefore produces a cut every ``2*N``
+    AR ops, i.e. one CUDA graph per N transformer layers.
+
+    Returns the split GraphModule and the number of submodules that the split
+    produced.  Falls back to a single-partition (no-op) split when no AR
+    boundary is found, which lets the wrapper degrade gracefully if the model
+    has no AR fusion (e.g. world_size==1).
+    """
+    # Each transformer layer for TP>1 has 2 fused AR ops (attn + MoE/MLP).
+    ops_per_layer = 2
+    cut_every = max(1, layers_per_chunk * ops_per_layer)
+
+    partition_counter = [0]
+    ar_seen = [0]
+    node_to_partition: Dict[Node, int] = {}
+
+    for node in gm.graph.nodes:
+        if node.op in ("placeholder", "output"):
+            continue
+        node_to_partition[node] = partition_counter[0]
+        if _is_ar_boundary_node(node):
+            ar_seen[0] += 1
+            # After the Nth AR boundary, advance to the next partition so that
+            # subsequent ops land in the next subgraph.  The AR op itself stays
+            # in the current partition (i.e. it's the LAST op of its chunk).
+            if ar_seen[0] % cut_every == 0:
+                partition_counter[0] += 1
+
+    if ar_seen[0] == 0:
+        # No AR ops in the graph — degrade to a single-partition split.
+        return gm, 1
+
+    def partition_fn(node: Node) -> int:
+        return node_to_partition.get(node, 0)
+
+    split_gm = split_module(gm, gm, partition_fn, keep_original_order=True)
+
+    submod_names = [n for n, _ in split_gm.named_children() if n.startswith("submod_")]
+    return split_gm, len(submod_names)
+
+
+class _SubgraphRunner(nn.Module):
+    """Captures-and-replays a single FX submodule as one CUDAGraph per shape key.
+
+    Stateful: in CAPTURE phase the runner captures the wrapped submodule into
+    a new ``torch.cuda.CUDAGraph`` and stores it under the current shape key
+    (set by the wrapper before each capture).  In REPLAY phase the runner
+    replays the graph stored under the current shape key and returns the
+    captured outputs.  All runners in a chain share one ``graph_pool`` so
+    tensors flowing between subgraphs keep stable addresses across replays.
+
+    NOTE: The runner returns the *exact same* output object captured during
+    capture.  Because every subgraph in a chain replays into those same
+    tensors before the next one consumes them, we don't need to clone here —
+    callers must not mutate outputs between subgraph boundaries.
+    """
+
+    _PHASE_WARMUP = "warmup"
+    _PHASE_CAPTURE = "capture"
+    _PHASE_REPLAY = "replay"
+
+    def __init__(self, submodule: nn.Module, graph_pool: Any, name: str):
+        super().__init__()
+        self.submodule = submodule
+        self._graph_pool = graph_pool
+        self._name = name
+        self._phase = self._PHASE_WARMUP
+        # Per-(combined_shape) capture state.
+        self._cuda_graphs: Dict[Tuple[int, ...], CUDAGraph] = {}
+        self._captured_outputs: Dict[Tuple[int, ...], Any] = {}
+        self._current_key: Optional[Tuple[int, ...]] = None
+
+    def set_phase(self, phase: str) -> None:
+        assert phase in (self._PHASE_WARMUP, self._PHASE_CAPTURE, self._PHASE_REPLAY), phase
+        self._phase = phase
+
+    def set_current_key(self, key: Tuple[int, ...]) -> None:
+        self._current_key = key
+
+    def has_key(self, key: Tuple[int, ...]) -> bool:
+        return key in self._cuda_graphs
+
+    def get_graph(self, key: Tuple[int, ...]) -> Optional[CUDAGraph]:
+        return self._cuda_graphs.get(key)
+
+    def get_output(self, key: Tuple[int, ...]) -> Any:
+        return self._captured_outputs.get(key)
+
+    @property
+    def graph_pool(self) -> Any:
+        return self._graph_pool
+
+    def forward(self, *args, **kwargs) -> Any:
+        if self._phase == self._PHASE_WARMUP:
+            return self.submodule(*args, **kwargs)
+
+        key = self._current_key
+        assert key is not None, (
+            f"_SubgraphRunner({self._name}): forward called with no current key."
+        )
+
+        if self._phase == self._PHASE_CAPTURE:
+            graph = CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._graph_pool):
+                output = self.submodule(*args, **kwargs)
+            self._cuda_graphs[key] = graph
+            self._captured_outputs[key] = output
+            # If we were the first runner in the chain, publish the new pool
+            # handle so subsequent runners share it.
+            if self._graph_pool is None:
+                self._graph_pool = graph.pool()
+            return output
+
+        # _PHASE_REPLAY
+        graph = self._cuda_graphs.get(key)
+        assert graph is not None, f"_SubgraphRunner({self._name}): no captured graph for key={key}."
+        graph.replay()
+        return self._captured_outputs[key]
+
+
+class PerNLayersCapturedGraph(CapturedGraph):
+    """CapturedGraph variant that splits decode capture into N-layer chunks.
+
+    Captures the decode-only forward pass into ``ceil(num_ar_boundaries /
+    (2*layers_per_chunk))`` separate CUDA graphs, all backed by a single
+    shared CUDA graph memory pool.  At replay time each sub-graph is launched
+    via its own ``cudaGraphLaunch``, which acts as an implicit cross-rank
+    re-sync barrier — this prevents per-layer micro-skew on spin-wait
+    collectives (e.g. lamport one-shot allreduce) from accumulating across
+    the full 36-layer iteration.
+
+    Mirrors the per-bucket ``cudaGraphLaunch`` pattern that the PyTorch
+    backend gets "for free" by capturing one graph per (num_tokens, beam)
+    bucket.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        layers_per_chunk: int,
+        layers_per_chunk_source: str = "yaml",
+        num_batched_inputs: Optional[int] = None,
+        dynamic_dims: Optional[List[int]] = None,
+    ):
+        super().__init__(
+            model=model,
+            num_batched_inputs=num_batched_inputs,
+            dynamic_dims=dynamic_dims,
+        )
+        assert layers_per_chunk >= 1, (
+            f"PerNLayersCapturedGraph: layers_per_chunk must be >= 1, got {layers_per_chunk}"
+        )
+        self.layers_per_chunk = layers_per_chunk
+        self.layers_per_chunk_source = layers_per_chunk_source
+        # The split GraphModule replaces ``self.model`` for capture/replay.
+        # We keep the original ``self.model`` reference for the very first
+        # warm-up + dynamic-dim probe (CapturedGraph.capture_graph uses
+        # ``self.model(...)`` before our hooks are wired up).
+        self._original_model = model
+        self._split_gm: Optional[GraphModule] = None
+        self._runners: List[_SubgraphRunner] = []
+        self._split_done = False
+        self._activation_logged = False
+
+    def _ensure_split(self) -> bool:
+        """Split the FX graph and wrap each submod in a _SubgraphRunner.
+
+        Returns True if the split produced more than one chunk (per-N-layers
+        capture is active).  Returns False if no AR boundaries were found —
+        in that case the caller should fall back to monolithic capture.
+        """
+        if self._split_done:
+            return len(self._runners) > 1
+
+        if not isinstance(self._original_model, GraphModule):
+            ad_logger.warning(
+                "[PerNLayersCudaGraphWrapper] underlying model is %s, not a "
+                "GraphModule — falling back to monolithic CUDA graph capture.",
+                type(self._original_model).__name__,
+            )
+            self._split_done = True
+            return False
+
+        # Deep-copy the FX graph so we don't mutate the user's GraphModule;
+        # otherwise the split's submod additions persist on the original.
+        gm = GraphModule(self._original_model, copy.deepcopy(self._original_model.graph))
+        split_gm, num_submods = _split_gm_at_ar_boundaries(gm, self.layers_per_chunk)
+
+        if num_submods <= 1:
+            ad_logger.warning(
+                "[PerNLayersCudaGraphWrapper] split produced %d submod(s) — no "
+                "AR boundaries detected.  Falling back to monolithic capture.",
+                num_submods,
+            )
+            self._split_done = True
+            return False
+
+        # Wrap each submod_K in a _SubgraphRunner sharing one graph pool.
+        # NOTE: the FIRST runner starts with graph_pool=None; after its capture
+        # it publishes the pool handle and we propagate it to the rest.
+        graph_pool: Any = None
+        runners: List[_SubgraphRunner] = []
+        for name, child in list(split_gm.named_children()):
+            if not name.startswith("submod_"):
+                continue
+            runner = _SubgraphRunner(child, graph_pool=graph_pool, name=name)
+            runners.append(runner)
+            setattr(split_gm, name, runner)
+
+        # Sort by partition index so replay order matches FX call order.
+        runners.sort(key=lambda r: int(r._name.split("_")[1]))
+
+        self._split_gm = split_gm
+        self._runners = runners
+        self.model = split_gm  # capture and forward will route through split_gm
+        self._split_done = True
+
+        if not self._activation_logged:
+            # Count fused-AR boundary ops in the original (pre-split) graph so
+            # we can give the user an honest layer estimate.  Each transformer
+            # layer with TP > 1 contributes 2 AR ops (post-attn, post-MoE).
+            ar_count = sum(1 for n in self._original_model.graph.nodes if _is_ar_boundary_node(n))
+            n_layers_est = ar_count // 2
+            ad_logger.info(
+                "[PerNLayersCudaGraphWrapper] activated "
+                "(layers_per_chunk=%d, source=%s); "
+                "capturing %d sub-graphs (~%d/%d)",
+                self.layers_per_chunk,
+                self.layers_per_chunk_source,
+                len(runners),
+                n_layers_est,
+                self.layers_per_chunk,
+            )
+            self._activation_logged = True
+
+        return True
+
+    def _current_combined_shape(self, args: Tuple, kwargs: Dict) -> Tuple[int, ...]:
+        """Compute the combined-shape key for the per-runner per-key map."""
+        flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
+        batched = flat[: self.num_batched_inputs]
+        return sum((tuple(t.shape) for t in batched), start=())
+
+    def _capture_one_graph(
+        self,
+        args: Tuple,
+        kwargs: Dict,
+        refresh_args_static: Optional[Callable] = None,
+    ) -> torch.cuda.CUDAGraph:
+        """Capture the model split into per-chunk CUDA graphs.
+
+        Returns the FIRST sub-graph as a sentinel for the parent class; the
+        full chain is stored per-runner per-shape and is replayed in
+        ``forward``.  ``self.cudagraphs`` only ever sees this sentinel — the
+        real replay path iterates over the runners.
+        """
+        # Lazy split (one-time).  If the split degenerates to <=1 chunk we
+        # delegate to the parent's monolithic capture path.
+        if not self._ensure_split():
+            return super()._capture_one_graph(args, kwargs, refresh_args_static)
+
+        # Compute the per-shape capture key from the (already truncated) args.
+        key = self._current_combined_shape(args, kwargs)
+
+        # Set every runner to warmup so submodules execute eagerly.
+        for r in self._runners:
+            r.set_phase(_SubgraphRunner._PHASE_WARMUP)
+
+        with autotune():
+            for _ in range(3):
+                with CudaGraphWarmUpPhase():
+                    self._split_gm(*args, **kwargs)
+                if refresh_args_static is not None:
+                    refresh_args_static()
+
+        # Capture phase: each runner captures its own CUDAGraph during the
+        # next forward, and shares the memory pool with subsequent runners.
+        torch.cuda.synchronize()
+        for r in self._runners:
+            r.set_phase(_SubgraphRunner._PHASE_CAPTURE)
+            r.set_current_key(key)
+
+        od = self._output_dynamic_dim
+        # Run split_gm once.  Each _SubgraphRunner intercepts its submod call
+        # and captures into its own CUDAGraph under the current shape key.
+        # The FIRST runner allocates and publishes the shared pool handle;
+        # we then thread it through the remaining runners so all subgraphs
+        # share one CUDA mempool.
+        out = self._split_gm(*args, **kwargs)
+        shared_pool = self._runners[0]._graph_pool
+        for r in self._runners[1:]:
+            if r._graph_pool is None:
+                r._graph_pool = shared_pool
+
+        # Write the final captured output into the pre-allocated output
+        # buffer.  This mirrors CapturedGraph._capture_one_graph so downstream
+        # replay bookkeeping keeps working.
+        out_flat = tree_flatten_spec(out, self._out_spec)
+        for o_buffer, o in zip(self._out_buffer_flat, out_flat):
+            o_buffer.narrow(od, 0, o.shape[od]).copy_(o)
+
+        torch.cuda.synchronize()
+
+        # All runners flip to replay phase; key stays cached for replay.
+        for r in self._runners:
+            r.set_phase(_SubgraphRunner._PHASE_REPLAY)
+
+        # Publish the shared pool to the parent's bookkeeping field so any
+        # later monolithic-style capture (unlikely but possible) reuses it.
+        self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or shared_pool
+
+        # Return the first runner's CUDAGraph as a "primary handle" so the
+        # parent's ``self.cudagraphs[combined_shape] = self._capture_one_graph(...)``
+        # bookkeeping still has a CUDAGraph object to record.  ``forward``
+        # below ignores it and replays the full chain instead.
+        return self._runners[0].get_graph(key)
+
+    def forward(self, *args, **kwargs) -> Any:
+        """Replay the per-chunk CUDA graph chain.
+
+        The parent ``CapturedGraph.forward`` only handles the case of one
+        CUDAGraph per batch-size combo; for the per-N-layers wrapper we have
+        a *chain* of graphs (one per chunk) per batch-size combo, all
+        keyed by combined_shape on each runner.  Replay routes through the
+        runners and copies the chain's final output into the parent output
+        buffer.
+        """
+        # If split degenerated (e.g. world_size==1, no AR ops), use the
+        # parent's monolithic replay path.
+        if not self._split_done or len(self._runners) <= 1:
+            return super().forward(*args, **kwargs)
+
+        # flatten args, kwargs
+        all_args_flat = _args_kwargs_flatten_spec(self._in_spec, *args, **kwargs)
+        args_batched = all_args_flat[: self.num_batched_inputs]
+        args_static = all_args_flat[self.num_batched_inputs :]
+
+        # check static-args hash; on mismatch, fall back to eager (split_gm).
+        if self._args_hash != self._get_hash(args_static):
+            return self._split_gm(*args, **kwargs)
+
+        combined_shape = sum((arg.shape for arg in args_batched), start=())
+        if combined_shape not in self.cudagraphs:
+            return self._split_gm(*args, **kwargs)
+
+        # If any runner is missing this shape key (shouldn't happen — capture
+        # populates all runners atomically — but guard anyway), fall back.
+        if not all(r.has_key(combined_shape) for r in self._runners):
+            return self._split_gm(*args, **kwargs)
+
+        # copy inputs to input buffers along their respective dynamic dims
+        for i, input_tensor in enumerate(args_batched):
+            dim_i = self.dynamic_dims[i]
+            size_i = input_tensor.shape[dim_i]
+            self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(input_tensor, non_blocking=True)
+
+        # Replay each subgraph in order.  Inputs are already in the static
+        # input buffers (captured-time addresses); each replay refreshes the
+        # tensors flowing between subgraphs in-place.
+        for r in self._runners:
+            r.get_graph(combined_shape).replay()
+
+        # The final runner's captured output IS the model output.  Copy it
+        # into the pre-allocated output buffer (dynamic-dim aware) so callers
+        # observe the same buffer layout the parent class promises.
+        final_output = self._runners[-1].get_output(combined_shape)
+        final_flat = tree_flatten_spec(final_output, self._out_spec)
+        od = self._output_dynamic_dim
+        bs = args_batched[0].shape[self.dynamic_dims[0]]
+        for o_buffer, o in zip(self._out_buffer_flat, final_flat):
+            o_buffer.narrow(od, 0, o.shape[od]).copy_(o.narrow(od, 0, o.shape[od]))
+
+        out_flat = [o_b.narrow(od, 0, bs) for o_b in self._out_buffer_flat]
+        return self._out_spec.unflatten(out_flat)
+
+
+def _resolve_layers_per_chunk(yaml_value: Optional[int]) -> Tuple[Optional[int], str]:
+    """Resolve the effective ``layers_per_chunk`` and its source.
+
+    Precedence (highest to lowest):
+      1. ``AD_LAYERS_PER_CHUNK`` env var (integer >= 1; "0" or unset disables).
+      2. ``cuda_graph_config.layers_per_chunk`` from YAML (>= 1).
+      3. None (use monolithic FullCudaGraphWrapper / CapturedGraph).
+
+    Returns ``(layers_per_chunk, source)`` where ``source`` is "env",
+    "yaml", or "" when unset.
+    """
+    env_val = os.environ.get("AD_LAYERS_PER_CHUNK", "").strip()
+    if env_val:
+        try:
+            n = int(env_val)
+        except ValueError:
+            ad_logger.warning(
+                "[PerNLayersCudaGraphWrapper] AD_LAYERS_PER_CHUNK=%r is not an integer; ignoring.",
+                env_val,
+            )
+            n = 0
+        if n >= 1:
+            return n, "env"
+
+    if yaml_value is not None and yaml_value >= 1:
+        return int(yaml_value), "yaml"
+
+    return None, ""
 
 
 class PiecewiseCapturedGraph(nn.Module):
@@ -1032,6 +1518,7 @@ class TorchCudagraphCompiler(CompilerBackend):
         piecewise_seq_info: Any = None,
         piecewise_named_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         full_model: Optional[nn.Module] = None,
+        layers_per_chunk: Optional[int] = None,
         **kwargs_for_init,
     ):
         super().__init__(*args_for_init, **kwargs_for_init)
@@ -1043,6 +1530,8 @@ class TorchCudagraphCompiler(CompilerBackend):
         self.piecewise_seq_info = piecewise_seq_info
         self.piecewise_named_args_fn = piecewise_named_args_fn
         self.full_model = full_model
+        # YAML-provided value; env var overrides this in compile().
+        self.layers_per_chunk_yaml = layers_per_chunk
 
     def _get_inner_args_kwargs_fn(self, inner_gm: GraphModule) -> GetArgsKwargsForBatchSize:
         """Return a function that generates inner-model args for a given batch size.
@@ -1079,7 +1568,19 @@ class TorchCudagraphCompiler(CompilerBackend):
             with CudaGraphWarmUpPhase():
                 return get_capture_args_fn(batch_size)
 
-        monolithic = CapturedGraph(target_gm, num_batched_inputs=self.num_batched_inputs)
+        # Select the decode-path wrapper.  Env var ``AD_LAYERS_PER_CHUNK``
+        # takes precedence over the YAML field; both default off (None) and
+        # fall back to the monolithic CapturedGraph (current behaviour).
+        layers_per_chunk, lpc_source = _resolve_layers_per_chunk(self.layers_per_chunk_yaml)
+        if layers_per_chunk is not None:
+            monolithic: CapturedGraph = PerNLayersCapturedGraph(
+                target_gm,
+                layers_per_chunk=layers_per_chunk,
+                layers_per_chunk_source=lpc_source,
+                num_batched_inputs=self.num_batched_inputs,
+            )
+        else:
+            monolithic = CapturedGraph(target_gm, num_batched_inputs=self.num_batched_inputs)
         monolithic.capture_graph(get_capture_args_with_warmup, self.cuda_graph_batch_sizes)
 
         piecewise = None

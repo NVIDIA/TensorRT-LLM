@@ -123,6 +123,20 @@ class CudaGraphConfig(StrictBaseModel):
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
     )
 
+    # AutoDeploy-only: split the decode-path CUDA graph into N-layer chunks.
+    # Ignored by all other backends.  See PerNLayersCapturedGraph in
+    # tensorrt_llm/_torch/auto_deploy/compile/backends/torch_cudagraph.py.
+    layers_per_chunk: Optional[int] = Field(
+        default=None,
+        description=
+        "(AutoDeploy only) When set (>= 1), split the decode-only CUDA graph at every Nth "
+        "fused allreduce-residual-rmsnorm boundary, capturing one graph per N transformer "
+        "layers.  Each cudaGraphLaunch boundary acts as an implicit cross-rank re-sync, "
+        "preventing per-layer skew on spin-wait collectives from accumulating across the "
+        "full iteration.  None (default) keeps the monolithic decode capture.  The "
+        "AD_LAYERS_PER_CHUNK env var overrides this field at runtime.  Other backends "
+        "ignore this field.")
+
     @model_validator(mode='after')
     def validate_cuda_graph_config(self) -> 'CudaGraphConfig':
         """Validate CUDA graph configuration.

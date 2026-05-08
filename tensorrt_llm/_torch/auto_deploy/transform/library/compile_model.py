@@ -74,6 +74,21 @@ class CompileModelConfig(TransformConfig):
             "up to max_num_tokens (e.g. [64, 128, 256, ..., max_num_tokens])."
         ),
     )
+    layers_per_chunk: Optional[int] = Field(
+        default=None,
+        description=(
+            "Number of transformer layers per CUDA graph sub-segment. "
+            "When set (>= 1), the decode-path graph is split at every Nth fused "
+            "allreduce-residual-rmsnorm boundary, producing one CUDA graph per "
+            "N layers.  Each cudaGraphLaunch boundary acts as an implicit "
+            "cross-rank re-sync, which prevents per-layer skew on spin-wait "
+            "collectives (e.g., lamport one-shot AR) from accumulating across "
+            "the full iteration.  None (default) keeps the existing monolithic "
+            "decode capture.  The env var ``AD_LAYERS_PER_CHUNK`` overrides "
+            "this YAML field at runtime.  Mirrors the per-bucket cudaGraphLaunch "
+            "topology that the PyTorch backend produces by default."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_piecewise_backend(self):
