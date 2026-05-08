@@ -332,7 +332,7 @@ def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
     assert "rotate_activation=HAS_FAST_HADAMARD" in indexer_init
 
     attention_init = inspect.getsource(DeepseekV4TrtllmAttention.__init__)
-    assert "rotate_activation=HAS_FAST_HADAMARD" in attention_init
+    assert "rotate_activation=False" in attention_init
 
 
 def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):

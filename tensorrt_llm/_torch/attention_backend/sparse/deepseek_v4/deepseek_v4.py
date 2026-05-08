@@ -1096,7 +1096,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 pos_embd_params,
                 kv_cache_dtype=kv_cache_dtype,
                 dtype=dtype,
-                rotate_activation=HAS_FAST_HADAMARD,
+                rotate_activation=False,
             )
 
     def forward(self, *args, **kwargs):
