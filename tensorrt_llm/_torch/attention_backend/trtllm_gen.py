@@ -17,7 +17,8 @@ Entry points:
 
 Example:
     backend = FlashInferTrtllmGenAttention(kv_cache_manager=..., quant_config=...)
-    supported, reason = backend.is_supported(num_heads=32, num_kv_heads=8, ...)
+    supported, reason = backend.is_supported(
+        q, attention_layer=..., metadata=..., forward_args=..., ...)
     if supported:
         backend.attention(q, attention_layer=..., metadata=..., forward_args=..., ...)
     else:
@@ -563,14 +564,62 @@ class FlashInferTrtllmGenAttention:
         """KV cache layout."""
         return self._layout
 
-    def is_supported(self, **kwargs) -> Tuple[bool, str]:
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        *,
+        attention_layer: "TrtllmAttention",
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        mask_type: int,
+        is_fused_qkv: bool,
+        update_kv_cache: bool,
+        sparse_kv_indices: Optional[torch.Tensor],
+        sparse_attn_indices: Optional[torch.Tensor],
+        skip_softmax_threshold_scale_factor_prefill: Optional[float],
+        skip_softmax_threshold_scale_factor_decode: Optional[float],
+    ) -> Tuple[bool, str]:
         if not IS_FLASHINFER_AVAILABLE:
             return False, "flashinfer package is not installed."
         if self._kv_cache_manager is None:
             return False, "trtllm-gen requires a KVCacheManager."
-        if not kwargs.get("use_paged_kv_cache", True):
+        use_paged_kv_cache = metadata.kv_cache_block_offsets is not None
+        if not use_paged_kv_cache:
             return False, "trtllm-gen requires paged KV cache."
-        return self._checker.is_supported(**kwargs)
+
+        output = forward_args.output
+        if output is None:
+            return False, "trtllm-gen requires forward_args.output."
+
+        return self._checker.is_supported(
+            q_dtype=q.dtype,
+            kv_cache_dtype=self._kv_cache_manager.dtype,
+            num_heads=attention_layer.num_heads,
+            num_kv_heads=attention_layer.num_kv_heads,
+            head_size=attention_layer.head_dim,
+            attention_input_type=int(forward_args.attention_input_type),
+            out_dtype=output.dtype,
+            mask_type=mask_type,
+            beam_width=metadata.beam_width,
+            sink_token_length=0,
+            tokens_per_block=metadata.tokens_per_block,
+            use_paged_kv_cache=use_paged_kv_cache,
+            is_mla_enable=attention_layer.is_mla_enable,
+            kv_lora_rank=attention_layer.kv_lora_rank,
+            qk_rope_head_dim=attention_layer.qk_rope_head_dim,
+            is_fused_qkv=is_fused_qkv,
+            update_kv_cache=update_kv_cache,
+            cross_attention=False,
+            is_spec_decoding=metadata.is_spec_decoding_enabled,
+            has_alibi=attention_layer.position_embedding_type in (4, 5),
+            is_padded=False,
+            position_shift_enabled=False,
+            quant_config=self._quant_config,
+            sparse_kv_indices=sparse_kv_indices,
+            sparse_attn_indices=sparse_attn_indices,
+            skip_softmax_threshold_scale_factor_prefill=skip_softmax_threshold_scale_factor_prefill,
+            skip_softmax_threshold_scale_factor_decode=skip_softmax_threshold_scale_factor_decode,
+        )
 
     def _get_multi_processor_count(self, device: torch.device) -> int:
         device = torch.device(device)

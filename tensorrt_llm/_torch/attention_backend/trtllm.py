@@ -13,8 +13,7 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import (get_sm_version, maybe_pin_memory,
-                                 prefer_pinned, torch_dtype_to_binding)
+from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -1368,36 +1367,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn:
             trtllm_gen_backend = self._get_trtllm_gen_backend(
                 metadata.kv_cache_manager)
-            kv_cache_dtype = torch_dtype_to_binding(q.dtype)
-            if metadata.kv_cache_manager is not None:
-                kv_cache_dtype = metadata.kv_cache_manager.dtype
 
+        trtllm_gen_forward_args = replace(forward_args,
+                                          output=output,
+                                          output_sf=output_sf)
         if trtllm_gen_backend is not None and trtllm_gen_backend.is_supported(
-                q_dtype=q.dtype,
-                kv_cache_dtype=kv_cache_dtype,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_dim,
-                out_dtype=output.dtype,
+                q,
+                attention_layer=self,
+                metadata=metadata,
+                forward_args=trtllm_gen_forward_args,
                 mask_type=int(mask_type),
-                has_alibi=(self.position_embedding_type == 4
-                           or self.position_embedding_type == 5),
-                is_padded=False,
-                use_paged_kv_cache=(metadata.kv_cache_block_offsets
-                                    is not None),
-                tokens_per_block=metadata.tokens_per_block,
-                beam_width=metadata.beam_width,
-                position_shift_enabled=False,
-                sink_token_length=0,
-                cross_attention=False,
-                is_spec_decoding=metadata.is_spec_decoding_enabled,
-                is_mla_enable=self.is_mla_enable,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_rope_head_dim=self.qk_rope_head_dim,
                 is_fused_qkv=is_fused_qkv,
                 update_kv_cache=update_kv_cache,
-                attention_input_type=int(attention_input_type),
-                quant_config=self.quant_config,
                 sparse_kv_indices=sparse_kv_indices,
                 sparse_attn_indices=sparse_attn_indices,
                 skip_softmax_threshold_scale_factor_prefill=
@@ -1409,9 +1390,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 q,
                 attention_layer=self,
                 metadata=metadata,
-                forward_args=replace(forward_args,
-                                     output=output,
-                                     output_sf=output_sf),
+                forward_args=trtllm_gen_forward_args,
                 mask_type=int(mask_type),
                 use_paged_context_fmha=use_paged_context_fmha,
             )
