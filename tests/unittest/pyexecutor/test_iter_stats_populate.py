@@ -227,7 +227,6 @@ def _invoke_update_iter_stats(
 
 
 def test_empty_iteration():
-    """Verify an iteration with no work reports zero request and token counters."""
     stats = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 0
@@ -243,7 +242,6 @@ def test_empty_iteration():
 
 
 def test_prefill_only_no_prefix_cache():
-    """Verify fresh prefill requests do not report prior KV tokens."""
     # Two fresh prefill requests: prompts of 100 and 200 tokens, chunk size
     # == full prompt (no chunked prefill). No prefix cache hits.
     reqs = [
@@ -259,7 +257,6 @@ def test_prefill_only_no_prefix_cache():
 
 
 def test_prefill_with_prefix_cache_hit():
-    """Verify prefix-cache hits are counted as prefill KV tokens."""
     # Prompt 1000 tokens; 256 already in prefix cache (prepopulatedPromptLen).
     # Chunk size = remaining = 744. py_last_context_chunk = (256, 1000);
     # start=256 is the precomputed-tokens count.
@@ -275,7 +272,6 @@ def test_prefill_with_prefix_cache_hit():
 
 
 def test_chunked_prefill_continuation():
-    """Verify chunked-prefill continuations count previously computed tokens."""
     # Chunked prefill: 3-chunk request, each chunk 512. This is step 2:
     # chunk size 512, previously computed 512 (== context_current_position).
     # py_last_context_chunk = (512, 1024); start=512.
@@ -291,7 +287,6 @@ def test_chunked_prefill_continuation():
 
 
 def test_decode_only():
-    """Verify decode requests report their total KV context length."""
     # Two decode requests: 1024 total context and 2048 total context.
     reqs = [
         _StubRequest(num_tokens=1024),
@@ -306,7 +301,6 @@ def test_decode_only():
 
 
 def test_mixed_prefill_and_decode():
-    """Verify prefill and decode counters are populated independently."""
     ctx = [_StubRequest(context_chunk_size=128, context_current_position=0)]
     gen = [_StubRequest(num_tokens=500), _StubRequest(num_tokens=700)]
     stats = _invoke_update_iter_stats(
@@ -319,7 +313,6 @@ def test_mixed_prefill_and_decode():
 
 
 def test_queued_context_requests_from_request_queue():
-    """Verify queued context requests are counted from the executor queue."""
     items = [
         _StubQueueItem(input_token_ids=list(range(256))),
         _StubQueueItem(input_token_ids=list(range(1024))),
@@ -331,7 +324,6 @@ def test_queued_context_requests_from_request_queue():
 
 
 def test_queued_filters_non_normal_requests():
-    """Verify control/shutdown queue items are excluded from queued counters."""
     # Shutdown / cancel / control items should be ignored.
     items = [
         _StubQueueItem(input_token_ids=list(range(100)), is_normal_request=False),
@@ -344,7 +336,6 @@ def test_queued_filters_non_normal_requests():
 
 
 def test_queued_routes_by_request_type():
-    """Verify queued context and generation-only request types route separately."""
     # Disaggregated serving: a decode engine receives
     # REQUEST_TYPE_GENERATION_ONLY items that await KV transfer from a
     # prefill engine before starting decode. They belong in the
@@ -387,7 +378,6 @@ def test_queued_routes_by_request_type():
 
 
 def test_paused_decode_requests():
-    """Verify paused decode requests contribute to paused request/KV counters."""
     paused = [
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
@@ -490,7 +480,6 @@ def test_attention_dp_dummy_filtering_on_count_fields():
 
 
 def test_full_mixed_iteration():
-    """Verify a mixed production-like iteration populates all aggregate fields."""
     # Realistic scenario: 3 prefill (1 fresh, 2 continuing chunks), 4 decode,
     # 2 preempted, 3 queued.
     ctx = [
