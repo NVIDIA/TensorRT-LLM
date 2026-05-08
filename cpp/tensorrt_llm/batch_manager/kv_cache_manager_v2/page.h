@@ -82,7 +82,7 @@ public:
 class CommittedPage : public Page
 {
 public:
-    std::weak_ptr<Block> block;
+    Block* block;
 
     CommittedPage(StorageManager* mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio);
 

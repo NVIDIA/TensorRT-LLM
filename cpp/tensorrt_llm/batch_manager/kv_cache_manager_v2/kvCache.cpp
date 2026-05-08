@@ -919,7 +919,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
             }
             else
             {
-                newBlock->storage[static_cast<size_t>(*ssmLcId)].reset();
+                newBlock->storage[static_cast<size_t>(*ssmLcId)] = nullptr;
             }
         }
         assert(gNdebug || _getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
@@ -937,9 +937,9 @@ void KvCache::_commitBlock(int ord, bool isLast)
             auto& bp = sb.pages[0][lc];
             if (blockPageIsNull(bp))
                 continue;
-            auto existingPage = newBlock->storage.at(static_cast<size_t>(lc)).lock();
+            auto* existingPage = newBlock->storage.at(static_cast<size_t>(lc));
             bool isLocked = std::holds_alternative<SharedPageLock>(bp);
-            if (!existingPage)
+            if (existingPage == nullptr)
             {
                 // Existing page gone — put our uncommitted page into the tree block.
                 if (auto* lock = std::get_if<SharedPageLock>(&bp))
@@ -976,8 +976,8 @@ void KvCache::_commitBlock(int ord, bool isLast)
                     auto holder = blockPageGetPage(bp)->hold();
                     bp = std::move(holder);
                 }
-                reuseTasks.push_back({existingPage, static_cast<BeamIndex>(0), static_cast<BlockOrdinal>(ord),
-                    static_cast<LifeCycleId>(lc)});
+                reuseTasks.push_back({existingPage->shared_from_this(), static_cast<BeamIndex>(0),
+                    static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc)});
             }
         }
         if (!reuseTasks.empty())
@@ -1151,7 +1151,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     };
 
     auto hasPage = [](Block const& blk, LifeCycleId lcId) -> bool
-    { return !blk.storage.at(static_cast<size_t>(lcId)).expired(); };
+    { return blk.storage.at(static_cast<size_t>(lcId)) != nullptr; };
 
     // Use attentionLifeCycles() for full-attention and SWA checks.
     auto attnLcs = lifeCycles.attentionLifeCycles();
@@ -1292,7 +1292,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
         auto processOrdinal = [&](int ordinal)
         {
             auto& blk = *matched[ordinal].block;
-            auto page = blk.storage.at(static_cast<size_t>(lcId)).lock();
+            auto* page = blk.storage.at(static_cast<size_t>(lcId));
             assert(page && "Expected page in non-stale block");
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
@@ -1308,7 +1308,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     if (ssmLcId.has_value() && !matched.empty())
     {
         auto& snapshotBlock = *matched.back().block;
-        auto snapshotPage = snapshotBlock.storage[static_cast<size_t>(*ssmLcId)].lock();
+        auto* snapshotPage = snapshotBlock.storage[static_cast<size_t>(*ssmLcId)];
         assert(snapshotPage && "Last matched block must have SSM snapshot after truncation");
         mSsmBlocks[0][static_cast<size_t>(*ssmLcId)] = snapshotPage->hold();
     }
@@ -1345,7 +1345,7 @@ std::shared_ptr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
             {
                 auto page = blockPageGetPage(beamBlock[lc]);
                 auto committed = std::dynamic_pointer_cast<CommittedPage>(page);
-                assert(committed && committed->block.lock() == ret);
+                assert(committed && committed->block == ret.get());
             }
         }
     }

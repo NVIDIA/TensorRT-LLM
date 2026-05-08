@@ -100,17 +100,16 @@ SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal or
 CommittedPage::CommittedPage(
     StorageManager* mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio)
     : Page(mgr, lc, level, prio)
-    , block(blk)
+    , block(blk.get())
 {
 }
 
 CommittedPage::~CommittedPage()
 {
-    auto blk = block.lock();
-    if (blk)
+    if (block != nullptr)
     {
         LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
-        blk->unsetPage(lifeCycle, lc);
+        block->unsetPage(lifeCycle, lc);
     }
     // Delegate slot release to Page::~Page().
 }
@@ -161,7 +160,7 @@ UncommittedPage::~UncommittedPage()
 std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_ptr<Block> blk, CachedCudaEvent readyEv)
 {
     assert(!scheduledForEviction());
-    assert(blk->storage.at(static_cast<size_t>(lifeCycle)).expired()
+    assert(blk->storage.at(static_cast<size_t>(lifeCycle)) == nullptr
         && "Block slot for this lifecycle already has a committed page");
     assert(status() == PageStatus::DROPPABLE && "Release holder/lock before converting");
 
@@ -179,7 +178,7 @@ std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_p
     assert(committed->hasValidSlot() && "committed page must have a valid slot after transfer");
 
     // Register in block storage.
-    blk->storage.at(static_cast<size_t>(lifeCycle)) = committed;
+    blk->storage.at(static_cast<size_t>(lifeCycle)) = committed.get();
 
     return committed;
 }
@@ -210,8 +209,7 @@ PageHolder::~PageHolder()
         auto* cp = dynamic_cast<CommittedPage*>(page.get());
         if (cp)
         {
-            auto blk = cp->block.lock();
-            if (!blk || blk->isOrphan())
+            if (cp->block == nullptr || cp->block->isOrphan())
                 manager->excludeFromEviction(*page);
         }
     }
