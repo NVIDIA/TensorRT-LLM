@@ -1358,6 +1358,10 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                # First TP collective each iter; keeps disagg error
+                # path symmetric under ADP.
+                self._handle_disagg_cache_errors_synced()
+
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
@@ -2084,6 +2088,28 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    def _handle_disagg_cache_errors_synced(self):
+        """ADP-safe disagg cache error handler.
+
+        Called from the top of every executor iteration so all TP ranks
+        enter ``_handle_errors`` together; otherwise the downstream
+        ``tp_gather`` in ``_enqueue_responses`` deadlocks.
+        """
+        if not (self.kv_cache_transceiver and self.enable_attention_dp
+                and self.dist.world_size != 1):
+            return
+        local_error_requests = self._get_disagg_reqs_in_error_state()
+        any_has_errors = any(self.dist.tp_allgather(bool(local_error_requests)))
+        if not any_has_errors:
+            return
+        logger.warning(
+            f"Disagg KV cache transfer error: rank={self.dist.rank} "
+            f"local_err_count={len(local_error_requests)}")
+        self._handle_errors(
+            "Disagg KV cache transfer error",
+            requests=local_error_requests,
+        )
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -2098,6 +2124,10 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                # First TP collective each iter; keeps disagg error
+                # path symmetric under ADP.
+                self._handle_disagg_cache_errors_synced()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
@@ -2345,6 +2375,10 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                # First TP collective each iter; keeps disagg error
+                # path symmetric under ADP.
+                self._handle_disagg_cache_errors_synced()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
@@ -3394,7 +3428,14 @@ class PyExecutor:
         ]
 
     def _check_cache_transfer_errors(self, error_msg_prefix: str):
-        """Common helper to check for and handle cache transfer errors."""
+        """Check and handle cache transfer errors.
+
+        Under ADP this is a no-op: errors are routed through
+        ``_handle_disagg_cache_errors_synced`` at the loop top so all
+        TP ranks enter ``_handle_errors`` together.
+        """
+        if self.enable_attention_dp and self.dist.world_size != 1:
+            return
         error_requests = self._get_disagg_reqs_in_error_state()
         if error_requests:
             self._handle_errors(

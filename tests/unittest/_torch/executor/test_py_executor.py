@@ -606,3 +606,88 @@ def test_pad_dummy_no_op_when_attention_dp_disabled():
     _run_pad(stub)
 
     assert stub.add_dummy_calls == []
+
+
+class _StubADPSyncedErrorExecutor:
+    """Minimal stub for testing _handle_disagg_cache_errors_synced."""
+
+    def __init__(self, *, enable_attention_dp=True, world_size=2,
+                 kv_cache_transceiver=object()):
+        self.enable_attention_dp = enable_attention_dp
+        self.kv_cache_transceiver = kv_cache_transceiver
+        self.active_requests = []
+        self.handle_errors_calls = []
+
+        self.dist = Mock()
+        self.dist.rank = 1
+        self.dist.world_size = world_size
+
+    _handle_disagg_cache_errors_synced = (
+        PyExecutor._handle_disagg_cache_errors_synced)
+    _get_disagg_reqs_in_error_state = PyExecutor._get_disagg_reqs_in_error_state
+
+    def _handle_errors(self, error_msg=None, *, requests=None):
+        self.handle_errors_calls.append((error_msg, requests))
+
+
+def _make_error_request():
+    req = Mock()
+    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    return req
+
+
+def test_synced_error_handler_no_op_when_disagg_disabled():
+    stub = _StubADPSyncedErrorExecutor(kv_cache_transceiver=None)
+    stub.active_requests = [_make_error_request()]
+
+    stub._handle_disagg_cache_errors_synced()
+
+    stub.dist.tp_allgather.assert_not_called()
+    assert stub.handle_errors_calls == []
+
+
+def test_synced_error_handler_no_op_when_attention_dp_disabled():
+    stub = _StubADPSyncedErrorExecutor(enable_attention_dp=False)
+    stub.active_requests = [_make_error_request()]
+
+    stub._handle_disagg_cache_errors_synced()
+
+    stub.dist.tp_allgather.assert_not_called()
+    assert stub.handle_errors_calls == []
+
+
+def test_synced_error_handler_skips_when_no_rank_has_errors():
+    stub = _StubADPSyncedErrorExecutor()
+    stub.dist.tp_allgather.return_value = [False, False]
+
+    stub._handle_disagg_cache_errors_synced()
+
+    stub.dist.tp_allgather.assert_called_once_with(False)
+    assert stub.handle_errors_calls == []
+
+
+def test_synced_error_handler_invokes_handle_errors_when_local_has_errors():
+    stub = _StubADPSyncedErrorExecutor()
+    err_req = _make_error_request()
+    stub.active_requests = [err_req]
+    stub.dist.tp_allgather.return_value = [True, True]
+
+    stub._handle_disagg_cache_errors_synced()
+
+    stub.dist.tp_allgather.assert_called_once_with(True)
+    assert len(stub.handle_errors_calls) == 1
+    assert stub.handle_errors_calls[0][1] == [err_req]
+
+
+def test_synced_error_handler_runs_on_silent_rank_when_peer_has_errors():
+    """Reproduces the deadlock scenario: this rank has no local errors
+    but a peer does.  All ranks must enter _handle_errors together."""
+    stub = _StubADPSyncedErrorExecutor()
+    # No local errors on this rank.
+    stub.dist.tp_allgather.return_value = [False, True]
+
+    stub._handle_disagg_cache_errors_synced()
+
+    stub.dist.tp_allgather.assert_called_once_with(False)
+    assert len(stub.handle_errors_calls) == 1
+    assert stub.handle_errors_calls[0][1] == []
