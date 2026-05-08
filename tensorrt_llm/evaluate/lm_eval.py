@@ -70,9 +70,8 @@ class LmEvalWrapper(TemplateLM):
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
         # When True, CLI-provided sampling params (temperature/top_k/top_p/seed)
-        # take precedence over task yaml gen_kwargs.  Needed to match the
-        # sampling recipe published by a model card (e.g., Gemma4 26B:
-        # temperature=1.0, top_p=0.95, top_k=64).
+        # take precedence over task yaml gen_kwargs. Lets users reproduce a
+        # model-card sampling recipe without editing the task yaml.
         self.sampling_override = sampling_override
 
     @property
@@ -987,9 +986,9 @@ class MMMUPro(LmEvalEvaluator):
 
     MMMU Pro (https://huggingface.co/datasets/MMMU/MMMU_Pro) is a harder
     sibling of MMMU with an expanded option set and a broader mix of
-    subjects.  Gemma4's HF blog reports MMMU Pro numbers, so we expose it
-    here as a first-class trtllm-eval task backed by a custom lm-eval
-    task yaml under ``tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro``.
+    subjects. Exposed as a first-class trtllm-eval task backed by a
+    custom lm-eval task yaml under
+    ``tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro``.
     """
 
     def __init__(self, subset: str = "standard_10", **kwargs):
@@ -1004,9 +1003,9 @@ class MMMUPro(LmEvalEvaluator):
                   type=click.Choice(["standard_10", "standard_4"]),
                   default="standard_10",
                   help=("MMMU Pro subset to evaluate. "
-                        "'standard_10' is the 10-option multiple-choice set "
-                        "reported on the Gemma4 model card (default); "
-                        "'standard_4' is the easier 4-option variant."))
+                        "'standard_10' is the 10-option multiple-choice "
+                        "set (default); 'standard_4' is the easier "
+                        "4-option variant."))
     @click.option("--dataset_path",
                   type=str,
                   default=None,
@@ -1036,16 +1035,22 @@ class MMMUPro(LmEvalEvaluator):
         help=
         "The system prompt to be added on the prompt. If specified, it will add {'role': 'system', 'content': system_prompt} to the prompt."
     )
-    @click.option("--max_input_length",
-                  type=int,
-                  default=8192,
-                  help="Maximum prompt length.")
+    @click.option(
+        "--max_input_length",
+        type=int,
+        default=8192,
+        show_default=True,
+        help="Maximum prompt length. Image-MM prompts include image soft "
+        "tokens — e.g. Gemma4 Image Processor's ``image_seq_length=280`` "
+        "(processor_config.json) per image — plus the question text and "
+        "chat-template overhead. 8192 (2x the text-task 4096 default) "
+        "covers MMMU Pro multi-image questions without truncation.")
     @click.option(
         "--max_output_length",
         type=int,
         default=32000,
         show_default=True,
-        help="Maximum generation length.  Default mirrors the lm-eval "
+        help="Maximum generation length. Default mirrors the lm-eval "
         "harness yaml (``max_gen_toks: 32000``) under "
         "tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro/_template_yaml.")
     @click.option("--temperature",
@@ -1165,10 +1170,15 @@ class MMMU(LmEvalEvaluator):
         help=
         "The system prompt to be added on the prompt. If specified, it will add {'role': 'system', 'content': system_prompt} to the prompt."
     )
-    @click.option("--max_input_length",
-                  type=int,
-                  default=8192,
-                  help="Maximum prompt length.")
+    @click.option(
+        "--max_input_length",
+        type=int,
+        default=8192,
+        show_default=True,
+        help="Maximum prompt length. Image-MM prompts include image soft "
+        "tokens (e.g. ~280 per image for Gemma3/4-style processors) plus "
+        "question text and chat-template overhead, so 8192 (2x the text-task "
+        "4096 default) covers multi-image MMMU questions without truncation.")
     @click.option(
         "--max_output_length",
         type=int,
@@ -1420,10 +1430,11 @@ class AIME2026(LmEvalEvaluator):
         default='{"thinking_budget": 32768}',
         show_default=True,
         callback=lambda ctx, param, value: json.loads(value) if value else None,
-        help='Chat template kwargs as JSON string. Default enables Gemma-style '
-        'thinking with a 32k budget (set thinking_budget to 0 to disable '
-        'thinking, or pass e.g. \'{"enable_thinking": true}\' for Qwen-style '
-        'templates).')
+        help='Chat template kwargs as JSON string. Default enables thinking '
+        'with a 32k budget for chat templates that consume '
+        '``thinking_budget`` (set to 0 to disable thinking; for templates '
+        'that use a different key, pass the appropriate JSON, e.g. '
+        '\'{"enable_thinking": true}\').')
     @click.option("--fewshot_as_multiturn",
                   is_flag=True,
                   default=False,
@@ -1452,9 +1463,9 @@ class AIME2026(LmEvalEvaluator):
         type=float,
         default=None,
         help="Sampling temperature. Defaults to the task yaml ``gen_kwargs`` "
-        "(harness aime25/26 yaml is greedy). Pass a value to override "
-        "(e.g. set the Gemma 4 sampling recipe via ``--temperature 1.0 "
-        "--top_p 0.95 --top_k 64``).")
+        "(harness aime25/26 yaml is greedy). Pass a value to override; "
+        "use together with ``--top_p`` / ``--top_k`` to reproduce a "
+        "model-card sampling recipe.")
     @click.option(
         "--top_p",
         type=float,
@@ -1536,10 +1547,11 @@ class AIME2025(LmEvalEvaluator):
         default='{"thinking_budget": 32768}',
         show_default=True,
         callback=lambda ctx, param, value: json.loads(value) if value else None,
-        help='Chat template kwargs as JSON string. Default enables Gemma-style '
-        'thinking with a 32k budget (set thinking_budget to 0 to disable '
-        'thinking, or pass e.g. \'{"enable_thinking": true}\' for Qwen-style '
-        'templates).')
+        help='Chat template kwargs as JSON string. Default enables thinking '
+        'with a 32k budget for chat templates that consume '
+        '``thinking_budget`` (set to 0 to disable thinking; for templates '
+        'that use a different key, pass the appropriate JSON, e.g. '
+        '\'{"enable_thinking": true}\').')
     @click.option("--fewshot_as_multiturn",
                   is_flag=True,
                   default=False,
@@ -1568,9 +1580,9 @@ class AIME2025(LmEvalEvaluator):
         type=float,
         default=None,
         help="Sampling temperature. Defaults to the task yaml ``gen_kwargs`` "
-        "(harness aime25/26 yaml is greedy). Pass a value to override "
-        "(e.g. set the Gemma 4 sampling recipe via ``--temperature 1.0 "
-        "--top_p 0.95 --top_k 64``).")
+        "(harness aime25/26 yaml is greedy). Pass a value to override; "
+        "use together with ``--top_p`` / ``--top_k`` to reproduce a "
+        "model-card sampling recipe.")
     @click.option(
         "--top_p",
         type=float,
