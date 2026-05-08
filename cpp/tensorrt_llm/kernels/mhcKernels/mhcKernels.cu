@@ -129,10 +129,16 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
             cm[k] = expf(cm[k] - rowMax);
-        float rs = cm[0] + cm[1] + cm[2] + cm[3];
+        // Replace per-element fdiv with one reciprocal + 4 fmul. fp32 fdiv on
+        // B200 is multi-cycle while fmul retires at peak rate; sinkhorn's
+        // O(HC_MULT * sinkhorn_repeat) divisions per token (160 at sinkhorn=20)
+        // dominate the bigfuse epilogue cost on this 4-lane warp. Math is
+        // identical modulo last-bit round-off, which sinkhorn iteration
+        // absorbs.
+        float inv_rs = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3]);
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
-            cm[k] = cm[k] / rs + hc_sinkhorn_eps;
+            cm[k] = cm[k] * inv_rs + hc_sinkhorn_eps;
 
             // Column normalize: sum across lanes (rows) via butterfly shuffle
 #pragma unroll
@@ -141,16 +147,16 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             float cs = cm[k];
             cs += __shfl_xor_sync(LANE_MASK, cs, 1);
             cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-            cm[k] /= (cs + hc_sinkhorn_eps);
+            cm[k] *= 1.0f / (cs + hc_sinkhorn_eps);
         }
 
         // Remaining Sinkhorn iterations: alternate row / column normalize
         for (int it = 1; it < sinkhorn_repeat; it++)
         {
-            rs = cm[0] + cm[1] + cm[2] + cm[3] + hc_sinkhorn_eps;
+            inv_rs = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3] + hc_sinkhorn_eps);
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
-                cm[k] /= rs;
+                cm[k] *= inv_rs;
 
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
@@ -158,7 +164,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
                 float cs = cm[k];
                 cs += __shfl_xor_sync(LANE_MASK, cs, 1);
                 cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                cm[k] /= (cs + hc_sinkhorn_eps);
+                cm[k] *= 1.0f / (cs + hc_sinkhorn_eps);
             }
         }
 

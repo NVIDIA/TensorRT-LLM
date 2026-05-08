@@ -1267,31 +1267,33 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 #pragma unroll
             for (uint32_t k = 0; k < HC_MULT; ++k)
                 cm_vals[k] = __expf(cm_vals[k] - rowMax);
-            float rs = cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3];
+            // Reciprocal-multiply for sinkhorn: 1 fdiv + 4 fmul instead of 4
+            // fdivs per row-normalize. Equivalent under fp32 round-off.
+            float inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3]);
 #pragma unroll
             for (uint32_t k = 0; k < HC_MULT; ++k)
-                cm_vals[k] = cm_vals[k] / rs + hc_sinkhorn_eps;
+                cm_vals[k] = cm_vals[k] * inv_rs + hc_sinkhorn_eps;
 #pragma unroll
             for (uint32_t k = 0; k < HC_MULT; ++k)
             {
                 float cs = cm_vals[k];
                 cs += __shfl_xor_sync(LANE_MASK, cs, 1);
                 cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                cm_vals[k] /= (cs + hc_sinkhorn_eps);
+                cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
             }
             for (uint32_t it = 1; it < sinkhorn_repeat; ++it)
             {
-                rs = cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps;
+                inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps);
 #pragma unroll
                 for (uint32_t k = 0; k < HC_MULT; ++k)
-                    cm_vals[k] /= rs;
+                    cm_vals[k] *= inv_rs;
 #pragma unroll
                 for (uint32_t k = 0; k < HC_MULT; ++k)
                 {
                     float cs = cm_vals[k];
                     cs += __shfl_xor_sync(LANE_MASK, cs, 1);
                     cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                    cm_vals[k] /= (cs + hc_sinkhorn_eps);
+                    cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
                 }
             }
             if (warp_in_team == 0)
