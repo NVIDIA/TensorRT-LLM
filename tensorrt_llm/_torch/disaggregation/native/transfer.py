@@ -390,6 +390,17 @@ class Sender(SenderBase):
                 timer.record_transfer_start(write_meta.peer_rank)
             if not self._agent.submit_transfer_requests(request).wait():
                 agent_result = AgentResult.FAILED
+                logger.error(
+                    f"KV transfer agent failed: "
+                    f"unique_rid={write_meta.unique_rid} "
+                    f"slice={write_meta.slice_id} "
+                    f"peer_rank={write_meta.peer_rank} "
+                    f"peer_endpoint={write_meta.peer_endpoint} "
+                    f"op={getattr(request, 'op', '?')} "
+                    f"remote={getattr(request, 'remote_name', '?')} "
+                    f"src_size={int(write_meta.src_ptrs.size)} "
+                    f"dst_size={int(write_meta.dst_ptrs.size)}"
+                )
                 if not write_meta.task_future.done():
                     write_meta.task_future.set_exception(
                         RuntimeError(f"KV transfer failed for request {write_meta.unique_rid}")

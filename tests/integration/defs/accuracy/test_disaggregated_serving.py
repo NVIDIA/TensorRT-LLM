@@ -267,14 +267,16 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(ctx_ports):
         env = base_env.copy()
-        env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        cache_transceiver_config_backend = ctx_server_config.get(
+            "cache_transceiver_config", {}).get("backend", "DEFAULT")
+        # NIXL backend ignores this env-var fallback; skip it.
+        if cache_transceiver_config_backend != "NIXL":
+            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
-        cache_transceiver_config_backend = ctx_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
         if cache_transceiver_config_backend == "NIXL":
             env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
@@ -302,13 +304,15 @@ def launch_disaggregated_llm(
         env = base_env.copy()
         if gen_extra_env:
             env.update(gen_extra_env)
-        env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        cache_transceiver_config_backend = gen_server_config.get(
+            "cache_transceiver_config", {}).get("backend", "DEFAULT")
+        # NIXL backend ignores this env-var fallback; skip it.
+        if cache_transceiver_config_backend != "NIXL":
+            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
-        cache_transceiver_config_backend = gen_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
         if cache_transceiver_config_backend == "NIXL":
             env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
