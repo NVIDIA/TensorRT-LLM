@@ -11,5 +11,5 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_fp8_8gpus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_nvfp4_4gpus
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4_longseq_trtllm_moe_stress
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4_longseq_trtllm_moe_async_cancel
-accuracy/test_llm_api_pytorch.py::TestGLM47FlashNVFP4::test_nvfp4_chunked_prefill_kv_reuse_stress
-accuracy/test_llm_api_pytorch.py::TestGLM47FlashNVFP4::test_nvfp4_async_stream_cancel_probe
+accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_chunked_prefill_kv_reuse_stress
+accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_async_stream_cancel_probe

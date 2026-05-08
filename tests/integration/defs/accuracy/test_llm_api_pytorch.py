@@ -3788,91 +3788,6 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-
-@skip_pre_blackwell
-class TestGLM4_5Air(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "zai-org/GLM-4.5-Air"
-    MODEL_PATH = f"{llm_models_root()}/GLM-4.5-Air"
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize(
-        "tp_size,pp_size,mtp_nextn,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
-        [
-            pytest.param(2, 1, 2, True, True, True, 16, "CUTLASS"),
-            pytest.param(2, 1, 2, True, True, True, 16, "TRTLLM")
-        ],
-        ids=["throughput", "throughput_trtllm"])
-    def test_nvfp4_multi_gpus(self, tp_size, pp_size, mtp_nextn, cuda_graph,
-                              overlap_scheduler, chunked_prefill,
-                              max_batch_size, moe_backend):
-
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_config=MoeConfig(backend=moe_backend))
-
-        mtp_config = None
-        if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-
-        with LLM(f"{llm_models_root()}/glm-4.5-air-fp4",
-                 max_batch_size=max_batch_size,
-                 tensor_parallel_size=tp_size,
-                 pipeline_parallel_size=pp_size,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 speculative_config=mtp_config,
-                 enable_chunked_prefill=chunked_prefill) as llm:
-
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize(
-        "tp_size,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
-        [
-            pytest.param(2, True, True, True, 16, "CUTLASS"),
-            pytest.param(2, True, True, True, 16, "TRTLLM"),
-        ],
-        ids=["2model", "2model_trtllm"])
-    def test_nvfp4_2_model_mtp(self, tp_size, cuda_graph, overlap_scheduler,
-                               chunked_prefill, max_batch_size, moe_backend):
-
-        model_path = f"{llm_models_root()}/glm-4.5-air-fp4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
-        pytorch_config = dict(
-            disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_config=MoeConfig(backend=moe_backend))
-
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
-                                       mtp_eagle_one_model=False,
-                                       speculative_model_dir=model_path)
-
-        with LLM(model_path,
-                 max_batch_size=max_batch_size,
-                 tensor_parallel_size=tp_size,
-                 kv_cache_config=kv_cache_config,
-                 **pytorch_config,
-                 speculative_config=mtp_config,
-                 enable_chunked_prefill=chunked_prefill) as llm:
-
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-@skip_pre_blackwell
-class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
-    """Stress coverage for GLM-4.7-Flash NVFP4 (MoE lite) under chunked prefill + KV reuse.
-
-    RCCA: https://nvbugspro.nvidia.com/bug/6025177 (TRTLLM-11688).
-    """
-
-    MODEL_NAME = "zai-org/GLM-4.7-Flash"
-
     @staticmethod
     def _llm_kwargs_nvbug_6025177(model_path: str) -> dict:
         """Shared ``LLM`` kwargs aligned with NVBug 6025177 StepsToReproduce server YAML.
@@ -3899,7 +3814,7 @@ class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
             trust_remote_code=True,
             kv_cache_config=kv_cache_config,
             max_num_tokens=8192,
-            max_seq_len=202752,
+            max_seq_len=131072,
             max_batch_size=8,
             speculative_config=mtp_config,
             cuda_graph_config=CudaGraphConfig(enable_padding=False),
@@ -3907,6 +3822,7 @@ class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
             guided_decoding_backend="xgrammar",
         )
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.timeout(14400)
@@ -3920,17 +3836,15 @@ class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
 
         RCCA: https://nvbugspro.nvidia.com/bug/6025177
 
-        Matches the checked-in YAML: PDL, chunked prefill, FP8 KV, block reuse,
-        MTP x3, TRTLLM MoE + low-precision combine, cuda graphs without padding,
-        iter perf stats, xgrammar, KV host tier size, tp=4 / ep=1, max batch 8,
-        max_seq_len / max_num_tokens 8192 as in the bug (model checkpoint differs:
-        ``GLM-4.7-Flash-NVFP4`` under LLM_MODELS_ROOT vs customer ``baseten-admin/glm-4.7-fp4``).
+        PDL, chunked prefill, FP8 KV with block reuse, MTP x3 (2-model),
+        TRTLLM MoE + low-precision combine, cuda graphs without padding,
+        iter perf stats, xgrammar, KV host tier size, tp=4 / ep=1, max batch 8.
 
         For cancellation + async overlap (customer probe behavior), see
         ``test_nvfp4_async_stream_cancel_probe``.
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
-        model_path = f"{llm_models_root()}/GLM-4.7-Flash-NVFP4"
+        model_path = f"{llm_models_root()}/glm-4.6-fp4"
         target_len = 49152
 
         with LLM(model_path,
@@ -3979,6 +3893,7 @@ class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
                     assert len(token_ids) > 0
                     assert not all(tid == 0 for tid in token_ids)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.timeout(14400)
@@ -3998,7 +3913,7 @@ class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
         ``ALL_SAME`` pool detection; it targets the executor/KV path under cancel.
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
-        model_path = f"{llm_models_root()}/GLM-4.7-Flash-NVFP4"
+        model_path = f"{llm_models_root()}/glm-4.6-fp4"
         target_len = 49152
 
         with LLM(model_path,
@@ -4082,6 +3997,81 @@ class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
                 token_ids = output.outputs[0].token_ids
                 assert len(token_ids) > 0
                 assert not all(tid == 0 for tid in token_ids)
+
+
+@skip_pre_blackwell
+class TestGLM4_5Air(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-4.5-Air"
+    MODEL_PATH = f"{llm_models_root()}/GLM-4.5-Air"
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,mtp_nextn,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
+        [
+            pytest.param(2, 1, 2, True, True, True, 16, "CUTLASS"),
+            pytest.param(2, 1, 2, True, True, True, 16, "TRTLLM")
+        ],
+        ids=["throughput", "throughput_trtllm"])
+    def test_nvfp4_multi_gpus(self, tp_size, pp_size, mtp_nextn, cuda_graph,
+                              overlap_scheduler, chunked_prefill,
+                              max_batch_size, moe_backend):
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        with LLM(f"{llm_models_root()}/glm-4.5-air-fp4",
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 speculative_config=mtp_config,
+                 enable_chunked_prefill=chunked_prefill) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize(
+        "tp_size,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
+        [
+            pytest.param(2, True, True, True, 16, "CUTLASS"),
+            pytest.param(2, True, True, True, 16, "TRTLLM"),
+        ],
+        ids=["2model", "2model_trtllm"])
+    def test_nvfp4_2_model_mtp(self, tp_size, cuda_graph, overlap_scheduler,
+                               chunked_prefill, max_batch_size, moe_backend):
+
+        model_path = f"{llm_models_root()}/glm-4.5-air-fp4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       mtp_eagle_one_model=False,
+                                       speculative_model_dir=model_path)
+
+        with LLM(model_path,
+                 max_batch_size=max_batch_size,
+                 tensor_parallel_size=tp_size,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 speculative_config=mtp_config,
+                 enable_chunked_prefill=chunked_prefill) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 @pytest.mark.timeout(10800)
