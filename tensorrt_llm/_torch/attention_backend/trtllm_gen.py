@@ -456,6 +456,7 @@ def _get_workspace_size(
 
 @dataclass(slots=True)
 class EnqueueParams:
+    forward: AttentionForwardArgs
     attention_input: Optional[torch.Tensor] = None
     qkv_input: Optional[torch.Tensor] = None
     context_buf: Optional[torch.Tensor] = None
@@ -485,33 +486,23 @@ class EnqueueParams:
     kv_cache_quant_mode: int = 0
     position_embedding_type: int = 0
     layer_idx: int = 0
-    global_layer_idx: int = 0
-    kv_scale_orig_quant: Optional[torch.Tensor] = None
-    kv_scale_quant_orig: Optional[torch.Tensor] = None
-    attention_output_orig_quant: Optional[torch.Tensor] = None
     bmm1_scale: float = 1.0
     bmm2_scale: float = 1.0
     rotary_inv_freq: Optional[torch.Tensor] = None
     rotary_cos_sin: Optional[torch.Tensor] = None
     attention_chunk_size: int = 0
     fp8_context_fmha: bool = False
-    remove_padding: bool = True
-    cross_attention: bool = False
-    position_shift_enabled: bool = False
     paged_context_fmha: bool = False
-    attention_sinks: Optional[torch.Tensor] = None
     is_mla_enable: bool = False
     # MLA parameters
     kv_lora_rank: int = 0
     qk_nope_head_dim: int = 0
     qk_rope_head_dim: int = 0
-    v_head_dim: int = 0
     q_scaling: float = 1.0
-    latent_cache: Optional[torch.Tensor] = None
-    num_layers: int = 0
     multi_processor_count: int = 0
+    kv_factor: int = 0
+    total_num_blocks: int = 0
     batch_size: int = 0
-    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
     beam_width: int = 1
     num_requests: int = 0
     predicted_tokens_per_seq: int = 1
@@ -554,6 +545,58 @@ class FlashInferTrtllmGenAttention:
         if attention_layer is None:
             raise RuntimeError("trtllm-gen attention layer has been destroyed.")
         return attention_layer
+
+    def _get_kv_scale_params(
+        self,
+        forward_args: AttentionForwardArgs,
+        quant_mode: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        attention_layer = self._get_attention_layer()
+        kv_cache_quant_mode = QuantMode(quant_mode)
+        kv_scale_orig_quant = (
+            attention_layer.kv_scale_orig_quant
+            if forward_args.kv_scales_sf_inv is None
+            else forward_args.kv_scales_sf_inv
+        )
+        kv_scale_quant_orig = (
+            attention_layer.kv_scale_quant_orig
+            if forward_args.kv_scales_sf is None
+            else forward_args.kv_scales_sf
+        )
+        if (
+            not kv_cache_quant_mode.has_kv_cache_quant()
+            or kv_scale_orig_quant is None
+            or kv_scale_quant_orig is None
+        ):
+            return None, None
+
+        if kv_cache_quant_mode.has_fp4_kv_cache():
+            assert kv_scale_orig_quant.size(0) == 3, (
+                f"kv_scale_orig_quant must have size(0)==3 for FP4, got {kv_scale_orig_quant.size(0)}"
+            )
+            assert kv_scale_quant_orig.size(0) == 3, (
+                f"kv_scale_quant_orig must have size(0)==3 for FP4, got {kv_scale_quant_orig.size(0)}"
+            )
+
+        return kv_scale_orig_quant, kv_scale_quant_orig
+
+    @staticmethod
+    def _get_attention_output_orig_quant(
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[torch.Tensor]:
+        return (
+            forward_args.out_scale_sf
+            if forward_args.output_sf is not None
+            else forward_args.out_scale
+        )
+
+    @staticmethod
+    def _get_mrope_rotary_cos_sin(
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[torch.Tensor]:
+        if forward_args.mrope_config is None:
+            return None
+        return forward_args.mrope_config.get("mrope_rotary_cos_sin")
 
     def is_supported(
         self,
@@ -641,7 +684,6 @@ class FlashInferTrtllmGenAttention:
         output = forward_args.output
         if output is None:
             raise RuntimeError("trtllm-gen attention requires forward_args.output.")
-        output_sf = forward_args.output_sf
 
         workspace = (
             metadata.workspace if not metadata.is_cuda_graph else metadata.cuda_graph_workspace
@@ -671,22 +713,6 @@ class FlashInferTrtllmGenAttention:
         ]
         attention_input_type = int(forward_args.attention_input_type)
         is_mla_enable = attention_layer.is_mla_enable
-        kv_scale_orig_quant = (
-            attention_layer.kv_scale_orig_quant
-            if forward_args.kv_scales_sf_inv is None
-            else forward_args.kv_scales_sf_inv
-        )
-        kv_scale_quant_orig = (
-            attention_layer.kv_scale_quant_orig
-            if forward_args.kv_scales_sf is None
-            else forward_args.kv_scales_sf
-        )
-        out_scale = forward_args.out_scale_sf if output_sf is not None else forward_args.out_scale
-        mrope_rotary_cos_sin = (
-            forward_args.mrope_config.get("mrope_rotary_cos_sin")
-            if forward_args.mrope_config is not None
-            else None
-        )
         spec_decoding_bool_params = [
             metadata.is_spec_decoding_enabled,
             metadata.use_spec_decoding,
@@ -722,24 +748,6 @@ class FlashInferTrtllmGenAttention:
         is_fp8_out = output.dtype == torch.float8_e4m3fn
         is_fp4_out = output.dtype == torch.uint8
         kv_cache_quant_mode = QuantMode(quant_mode)
-
-        has_kv_cache_quant = kv_cache_quant_mode.has_kv_cache_quant()
-        resolved_kv_scale_orig_quant = None
-        resolved_kv_scale_quant_orig = None
-        if (
-            has_kv_cache_quant
-            and kv_scale_orig_quant is not None
-            and kv_scale_quant_orig is not None
-        ):
-            resolved_kv_scale_orig_quant = kv_scale_orig_quant
-            resolved_kv_scale_quant_orig = kv_scale_quant_orig
-            if kv_cache_quant_mode.has_fp4_kv_cache():
-                assert resolved_kv_scale_orig_quant.size(0) == 3, (
-                    f"kv_scale_orig_quant must have size(0)==3 for FP4, got {resolved_kv_scale_orig_quant.size(0)}"
-                )
-                assert resolved_kv_scale_quant_orig.size(0) == 3, (
-                    f"kv_scale_quant_orig must have size(0)==3 for FP4, got {resolved_kv_scale_quant_orig.size(0)}"
-                )
 
         num_tokens = q.size(0)
 
@@ -803,7 +811,9 @@ class FlashInferTrtllmGenAttention:
             )
         )
         cyclic_attn_window_size = attention_window_size
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, is_mla_enable)
         params = EnqueueParams(
+            forward=forward_args,
             workspace=workspace,
             max_attention_window_size=max_attn_window_size,
             cyclic_attention_window_size=cyclic_attn_window_size,
@@ -826,10 +836,6 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode=quant_mode,
             position_embedding_type=position_embedding_type,
             layer_idx=layer_idx,
-            global_layer_idx=attention_layer.layer_idx,
-            kv_scale_orig_quant=resolved_kv_scale_orig_quant,
-            kv_scale_quant_orig=resolved_kv_scale_quant_orig,
-            attention_output_orig_quant=out_scale,
             bmm1_scale=1.0 / (math.sqrt(head_size) * q_scaling),
             bmm2_scale=1.0,
             rotary_inv_freq=attention_layer.rotary_inv_freq,
@@ -840,22 +846,15 @@ class FlashInferTrtllmGenAttention:
             fp8_context_fmha=is_fp8_out
             or is_fp4_out
             or (kv_cache_quant_mode.has_fp8_kv_cache() and use_paged_context_fmha),
-            remove_padding=True,
-            cross_attention=False,
-            position_shift_enabled=False,
             paged_context_fmha=use_paged_context_fmha,
-            attention_sinks=forward_args.attention_sinks,
             is_mla_enable=is_mla_enable,
             kv_lora_rank=kv_lora_rank or 0,
             qk_nope_head_dim=qk_nope_head_dim or 0,
             qk_rope_head_dim=qk_rope_head_dim or 0,
-            v_head_dim=v_head_dim or 0,
             q_scaling=q_scaling,
-            latent_cache=forward_args.latent_cache,
-            num_layers=metadata.host_kv_cache_pool_mapping.size(0)
-            if metadata.host_kv_cache_pool_mapping is not None
-            else 0,
             multi_processor_count=self._get_multi_processor_count(q.device),
+            kv_factor=kv_factor,
+            total_num_blocks=total_num_blocks,
         )
 
         if num_contexts > 0 and attn_input_type != AttentionInputType.generation_only:
@@ -878,8 +877,7 @@ class FlashInferTrtllmGenAttention:
             params.seq_offset = seq_offset
             params.input_seq_length = max_context_q_len
             params.batch_size = num_seqs
-            params.mrope_rotary_cos_sin = mrope_rotary_cos_sin
-            self.run_context(params, metadata)
+            self.run_context(params)
 
         if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
             seq_offset = num_contexts
@@ -922,9 +920,9 @@ class FlashInferTrtllmGenAttention:
             params.spec_decoding_position_offsets = spec_pos_offsets
             params.spec_decoding_packed_mask = spec_packed_mask
             if is_mla_enable:
-                self.run_mla_generation(params, metadata)
+                self.run_mla_generation(params)
             else:
-                self.run_generation(params, metadata)
+                self.run_generation(params)
 
         logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")
 
@@ -986,9 +984,12 @@ class FlashInferTrtllmGenAttention:
     def run_context(
         self,
         params: EnqueueParams,
-        metadata: "TrtllmAttentionMetadata",
     ):
-        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, params.is_mla_enable)
+        kv_scale_orig_quant, kv_scale_quant_orig = self._get_kv_scale_params(
+            params.forward, params.kv_cache_quant_mode
+        )
+        attention_output_orig_quant = self._get_attention_output_orig_quant(params.forward)
+        mrope_rotary_cos_sin = self._get_mrope_rotary_cos_sin(params.forward)
         with nvtx_range("trtllm_gen.context.preprocess", color="purple"):
             (
                 q_processed,
@@ -1008,12 +1009,12 @@ class FlashInferTrtllmGenAttention:
                 kv_cache_block_offsets=params.kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-                kv_scale_orig_quant=params.kv_scale_orig_quant,
-                kv_scale_quant_orig=params.kv_scale_quant_orig,
-                attention_output_orig_quant=params.attention_output_orig_quant,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
+                attention_output_orig_quant=attention_output_orig_quant,
                 rotary_inv_freq=params.rotary_inv_freq,
                 rotary_cos_sin=params.rotary_cos_sin,
-                mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
+                mrope_rotary_cos_sin=mrope_rotary_cos_sin,
                 layer_idx=params.layer_idx,
                 num_heads=params.num_heads,
                 num_kv_heads=params.num_kv_heads,
@@ -1041,8 +1042,8 @@ class FlashInferTrtllmGenAttention:
                 paged_context_fmha=params.paged_context_fmha,
                 is_mla_enable=params.is_mla_enable,
                 multi_processor_count=params.multi_processor_count,
-                total_num_blocks=total_num_blocks,
-                kv_factor=kv_factor,
+                total_num_blocks=params.total_num_blocks,
+                kv_factor=params.kv_factor,
                 need_build_kv_cache_metadata=True,
             )
 
@@ -1063,7 +1064,7 @@ class FlashInferTrtllmGenAttention:
                 window_left=window_left,
                 out=params.context_buf,
                 kv_layout=self._layout,
-                sinks=params.attention_sinks,
+                sinks=params.forward.attention_sinks,
                 uses_shared_paged_kv_idx=False,
                 enable_pdl=self._enable_pdl,
             )
@@ -1077,11 +1078,11 @@ class FlashInferTrtllmGenAttention:
                 kv_cache_block_offsets=params.kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-                kv_scale_orig_quant=params.kv_scale_orig_quant,
-                kv_scale_quant_orig=params.kv_scale_quant_orig,
-                attention_output_orig_quant=params.attention_output_orig_quant,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
+                attention_output_orig_quant=attention_output_orig_quant,
                 rotary_cos_sin=params.rotary_cos_sin,
-                mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
+                mrope_rotary_cos_sin=mrope_rotary_cos_sin,
                 layer_idx=params.layer_idx,
                 num_heads=params.num_heads,
                 num_kv_heads=params.num_kv_heads,
@@ -1113,10 +1114,12 @@ class FlashInferTrtllmGenAttention:
     def run_generation(
         self,
         params: EnqueueParams,
-        metadata: "TrtllmAttentionMetadata",
     ):
         batch_beam = params.num_requests * params.beam_width
-        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, params.is_mla_enable)
+        kv_scale_orig_quant, kv_scale_quant_orig = self._get_kv_scale_params(
+            params.forward, params.kv_cache_quant_mode
+        )
+        attention_output_orig_quant = self._get_attention_output_orig_quant(params.forward)
         with nvtx_range("trtllm_gen.generation.preprocess", color="purple"):
             (
                 q_processed,
@@ -1137,9 +1140,9 @@ class FlashInferTrtllmGenAttention:
                 kv_cache_block_offsets=params.kv_cache_block_offsets,
                 host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-                kv_scale_orig_quant=params.kv_scale_orig_quant,
-                kv_scale_quant_orig=params.kv_scale_quant_orig,
-                attention_output_orig_quant=params.attention_output_orig_quant,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
+                attention_output_orig_quant=attention_output_orig_quant,
                 rotary_inv_freq=params.rotary_inv_freq,
                 rotary_cos_sin=params.rotary_cos_sin,
                 layer_idx=params.layer_idx,
@@ -1168,8 +1171,8 @@ class FlashInferTrtllmGenAttention:
                 predicted_tokens_per_seq=params.predicted_tokens_per_seq,
                 attention_chunk_size=params.attention_chunk_size,
                 multi_processor_count=params.multi_processor_count,
-                total_num_blocks=total_num_blocks,
-                kv_factor=kv_factor,
+                total_num_blocks=params.total_num_blocks,
+                kv_factor=params.kv_factor,
                 need_build_kv_cache_metadata=True,
             )
 
@@ -1189,7 +1192,7 @@ class FlashInferTrtllmGenAttention:
                 bmm2_scale=params.bmm2_scale,
                 window_left=window_left,
                 kv_layout=self._layout,
-                sinks=params.attention_sinks,
+                sinks=params.forward.attention_sinks,
                 q_len_per_req=q_len_per_req,
                 max_q_len=decode_max_q_len,
                 cum_seq_lens_q=decode_cu_seqlens,
@@ -1201,7 +1204,6 @@ class FlashInferTrtllmGenAttention:
     def run_mla_generation(
         self,
         params: EnqueueParams,
-        metadata: "TrtllmAttentionMetadata",
     ) -> None:
         """MLA generation decode using flashinfer MLA kernel."""
         if 0 < params.cyclic_attention_window_size < params.max_past_kv_length:
@@ -1212,7 +1214,6 @@ class FlashInferTrtllmGenAttention:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * params.beam_width
-        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, params.is_mla_enable)
         with nvtx_range("trtllm_gen.mla.kv_metadata", color="blue"):
             kv_cache, block_tables = thop.build_trtllm_gen_kv_cache_metadata(
                 host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
@@ -1222,8 +1223,8 @@ class FlashInferTrtllmGenAttention:
                 num_kv_heads=params.num_kv_heads,
                 tokens_per_block=params.tokens_per_block,
                 head_dim=params.head_size,
-                kv_factor=kv_factor,
-                total_num_blocks=total_num_blocks,
+                kv_factor=params.kv_factor,
+                total_num_blocks=params.total_num_blocks,
                 kv_cache_quant_mode=params.kv_cache_quant_mode,
                 batch_start=params.seq_offset,
                 batch_size=batch_beam,
@@ -1268,7 +1269,7 @@ class FlashInferTrtllmGenAttention:
                 ),
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
-                sinks=params.attention_sinks,
+                sinks=params.forward.attention_sinks,
                 uses_shared_paged_kv_idx=False,
                 enable_pdl=self._enable_pdl,
                 backend="trtllm-gen",
