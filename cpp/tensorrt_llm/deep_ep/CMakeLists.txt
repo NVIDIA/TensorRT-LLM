@@ -120,6 +120,15 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_C_COMPILER gcc)
   set(CMAKE_CXX_COMPILER g++)
   set(CMAKE_CUDA_HOST_COMPILER g++)
+  # PyTorch's cmake/public/cuda.cmake (loaded transitively by
+  # find_package(Torch)) appends -Xcompiler=-fclang-abi-compat=17 to
+  # CMAKE_CUDA_FLAGS whenever the parent build is configured with Clang>=18 (see
+  # pytorch PR #175233). Since this subdirectory falls back to GCC for NVSHMEM
+  # compatibility, that Clang-only flag would be forwarded to g++ via `nvcc
+  # -ccbin=g++` and abort the build with: g++: error: unrecognized command-line
+  # option '-fclang-abi-compat=17'
+  string(REGEX REPLACE "-Xcompiler=-fclang-abi-compat=[0-9]+" ""
+                       CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 endif()
 
 # Add nvshmem external project
