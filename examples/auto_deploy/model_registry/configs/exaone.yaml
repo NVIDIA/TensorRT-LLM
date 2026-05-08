@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Configuration for EXAONE 3.5 models
 # The HF checkpoint bundles a configuration_exaone.py that imports RopeParameters
 # from transformers, which is unavailable in some transformers versions. Setting

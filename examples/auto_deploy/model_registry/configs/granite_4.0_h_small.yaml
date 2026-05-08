@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Configuration for granite-4.0-h-small (GraniteMoeHybrid with Mamba+MoE)
 # Uses flashinfer attention backend (trtllm backend produces garbled output with muP scaling)
 # Attention-DP + EP mode: Mamba/Attention layers replicated (not TP-sharded),

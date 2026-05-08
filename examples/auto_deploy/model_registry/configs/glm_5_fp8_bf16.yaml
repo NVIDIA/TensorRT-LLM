@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-5-FP8 uses the fused finegrained FP8 MoE path under torch-cudagraph.
+# Dashboard/registry validation must run with TRTLLM_DG_JIT_USE_NVCC=1; without
+# it, DeepGEMM JIT compilation fails with NVRTC errors in this environment. Keep
+# the GLM-5 tokenizer workaround and load BF16 weights while disabling the
+# unrelated finegrained FP8 linear/SwiGLU fusions.
+tokenizer_kwargs:
+  extra_special_tokens: {}
+transforms:
+  match_finegrained_fp8_swiglu_pattern:
+    enabled: false
+  fuse_finegrained_fp8_linear:
+    enabled: false
+  fuse_finegrained_fp8_swiglu:
+    enabled: false
+model_kwargs:
+  torch_dtype: bfloat16

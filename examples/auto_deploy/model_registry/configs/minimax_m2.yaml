@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # MiniMax-M2 - override model dtype and attention backend for AutoDeploy
 attn_backend: flashinfer
 # Disable fuse_finegrained_fp8_moe: the trtllm fused MoE kernel fails with

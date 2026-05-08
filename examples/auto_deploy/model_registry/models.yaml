@@ -80,8 +80,8 @@ models:
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/gemma-2-9b-it
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/codegemma-7b-it
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -113,23 +113,23 @@ models:
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ibm-granite/granite-3.1-2b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.1-8b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.3-2b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.3-8b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-guardian-3.1-2b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-guardian-3.2-5b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: meta-llama/CodeLlama-7b-Instruct-hf
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -161,8 +161,8 @@ models:
   config_id: gpt_oss_20b
   yaml_extra: ['gpt_oss_20b.yaml']
 - name: ibm-granite/granite-3.0-8b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: mistralai/Ministral-8B-Instruct-2410
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -218,8 +218,8 @@ models:
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: google/gemma-2-27b-it
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: perplexity-ai/r1-1776-distill-llama-70b
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -344,8 +344,8 @@ models:
   config_id: glm_5
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'glm_5.yaml', 'num_hidden_layers_5.yaml']
 - name: zai-org/GLM-5-FP8
-  config_id: glm_5
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'glm_5.yaml', 'num_hidden_layers_5.yaml']
+  config_id: glm_5_fp8_bf16
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'glm_5_fp8_bf16.yaml', 'num_hidden_layers_5.yaml']
 # --- MiniMax-M2.5 / M2.7 (Feb 2026) ---
 - name: MiniMaxAI/MiniMax-M2.5
   config_id: minimax_m2
@@ -399,8 +399,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
 # --- Aya Expanse (2025) - multilingual ---
 - name: CohereForAI/aya-expanse-8b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: CohereForAI/aya-expanse-32b
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -455,11 +455,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- SmolLM3 (Jul 2025) ---
 - name: HuggingFaceTB/SmolLM3-3B
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: HuggingFaceTB/SmolLM3-3B-Base
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Gemma 3n (Jun 2025) - on-device VLM ---
 - name: google/gemma-3n-E2B-it
   config_id: multimodal
@@ -588,7 +588,7 @@ models:
 # --- EXAONE 3.5 (Dec 2024) ---
 - name: LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct
   config_id: exaone
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'exaone.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'exaone.yaml']
 - name: LGAI-EXAONE/EXAONE-3.5-32B-Instruct
   config_id: exaone
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'exaone.yaml']
@@ -731,7 +731,7 @@ models:
 # --- Aya Vision (2025) - multilingual VLM ---
 - name: CohereLabs/aya-vision-8b
   config_id: multimodal
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'aya_vision_8b.yaml']
 - name: CohereLabs/aya-vision-32b
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']

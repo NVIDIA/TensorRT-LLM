@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Configuration for nvidia/Llama-3_3-Nemotron-Super-49B-v1 (DeciLM / Nemotron-NAS)
 #
 # This 49B model with TP=8 leaves ~7GB free per GPU after weight loading + compile.

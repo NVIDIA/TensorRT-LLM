@@ -1,4 +1,0 @@
-# Configuration for Tencent Hunyuan-MT-7B (Dense)
-# Standard dense GQA model with QK norm and Dynamic NTK-Alpha RoPE.
-# Uses a custom AutoDeploy model implementation (HunYuanDenseForCausalLM)
-# registered locally; no additional overrides needed beyond dashboard_default.
