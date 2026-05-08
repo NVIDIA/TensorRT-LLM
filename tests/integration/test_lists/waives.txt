@@ -12,6 +12,8 @@ accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xg
 accuracy/test_llm_api.py::TestMistralNemo12B::test_fp8 SKIP (https://nvbugs/5413197)
 accuracy/test_llm_api_autodeploy.py::TestGemma4MoE::test_bf16 SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma4_e2b_it SKIP (https://nvbugs/6194934)
+accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer] SKIP (https://nvbugs/6117814)
+accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[trtllm] SKIP (https://nvbugs/6117814)
 accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8 SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[google_gemma-3-1b-it-False] SKIP (https://nvbugs/6248764)
 accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Ministral-8B-Instruct-2410-False] SKIP (https://nvbugs/6248769)

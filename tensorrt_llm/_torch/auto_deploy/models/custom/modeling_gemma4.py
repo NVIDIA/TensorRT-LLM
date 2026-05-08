@@ -1559,7 +1559,7 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
 
 class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
     config_class = Gemma4TextConfig
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tied_weights_keys = {"lm_head.weight": "embed_tokens.weight"}
 
     def __init__(self, config: Gemma4TextConfig, **kwargs):
         del kwargs
@@ -2297,6 +2297,12 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         return Gemma4ConditionalOutput(logits=outputs.logits)
 
 
+
+# ---------------------------------------------------------------------------
+# Gemma4 processor helpers
+# ---------------------------------------------------------------------------
+
+
 _PROCESSOR_CONFIG_FILE = "processor_config.json"
 _SUPPORTED_GEMMA4_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 
@@ -2825,17 +2831,40 @@ class Gemma4ADInputProcessor:
         num_soft_tokens = int(image_inputs["num_soft_tokens_per_image"][0].item())
         return num_soft_tokens + 2  # include BOI + EOI
 
+    @staticmethod
+    def _safe_tokenizer_vocab_size(tokenizer: Any) -> Optional[int]:
+        if tokenizer is None:
+            return None
+        try:
+            vocab_size = tokenizer.vocab_size
+        except (AttributeError, NotImplementedError):
+            pass
+        else:
+            if vocab_size is not None:
+                return int(vocab_size)
+        try:
+            return len(tokenizer)
+        except (AttributeError, NotImplementedError, TypeError):
+            return None
+
     def get_vocab_size(self) -> Optional[int]:
+        try:
+            vocab_size = self.base.get_vocab_size()
+        except (AttributeError, NotImplementedError):
+            vocab_size = None
+        if vocab_size is not None:
+            return int(vocab_size)
+
         tokenizer = getattr(self, "tokenizer", None)
-        if tokenizer is not None and hasattr(tokenizer, "vocab_size"):
-            return int(tokenizer.vocab_size)
-        wrapped_tokenizer = getattr(tokenizer, "tokenizer", None)
-        if wrapped_tokenizer is not None and hasattr(wrapped_tokenizer, "vocab_size"):
-            return int(wrapped_tokenizer.vocab_size)
         processor = getattr(self, "processor", None)
-        processor_tokenizer = getattr(processor, "tokenizer", None)
-        if processor_tokenizer is not None and hasattr(processor_tokenizer, "vocab_size"):
-            return int(processor_tokenizer.vocab_size)
+        for candidate in (
+            tokenizer,
+            getattr(tokenizer, "tokenizer", None),
+            getattr(processor, "tokenizer", None),
+        ):
+            vocab_size = self._safe_tokenizer_vocab_size(candidate)
+            if vocab_size is not None:
+                return vocab_size
         return None
 
     def get_mm_token_ids(self) -> torch.Tensor:
