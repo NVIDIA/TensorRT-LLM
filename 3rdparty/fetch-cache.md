@@ -12,10 +12,9 @@ from disk instead of refetched over the network.
 
 Opt-in via `scripts/build_wheel.py --use-3rdparty-cache`. The flag forwards
 `-DTRTLLM_FETCHCONTENT_CACHE=<dir>` to cmake (default
-`<project>/3rdparty/.cache_3rdparty`, git-ignored). Without the flag, not
-a single `-D` is added, the entire cache block in
-`3rdparty/CMakeLists.txt` is bypassed, `GIT_EXECUTABLE` stays at the
-system git, and the build path is byte-for-byte identical to before.
+`<project>/3rdparty/.cache_3rdparty`, git-ignored). Without the flag, no
+`-D` is added, the entire cache block in `3rdparty/CMakeLists.txt` is
+bypassed, and `GIT_EXECUTABLE` stays at the system git.
 
 For read-only shared caches — the typical setup for the autonomous-agent
 builds discussed in the [threat model](#why-this-exists) — pass
@@ -113,10 +112,11 @@ created from a shallow src contains tip commits whose parents are absent
 from the object store. Advertising such a tip as a "have" to a
 non-shallow consumer during `clone --reference` negotiation tricks
 upstream into skipping parent history, leaving the consumer's `git log`
-unable to traverse ancestors. That is the exact bug the split prevents
-(historically observed as `Could not read <SHA>: Failed to traverse
-parents of commit <SHA>` after a clone from a cache first populated from
-a shallow src).
+unable to traverse ancestors and the next pack walk failing with
+`Could not read <SHA>: Failed to traverse parents of commit <SHA>`.
+The split prevents this failure mode by construction: a non-shallow
+consumer can only read from a pool whose bares were populated from
+non-shallow srcs.
 
 Routing is purely local and hardcoded on both sides:
 
@@ -190,11 +190,11 @@ shallow/full split.
 
 `build_wheel.py --use-3rdparty-cache` is invoked both by trusted
 developers on their own workstations and by **autonomous agents**
-(e.g. Claude Code) driving builds on branches whose contents may be
-effectively attacker-controlled. In the agent scenario the
-`_deps/<name>-src` directories that the cache writer reads from are an
-untrusted input: an attacker-crafted third-party dep declaration can
-steer the cache to ingest a repository of the attacker's choosing, with
+driving builds on branches whose contents may be effectively
+attacker-controlled. In the agent scenario the `_deps/<name>-src`
+directories that the cache writer reads from are an untrusted input:
+an attacker-crafted third-party dep declaration can steer the cache
+to ingest a repository of the attacker's choosing, with
 attacker-controlled `.git/config`, refs, and object store. Every design
 choice in this section exists to let such a hostile src pass through the
 update path safely — without giving the attacker code execution on the
@@ -603,25 +603,23 @@ runs only on inbound objects, not on the existing pack.
 
 ### Shared-filesystem optimizations
 
-On a shared cache backed by Lustre/NFS/GPFS, every file operation on
-the bare also pays a metadata round-trip (~10 ms observed on Lustre
-versus ~100 µs on local ext4/tmpfs). The standin placement keeps
-the steady-state update cheap even when the cache lives on slow
-storage:
+On a cache backed by a network filesystem, every file operation on the
+bare pays a metadata round-trip that is roughly two orders of magnitude
+slower than the equivalent operation on a local filesystem. The
+standin placement keeps the steady-state update cheap on such backends:
 
 * **Standin lives in the system temp dir.** The ephemeral
   `.fc-standin-<random>/` holds only metadata (config, `packed-refs`,
   an `alternates` pointer); the tmpfs-friendly access pattern is
   `git init --bare`'s ~20 tiny files plus the `rmtree` at the end.
-  Putting them on tmpfs removes them from the Lustre/NFS metadata path
-  entirely, while the fetched objects still land in the Lustre/NFS
-  bare via the `+refs/.../*:refs/fetch-cache/.../*` refspec as before.
+  Putting them on tmpfs keeps them off the network-FS metadata path,
+  while the fetched objects still land in the bare via the
+  `+refs/.../*:refs/fetch-cache/.../*` refspec.
 
-Measured impact on a warm NVTX (shallow) update against a Lustre-hosted
-cache: standin on cache_parent → ~104 ms per dep; standin on tmpfs
-→ ~62 ms per dep (saving ~20 ms on `git init --bare` and ~11 ms on
-the final `rmtree`). Speedup scales with the number of deps the build
-configures.
+The savings (predominantly on `git init --bare` and the final `rmtree`)
+scale with the number of deps the build configures and with the
+metadata-latency gap between the system temp dir and the cache
+backend.
 
 **Protocol floor.** Even with a complete non-shallow cache, a
 `--no-single-branch --depth 1` clone of `nlohmann/json` still

@@ -225,11 +225,9 @@ _KV_RE = re.compile(r'^(\S+)\s*=\s*(.*)$')
 
 
 # Refnames admitted into the standin's packed-refs.  Three fetched
-# categories only; character class rejects anything that would need
-# escaping on a "<sha> <refname>" line (spaces, newlines, ;, \, @{...},
-# Unicode controls) — that's what lets _safe_fetch_into_cache write
-# packed-refs without quoting.  git-semantic checks (.., .lock, empty
-# components) happen in _is_safe_refname.
+# categories only; quoting/escaping rationale lives in fetch-cache.md
+# (threat model I3).  git-semantic checks (.., .lock, empty components)
+# happen in _is_safe_refname.
 _SAFE_REFNAME_RE = re.compile(
     r"^refs/(?:heads|remotes/origin|tags)"
     r"/[A-Za-z0-9][A-Za-z0-9._/-]*$"
@@ -490,8 +488,8 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
             logger.info("%s/%s.git: init --bare failed, skipping",
                         subdir, name)
             return None
-    # Re-apply on every update: safety keys may have been added since
-    # this bare was first created by an older version of this script.
+    # Re-apply on every update so the bare always carries the current
+    # SAFETY_CONFIG, regardless of which writer first created it.
     _apply_safety_config(bare)
 
     if _safe_fetch_into_cache(bare, src_git) != 0:
@@ -665,19 +663,9 @@ def _safe_fetch_into_cache(bare: str, src_git: str) -> int:
     (threat model, invariant I3).  Inline comments below flag the
     **local** reason each line exists.
     """
-    # Prefer the system temp dir (typically a tmpfs) for the standin: the
-    # init-bare phase writes ~20 small metadata files, then packed-refs,
-    # shallow, alternates, and an rmtree — every one of which is a metadata
-    # round-trip on Lustre/NFS (~ms each) but a memory op on tmpfs.
-    # Security is preserved by ``mkdtemp`` itself: 0700 mode plus an
-    # unpredictable random suffix means no other uid can discover or
-    # pre-create the dir, which is what the I3 argument actually relies
-    # on — not the specific parent directory.
-    #
-    # Fall back to the cache's own parent when the system temp is not
-    # writable (e.g. a Landlock-sandboxed caller whose ruleset grants
-    # writes to the cache dir but not to /tmp). The fallback preserves
-    # the pre-change behavior byte-for-byte.
+    # System temp by default (tmpfs perf on shared-FS caches); fall back
+    # to the cache parent when the system temp is not writable.  Design
+    # treatment in fetch-cache.md "Performance model" and threat model I3.
     try:
         standin = tempfile.mkdtemp(prefix=".fc-standin-")
     except OSError:

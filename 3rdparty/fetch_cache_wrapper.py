@@ -249,9 +249,8 @@ def handle_submodule(global_args: list[str], sub_args: list[str]):
             continue
         sub_url = r2.stdout.strip()
 
-        # Submodules are always non-shallow; cmake FetchContent never
-        # passes --depth to `git submodule update`.  See fetch-cache.md "Cache
-        # layout".
+        # shallow=False; submodules always route to full/.  See
+        # fetch-cache.md "Cache layout".
         ref = lookup_cache(sub_url, shallow=False)
         cmd = [REAL_GIT, "submodule", "update", "--init"]
         if ref:

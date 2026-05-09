@@ -19,8 +19,9 @@ dependency you want to add:
 
 `scripts/build_wheel.py --use-3rdparty-cache` enables a local bare-repo
 cache that accelerates cmake `FetchContent` clones via
-`git clone --reference`. It is opt-in; without the flag the build path is
-byte-for-byte identical to before.
+`git clone --reference`. It is opt-in; without the flag, no `-D` is
+added and the cache code path in `3rdparty/CMakeLists.txt` is bypassed
+entirely.
 
 For flow, cache layout, threat model, and design rationale, see
 [fetch-cache.md](fetch-cache.md).
