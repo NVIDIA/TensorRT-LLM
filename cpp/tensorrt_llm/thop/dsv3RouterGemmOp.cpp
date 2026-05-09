@@ -87,7 +87,7 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     TORCH_CHECK(!bias.has_value(), "bias is not support yet");
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
     bool const shape_ok = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts
-        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32);
+        && mat_b.sizes()[0] == hidden_dim && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32);
 
     if (shape_ok && hidden_dim == kHiddenDim7168)
     {
