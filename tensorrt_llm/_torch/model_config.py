@@ -318,8 +318,7 @@ class ModelConfig(Generic[TConfig]):
                         f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
                         f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
                     )
-            quant_config.kv_cache_quant_algo = json_quant_configs[
-                "kv_cache_quant_algo"]
+            quant_config.kv_cache_quant_algo = kv_cache_quant_algo
             for layer in mixed_quant_configs:
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
@@ -543,6 +542,7 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                        use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
@@ -553,6 +553,7 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False
+                        use_cute_dsl_paged_mqa_logits = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
                         indexer_k_dtype = "fp8"
@@ -565,6 +566,8 @@ class ModelConfig(Generic[TConfig]):
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
                             use_cute_dsl_topk=use_cute_dsl_topk,
+                            use_cute_dsl_paged_mqa_logits=
+                            use_cute_dsl_paged_mqa_logits,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
@@ -705,6 +708,10 @@ class ModelConfig(Generic[TConfig]):
             is_disagg, kv_cache_config, spec_config)
         if (self.spec_config is not None
                 and self.spec_config.spec_dec_mode.is_mtp_one_model()):
+            assert self.spec_config.num_nextn_predict_layers is not None, (
+                "num_nextn_predict_layers must be set from model config before building ModelConfig. "
+                "Ensure update_spec_config_from_model_config() has been called."
+            )
             num_layers += self.spec_config.num_nextn_predict_layers
             num_attention_layers += self.spec_config.num_nextn_predict_layers
 

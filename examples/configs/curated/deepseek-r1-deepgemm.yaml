@@ -12,7 +12,7 @@ kv_cache_config:
 stream_interval: 10
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 1
+  max_draft_len: 1
 moe_config:
   backend: DEEPGEMM
   max_num_tokens: 3200

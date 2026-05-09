@@ -37,6 +37,7 @@ from pydantic import (BaseModel, ConfigDict, Field, field_validator,
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
@@ -742,6 +743,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Additional kwargs to pass to the template renderer. "
                      "Will be accessible by the chat template."),
+    )
+
+    media_io_kwargs: Optional[Dict[MediaModality, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Per-request override for the server's `--media_io_kwargs`. "
+            "Shape: `{modality: {kwarg: value}}` with modality in "
+            "{\"image\", \"video\", \"audio\"}; unknown modality keys are "
+            "rejected. Per modality, request kwargs are shallow-merged "
+            "onto the server defaults (request wins per key). For "
+            "`video`, overriding only one of `fps`/`num_frames` drops "
+            "the other from the server default so the loader's built-in "
+            "is used. "
+            "Example: `{\"video\": {\"num_frames\": 32}}`."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(

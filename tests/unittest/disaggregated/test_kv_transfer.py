@@ -20,6 +20,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     LayerRange,
     SessionStatus,
     TokenRange,
+    WaitResult,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -1055,6 +1056,145 @@ def test_transfer_worker_v2_with_window(
             worker.shutdown()
         for worker in setup["gen_transfer_workers"]:
             worker.shutdown()
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+def test_transfer_with_gen_prefix_offset(use_v2):
+    """Verify that only suffix blocks are transferred when gen has a prefix offset.
+
+    Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
+    gen only provides suffix block IDs with start_token_idx > 0.
+    _align_kv_blocks should align correctly so only the suffix data is written.
+    """
+    tensorrt_llm.logger.set_level("info")
+    tokens_per_block = 8
+    request_len = 32  # 4 blocks
+    prefix_blocks = 2  # gen has 2 blocks already cached
+    prefix_tokens = prefix_blocks * tokens_per_block
+
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=use_v2,
+    )
+
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    ctx_mgr = setup["ctx_kv_cache_managers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    gen_mgr = setup["gen_kv_cache_managers"][0]
+    ctx_info_endpoint = setup["ctx_info_endpoint"]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams()
+    sc = tensorrt_llm.bindings.SamplingConfig(sampling_params._get_sampling_config())
+
+    # Create ctx request (full prompt)
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(request_len)),
+        sampling_config=sc,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    # Create gen request (same prompt)
+    gen_request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=list(range(request_len)),
+        sampling_config=sc,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=0,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=unique_rid,
+    )
+
+    # Allocate KV on both sides
+    ctx_kv_caches, gen_kv_caches = [], []
+    if use_v2:
+        kv = ctx_mgr._create_kv_cache(0, None, None)
+        kv.resume(torch.cuda.current_stream().cuda_stream)
+        kv.resize(request_len)
+        ctx_kv_caches.append(kv)
+
+        kv = gen_mgr._create_kv_cache(1, None, None)
+        kv.resume(torch.cuda.current_stream().cuda_stream)
+        kv.resize(request_len)
+        gen_kv_caches.append(kv)
+    else:
+        ctx_mgr.impl.add_sequence_batch(
+            [(ctx_request.py_request_id, request_len, 1)], [ctx_request]
+        )
+        gen_mgr.impl.add_sequence_batch(
+            [(gen_request.py_request_id, request_len, 1)], [gen_request]
+        )
+
+    # Get block IDs
+    ctx_block_ids = get_block_ids_per_layer_groups(ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block)
+    gen_block_ids = get_block_ids_per_layer_groups(gen_mgr, gen_tw, 1, use_v2, tokens_per_block)
+
+    # Gen: only provide suffix block IDs (skip prefix_blocks)
+    gen_suffix_block_ids = [
+        np.asarray(bids[prefix_blocks:], dtype=np.int64) for bids in gen_block_ids
+    ]
+
+    try:
+        # Ctx sends all blocks
+        tx = ctx_tw.create_tx_session(ctx_request)
+        send_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=ctx_block_ids,
+            token_range=TokenRange(start=0, end=request_len),
+        )
+
+        # Gen receives only suffix blocks with start_token_idx offset
+        rx = gen_tw.create_rx_session(gen_request)
+        recv_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=gen_suffix_block_ids,
+            token_range=TokenRange(start=prefix_tokens, end=request_len),
+        )
+        rx.receive(recv_slice)
+        tx.send(send_slice)
+
+        result = tx.wait_complete()
+        assert result == WaitResult.COMPLETED, f"tx wait_complete returned {result}"
+        result = rx.wait_complete(blocking=True)
+        assert result == WaitResult.COMPLETED, f"rx wait_complete returned {result}"
+
+        # Verify: suffix blocks on gen should match corresponding ctx blocks
+        num_layer_groups = len(ctx_block_ids)
+        for lg_id in range(num_layer_groups):
+            ctx_all_bids = ctx_block_ids[lg_id]
+            ctx_suffix_bids = ctx_all_bids[prefix_blocks:]
+            gen_suffix_bids = gen_suffix_block_ids[lg_id]
+
+            ctx_data = get_block_data(ctx_mgr, ctx_suffix_bids, lg_id, use_v2, 0)
+            gen_data = get_block_data(gen_mgr, gen_suffix_bids, lg_id, use_v2, 1)
+            assert ctx_data.equal(gen_data), (
+                f"Layer group {lg_id}: suffix block data mismatch after prefix-offset transfer"
+            )
+
+        rx.close()
+        tx.close()
+    finally:
+        if use_v2:
+            torch.cuda.current_stream().synchronize()
+            for kv in ctx_kv_caches + gen_kv_caches:
+                kv.close()
+        ctx_tw.shutdown()
+        gen_tw.shutdown()
 
 
 @pytest.mark.timeout(60)

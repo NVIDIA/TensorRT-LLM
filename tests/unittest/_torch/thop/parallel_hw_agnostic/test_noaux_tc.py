@@ -12,6 +12,10 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
         (72, 1, 1, 6),
         (384, 1, 1, 8),
         (512, 1, 1, 22),
+        (1024, 1, 1, 32),
+        (512, 1, 1, 32),
+        (256, 8, 2, 8),
+        (512, 8, 6, 8),  # fallback
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

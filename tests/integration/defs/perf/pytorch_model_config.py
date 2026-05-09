@@ -77,7 +77,7 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {},
                 'speculative_config': {
                     'decoding_type': 'MTP',
-                    'num_nextn_predict_layers': 3
+                    'max_draft_len': 3
                 }
             }
         },
@@ -97,7 +97,7 @@ def get_model_yaml_config(model_label: str,
                 },
                 'speculative_config': {
                     'decoding_type': 'MTP',
-                    'num_nextn_predict_layers': 3
+                    'max_draft_len': 3
                 },
                 'disable_overlap_scheduler': True,
                 'enable_autotuner': True,

@@ -666,6 +666,12 @@ class BaseWorker(GenerationExecutor):
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
+        # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
+        # Already serialized on the producing rank via allgather — just emit.
+        if (isinstance(stats, tuple) and len(stats) == 2
+                and stats[0] == "per_rank_dict"):
+            return json.dumps(stats[1])
+
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
 
