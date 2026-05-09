@@ -191,6 +191,10 @@ def test_deepseek_v4_gate_bias_maps_to_score_correction_bias():
 
 
 def test_deepseek_v4_gate_uses_fp32_reference_linear():
+    if not torch.cuda.is_available():
+        pytest.skip("dsv3_router_gemm_op requires CUDA")
+
+    device = torch.device("cuda")
     gate = DeepseekV4Gate(
         hidden_size=4,
         num_experts=3,
@@ -201,11 +205,12 @@ def test_deepseek_v4_gate_uses_fp32_reference_linear():
         is_hashed=False,
         dtype=torch.bfloat16,
         moe_backend="TRTLLM",
-    )
-    hidden_states = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.bfloat16)
+    ).to(device)
+    hidden_states = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.bfloat16, device=device)
     weight = torch.tensor(
         [[1.0, 2.0, 3.0, 4.0], [-1.0, 1.0, -1.0, 1.0], [0.5, -0.5, 0.25, -0.25]],
         dtype=torch.bfloat16,
+        device=device,
     )
     gate.weight.copy_(weight)
 
