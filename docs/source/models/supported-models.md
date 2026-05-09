@@ -14,8 +14,7 @@ The following is a table of supported models for the PyTorch backend:
 | `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma3nForConditionalGeneration` [^8]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
-| `Gemma4ForConditionalGeneration` [^10]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
-| `Gemma4ForConditionalGeneration` [^7]| Gemma 4 (AutoDeploy, text-only)    | `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
+| `Gemma4ForConditionalGeneration` [^10]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^7], `google/gemma-4-31B-it` [^7] |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^6]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
