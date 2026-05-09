@@ -31,7 +31,9 @@ from xdsl.ir import Operation, SSAValue
 from .dialect import (
     AdAdd,
     AdCast,
+    AdEq,
     AdExp,
+    AdFloorDiv,
     AdGatedRMSNorm,
     AdGelu,
     AdGraphInput,
@@ -175,6 +177,10 @@ class MLIRToFXConverter:
             self._convert_cast(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdPow):
             self._convert_pow(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdFloorDiv):
+            self._convert_floordiv(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdEq):
+            self._convert_eq(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdRMSNorm):
             self._convert_rmsnorm(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdGatedRMSNorm):
@@ -273,6 +279,22 @@ class MLIRToFXConverter:
         exp_attr = op.exponent
         exp_val = exp_attr.value.data if isinstance(exp_attr, FA) else float(str(exp_attr))
         node = graph.call_function(torch.ops.aten.pow.Tensor_Scalar, args=(base_node, exp_val))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_floordiv(self, op: AdFloorDiv, graph: Graph, metadata: dict) -> None:
+        """Reconstruct ``operator.floordiv`` from ``ad.floordiv``."""
+        input_node = self._resolve(op.input)
+        divisor = op.divisor.value.data
+        node = graph.call_function(operator.floordiv, args=(input_node, divisor))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_eq(self, op: AdEq, graph: Graph, metadata: dict) -> None:
+        """Reconstruct ``operator.eq`` from ``ad.eq``."""
+        input_node = self._resolve(op.input)
+        value = op.value.value.data
+        node = graph.call_function(operator.eq, args=(input_node, value))
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)
 
@@ -380,7 +402,13 @@ class MLIRToFXConverter:
             # Reconstruct args from template, substituting MLIR operand indices
             new_args = self._instantiate_template(args_template, mlir_operands)
             new_kwargs = self._instantiate_template(kwargs_template, mlir_operands)
-            node = graph.call_function(original_target, args=new_args, kwargs=new_kwargs)
+            fx_op = meta.get("_fx_op", "call_function")
+            if fx_op == "call_method":
+                node = graph.call_method(original_target, args=new_args, kwargs=new_kwargs)
+            elif fx_op == "call_module":
+                node = graph.call_module(original_target, args=new_args, kwargs=new_kwargs)
+            else:
+                node = graph.call_function(original_target, args=new_args, kwargs=new_kwargs)
         else:
             # Fallback: use MLIR operands as flat args
             op_name = op.op_name.data
@@ -428,19 +456,28 @@ class MLIRToFXConverter:
         if name:
             self._node_name_map[name] = fx_node
 
-    @staticmethod
-    def _instantiate_template(template, mlir_operands: list):
+    def _instantiate_template(self, template, mlir_operands: list):
         """Rebuild args/kwargs from a template, substituting MLIR operand markers.
 
         The template contains ``("__mlir_operand__", idx)`` markers at positions
         where FX Node args were. These are replaced with the corresponding
         new FX nodes from ``mlir_operands``.
+        Also resolves ``("__fx_node_ref__", name)`` markers for nodes that
+        were not converted to MLIR (e.g. call_method nodes).
         """
+        node_name_map = self._node_name_map
 
         def _rebuild(item):
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__mlir_operand__":
                 idx = item[1]
                 return mlir_operands[idx]
+            elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__fx_node_ref__":
+                name = item[1]
+                if name in node_name_map:
+                    return node_name_map[name]
+                raise ValueError(
+                    f"Cannot resolve __fx_node_ref__ '{name}': node not found in new graph"
+                )
             elif isinstance(item, tuple):
                 return tuple(_rebuild(a) for a in item)
             elif isinstance(item, list):

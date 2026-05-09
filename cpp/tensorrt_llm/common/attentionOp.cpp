@@ -854,8 +854,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     // Each token holds (batch_idx, token_idx_in_seq) int2.
     size_t const tokens_info_size = sizeof(int2) * max_num_tokens;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
-    size_t const fmha_bmm1_scale_size = mFP8ContextFMHA ? sizeof(float) * 2 : 0;
-    size_t const fmha_bmm2_scale_size = mFP8ContextFMHA ? sizeof(float) : 0;
+    size_t const fmha_bmm1_scale_size = (mFP8ContextFMHA || mFP8ContextMLA) ? sizeof(float) * 2 : 0;
+    size_t const fmha_bmm2_scale_size = (mFP8ContextFMHA || mFP8ContextMLA) ? sizeof(float) : 0;
 
     // cp workspace size upper bound
     size_t const cpMaxPaddedSequenceLength = max_num_tokens + batch_size * (mCpSize - 1);

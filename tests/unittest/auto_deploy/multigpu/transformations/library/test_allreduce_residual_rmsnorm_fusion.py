@@ -66,7 +66,7 @@ class AllreduceResidualNorm2(torch.nn.Module):
         return normed, y
 
 
-def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
+def _test_allreduce_fusion(port: int, ModuleCls, strategy: str, rmsnorm_op: str):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
@@ -88,22 +88,30 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
         # Run the original
         original_outputs, residual_original = gm(x, residual)
 
-        # Fuse ops with the specified strategy
-        gm_transformed = InferenceOptimizer(
-            None,
-            {
-                "match_rmsnorm_pattern": {
-                    "stage": "pattern_matcher",
-                },
-                "detect_sharding": {
-                    "stage": "post_export",
-                    "allreduce_strategy": strategy,
-                },
-                "fuse_allreduce_residual_rmsnorm": {
-                    "stage": "post_load_fusion",
-                },
+        # Build optimizer config. When testing the triton rmsnorm variant, run
+        # `fuse_rmsnorm` (with rmsnorm_backend="triton") before
+        # `fuse_allreduce_residual_rmsnorm` so the graph contains triton_rms_norm
+        # ops at the time the allreduce-residual-rmsnorm fusion runs.
+        optimizer_config = {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
             },
-        )(None, gm)
+            "detect_sharding": {
+                "stage": "post_export",
+                "allreduce_strategy": strategy,
+            },
+        }
+        if rmsnorm_op == "triton_rms_norm":
+            optimizer_config["fuse_rmsnorm"] = {
+                "stage": "post_load_fusion",
+                "rmsnorm_backend": "triton",
+            }
+        optimizer_config["fuse_allreduce_residual_rmsnorm"] = {
+            "stage": "post_load_fusion",
+        }
+
+        # Fuse ops with the specified strategy
+        gm_transformed = InferenceOptimizer(None, optimizer_config)(None, gm)
 
         # Run the fused graph
         fused_outputs, residual_fused = gm_transformed(x, residual)
@@ -150,7 +158,12 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
     ["AUTO", "NCCL", "ONESHOT"],
     ids=["strategy_auto", "strategy_nccl", "strategy_oneshot"],
 )
-def test_allreduce_fusion(device_count, ModuleCls, strategy):
+@pytest.mark.parametrize(
+    "rmsnorm_op",
+    ["torch_rmsnorm", "triton_rms_norm"],
+    ids=["rmsnorm_torch", "rmsnorm_triton"],
+)
+def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
     # Test the allreduce, residual, and rmsnorm fusion.
     # MpiPoolSession is required because the test exercises trtllm's MPI-mode allreduce ops,
     # which only activate when is_ompi() is true.
@@ -173,6 +186,7 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy):
                 port=port,
                 ModuleCls=ModuleCls,
                 strategy=strategy,
+                rmsnorm_op=rmsnorm_op,
             )
             return
         except DistNetworkError as e:

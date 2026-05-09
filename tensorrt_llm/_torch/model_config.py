@@ -318,8 +318,7 @@ class ModelConfig(Generic[TConfig]):
                         f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
                         f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
                     )
-            quant_config.kv_cache_quant_algo = json_quant_configs[
-                "kv_cache_quant_algo"]
+            quant_config.kv_cache_quant_algo = kv_cache_quant_algo
             for layer in mixed_quant_configs:
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
@@ -705,6 +704,10 @@ class ModelConfig(Generic[TConfig]):
             is_disagg, kv_cache_config, spec_config)
         if (self.spec_config is not None
                 and self.spec_config.spec_dec_mode.is_mtp_one_model()):
+            assert self.spec_config.num_nextn_predict_layers is not None, (
+                "num_nextn_predict_layers must be set from model config before building ModelConfig. "
+                "Ensure update_spec_config_from_model_config() has been called."
+            )
             num_layers += self.spec_config.num_nextn_predict_layers
             num_attention_layers += self.spec_config.num_nextn_predict_layers
 

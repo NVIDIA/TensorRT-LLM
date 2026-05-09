@@ -17,7 +17,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -50,7 +50,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -88,7 +88,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -121,7 +121,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -154,7 +154,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -191,7 +191,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -224,7 +224,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -257,7 +257,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -290,7 +290,7 @@ server_configs:
     backend: CUTLASS
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true

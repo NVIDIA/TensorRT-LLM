@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .audio_asr import AudioASREvaluator
 from .cnn_dailymail import CnnDailymail
 from .covost2 import CoVoST2
 from .json_mode_eval import JsonModeEval
@@ -22,7 +23,19 @@ from .longbench_v2 import LongBenchV2
 from .mmlu import MMLU
 
 __all__ = [
-    "CnnDailymail", "MMLU", "GSM8K", "GPQADiamond", "GPQAMain", "GPQAExtended",
-    "JsonModeEval", "MMMU", "MMMUPro", "CoVoST2", "LongBenchV1", "LongBenchV2",
-    "AIME2025", "AIME2026"
+    "CnnDailymail",
+    "MMLU",
+    "GSM8K",
+    "GPQADiamond",
+    "GPQAMain",
+    "GPQAExtended",
+    "JsonModeEval",
+    "MMMU",
+    "MMMUPro",
+    "CoVoST2",
+    "LongBenchV1",
+    "LongBenchV2",
+    "AIME2025",
+    "AIME2026",
+    "AudioASREvaluator",
 ]

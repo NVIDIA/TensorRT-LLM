@@ -23,13 +23,16 @@ torch.manual_seed(0)
 
 
 def _count_split_output_nodes(gm):
-    """Count getitem nodes that extract slices from a split_output/split_with_sizes."""
+    """Count torch.narrow nodes produced by fuse_gemms_mixed_children.
+
+    These narrow calls split the fused GEMM output back into per-projection
+    slices. (The legacy split_output closure path was replaced by
+    ``torch.narrow + .contiguous`` in the GEMM fusion code.)
+    """
     count = 0
     for n in gm.graph.nodes:
-        if n.op == "call_function" and n.target is operator.getitem:
-            source = n.args[0]
-            if isinstance(source, torch.fx.Node) and source.op == "call_function":
-                count += 1
+        if n.op == "call_function" and n.target is torch.narrow:
+            count += 1
     return count
 
 

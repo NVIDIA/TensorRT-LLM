@@ -103,7 +103,8 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
   - unittest/_torch/visual_gen/test_visual_gen_params.py
-  - unittest/_torch/visual_gen/test_media_storage.py
+  - unittest/visual_gen/test_output.py
+  - unittest/media/test_encoding.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py

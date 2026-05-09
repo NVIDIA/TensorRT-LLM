@@ -129,7 +129,7 @@ async def _do_post(
             if response.status == 200:
                 await response.read()
                 output.success = True
-                output.e2e_latency = time.perf_counter() - st
+                output.latency = time.perf_counter() - st
             else:
                 body = await response.text()
                 output.error = f"HTTP {response.status}: {body}"

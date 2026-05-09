@@ -770,14 +770,14 @@ grpc = ["grpcio (>=1.33.2,<2.0.0)", "grpcio (>=1.49.1,<2.0.0) ; python_version >
 
 [[package]]
 name = "google-auth"
-version = "2.51.0"
+version = "2.52.0"
 description = "Google Authentication Library"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "google_auth-2.51.0-py3-none-any.whl", hash = "sha256:230bd016f50d4c0b82fda2f50db5d372bc02cfd9bdab4ce5a9ce0d8c0f06bba5"},
-    {file = "google_auth-2.51.0.tar.gz", hash = "sha256:a8191008d6aaace30f0823daa3f0073c734f8b4da8b8de074b5151aa9aa732c5"},
+    {file = "google_auth-2.52.0-py3-none-any.whl", hash = "sha256:aee92803ba0ff93a70a3b8a35c7b4797837751cd6380b63ff38372b98f3ed627"},
+    {file = "google_auth-2.52.0.tar.gz", hash = "sha256:01f30e1a9e3638698d89464f5e603ce29d18e1c0e63ec31ac570aba4e164aaf5"},
 ]
 
 [package.dependencies]
