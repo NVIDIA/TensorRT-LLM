@@ -251,6 +251,15 @@ transforms:
   # post_load_fusion (after weight_load) so buffers are real tensors.
   # DCE after fuse_rope removes dead rope nodes; optimize_rope then
   # handles remaining torch_rope_* for non-trtllm backends.
+  #
+  # Verified working on gpt-oss-120b YaRN rope (2026-05-08): the attention
+  # scaling factor is pre-baked into the model's cos/sin buffers, so the
+  # extracted tensors are already correctly scaled.  Stacks with the
+  # AD_W4A8_FUSED_ROUTING=1 env flag for the gpt-oss-120b W4A8 BS=1 win
+  # (cc_reports/gpt-oss-120b/report.md sec. 5.16: ITL p50 7.56 -> 6.12 ms,
+  # +22 % TPS, correctness preserved).  Kept disabled by default because
+  # the transform is no-op on backends without trtllm attention; turn on
+  # in user yaml when targeting trtllm attn.
   fuse_rope_into_trtllm_attention:
     stage: post_load_fusion
     enabled: false

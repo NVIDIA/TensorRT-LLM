@@ -22,7 +22,28 @@ kv_cache_config:
 transforms:
   quantize_mxfp4_moe_trtllm_gen:
     enabled: true
+    # quant_act: mxfp8   # opt-in: switches MoE FC1+FC2 to MXFP8-input W4A8
+                          # cubin family. Stack with ONESHOT allreduce_strategy
+                          # for the gpt-oss-120b BS=1 win documented in
+                          # cc_reports/gpt-oss-120b/report.md section 5.12.
   fuse_gemms_mixed_children:
     enabled: true
   fuse_gemms:
     enabled: true
+  # Optional perf knob — uncomment to fuse RoPE table lookups into the
+  # trtllm_attention kernel (sets RotaryPositionEmbeddingType=GPT_NEOX inside
+  # applyBiasRopeUpdateKVCacheV2 and DCEs the external flashinfer_rope call).
+  # Verified working with gpt-oss-120b YaRN rope (the attention_scaling factor
+  # is pre-baked into the cos/sin buffers, so the extracted tensors are
+  # already correctly scaled). Stacks with the AD_W4A8_FUSED_ROUTING=1 env
+  # flag for the W4A8 BS=1 ITL win (see cc_reports/gpt-oss-120b/report.md
+  # section 5.16: 7.56 -> 6.12 ms p50, +22% TPS, OSL=1000 mismatch=0).
+  # fuse_rope_into_trtllm_attention:
+  #   enabled: true
+#
+# Optional env-flag knob (not a yaml entry — set in the launch environment):
+#   AD_W4A8_FUSED_ROUTING=1
+# Skips the Python-side topk/softmax in trtllm_mxfp4_w4a8_moe_fused and
+# lets mxe4m3_mxe2m1_block_scale_moe_runner do fused topk+softmax internally.
+# Pair with the fuse_rope_into_trtllm_attention transform above for the
+# stacked W4A8 BS=1 win.
