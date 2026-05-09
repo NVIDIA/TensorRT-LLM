@@ -474,7 +474,6 @@ class PyExecutor:
             self.max_num_active_requests = derived_cap
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
         # from _send_kv_async the owning DP rank has a response but the other
@@ -482,11 +481,9 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
-
-        # ADP dummy role for _pad_attention_dp_dummy_request; locked to
-        # this worker's disagg role on first observation. Default is_gen=True.
+        # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
+        # updated from observed request types.
         self._adp_dummy_is_gen: bool = True
-        self._adp_dummy_role_locked: bool = False
         # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
         # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
@@ -577,7 +574,7 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
 
         def on_detected():
-            self._handle_errors(
+            logger.error(
                 f"Hang detected on rank {self.global_rank} in PyExecutor.")
             self.shutdown_event.set()
             self.is_shutdown = True
@@ -2018,6 +2015,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                self._handle_disagg_cache_errors_synced()
+
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
@@ -2876,6 +2875,28 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    def _handle_disagg_cache_errors_synced(self):
+        """ADP-safe disagg cache error handler.
+
+        Called from the top of every executor iteration so all TP ranks
+        enter ``_handle_errors`` together; otherwise the downstream
+        ``tp_gather`` in ``_enqueue_responses`` deadlocks.
+        """
+        if not (self.kv_cache_transceiver and self.enable_attention_dp
+                and self.dist.world_size != 1):
+            return
+        local_error_requests = self._get_disagg_reqs_in_error_state()
+        any_has_errors = any(self.dist.tp_allgather(bool(local_error_requests)))
+        if not any_has_errors:
+            return
+        logger.warning(f"Disagg KV cache transfer error: rank={self.dist.rank} "
+                       f"local_err_count={len(local_error_requests)}")
+        self._handle_errors(
+            "Disagg KV cache transfer error",
+            requests=local_error_requests,
+            charge_budget=False,
+        )
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -2894,6 +2915,7 @@ class PyExecutor:
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
 
+                self._handle_disagg_cache_errors_synced()
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
@@ -3283,6 +3305,7 @@ class PyExecutor:
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
 
+                self._handle_disagg_cache_errors_synced()
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
@@ -3832,6 +3855,11 @@ class PyExecutor:
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
+            all_new_flat = [
+                req for reqs in all_ranks_new_requests.values() for req in reqs
+            ]
+            self._update_adp_dummy_role(all_new_flat)
+
             # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
@@ -3904,20 +3932,6 @@ class PyExecutor:
             request for request in new_requests_cur_rank
             if not _respond_if_invalid(request)
         ]
-
-        # Lock the ADP dummy role to match this worker's disagg role.
-        if (self.enable_attention_dp and self.kv_cache_transceiver is not None
-                and not self._adp_dummy_role_locked):
-            for request in validated_requests:
-                rt = getattr(request, "llm_request_type", None)
-                if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
-                    self._adp_dummy_is_gen = False
-                    self._adp_dummy_role_locked = True
-                    break
-                if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
-                    self._adp_dummy_is_gen = True
-                    self._adp_dummy_role_locked = True
-                    break
 
         self.active_requests.extend(validated_requests)
         return validated_requests
@@ -4169,26 +4183,27 @@ class PyExecutor:
             gen_first_ctx_requests)
 
     def _count_schedulable_active_requests(self) -> int:
-        """Count active requests that are ready for scheduling.
+        """Count active requests eligible for scheduling.
 
-        In non-disaggregated mode, all active requests are schedulable.
-        In disaggregated mode, requests still waiting for KV cache
-        transfer (in INIT or transmission-in-progress state) are
-        excluded because they cannot participate in the forward pass
-        until transfer completes.
-
-        Returns:
-            The number of active requests eligible for scheduling.
+        Excludes GENERATION_TO_COMPLETE (V2 scheduler skips state
+        >= GENERATION_TO_COMPLETE) and, in disaggregated mode, requests
+        still awaiting KV cache transfer.
         """
+
+        def _is_to_complete(req) -> bool:
+            return req.state == LlmRequestState.GENERATION_TO_COMPLETE
+
         if self.kv_cache_transceiver is None:
-            return len(self.active_requests)
+            return sum(1 for req in self.active_requests
+                       if not _is_to_complete(req))
 
         def _is_awaiting_kv_transfer(req) -> bool:
             return (req.is_disagg_generation_init_state
                     or req.is_disagg_generation_transmission_in_progress)
 
-        return sum(1 for req in self.active_requests
-                   if not _is_awaiting_kv_transfer(req))
+        return sum(
+            1 for req in self.active_requests
+            if not _is_awaiting_kv_transfer(req) and not _is_to_complete(req))
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -4220,6 +4235,18 @@ class PyExecutor:
                     f"num_fetch_requests={self.num_fetch_requests}, "
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
+
+    def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+        if not self.enable_attention_dp or self.kv_cache_transceiver is None:
+            return
+        for req in candidates:
+            rt = getattr(req, "llm_request_type", None)
+            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+                self._adp_dummy_is_gen = False
+                return
+            if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                self._adp_dummy_is_gen = True
+                return
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
@@ -4439,7 +4466,13 @@ class PyExecutor:
         ]
 
     def _check_cache_transfer_errors(self, error_msg_prefix: str):
-        """Common helper to check for and handle cache transfer errors."""
+        """Check and handle cache transfer errors.
+
+        Under ADP this is a no-op: errors are handled by
+        ``_handle_disagg_cache_errors_synced`` at the loop top.
+        """
+        if self.enable_attention_dp and self.dist.world_size != 1:
+            return
         error_requests = self._get_disagg_reqs_in_error_state()
         if error_requests:
             self._handle_errors(
@@ -4989,6 +5022,7 @@ class PyExecutor:
         # included in the return value for stats but not re-terminated here.
         requests_finished_by_transfer = []
         new_active_requests = []
+        timed_out_requests = []
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
@@ -5006,10 +5040,7 @@ class PyExecutor:
             if request.py_kv_transfer_timed_out:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
-                    self._handle_errors(
-                        error_msg=f"Request {request.py_request_id} timed out",
-                        requests=[request],
-                        charge_budget=False)
+                    timed_out_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
@@ -5114,6 +5145,17 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
+        if self.enable_attention_dp and self.dist.world_size != 1:
+            any_timed_out = any(self.dist.tp_allgather(
+                bool(timed_out_requests)))
+            if any_timed_out:
+                self._handle_errors(error_msg="Request timed out (KV transfer)",
+                                    requests=timed_out_requests)
+        else:
+            for req in timed_out_requests:
+                self._handle_errors(
+                    error_msg=f"Request {req.py_request_id} timed out",
+                    requests=[req])
         return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,
