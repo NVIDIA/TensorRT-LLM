@@ -307,6 +307,22 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             return super().get_mm_token_ids()
         return torch.tensor(ids, dtype=torch.int32)
 
+    def get_num_tokens_per_audio(self, *, audio, **kwargs) -> int:
+        # Gemma4 audio token count is dynamic: HF Gemma4Processor inserts
+        # placeholders via _compute_audio_num_tokens(waveform, sampling_rate),
+        # which mirrors the audio encoder's mel-frame + 2x SSCP-conv stride
+        # math and caps at audio_seq_length (=750, the 30s window). HF's
+        # `_get_num_multimodal_tokens` evaluates the formula at
+        # `feature_extractor.sampling_rate` (16 kHz), so the predicted count
+        # must use the post-resample length. Run the same
+        # `_normalize_audio_inputs` step that the prompt-side `_preprocess`
+        # path applies (mono downmix + scipy.signal.resample_poly to 16 kHz)
+        # so the predictor and the actual placeholder count agree exactly.
+        target_sr = self.processor.feature_extractor.sampling_rate
+        normalized = _normalize_audio_inputs([audio], target_sr=target_sr)
+        n_samples = len(normalized[0])
+        return self.get_num_multimodal_tokens(audio_lengths=[n_samples])["num_audio_tokens"][0]
+
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
