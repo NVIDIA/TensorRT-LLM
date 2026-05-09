@@ -130,6 +130,8 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     for tree attention setup and verification routing.
     """
 
+    hidden_states: Optional[torch.Tensor] = None
+
     def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
         self.max_num_requests = max_num_requests
         self.spec_tree_manager = SpecTreeManager(
@@ -369,8 +371,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        if self.spec_resource_manager is not None and hasattr(
-                self.spec_resource_manager, 'hidden_states'):
+        if (self.spec_resource_manager is not None
+                and self.spec_resource_manager.hidden_states is not None):
             self.hidden_states = self.spec_resource_manager.hidden_states
             expected_cols = self.hidden_size * len(self.layers_to_capture)
             assert self.hidden_states.shape[1] == expected_cols, (
