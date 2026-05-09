@@ -1168,7 +1168,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
 
                 def exemptionComment = ""
-                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
+                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax") || cluster.host.contains("oci-iad")) {
                     exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
                 }
 
@@ -3799,7 +3799,8 @@ def launchTestJobs(pipeline, testFilter)
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
-        "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
+        // A100 tests moved to SLURM on draco-oci-iad cluster
+        // "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
@@ -3832,9 +3833,10 @@ def launchTestJobs(pipeline, testFilter)
         // "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
         // "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
         // "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
-        "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
-        "A100X-FMHA-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
+        // A100 tests moved to SLURM on draco-oci-iad cluster
+        // "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
+        // "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
+        // "A100X-FMHA-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         // "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
         // "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
         // "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
@@ -3883,6 +3885,11 @@ def launchTestJobs(pipeline, testFilter)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
+        // DGX A100 tests on draco-oci-iad cluster
+        "DGX_A100-PyTorch-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
+        "DGX_A100-Triton-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 2],
+        "DGX_A100-Triton-Post-Merge-2": ["auto:dgx-a100-x1", "l0_a100", 2, 2],
+        "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 4],
         "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 4],
         "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 4],
