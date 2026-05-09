@@ -1048,10 +1048,13 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
             smem->out_count = 0;
         __syncthreads();
 
-        // Opt-M fix: separate gt and eq into two sequential passes so that
-        // strictly-greater values are never dropped in favor of tie-values.
-        // The v0 interleaved version had a correctness bug when ties at the
-        // K-th value cross kK; this fix makes the selection rank-stable.
+        // Two-pass selection: pass 1 emits strictly-greater-than-threshold
+        // candidates, pass 2 fills remaining slots with tie-values. An
+        // interleaved single-pass implementation would be unstable across
+        // rows with many ties at the K-th rank — equal-valued candidates
+        // could displace strictly-greater ones depending on their relative
+        // order in the candidate buffer. Splitting the passes makes the
+        // selection deterministic regardless of buffer ordering.
 
         // Pass 1: strictly greater than sel_thr
         for (int base = warp_id * WARP_SIZE; base < cand_count; base += BLOCK_SIZE)
