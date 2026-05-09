@@ -166,9 +166,13 @@ class Compressor(nn.Module):
         paged_score_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, score_type)
 
         # Get block tables
-        block_table = metadata.block_tables[(self.compress_ratio, compress_type)]
-        block_table_kv_state = metadata.block_tables[(self.compress_ratio, kv_type)]
-        block_table_score_state = metadata.block_tables[(self.compress_ratio, score_type)]
+        local_layer_idx = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+        if self.is_indexer:
+            block_table = metadata.indexer_k_cache_block_offsets
+        else:
+            block_table = metadata.compress_block_tables[self.compress_ratio]
+        block_table_kv_state = metadata.sliding_block_tables[local_layer_idx, kv_type.value]
+        block_table_score_state = metadata.sliding_block_tables[local_layer_idx, score_type.value]
 
         # Get tokens_per_block from cache manager
         # state_tokens_per_block: for compressor kv/score state caches (used in compress kernels)

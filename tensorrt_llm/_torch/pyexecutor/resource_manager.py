@@ -622,11 +622,12 @@ class KVCacheManager(BaseResourceManager):
 
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
+        self.num_attention_op_pools = self.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.host_kv_cache_block_offsets = torch.empty(
-            self.num_pools,
+            self.num_attention_op_pools,
             max_batch_size * max_beam_width,
             2,
             self.max_blocks_per_seq,
@@ -2008,6 +2009,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._get_event_layer_group_ids())
 
         self.num_pools = len(self.impl.layer_grouping)
+        # num_pools is the physical pool count owned by the KV cache manager.
+        # The TRT-LLM attention op indexes kv_cache_block_offsets and
+        # host_kv_cache_pool_mapping by attention-op pool ids. Most models use
+        # the physical pool ids directly; model-specific managers can override
+        # this when their kernels need a different page-table layout.
+        self.num_attention_op_pools = self.num_pools
 
         num_layers = len(config.layers)
         self.layer_to_pool_mapping_dict: dict[int, int] = {

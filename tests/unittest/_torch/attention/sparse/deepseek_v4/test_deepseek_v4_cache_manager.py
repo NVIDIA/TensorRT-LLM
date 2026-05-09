@@ -6,6 +6,7 @@ from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+    DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -15,6 +16,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
@@ -392,6 +394,64 @@ class TestDeepseekV4CacheManager:
             values = values[-window_size:]
         return values
 
+    def _get_page_indices(
+        self,
+        req: LlmRequest,
+        cache_manager: DeepseekV4CacheManager,
+        layer_idx: int,
+        attn_type: DeepseekV4AttentionType,
+        num_contexts: int = 1,
+    ) -> torch.Tensor:
+        if attn_type == DeepseekV4AttentionType.COMPRESS:
+            compress_block_tables = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            cache_manager.copy_batch_compress_block_tables(
+                compress_block_tables,
+                [req.py_request_id],
+                compress_ratio=cache_manager._compress_ratios[layer_idx],
+                num_contexts=num_contexts,
+                num_seqs=1,
+            )
+            return compress_block_tables[0]
+
+        if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+            host_block_table = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            cache_manager.copy_batch_indexer_compress_block_tables(
+                host_block_table,
+                [req.py_request_id],
+                num_seqs=1,
+            )
+            return host_block_table[0]
+
+        sliding_block_tables = torch.empty(
+            cache_manager.num_local_layers,
+            len(DEEPSEEK_V4_SLIDING_ATTENTION),
+            1,
+            cache_manager.max_blocks_per_seq,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        cache_manager.copy_batch_sliding_block_tables(
+            sliding_block_tables,
+            [req.py_request_id],
+            num_contexts=num_contexts,
+            num_seqs=1,
+        )
+        return sliding_block_tables[
+            cache_manager.layer_offsets[layer_idx],
+            attn_type.value,
+            0,
+        ]
+
     def _write_request_prefill(
         self,
         req: LlmRequest,
@@ -409,14 +469,12 @@ class TestDeepseekV4CacheManager:
         """
         compress_ratios = cache_manager._compress_ratios
         for (layer_idx, attn_type), (values, scales) in cache_values.items():
-            page_indices = cache_manager.get_batch_attn_offset(
-                [req.py_request_id],
-                beam_width=1,
-                num_contexts=1,
-                num_seqs=1,
-                attn_type=attn_type,
-                compress_ratio=compress_ratios[layer_idx],
-            ).squeeze(0)
+            page_indices = self._get_page_indices(
+                req,
+                cache_manager,
+                layer_idx,
+                attn_type,
+            )
 
             if attn_type in [
                 DeepseekV4AttentionType.COMPRESS,
@@ -464,14 +522,12 @@ class TestDeepseekV4CacheManager:
         """
         compress_ratios = cache_manager._compress_ratios
         for (layer_idx, attn_type), (values, scales) in cache_values.items():
-            block_indices = cache_manager.get_batch_attn_offset(
-                [req.py_request_id],
-                beam_width=1,
-                num_contexts=1,
-                num_seqs=1,
-                attn_type=attn_type,
-                compress_ratio=compress_ratios[layer_idx],
-            ).squeeze(0)
+            block_indices = self._get_page_indices(
+                req,
+                cache_manager,
+                layer_idx,
+                attn_type,
+            )
 
             compressed_token_idx = token_idx
             if attn_type in [
@@ -546,14 +602,12 @@ class TestDeepseekV4CacheManager:
 
             # read cache values for each attention type
             for attn_type in attn_types:
-                page_indices = cache_manager.get_batch_attn_offset(
-                    [req.py_request_id],
-                    beam_width=1,
-                    num_contexts=1,
-                    num_seqs=1,
-                    attn_type=attn_type,
-                    compress_ratio=ratio,
-                ).squeeze(0)
+                page_indices = self._get_page_indices(
+                    req,
+                    cache_manager,
+                    layer,
+                    attn_type,
+                )
                 if attn_type in [
                     DeepseekV4AttentionType.COMPRESS,
                     DeepseekV4AttentionType.INDEXER_COMPRESS,
@@ -804,11 +858,10 @@ class TestDeepseekV4CacheManager:
     @pytest.mark.parametrize(
         "dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT), (DataType.FP8, DataType.FLOAT)]
     )
-    def test_kv_cache_pool_mapping(
+    def test_pool_mapping_tensors(
         self, compress_ratios: List[int], dtype: DataType, compressor_dtype: DataType
     ):
         # Create cache manager and sparse attention config
-        num_layers = len(compress_ratios)
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=4,
@@ -818,18 +871,150 @@ class TestDeepseekV4CacheManager:
             compressor_dtype=compressor_dtype,
         )
 
-        kv_cache_pool_mapping = cache_manager.kv_cache_pool_mapping
-        assert kv_cache_pool_mapping.shape == (num_layers, 2)
+        try:
+            expected_mapping = torch.stack(
+                [
+                    torch.arange(cache_manager.num_local_layers, dtype=torch.int32),
+                    torch.zeros(cache_manager.num_local_layers, dtype=torch.int32),
+                ],
+                dim=1,
+            )
+            expected_pointers = torch.tensor(
+                [
+                    [
+                        cache_manager.impl.get_mem_pool_base_address(
+                            cache_manager._layer_attn_to_layer_id[
+                                pp_layer, DeepseekV4AttentionType.SWA
+                            ],
+                            DeepseekV4AttentionType.SWA.role,
+                            PageIndexMode.PER_LAYER,
+                        ),
+                        0,
+                    ]
+                    for pp_layer in cache_manager.pp_layers
+                ],
+                dtype=torch.int64,
+            )
 
-        assert torch.all(kv_cache_pool_mapping[:, 0] != -1), (
-            "all layers should have swa attention pool"
+            assert cache_manager.kv_cache_pool_mapping.shape == expected_mapping.shape
+            assert cache_manager.kv_cache_pool_mapping.dtype == expected_mapping.dtype
+            assert torch.equal(cache_manager.kv_cache_pool_mapping, expected_mapping)
+            assert cache_manager.kv_cache_pool_pointers.shape == expected_pointers.shape
+            assert cache_manager.kv_cache_pool_pointers.dtype == expected_pointers.dtype
+            assert torch.equal(cache_manager.kv_cache_pool_pointers, expected_pointers)
+        finally:
+            cache_manager.shutdown()
+
+    def test_dsv4_block_tables(self):
+        prompt_len = self.tokens_per_block * 2
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=prompt_len,
+            compress_ratios=[4, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
         )
-        assert torch.all(kv_cache_pool_mapping[:, 1] >= 0), (
-            "buffer pointer offset should be non-negative"
-        )
-        assert torch.all(kv_cache_pool_mapping[:, 0] == kv_cache_pool_mapping[0, 0]), (
-            "all layers should have the same pool_id"
-        )
+
+        req = self._create_request(0, prompt_len)
+        allocated = False
+        try:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(req, req.context_chunk_size)
+            allocated = True
+
+            attention_types = {
+                DeepseekV4AttentionType.COMPRESS,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+                DeepseekV4AttentionType.COMPRESSOR_KV,
+            }
+            sliding_block_tables = torch.empty(
+                cache_manager.num_local_layers,
+                len(DEEPSEEK_V4_SLIDING_ATTENTION),
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            compress_block_table = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            host_indexer_compress_block_table = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            cache_manager.copy_batch_sliding_block_tables(
+                sliding_block_tables,
+                [req.py_request_id],
+                num_contexts=1,
+                num_seqs=1,
+            )
+            cache_manager.copy_batch_compress_block_tables(
+                compress_block_table,
+                [req.py_request_id],
+                compress_ratio=4,
+                num_contexts=1,
+                num_seqs=1,
+            )
+            cache_manager.copy_batch_indexer_compress_block_tables(
+                host_indexer_compress_block_table,
+                [req.py_request_id],
+                num_seqs=1,
+            )
+            for attn_type in attention_types:
+                layer0_buffer = _view_fp8_as_uint8(cache_manager.get_buffers(0, attn_type))
+                layer1_buffer = _view_fp8_as_uint8(cache_manager.get_buffers(1, attn_type))
+                attn_len = prompt_len
+                if attn_type in [
+                    DeepseekV4AttentionType.COMPRESS,
+                    DeepseekV4AttentionType.INDEXER_COMPRESS,
+                ]:
+                    attn_len //= 4
+                num_blocks = (attn_len + layer0_buffer.shape[1] - 1) // layer0_buffer.shape[1]
+                if attn_type == DeepseekV4AttentionType.COMPRESS:
+                    layer0_offsets = compress_block_table[0, :num_blocks].tolist()
+                    layer1_offsets = compress_block_table[0, :num_blocks].tolist()
+                elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+                    layer0_offsets = host_indexer_compress_block_table[0, :num_blocks].tolist()
+                    layer1_offsets = host_indexer_compress_block_table[0, :num_blocks].tolist()
+                else:
+                    layer0_offsets = sliding_block_tables[
+                        cache_manager.layer_offsets[0],
+                        attn_type.value,
+                        0,
+                        :num_blocks,
+                    ].tolist()
+                    layer1_offsets = sliding_block_tables[
+                        cache_manager.layer_offsets[1],
+                        attn_type.value,
+                        0,
+                        :num_blocks,
+                    ].tolist()
+                assert all(offset != BAD_PAGE_INDEX for offset in layer0_offsets)
+                assert all(offset != BAD_PAGE_INDEX for offset in layer1_offsets)
+
+                layer0_values = torch.full(
+                    (num_blocks, layer0_buffer.shape[1], layer0_buffer.shape[-1]),
+                    1,
+                    dtype=layer0_buffer.dtype,
+                    device=layer0_buffer.device,
+                )
+                layer1_values = torch.full_like(layer0_values, 2)
+
+                layer0_buffer[layer0_offsets] = layer0_values
+                layer1_buffer[layer1_offsets] = layer1_values
+
+                torch.testing.assert_close(layer0_buffer[layer0_offsets], layer0_values)
+                torch.testing.assert_close(layer1_buffer[layer1_offsets], layer1_values)
+        finally:
+            if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
     @pytest.mark.parametrize(

@@ -278,8 +278,8 @@ class TrtllmAttentionWrapper:
             context_lengths (torch.Tensor): The context-phase sequence length of each request with shape (batch_size) on GPU.
             host_context_lengths (torch.Tensor): Same as context_lengths, but on CPU.
             host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
-            kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
-            host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory.
+            kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_attention_op_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
+            host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_attention_op_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory.
             host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case.
             workspace (torch.Tensor): An optional workspace tensor on GPU.
             cache_indirection (torch.Tensor): A tensor for beam search on GPU, its shape is (batch_size, beam_width, max_seqlen), for a sequence si, a beam bi and a token ti, the element cache_indirection[si][bi][ti] is an integer between 0 and beam_width-1 that indicates which path in the beam to read the K and V elements from in the KV cache.
@@ -1021,7 +1021,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets = self.get_empty(
                 buffers,
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                    self.kv_cache_manager.num_attention_op_pools,
+                    self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 cache_name="kv_cache_block_offsets",
@@ -1038,7 +1039,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.draft_kv_cache_block_offsets = self.get_empty(
                     buffers,
                     [
-                        self.draft_kv_cache_manager.num_pools,
+                        self.draft_kv_cache_manager.num_attention_op_pools,
                         self.max_num_sequences, 2,
                         self.draft_kv_cache_manager.max_blocks_per_seq
                     ],
