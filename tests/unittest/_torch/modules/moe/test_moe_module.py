@@ -48,6 +48,7 @@ from _torch.modules.moe.moe_test_utils import (
     get_quick_skip_reason,
     iter_base_test_configs,
     replay_tactics_and_check,
+    resolve_deepseek_group_config,
     should_skip_cutedsl,
     should_skip_cutlass,
     should_skip_deepgemm,
@@ -319,7 +320,7 @@ def _run_eplb_test(
     )
 
 
-def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
+def _create_routing_method(routing_method_cls, top_k, num_experts, dtype, model_config=None):
     """
     Create a routing method instance with appropriate parameters for each routing method type.
 
@@ -328,6 +329,7 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
         top_k: Number of experts to select per token
         num_experts: Total number of experts
         dtype: Data type for tensors
+        model_config: Optional model config with routing-specific parameters
 
     Returns:
         An instance of the routing method
@@ -342,13 +344,9 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
 
     # DeepSeekV3 routing method requires special parameters
     if routing_method_cls == DeepSeekV3MoeRoutingMethod:
-        # DeepSeek-V3 routing: groups experts, selects top groups, then selects top_k from those
-        # The routing logic does topk(k=2) within each group, so each group must have >= 2 experts
-        # Calculate n_group such that each group has at least 2 experts
-        experts_per_group = 2
-        n_group = max(1, num_experts // experts_per_group)
-        # topk_group should be <= n_group and reasonable for the selection
-        topk_group = min(n_group, max(1, n_group // 2))
+        if model_config is None:
+            model_config = MoeModelConfig(num_experts, top_k, hidden_size=0, intermediate_size=0)
+        n_group, topk_group = resolve_deepseek_group_config(model_config)
         routed_scaling_factor = 1.0
         # Create e_score_correction_bias as a zero tensor (no bias correction in test)
         e_score_correction_bias = torch.zeros(num_experts, dtype=dtype, device="cuda")
@@ -487,7 +485,11 @@ def _test_moe_worker_impl(
         # Create routing method and input tensors
         effective_bias_dtype = bias_dtype if bias_dtype is not None else dtype
         routing_method = _create_routing_method(
-            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=effective_bias_dtype
+            routing_method_cls,
+            top_k=top_k,
+            num_experts=num_experts,
+            dtype=effective_bias_dtype,
+            model_config=model_config,
         )
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
         if enable_eplb:

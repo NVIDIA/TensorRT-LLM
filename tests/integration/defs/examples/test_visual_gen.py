@@ -160,7 +160,7 @@ def _visual_gen_deps(llm_venv):
     """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by MediaStorage.save_video for MP4 encoding
+    # Install ffmpeg system package required by save_video() for MP4 encoding
     check_call(["apt-get", "update", "-y"], shell=False)
     check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
@@ -350,7 +350,6 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
     or text encoder is not found under LLM_MODELS_ROOT.
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
-    from tensorrt_llm.serve.media_storage import MediaStorage
 
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
@@ -391,20 +390,19 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
             max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
             seed=LTX2_T2V_SEED,
             frame_rate=LTX2_T2V_FRAME_RATE,
+            negative_prompt=LTX2_T2V_NEGATIVE_PROMPT,
         )
-        output = visual_gen.generate(
-            inputs={
-                "prompt": LTX2_T2V_PROMPT,
-                "negative_prompt": LTX2_T2V_NEGATIVE_PROMPT,
-            },
-            params=params,
-        )
-        MediaStorage.save_video(
-            output.video,
-            output_path,
-            audio=output.audio,
-            frame_rate=LTX2_T2V_FRAME_RATE,
-        )
+        output = visual_gen.generate(inputs=LTX2_T2V_PROMPT, params=params)
+        assert output.error is None, f"unexpected error on LTX-2 run: {output.error}"
+        assert output.video is not None
+        assert output.frame_rate == LTX2_T2V_FRAME_RATE
+        assert output.audio_sample_rate is not None and output.audio_sample_rate > 0
+        assert output.metrics is not None
+        assert output.metrics.generation > 0
+        assert output.metrics.denoise > 0
+        assert output.metrics.pre_denoise >= 0
+        assert output.metrics.post_denoise >= 0
+        output.save(output_path, frame_rate=LTX2_T2V_FRAME_RATE)
     finally:
         visual_gen.shutdown()
 
@@ -432,7 +430,6 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
     pytest.skip if any asset is missing.
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
-    from tensorrt_llm.serve.media_storage import MediaStorage
 
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
@@ -480,20 +477,17 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
             max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
             seed=LTX2_T2V_SEED,
             frame_rate=LTX2_T2V_FRAME_RATE,
+            negative_prompt=LTX2_T2V_NEGATIVE_PROMPT,
         )
-        output = visual_gen.generate(
-            inputs={
-                "prompt": LTX2_T2V_PROMPT,
-                "negative_prompt": LTX2_T2V_NEGATIVE_PROMPT,
-            },
-            params=params,
-        )
-        MediaStorage.save_video(
-            output.video,
-            output_path,
-            audio=output.audio,
-            frame_rate=LTX2_T2V_FRAME_RATE,
-        )
+        output = visual_gen.generate(inputs=LTX2_T2V_PROMPT, params=params)
+        assert output.error is None
+        assert output.video is not None
+        assert output.frame_rate == LTX2_T2V_FRAME_RATE
+        assert output.metrics is not None
+        assert output.metrics.generation > 0
+        assert output.metrics.denoise > 0
+        assert output.metrics.post_denoise >= 0
+        output.save(output_path, frame_rate=LTX2_T2V_FRAME_RATE)
     finally:
         visual_gen.shutdown()
 

@@ -408,7 +408,10 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def is_ready(self) -> bool:
         if self._disagg_cluster_manager:
-            return await self._disagg_cluster_manager.is_ready()
+            return await self._disagg_cluster_manager.is_ready_with_router(
+                self._ctx_router.num_prepared_servers,
+                self._gen_router.num_prepared_servers,
+            )
         return True
 
     @property

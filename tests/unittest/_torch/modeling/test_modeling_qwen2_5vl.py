@@ -12,7 +12,8 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel
+from tensorrt_llm._torch.models.modeling_qwen2vl import (
+    Qwen2_5_VLModel, Qwen2VLInputProcessorBase)
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -257,6 +258,29 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                                    kv_cache_reuse=False),
         ]
         return scenarios
+
+    def get_hf_inputs(self, modality: str, prompt, media):
+        processor_inputs = super().get_hf_inputs(modality, prompt, media)
+
+        # HF transformers 5.x uses a different get_rope_index algorithm for Qwen2.5-VL:
+        # it multiplies temporal positions by tokens_per_second, which diverges from
+        # TRT-LLM's algorithm. Compute position IDs using TRT-LLM's get_rope_index and
+        # pass them explicitly so both models use the same position IDs.
+        has_vision = "image_grid_thw" in processor_inputs or "video_grid_thw" in processor_inputs
+        if has_vision:
+            position_ids, _ = Qwen2VLInputProcessorBase.get_rope_index(
+                self.hf_config,
+                processor_inputs["input_ids"],
+                image_grid_thw=processor_inputs.get("image_grid_thw"),
+                video_grid_thw=processor_inputs.get("video_grid_thw"),
+                attention_mask=processor_inputs.get("attention_mask"),
+                second_per_grid_ts=processor_inputs.get("second_per_grid_ts"),
+            )
+            processor_inputs["position_ids"] = position_ids.to(
+                processor_inputs["input_ids"].device)
+            processor_inputs.pop("mm_token_type_ids", None)
+
+        return processor_inputs
 
     def setup_scenario(self, scenario: TestQwen2_5_VLScenario):
         super().setup_scenario(scenario)

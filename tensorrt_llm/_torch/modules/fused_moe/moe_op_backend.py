@@ -120,6 +120,7 @@ class MoEOpBackend:
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
     ) -> torch.Tensor:
         """Run FP8 block scale MoE computation."""
         raise NotImplementedError
@@ -160,6 +161,7 @@ class MoEOpBackend:
         gated_act_type: int = 0,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation."""
         raise NotImplementedError
@@ -230,6 +232,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         weight_layout=0,
         enable_pdl=None,
         tune_max_num_tokens=8192,
+        use_dp=False,
     ):
         return torch.ops.trtllm.fp8_block_scale_moe_runner(
             router_logits,
@@ -253,6 +256,8 @@ class TRTLLMOpBackend(MoEOpBackend):
             topk_ids=topk_ids,
             act_type=gated_act_type,
             output=output,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_dp=use_dp,
         )
 
     def run_fp4_block_scale_moe(
@@ -291,6 +296,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         gated_act_type=0,
         output=None,
         tune_max_num_tokens=8192,
+        use_dp=False,
     ):
         hidden_size = gemm1_weights.shape[-1] * 2
         if hidden_states.dtype == torch.uint8 or hidden_states.dtype == torch.float8_e4m3fn:
@@ -332,6 +338,8 @@ class TRTLLMOpBackend(MoEOpBackend):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     output=output,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                    use_dp=use_dp,
                 )
                 if not do_finalize:
                     return outputs
@@ -372,6 +380,8 @@ class TRTLLMOpBackend(MoEOpBackend):
                     topk_weights,
                     topk_ids,
                     output=output,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                    use_dp=use_dp,
                 )
 
         elif hidden_states.dtype == torch.bfloat16:
@@ -403,6 +413,8 @@ class TRTLLMOpBackend(MoEOpBackend):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 output=output,
+                tune_max_num_tokens=tune_max_num_tokens,
+                use_dp=use_dp,
             )
 
 
@@ -519,6 +531,7 @@ class FlashinferOpBackend(MoEOpBackend):
         weight_layout=0,
         enable_pdl=None,
         tune_max_num_tokens=8192,
+        use_dp=False,
     ):
         if router_logits is not None:
             return self._fused_moe.trtllm_fp8_block_scale_moe(
@@ -608,6 +621,7 @@ class FlashinferOpBackend(MoEOpBackend):
         gated_act_type=0,
         output=None,
         tune_max_num_tokens=8192,
+        use_dp=False,
     ):
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(

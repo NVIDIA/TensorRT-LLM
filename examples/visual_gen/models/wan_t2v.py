@@ -23,7 +23,6 @@ Usage:
 import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 
 def main():
@@ -65,8 +64,7 @@ def main():
         params=params,
     )
 
-    # --- Model-specific: video output ---
-    MediaStorage.save_video(output.video, args.output_path, frame_rate=params.frame_rate)
+    output.save(args.output_path)
     print(f"Saved: {args.output_path}")
 
 

@@ -1,3 +1,17 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import os
 import time
@@ -280,6 +294,10 @@ class Router(ABC):
     @property
     def servers(self) -> List[str]:
         return self._servers
+
+    @property
+    def num_prepared_servers(self) -> int:
+        return len(self._prepared_ready_servers)
 
     @staticmethod
     def _ensure_url(server: str) -> str:
@@ -677,8 +695,15 @@ class BlockHashMixin:
                 self._tokenizers[model] = load_custom_tokenizer(
                     self._custom_tokenizer, model)
             else:
-                self._tokenizers[model] = AutoTokenizer.from_pretrained(
+                from tensorrt_llm.tokenizer import \
+                    maybe_fix_byte_level_tokenizer
+                tokenizer = AutoTokenizer.from_pretrained(
                     model, trust_remote_code=True)
+                # Work around Transformers 5.x LlamaTokenizer overriding
+                # tokenizer.json's ByteLevel pre-tokenizer with Metaspace,
+                # which silently strips spaces from prompts (see tokenizer.py).
+                self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
+                    tokenizer, model, trust_remote_code=True)
         return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
@@ -694,6 +719,7 @@ class BlockHashMixin:
                 ],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
+                return_dict=False,
             )
             # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
             # string from apply_chat_template even with tokenize=True.
