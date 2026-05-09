@@ -119,6 +119,7 @@ class TestDeepseekV4CacheManager:
         dtype: DataType,
         compressor_dtype: DataType,
         max_input_len: Optional[int] = None,
+        is_draft: bool = False,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -158,6 +159,7 @@ class TestDeepseekV4CacheManager:
             vocab_size=self.vocab_size,
             max_num_tokens=max_batch_size * (max_input_len + 1),
             sparse_attn_config=sparse_attn_config,
+            is_draft=is_draft,
         )
 
         return cache_manager, sparse_attn_config
@@ -1013,6 +1015,109 @@ class TestDeepseekV4CacheManager:
                 torch.testing.assert_close(layer1_buffer[layer1_offsets], layer1_values)
         finally:
             if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_swa_scratch_reuse_enabled_for_main_manager(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        try:
+            assert cache_manager.enable_swa_scratch_reuse
+            assert cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_draft_cache_manager_disables_swa_scratch_reuse(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            is_draft=True,
+        )
+
+        try:
+            assert not cache_manager.enable_swa_scratch_reuse
+            assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_context_request_enable_scratch_reuse_until_generation(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        req = self._create_request(request_id=0, prompt_len=self.tokens_per_block + 1)
+        allocated = False
+        try:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(req, req.context_chunk_size)
+            allocated = True
+
+            kv_cache = cache_manager.kv_cache_map[req.py_request_id]
+            assert kv_cache.enable_swa_scratch_reuse
+
+            scheduled_batch = ScheduledRequests()
+            scheduled_batch.context_requests_last_chunk = [req]
+            req.context_current_position = req.prompt_len
+            req.add_new_token(req.prompt_len, 0)
+            cache_manager.update_context_resources(scheduled_batch)
+            assert not kv_cache.enable_swa_scratch_reuse
+
+            assert cache_manager.try_allocate_generation(req)
+            assert not kv_cache.enable_swa_scratch_reuse
+        finally:
+            if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_dummy_generation_requests_with_swa_scratch_reuse(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        requests = []
+        token_nums = [1, self.tokens_per_block * 4 + 1]
+        try:
+            requests = cache_manager.add_dummy_requests(
+                request_ids=[0, 1],
+                token_nums=token_nums,
+                is_gen=True,
+            )
+            assert requests is not None
+            assert len(requests) == len(token_nums)
+
+            short_kv_cache = cache_manager.kv_cache_map[requests[0].py_request_id]
+            long_kv_cache = cache_manager.kv_cache_map[requests[1].py_request_id]
+            assert not short_kv_cache.enable_swa_scratch_reuse
+            assert not long_kv_cache.enable_swa_scratch_reuse
+            assert short_kv_cache.history_length == 0
+            assert short_kv_cache.capacity == token_nums[0] + 1
+            assert long_kv_cache.history_length == token_nums[1] - 1
+            assert long_kv_cache.capacity == token_nums[1] + 1
+        finally:
+            for req in requests:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
