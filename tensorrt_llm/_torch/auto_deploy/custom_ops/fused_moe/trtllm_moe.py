@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import List, Tuple
 
 import torch
@@ -24,6 +25,12 @@ from tensorrt_llm.mapping import Mapping
 from ..._compat import ActivationType, is_sm_100f
 from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+
+# O11: when set, skip the Python-side topk/softmax in trtllm_mxfp4_w4a8_moe_fused
+# and pass router_logits straight to mxe4m3_mxe2m1_block_scale_moe_runner so the
+# kernel does fused routing internally (matches PT's run_fp4_block_scale_moe path).
+# Saves ~5 elementwise launches per layer × 36 ≈ 180 launches/iter on gpt-oss-120b.
+_AD_W4A8_FUSED_ROUTING = os.environ.get("AD_W4A8_FUSED_ROUTING", "0") == "1"
 
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
@@ -1296,10 +1303,21 @@ def trtllm_mxfp4_w4a8_moe_fused(
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 
-    # Top-k routing — same numerics as the W4A16 path.
+    # Top-k routing — two paths:
+    #   (default) PyTorch chain — linear + topk + softmax + cast (5+ kernels)
+    #   (O11, AD_W4A8_FUSED_ROUTING=1) compute logits only, hand them to the
+    #     C++ runner which does fused topk + softmax internally (1 kernel).
     router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
-    topk_vals, topk_ids = torch.topk(router_logits.to(torch.float32), top_k, dim=-1)
-    topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
+    if _AD_W4A8_FUSED_ROUTING:
+        runner_topk_weights = None
+        runner_topk_ids = None
+        runner_router_logits = router_logits
+    else:
+        topk_vals, topk_ids = torch.topk(router_logits.to(torch.float32), top_k, dim=-1)
+        topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
+        runner_topk_weights = topk_weights.to(torch.bfloat16)
+        runner_topk_ids = topk_ids.to(torch.int32)
+        runner_router_logits = None
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
     expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
@@ -1326,7 +1344,7 @@ def trtllm_mxfp4_w4a8_moe_fused(
     intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
 
     result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
-        None,  # routing_logits (using pre-computed topk)
+        runner_router_logits,  # router_logits (None if pre-computed topk path)
         None,  # routing_bias
         x_mxfp8,  # hidden_states (E4M3-packed uint8)
         x_scale,  # hidden_states_scale (UE8M0 per-32-elem block scale)
@@ -1351,8 +1369,8 @@ def trtllm_mxfp4_w4a8_moe_fused(
         None,  # routed_scaling_factor
         routing_method_type,
         0,  # act_type = SwiGlu
-        topk_weights=topk_weights.to(torch.bfloat16),
-        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=runner_topk_weights,
+        topk_ids=runner_topk_ids,
     )
     if result.shape[-1] > valid_hidden_size:
         result = result[..., :valid_hidden_size].contiguous()
