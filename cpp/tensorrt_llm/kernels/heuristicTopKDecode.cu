@@ -26,8 +26,8 @@
 #include "tensorrt_llm/kernels/heuristic_topk.cuh"
 
 #include <cfloat>
-#include <cuda_bf16.h> // 4d: bf16 input dtype support
-#include <cuda_fp16.h> // 4d: fp16 input dtype support
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -43,9 +43,9 @@ using heuristic_topk::gvrTopKJob;
 using heuristic_topk::gvrTopKJobDtype;
 using heuristic_topk::KernelSmemTplK;
 
-// 4d.D: heuristicTopKMultiRowKernel templated on TopK so launcher can
-// dispatch K=512/1024/2048 to the same kernel template. Smem layout
-// derived from GvrParams<float, TopK> at compile time.
+// Templated on TopK so the launcher can dispatch K=512/1024/2048 to the
+// same kernel template. Smem layout is derived from GvrParams<float, TopK>
+// at compile time.
 template <int TopK>
 __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float const* __restrict__ logits,
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, float* __restrict__ scratchValues,
@@ -94,21 +94,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
 }
 
 // ============================================================================
-// Multi-dtype path (4d_multi_dtype_unified, 2026-05-06)
+// Multi-dtype path (bf16 / fp16)
 // ============================================================================
-// Mirrors heuristicTopKMultiRowKernel for bf16/fp16 inputs. fp32 path stays
-// byte-untouched (option A). The kernel body is structurally identical;
-// only the input/output dtype, the smem-key dtype, and the GVR job called
-// (gvrTopKJobDtype<InputT>) differ.
+// Mirrors heuristicTopKMultiRowKernel for bf16/fp16 inputs. The kernel body
+// is structurally identical; only the input/output dtype, the smem-key
+// dtype, and the GVR job (gvrTopKJobDtype<InputT>) differ.
 
-// 4d.D: dtype multi-row kernel templated on (InputT, TopK). Smem layout
-// derived from GvrParams<InputT, TopK>.
+// Templated on (InputT, TopK). Smem layout is derived from
+// GvrParams<InputT, TopK>.
 template <typename InputT, int TopK>
 __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(InputT const* __restrict__ logits,
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, InputT* __restrict__ scratchValues,
     int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
 {
-    // P0 (2026-05-07): dtype path uses fp32 keys[] in smem (deferred convert).
+    // dtype path uses fp32 keys[] in smem (down-conversion deferred to writeback).
     using SmemT = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
 
     int const rowIdx = blockIdx.x;
@@ -172,9 +171,9 @@ template __global__ void heuristicTopKMultiRowKernel<1024>(
 template __global__ void heuristicTopKMultiRowKernel<2048>(
     float const*, int const*, int const*, float*, int*, int, int, int, int, int);
 
-// 4d.D: dispatch on topK at runtime — each TopK-instantiation gets its own
-// smem size (driven by GvrParams<InputT, TopK>::kC/kNumBins) and own kfn
-// pointer (cudaFuncSetAttribute / cudaLaunchKernelEx target the right kernel).
+// Dispatch on topK at runtime — each TopK-instantiation gets its own smem
+// size (driven by GvrParams<InputT, TopK>::kC/kNumBins) and own kfn pointer
+// (cudaFuncSetAttribute / cudaLaunchKernelEx target the right kernel).
 template <typename InputT>
 void launchHeuristicTopKDecodeDtype(InputT const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     InputT* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
@@ -191,7 +190,7 @@ void launchHeuristicTopKDecodeDtype(InputT const* logits, int const* seqLens, in
 
     auto launchOne = [&]<int TopK>()
     {
-        // P0 (2026-05-07): dtype path uses fp32 keys[] in smem.
+        // dtype path uses fp32 keys[] in smem.
         using SmemT = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
         size_t const smemSize = sizeof(SmemT);
 

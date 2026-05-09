@@ -43,26 +43,25 @@
 
 #include <cfloat>
 #include <cstdint>
-#include <cstdio>      // for snap convergence warning printf
-#include <cstdlib>     // for std::getenv (PDL launcher env-gate)
-#include <cuda_bf16.h> // 4d: bf16 input dtype support
-#include <cuda_fp16.h> // 4d: fp16 input dtype support
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <type_traits> // 4d: std::is_same_v in launchHeuristicTopK dispatch
+#include <type_traits>
 
 namespace heuristic_topk
 {
 
 // ============================================================================
-// Multi-dtype Trait Layer (4d_multi_dtype_unified, 2026-05-06)
+// Multi-dtype Trait Layer
 // ============================================================================
 // Encapsulates dtype-specific cvt intrinsics + vector load width so the
-// kernel body can be templated cleanly. For fp32 the path is byte-
-// equivalent to the original V2e kernel (VEC_W=4, identity cvt).
+// kernel body can be templated cleanly. For fp32 the trait is identity.
 //
-// Tier-1 fp32 arithmetic (threshold, accumulators, bin index) — kernel-
-// internal, not in trait. Tier-2 InputT containers (HBM input, smem keys,
-// outputValues) — dtype-driven. Tier-3 ALU stays fp32 (GVR is HBM-bound).
+// Arithmetic (threshold, accumulators, bin index) is always fp32; only
+// the HBM input container, smem keys, and output values follow InputT.
+// GVR is HBM-bandwidth-bound, so fp32 ALU has no measurable cost.
 
 template <typename T>
 struct GvrDtypeTraits;
@@ -171,34 +170,38 @@ static_assert(TOP_K % BLOCK_SIZE == 0);
 static_assert(MAX_CANDIDATES % BLOCK_SIZE == 0);
 
 // ============================================================================
-// Multi-K Trait Layer (4d.D 9-combo sweep, 2026-05-06)
+// Multi-K Trait Layer
 // ============================================================================
-// Per-(InputT, TopK) compile-time trait class encoding the optimal
-// (f_target, max_candidates) tuple discovered by the SWE-Bench-64K
-// 9-combo sweep in 04_kernel_optimizations/4d_multi_dtype_unified/
-// data/D_param_sweep_9combos/REPORT.md.
+// Per-(InputT, TopK) compile-time trait encoding the secant-search target
+// `kFTarget`, candidate-buffer cap `kC`, and Phase-4 histogram bin count
+// `kNumBins`.
 //
-// Selection rationale:
-//   - kC=5120 unified across all 9 combos (smem-Occ jump 3→4 fp32 / 3→5
-//     bf16/fp16 buys ≤+10% sim cost vs C=6144; reg-bound limit may cap
-//     real occupancy at 3 — Step 2 must verify with cuobjdump).
-//   - kFTarget varies by K only:
-//       K=512:  f=K        (P1 pmean threshold lands near K → P2 idle)
-//       K=1024: f=3K       (U-shape minimum at high f)
-//       K=2048: f=2K       (monotone: higher f → fewer P2 iters)
-//   - kFTarget for fp32 K=2048 = 4096 deviates from V2e production
-//     (3072) — applied per REPORT.md recommendation; Step 3 must run
-//     Scheme X v1.2 4-report regression to confirm no real-world loss.
-//   - kNumBins=NUM_BINS=2048 unchanged across combos (P4 histogram).
+// kFTarget under V3.2-decode preIdx semantics (preIdx = top-K of prev row):
+// Phase-1 pmean lands near the right tail of the prev-row top-K, so the
+// Phase-2 secant initial bracket is biased high. A tighter K-proportional
+// target converges faster than the M=2048 era's flat target.
+//   K=512:  0.75K = 384
+//   K=1024: 2.5K  = 2560
+//   K=2048: kept at 1.5K (3072) for fp32 to preserve SASS byte-identity
+//          with the V2e production hot path. bf16/fp16 K=2048 use 2K
+//          (4096), where there is no prior production baseline to honor.
 //
-// Q10b-S2 (2026-05-08): kFTarget re-tuned for V4 production M=K (preIdx=K, not 2048).
-// Under M=K, pmean shifts to right tail (top-K of prev row); P2 secant needs a
-// tighter target to converge in fewer iterations. K-proportional K=512/1024 picks:
-//   K=512:  kFTarget=384  (= 0.75K)  — was K
-//   K=1024: kFTarget=2560 (= 2.5K)   — was 3K
-//   K=2048: unchanged (M=K=2048 trivially equals legacy M=2048)
-// Cross-layer 8-cell sweep on SWE-Bench-64K (`10_multi_cta_v1/M_eq_K_redesign/`):
-// 4 V4-hot cells (bf16/fp16 × K=512/1024) recover ~3.78 µs total wall.
+// kC = 5120 for K=512/1024 across all dtypes — drops smem footprint enough
+// to leave headroom for 4-5 CTA/SM theoretical occupancy when register
+// allocation permits. fp32 K=2048 keeps kC=6144 to preserve V2e SASS
+// byte-identity (production fp32 K=2048 hot path is the correctness
+// floor; smem layout change would alter SASS).
+//
+// kNumBins varies per (T, K) by atomic-contention vs Phase-4 setup-cost
+// trade-off:
+//   - Below ~1024 bins, atomicAdd contention on the bin-counter array
+//     dominates Phase-4 cost.
+//   - Above 1024 bins, the Phase-4 histogram clear+scan setup cost
+//     dominates over the contention savings.
+//   The optimum varies because (a) candidate-buffer size kC scales the
+//   atomic-contention denominator, and (b) bf16/fp16 paths read smem keys
+//   through Trait::to_fp32, shifting the Phase-3 ↔ Phase-4 ratio. Hence
+//   per-(T, K) tabulation rather than a closed-form rule.
 //
 // Primary template intentionally left undefined: any unsupported (T, K)
 // combination triggers a compile-time error rather than a runtime fall-
@@ -206,15 +209,10 @@ static_assert(MAX_CANDIDATES % BLOCK_SIZE == 0);
 template <typename InputT, int TopK>
 struct GvrParams; // primary undefined → compile-time error for bad combos
 
-// fp32 specializations
-// kNumBins per Q1b-P0.5 sweep (2026-05-07): kNumBins=1024 saves -7.0% total
-// on K=512 fp32 vs default 2048; K=1024 fp32 saves -5.9% at kNumBins=1024.
-// Phase 4 histogram_clear + bin_search shrinks; fewer bins than candidate
-// count is fine because per-bin contention stays at ≤5 atomicAdds.
 template <>
 struct GvrParams<float, 512>
 {
-    static constexpr int kFTarget = 384; // Q10b-S2 (M=K retune): was 512
+    static constexpr int kFTarget = 384;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
@@ -222,35 +220,26 @@ struct GvrParams<float, 512>
 template <>
 struct GvrParams<float, 1024>
 {
-    static constexpr int kFTarget = 2560; // Q10b-S2 (M=K retune): was 3072
+    static constexpr int kFTarget = 2560;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
 
-// fp32 K=2048: V2e production-identity preservation (Option B 2026-05-07).
-// Cuobjdump showed nvcc 13.1 regs/thread = 64 → reg-bound 2 CTA/SM regardless of
-// kC; the REPORT-recommended (4096, 5120) gives no occupancy benefit but
-// breaks V2e SMEM byte-identity. Reverting to V2e (3072, 6144) keeps the
-// production path byte-identical and avoids Scheme X v1.2 4-report
-// regression. The other 8 combos still use REPORT picks where there is
-// no production baseline to preserve.
+// fp32 K=2048 preserves V2e SASS byte-identity with the production hot path.
+// Changing kFTarget or kC would alter ptxas output for the existing
+// `gvrTopKJob<2048>` / `heuristicTopKMultiRowKernel<2048>` instantiations.
 template <>
 struct GvrParams<float, 2048>
 {
-    static constexpr int kFTarget = 3072; // V2e: TOP_K + SAFETY_MARGIN/2
-    static constexpr int kC = 6144;       // V2e: TOP_K + SAFETY_MARGIN*2
+    static constexpr int kFTarget = 3072;
+    static constexpr int kC = 6144;
     static constexpr int kNumBins = NUM_BINS;
 };
 
-// bf16 specializations
-// Q1b-P0.5 (2026-05-07) chose folded rule for bf16: K=512 keeps kNumBins=K
-// (avoid K/2=256 atomic-contention edge), K=1024 takes K/2=512 (full
-// -7.8% saving). K=2048 unchanged since K=2048 sweep showed ~0 effect.
-// Captures ~90% of the optimal-per-cell saving with simpler dispatch.
 template <>
 struct GvrParams<__nv_bfloat16, 512>
 {
-    static constexpr int kFTarget = 384; // Q10b-S2 (M=K retune): was 512
+    static constexpr int kFTarget = 384;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -258,7 +247,7 @@ struct GvrParams<__nv_bfloat16, 512>
 template <>
 struct GvrParams<__nv_bfloat16, 1024>
 {
-    static constexpr int kFTarget = 2560; // Q10b-S2 (M=K retune): was 3072
+    static constexpr int kFTarget = 2560;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -271,13 +260,10 @@ struct GvrParams<__nv_bfloat16, 2048>
     static constexpr int kNumBins = NUM_BINS;
 };
 
-// fp16 specializations
-// Q1b-P0.5 (2026-05-07): kNumBins = K is the empirical optimum for fp16
-// (sweeping K/2 actually regressed K=512/1024 fp16). K=2048 unchanged.
 template <>
 struct GvrParams<__half, 512>
 {
-    static constexpr int kFTarget = 384; // Q10b-S2 (M=K retune): was 512
+    static constexpr int kFTarget = 384;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -285,7 +271,7 @@ struct GvrParams<__half, 512>
 template <>
 struct GvrParams<__half, 1024>
 {
-    static constexpr int kFTarget = 2560; // Q10b-S2 (M=K retune): was 3072
+    static constexpr int kFTarget = 2560;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
@@ -306,15 +292,12 @@ static_assert(GvrParams<float, 2048>::kC % BLOCK_SIZE == 0);
 // ============================================================================
 // Shared Memory Layout
 // ============================================================================
-// Default instantiation (CCap=MAX_CANDIDATES=6144, NumBinsT=NUM_BINS=2048):
-//   fp32  (KernelSmem = KernelSmemTpl<float>           = KernelSmemTplK<float, 6144, 2048>): ~59 KB
-//   bf16/fp16                                                                              : ~47 KB
-//
-// 4d.D K=512/1024 instantiations use kC=5120 (KernelSmemTplK<T, 5120, 2048>):
-//   fp32: 51 KB, bf16/fp16: 41 KB
-//
-// 4d_multi_dtype_unified (2026-05-06): templatized on SmemKey.
-// 4d.D 9-combo (2026-05-06): templatized on (CCap, NumBinsT) for multi-K paths.
+// Templated on (SmemKey, candidate-cap, num-bins). Default
+// (MAX_CANDIDATES=6144, NUM_BINS=2048) sizes:
+//   fp32      : ~59 KB
+//   bf16/fp16 : ~47 KB
+// K=512/1024 instantiations cap candidates at kC=5120 (~51 KB fp32 /
+//   ~41 KB bf16/fp16) per GvrParams<T, K>::kC.
 
 template <typename SmemKey, int CCap = MAX_CANDIDATES, int NumBinsT = NUM_BINS>
 struct KernelSmemTplK
@@ -337,14 +320,11 @@ struct KernelSmemTplK
     int out_count;
 };
 
-// Backwards-compat alias for K=2048 default — same layout as pre-4d.D
-// KernelSmemTpl. fp32 instantiation = KernelSmemTplK<float, 6144, 2048>.
+// Convenience alias for the default-cap layout (kC=6144, kNumBins=2048),
+// used by the K=2048 instantiations.
 template <typename SmemKey>
 using KernelSmemTpl = KernelSmemTplK<SmemKey>;
 
-// fp32 alias preserved so the original gvrTopKJob / gvrTopKKernel /
-// blockCountGE / blockFusedSnapIter and the TRT-LLM multi-row caller
-// `using heuristic_topk::gvrTopKJob` keep their byte-equivalent signature.
 using KernelSmem = KernelSmemTpl<float>;
 
 // ============================================================================
@@ -415,8 +395,8 @@ __device__ __forceinline__ float warpReduceMax(float val)
 // Device: Block count ≥ threshold in GLOBAL memory  (1-sync pattern)
 // ============================================================================
 
-// 4d.D: templated on SmemT so K=512/1024 fp32 paths can pass a smaller
-// KernelSmemTplK<float, 5120, 2048>* smem. Default = legacy KernelSmem.
+// Templated on SmemT so K=512/1024 paths can pass a kC=5120 layout.
+// Default (KernelSmem) targets the K=2048 kC=6144 layout.
 template <typename SmemT = KernelSmem>
 __device__ __forceinline__ void blockCountGE(
     float const* __restrict__ input, int N, float threshold, SmemT* smem, int tid, int warp_id, int lane)
@@ -452,9 +432,7 @@ __device__ __forceinline__ void blockCountGE(
 // Fused snap iteration (2 syncs per call)
 // ============================================================================
 
-// 4d.D: templated on (TopK, SmemT) so K=512/1024 paths reuse the same
-// helper. Default <TOP_K, KernelSmem> preserves byte-equivalence with
-// the V2e baseline call site.
+// Templated on (TopK, SmemT) so K=512/1024 paths reuse the same helper.
 template <int TopK = TOP_K, typename SmemT = KernelSmem>
 __device__ __forceinline__ void blockFusedSnapIter(SmemT* smem, int count, int tid, int warp_id, int lane)
 {
@@ -518,10 +496,10 @@ __device__ __forceinline__ void blockFusedSnapIter(SmemT* smem, int count, int t
 }
 
 // ============================================================================
-// Dtype-templated helpers (4d_multi_dtype_unified)
+// Dtype-templated helpers (bf16 / fp16)
 // ============================================================================
 // Mirror blockCountGE / blockFusedSnapIter for bf16/fp16 inputs. fp32
-// path keeps the originals untouched (byte-equivalent to V2e baseline).
+// path uses the originals.
 //
 // blockCountGEDtype:
 //   - 8-wide vector load (int4 = 8 × 16-bit) instead of 4-wide (float4 = 4 × fp32)
@@ -529,11 +507,10 @@ __device__ __forceinline__ void blockFusedSnapIter(SmemT* smem, int count, int t
 //
 // blockFusedSnapIterDtype:
 //   - reads SmemKey (bf16 / fp16) from smem->keys, up-casts to fp32 for
-//     min/max/count work; threshold remains fp32 (Tier-1 invariant).
+//     min/max/count work; threshold remains fp32.
 
-// 4d.D: add SmemT default to allow K=512/1024 dtype paths to pass a
-// smaller KernelSmemTplK<SmemKey, 5120, 2048>* smem. Default = legacy
-// 6144-cap layout (KernelSmemTpl<SmemKey>).
+// Templated on SmemT so K=512/1024 dtype paths can pass a kC=5120 layout.
+// Default targets the K=2048 kC=6144 layout.
 template <typename InputT, typename SmemT = KernelSmemTpl<typename GvrDtypeTraits<InputT>::SmemKey>>
 __device__ __forceinline__ void blockCountGEDtype(
     InputT const* __restrict__ input, int N, float threshold, SmemT* smem, int tid, int warp_id, int lane)
@@ -571,8 +548,7 @@ __device__ __forceinline__ void blockCountGEDtype(
     }
 }
 
-// 4d.D: templated on (TopK, SmemT). Default <SmemKey, TOP_K, KernelSmemTpl<SmemKey>>
-// preserves the K=2048 dtype path's pre-multi-K signature.
+// Templated on (SmemKey, TopK, SmemT). Default targets the K=2048 dtype path.
 template <typename SmemKey, int TopK = TOP_K, typename SmemT = KernelSmemTpl<SmemKey>>
 __device__ __forceinline__ void blockFusedSnapIterDtype(SmemT* smem, int count, int tid, int warp_id, int lane)
 {
@@ -643,13 +619,10 @@ __device__ __forceinline__ void blockFusedSnapIterDtype(SmemT* smem, int count, 
 // for this function independently from the caller, matching standalone SASS.
 // ============================================================================
 
-// 4d.D: templated on TopK so the K=512 / K=1024 fp32 paths share this
-// body with K=2048. Default <TOP_K> + KernelSmem (= KernelSmemTplK<float, 6144, 2048>)
-// matches the pre-multi-K signature for the legacy V2e call site.
-//
-// The runtime `topK` parameter is kept for header-API compatibility with
-// callers that pass it (assert at entry that it matches the template
-// instantiation).
+// Templated on TopK so K=512/1024/2048 fp32 paths share this body. The
+// runtime `topK` parameter is kept for header-API compatibility with
+// callers that pass it; the kernel asserts at entry that it matches
+// the template instantiation.
 template <int TopK = TOP_K>
 __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int const N, int const* __restrict__ preIdx,
     int const M, int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices,
@@ -1158,18 +1131,13 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
 // heuristicTopKDecode.cu — both share the same micro-kernel job.
 // ============================================================================
 
-// 4d.D: templated on TopK so launcher can dispatch K=512/1024/2048 to the
-// same kernel template. Default <TOP_K> matches the legacy non-templated
-// signature (callers that pass no template argument get K=2048 fp32).
+// Templated on TopK so the launcher can dispatch K=512/1024/2048 to the
+// same kernel template.
 //
-// 2026-05-08 alignment with production: __launch_bounds__ now matches
-// heuristicTopKMultiRowKernel (single-arg, no minBlocksPerSM hint) so nvcc
-// applies the same register heuristic to this standalone wrapper as to the
-// production multi-row kernel. Removing the trailing `, 1` lets ptxas pick
-// REG=40 (K=2048 fp32) instead of REG=64, restoring 75% theoretical
-// occupancy parity. NOTE: this changes the standalone gvrTopKKernel<2048>
-// SASS away from V2e LOCK byte-identity (production multi-row path is
-// unaffected — it uses its own __launch_bounds__).
+// __launch_bounds__ uses the single-arg form (no minBlocksPerSM hint) so
+// nvcc applies the same register heuristic as `heuristicTopKMultiRowKernel`
+// in heuristicTopKDecode.cu. Adding `, 1` would lower theoretical occupancy
+// from 75% (REG=40) to 50% (REG=64) for the K=2048 fp32 path.
 template <int TopK = TOP_K>
 __global__ void __launch_bounds__(BLOCK_SIZE)
     gvrTopKKernel(float const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
@@ -1186,28 +1154,23 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 }
 
 // ============================================================================
-// gvrTopKJobDtype<InputT, TopK> — bf16/fp16 device function (4d_multi_dtype_unified)
+// gvrTopKJobDtype<InputT, TopK> — bf16/fp16 device function
 // ============================================================================
 // Mirror of gvrTopKJob with trait-driven dtype substitutions:
 //   - HBM input read   : Trait::to_fp32(__ldg(&input[i]))
-//   - smem keys write  : Trait::from_fp32(v)   (Tier-2 SmemKey container)
 //   - smem keys read   : Trait::to_fp32(keys[i]) for arithmetic
-//   - outputValues     : InputT (SmemKey == InputT in templated path)
+//   - outputValues     : InputT
 //   - vector load      : 8-wide via Trait::unpack8
 //   - blockCountGE     : blockCountGEDtype<InputT>
 //   - blockFusedSnapIter: blockFusedSnapIterDtype<SmemKey>
-// All Tier-1 arithmetic stays fp32 (threshold, accumulators, bin index).
-// fp32 path is NOT routed here — fp32 keeps the original gvrTopKJob (option A,
-// guaranteed zero-regression). This template only instantiates for bf16/fp16.
+// All arithmetic (threshold, accumulators, bin index) stays fp32. The fp32
+// dtype path uses gvrTopKJob (above), not this template; instantiated only
+// for bf16 and fp16.
 //
-// 4d.D: templated on TopK so K=512/1024/2048 share the same body. Default
-// <InputT, TOP_K> with KernelSmemTpl<...> matches the pre-multi-K signature.
-
-// P0 (Q1b-P0, 2026-05-07): smem keys[] are kept as fp32 to defer the
-// Trait::from_fp32(val) write conversion out of the P3 hot loop. This trades
-// ~10 KB extra smem (5120 keys × +2B at K=2048 dtype) for ~2 µs P3 savings on
-// bf16/fp16 (P3 -10-25%, total -4.5-7.1% per Q1b-P0 snapshot bench).
-// fp32 path is unaffected — gvrTopKJob (separate function) keeps its layout.
+// smem `keys[]` are stored as fp32 even on the bf16/fp16 paths: deferring
+// the down-conversion out of the Phase-3 collect loop saves more than the
+// extra ~10 KB of smem costs. The fp32 keys move conversion to the output
+// writeback (one cvt per surviving candidate) instead of every smem store.
 template <typename InputT, int TopK = TOP_K>
 __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, int const N,
     int const* __restrict__ preIdx, int const M, int const topK, InputT* __restrict__ outputValues,
@@ -1216,7 +1179,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
     int const preIdxOffset = 0)
 {
     using Trait = GvrDtypeTraits<InputT>;
-    using SmemKey = float; // P0: keys stay fp32; conversion deferred to output writeback
+    using SmemKey = float; // keys stay fp32; conversion deferred to output writeback
     using Params = GvrParams<InputT, TopK>;
     constexpr int kK = TopK;
     constexpr int kCC = Params::kC;
@@ -1706,12 +1669,9 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
 // ============================================================================
 // gvrTopKKernelDtype<InputT, TopK> — bf16/fp16 single-row global wrapper
 // ============================================================================
-// 4d.D: templated on TopK alongside InputT. Default <InputT, TOP_K> matches
-// the pre-multi-K signature for the existing K=2048 dtype path.
-//
-// 2026-05-08: same alignment with heuristicTopKMultiRowKernelDtype — single-arg
-// __launch_bounds__ removes the minBlocksPerSM=1 hint so ptxas applies the
-// production register heuristic. See gvrTopKKernel<TopK> note above.
+// Templated on (InputT, TopK). __launch_bounds__ uses the single-arg form
+// so nvcc applies the same register heuristic as the multi-row dtype kernel
+// in heuristicTopKDecode.cu. See `gvrTopKKernel<TopK>` note above.
 
 template <typename InputT, int TopK = TOP_K>
 __global__ void __launch_bounds__(BLOCK_SIZE)
@@ -1720,7 +1680,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 {
     using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
     using SmemT
-        = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>; // P0: dtype keys fp32
+        = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>; // dtype keys fp32
     extern __shared__ unsigned char smem_raw[];
     auto* smem = reinterpret_cast<SmemT*>(smem_raw);
 
@@ -1743,24 +1703,18 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __half>,
         "launchHeuristicTopK supports only fp32 / bf16 / fp16");
 
-    // 4d.D: validate K against the supported set. Compile-time GvrParams
-    // specializations cover {512, 1024, 2048}; any other value rejects.
+    // GvrParams specializations cover K ∈ {512, 1024, 2048}; reject others.
     if (topK != 512 && topK != 1024 && topK != 2048)
         return cudaErrorInvalidValue;
 
-    // 4d.D: dispatch on (T, topK) → 9 distinct kernel-pointer paths.
-    // Each instantiation captures its own (kFTarget, kC, kNumBins) tuple
-    // via GvrParams<T, TopK> so all values are compile-time constants
-    // inside the kernel body (zero runtime overhead vs hardcoded literals).
-    //
-    // NOTE: opt-in shared memory + cudaLaunchKernelEx + PDL handling
-    // shared across all 9 kernels. We keep that block runtime-shared by
-    // taking the smem size and kernel function pointer from a
-    // template-parametric lambda.
+    // Dispatch on (T, topK) → 9 distinct kernel-pointer paths. Each
+    // instantiation captures its own (kFTarget, kC, kNumBins) tuple via
+    // GvrParams<T, TopK> so all values are compile-time constants inside
+    // the kernel body. Opt-in smem + cudaLaunchKernelEx + PDL handling is
+    // shared across all 9 paths via a template-parametric lambda.
 
     // Honor the standard TRTLLM_ENABLE_PDL env var (default on; set "0" to
-    // disable). This launcher is also reused by the standalone JIT-compiled
-    // PyTorch extension under ablation_study/gvr_phase_timing/.
+    // disable).
     bool enablePDL = true;
     if (char const* env = std::getenv("TRTLLM_ENABLE_PDL"))
     {
@@ -1770,8 +1724,8 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
 
     auto launchOne = [&]<int TopK>() -> cudaError_t
     {
-        // P0 (2026-05-07): dtype path uses fp32 smem keys (deferred convert).
-        // Launcher allocates smem with float keys regardless of input dtype.
+        // dtype path uses fp32 smem keys (deferred convert). Launcher
+        // allocates smem with float keys regardless of input dtype.
         using SmemT = KernelSmemTplK<float, GvrParams<T, TopK>::kC, GvrParams<T, TopK>::kNumBins>;
         size_t const smemSize = sizeof(SmemT);
 
@@ -1820,7 +1774,7 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
     }
 }
 
-// Explicit instantiations — fp32 (V2e baseline path) + bf16/fp16 (4d dtype path)
+// Explicit instantiations — fp32 + bf16/fp16
 template cudaError_t launchHeuristicTopK<float, int>(
     float const*, int, int const*, int, int, float*, int*, cudaStream_t, int);
 template cudaError_t launchHeuristicTopK<__nv_bfloat16, int>(

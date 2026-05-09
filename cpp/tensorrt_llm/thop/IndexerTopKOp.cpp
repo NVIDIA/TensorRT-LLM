@@ -88,7 +88,7 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
 
     // Caller-owned scratch buffer for heuristic TopK output values.
     // Must be pre-allocated with stable address for CUDA Graph compatibility.
-    // 4d_multi_dtype_unified: scratch dtype must match input dtype.
+    // scratch dtype must match input dtype.
     auto const logits_dtype = logits.scalar_type();
     TORCH_CHECK(logits_dtype == at::ScalarType::Float || logits_dtype == at::ScalarType::BFloat16
             || logits_dtype == at::ScalarType::Half,

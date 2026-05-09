@@ -691,28 +691,25 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
     // ========================================================================
-    // Scheme X v1.2 (2026-04-25): adds small-N dispatch axis.
+    // Small-N dispatch axis.
     //
     // GVR Heuristic Top-K has a *fixed* per-launch overhead from Phase-1
     // (preIdx stats reduction over M=2048) and Phase-4 (2048-bin histogram
     // snap), totaling ~11 µs regardless of N. For small N (≤16K), this
-    // fixed cost dominates and the kernel loses to TRT-LLM's own
+    // fixed cost dominates and the kernel loses to the existing
     // insertion-sort/radix path. Empirically (random data, B200 BS=1):
     //   N=8192   : Heuristic 16.5 µs vs Radix 11.2 µs (radix 1.47× faster)
     //   N=16384  : Heuristic 21.9 µs vs Radix 22.0 µs (parity)
     //   N=32768  : Heuristic 26.1 µs vs Radix 32.9 µs (heuristic 1.26× faster)
     //   N=131072 : Heuristic 43.4 µs vs Radix 76.1 µs (heuristic 1.75× faster)
     //
-    // We therefore route N < kSeqSmall to the existing Radix/Insertion path
-    // (which itself splits at kSortingAlgorithmThreshold=12288), giving the
-    // best of both worlds. kSeqSmall is set at the empirical crossover point.
-    //
-    // See ablation_study/gvr_phase_timing/05_scheme_x_production/v1.2_smallN_dispatch/
-    // for the full N-scaling sweep and per-layer validation.
+    // Route N < kSeqSmall to the existing Radix/Insertion path (which itself
+    // splits at kSortingAlgorithmThreshold=12288). kSeqSmall is set at the
+    // empirical crossover point.
     //
     // ========================================================================
-    // Scheme X v1.1 (2026-04-23): architecture-derived BS-threshold dispatch,
-    // now jointly bounded by occupancy AND L2 cache capacity.
+    // Architecture-derived BS-threshold dispatch — jointly bounded by
+    // occupancy AND L2 cache capacity.
     //
     // Two physical constraints bound when the per-row heuristic kernel
     // remains faster than a radix streaming kernel:
@@ -734,11 +731,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     //        over; e.g. N=128K → kBsL2=238, N=196K → kBsL2=155.
     //
     // Dispatch threshold = min(kBsWave, kBsL2), still data-agnostic (only
-    // queries hardware attrs). For the SWE-Bench scenario (N≈70K) this is
-    // equivalent to Scheme X v1.0 (both produce 426), so v1.1 is a
-    // zero-regression upgrade; for larger N it auto-tightens the threshold.
-    // See ablation_study/gvr_phase_timing/optM_unified/Scheme_X_Report_20260422.md
-    // §9 for the full N-scaling analysis.
+    // queries hardware attrs). At N≈70K both bounds produce ~426, so the
+    // L2 axis is a no-op there; for larger N it auto-tightens the threshold.
     // ========================================================================
     // Hardware-attribute cache (sm count, L2 capacity). std::call_once keeps
     // the first concurrent caller from racing on cudaDeviceGetAttribute and
@@ -761,14 +755,14 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         : kBsWave;
     int const kBsLarge = std::min(kBsWave, kBsL2 > 0 ? kBsL2 : kBsWave);
 
-    // v1.2: small-N lower bound — set to kSortingAlgorithmThreshold (12288) so
-    // the Heuristic axis takes over wherever the original Radix-radix branch
-    // would have triggered. Random-data benchmarks suggested 16384, but real
-    // SWE-Bench workloads see Heuristic ~6.3 us faster than random (preIdx-vs-
-    // logits ~99% correlated → P1 stats accurate → P2 secant 1-2 iter), shifting
-    // the real crossover into the [12288, 16384] band. Below 12288 the Insertion
-    // path is still used (canUseHeuristic gating + dispatcher fallback both
-    // route there). Configurable via TRTLLM_HEURISTIC_NMIN env (>=1024).
+    // Small-N lower bound — set to kSortingAlgorithmThreshold (12288) so the
+    // Heuristic axis takes over wherever the original Radix-radix branch
+    // would have triggered. Random-data benchmarks suggest the crossover is
+    // 16384, but workloads with strongly preIdx-correlated logits make P1
+    // stats accurate and P2 converge in 1-2 iterations, shifting the real
+    // crossover into the [12288, 16384] band. Below 12288 the Insertion path
+    // is still used (canUseHeuristic gating + dispatcher fallback both route
+    // there). Configurable via TRTLLM_HEURISTIC_NMIN env (>=1024).
     static std::once_flag sNMinOnceFlag;
     static int sCachedNMin = 0;
     std::call_once(sNMinOnceFlag,
@@ -894,12 +888,12 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 }
 
 // ============================================================================
-// bf16 / fp16 dispatcher overloads (4d_multi_dtype_unified, 2026-05-06)
+// bf16 / fp16 dispatcher overloads
 // ============================================================================
-// Reuse Scheme X v1.1 BS-threshold + v1.2 small-N axis (kBsLarge, kSeqSmall)
-// from the fp32 dispatcher, except kBsL2 uses 2 bytes/element instead of 4
+// Reuse the BS-threshold + small-N dispatch axes (kBsLarge, kSeqSmall) from
+// the fp32 dispatcher, except kBsL2 uses 2 bytes/element instead of 4
 // (L2 footprint is half) — this means bf16/fp16 path remains valid for
-// LARGER BS than fp32, anticipating the Stage C re-tune.
+// larger BS than fp32 at the same N.
 //
 // bf16/fp16 input has NO radix fallback — the production radix kernel
 // (topKPerRowDecode) is fp32-only. If GVR-Heuristic preconditions are not
