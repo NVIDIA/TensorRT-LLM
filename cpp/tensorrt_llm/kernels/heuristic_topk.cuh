@@ -307,7 +307,7 @@ struct KernelSmemTplK
 
     int warp_counts[NUM_WARPS];        // 64 B
     int histogram[NumBinsT];           // NumBinsT × 4B (default 2048 → 8 KB)
-    int per_thread_counts[BLOCK_SIZE]; // 2 KB — OPT7: cached from last blockCountGE
+    int per_thread_counts[BLOCK_SIZE]; // cached from the most recent blockCountGE call (Phase-3 reuse)
 
     float threshold;
     int cand_count;
@@ -328,7 +328,7 @@ using KernelSmemTpl = KernelSmemTplK<SmemKey>;
 using KernelSmem = KernelSmemTpl<float>;
 
 // ============================================================================
-// ★ OPT4: Warp-Level Reduction Primitives
+// Warp-Level Reduction Primitives
 // ============================================================================
 
 #if __CUDA_ARCH__ >= 800
@@ -410,7 +410,7 @@ __device__ __forceinline__ void blockCountGE(
     for (int i = (N & ~3) + tid; i < N; i += BLOCK_SIZE)
         c += (__ldg(&input[i]) >= threshold);
 
-    // OPT7: cache per-thread count for Phase 3 sub-pass 1 reuse
+    // cache per-thread count for Phase 3 sub-pass 1 reuse
     smem->per_thread_counts[tid] = c;
 
     c = warpReduceSum(c);
@@ -814,9 +814,8 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
     // Phase 3 (GVR Verify) — Ballot-free candidate collect
     // ================================================================
 
-    // OPT5: when done==1, Phase 2 already verified count in
-    //        [kK, kCC]; skip the redundant full-N
-    //        blockCountGE re-check entirely.
+    // When done==1, Phase 2 already verified the candidate count is in
+    // [kK, kCC]; skip the redundant full-N blockCountGE re-check.
     if (smem->done != 1)
     {
         blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
@@ -848,8 +847,8 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         }
     }
 
-    // OPT7: reuse per-thread counts cached by the last blockCountGE call;
-    //        saves one full N-scan (blockCountGE's __syncthreads guarantees visibility).
+    // Reuse per-thread counts cached by the last blockCountGE call (saves
+    // one full N-scan; blockCountGE's __syncthreads guarantees visibility).
     int my_total_qual = smem->per_thread_counts[tid];
 
     int thread_prefix = my_total_qual;
@@ -970,10 +969,11 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         }
         __syncthreads();
 
-        // OPT6: Parallel K-th bin search (2-step).
-        // Each warp sums BINS_PER_WARP consecutive bins (high→low); tid=0 locates the
-        // target warp in NUM_WARPS steps; one thread in that warp scans BINS_PER_WARP bins.
-        // Total serial depth: NUM_WARPS + BINS_PER_WARP = 16 + 128 = 144 steps vs 2048.
+        // Parallel K-th bin search (3-step).
+        // Step 1: each warp sums BINS_PER_WARP consecutive bins (high→low).
+        // Step 2: tid=0 locates the target warp in NUM_WARPS steps.
+        // Step 3: one thread in that warp scans its BINS_PER_WARP bins.
+        // Total serial depth: NUM_WARPS + BINS_PER_WARP steps vs full kBins.
         {
             constexpr int BINS_PER_WARP = kBins / NUM_WARPS;
             static_assert(kBins % NUM_WARPS == 0, "kBins must be divisible by NUM_WARPS");
@@ -1141,7 +1141,7 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
 template <int TopK = TOP_K>
 __global__ void __launch_bounds__(BLOCK_SIZE)
     gvrTopKKernel(float const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
-        int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
+        int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices)
 {
     using SmemT = KernelSmemTplK<float, GvrParams<float, TopK>::kC, GvrParams<float, TopK>::kNumBins>;
     extern __shared__ unsigned char smem_raw[];
@@ -1676,7 +1676,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
 template <typename InputT, int TopK = TOP_K>
 __global__ void __launch_bounds__(BLOCK_SIZE)
     gvrTopKKernelDtype(InputT const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
-        int const topK, InputT* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
+        int const topK, InputT* __restrict__ outputValues, int* __restrict__ outputIndices)
 {
     using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
     using SmemT
@@ -1697,7 +1697,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
 template <typename T, typename IdxT = int>
 cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M, int topK, T* outputValues,
-    IdxT* outputIndices, cudaStream_t stream = 0, int thresholdPos = -1)
+    IdxT* outputIndices, cudaStream_t stream = 0)
 {
     static_assert(sizeof(IdxT) == sizeof(int), "launchHeuristicTopK only supports 32-bit indices");
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __half>,
@@ -1761,7 +1761,7 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
         config.attrs = attrs;
         config.numAttrs = 1;
 
-        cudaLaunchKernelEx(&config, kfn, input, N, preIdx, M, topK, outputValues, outputIndices, thresholdPos);
+        cudaLaunchKernelEx(&config, kfn, input, N, preIdx, M, topK, outputValues, outputIndices);
         return cudaGetLastError();
     };
 
