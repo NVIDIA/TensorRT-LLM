@@ -876,6 +876,9 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None and hasattr(engine, 'cleanup'):
+                engine.cleanup()
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine

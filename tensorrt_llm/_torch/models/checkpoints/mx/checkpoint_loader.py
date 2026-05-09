@@ -149,18 +149,13 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def query_timeout_s(self) -> Optional[int]:
         return self._query_timeout_s
 
-    @property
-    def p2p_succeeded(self) -> bool:
-        """Whether the last load_weights() call used P2P transfer.
-
-        ``True`` means weights are already in model parameter buffers
-        and the standard weight-mapping pipeline should be skipped
-        for those parameters.
-        """
-        return self._p2p_succeeded
-
     def is_weights_preloaded(self) -> bool:
-        """Whether the last MX load wrote weights directly into the model."""
+        """Whether the last load_weights() call wired weights directly into the model.
+
+        ``True`` means MX P2P transfer succeeded, weights are already in model
+        parameter buffers, and the standard weight-mapping pipeline should be
+        skipped for those parameters.
+        """
         return self._p2p_succeeded
 
     def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs) -> dict[str, Any]:
@@ -404,7 +399,20 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def post_load_publish(
         self, model, *, checkpoint_dir: str, weights_preloaded: bool = False
     ) -> None:
-        """Publish only workers that loaded locally, not MX P2P receivers."""
+        """Publish locally loaded weights as an MX source when appropriate.
+
+        Args:
+            model: The loaded model whose parameters should be published for
+                future MX P2P receivers.
+            checkpoint_dir: Checkpoint directory used as a fallback model
+                identity when no explicit MX model name is configured.
+            weights_preloaded: Whether this worker already received weights
+                through MX P2P. When true, this worker is an MX receiver and
+                should not republish the same weights as a source.
+
+        Returns:
+            None.
+        """
         if weights_preloaded:
             return
         self.publish_as_source(model, checkpoint_dir=checkpoint_dir)
