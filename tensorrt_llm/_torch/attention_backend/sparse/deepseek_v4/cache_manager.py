@@ -204,6 +204,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             mapping=mapping,
             dtype=dtype,
+            enable_swa_scratch_reuse=True,  # DSV4 enable scratch reuse by default
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
@@ -446,6 +447,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return converter(
             base_indices,
             page_index_mode,
+            kv_cache.get_scratch_desc(pool_id),
         )
 
     def _get_converted_batch_page_indices(
@@ -466,9 +468,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             device="cpu",
         )
 
-        for row in range(len(request_ids)):
+        for row, request_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[request_id]
             base_indices = self.host_kv_cache_block_offsets[pool_id, int(copy_idx[row]), 0].tolist()
-            converted = converter(base_indices, page_index_mode)
+            converted = converter(base_indices, page_index_mode, kv_cache.get_scratch_desc(pool_id))
             if len(converted) > self.max_blocks_per_seq:
                 raise ValueError(
                     f"Converted page indices length {len(converted)} exceeds "
@@ -620,6 +623,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
+            enable_swa_scratch_reuse=self.enable_swa_scratch_reuse,
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
