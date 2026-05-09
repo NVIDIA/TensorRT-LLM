@@ -1535,15 +1535,12 @@ class PyTorchModelEngine(ModelEngine):
         return default_max_seq_len
 
     def _init_max_num_tokens(self):
-        # Modified from tensorrt_llm/_common.py check_max_num_tokens
+        # The user-facing clamp `max_num_tokens <= max_seq_len * max_batch_size`
+        # is now performed in `BaseLlmArgs.validate_runtime_args`, so by the
+        # time we get here `self.max_num_tokens` is already clamped whenever
+        # `max_seq_len` was set explicitly. We keep this fallback for the case
+        # where `max_num_tokens` was not provided at all.
         if self.max_num_tokens is None:
-            self.max_num_tokens = self.max_seq_len * self.batch_size
-        if self.max_num_tokens > self.max_seq_len * self.batch_size:
-            logger.warning(
-                f"max_num_tokens ({self.max_num_tokens}) shouldn't be greater than "
-                f"max_seq_len * max_batch_size ({self.max_seq_len * self.batch_size}), "
-                f"specifying to max_seq_len * max_batch_size ({self.max_seq_len * self.batch_size})."
-            )
             self.max_num_tokens = self.max_seq_len * self.batch_size
 
     def _init_model_capacity(self):
