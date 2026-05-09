@@ -369,7 +369,15 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        self.hidden_states = self.spec_resource_manager.hidden_states
+        if self.spec_resource_manager is not None and hasattr(
+                self.spec_resource_manager, 'hidden_states'):
+            self.hidden_states = self.spec_resource_manager.hidden_states
+        else:
+            self.hidden_states = torch.empty(
+                (self.max_num_tokens,
+                 self.hidden_size * len(self.layers_to_capture)),
+                dtype=self.dtype,
+                device='cuda')
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
