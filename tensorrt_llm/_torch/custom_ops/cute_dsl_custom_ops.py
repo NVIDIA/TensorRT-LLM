@@ -4380,6 +4380,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b.shape[0]
             l = 1  # dense GEMM
 
+            # The kernel wrapper expects alpha_scale laid out token-major
+            # (token has stride 1, expert has stride m), which gives
+            # warp 6 a coalesced load of 32 contiguous M alphas per expert.
+            # PyTorch's default contiguous (M, expert_count) is expert-major,
+            # so transpose+contiguous to convert.
+            alpha_scale = alpha_scale.t().contiguous()
+
             # Default tactic if not provided
             if isinstance(tactic, tuple) and len(tactic) == 3:
                 mma_tiler_mn, cluster_shape_mn, split_k = tactic

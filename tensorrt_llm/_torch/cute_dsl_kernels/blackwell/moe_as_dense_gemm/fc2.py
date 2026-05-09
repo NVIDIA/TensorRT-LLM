@@ -1211,7 +1211,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Reset producer state for this tile
                 alpha_scale_producer_state.reset_count()
                 peek_alpha_scale_empty_status = cutlass.Boolean(1)
-                if alpha_scale_producer_state.count < k_tile_cnt_local:
+                if alpha_scale_producer_state.count < experts_per_split_w6:
                     peek_alpha_scale_empty_status = alpha_scale_pipeline.producer_try_acquire(
                         alpha_scale_producer_state
                     )
@@ -1228,10 +1228,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 tAgAlphaScale = thr_copy_alpha_scale.partition_S(galpha_scale_mnl_current_tile)
                 tAsAlphaScale = thr_copy_alpha_scale.partition_D(sAlphaScale)
 
-                # Load alpha scale for each k tile (one per expert in this split)
-                for k_tile in cutlass.range(0, k_tile_cnt_local, 1, unroll=1):
-                    # Calculate expert index for this k_tile (with split-K offset)
-                    expert_idx = expert_offset_w6 + k_tile // tiles_per_expert_w6
+                # Load alpha scale once per expert in this split. Within an expert
+                # the alpha is invariant across the tiles_per_expert k_tiles, so we
+                # commit once per expert to mirror the MMA accumulator pipeline
+                # (which acquires/commits per expert, not per k_tile).
+                for expert in cutlass.range(0, experts_per_split_w6, 1, unroll=1):
+                    # Calculate expert index for this iteration (with split-K offset)
+                    expert_idx = expert_offset_w6 + expert
 
                     # Slice alpha scale for current tile and expert
                     tAgAlphaScale_slice = tAgAlphaScale[(None, None, expert_idx)]
@@ -1265,7 +1268,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                     # Peek next
                     peek_alpha_scale_empty_status = cutlass.Boolean(1)
-                    if alpha_scale_producer_state.count < k_tile_cnt_local:
+                    if alpha_scale_producer_state.count < experts_per_split_w6:
                         peek_alpha_scale_empty_status = alpha_scale_pipeline.producer_try_acquire(
                             alpha_scale_producer_state
                         )
@@ -1581,6 +1584,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
             m_total = malpha_scale_mnl.shape[0]
 
+            # MMA producer accumulates `tiles_per_expert_epi` k_tiles into a single
+            # tmem stage and commits once per expert. The epilogue therefore
+            # consumes the acc / alpha pipelines once per expert (not per k_tile),
+            # otherwise the second consumer_wait would block forever when
+            # weight_per_expert > mma_tiler_k.
+            tiles_per_expert_epi = self.weight_per_expert // self.mma_tiler[2]
+            experts_per_split_epi = k_tile_cnt_local // tiles_per_expert_epi
+
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -1619,21 +1630,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 if cutlass.const_expr(not self.swap_ab):
                     #
                     # Standard path: alpha loaded by warp 6 via alpha_scale_pipeline.
-                    # One scalar alpha per M position per expert.
+                    # One scalar alpha per M position per expert. Iterate once per
+                    # expert in this split (matches MMA acc commit cadence).
                     #
                     alpha_scale_consumer_state.reset_count()
                     peek_alpha_scale_full_status = cutlass.Boolean(1)
-                    if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                    if alpha_scale_consumer_state.count < experts_per_split_epi:
                         peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
                             alpha_scale_consumer_state
                         )
 
                     acc_consumer_state.reset_count()
                     peek_acc_full_status = cutlass.Boolean(1)
-                    if acc_consumer_state.count < k_tile_cnt_local:
+                    if acc_consumer_state.count < experts_per_split_epi:
                         peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
 
-                    for k_tile in cutlass.range(k_tile_cnt_local):
+                    for expert in cutlass.range(experts_per_split_epi):
                         tTR_tAcc = tTR_tAcc_base[
                             (None, None, None, None, None, acc_consumer_state.index)
                         ]
@@ -1680,7 +1692,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         alpha_scale_consumer_state.advance()
 
                         peek_alpha_scale_full_status = cutlass.Boolean(1)
-                        if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                        if alpha_scale_consumer_state.count < experts_per_split_epi:
                             peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
                                 alpha_scale_consumer_state
                             )
@@ -1691,7 +1703,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         acc_consumer_state.advance()
 
                         peek_acc_full_status = cutlass.Boolean(1)
-                        if acc_consumer_state.count < k_tile_cnt_local:
+                        if acc_consumer_state.count < experts_per_split_epi:
                             peek_acc_full_status = acc_pipeline.consumer_try_wait(
                                 acc_consumer_state
                             )
@@ -1701,20 +1713,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # SwapAB path: warp 6 loads cta_N alphas per expert via pipeline.
                     # Epilogue waits on pipeline, then copies epi_tile_n alpha per subtile
                     # to stage-0 region of sAlphaScale for broadcast read.
+                    # Iterate once per expert (matches MMA acc commit cadence).
                     #
                     alpha_scale_consumer_state.reset_count()
                     peek_alpha_scale_full_status = cutlass.Boolean(1)
-                    if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                    if alpha_scale_consumer_state.count < experts_per_split_epi:
                         peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
                             alpha_scale_consumer_state
                         )
 
                     acc_consumer_state.reset_count()
                     peek_acc_full_status = cutlass.Boolean(1)
-                    if acc_consumer_state.count < k_tile_cnt_local:
+                    if acc_consumer_state.count < experts_per_split_epi:
                         peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
 
-                    for k_tile in cutlass.range(k_tile_cnt_local):
+                    for expert in cutlass.range(experts_per_split_epi):
                         tTR_tAcc = tTR_tAcc_base[
                             (None, None, None, None, None, acc_consumer_state.index)
                         ]
@@ -1778,7 +1791,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         alpha_scale_consumer_state.advance()
 
                         peek_alpha_scale_full_status = cutlass.Boolean(1)
-                        if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                        if alpha_scale_consumer_state.count < experts_per_split_epi:
                             peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
                                 alpha_scale_consumer_state
                             )
@@ -1789,7 +1802,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         acc_consumer_state.advance()
 
                         peek_acc_full_status = cutlass.Boolean(1)
-                        if acc_consumer_state.count < k_tile_cnt_local:
+                        if acc_consumer_state.count < experts_per_split_epi:
                             peek_acc_full_status = acc_pipeline.consumer_try_wait(
                                 acc_consumer_state
                             )
@@ -2606,21 +2619,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
             )
 
-        # Create A scale factor tensor (swizzled layout)
-        # Shape: (32, 4, m // 128, 4, scale_k // 4, l)
+        # Create scale factor tensors (swizzled layout)
+        # Layout: (32, 4, ceil_div(dim, 128), 4, scale_k // 4, L) with order (2, 1, 4, 0, 3, 5)
+        # Use ceil_div for the M / N block dim to avoid zero-volume tensors when M < 128 or N < 128.
+        m_blocks = (m + 127) // 128
+        n_blocks = (n + 127) // 128
         a_sf = cute.make_tensor(
             a_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, m // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, m_blocks, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
             ),
         )
 
-        # Create B scale factor tensor (swizzled layout)
-        # Shape: (32, 4, n // 128, 4, scale_k // 4, l)
         b_sf = cute.make_tensor(
             b_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, n_blocks, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
             ),
         )
 
