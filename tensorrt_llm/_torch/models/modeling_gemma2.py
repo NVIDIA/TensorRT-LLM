@@ -20,30 +20,30 @@ import torch
 from torch import nn
 from transformers import Gemma2Config
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
-    BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (AttentionMask,
-                                           PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention_backend.interface import (
+    AttentionMask,
+    PositionalEmbeddingParams,
+    PredefinedAttentionMask,
+    RopeParams,
+)
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
-from ..modules.attention import Attention
 from ..modules.rms_norm import RMSNorm
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..utils import inference_mode_unless_compiling
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 
 class Gemma2ScaledWordEmbedding(Embedding):
-
     def __init__(
         self,
         vocab_size: int,
@@ -87,8 +87,7 @@ class Gemma2Attention(Attention):
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
         )
-        q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(
-            config.head_dim)
+        q_scaling = math.sqrt(config.query_pre_attn_scalar) / math.sqrt(config.head_dim)
         self.attention_window_size = config.sliding_window if is_sliding else None
 
         attn_logit_softcap = getattr(config, "attn_logit_softcapping", None)
@@ -136,7 +135,6 @@ def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
 
 
 class Gemma2DecoderLayer(DecoderLayer):
-
     def __init__(
         self,
         model_config: ModelConfig[Gemma2Config],
@@ -146,8 +144,7 @@ class Gemma2DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
         layer_types = getattr(config, "layer_types", [])
-        is_sliding = (len(layer_types) > layer_idx
-                      and layer_types[layer_idx] == "sliding_attention")
+        is_sliding = len(layer_types) > layer_idx and layer_types[layer_idx] == "sliding_attention"
         self.self_attn = Gemma2Attention(
             model_config,
             layer_idx=layer_idx,
@@ -204,15 +201,13 @@ class Gemma2DecoderLayer(DecoderLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states,
-                                 lora_params=kwargs.get("lora_params", None))
+        hidden_states = self.mlp(hidden_states, lora_params=kwargs.get("lora_params", None))
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
 
 class Gemma2TextModel(DecoderModel):
-
     def __init__(self, model_config: ModelConfig[Gemma2Config]):
         super().__init__(model_config)
         config = self.model_config
@@ -226,10 +221,12 @@ class Gemma2TextModel(DecoderModel):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
         )
-        self.layers = nn.ModuleList([
-            Gemma2DecoderLayer(model_config, layer_idx)
-            for layer_idx in range(config.pretrained_config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Gemma2DecoderLayer(model_config, layer_idx)
+                for layer_idx in range(config.pretrained_config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             hidden_size=config.pretrained_config.hidden_size,
             eps=config.pretrained_config.rms_norm_eps,
@@ -246,8 +243,7 @@ class Gemma2TextModel(DecoderModel):
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "Specify exactly one of input_ids or inputs_embeds.")
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -267,9 +263,7 @@ class Gemma2TextModel(DecoderModel):
 
 
 @register_auto_model("Gemma2ForCausalLM")
-class Gemma2ForCausalLM(DecoderModelForCausalLM[Gemma2TextModel,
-                                                Gemma2Config]):
-
+class Gemma2ForCausalLM(DecoderModelForCausalLM[Gemma2TextModel, Gemma2Config]):
     def __init__(self, model_config: ModelConfig[Gemma2Config]):
         super().__init__(
             Gemma2TextModel(model_config),
@@ -278,7 +272,8 @@ class Gemma2ForCausalLM(DecoderModelForCausalLM[Gemma2TextModel,
             vocab_size=model_config.pretrained_config.vocab_size,
         )
         self._final_logit_softcap = getattr(
-            model_config.pretrained_config, "final_logit_softcapping", None)
+            model_config.pretrained_config, "final_logit_softcapping", None
+        )
 
     @inference_mode_unless_compiling
     def forward(
@@ -306,12 +301,10 @@ class Gemma2ForCausalLM(DecoderModelForCausalLM[Gemma2TextModel,
         if self._final_logit_softcap is not None:
             cap = float(self._final_logit_softcap)
             if cap <= 0:
-                raise ValueError(
-                    f"final_logit_softcapping must be > 0, got {cap}.")
+                raise ValueError(f"final_logit_softcapping must be > 0, got {cap}.")
             logits = logits * (1.0 / cap)
             logits = torch.tanh(logits) * cap
         return logits
 
-    def load_weights(self, weights: Dict,
-                     weight_mapper: Optional[BaseWeightMapper] = None):
+    def load_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
         super().load_weights(weights, weight_mapper)

@@ -20,8 +20,7 @@ from transformers import Gemma2Config
 from transformers import Gemma2ForCausalLM as HFGemma2ForCausalLM
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.checkpoints.hf.gemma2_weight_mapper import \
-    Gemma2HfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.gemma2_weight_mapper import Gemma2HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma2 import Gemma2ForCausalLM
 from tensorrt_llm.mapping import Mapping
 
@@ -44,8 +43,10 @@ GEMMA2_SMALL_CONFIG = {
     "rope_scaling": {"rope_theta": 10000.0, "rope_type": "default"},
     "sliding_window": 32,
     "layer_types": [
-        "sliding_attention", "full_attention",
-        "sliding_attention", "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
     ],
     "torch_dtype": "bfloat16",
     "vocab_size": 1024,
@@ -54,17 +55,14 @@ GEMMA2_SMALL_CONFIG = {
 
 
 def _build_hf_config(config_dict):
-    config = Gemma2Config(**{
-        k: v
-        for k, v in config_dict.items()
-        if k not in ("architectures", "torch_dtype")
-    })
+    config = Gemma2Config(
+        **{k: v for k, v in config_dict.items() if k not in ("architectures", "torch_dtype")}
+    )
     config.torch_dtype = torch.bfloat16
     return config
 
 
 class TestGemma2ForCausalLM(unittest.TestCase):
-
     def _build_model(self, config_dict: dict):
         config = _build_hf_config(config_dict)
         mapping = Mapping(world_size=1, tp_size=1)
@@ -104,8 +102,7 @@ class TestGemma2ForCausalLM(unittest.TestCase):
 
         # Verify 1P RMSNorm: TRT-LLM weight = HF weight + 1.0
         hf_norm_w = weights["model.layers.0.input_layernorm.weight"]
-        trt_norm_w = trtllm_model.model.layers[
-            0].input_layernorm.weight.data.float()
+        trt_norm_w = trtllm_model.model.layers[0].input_layernorm.weight.data.float()
         self.assertTrue(
             torch.allclose(trt_norm_w, hf_norm_w.float() + 1.0),
             "1P RMSNorm +1 correction not applied correctly",
@@ -122,6 +119,7 @@ class TestGemma2ForCausalLM(unittest.TestCase):
     def test_rope_params_default_type(self):
         """RopeParams.from_config must not raise for rope_type='default'."""
         from tensorrt_llm._torch.attention_backend.interface import RopeParams
+
         config = Gemma2Config()
         # Explicitly set to verify the "default" alias branch is exercised.
         config.rope_scaling = {"rope_theta": 10000.0, "rope_type": "default"}
@@ -135,19 +133,17 @@ class TestGemma2ForCausalLM(unittest.TestCase):
 
 
 class TestGemma2AttentionSliding(unittest.TestCase):
-
     def test_sliding_layer_has_window(self):
         config = _build_hf_config(GEMMA2_SMALL_CONFIG)
         mapping = Mapping(world_size=1, tp_size=1)
         model_config = ModelConfig(pretrained_config=config, mapping=mapping)
 
         from tensorrt_llm._torch.models.modeling_gemma2 import Gemma2Attention
-        attn_sliding = Gemma2Attention(model_config, layer_idx=0,
-                                       is_sliding=True)
+
+        attn_sliding = Gemma2Attention(model_config, layer_idx=0, is_sliding=True)
         attn_full = Gemma2Attention(model_config, layer_idx=1, is_sliding=False)
 
-        self.assertEqual(attn_sliding.attention_window_size,
-                         config.sliding_window)
+        self.assertEqual(attn_sliding.attention_window_size, config.sliding_window)
         self.assertIsNone(attn_full.attention_window_size)
 
 
@@ -156,8 +152,8 @@ class TestPaliGemmaSmoke(unittest.TestCase):
 
     def _build_paligemma_model(self):
         from transformers import PaliGemmaConfig, SiglipVisionConfig
-        from tensorrt_llm._torch.models.modeling_paligemma import \
-            PaliGemmaForConditionalGeneration
+
+        from tensorrt_llm._torch.models.modeling_paligemma import PaliGemmaForConditionalGeneration
 
         vision_config = SiglipVisionConfig(
             hidden_size=64,
@@ -191,12 +187,11 @@ class TestPaliGemmaSmoke(unittest.TestCase):
 
     def test_image_token_ids_is_buffer(self):
         """image_token_ids must be a registered buffer, not a plain tensor."""
-        from tensorrt_llm._torch.models.modeling_paligemma import \
-            PaliGemmaForConditionalGeneration
         model = self._build_paligemma_model()
         buffer_names = [name for name, _ in model.named_buffers()]
-        self.assertIn("image_token_ids", buffer_names,
-                      "image_token_ids must be a registered buffer")
+        self.assertIn(
+            "image_token_ids", buffer_names, "image_token_ids must be a registered buffer"
+        )
 
     def test_mm_projector_shape(self):
         """Projector linear weight has expected shape."""

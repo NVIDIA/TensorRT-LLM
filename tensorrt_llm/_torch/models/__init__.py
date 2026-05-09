@@ -10,7 +10,6 @@ from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma2 import Gemma2ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
-from .modeling_paligemma import PaliGemmaForConditionalGeneration
 from .modeling_glm import Glm4MoeForCausalLM
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
@@ -25,6 +24,7 @@ from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_nemotron_nano import NemotronH_Nano_VL_V2
 from .modeling_nemotron_nas import NemotronNASForCausalLM
+from .modeling_paligemma import PaliGemmaForConditionalGeneration
 from .modeling_phi3 import Phi3ForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
