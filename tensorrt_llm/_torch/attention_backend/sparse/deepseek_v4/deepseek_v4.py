@@ -21,6 +21,7 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 from ..dsa import HAS_FAST_HADAMARD, DSAtrtllmAttentionMetadata, Indexer, rotate_activation
 from ..kernel import deepseek_v4_local_to_global_indices
@@ -34,13 +35,32 @@ DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO = 4
 
 
 class DeepseekV4AttentionType(Enum):
+    # attentions managed in sliding-window mode are put in the front on purpose
     SWA = 0
-    COMPRESS = 1
-    COMPRESSOR_KV = 2
-    COMPRESSOR_SCORE = 3
-    INDEXER_COMPRESS = 4
-    INDEXER_COMPRESSOR_KV = 5
-    INDEXER_COMPRESSOR_SCORE = 6
+    COMPRESSOR_KV = 1
+    COMPRESSOR_SCORE = 2
+    INDEXER_COMPRESSOR_KV = 3
+    INDEXER_COMPRESSOR_SCORE = 4
+
+    # attentions not managed in sliding-window mode
+    COMPRESS = 5
+    INDEXER_COMPRESS = 6
+
+    @property
+    def role(self) -> DataRole:
+        return DataRole(f"deepseek_v4_{self.name.lower()}")
+
+
+DEEPSEEK_V4_SLIDING_ATTENTION = (
+    DeepseekV4AttentionType.SWA,
+    DeepseekV4AttentionType.COMPRESSOR_KV,
+    DeepseekV4AttentionType.COMPRESSOR_SCORE,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+)
+assert tuple(attn_type.value for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION) == tuple(
+    range(len(DEEPSEEK_V4_SLIDING_ATTENTION))
+)
 
 
 def is_overlap_compressor(compress_ratio: int) -> bool:
@@ -356,21 +376,38 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
-        self.block_tables = {
-            attention_type: self.get_empty(
+        # Sliding-window caches use per-layer page indices and are indexed by
+        # [local_layer_idx, attention_type.value, sequence, block]. COMPRESS
+        # uses ratio-shared page indices, and INDEXER_COMPRESS keeps a separate
+        # compatibility table for the generic DSA indexer path.
+        block_table_shape = (
+            self.kv_cache_manager.num_local_layers,
+            len(DEEPSEEK_V4_SLIDING_ATTENTION),
+            self.max_num_sequences,
+            self.kv_cache_manager.max_blocks_per_seq,
+        )
+        self.sliding_block_tables = self.get_empty(
+            self.cuda_graph_buffers,
+            block_table_shape,
+            cache_name="sliding_block_tables",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+        compress_block_table_shape = (
+            self.max_num_sequences,
+            self.kv_cache_manager.max_blocks_per_seq,
+        )
+        self.compress_block_tables = {
+            compress_ratio: self.get_empty(
                 self.cuda_graph_buffers,
-                (self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq),
-                cache_name=f"block_tables_{attention_type}",
+                compress_block_table_shape,
+                cache_name=f"compress_block_tables_{compress_ratio}",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            for attention_type in self.attention_type_set
-        }
-        self.host_block_tables = {
-            attention_type: torch.empty_like(
-                self.block_tables[attention_type], device="cpu", pin_memory=prefer_pinned()
-            )
-            for attention_type in self.attention_type_set
+            for compress_ratio in self._compress_ratios_sorted
+            if is_compress_layer(compress_ratio)
         }
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -403,47 +440,34 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self._init_cache_buffer_data_pointers()
 
     def prepare_for_indexer_k_cache(self):
-        """Optimized: bulk tensor copy instead of per-row Python loop.
-
-        Note: must use num_contexts=0 for get_batch_attn_offset because the
-        indexer k cache always uses generation-style copy indices regardless
-        of request type.
-        """
-        num_seqs = self.num_seqs
-        offsets = self.kv_cache_manager.get_batch_attn_offset(
+        """Prepare the shared indexer K-cache decode table for DSA kernels."""
+        # INDEXER_COMPRESS uses shared page indices, so the generic DSA
+        # indexer path only needs one 2D block table.
+        self.kv_cache_manager.copy_batch_indexer_compress_block_tables(
+            self.host_indexer_k_cache_block_offsets,
             self.request_ids,
-            1,  # beam_width
-            0,  # num_contexts=0 (indexer always uses gen-style copy index)
-            num_seqs,
-            DeepseekV4AttentionType.INDEXER_COMPRESS,
-            DEEPSEEK_V4_SPARSE_RATIO,
+            self.num_seqs,
         )
-        num_cols = offsets.shape[1]
-        self.host_indexer_k_cache_block_offsets[:num_seqs, :num_cols] = offsets[:num_seqs]
-        self.indexer_k_cache_block_offsets[:num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[:num_seqs],
+        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
+            self.host_indexer_k_cache_block_offsets[: self.num_seqs],
             non_blocking=True,
         )
 
     def prepare_for_block_tables(self):
-        """Prepare block tables for all attention types.
-
-        Delegates offset computation to DeepseekV4CacheManager.get_batch_block_offsets
-        (single get_copy_index call, deduplicated by pool), then copies to device.
-        """
-        num_seqs = self.num_seqs
-        offsets_map = self.kv_cache_manager.get_batch_block_offsets(
-            self.request_ids, self.num_contexts, self.attention_type_set
+        """Prepare block tables for sliding-window and compressed attention."""
+        self.kv_cache_manager.copy_batch_sliding_block_tables(
+            self.sliding_block_tables,
+            self.request_ids,
+            self.num_contexts,
+            self.num_seqs,
         )
-
-        # Phase 1: write host buffers.
-        for key, offsets in offsets_map.items():
-            self.host_block_tables[key][:num_seqs] = offsets[:num_seqs]
-
-        # Phase 2: batch H2D copies.
-        for key in self.attention_type_set:
-            self.block_tables[key][:num_seqs].copy_(
-                self.host_block_tables[key][:num_seqs], non_blocking=True
+        for compress_ratio, compress_block_table in self.compress_block_tables.items():
+            self.kv_cache_manager.copy_batch_compress_block_tables(
+                compress_block_table,
+                self.request_ids,
+                compress_ratio=compress_ratio,
+                num_contexts=self.num_contexts,
+                num_seqs=self.num_seqs,
             )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
@@ -544,10 +568,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
             self.max_draft_tokens - 1
         )
+        # SWA uses PER_LAYER indices; COMPRESS uses SHARED indices. The sparse
+        # MLA conversion kernel receives a representative base pointer per pool
+        # and a per-layer buffer pointer so it can account for any layer offset.
+        self.sparse_mla_base_ptrs = {
+            1: self.kv_cache_manager.swa_pool_ptr,
+        }
+        for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
+            self.sparse_mla_base_ptrs[ratio] = compress_pool_ptr
+
         self.swa_buffer_ptrs = {
-            layer_idx: self.kv_cache_manager.get_buffers(
-                layer_idx, DeepseekV4AttentionType.SWA
-            ).data_ptr()
+            layer_idx: self.kv_cache_manager.swa_pool_ptr
             for layer_idx in self.kv_cache_manager.pp_layers
         }
         self.compressed_buffer_ptrs = {
@@ -557,14 +588,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for layer_idx in self.kv_cache_manager.pp_layers
             if is_compress_layer(extend_compress_ratios[layer_idx])
         }
-
-        # Per-ratio base pointer for sparse MLA global-index conversion.
-        # Ratio 1 is the SWA pool; ratios greater than 1 are compressed pools.
-        self.sparse_mla_base_ptrs = {
-            1: self.kv_cache_manager.swa_pool_ptr,
-        }
-        for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
-            self.sparse_mla_base_ptrs[ratio] = compress_pool_ptr
 
     def prepare(self):
         TrtllmAttentionMetadata.prepare(self)
@@ -594,15 +617,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         has_sparse_layers = DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
 
+        # For block offsets
+        self.prepare_for_block_tables()
+
         # For indexer k cache (only needed when sparse layers exist)
         if has_sparse_layers:
             self.prepare_for_indexer_k_cache()
 
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
-
-        # For block offsets
-        self.prepare_for_block_tables()
 
         # For DeepSeek-V4 indices
         self.prepare_for_deepseek_v4_indices()
@@ -1125,6 +1148,16 @@ class DeepseekV4Indexer(Indexer):
         self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
         return q_fp8, q_scale, k_fp8, k_scale, weights
 
+    def _update_k_cache(
+        self,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+    ) -> None:
+        # DSV4's indexer compressor already scatters INDEXER_COMPRESS. The
+        # shared DSA scatter would duplicate that write.
+        return
+
     def forward(
         self,
         qr: torch.Tensor,
@@ -1285,14 +1318,15 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         # Use global req_id directly
         req_id = metadata.req_idx_per_token[start_idx:end_idx]
         swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
-        block_table_swa = metadata.block_tables[(1, DeepseekV4AttentionType.SWA)]
+        local_layer_idx = kv_cache_manager.layer_offsets[layer_idx]
+        block_table_swa = metadata.sliding_block_tables[
+            local_layer_idx, DeepseekV4AttentionType.SWA.value
+        ]
 
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
-            block_table_compressed = metadata.block_tables[
-                (self.compress_ratio, DeepseekV4AttentionType.COMPRESS)
-            ]
+            block_table_compressed = metadata.compress_block_tables[self.compress_ratio]
             if self.compress_ratio == 4:
                 topk_indices = forward_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
