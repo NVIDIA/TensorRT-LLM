@@ -7,7 +7,6 @@ import torch
 
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig)
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...inputs.multimodal import MultimodalParams
@@ -391,12 +390,6 @@ class CUDAGraphRunner:
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
-        logger.debug(
-            f"[Memory-Debug][rank={self.config.mapping.rank}][cuda_graph:capture] "
-            f"key={key} is_draft_model={self.config.is_draft_model} "
-            f"graphs_so_far={len(self.graphs)} "
-            f"torch_memory_allocated={torch.cuda.memory_allocated()/1024**3:.2f}GiB"
-        )
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
