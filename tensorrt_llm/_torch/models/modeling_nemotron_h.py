@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, NemotronHConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -52,12 +52,11 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
 
-class NemotronHConfig(PretrainedConfig):
-    model_type = "nemotron_h"
-
-
 class NemotronHPuzzleConfig(PretrainedConfig):
     model_type = "nemotron_h_puzzle"
+
+
+NemotronHModelConfig = ModelConfig[NemotronHConfig | NemotronHPuzzleConfig]
 
 
 def _bc_getattr(bc, key, default=None):
@@ -81,7 +80,7 @@ class MLPLayer(MLP):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
@@ -121,7 +120,7 @@ class TransformerLayer(Attention):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         reduce_output: bool = False,
         use_custom_cublas_mm: bool = False,
@@ -413,7 +412,7 @@ class NemotronHLayer(DecoderLayer):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         # M -> MambaLayer
         # - -> MLPLayer
@@ -638,7 +637,7 @@ class NemotronHLayer(DecoderLayer):
 
 class NemotronHModel(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[NemotronHConfig]):
+    def __init__(self, model_config: NemotronHModelConfig):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
 
@@ -764,7 +763,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig | NemotronHPuzzleConfig],
+        model_config: NemotronHModelConfig,
     ):
         # rms_norm_eps might be named differently in the config.
         if hasattr(model_config.pretrained_config, "rms_norm_eps"):
@@ -911,7 +910,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         has_start_projections: bool,
@@ -1062,7 +1061,7 @@ class NemotronHMTP(nn.Module):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         is_separate_draft_engine: bool = False,
@@ -1114,8 +1113,8 @@ class NemotronHMTP(nn.Module):
         # Add shared_head for MTP, following DeepseekV3MTP pattern
         self.shared_head = DeepseekV3MTPHead(model_config)
 
-    def _get_mtp_sublayer_quant_config(
-            self, model_config: ModelConfig[NemotronHConfig], layer_idx: int):
+    def _get_mtp_sublayer_quant_config(self, model_config: NemotronHModelConfig,
+                                       layer_idx: int):
         """
         Get quantization config for MTP sublayer.
         The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
@@ -1161,5 +1160,4 @@ class NemotronHMTP(nn.Module):
         return hidden_states
 
 
-AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)
 AutoConfig.register(NemotronHPuzzleConfig.model_type, NemotronHPuzzleConfig)

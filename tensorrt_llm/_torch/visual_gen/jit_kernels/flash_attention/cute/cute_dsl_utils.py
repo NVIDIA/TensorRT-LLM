@@ -109,10 +109,11 @@ def load_cubin_module_data_patched(cubin_data, filepath):
 
 
 class _CuteCompilePatched:
-    """Wrapper around cute.compile that optionally dumps SASS via CUTE_CUBIN_PATH.
+    """Drop-in replacement for cute.compile that dumps SASS when CUTE_CUBIN_PATH is set.
 
-    Preserves the CompileCallable subscript interface (cute.compile[opts](...))
-    so that third-party CuTe DSL kernels (e.g. FlashInfer) keep working.
+    Must be a class (not a function) because cute.compile is a CompileCallable
+    supporting both `cute.compile(...)` and `cute.compile[opts](...)`. The latter
+    form is used by FlashInfer's mamba SSD kernels, so __getitem__ is preserved.
     """
 
     def __init__(self, original=None):
