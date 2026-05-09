@@ -517,6 +517,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mGroupsHeadsQ, false, bool)                                                              \
   /* Whether to group both tokensQ and headsQ into one CTA. */                                     \
   X(bool, mGroupsTokensHeadsQ, false, bool)                                                        \
+  /* Whether the DSv4 sparse MLA sliding-window KV pool is enabled. */                             \
+  X(bool, mHasSlidingWindowKvPool, false, bool)                                                    \
   /* The head dimension per CTA for V. */                                                          \
   X(int32_t, mHeadDimPerCtaV, 0, int32_t)                                                          \
   /* The head dimension per stage for K/V. */                                                      \
@@ -671,6 +673,13 @@ struct KernelConfigBase {
 
   bool operator!=(KernelConfigBase const& o) const { return !(*this == o); }
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Config_>
+__host__ __device__ inline bool supportsVarSparseMlaTopKLens(Config_ const& config) {
+  return config.mIsMlaGen && isDynamicTokenSparse(config.mSparseType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

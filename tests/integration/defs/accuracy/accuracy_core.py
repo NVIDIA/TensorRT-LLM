@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.builder import BuildConfig
+from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
@@ -71,6 +72,7 @@ def compute_threshold(num_samples: int,
 class HypothesisTestingParams:
     ref_accuracy: float
     num_samples: int
+    metric_name: str = "accuracy"
     alpha: float = 0.05
     beta: float = 0.2
     sigma: float = 50.0
@@ -91,8 +93,9 @@ class HypothesisTestingParams:
             higher_is_better=self.higher_is_better)
 
     def report(self, accuracy: Optional[float] = None) -> str:
+        metric_name = self.metric_name.upper()
         report = f"""===========================================================
-= ACCURACY HYPOTHESIS TESTING
+= {metric_name} HYPOTHESIS TESTING
 ===========================================================
 Alpha (Type I:  False Positive): {self.alpha:.3f}
 Beta  (Type II: False Negative): {self.beta:.3f}
@@ -100,18 +103,21 @@ Sigma (Standard deviation): {self.sigma:.3f}
 #Samples: {self.num_samples}
 Higher is better: {self.higher_is_better}
 Theta (Minimum detectable effect): {self.theta:.3f}
-Reference accuracy: {self.ref_accuracy:.3f}
+Reference {self.metric_name}: {self.ref_accuracy:.3f}
 Threshold: {self.threshold:.3f}
 ==========================================================="""
         if accuracy is not None:
             report = f"""{report}
-Evaluated accuracy: {accuracy:.3f}
+Evaluated {self.metric_name}: {accuracy:.3f}
 ==========================================================="""
         return report
 
     def assert_passing(self, accuracy: float) -> None:
         compare_op = ">=" if self.higher_is_better else "<="
-        err_msg = f"Reference accuracy is {self.ref_accuracy:.3f}, threshold is {self.threshold:.3f}. Expected accuracy {compare_op} threshold, but got {accuracy:.3f}. Please see hypothesis testing report:\n{self.report(accuracy)}"
+        err_msg = (
+            f"Reference {self.metric_name} is {self.ref_accuracy:.3f}, threshold is {self.threshold:.3f}. "
+            f"Expected {self.metric_name} {compare_op} threshold, but got {accuracy:.3f}. "
+            f"Please see hypothesis testing report:\n{self.report(accuracy)}")
         if self.higher_is_better:
             assert accuracy >= self.threshold, err_msg
         else:
@@ -125,6 +131,7 @@ class AccuracyTask:
     DATASET = None
     DATASET_DIR = None
     HIGHER_IS_BETTER = True
+    METRIC_NAME = "accuracy"
 
     # Hypothesis testing parameters
     ALPHA = None
@@ -168,12 +175,15 @@ class AccuracyTask:
                 break
         else:
             if os.getenv("TRTLLM_ACCURACY_NO_REFERENCE") == "1":
-                entry = {"accuracy": 0}
+                metric_key = self.METRIC_NAME.lower()
+                entry = {metric_key: 0 if self.HIGHER_IS_BETTER else math.inf}
             else:
                 raise ValueError(f"Not registered specs: {acc_specs}.")
 
+        metric_key = self.METRIC_NAME.lower()
         return HypothesisTestingParams(
-            ref_accuracy=entry.get("accuracy"),
+            ref_accuracy=entry.get(metric_key, entry.get("accuracy")),
+            metric_name=self.METRIC_NAME,
             alpha=entry.get("alpha", self.ALPHA),
             beta=entry.get("beta", self.BETA),
             sigma=entry.get("sigma", self.SIGMA),
@@ -207,8 +217,11 @@ class AccuracyTask:
             logger.info(
                 "Running in INTEGRATION_TEST mode: using only 1 sample and skipping accuracy verification"
             )
-            hypothesis_testing_params = HypothesisTestingParams(ref_accuracy=0,
-                                                                num_samples=1)
+            hypothesis_testing_params = HypothesisTestingParams(
+                ref_accuracy=0 if self.HIGHER_IS_BETTER else math.inf,
+                num_samples=1,
+                metric_name=self.METRIC_NAME,
+                higher_is_better=self.HIGHER_IS_BETTER)
         else:
             hypothesis_testing_params = self.get_hypothesis_testing_params(
                 dtype=llm.args.dtype,
@@ -238,13 +251,38 @@ class AccuracyTask:
         evaluate_kwargs = {}
         if hasattr(self, 'EVALUATE_KWARGS'):
             evaluate_kwargs.update(self.EVALUATE_KWARGS)
-        accuracy = evaluator.evaluate(llm, sampling_params, streaming,
-                                      **evaluate_kwargs)
+        score = evaluator.evaluate(llm, sampling_params, streaming,
+                                   **evaluate_kwargs)
 
         logger.info(
-            f"Hypothesis testing report:\n{hypothesis_testing_params.report(accuracy)}"
+            f"Hypothesis testing report:\n{hypothesis_testing_params.report(score)}"
         )
-        hypothesis_testing_params.assert_passing(accuracy)
+        hypothesis_testing_params.assert_passing(score)
+
+
+class VoxPopuli(AccuracyTask):
+    """ASR accuracy task on the facebook/voxpopuli dataset, scored by WER (lower is better)."""
+
+    DATASET = "voxpopuli"
+    DATASET_DIR = f"{llm_models_root()}/datasets/facebook/voxpopuli"
+    METRIC_NAME = "WER"
+    HIGHER_IS_BETTER = False
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = 32
+
+    MAX_INPUT_LEN = 8192
+    MAX_OUTPUT_LEN = 128
+    MAX_BATCH_SIZE = 64
+
+    EVALUATOR_CLS = AudioASREvaluator
+    EVALUATOR_KWARGS = {
+        "dataset_path": DATASET_DIR,
+        "split": "test",
+        "text_column": "normalized_text",
+    }
 
 
 class CnnDailymail(AccuracyTask):
@@ -845,8 +883,8 @@ class CliFlowAccuracyTestHarness:
             extra_eval_long_context_args: Optional[list] = None,
             env: Optional[Dict[str, str]] = None,
             timeout_manager=None):
-        """
-        Run all accuracy test phases with timeout management.
+        """Run all accuracy test phases with timeout management.
+
         If timeout_manager is provided, each phase will be wrapped to track and deduct remaining timeout.
         """
         # Use timeout_manager to manage timeout for each phase

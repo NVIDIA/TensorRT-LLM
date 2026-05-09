@@ -1,0 +1,273 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Syncs LFS binary objects from a contributor's fork into this repository's
+# LFS storage after a cross-fork PR is merged.
+#
+# Background: when GitHub merges a PR from a fork it only copies Git pointer
+# files (small text blobs). The actual LFS binary objects remain in the fork's
+# LFS storage and become inaccessible to users who clone this repo. This
+# workflow closes that gap by fetching the objects from the fork and pushing
+# them to the main repository's LFS storage, then verifies with a fresh clone.
+
+name: Sync LFS Objects After Merge
+
+on:
+  pull_request_target:
+    types: [closed]
+
+jobs:
+  sync-lfs-objects:
+    name: Sync LFS Objects from Fork
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    # Run only when:
+    #   - The PR was actually merged (not just closed)
+    #   - The PR came from a fork (same-repo PRs share LFS storage already)
+    if: |
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name != github.repository
+
+    steps:
+      - name: Checkout merge commit without LFS smudge
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          lfs: false
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install git-lfs
+        run: git lfs install
+
+      - name: Detect LFS files and check storage status
+        id: detect-lfs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          # lfs_status values:
+          #   none    — no LFS-tracked files changed, nothing to do
+          #   synced  — LFS objects already in this repo's storage
+          #   pending — LFS objects need to be fetched from the fork
+
+          git fetch --depth=1 origin "$BASE_SHA"
+
+          mapfile -t CHANGED < <(git diff --name-only --diff-filter=AM "$BASE_SHA" "$MERGE_SHA")
+
+          LFS_FILES=()
+          for f in "${CHANGED[@]}"; do
+            if [ -f "$f" ] && git check-attr filter "$f" | grep -q "filter: lfs"; then
+              LFS_FILES+=("$f")
+            fi
+          done
+
+          if [ "${#LFS_FILES[@]}" -eq 0 ]; then
+            echo "No LFS-tracked files changed in this PR — nothing to sync."
+            echo "lfs_status=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "LFS-tracked files changed in this PR:"
+          printf '  %s\n' "${LFS_FILES[@]}"
+          printf '%s\n' "${LFS_FILES[@]}" > /tmp/lfs_files.txt
+
+          # Try to fetch the changed objects from this repo's own LFS storage.
+          # Use --include to avoid pulling every LFS object in the shallow clone.
+          INCLUDE_PATTERN=$(IFS=,; echo "${LFS_FILES[*]}")
+          git lfs fetch origin HEAD --include="$INCLUDE_PATTERN" 2>&1 | grep -v "Authorization" || true
+
+          ALL_PRESENT=true
+          for f in "${LFS_FILES[@]}"; do
+            git lfs checkout "$f" 2>/dev/null || true
+            if git lfs pointer --check "$f" >/dev/null 2>&1; then
+              echo "Not yet in storage: $f"
+              ALL_PRESENT=false
+            else
+              echo "Already in storage: $f"
+              git checkout HEAD -- "$f"  # restore pointer for subsequent steps
+            fi
+          done
+
+          if [ "$ALL_PRESENT" = "true" ]; then
+            echo "lfs_status=present" >> "$GITHUB_OUTPUT"
+            echo "All LFS objects already present — skipping sync from fork."
+          else
+            echo "lfs_status=pending" >> "$GITHUB_OUTPUT"
+            echo "Some LFS objects missing — will sync from fork."
+          fi
+
+      - name: Fetch LFS objects from contributor fork
+        id: fetch-lfs
+        continue-on-error: true
+        if: steps.detect-lfs.outputs.lfs_status == 'pending'
+        env:
+          FORK_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          # actions/checkout sets http.https://github.com/.extraheader with
+          # GITHUB_TOKEN for ALL github.com URLs. Sending this token to the
+          # fork's LFS endpoint causes a 403 even on public forks. Re-scope the
+          # header to just this repo so the fork is reached anonymously.
+          if git config --local http.https://github.com/.extraheader >/dev/null 2>&1; then
+            echo "Found http.extraheader scoped to https://github.com/ — re-scoping to ${REPO} only"
+            AUTH_HEADER=$(git config --local http.https://github.com/.extraheader)
+            git config --local --unset http.https://github.com/.extraheader
+            # Scope to both URL forms: git-lfs uses the .git-suffixed endpoint
+            # (e.g. https://github.com/owner/repo.git/info/lfs) for LFS batch
+            # API calls, while git itself may use the non-.git form.
+            git config --local "http.https://github.com/${REPO}/.extraheader" "$AUTH_HEADER"
+            git config --local "http.https://github.com/${REPO}.git/.extraheader" "$AUTH_HEADER"
+            echo "Auth header moved to https://github.com/${REPO}/ and .git/"
+          else
+            echo "No broad github.com extraheader found — proceeding without re-scoping"
+          fi
+
+          echo "Adding fork remote: https://github.com/${FORK_REPO}.git"
+          git remote add fork "https://github.com/${FORK_REPO}.git"
+
+          # Fetch the git commit object first so git ls-tree can locate LFS
+          # pointer files within it (git lfs fetch needs this to exist locally).
+          git fetch --depth=1 fork "$HEAD_SHA"
+
+          echo "Fetching LFS objects from fork at ${HEAD_SHA}..."
+          git lfs fetch fork "$HEAD_SHA" 2>&1 | grep -v "Authorization" || true
+          FETCH_EXIT=${PIPESTATUS[0]}
+          git remote remove fork
+          if [ $FETCH_EXIT -ne 0 ]; then
+            echo "--- git lfs error log ---"
+            git lfs logs last
+          fi
+          exit $FETCH_EXIT
+
+      - name: Push LFS objects to this repository
+        id: push-lfs
+        continue-on-error: true
+        if: steps.detect-lfs.outputs.lfs_status == 'pending' && steps.fetch-lfs.outcome == 'success'
+        run: |
+          # git lfs push origin HEAD fails in detached HEAD state: git-lfs calls
+          # git for-each-ref internally which exits 1 and returns no branch refs.
+          # Creating a temporary local branch gives git-lfs a ref to enumerate.
+          echo "Pushing fetched LFS objects to origin..."
+          git branch _lfs_push_tmp
+          git lfs push origin _lfs_push_tmp 2>&1 | grep -v "Authorization" || true
+          PUSH_EXIT=${PIPESTATUS[0]}
+          git branch -D _lfs_push_tmp
+          if [ $PUSH_EXIT -ne 0 ]; then
+            echo "--- git lfs error log ---"
+            git lfs logs last
+          fi
+          exit $PUSH_EXIT
+
+      - name: Verify with a fresh clone
+        if: always() && steps.detect-lfs.outputs.lfs_status == 'pending' && steps.fetch-lfs.outcome == 'success' && steps.push-lfs.outcome == 'success'
+        id: verify
+        env:
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CLONE_DIR="$(mktemp -d)/lfs-verify"
+
+          echo "Cloning repository with LFS into ${CLONE_DIR} (branch: ${BASE_REF})..."
+          GIT_LFS_SKIP_SMUDGE=1 git clone \
+            --depth=1 \
+            --branch "$BASE_REF" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
+            "$CLONE_DIR"
+
+          cd "$CLONE_DIR"
+          git lfs pull
+
+      - name: Comment on PR — already in storage
+        if: steps.detect-lfs.outputs.lfs_status == 'present'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = require('fs').readFileSync('/tmp/lfs_files.txt', 'utf8').trim().split('\n');
+            const preview = files.slice(0, 5).map(f => `- \`${f}\``).join('\n');
+            const extra = files.length > 5 ? `\n- _...and ${files.length - 5} more_` : '';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                `✅ **LFS objects already in storage** (${files.length} file${files.length > 1 ? 's' : ''}) — no sync needed.`,
+                '',
+                'These LFS-tracked files are already present in this repository\'s LFS storage:',
+                '',
+                preview + extra,
+              ].join('\n'),
+            });
+
+      - name: Comment on PR — sync succeeded
+        if: steps.detect-lfs.outputs.lfs_status == 'pending' && steps.verify.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = require('fs').readFileSync('/tmp/lfs_files.txt', 'utf8').trim().split('\n');
+            const preview = files.slice(0, 5).map(f => `- \`${f}\``).join('\n');
+            const extra = files.length > 5 ? `\n- _...and ${files.length - 5} more_` : '';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                `✅ **LFS objects synced successfully** (${files.length} file${files.length > 1 ? 's' : ''}).`,
+                '',
+                'LFS-tracked files fetched from the contributor\'s fork and pushed to this repository\'s LFS storage. Verified with a fresh clone:',
+                '',
+                preview + extra,
+              ].join('\n'),
+            });
+
+      - name: Comment on PR — sync failed
+        if: always() && steps.detect-lfs.outputs.lfs_status == 'pending' && (steps.fetch-lfs.outcome != 'success' || steps.push-lfs.outcome != 'success' || steps.verify.outcome != 'success')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const forkRepo = context.payload.pull_request.head.repo.full_name;
+            const forkRef  = context.payload.pull_request.head.ref;
+            const forkSha  = context.payload.pull_request.head.sha;
+            const files = require('fs').readFileSync('/tmp/lfs_files.txt', 'utf8').trim().split('\n');
+            const preview = files.slice(0, 5).map(f => `- \`${f}\``).join('\n');
+            const extra = files.length > 5 ? `\n- _...and ${files.length - 5} more_` : '';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                `⚠️ **LFS sync failed — manual intervention required** (${files.length} file${files.length > 1 ? 's' : ''}).`,
+                '',
+                'One or more LFS objects could not be verified in a fresh clone after syncing from the contributor\'s fork:',
+                '',
+                preview + extra,
+                '',
+                `Please manually sync the missing LFS objects. Fork: \`${forkRepo}\`, branch: \`${forkRef}\`.`,
+                '',
+                `**Action run log:** https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                '',
+                '**Manual sync steps:**',
+                '```bash',
+                `git remote add fork https://github.com/${forkRepo}.git`,
+                `git lfs fetch fork ${forkSha}`,
+                'git remote remove fork',
+                'git lfs push --all origin',
+                '```',
+              ].join('\n'),
+            });
