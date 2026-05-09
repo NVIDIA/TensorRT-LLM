@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::runtime::decoder
@@ -74,6 +75,14 @@ public:
     //! Logits for requests in forwardBatchSlots (in the same order).
     //! [maxDecoderSteps][batchSize][1, beamWidth, vocabSizePadded], on gpu
     std::vector<std::vector<TensorConstPtr>> batchLogits;
+
+    //! Coherent per-beam token histories for LogitsPostProcessor callbacks.
+    //! Built by buildGatheredBeamTokensForCallback() by tracing
+    //! parentIds to recover the true ancestral token path for each beam.
+    //! Entry [i] corresponds to decoderRequests[i]. nullopt when beam_width==1
+    //! or no callback is registered (cheap fallback to llmReq->getTokens()).
+    using BeamTokens = std::vector<std::vector<runtime::TokenIdType>>;
+    std::vector<std::optional<BeamTokens>> gatheredBeamTokensForCallback;
 
     //! Logits for speculative decoding (Medusa).
     //! The vector is sparse, only slots in forwardBatchSlots are used.

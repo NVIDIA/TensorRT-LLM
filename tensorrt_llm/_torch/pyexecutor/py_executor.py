@@ -333,6 +333,11 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
+        # When using TRTLLMSampler, beam search logits processing is handled
+        # by the sampler with coherent per-beam token histories from parentIds
+        # tracing. Tell model_engine to skip its own beam search logits processing.
+        if isinstance(sampler, TRTLLMSampler):
+            model_engine.skip_beam_search_logits_processing = True
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
@@ -3796,6 +3801,38 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+            return
+
+        # Build coherent per-beam token histories for logits processors.
+        # request.get_tokens(beam) returns incoherent slot-accumulated
+        # histories after beam reassignment.  We use predecessor_beams to
+        # maintain a coherent history buffer on each request so that
+        # logits processors receive correct ancestral token paths (like HF).
+        sampler_store = getattr(self.sampler, 'store', None)
+        beam_search_store = getattr(sampler_store, 'beam_search_store', None) if sampler_store else None
+        if beam_search_store is not None:
+            pred_host = beam_search_store.predecessor_beams.cpu()
+            for req in (sample_state.requests or []):
+                bw = req.sampling_config.beam_width
+                if bw > 1 and req.py_seq_slot is not None:
+                    preds = pred_host[req.py_seq_slot, :bw].tolist()
+                    req.py_predecessor_beams = preds
+
+                    # Incrementally build coherent histories:
+                    # coherent[b] = coherent[pred[b]] + [new_token_b]
+                    old_coherent = getattr(req, 'py_coherent_beam_tokens', None)
+                    if old_coherent is None:
+                        # First beam search step after expansion.
+                        # get_tokens(0) already has the new token appended,
+                        # so [:-1] gives the shared prefix before this step.
+                        base = list(req.get_tokens(0))[:-1]
+                        old_coherent = [base] * bw
+
+                    new_coherent = []
+                    for b in range(bw):
+                        new_token = req.get_tokens(b)[-1]
+                        new_coherent.append(old_coherent[preds[b]] + [new_token])
+                    req.py_coherent_beam_tokens = new_coherent
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
