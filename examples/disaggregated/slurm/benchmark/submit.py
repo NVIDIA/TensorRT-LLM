@@ -68,21 +68,23 @@ def allocate_gpus(
 
     global_gpu_cursor = 0
 
-    def get_gpu_location(gpus_per_node: int):
-        node_id = global_gpu_cursor // gpus_per_node
-        local_gpu_id = global_gpu_cursor % gpus_per_node
-        return node_id, local_gpu_id
-
     def assign_server(server_allocation: Dict[str, Any], world_size: int,
                       gpus_per_node: int):
         nonlocal global_gpu_cursor
-        for _ in range(world_size):
-            node_id, gpu_id = get_gpu_location(gpus_per_node)
-            hostname = hostnames[node_id]
+        # Round-robin across nodes so each node gets ceil(world_size/num_nodes)
+        # GPUs, matching SLURM's block distribution which assigns
+        # ceil(world_size/num_nodes) tasks per node.
+        num_nodes_for_server = math.ceil(world_size / gpus_per_node)
+        start_node = global_gpu_cursor // gpus_per_node
+        for task_idx in range(world_size):
+            node_within = task_idx % num_nodes_for_server
+            gpu_within = task_idx // num_nodes_for_server
+            hostname = hostnames[start_node + node_within]
             if hostname not in server_allocation["nodes"]:
                 server_allocation["nodes"][hostname] = []
-            server_allocation["nodes"][hostname].append(gpu_id)
-            global_gpu_cursor += 1
+            server_allocation["nodes"][hostname].append(gpu_within)
+        # Advance cursor past all nodes owned by this server
+        global_gpu_cursor += num_nodes_for_server * gpus_per_node
 
     port = base_port
 
@@ -453,8 +455,14 @@ def submit_job(config, log_dir, dry_run):
     mtp_size = worker_config['gen'].get('speculative_config',
                                         {}).get('max_draft_len')
 
+    # Get gen moe_expert_parallel_size; only tag when it differs from TP
+    gen_ep_size = worker_config['gen'].get('moe_expert_parallel_size',
+                                           gen_tp_size)
+    ep_tag = f"_ep{gen_ep_size}" if gen_ep_size != gen_tp_size else ""
+
     # Create base log directory path
-    if 'log_dir' in env_config and env_config['log_dir']:
+    # CLI --log-dir takes precedence; fall back to yaml log_dir only when not set
+    if log_dir is None and 'log_dir' in env_config and env_config['log_dir']:
         log_dir = env_config['log_dir']
     if log_dir is None:
         log_base = os.path.join(script_dir, "logs")
@@ -466,9 +474,9 @@ def submit_job(config, log_dir, dry_run):
 
         # Determine directory suffix based on attention_dp
         if gen_enable_attention_dp:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}{ep_tag}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
         else:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}{ep_tag}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
 
         # Create full log directory path
         log_dir = os.path.join(log_base, dir_suffix)
@@ -547,9 +555,14 @@ def submit_job(config, log_dir, dry_run):
 
         for server_id in allocations[server_type].keys():
             allocation = allocations[server_type][server_id]
-            gpu_ids = list(allocation["nodes"].values())[0]
 
-            cuda_devices = ','.join(map(str, gpu_ids))
+            # Nodes are in insertion order from round-robin assign_server.
+            # Each node is dedicated to this server (no cross-server sharing),
+            # so start_worker.sh can safely use SLURM_LOCALID as the GPU index
+            # without any pre-specified mapping.
+            node_list = list(allocation["nodes"].keys())
+            num_nodes = len(node_list)
+
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -563,10 +576,9 @@ def submit_job(config, log_dir, dry_run):
 
             cmd = [
                 "srun -l",
-                f"--nodelist {','.join(allocation['nodes'].keys())}",
-                f"-N {len(allocation['nodes'])}",
+                f"--nodelist {','.join(node_list)}",
+                f"-N {num_nodes}",
                 f"--ntasks {server_cfg['world_size']}",
-                f"--ntasks-per-node {gpus_per_node}",
                 f"--export=\"{export_str}\"",
                 f"--container-image {env_config['container_image']}",
                 f"--container-name {container_name}",
@@ -581,7 +593,6 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
-                cuda_devices,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
@@ -631,7 +642,7 @@ def submit_job(config, log_dir, dry_run):
     client_slurm_prefix = [
         f"srun -l --container-name={container_name}",
         f"--container-mounts={container_mount_str}",
-        f"--mpi=pmix --overlap -N 1 -n 1",
+        f"--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
     ]
     # Append benchmark commands
     if benchmark_config.get('enable_benchmark', True):
