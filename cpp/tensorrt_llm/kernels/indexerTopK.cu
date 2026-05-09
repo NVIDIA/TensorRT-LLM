@@ -164,8 +164,8 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
 }
 
 template <int step, int kNumThreadsPerBlock, int kNumBins, int kNumFinalItems, bool multipleBlocksPerRow,
-    bool mergeBlocks, typename SmemFinalType, typename SmemOutputType>
-__device__ bool processHistogramStep(int const* indices, float const* logits, int rowEnd, uint32_t& logitPattern,
+    bool mergeBlocks, typename SmemFinalType, typename SmemOutputType, typename InputT = float>
+__device__ bool processHistogramStep(int const* indices, InputT const* logits, int rowEnd, uint32_t& logitPattern,
     int& thresholdBinIdx, SmemOutputType& smemOutput, int* smemThresholdBinIdx, int* smemFinalDstIdx,
     int* smemFinalBinSize, int* smemFoundTopKValues, SmemFinalType& smemFinal, int stride1, int rowStart, int topK)
 {
@@ -190,8 +190,9 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
         logitPattern |= static_cast<uint32_t>(thresholdBinIdx & 0x7ff) << patternShift;
     }
 
-    auto distributeToBins = [&](float logit, int /* idx */ = 0)
+    auto distributeToBins = [&](InputT logitIn, int /* idx */ = 0)
     {
+        float const logit = static_cast<float>(logitIn);
         if (isPartialMatch<patternShift>(logit, logitPattern))
         {
             uint32_t binIdx = extractBinIdx<step>(logit);
@@ -208,8 +209,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     {
         for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock)
         {
-            float logit = logits[idx * stride1];
-            distributeToBins(logit, idx);
+            distributeToBins(logits[idx * stride1], idx);
         }
     }
     // Make sure the histogram is ready.
@@ -271,8 +271,9 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     // The threshold bin.
     thresholdBinIdx = smemThresholdBinIdx[0];
 
-    auto processBins = [&](float logit, int idx)
+    auto processBins = [&](InputT logitIn, int idx)
     {
+        float const logit = static_cast<float>(logitIn);
         if (isPartialMatch<patternShift>(logit, logitPattern))
         {
             uint32_t binIdx = extractBinIdx<step>(logit);
@@ -351,8 +352,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     {
         for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock)
         {
-            float logit = logits[idx * stride1];
-            processBins(logit, idx);
+            processBins(logits[idx * stride1], idx);
         }
     }
 
@@ -365,9 +365,9 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
 
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort, bool multipleBlocksPerRow = false,
-    bool mergeBlocks = false>
-static __device__ void topKPerRowJob(int const* indices, float const* logits, int rowStart, int rowEnd, int* outIndices,
-    float* outLogits, int stride1, int topK)
+    bool mergeBlocks = false, typename InputT = float>
+static __device__ void topKPerRowJob(int const* indices, InputT const* logits, int rowStart, int rowEnd,
+    int* outIndices, float* outLogits, int stride1, int topK)
 {
     // The number of slots for the final pass.
     static constexpr int kNumFinalItems = 2048;
@@ -429,7 +429,7 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
             if constexpr (multipleBlocksPerRow)
             {
                 outIndices[rowIt] = rowIt + rowStart;
-                outLogits[rowIt] = logits[rowIt + rowStart];
+                outLogits[rowIt] = static_cast<float>(logits[rowIt + rowStart]);
             }
             else
             {
@@ -597,8 +597,8 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
 }
 } // namespace
 
-template <int kNumThreadsPerBlock, bool useRadixSort>
-static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(float const* logits,
+template <int kNumThreadsPerBlock, bool useRadixSort, typename InputT = float>
+static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(InputT const* logits,
     int const* rowStarts, int const* rowEnds, int* outIndices, int stride0, int stride1, int const topK,
     int const offsetIndex)
 {
@@ -626,8 +626,9 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 #endif
 }
 
-template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false>
-static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(float const* logits, int const* seqLens,
+template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
+    typename InputT = float>
+static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
     int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
     int const numBlocksToMerge = 0, int const* indices = nullptr)
 {
@@ -913,17 +914,25 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 // ============================================================================
 // bf16 / fp16 dispatcher overloads
 // ============================================================================
-// Reuse the BS-threshold + small-N dispatch axes (kBsLarge, kSeqSmall) from
-// the fp32 dispatcher, except kBsL2 uses 2 bytes/element instead of 4
-// (L2 footprint is half) — this means bf16/fp16 path remains valid for
-// larger BS than fp32 at the same N.
+// Reuses the BS-threshold + small-N dispatch axes (kBsLarge, kSeqSmall) from
+// the fp32 dispatcher, except kBsL2 uses sizeof(InputT) bytes/element instead
+// of 4 — L2 footprint is half, so bf16/fp16 path remains valid for larger BS
+// than fp32 at the same N.
 //
-// bf16/fp16 input has NO radix fallback — the production radix kernel
-// (topKPerRowDecode) is fp32-only. If GVR-Heuristic preconditions are not
-// met (preIdx missing, BS too large, N too small), this overload aborts
-// with a TLLM_CHECK error instead of casting to fp32 silently. Callers
-// must either (a) ensure GVR conditions are met, or (b) explicitly cast
-// logits to fp32 and call the fp32 entry.
+// Fallback chain when GVR-Heuristic preconditions are not met (preIdx
+// missing, BS too large, or numColumns < kSeqSmall):
+//   numColumns < kSortingAlgorithmThreshold (12288)            → insertion sort
+//   kSortingAlgorithmThreshold ≤ numColumns < splitWorkThreshold → radix sort
+//   numColumns ≥ splitWorkThreshold (200K default)             → unsupported
+//
+// Insertion + radix tiers use the same topKPerRowDecode kernel as fp32 with
+// InputT propagated through; the histogram and sort steps operate on float
+// keys after a static_cast<float>(InputT) at HBM-read sites, so accuracy is
+// identical to casting input to fp32 before the kernel.
+//
+// The split-work tier requires float aux buffers (outLogitsAux /
+// outIndicesAux) that the bf16/fp16 entry does not expose; callers in that
+// regime must use the fp32 entry.
 
 namespace
 {
@@ -937,7 +946,9 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     static_assert(std::is_same_v<InputT, __nv_bfloat16> || std::is_same_v<InputT, __half>,
         "invokeIndexerTopKDecodeDtype is for bf16/fp16 only");
 
+    constexpr int kSortingAlgorithmThreshold = 12288;
     constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
+    constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
     // bf16/fp16: bytes_per_element = sizeof(InputT) = 2 → kBsL2 doubles vs fp32.
@@ -950,17 +961,59 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
         && heuristicScratch != nullptr && numRows < kBsLarge;
 
-    TLLM_CHECK_WITH_INFO(canUseHeuristic,
-        "indexer_topk_decode bf16/fp16 path requires GVR-Heuristic preconditions: preIdx != nullptr, "
-        "stride1 == 1, topK ∈ {512, 1024, 2048}, preIdxCount == topK, "
-        "kSeqSmall=%d <= numColumns < kSplitWork=%d, numRows < kBsLarge=%d, heuristicScratch != nullptr. "
-        "Got topK=%d preIdxCount=%d numRows=%d numColumns=%d preIdx=%s heuristicScratch=%s. "
-        "(bf16/fp16 has no radix fallback — caller must cast to fp32 if conditions not met.)",
-        kSeqSmall, effectiveSplitWorkThreshold, kBsLarge, topK, preIdxCount, numRows, numColumns,
-        preIdx ? "ok" : "null", heuristicScratch ? "ok" : "null");
+    if (canUseHeuristic)
+    {
+        launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
+            preIdxStride, preIdxCount, numRows, stream);
+    }
+    else if (numColumns < kSortingAlgorithmThreshold)
+    {
+        // Insertion sort path — InputT propagated; histogram/sort run on float keys.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false,
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
 
-    launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK, preIdxStride,
-        preIdxCount, numRows, stream);
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = kNumThreadsPerBlock;
+        config.dynamicSmemBytes = topK * sizeof(int32_t);
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(
+            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+    }
+    else if (numColumns < effectiveSplitWorkThreshold)
+    {
+        // Radix sort path — InputT propagated; histogram/sort run on float keys.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true,
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = kNumThreadsPerBlock;
+        config.dynamicSmemBytes = topK * sizeof(int32_t);
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(
+            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false,
+            "indexer_topk_decode bf16/fp16 path does not support numColumns >= splitWorkThreshold "
+            "(split-work path requires float aux buffers not exposed in the bf16/fp16 entry). "
+            "Got numColumns=%d splitWorkThreshold=%d. Use the fp32 entry for this regime.",
+            numColumns, effectiveSplitWorkThreshold);
+    }
 
     sync_check_cuda_error(stream);
 }
@@ -1006,6 +1059,18 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     }
 
     sync_check_cuda_error(stream);
+}
+
+bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int bytesPerElem)
+{
+    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
+    if (!isSupportedTopK)
+    {
+        return false;
+    }
+    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
+    auto const bounds = getSchemeXBounds(numColumns, bytesPerElem);
+    return numColumns >= bounds.kSeqSmall && numColumns < kDefaultSplitWorkThreshold && numRows < bounds.kBsLarge;
 }
 
 } // namespace kernels
