@@ -48,24 +48,28 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           lfs: false
-          fetch-depth: 1
+          fetch-depth: 2
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install git-lfs
-        run: git lfs install
+        run: git lfs install --skip-smudge
 
       - name: Detect LFS files and check storage status
         id: detect-lfs
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           # lfs_status values:
           #   none    — no LFS-tracked files changed, nothing to do
-          #   synced  — LFS objects already in this repo's storage
+          #   present — LFS objects already in this repo's storage
           #   pending — LFS objects need to be fetched from the fork
 
-          git fetch --depth=1 origin "$BASE_SHA"
+          # Use MERGE_SHA^1 (first parent of the merge commit) rather than
+          # pull_request.base.sha, which is the base branch tip at the time the
+          # PR was last synced — not at merge time. If main advanced between PR
+          # creation and merge, base.sha would be stale and the diff would pick
+          # up unrelated LFS files added to main in the interim.
+          BASE_SHA=$(git rev-parse "${MERGE_SHA}^1")
 
           mapfile -t CHANGED < <(git diff --name-only --diff-filter=AM "$BASE_SHA" "$MERGE_SHA")
 

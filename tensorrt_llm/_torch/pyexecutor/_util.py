@@ -1,3 +1,4 @@
+import copy
 import os
 from typing import Dict, List, Optional, Union
 
@@ -5,7 +6,6 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
@@ -29,8 +29,9 @@ from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
-from .config_utils import (get_qwen3_hybrid_layer_masks, is_hybrid_linear,
-                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid)
+from .config_utils import (get_qwen3_hybrid_layer_masks, is_gemma4_hybrid,
+                           is_hybrid_linear, is_mla, is_nemotron_hybrid,
+                           is_qwen3_hybrid)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -65,7 +66,11 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     elif is_hybrid_linear(config):
         return MambaHybridCacheManager
     else:
-        return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
+        # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
+        # require KVCacheManagerV2 for per-layer buffer sizes.
+        needs_v2 = (kv_cache_config.use_kv_cache_manager_v2
+                    or is_gemma4_hybrid(config))
+        return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
 def is_vswa_enabled(kv_cache_config):
@@ -127,6 +132,7 @@ class KvCacheCreator:
         self._skip_est = skip_est
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
+        config = model_engine.model.model_config.pretrained_config
         cls = get_kv_cache_manager_cls(model_engine.model.model_config,
                                        self._kv_cache_config)
         if cls == KVCacheManagerV2:
@@ -135,6 +141,18 @@ class KvCacheCreator:
                     > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
+                # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
+                # split-pool layout. KVCacheManager (V1) coerces head_dim list
+                # to max(head_dim), changing per-layer KV byte sizes — which
+                # breaks correctness, not just efficiency. Fail fast here
+                # rather than silently producing wrong outputs.
+                if is_gemma4_hybrid(config):
+                    raise NotImplementedError(
+                        "Gemma4 hybrid attention requires KVCacheManagerV2, "
+                        "which is not yet supported with kv_connector_manager, "
+                        "beam_width > 1, event_buffer_max_size > 0, or "
+                        "cache_transceiver. Disable these features to run "
+                        "Gemma4 hybrid models.")
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
                     "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
@@ -362,6 +380,36 @@ class KvCacheCreator:
         # This is the minimal blocks required to run with max bs
         # If not able to allocate self._model_engine.batch_size blocks, the max batch size should be adjusted.
         num_cache_blocks = max(num_cache_blocks, self._model_engine.batch_size)
+
+        # For VSWA (variable sliding window attention) models such as Gemma4
+        # hybrid, KVCacheManagerV2 creates a separate pool group per distinct
+        # attention window size. The quota passed via max_tokens is split
+        # across pool groups proportionally, so each pool ends up with roughly
+        # num_cache_blocks/num_pool_groups blocks in the worst case. A single
+        # context request of max_seq_len tokens then exceeds the full-attention
+        # pool's block budget and resize_context livelocks on suspend/retry
+        # (observed for Gemma4 multimodal at max_seq_len>=8K, e.g. MMMU Pro).
+        # Scale num_cache_blocks by the number of distinct pool groups so that
+        # each pool has enough blocks for the dummy request even after the
+        # proportional split. Inferred from the model config since the hybrid
+        # max_attention_window hasn't been populated in kv_cache_config yet at
+        # this stage (it's filled in later by _create_kv_cache_manager).
+        # Only V2 has split-pool semantics — Mamba hybrid (which also has
+        # heterogeneous layer_types) uses MambaHybridCacheManager and would
+        # have its max_tokens estimate inflated incorrectly otherwise.
+        num_pool_groups = 1
+        if self._kv_cache_manager_cls == KVCacheManagerV2:
+            model_cfg = self._model_engine.model.model_config.pretrained_config
+            layer_types = getattr(model_cfg, "layer_types", None)
+            if isinstance(layer_types, (list, tuple)):
+                distinct = len(set(layer_types))
+                if distinct > 1:
+                    num_pool_groups = distinct
+            elif (self._kv_cache_config.max_attention_window is not None
+                  and len(set(self._kv_cache_config.max_attention_window)) > 1):
+                num_pool_groups = len(
+                    set(self._kv_cache_config.max_attention_window))
+        num_cache_blocks *= num_pool_groups
 
         free_mem, total_mem = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
@@ -939,6 +987,55 @@ def _create_kv_cache_manager(
     if not isinstance(head_dim, int):
         head_dim = hidden_size // num_attention_heads
 
+    # Gemma4: build per-layer head_dim, num_kv_heads, and sliding window
+    # for hybrid attention. Different layer types need different KV cache
+    # pool groups (via max_attention_window) so FlashInfer page indices
+    # are consistent within each group.
+    if is_gemma4_hybrid(config):
+        layer_types = config.layer_types
+        global_head_dim = config.global_head_dim
+        attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
+        num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
+                                       None) or num_key_value_heads)
+        sliding_window = getattr(config, 'sliding_window', None)
+        head_dim_list = []
+        kv_heads_list = []
+        for lt in layer_types:
+            is_sliding = (lt == "sliding_attention")
+            if is_sliding:
+                head_dim_list.append(head_dim)
+                kv_heads_list.append(num_key_value_heads)
+            else:
+                head_dim_list.append(global_head_dim)
+                use_k_eq_v = attention_k_eq_v and not is_sliding
+                kv_heads_list.append(
+                    num_global_kv_heads if use_k_eq_v else num_key_value_heads)
+        head_dim = head_dim_list
+        num_key_value_heads = kv_heads_list
+
+        # Set per-layer max_attention_window so V2 creates separate pool
+        # groups for sliding vs full attention layers (different page sizes).
+        # Sliding layers use the model's sliding_window; full layers use
+        # max_seq_len.  V2 uses this to evict old blocks when kv_len >
+        # window, saving memory (only ~ceil(sliding_window/page_size)
+        # blocks per sequence for sliding layers, vs the full kv_len for
+        # full attention layers).  FlashInfer's prepare() reads the
+        # currently-allocated block IDs per pool from the V2 manager,
+        # so the smaller sliding-pool block count after eviction is
+        # picked up automatically.
+        if (kv_cache_config.max_attention_window is None
+                and sliding_window is not None):
+            kv_cache_config = copy.copy(kv_cache_config)
+            kv_cache_config.max_attention_window = [
+                int(sliding_window)
+                if lt == "sliding_attention" else int(max_seq_len)
+                for lt in layer_types
+            ]
+
+    # Note: Gemma4 KV sharing is handled at the model level — shared layers
+    # use cache_layer_idx to read from the target layer's cache slot via
+    # Gemma4Attention. No layer_mask exclusion needed here.
+
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
@@ -947,8 +1044,15 @@ def _create_kv_cache_manager(
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
 
-    # Use provided num_layers if available, otherwise use config
-    num_hidden_layers = num_layers if num_layers is not None else config.num_hidden_layers
+    # Use provided num_layers if available, otherwise use config.
+    # When layer_mask is set (e.g., KV sharing), num_layers for the cache
+    # manager must equal the number of enabled (True) layers in the mask.
+    if num_layers is not None:
+        num_hidden_layers = num_layers
+    elif layer_mask is not None:
+        num_hidden_layers = sum(layer_mask)
+    else:
+        num_hidden_layers = config.num_hidden_layers
     # Only include draft KV heads in the per-layer list when draft layers
     # are NOT handled by a separate draft KV cache manager.  When layer_mask
     # is provided from the caller, it means the main KV cache covers only
@@ -957,9 +1061,14 @@ def _create_kv_cache_manager(
     if layer_mask is None:
         draft_config_for_kv = (getattr(model_engine.model, 'draft_config', None)
                                if model_engine is not None else None)
-    per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
-        num_key_value_heads, num_hidden_layers, spec_config,
-        draft_config_for_kv)
+    # If num_key_value_heads is already a per-layer list (e.g., Gemma4 hybrid),
+    # use it directly; otherwise build from the scalar value.
+    if isinstance(num_key_value_heads, list):
+        per_layer_num_kv_heads = num_key_value_heads
+    else:
+        per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
+            num_key_value_heads, num_hidden_layers, spec_config,
+            draft_config_for_kv)
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
@@ -1168,18 +1277,26 @@ def _create_kv_cache_manager(
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
+        # Only needed for V1; V2 handles per-layer windows natively via life cycles.
         is_vswa = is_vswa_enabled(kv_cache_config)
-        binding_model_config = _model_config.get_bindings_model_config(
-            tokens_per_block=tokens_per_block,
-            kv_cache_config=kv_cache_config,
-            spec_config=spec_config) if is_vswa else None
+        binding_model_config = None
+        if is_vswa and kv_cache_manager_cls.__name__ == "KVCacheManager":
+            binding_model_config = _model_config.get_bindings_model_config(
+                tokens_per_block=tokens_per_block,
+                kv_cache_config=kv_cache_config,
+                spec_config=spec_config)
 
+        # KVCacheManager (V1) doesn't support per-layer head_dim lists;
+        # use max for estimation. KVCacheManagerV2 handles lists natively.
+        effective_head_dim = (
+            max(head_dim) if isinstance(head_dim, list)
+            and kv_cache_manager_cls.__name__ == "KVCacheManager" else head_dim)
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_hidden_layers,
             num_kv_heads=per_layer_num_kv_heads,
-            head_dim=head_dim,
+            head_dim=effective_head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
@@ -1198,6 +1315,10 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
         )
+    # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
+    # via cache_layer_idx — shared layers use target layer's index for
+    # get_buffers(). No layer_offsets remapping needed here.
+
     return kv_cache_manager
 
 

@@ -7,6 +7,14 @@ import transformers
 from tensorrt_llm.logger import logger
 
 
+def is_gemma4_hybrid(config):
+    """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
+    global_head_dim = getattr(config, 'global_head_dim', None)
+    head_dim = getattr(config, 'head_dim', None)
+    return (global_head_dim is not None and isinstance(head_dim, int)
+            and global_head_dim != head_dim)
+
+
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
 
