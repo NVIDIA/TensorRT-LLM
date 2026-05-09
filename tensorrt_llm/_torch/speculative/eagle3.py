@@ -372,6 +372,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         if self.spec_resource_manager is not None and hasattr(
                 self.spec_resource_manager, 'hidden_states'):
             self.hidden_states = self.spec_resource_manager.hidden_states
+            expected_cols = self.hidden_size * len(self.layers_to_capture)
+            assert self.hidden_states.shape[1] == expected_cols, (
+                f"hidden_states shape mismatch: resource_manager has "
+                f"{self.hidden_states.shape}, expected (:, {expected_cols})")
         else:
             self.hidden_states = torch.empty(
                 (self.max_num_tokens,
