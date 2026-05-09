@@ -374,8 +374,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             self.hidden_states = self.spec_resource_manager.hidden_states
             expected_cols = self.hidden_size * len(self.layers_to_capture)
             assert self.hidden_states.shape[1] == expected_cols, (
-                f"hidden_states shape mismatch: resource_manager has "
-                f"{self.hidden_states.shape}, expected (:, {expected_cols})")
+                f"hidden_states shape mismatch: "
+                f"{type(self.spec_resource_manager).__name__} has "
+                f"{self.hidden_states.shape}, but metadata expects "
+                f"(:, {expected_cols}) from hidden_size={self.hidden_size} "
+                f"x capture_layers={list(self.layers_to_capture)}")
         else:
             self.hidden_states = torch.empty(
                 (self.max_num_tokens,
