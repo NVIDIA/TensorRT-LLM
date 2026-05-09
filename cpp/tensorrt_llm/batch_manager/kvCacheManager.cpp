@@ -2073,6 +2073,98 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
+void WindowBlockManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    // TODO: optimize this walk by replacing the per-step findMatchingBlock loop
+    // with mLookupTree->lookupBlocksAtAllPositions(prefix, mWindowSize), which
+    // returns the entire matched chain in a single trie traversal. This was
+    // kept as a 1:1 port of the pre-radix-cleanup implementation for review
+    // tractability; the bulk-API rewrite is deferred to a follow-up change.
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
+    auto const numTokens = static_cast<SizeType32>(targetTokens.size());
+    auto blockedTokens = chopVectorIntoBlocks<TokenIdType>(
+        targetTokens, numTokens, mTokensPerBlock, /*allowPartial=*/true);
+
+    std::vector<BlockKey> blockKeys;
+    blockKeys.reserve(blockedTokens.size());
+    for (auto const& blockedTokensList : blockedTokens)
+    {
+        blockKeys.emplace_back(blockedTokensList, std::nullopt);
+    }
+
+    SizeType32 numMatchedTokens = 0;
+    auto searchRoot = mCachedBlocksRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, mEnablePartialReuse, mCopyOnPartialReuse)
+            : std::make_tuple(false, 0, nullptr);
+        if (matchingBlock == nullptr)
+        {
+            break;
+        }
+        if (numMatchedTokens > numTokensToKeep)
+        {
+            matchingBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            releaseSubtree(matchingBlock);
+            break;
+        }
+        // findMatchingBlock returns numMatched > 0 whenever matchingBlock is non-null
+        // (set above), so we can use numMatched directly.
+        numMatchedTokens += numMatched;
+        searchRoot = matchingBlock;
+    }
+}
+
+void WindowBlockManager::releaseSubtree(BlockPtr const& block)
+{
+    // Iterative pre-order DFS over `block` and all its descendants. We collect first,
+    // then detach in reverse order: cascade-prune in clearValue() removes empty parent
+    // nodes from the trie, so leaves must be removed before their parents to keep the
+    // mNextNodes map consistent during the walk.
+    std::vector<BlockPtr> subtree;
+    std::vector<BlockPtr> stack{block};
+    while (!stack.empty())
+    {
+        auto current = std::move(stack.back());
+        stack.pop_back();
+        for (auto const& [_, child] : current->getNextBlocks())
+        {
+            stack.push_back(child);
+        }
+        subtree.push_back(std::move(current));
+    }
+
+    for (auto it = subtree.rbegin(); it != subtree.rend(); ++it)
+    {
+        auto const& b = *it;
+        if (mEventManager && blockInRadixTree(b))
+        {
+            mEventManager->enqueueRemovedEvent(b, mWindowSize);
+        }
+        b->freeLeafBlock();
+        if (!b->hasRefs())
+        {
+            // Claim the block before re-releasing it: cached blocks already sit in
+            // an eviction priority queue, so a bare releaseBlock() would create a
+            // duplicate queue entry and corrupt mNumFreeBlocksPerLevel. claimBlock
+            // removes the existing entry first, mirroring the pattern in
+            // storeBlocks (see the "Claim it first..." comment elsewhere in this file).
+            b->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            mEvictionPolicy->claimBlock(b);
+            mEvictionPolicy->releaseBlock(b, /*toFront=*/true);
+        }
+    }
+}
+
+void BlockManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize)
+{
+    mWindowBlockManagers.at(windowSize).truncateBlocks(targetTokens, numTokensToKeep);
+}
+
 std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& numContextBlocksVec,
@@ -3680,6 +3772,15 @@ std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
     auto pinnedBlockIds = mBlockManager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return pinnedBlockIds;
+}
+
+void KVCacheManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    for (auto const& [windowSize, _] : mBlockManager.getWindowSizesMetadata())
+    {
+        mBlockManager.truncateBlocks(targetTokens, numTokensToKeep, windowSize);
+    }
 }
 
 void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
