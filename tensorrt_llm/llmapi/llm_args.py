@@ -3153,6 +3153,22 @@ class BaseLlmArgs(StrictBaseModel):
                 logger.warning(
                     f"max_batch_size [{self.max_batch_size}] should be less than or equal to max_num_tokens [{self.max_num_tokens}]"
                 )
+        # Clamp max_num_tokens to max_seq_len * max_batch_size so that the
+        # capped value is visible to all downstream consumers (e.g. the
+        # autotuner-facing chunk_size in AttentionRuntimeFeatures and the
+        # max_num_tokens that flows into ModelConfig and the MoE communication
+        # workspace). Otherwise PyTorchModelEngine would only clamp its own
+        # self.max_num_tokens after ModelLoader and AttentionRuntimeFeatures
+        # had already been built from the un-clamped value.
+        if (self.max_num_tokens is not None and self.max_seq_len is not None
+                and self.max_batch_size is not None):
+            cap = self.max_seq_len * self.max_batch_size
+            if self.max_num_tokens > cap:
+                logger.warning(
+                    f"max_num_tokens ({self.max_num_tokens}) shouldn't be greater than "
+                    f"max_seq_len * max_batch_size ({cap}), "
+                    f"specifying to max_seq_len * max_batch_size ({cap}).")
+                self.max_num_tokens = cap
         return self
 
     @model_validator(mode="after")

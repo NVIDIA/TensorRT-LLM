@@ -775,6 +775,26 @@ class TestTorchLlmArgs:
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
 
+    @print_traceback_on_error
+    def test_max_num_tokens_capped_to_max_seq_len_times_max_batch_size(self):
+        # When the user-supplied max_num_tokens is larger than
+        # max_seq_len * max_batch_size, BaseLlmArgs.validate_runtime_args
+        # should cap it so that downstream consumers (chunk_size in
+        # AttentionRuntimeFeatures, model_config.max_num_tokens, MoE
+        # communication workspace, ...) all observe the clamped value.
+        args = TorchLlmArgs(model=llama_model_path,
+                            max_seq_len=8193,
+                            max_batch_size=1,
+                            max_num_tokens=8208)
+        cap = args.max_seq_len * args.max_batch_size
+        assert args.max_num_tokens == cap
+        # get_runtime_sizes() must return the same clamped value.
+        _, max_num_tokens, max_seq_len, max_batch_size = (
+            args.get_runtime_sizes())
+        assert max_num_tokens == cap
+        assert max_seq_len == 8193
+        assert max_batch_size == 1
+
     def test_speculative_model_alias(self):
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
