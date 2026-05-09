@@ -3031,7 +3031,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     def _shuffle_and_interleave_w3_w1_weight_scale(
             self,
             dst_w3_w1_weight_scale: torch.Tensor,
-            num_elts_per_sf: int = 16):
+            num_elts_per_sf: int = 16,
+            is_gated_act_gemm: bool = True):
         """Apply trtllm-gen specific shuffle + interleave to w3_w1 weight scale buffer."""
         orig_shape = dst_w3_w1_weight_scale.shape
         epilogue_tile_m = 128  # FIXME
@@ -3045,7 +3046,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype),
             self._cache_permute_indices,
             epilogue_tile_m,
-            num_elts_per_sf=num_elts_per_sf)
+            num_elts_per_sf=num_elts_per_sf,
+            is_gated_act_gemm=is_gated_act_gemm)
 
         # Shuffle the weight according to permute indices
         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
@@ -3161,7 +3163,9 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             ('local_shared_w2_tensors', self._shuffle_w2_weight),
             ('local_shared_w3_w1_scale_tensors',
              lambda t: self._shuffle_and_interleave_w3_w1_weight_scale(
-                 t, num_elts_per_sf=num_elts_per_sf)),
+                 t,
+                 num_elts_per_sf=num_elts_per_sf,
+                 is_gated_act_gemm=module.is_gated_activation)),
             ('local_shared_w2_scale_tensors',
              lambda t: self._shuffle_and_interleave_w2_weight_scale(
                  t, num_elts_per_sf=num_elts_per_sf)),
