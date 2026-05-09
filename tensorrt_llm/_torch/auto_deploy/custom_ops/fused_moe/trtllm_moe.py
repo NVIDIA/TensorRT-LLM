@@ -1540,10 +1540,10 @@ def trtllm_mxfp4_w4a8_moe_fused(
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 
-    # Top-k routing — same numerics as the W4A16 path.
+    # Routing: compute router logits and hand them to the C++ runner which
+    # performs fused topk + softmax + cast internally (1 kernel instead of 5+
+    # Python launches). Matches PT's run_fp4_block_scale_moe path.
     router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
-    topk_vals, topk_ids = torch.topk(router_logits.to(torch.float32), top_k, dim=-1)
-    topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
     expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
@@ -1570,7 +1570,7 @@ def trtllm_mxfp4_w4a8_moe_fused(
     intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
 
     result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
-        None,  # routing_logits (using pre-computed topk)
+        router_logits,  # router_logits — kernel does fused topk+softmax internally
         None,  # routing_bias
         x_mxfp8,  # hidden_states (E4M3-packed uint8)
         x_scale,  # hidden_states_scale (UE8M0 per-32-elem block scale)
@@ -1595,8 +1595,8 @@ def trtllm_mxfp4_w4a8_moe_fused(
         None,  # routed_scaling_factor
         routing_method_type,
         0,  # act_type = SwiGlu
-        topk_weights=topk_weights.to(torch.bfloat16),
-        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=None,
+        topk_ids=None,
     )
     if result.shape[-1] > valid_hidden_size:
         result = result[..., :valid_hidden_size].contiguous()
