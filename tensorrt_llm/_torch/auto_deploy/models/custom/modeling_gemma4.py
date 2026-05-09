@@ -2831,6 +2831,11 @@ class Gemma4ADInputProcessor:
         num_soft_tokens = int(image_inputs["num_soft_tokens_per_image"][0].item())
         return num_soft_tokens + 2  # include BOI + EOI
 
+    def get_vocab_size(self) -> Optional[int]:
+        # Gemma4 multimodal masks are identified by the explicit image token id.
+        # Avoid probing tokenizer.vocab_size; it is only needed when mm_token_ids is unavailable.
+        return None
+
     def get_mm_token_ids(self) -> torch.Tensor:
         return torch.tensor([self.image_token_id], dtype=torch.int32)
 
