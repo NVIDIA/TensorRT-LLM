@@ -1776,10 +1776,10 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
 
 // Explicit instantiations — fp32 + bf16/fp16
 template cudaError_t launchHeuristicTopK<float, int>(
-    float const*, int, int const*, int, int, float*, int*, cudaStream_t, int);
+    float const*, int, int const*, int, int, float*, int*, cudaStream_t);
 template cudaError_t launchHeuristicTopK<__nv_bfloat16, int>(
-    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*, cudaStream_t, int);
+    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*, cudaStream_t);
 template cudaError_t launchHeuristicTopK<__half, int>(
-    __half const*, int, int const*, int, int, __half*, int*, cudaStream_t, int);
+    __half const*, int, int const*, int, int, __half*, int*, cudaStream_t);
 
 } // namespace heuristic_topk

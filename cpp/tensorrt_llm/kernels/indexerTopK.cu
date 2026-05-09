@@ -28,8 +28,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cuda_bf16.h> // 4d: bf16 dispatcher overload
-#include <cuda_fp16.h> // 4d: fp16 dispatcher overload
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <mutex>
 
 namespace cg = cooperative_groups;
@@ -673,6 +673,63 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
 #endif
 }
 
+namespace
+{
+
+// Scheme X bound calculator — shared between fp32 and bf16/fp16 dispatchers.
+// Caches hardware attrs (SM count, L2 capacity) and the small-N threshold
+// once per process via std::call_once. Per-call cost is just two reads
+// from cached static variables plus a small arithmetic block, no syscalls.
+struct SchemeXBounds
+{
+    int smCount;
+    int l2Bytes;
+    int kBsWave;
+    int kBsL2;
+    int kBsLarge;
+    int kSeqSmall;
+};
+
+inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
+{
+    static std::once_flag sOnce;
+    static int sSm = 0;
+    static int sL2 = 0;
+    static int sNMin = 0;
+    std::call_once(sOnce,
+        []()
+        {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&sSm, cudaDevAttrMultiProcessorCount, dev);
+            cudaDeviceGetAttribute(&sL2, cudaDevAttrL2CacheSize, dev);
+            constexpr int kSeqSmallDefault = 12288;
+            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
+            if (env != nullptr)
+            {
+                int const v = std::atoi(env);
+                sNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
+            }
+            else
+            {
+                sNMin = kSeqSmallDefault;
+            }
+        });
+
+    SchemeXBounds b;
+    b.smCount = sSm;
+    b.l2Bytes = sL2;
+    b.kBsWave = (sSm > 0) ? (sSm * 3 - sSm / 8) : 426;
+    b.kBsL2 = (sL2 > 0 && numColumns > 0)
+        ? static_cast<int>(static_cast<int64_t>(sL2) * 9 / 10 / (static_cast<int64_t>(numColumns) * bytesPerElem))
+        : b.kBsWave;
+    b.kBsLarge = std::min(b.kBsWave, b.kBsL2 > 0 ? b.kBsL2 : b.kBsWave);
+    b.kSeqSmall = sNMin;
+    return b;
+}
+
+} // anonymous namespace
+
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
@@ -733,54 +790,20 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     // Dispatch threshold = min(kBsWave, kBsL2), still data-agnostic (only
     // queries hardware attrs). At N≈70K both bounds produce ~426, so the
     // L2 axis is a no-op there; for larger N it auto-tightens the threshold.
+    //
+    // Small-N lower bound `kSeqSmall` (default 12288) lets the Heuristic
+    // axis take over wherever the original Radix-radix branch would have
+    // triggered. Random-data benchmarks suggest the crossover is 16384,
+    // but workloads with strongly preIdx-correlated logits make P1 stats
+    // accurate and P2 converge in 1-2 iterations, shifting the real
+    // crossover into the [12288, 16384] band. Configurable via
+    // TRTLLM_HEURISTIC_NMIN env (>=1024).
     // ========================================================================
-    // Hardware-attribute cache (sm count, L2 capacity). std::call_once keeps
-    // the first concurrent caller from racing on cudaDeviceGetAttribute and
-    // ensures every later caller observes the populated values without an
-    // atomic compare-exchange of its own.
-    static std::once_flag sHwOnceFlag;
-    static int sCachedSmCount = 0;
-    static int sCachedL2Bytes = 0;
-    std::call_once(sHwOnceFlag,
-        []()
-        {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&sCachedSmCount, cudaDevAttrMultiProcessorCount, dev);
-            cudaDeviceGetAttribute(&sCachedL2Bytes, cudaDevAttrL2CacheSize, dev);
-        });
-    int const kBsWave = (sCachedSmCount > 0) ? (sCachedSmCount * 3 - sCachedSmCount / 8) : 426;
-    int const kBsL2 = (sCachedL2Bytes > 0 && numColumns > 0)
-        ? (int) ((int64_t) sCachedL2Bytes * 9 / 10 / ((int64_t) numColumns * 4))
-        : kBsWave;
-    int const kBsLarge = std::min(kBsWave, kBsL2 > 0 ? kBsL2 : kBsWave);
-
-    // Small-N lower bound — set to kSortingAlgorithmThreshold (12288) so the
-    // Heuristic axis takes over wherever the original Radix-radix branch
-    // would have triggered. Random-data benchmarks suggest the crossover is
-    // 16384, but workloads with strongly preIdx-correlated logits make P1
-    // stats accurate and P2 converge in 1-2 iterations, shifting the real
-    // crossover into the [12288, 16384] band. Below 12288 the Insertion path
-    // is still used (canUseHeuristic gating + dispatcher fallback both route
-    // there). Configurable via TRTLLM_HEURISTIC_NMIN env (>=1024).
-    static std::once_flag sNMinOnceFlag;
-    static int sCachedNMin = 0;
-    std::call_once(sNMinOnceFlag,
-        []()
-        {
-            constexpr int kSeqSmallDefault = 12288;
-            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
-            if (env != nullptr)
-            {
-                int const v = std::atoi(env);
-                sCachedNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
-            }
-            else
-            {
-                sCachedNMin = kSeqSmallDefault;
-            }
-        });
-    int const kSeqSmall = sCachedNMin;
+    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/4);
+    int const kBsWave = bounds.kBsWave;
+    int const kBsL2 = bounds.kBsL2;
+    int const kBsLarge = bounds.kBsLarge;
+    int const kSeqSmall = bounds.kSeqSmall;
 
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
@@ -800,10 +823,10 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         if (sDebug)
         {
             fprintf(stderr,
-                "[Scheme X v1.2] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
+                "[Scheme X] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
                 "L2=%dMB -> %s path%s\n",
-                numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, sCachedSmCount,
-                sCachedL2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
+                numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, bounds.smCount,
+                bounds.l2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
                 (numColumns < kSeqSmall) ? " (small-N route)" : "");
         }
     }
@@ -917,46 +940,10 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
-    // Hardware caching — share with fp32 dispatcher's once_flag would require
-    // hoisting; cheaper to use a new once_flag per dtype overload.
-    static std::once_flag sHwOnceFlag;
-    static int sCachedSmCount = 0;
-    static int sCachedL2Bytes = 0;
-    std::call_once(sHwOnceFlag,
-        []()
-        {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&sCachedSmCount, cudaDevAttrMultiProcessorCount, dev);
-            cudaDeviceGetAttribute(&sCachedL2Bytes, cudaDevAttrL2CacheSize, dev);
-        });
-
-    int const kBsWave = (sCachedSmCount > 0) ? (sCachedSmCount * 3 - sCachedSmCount / 8) : 426;
     // bf16/fp16: bytes_per_element = sizeof(InputT) = 2 → kBsL2 doubles vs fp32.
-    int const bytesPerElem = static_cast<int>(sizeof(InputT));
-    int const kBsL2 = (sCachedL2Bytes > 0 && numColumns > 0)
-        ? (int) ((int64_t) sCachedL2Bytes * 9 / 10 / ((int64_t) numColumns * bytesPerElem))
-        : kBsWave;
-    int const kBsLarge = std::min(kBsWave, kBsL2 > 0 ? kBsL2 : kBsWave);
-
-    static std::once_flag sNMinOnceFlag;
-    static int sCachedNMin = 0;
-    std::call_once(sNMinOnceFlag,
-        []()
-        {
-            constexpr int kSeqSmallDefault = 12288;
-            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
-            if (env != nullptr)
-            {
-                int const v = std::atoi(env);
-                sCachedNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
-            }
-            else
-            {
-                sCachedNMin = kSeqSmallDefault;
-            }
-        });
-    int const kSeqSmall = sCachedNMin;
+    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/static_cast<int>(sizeof(InputT)));
+    int const kBsLarge = bounds.kBsLarge;
+    int const kSeqSmall = bounds.kSeqSmall;
 
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
