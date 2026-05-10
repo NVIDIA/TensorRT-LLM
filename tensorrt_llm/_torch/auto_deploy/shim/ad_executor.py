@@ -1179,7 +1179,11 @@ def instantiate_sampler(
     return sampler
 
 
-def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
+def create_autodeploy_executor(
+    ad_config: LlmArgs,
+    tokenizer: Optional[TokenizerBase] = None,
+    resource_governor_queue=None,
+):
     """Create an AutoDeploy executor from the given configuration and tokenizer.
     The tokenizer is required for guided decoding.
 
@@ -1377,5 +1381,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
         drafter=drafter,
+        resource_governor_queue=resource_governor_queue,
     )
     return py_executor
