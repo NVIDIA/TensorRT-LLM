@@ -671,7 +671,9 @@ class DeepseekV4WeightLoader:
                 if o_a_proj_scale is not None:
                     o_a_proj_scale = split_matrix_tp(o_a_proj_scale, tp_size, tp_rank, 0)
 
-            if o_a_proj_scale is not None:
+            # Skip the BF16 dequant when the destination is FP8 (the cute_dsl
+            # FP8 BMM path on SM100 consumes the native FP8 weight directly).
+            if o_a_proj_scale is not None and module.o_a_proj.dtype != torch.float8_e4m3fn:
                 o_a_proj = weight_dequant(
                     o_a_proj.reshape(-1, o_a_proj.shape[-1]).contiguous().cuda(),
                     o_a_proj_scale.reshape(-1, o_a_proj_scale.shape[-1]).contiguous().cuda(),
