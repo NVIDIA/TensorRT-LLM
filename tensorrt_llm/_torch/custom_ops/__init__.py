@@ -1,3 +1,6 @@
+# Imported first to register the op before the chain via ..modules.attention re-enters this package.
+from . import triton_fused_inv_rope_fp8_quant  # noqa: F401  # isort: skip
+
 import torch
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
