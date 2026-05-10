@@ -392,12 +392,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Shared rotary embedding at model level
+        # Shared rotary embedding at model level. In transformers 4.x rope_theta
+        # sits on the config directly; in transformers 5.x it has been moved
+        # under ``rope_scaling`` (alongside ``rope_type``). Handle both layouts.
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = (config.rope_scaling or {}).get("rope_theta", 10000.0)
         self.rotary_emb = Qwen3RotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=rope_theta,
         )
 
         self.post_init()
@@ -445,7 +450,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     """Qwen3 model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
