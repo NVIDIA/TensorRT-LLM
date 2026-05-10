@@ -1395,6 +1395,7 @@ def create_py_executor_instance(
     lora_config: Optional[LoraConfig] = None,
     garbage_collection_gen0_threshold: Optional[int] = None,
     kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+    resource_governor_queue=None,
     max_seq_len: Optional[int] = None,
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
@@ -1628,6 +1629,14 @@ def create_py_executor_instance(
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
+
+        reorder_policy_config = llm_args.reorder_policy_config
+        if reorder_policy_config is not None:
+            assert reorder_policy_config.policy_name == "AgentTree", "Reorder policy only supports AgentTree for now"
+            capacity_scheduler.impl.set_agent_tree_reorder_policy(
+                reorder_policy_config.policy_args.agent_percentage,
+                reorder_policy_config.policy_args.agent_types,
+                reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config
@@ -1667,6 +1676,7 @@ def create_py_executor_instance(
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
+        resource_governor_queue=resource_governor_queue,
         max_seq_len=max_seq_len,
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,

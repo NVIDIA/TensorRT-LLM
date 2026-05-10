@@ -36,7 +36,7 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import MultimodalEncoder, tracing
+from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -222,6 +222,7 @@ class OpenAIServer(_VideoRoutesMixin):
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
+        self.resource_governor = None
 
         # Skip loading AutoProcessor and model_config for VISUAL_GEN models
         # These are LLM-specific and can cause unnecessary memory usage
@@ -295,6 +296,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
             if self.disagg_cluster_worker:
                 await self.disagg_cluster_worker.deregister_worker()
+            if self.resource_governor is not None:
+                self.resource_governor.close()
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -591,6 +594,32 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
+        resource_governor_queue = self.generator._executor.resource_governor_queue
+        if resource_governor_queue is not None:
+            from .resource_governor import ResourceGovernor
+            self.resource_governor = ResourceGovernor(
+                resource_governor_queue=resource_governor_queue,
+                tokenizer=self.tokenizer,
+                model_config=self.model_config,
+                processor=self.processor,
+                harmony_adapter_factory=get_harmony_adapter
+                if self.use_harmony else None,
+            )
+            self.resource_governor.register_routes(self.app)
+        else:
+            # Resource governor is unavailable because the executor does not
+            # expose a resource_governor_queue. This is expected in RPC
+            # orchestrator mode (GenerationExecutorRpcProxy), non-PyExecutor
+            # backends, or when enable_resource_governor is false. The
+            # /_resource_governor/* endpoints will not be registered; clients
+            # that attempt to call them will receive 404.
+            logger.warning(
+                "Resource governor is disabled: the executor backend does "
+                "not provide a resource_governor_queue (e.g. RPC "
+                "orchestrator mode or explicit opt-out). Endpoints under "
+                "/_resource_governor/ will not be available.")
+            self.resource_governor = None
+
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -1150,6 +1179,9 @@ class OpenAIServer(_VideoRoutesMixin):
             trace_headers = (None if raw_request is None else
                              tracing.extract_trace_headers(raw_request.headers))
 
+            scheduling_params = SchedulingParams(
+                agent_hierarchy=request.agent_hierarchy)
+
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
@@ -1167,6 +1199,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+                scheduling_params=scheduling_params,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -1559,6 +1592,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args=postproc_args,
             )
 
+            scheduling_params = SchedulingParams(
+                agent_hierarchy=request.agent_hierarchy)
+
             # Generate
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
@@ -1567,6 +1603,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if self.postproc_worker_enabled else None,
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,
+                scheduling_params=scheduling_params,
                 disaggregated_params=disaggregated_params,
                 trace_headers=trace_headers,
             )

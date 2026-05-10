@@ -50,6 +50,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  LookaheadDecodingConfig as _LookaheadDecodingConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
+from ..bindings.internal.algorithms import AgentTreeConfig as _AgentTreeConfig  # isort: skip
 # isort: on
 
 # yapf: enable
@@ -446,7 +447,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
     def resolve_for_target_sparsity(
             self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
-        """
+        """Compute threshold_scale_factor from formula coefficients and target_sparsity.
+
         Given formula coefficients from HF config.json (dict with 'prefill' and
         'decode' keys, each containing 'a' and 'b'), compute threshold_scale_factor
         and return a new SkipSoftmaxAttentionConfig with it set.
@@ -2462,6 +2464,44 @@ SparseAttentionConfig: TypeAlias = Annotated[
 ]
 
 
+@PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
+class AgentTreeConfig(StrictBaseModel, PybindMirror):
+    """Configuration for agent tree scheduling.
+
+    Controls how agent requests are scheduled relative to regular chat requests.
+    """
+    agent_percentage: float = Field(
+        default=0.0,
+        description=
+        "The percentage of agent requests to schedule. Defaults to 0.0. "
+        "Should be between 0.0 and 1.0. -1.0 means random schedule between agent and chatbot."
+    )
+    agent_types: Optional[List[str]] = Field(
+        default=None,
+        description=
+        "Types of agents to schedule (e.g. 'AgentDeepResearch', 'Researcher', 'MultiroundChat')."
+    )
+    agent_inflight_seq_num: int = Field(
+        default=2**31 - 1,
+        description="Max number of inflight sequences for agent requests.")
+
+    def _to_pybind(self):
+        return _AgentTreeConfig(
+            agent_percentage=self.agent_percentage,
+            agent_types=self.agent_types,
+            agent_inflight_seq_num=self.agent_inflight_seq_num,
+        )
+
+
+class ReorderRequestPolicyConfig(StrictBaseModel):
+    """Configuration for request reordering policy."""
+    policy_name: Optional[Literal["AgentTree"]] = Field(
+        default=None, description="The name of the request reordering policy.")
+    policy_args: AgentTreeConfig = Field(
+        default_factory=AgentTreeConfig,
+        description="The arguments of the request reordering policy.")
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """
@@ -3944,6 +3984,20 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
+        default=None,
+        description="The request reordering policy to use.",
+        status="prototype",
+    )
+
+    enable_resource_governor: bool = Field(
+        default=False,
+        description="Enable the resource governor for runtime cache management "
+        "operations such as KV cache truncation. This adds a per-iteration "
+        "broadcast collective.",
+        status="prototype",
+    )
+
     # fp8 cute dsl configs
     use_cute_dsl_blockscaling_mm: bool = Field(
         default=False,
@@ -4342,6 +4396,7 @@ def update_llm_args_with_extra_dict(
         "moe_config": MoeConfig,
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
+        "reorder_policy_config": ReorderRequestPolicyConfig,
         "kv_cache_config": KvCacheConfig,
         "dwdp_config": DwdpConfig,
         "telemetry_config": TelemetryConfig,

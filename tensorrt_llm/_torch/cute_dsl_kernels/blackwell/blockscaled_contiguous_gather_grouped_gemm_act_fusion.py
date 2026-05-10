@@ -38,6 +38,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from ...utils import ActivationType, is_gated_activation
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     TRTLLM_ENABLE_PDL,
@@ -48,20 +49,43 @@ from .utils import (
     silu_f32,
 )
 
-"""
-High-performance persistent blockscaled contiguous grouped dense GEMM with gather and SwiGLU fusion
-(C = up * silu(gate), where up and gate come from interleaved weight matrix B)
-example for the NVIDIA Blackwell architecture using CUTE DSL.
+SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
 
-This kernel performs FC1 layer computation with SwiGLU activation fusion:
+
+def validate_activation_type(activation_type) -> ActivationType:
+    """Normalize to ``ActivationType`` and assert the value is one this kernel
+    supports. Accepts either an ``ActivationType`` or its ``int`` value."""
+    activation_type = ActivationType(int(activation_type))
+    assert activation_type in SUPPORTED_ACTIVATION_TYPES, (
+        "activation_type must be one of "
+        f"{[a.name for a in SUPPORTED_ACTIVATION_TYPES]}, "
+        f"got {activation_type.name}"
+    )
+    return activation_type
+
+
+"""
+High-performance persistent blockscaled contiguous grouped dense GEMM with gather and activation
+fusion example for the NVIDIA Blackwell architecture using CUTE DSL.
+
+Supported fused activations (selected at construction via ``activation_type``):
+    - ActivationType.Swiglu: C = up * silu(gate), where up/gate come from interleaved weight matrix B
+    - ActivationType.Relu2:  C = relu(alpha * x)^2
+
+Any other ``ActivationType`` value raises an assertion at construction time.
+
+This kernel performs FC1 layer computation with fused activation:
 1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+2. Activation:
+     - Swiglu: C = up * silu(gate), up/gate extracted from interleaved acc (granularity=64)
+     - Relu2:  C = relu(acc)^2
 3. Optional Quant: When c_dtype is Float4E2M1FN, generates scale factor C and quantizes output
 
 - Matrix A is MxKx1, A can be row-major("K"), ValidM is composed of valid m in different groups
 - Matrix B is NxKxL, B can be column-major("K"), L is grouped dimension (number of experts)
-  - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
-- Matrix C is Mx(N/2)x1, C can be row-major("N"), N is halved due to SwiGLU fusion
+  - Gated: B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
+  - Non-gated: B weights are plain
+- Matrix C is MxN_out x1, C can be row-major("N"). N_out = N/2 for gated, N for non-gated.
 - Matrix SFA layout is filled internally according to A shape and BlockScaledBasicChunk,
   which has M×ceil_div(K, sf_vec_size)×1 elements
 - Matrix SFB layout is filled internally according to B shape and BlockScaledBasicChunk,
@@ -103,10 +127,10 @@ This GEMM works as follows:
     - Load scale factor A/B from shared memory (SMEM) to tensor memory (TMEM) using tcgen05.cp instruction.
     - Perform matrix multiply-accumulate (MMA) operations using tcgen05.mma instruction.
 5. EPILOGUE warps (warps 0-3):
-    - Load two accumulator subtiles (up and gate) from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
-    - Apply alpha scaling: up_scaled = alpha * up, gate_scaled = alpha * gate
-    - Compute SwiGLU activation: output = up_scaled * silu(gate_scaled), where silu(x) = x * sigmoid(x)
-    - If c_dtype is Float4E2M1FN: generate scale factor C (SFC) and quantize output
+    - Gated: load two accumulator subtiles (up, gate) from TMEM to RMEM via tcgen05.ld, then
+             apply alpha scaling and compute output = (alpha*up) * silu(alpha*gate).
+    - Non-gated: load one accumulator subtile per iteration and compute output = relu(alpha*acc)^2.
+    - If c_dtype is Float4E2M1FN: generate scale factor C (SFC) and quantize output.
     - Type convert output to c_dtype.
     - Store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations.
 
@@ -155,21 +179,24 @@ CUDA Graph Support:
 
 
 class BlockScaledContiguousGatherGroupedGemmKernel:
-    """This class implements contiguous grouped matrix multiplication with gather operation and SwiGLU fusion
-    for FC1 layer computation (C = up * silu(gate), where up/gate come from interleaved GEMM result).
+    """This class implements contiguous grouped matrix multiplication with gather operation and a
+    fused activation (selected via ``activation_type``: SwiGLU or Relu2) for FC1 layer computation.
 
     The computation flow:
     1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-    2. SwiGLU: C = up * silu(gate), extracted from interleaved acc with granularity=64
+    2. Activation (selected via ``activation_type``):
+         - ActivationType.Swiglu: C = up * silu(gate), from interleaved acc with granularity=64
+         - ActivationType.Relu2:  C = relu(acc)^2
+       Any other ``ActivationType`` value raises an assertion in ``__init__``.
     3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
-    Note: Output C has N/2 columns since pairs of (up, gate) are combined by SwiGLU.
+    Note: Output C has N/2 columns for Swiglu (pairs of up/gate collapsed), N columns for Relu2.
 
     Key Features:
     - Uses LDGSTS instructions for loading A and SFA matrices with gather/permutation capability
     - Uses TMA (Tensor Memory Access) for loading B and SFB matrices with multicast
     - Token ID mapping enables efficient gather operation during A/SFA load
-    - SwiGLU activation fusion in epilogue (up * silu(gate) with interleaved weights)
+    - Activation fusion in epilogue (gated uses interleaved weights; non-gated uses plain weights)
     - Optional quantization fusion for Float4E2M1FN output with scale factor generation
     - Warp specialization: Scheduler (warp 10), A Sync Transform (warp 11, only used when
       use_2cta_instrs is True), LDGSTS A/SFA (warps 4-7), TMA B/SFB (warp 9), MMA (warp 8),
@@ -250,9 +277,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         topk: cutlass.Int64,
         raster_along_m: bool = False,
         b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
-        gather operation and SwiGLU fusion.
+        gather operation and fused activation.
+
+        ``activation_type`` accepts a value from ``ActivationType``; only
+        ``ActivationType.Swiglu`` (gated path) and ``ActivationType.Relu2``
+        (non-gated path) are currently supported.
 
         This configuration includes several key aspects:
 
@@ -289,10 +321,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             E.g., (8, 8, 16) means 3 B tensors with L=8, 8, 16. Sum equals total L.
             If None, single B tensor mode (backward compatible).
         :type b_tensor_l_sizes: Optional[Tuple[int, ...]]
+        :param activation_type: Fused activation. Must be ``ActivationType.Swiglu``
+            (gated, default) or ``ActivationType.Relu2`` (non-gated).
+        :type activation_type: ActivationType
         """
 
         self.sf_vec_size = sf_vec_size
         self.topk = topk
+        self.activation_type = validate_activation_type(activation_type)
+        self.is_gated = is_gated_activation(self.activation_type)
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -460,7 +497,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.mma_tiler_c = (
             self.mma_inst_shape_mn[0],
-            self.mma_inst_shape_mn[1] // 2,
+            self.mma_inst_shape_mn[1] // 2 if self.is_gated else self.mma_inst_shape_mn[1],
             mma_inst_shape_k * mma_inst_tile_k,
         )
 
@@ -577,7 +614,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         )
 
-        self.epi_tile_n_required = 2 * cute.size(self.epi_tile[1])
+        self.epi_tile_n_required = (2 if self.is_gated else 1) * cute.size(self.epi_tile[1])
         # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
         self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n_required
 
@@ -600,17 +637,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
+        """Execute the contiguous grouped GEMM with gather operation and fused activation.
 
         This method performs FC1 layer computation:
         1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+        2. Activation (selected by ``activation_type`` at construction):
+             - ActivationType.Swiglu: C = up * silu(gate), up/gate from interleaved acc (granularity=64)
+             - ActivationType.Relu2:  C = relu(acc)^2
         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
         Data loading:
         - A and SFA are loaded using LDGSTS instructions with token-based gather
         - B and SFB are loaded using TMA instructions with multicast
-        - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
+        - Gated: B weights are interleaved [up_0:64, gate_64:128, up_128:192, gate_192:256, ...];
+          non-gated: B weights are plain.
 
         Execution steps:
         1. Setup static attributes before smem/grid computation
@@ -624,13 +664,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
              shared memory when use_2cta_instrs is True
            - TMA warp: Load B and SFB with multicast
            - MMA warp: Perform matrix multiply-accumulate
-           - Epilogue warps: Apply SwiGLU activation, optional quantization, and store results
+           - Epilogue warps: Apply fused activation, optional quantization, and store results
 
         :param a: Input tensor A (MxKx1), will be gathered using token_id_mapping
         :type a: cute.Tensor
-        :param b: Input tensor B (NxKxL), L is the number of experts/groups, weights are interleaved for SwiGLU
+        :param b: Input tensor B (NxKxL), L is the number of experts/groups; gated mode uses
+                  interleaved up/gate weights, non-gated uses plain weights.
         :type b: cute.Tensor
-        :param c: Output tensor C (Mx(N/2)x1), N is halved due to SwiGLU fusion
+        :param c: Output tensor C; last dim is N/2 for gated (SwiGLU), N for non-gated (Relu2).
         :type c: cute.Tensor
         :param sfa: Scale factor tensor A, will be gathered using token_id_mapping
         :type sfa: cute.Tensor
@@ -2676,35 +2717,45 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
                 #
-                # Process accumulator subtiles with SwiGLU fusion and store to global memory
-                # Each iteration processes a pair of subtiles (up, gate) and computes
-                # up * silu(gate)
+                # Process accumulator subtiles with activation fusion and store to global memory.
+                # - Gated (SwiGLU): processes pairs of subtiles (up, gate), computes up * silu(gate)
+                # - Non-gated (e.g. Relu2): processes individual subtiles, computes relu(alpha*x)^2
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
-                for subtile_idx in cutlass.range(0, subtile_cnt, 2):
-                    real_subtile_idx = subtile_idx // 2
+                for subtile_idx in cutlass.range(0, subtile_cnt, 2 if self.is_gated else 1):
+                    if cutlass.const_expr(self.is_gated):
+                        real_subtile_idx = subtile_idx // 2
+                    else:
+                        real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
                             real_subtile_idx = (
                                 self.cta_tile_shape_mnk[1] // self.epi_tile_n_required
                                 - 1
-                                - subtile_idx // 2
+                                - real_subtile_idx
                             )
-                    #
-                    # Load accumulator from tensor memory buffer to register
-                    #
-                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
-                    tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
 
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+                    if cutlass.const_expr(self.is_gated):
+                        #
+                        # Gated: Load pair of accumulator subtiles (up, gate)
+                        #
+                        tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
+                        tTR_tAcc_mn_gate = tTR_tAcc[(None, None, None, real_subtile_idx * 2 + 1)]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+                    else:
+                        #
+                        # Non-gated: Load single accumulator subtile
+                        #
+                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc_up)
 
                     #
                     # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
-                        if subtile_idx // 2 == self.iter_acc_early_release_in_epilogue:
+                        if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
                             with cute.arch.elect_one():
@@ -2712,71 +2763,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             acc_consumer_state.advance()
 
                     acc_vec_up = tTR_rAcc_up.load()
-                    acc_vec_gate = tTR_rAcc_gate.load()
 
-                    #
-                    # SwiGLU activation: output = up * silu(gate)
-                    # where silu(x) = x * sigmoid(x)
-                    # up and gate are extracted from interleaved accumulator subtiles
-                    #
-                    tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.vectorized_f32):
-                        # SwiGLU Packed Version: uses f32x2 packed operations for better performance
-                        # Computes: output = (alpha * up) * silu(alpha * gate)
-                        # where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-                        LOG2_E = cutlass.Float32(1.4426950408889634)
-                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_up), 2):
-                            acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
-                                (acc_vec_up[i], acc_vec_up[i + 1]),
-                                (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
-                            )
-                            acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
-                                (acc_vec_gate[i], acc_vec_gate[i + 1]),
-                                (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
-                            )
-                            tCompute_log2e = cute.arch.mul_packed_f32x2(
-                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]), (-LOG2_E, -LOG2_E)
-                            )
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.add_packed_f32x2(
-                                (
-                                    cute.math.exp2(tCompute_log2e[0], fastmath=True),
-                                    cute.math.exp2(tCompute_log2e[1], fastmath=True),
-                                ),
-                                (1.0, 1.0),
-                            )
-                            tCompute[i] = cute.arch.rcp_approx(tCompute[i])
-                            tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.mul_packed_f32x2(
-                                (tCompute[i], tCompute[i + 1]),
-                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                            )
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.mul_packed_f32x2(
-                                (tCompute[i], tCompute[i + 1]),
-                                (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
-                            )
-                    else:
-                        # SwiGLU Unpacked Version: scalar operations
-                        # Computes: output = (alpha * up) * silu(alpha * gate)
-                        for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                            acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
-                            acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
-                            tCompute[i] = acc_vec_up_alpha * silu_f32(
-                                acc_vec_gate_alpha, fastmath=True
-                            )
+                    tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
+                    if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
+                        acc_vec_gate = tTR_rAcc_gate.load()
+                        self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
+                    elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
+                        self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
                         # Quantization path for Float4E2M1FN output:
-                        # 1. Compute per-vector absolute max from SwiGLU result
+                        # 1. Compute per-vector absolute max from activation result
                         # 2. Generate scale factor C (SFC) based on max values
                         # 3. Store SFC to global memory
                         # 4. Quantize output by scaling with reciprocal of SFC
@@ -2964,6 +2962,116 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             c_pipeline.producer_tail()
 
         griddepcontrol_launch_dependents()
+
+    # ------------------------------------------------------------------
+    # Fused activation epilogues
+    # ------------------------------------------------------------------
+    # Each supported ``ActivationType`` has its own ``_apply_*_epilogue``
+    # method below. The dispatch happens in ``__call__`` via
+    # ``cutlass.const_expr(self.activation_type == ActivationType.X)``.
+    #
+    # To add a new activation:
+    #   1. Add it to ``SUPPORTED_ACTIVATION_TYPES``.
+    #   2. Implement ``_apply_<name>_epilogue(self, acc_vec_up, [acc_vec_gate,]
+    #      alpha_val, tCompute)`` decorated with ``@cute.jit`` — writing into
+    #      ``tCompute`` in place. The decorator is required so the method body
+    #      is AST-preprocessed (``cutlass.range_constexpr`` relies on this).
+    #      Provide both a ``vectorized_f32`` (packed f32x2) path and a scalar
+    #      path.
+    #   3. Extend the ``__call__`` dispatch with another ``elif`` branch.
+    #   4. If the new activation is gated, also handle the two-subtile TMEM
+    #      load path in ``__call__`` (mirror the existing Swiglu branch).
+    # ------------------------------------------------------------------
+
+    @cute.jit
+    def _apply_swiglu_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``
+
+        ``up`` and ``gate`` come from the two interleaved accumulator
+        subtiles loaded by the caller.
+        """
+        if cutlass.const_expr(self.vectorized_f32):
+            # Packed f32x2: compute silu via 1 / (1 + exp2(-log2_e * x))
+            LOG2_E = cutlass.Float32(1.4426950408889634)
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
+                    (acc_vec_up[i], acc_vec_up[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
+                    (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                tCompute_log2e = cute.arch.mul_packed_f32x2(
+                    (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                    (-LOG2_E, -LOG2_E),
+                )
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.add_packed_f32x2(
+                    (
+                        cute.math.exp2(tCompute_log2e[0], fastmath=True),
+                        cute.math.exp2(tCompute_log2e[1], fastmath=True),
+                    ),
+                    (1.0, 1.0),
+                )
+                tCompute[i] = cute.arch.rcp_approx(tCompute[i])
+                tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (tCompute[i], tCompute[i + 1]),
+                    (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                )
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (tCompute[i], tCompute[i + 1]),
+                    (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                )
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+
+    @cute.jit
+    def _apply_relu2_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """Relu2: ``tCompute[i] = relu(alpha * up[i]) ** 2``"""
+        if cutlass.const_expr(self.vectorized_f32):
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                scaled = cute.arch.mul_packed_f32x2(
+                    (acc_vec_up[i], acc_vec_up[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                relu0 = cute.arch.fmax(scaled[0], 0.0)
+                relu1 = cute.arch.fmax(scaled[1], 0.0)
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (relu0, relu1),
+                    (relu0, relu1),
+                )
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                scaled = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                relu_val = cute.arch.fmax(scaled, 0.0)
+                tCompute[i] = relu_val * relu_val
 
     def epilog_tmem_copy_and_partition(
         self,
@@ -3611,14 +3719,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        activation_type: cutlass.Constexpr = ActivationType.Swiglu,
     ):
         """Unified wrapper supporting both single-B and multi-B tensors.
 
         B tensors are always passed as tuples (length 1 for single-B).
         L sizes are configured via b_tensor_l_sizes in __init__.
+        ``activation_type`` is an ``ActivationType`` value and must match the
+        one passed to ``__init__``; only ``Swiglu`` and ``Relu2`` are supported.
         """
+        is_gated = is_gated_activation(activation_type)
         scale_k = k // scaling_vector_size
-        interm_size = n // 2
+        interm_size = n // 2 if is_gated else n
         num_tiles = m // tile_size
         total_l = self.b_tensor_l_offsets[self.num_b_tensors]
 

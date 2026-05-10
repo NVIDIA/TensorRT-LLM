@@ -115,9 +115,14 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
+
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
 
     def _configure_affinity(self, device_id):
         '''Probe and configure the CPU affinity of the worker based on NUMA topology.
@@ -215,6 +220,9 @@ class BaseWorker(GenerationExecutor):
                 args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
+
+            if self._resource_governor_queue is not None:
+                args["resource_governor_queue"] = self._resource_governor_queue
 
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
