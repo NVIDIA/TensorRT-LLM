@@ -220,6 +220,10 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
 
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+
         # +block_size slack lets per-iter noise K/V scatter into the gathered
         # view and flash_attn read it in place.
         assert hasattr(draft_model, "_build_fused_kv_buffers"), (
@@ -229,8 +233,7 @@ class DFlashWorker(SpecWorkerBase):
         L = draft_model._num_attn_layers
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
-        block_size = getattr(draft_model, "block_size", None) or (self.max_draft_len + 1)
-        kv_shape = (max_batch, L, self._max_ctx + block_size, nkv, hd)
+        kv_shape = (max_batch, L, self._max_ctx + self._resolved_block_size, nkv, hd)
         self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_buf_inited = True
@@ -585,11 +588,6 @@ class DFlashWorker(SpecWorkerBase):
                     "or ensure the draft model config has 'dflash_config.mask_token_id' or 'mask_token_id'."
                 )
         mask_token_id = self._resolved_mask_token_id
-
-        if self._resolved_block_size is None:
-            self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-                self.max_draft_len + 1
-            )
 
         # Get the embed_tokens layer from the draft model
         embed_tokens = draft_model.draft_model_full.model.embed_tokens
