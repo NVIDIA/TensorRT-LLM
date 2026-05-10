@@ -9,7 +9,7 @@ from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
 
-from ...functional import PositionEmbeddingType
+from ...functional import PositionEmbeddingType, RotaryScalingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig, TConfig
@@ -860,12 +860,14 @@ class DFlashForCausalLM(nn.Module):
         self._rope_dummy_q = None
 
         # Lazy-built after weights load (see _build_fused_kv_buffers).
-        self._fused_kv_weight = None  # [L*2*kv_size, hidden]
-        self._fused_kv_bias = None  # [L*2*kv_size] or None
-        self._k_norm_weights = None  # list of L tensors, each [head_dim]
+        self._fused_kv_weight = None
+        self._fused_kv_bias = None
+        self._k_norm_weights = None
         self._num_attn_layers = 0
         self._head_dim = 0
         self._num_kv_heads = 0
+        self._has_qk_norm = False
+        self._use_fused_qk_norm_rope = False
 
     def _init_rope(self):
         """Initialize RoPE from the draft model's attention configuration.
@@ -1109,6 +1111,25 @@ class DFlashForCausalLM(nn.Module):
         self._head_dim = head_dim
         self._num_kv_heads = num_kv_heads
         self._fused_kv_weight = fused_kv_weight
+
+        # fused_qk_norm_rope derives YaRN / partial-rotary frequencies on
+        # the fly, which can disagree with precompute_context_kv's cached
+        # cos/sin. Only enable it when the drafter uses plain RoPE.
+        self._has_qk_norm = (all(has_k_norm)
+                             and all(hasattr(a, 'q_norm') for a in layers_attn))
+        rope_params = getattr(getattr(attn0, 'pos_embd_params', None), 'rope',
+                              None)
+        scale_type = getattr(rope_params, 'scale_type', None)
+        partial_rotary_factor = getattr(
+            getattr(attn0, 'pretrained_config', None), 'partial_rotary_factor',
+            1.0)
+        self._use_fused_qk_norm_rope = (self._has_qk_norm
+                                        and hasattr(attn0, 'apply_qk_norm_rope')
+                                        and rope_params is not None
+                                        and scale_type
+                                        in (None, RotaryScalingType.none)
+                                        and partial_rotary_factor == 1.0)
+
         logger.debug(
             f"DFlash: fused KV weights built for {self._num_attn_layers} layers "
             f"(fused_kv_weight shape={tuple(self._fused_kv_weight.shape)})")
@@ -1158,8 +1179,10 @@ class DFlashForCausalLM(nn.Module):
         Returns:
             [B * block_size, hidden_size]
         """
-        import torch.nn.functional as F
         from flash_attn import flash_attn_with_kvcache
+
+        if self._fused_kv_weight is None:
+            self._build_fused_kv_buffers()
 
         layer0 = self.model.layers[0]
         attn0 = layer0.self_attn
@@ -1168,14 +1191,12 @@ class DFlashForCausalLM(nn.Module):
         head_dim = attn0.head_dim
         num_heads_per_rank = attn0.num_heads
         num_kv_heads_per_rank = attn0.num_key_value_heads
-        has_qk_norm = hasattr(attn0, 'q_norm') and hasattr(attn0, 'k_norm')
-        # Apply RoPE via the same flashinfer in-place kernel + cos/sin cache
-        # that precompute_context_kv uses. Sharing the cache is critical —
-        # fused_qk_norm_rope / apply_rotary_pos_emb derive YaRN (or other
-        # scaled) frequencies on their own, and a mismatch against the cached
-        # cos/sin breaks context-vs-query attention and collapses acceptance.
+
+        has_qk_norm = self._has_qk_norm
+        is_bf16 = noise_embedding.dtype == torch.bfloat16
+        use_fused_qk_norm_rope = self._use_fused_qk_norm_rope and is_bf16
         use_fused_rope = (_flashinfer_rope is not None and has_qk_norm
-                          and noise_embedding.dtype == torch.bfloat16)
+                          and is_bf16 and not use_fused_qk_norm_rope)
 
         B = noise_embedding.shape[0]
         block_size = noise_embedding.shape[1]
@@ -1217,7 +1238,24 @@ class DFlashForCausalLM(nn.Module):
             # QKV projection on normed query tokens (2D)
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
 
-            if use_fused_rope:
+            if use_fused_qk_norm_rope:
+                # One kernel does q_norm + k_norm + RoPE in-place on qkv.
+                # Only safe when the drafter's rope params don't use YaRN /
+                # long-rope / partial-rotary — otherwise fall back to the
+                # shared-cache path below.
+                attn_mod.apply_qk_norm_rope(qkv_query, query_positions_flat_i32)
+                q_all_2d = qkv_query[:, :q_size]
+                k_noise_2d = qkv_query[:, q_size:q_size + kv_size]
+                v_noise_2d = qkv_query[:, q_size + kv_size:]
+                Q_bshd = q_all_2d.reshape(B, block_size, num_heads_per_rank,
+                                          head_dim)
+                k_noise_bshd = k_noise_2d.reshape(B, block_size,
+                                                  num_kv_heads_per_rank,
+                                                  head_dim)
+                v_noise_bshd = v_noise_2d.reshape(B, block_size,
+                                                  num_kv_heads_per_rank,
+                                                  head_dim)
+            elif use_fused_rope:
                 # Per-head RMSNorm on q/k (returns new contiguous tensors),
                 # then flashinfer in-place RoPE sharing the same cos/sin cache
                 # as precompute_context_kv.
@@ -1279,9 +1317,8 @@ class DFlashForCausalLM(nn.Module):
             layer_k_cache = ctx_k_cache[:, layer_idx]
             layer_v_cache = ctx_v_cache[:, layer_idx]
 
-            # flash_attn writes k_noise/v_noise in-place into the cache at
-            # positions cache_seqlens[i]..+block_size for each batch i.
-            # Replaces the old torch.scatter_ step.
+            # flash_attn appends k_noise/v_noise in-place at
+            # cache_seqlens[i]..+block_size for each batch i.
             out = flash_attn_with_kvcache(
                 q=Q_bshd,
                 k_cache=layer_k_cache,
