@@ -164,7 +164,6 @@ class DFlashWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
-        self._mask_embed = None  # Cached mask token embedding (CUDA-graph safe)
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
 
@@ -617,40 +616,33 @@ class DFlashWorker(SpecWorkerBase):
             block_size = self._resolved_block_size
             query_tokens_per_req = block_size
 
-            if self._mask_embed is None:
-                mask_token = torch.tensor([mask_token_id], dtype=torch.long, device="cuda")
-                self._mask_embed = embed_tokens(mask_token).detach()
-
-            # Start with all mask embeddings for block_size tokens
-            noise_embed_2d = self._mask_embed.expand(
-                num_gens * query_tokens_per_req, hidden_dim
-            ).clone()
-            noise_embed_2d = noise_embed_2d.reshape(num_gens, query_tokens_per_req, hidden_dim)
-
-            # Fill position 0 (bonus) with embedding of last accepted token
-            bonus_indices = (gen_num_accepted - 1).long().clamp(min=0).unsqueeze(1)
-            bonus_token_ids = gen_accepted_tokens.gather(1, bonus_indices).squeeze(1)
-            bonus_embeds = embed_tokens(bonus_token_ids.long())
-            noise_embed_2d[:, 0, :] = bonus_embeds.to(noise_embed_2d.dtype)
-
             # Get slots for gen requests from pre-computed mapping
             slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
 
-            # Position starts from accumulated context length (BEFORE
-            # adding current step's features).
-            gen_pos_starts = self._ctx_len[slots].int()
+            K_plus_1 = K + 1
 
-            # Context positions for storing new accepted tokens (reused below)
-            offsets_kp1 = torch.arange(K + 1, dtype=torch.long, device="cuda")
-            ctx_position_ids = (
-                gen_pos_starts.unsqueeze(1) + offsets_kp1.unsqueeze(0).int()
-            )  # [num_gens, K+1]
+            bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
+            bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
-            # Query positions start AFTER the full context including current
-            # step's accepted features
-            gen_query_start = gen_pos_starts + gen_num_accepted.to(torch.int32)
-            query_offsets = torch.arange(query_tokens_per_req, dtype=torch.int32, device="cuda")
-            query_position_ids = gen_query_start.unsqueeze(1) + query_offsets.unsqueeze(0)
+            ctx_len_gen = self._ctx_len[slots]
+            j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
+            offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
+
+            query_position_ids = (
+                ctx_len_gen.unsqueeze(1)
+                + gen_num_accepted.long().unsqueeze(1)
+                + j_block.unsqueeze(0)
+            )
+            ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+
+            # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
+            # vocabs mask out ranks that don't own the token id and all-reduce.
+            mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device="cuda")
+            combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
+            embed_bonus = combined_embed[:num_gens]
+            embed_mask = combined_embed[num_gens]
+            noise_embed_2d = embed_mask.expand(num_gens, query_tokens_per_req, -1).clone()
+            noise_embed_2d[:, 0, :] = embed_bonus
 
             # Accumulate new accepted features into context buffers
             if has_target_features:
