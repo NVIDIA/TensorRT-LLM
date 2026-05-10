@@ -108,8 +108,10 @@ CommittedPage::~CommittedPage()
 {
     if (block != nullptr)
     {
+        block->unlinkPage(lifeCycle);
         LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
-        block->unsetPage(lifeCycle, lc);
+        auto detachedBlocks = Block::clearStaleBlocksAfterPageUnlink(*block, lifeCycle, lc);
+        (void) detachedBlocks;
     }
     // Delegate slot release to Page::~Page().
 }

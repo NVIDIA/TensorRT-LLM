@@ -185,20 +185,49 @@ BlockKey RootBlock::makeKey(std::optional<int64_t> loraTaskId)
 }
 
 RootBlock::RootBlock(std::optional<int64_t> loraTaskId, BlockRadixTree* treePtr)
-    : key(makeKey(loraTaskId))
+    : NodeBase(makeKey(loraTaskId))
     , loraTaskId(loraTaskId)
     , tree(treePtr)
 {
 }
 
-int RootBlock::numLifeCycles() const
-{
-    return tree->numLifeCycles();
-}
-
-int RootBlock::tokensPerBlock() const
+int RootBlock::tokensPerBlock() const noexcept
 {
     return tree->tokensPerBlock();
+}
+
+// ---------------------------------------------------------------------------
+// NodeBase
+// ---------------------------------------------------------------------------
+
+NodeBase::~NodeBase()
+{
+    // Detach children before next is destroyed (implicit member destruction).
+    // This ensures that when a child's ~Block() runs, it sees prev == nullptr
+    // and skips parent cleanup — avoiding virtual calls on a mid-destruction parent.
+    for (auto& [k, child] : next)
+    {
+        child->prev = nullptr;
+    }
+}
+
+std::shared_ptr<Block> NodeBase::detachNext(BlockKey const& blockKey)
+{
+    auto it = next.find(blockKey);
+    if (it == next.end())
+    {
+        return nullptr;
+    }
+
+    auto block = it->second;
+    block->prev = nullptr;
+    next.erase(it);
+    if (type() == Type::kROOT_BLOCK && next.empty())
+    {
+        auto* root = static_cast<RootBlock*>(this);
+        root->tree->proposeToEraseEmptyRoot(root->key);
+    }
+    return block;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,43 +259,48 @@ BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_
     return h.digest();
 }
 
-Block::~Block()
+Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode, int nlc)
+    : NodeBase(k)
+    , tokens(std::move(toks))
+    , prev(prevNode)
+    , storage(static_cast<size_t>(nlc), nullptr)
+    , mOrdinal(prevNode->ordinal() + 1)
 {
-    // Mirrors Python Block.__del__: for each stored page, if alive and
-    // DROPPABLE and scheduled for eviction, exclude from eviction.
-    for (auto const page : storage)
-    {
-        if (page != nullptr && page->status() == PageStatus::DROPPABLE)
-        {
-            if (page->scheduledForEviction())
-                page->manager->excludeFromEviction(*page);
-        }
-    }
-    // If we're the last child of a root block, remove the root block from the tree.
-    // Mirrors Python: `self.prev.prev.next.pop(self.prev.key)`
-    if (parentRoot && parentRoot->next.empty())
-    {
-        auto rootKey = parentRoot->key;
-        parentRoot->tree->eraseRoot(rootKey);
-    }
 }
 
 int Block::tokensPerBlock() const noexcept
 {
-    if (parentBlock)
-        return static_cast<int>(parentBlock->tokens.size());
-    if (parentRoot)
-        return parentRoot->tokensPerBlock();
-    assert(false && "Block must have a parent");
-    return 0; // unreachable, keeps compiler happy
+    assert(prev && "Block must have a prev");
+    // Mirrors Python: prev.tokens_per_block if isinstance(prev, RootBlock) else len(prev.tokens)
+    if (prev->type() == Type::kROOT_BLOCK)
+        return prev->tokensPerBlock();
+    return static_cast<int>(static_cast<Block const*>(prev)->tokens.size());
+}
+
+Block::~Block()
+{
+    // Mirrors Python Block.__del__: for each stored page, if alive and
+    // DROPPABLE and scheduled for eviction, exclude from eviction.
+    // Also null out the page's back-pointer so that CommittedPage::~CommittedPage()
+    // doesn't attempt cleanup through this dead Block.
+    for (size_t i = 0; i < storage.size(); ++i)
+    {
+        auto const page = storage[i];
+        if (page != nullptr)
+        {
+            unlinkPage(static_cast<LifeCycleId>(i));
+            if (page->status() == PageStatus::DROPPABLE && page->scheduledForEviction())
+            {
+                page->manager->excludeFromEviction(*page);
+            }
+        }
+    }
 }
 
 bool Block::isOrphan() const noexcept
 {
-    auto* map = const_cast<Block*>(this)->parentNextMap();
-    assert(map && "Block must have a parent");
-    auto it = map->find(key);
-    return it == map->end() || it->second.get() != this;
+    assert(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
+    return prev == nullptr;
 }
 
 int Block::partialMatchThisNode(TokenIdExt const* otherTokens, size_t otherCount) const
@@ -281,87 +315,83 @@ int Block::partialMatchThisNode(TokenIdExt const* otherTokens, size_t otherCount
     return count;
 }
 
-std::unordered_map<BlockKey, std::shared_ptr<Block>>* Block::parentNextMap()
-{
-    if (parentRoot)
-        return &parentRoot->next;
-    if (parentBlock)
-        return &parentBlock->next;
-    return nullptr;
-}
-
-BlockKey const& Block::parentKey() const
-{
-    if (parentRoot)
-        return parentRoot->key;
-    if (parentBlock)
-        return parentBlock->key;
-    assert(false && "Block must have a parent");
-    static BlockKey empty{};
-    return empty; // unreachable
-}
-
-void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
+void Block::unlinkPage(LifeCycleId lcIdx)
 {
     auto& page = storage.at(static_cast<size_t>(lcIdx));
-    if (page == nullptr)
+    if (page != nullptr)
     {
-        return;
+        page->block = nullptr;
+        page = nullptr;
     }
-    page = nullptr;
+}
+
+std::vector<std::shared_ptr<Block>> Block::clearStaleBlocksAfterPageUnlink(
+    Block& block, LifeCycleId lcIdx, LifeCycle const& lc)
+{
+    std::vector<std::shared_ptr<Block>> detachedBlocks;
+    assert(block.storage.at(static_cast<size_t>(lcIdx)) == nullptr);
+    if (block.isOrphan())
+    {
+        return detachedBlocks;
+    }
 
     // Reuse cleanup only applies to attention lifecycles.
     // SSM lifecycles are allowed in the tree but don't trigger subtree eviction.
-    auto const alc = std::get_if<AttnLifeCycle>(&lc);
+    auto const* const alc = std::get_if<AttnLifeCycle>(&lc);
+    NodeBase* pruneStart = &block;
 
-    // If this is a non-sink block with no window (or sink block): evict subtree.
+    // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && (!alc->windowSize.has_value() || ordinal < alc->numSinkBlocks))
+    if (alc && (!alc->windowSize.has_value() || block.ordinal() < alc->numSinkBlocks))
     {
-        auto const self = shared_from_this(); // prevent destruction during removeSubtree
-        auto& parentMap = *parentNextMap();
-        assert(parentMap);
-        auto const allPages = removeSubtree(parentMap, key);
-
-        for (auto const pg : allPages)
-        {
-            assert(pg != nullptr);
-            assert(pg->status() == PageStatus::DROPPABLE);
-            if (pg->scheduledForEviction())
-                pg->manager->excludeFromEviction(*pg);
-        }
+        pruneStart = block.prev;
+        detachedBlocks.push_back(removeSubtree(block));
     }
 
     // Prune empty tail nodes up the chain.
-    Block* curr = this;
-    while (curr && curr->storage.at(static_cast<size_t>(lcIdx)) == nullptr && curr->next.empty())
+    // Save prev, key, and type before erasing, because the erase may destroy
+    // curr when its last shared_ptr is dropped.
+    Block* curr
+        = pruneStart && pruneStart->type() == NodeBase::Type::kBLOCK ? static_cast<Block*>(pruneStart) : nullptr;
+    while (curr && curr->next.empty() && curr->storage.at(static_cast<size_t>(lcIdx)) == nullptr)
     {
-        auto* map = curr->parentNextMap();
-        if (map)
-            map->erase(curr->key);
-        curr = curr->parentBlock;
+        NodeBase* prevNode = curr->prev;
+        BlockKey const currKey = curr->key;
+        bool const prevIsBlock = prevNode && prevNode->type() == NodeBase::Type::kBLOCK;
+        if (prevNode)
+        {
+            auto detached = prevNode->detachNext(currKey); // may destroy curr
+            assert(detached && detached.get() == curr);
+            detachedBlocks.push_back(std::move(detached));
+        }
+        // Walk up only through Block nodes; stop at RootBlock.
+        curr = prevIsBlock ? static_cast<Block*>(prevNode) : nullptr;
     }
+    return detachedBlocks;
 }
 
 // ---------------------------------------------------------------------------
 // addOrGetExistingBlock
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::shared_ptr<Block>>& parentNext,
-    BlockKey const& parentKey, int numLifeCycles, int tokensPerBlock, std::vector<TokenIdExt> tokens,
-    RootBlock* parentRoot, Block* parentBlock, bool* isNew)
+std::shared_ptr<Block> addOrGetExistingBlock(
+    NodeBase* prev, int numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
 {
-    // Parent must be a full block (mirrors Python: "prev must be a full block").
-    if (parentBlock)
+    assert(prev && "prev must not be null");
+
+    // Prev must be a full block if it is a Block (mirrors Python: "prev must be a full block").
+    if (prev->type() == NodeBase::Type::kBLOCK)
     {
-        assert(parentBlock->isFull() && "prev must be a full block");
+        assert(static_cast<Block*>(prev)->isFull() && "prev must be a full block");
     }
 
-    BlockKey newKey = Block::makeKey(parentKey, tokens.data(), tokens.size());
+    auto& prevNext = prev->next;
+    int const tpb = prev->tokensPerBlock();
+    BlockKey newKey = Block::makeKey(prev->key, tokens.data(), tokens.size());
 
     // Exact match: return existing block (not new — mirrors Python's UselessBlockError path).
-    auto it = parentNext.find(newKey);
-    if (it != parentNext.end())
+    auto it = prevNext.find(newKey);
+    if (it != prevNext.end())
     {
         if (isNew)
             *isNew = false;
@@ -370,9 +400,9 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
 
     // Useless check: is this block's token prefix covered by a sibling?
     // Mirrors Python's UselessBlockError — throw with the sibling block.
-    if (static_cast<int>(tokens.size()) < tokensPerBlock)
+    if (static_cast<int>(tokens.size()) < tpb)
     {
-        for (auto const& [k, sibling] : parentNext)
+        for (auto const& [k, sibling] : prevNext)
         {
             if (sibling->tokens.size() >= tokens.size() && isPrefix(tokens, sibling->tokens))
                 throw UselessBlockError(sibling);
@@ -381,7 +411,7 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
 
     // Remove siblings whose tokens are a strict prefix of ours.
     std::vector<BlockKey> toRemove;
-    for (auto const& [k, sibling] : parentNext)
+    for (auto const& [k, sibling] : prevNext)
     {
         if (sibling->tokens.size() < tokens.size() && isPrefix(sibling->tokens, tokens))
         {
@@ -391,23 +421,16 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
     }
     for (auto const& k : toRemove)
     {
-        auto erased = parentNext.find(k);
-        assert(erased != parentNext.end());
-        auto erasedBlock = erased->second;
-        parentNext.erase(erased);
+        auto erasedBlock = prev->detachNext(k);
+        assert(erasedBlock);
         assert(erasedBlock->isOrphan() && "erased sibling must be orphan after removal");
+        (void) erasedBlock;
     }
 
-    // Create the new block.
-    auto block = std::make_shared<Block>();
-    block->key = newKey;
-    block->tokens = std::move(tokens);
-    block->ordinal = parentRoot ? BlockOrdinal(0) : BlockOrdinal(parentBlock->ordinal + 1);
-    block->parentRoot = parentRoot;
-    block->parentBlock = parentBlock;
-    block->storage.assign(static_cast<size_t>(numLifeCycles), {});
+    // Create the new block. ordinal and tokensPerBlock are derived from prev inside the Block ctor.
+    auto block = std::make_shared<Block>(newKey, std::move(tokens), prev, numLifeCycles);
 
-    parentNext[newKey] = block;
+    prevNext[newKey] = block;
     if (isNew)
         *isNew = true;
     return block;
@@ -417,46 +440,45 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
 // removeSubtree
 // ---------------------------------------------------------------------------
 
-std::vector<CommittedPage*> removeSubtree(
-    std::unordered_map<BlockKey, std::shared_ptr<Block>>& parentNext, BlockKey const& rootKey)
+std::shared_ptr<Block> removeSubtree(Block& root)
 {
-    std::vector<CommittedPage*> ret{};
-    auto it = parentNext.find(rootKey);
-    assert(it != parentNext.end() && "Key must exist in parent's next map");
+    Block* current = &root;
+    std::shared_ptr<Block> detachedRoot;
 
-    std::vector<std::shared_ptr<Block>> stack = {it->second};
-    parentNext.erase(it);
-
-    while (!stack.empty())
+    // Post-order traversal using prev/next links — O(1) extra space.
+    // Descend to leaves first, remove on the way back up.
+    // ~Block() handles page cleanup (nulling back-pointers, excludeFromEviction).
+    // Mirrors Python's remove_subtree().
+    while (true)
     {
-        auto block = stack.back();
-        stack.pop_back();
-
-        // Collect pages.
-        for (auto& page : block->storage)
+        // Descend: if the current block has children, go to the first child.
+        if (!current->next.empty())
         {
-            if (page != nullptr)
-            {
-                page->block = nullptr;
-                ret.push_back(page);
-                page = nullptr;
-            }
+            current = current->next.begin()->second.get();
         }
+        else
+        {
+            // Remove this block from its parent's next map.
+            // Null prev to detach — the block may outlive the tree if held
+            // externally (e.g., by nanobind/Python shared_ptr).
+            NodeBase* parent = current->prev;
+            BlockKey const currentKey = current->key;
+            auto detached = parent->detachNext(currentKey);
+            assert(detached && detached.get() == current);
+            (void) detached;
 
-        // Clear storage.
-        block->storage.assign(block->storage.size(), nullptr);
-        assert(gNdebug
-            || (std::all_of(
-                    block->storage.begin(), block->storage.end(), [](auto const* page) { return page == nullptr; })
-                && "storage must be cleared after assign"));
+            if (current == &root)
+            {
+                detachedRoot = std::move(detached);
+                break;
+            }
 
-        // Push children (they will be destroyed when removed from parent's next).
-        for (auto& [k, child] : block->next)
-            stack.push_back(child);
-        block->next.clear();
+            assert(parent->type() == NodeBase::Type::kBLOCK);
+            current = static_cast<Block*>(parent);
+        }
     }
-
-    return ret;
+    assert(detachedRoot);
+    return detachedRoot;
 }
 
 // ---------------------------------------------------------------------------
@@ -480,17 +502,41 @@ int BlockRadixTree::numLifeCycles() const noexcept
     return static_cast<int>(mLifeCycles.size());
 }
 
+void BlockRadixTree::drainPendingRootErases() const
+{
+    if (mPendingRootErases.empty())
+    {
+        return;
+    }
+    // Move to local to allow re-entrancy (proposeToEraseEmptyRoot during erase).
+    std::vector<BlockKey> pending;
+    pending.swap(mPendingRootErases);
+    auto& roots = const_cast<std::unordered_map<BlockKey, std::shared_ptr<RootBlock>>&>(mRoots);
+    for (auto const& key : pending)
+    {
+        auto it = roots.find(key);
+        // Only erase if the root exists and is still childless.
+        if (it != roots.end() && it->second->next.empty())
+        {
+            roots.erase(it);
+        }
+    }
+}
+
 RootBlock& BlockRadixTree::addOrGetExisting(std::optional<int64_t> loraTaskId)
 {
+    drainPendingRootErases();
+
     BlockKey key = RootBlock::makeKey(loraTaskId);
     auto it = mRoots.find(key);
     if (it != mRoots.end())
     {
-        return it->second;
+        return *it->second;
     }
 
-    auto [newIt, inserted] = mRoots.emplace(key, RootBlock(loraTaskId, this));
-    return newIt->second;
+    auto rb = std::make_shared<RootBlock>(loraTaskId, this);
+    auto [newIt, inserted] = mRoots.emplace(key, std::move(rb));
+    return *newIt->second;
 }
 
 // Among all child nodes, find the one whose tokens have the longest leading match.
@@ -519,6 +565,8 @@ std::pair<Block*, int> findBestPartialMatchInNextNodes(
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
+    drainPendingRootErases();
+
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
@@ -532,7 +580,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     if (rootIt == mRoots.end())
         return results;
 
-    RootBlock const& root = rootIt->second;
+    RootBlock const& root = *rootIt->second;
     std::unordered_map<BlockKey, std::shared_ptr<Block>> const* currentNext = &root.next;
     // ordinal tracks which block we're on (0-based, after root).
     int ordinal = 0;
@@ -567,32 +615,19 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     return results;
 }
 
-std::vector<CommittedPage*> BlockRadixTree::clear()
+void BlockRadixTree::clear()
 {
-    std::vector<CommittedPage*> ret{};
-
-    // Swap mRoots into a local so that if ~Block() calls eraseRoot() during
-    // removeSubtree() destruction, it operates on the (now-empty) mRoots — safe no-op.
-    std::unordered_map<BlockKey, RootBlock> roots;
-    roots.swap(mRoots);
-
-    for (auto& [rootKey, root] : roots)
+    // detachNext() may call proposeToEraseEmptyRoot, but won't modify mRoots directly.
+    for (auto& [rootKey, root] : mRoots)
     {
-        // Collect child keys, then delegate to removeSubtree() for each — mirrors Python's clear().
-        std::vector<BlockKey> childKeys;
-        childKeys.reserve(root.next.size());
-        for (auto const& [k, child] : root.next)
-            childKeys.push_back(k);
-
-        for (auto const& k : childKeys)
+        while (!root->next.empty())
         {
-            auto pages = removeSubtree(root.next, k);
-            ret.insert(ret.end(), pages.begin(), pages.end());
+            removeSubtree(*root->next.begin()->second);
         }
     }
-
-    assert(mRoots.empty() && "mRoots must be empty after clear");
-    return ret;
+    assert(mRoots.size() == mPendingRootErases.size());
+    mRoots.clear();
+    mPendingRootErases.clear();
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
