@@ -205,20 +205,25 @@ class BambaModelPatch(BaseExportPatch):
     def _apply_patch(self):
         self.original_values["BambaMixer.torch_forward"] = BambaMixer.torch_forward
         self.original_values["BambaModel._update_mamba_mask"] = BambaModel._update_mamba_mask
-        self.original_values["BambaModel._update_causal_mask"] = BambaModel._update_causal_mask
+        # Older transformers expose both; newer releases dropped `_update_causal_mask` on `BambaModel`
+        # (mask handling consolidated under `_update_mamba_mask`).
+        if hasattr(BambaModel, "_update_causal_mask"):
+            self.original_values["BambaModel._update_causal_mask"] = BambaModel._update_causal_mask
         # NOTE: there is `HybridMambaAttentionDynamicCache.__bool__` to save.
         # self.original_values["BambaPreTrainedModel._init_weights"] = BambaPreTrainedModel._init_weights
 
         BambaMixer.torch_forward = _bamba_mixer_torch_forward
         BambaModel._update_mamba_mask = _bamba_model_update_mamba_mask
-        BambaModel._update_causal_mask = _bamba_model_update_causal_mask
+        if hasattr(BambaModel, "_update_causal_mask"):
+            BambaModel._update_causal_mask = _bamba_model_update_causal_mask
         HybridMambaAttentionDynamicCache.__bool__ = _cache_bool
         # BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
 
     def _revert_patch(self):
         BambaMixer.torch_forward = self.original_values["BambaMixer.torch_forward"]
         BambaModel._update_mamba_mask = self.original_values["BambaModel._update_mamba_mask"]
-        BambaModel._update_causal_mask = self.original_values["BambaModel._update_causal_mask"]
+        if "BambaModel._update_causal_mask" in self.original_values:
+            BambaModel._update_causal_mask = self.original_values["BambaModel._update_causal_mask"]
         del HybridMambaAttentionDynamicCache.__bool__
         # BambaPreTrainedModel._init_weights = self.original_values[
         #     "BambaPreTrainedModel._init_weights"

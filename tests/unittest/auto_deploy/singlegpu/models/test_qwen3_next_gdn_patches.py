@@ -184,6 +184,7 @@ def _force_torch_fallbacks(module):
     module.recurrent_gated_delta_rule = hf_recurrent
 
 
+@torch.no_grad()
 def test_qwen3_next_gdn_patch():
     """Verify patched Qwen3NextGatedDeltaNet.forward matches the original HF implementation.
 
@@ -199,20 +200,19 @@ def test_qwen3_next_gdn_patch():
     # Force torch fallbacks for the reference path so both sides use pure torch
     _force_torch_fallbacks(module)
 
-    # Convert to bfloat16 to match typical inference dtype
-    module = module.to(torch.bfloat16)
+    # Convert to bfloat16 on CUDA (the norm layer uses Triton kernels that require CUDA)
+    device = "cuda"
+    module = module.to(torch.bfloat16).to(device)
 
     hidden_size = 32
-    inputs = torch.randn(2, 16, hidden_size, dtype=torch.bfloat16)
+    inputs = torch.randn(2, 16, hidden_size, dtype=torch.bfloat16, device=device)
 
     # Reference: original HF forward (with torch fallbacks, no cache)
-    with torch.no_grad():
-        ref_output = type(module).forward(module, inputs)
+    ref_output = type(module).forward(module, inputs)
 
     # Patched: our _patched_gdn_forward
     module.forward = types.MethodType(_patched_gdn_forward, module)
-    with torch.no_grad():
-        test_output = module(inputs)
+    test_output = module(inputs)
 
     torch.testing.assert_close(
         ref_output,
@@ -223,6 +223,7 @@ def test_qwen3_next_gdn_patch():
     )
 
 
+@torch.no_grad()
 def test_qwen3_next_gdn_patch_float32():
     """Same as above but in float32 for tighter tolerance checks."""
     torch.manual_seed(42)
@@ -230,18 +231,17 @@ def test_qwen3_next_gdn_patch_float32():
     module = _load_qwen3_next_gdn_layer()
     _force_torch_fallbacks(module)
 
-    # Stay in float32 for tighter tolerances
-    module = module.to(torch.float32)
+    # Run on CUDA (the norm layer uses Triton kernels that require CUDA)
+    device = "cuda"
+    module = module.to(torch.float32).to(device)
 
     hidden_size = 32
-    inputs = torch.randn(2, 16, hidden_size, dtype=torch.float32)
+    inputs = torch.randn(2, 16, hidden_size, dtype=torch.float32, device=device)
 
-    with torch.no_grad():
-        ref_output = type(module).forward(module, inputs)
+    ref_output = type(module).forward(module, inputs)
 
     module.forward = types.MethodType(_patched_gdn_forward, module)
-    with torch.no_grad():
-        test_output = module(inputs)
+    test_output = module(inputs)
 
     torch.testing.assert_close(
         ref_output,

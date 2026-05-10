@@ -29,12 +29,17 @@ class QwenAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if getattr(config, "rope_scaling", None) is not None:
+        rope_scaling = getattr(config, "rope_scaling", None)
+        # In transformers 5.x, rope_scaling is always a dict (never None)
+        # and uses "rope_type" key instead of "type".
+        rope_type = None
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+        if rope_type is not None and rope_type != "default":
             pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
+                type=PositionEmbeddingType.from_string(rope_type),
                 rope=RopeParams.from_config(config),
-                mrope_section=config.rope_scaling.get('mrope_section', None))
+                mrope_section=rope_scaling.get('mrope_section', None))
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
@@ -116,8 +121,11 @@ class QwenDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
 
-        if getattr(config, "rope_scaling", None) is not None and getattr(
-                config.rope_scaling, "rope_type", None) == "yarn":
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_type = rope_scaling.get("rope_type",
+                                     rope_scaling.get("type")) \
+            if isinstance(rope_scaling, dict) else None
+        if rope_type == "yarn":
             self.self_attn = QwenYarnAttention(
                 model_config,
                 layer_idx=layer_idx,

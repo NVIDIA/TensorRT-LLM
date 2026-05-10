@@ -19,7 +19,12 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.4
 transforms:
   compile_model:
-    piecewise_enabled: true
+    # Gemma4's inner text graph has 8 leading request-dependent inputs; if
+    # fewer are marked batched, CUDA graph capture treats dynamic tensors as static.
+    num_batched_inputs: 8
+    # Gemma4 image batches carry variable-length multimodal span tensors.
+    # Piecewise CUDA graph currently sizes those buffers from text-only warmup.
+    piecewise_enabled: false
   mlir_elementwise_fusion:
     enabled: true
   gather_logits_before_lm_head:

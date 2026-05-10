@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
+from transformers import NemotronHConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -50,10 +50,6 @@ from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
-
-
-class NemotronHConfig(PretrainedConfig):
-    model_type = "nemotron_h"
 
 
 class MLPLayer(MLP):
@@ -775,7 +771,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         self.model_nextn = 0
         if (model_config.spec_config is not None
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There are not MTP modules in the checkpoint."
@@ -874,7 +870,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         self.model_nextn = 0
         if (model_config.spec_config is not None
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
@@ -1104,6 +1100,3 @@ class NemotronHMTP(nn.Module):
                 lora_params=lora_params,
             )
         return hidden_states
-
-
-AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)

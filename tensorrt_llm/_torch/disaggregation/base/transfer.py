@@ -44,8 +44,12 @@ class KVSlice:
     """
     Specifies which portion of KV cache to transfer.
 
-    token_range is the half-open token interval [start, end) of the tokens
-    covered by the blocks in block_ids_per_layer_groups.
+    token_range is the half-open token interval [start, end) representing
+    the logical portion of the prompt being transferred.  For non-windowed
+    layers every block in block_ids_per_layer_groups covers exactly this
+    range.  For sliding-window layers the actual blocks may cover only a
+    suffix of the interval; the sender derives the exact per-group token
+    offset from its own page-table metadata when building write metadata.
     """
 
     token_range: Optional[TokenRange] = None

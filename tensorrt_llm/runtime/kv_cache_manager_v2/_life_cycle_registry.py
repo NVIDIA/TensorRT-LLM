@@ -15,9 +15,9 @@
 
 from typing import Iterator, NamedTuple, NewType, TypeAlias, cast
 
-from ._common import SlidingWindowSize
+from ._common import BlockOrdinal, SlidingWindowSize
 from ._config import AttentionLayerConfig, KVCacheManagerConfig, LayerConfig, SsmLayerConfig
-from ._utils import HalfOpenRange, TypedIndexList, div_up, typed_enumerate
+from ._utils import HalfOpenRange, TypedIndexList, div_up, intersect, typed_enumerate
 
 
 class AttnLifeCycle(NamedTuple):
@@ -35,19 +35,24 @@ class AttnLifeCycle(NamedTuple):
         num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
         return AttnLifeCycle(window_size, num_sink_blocks)
 
-    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange:
+    def get_stale_range(
+        self, history_length: int, tokens_per_block: int
+    ) -> HalfOpenRange[BlockOrdinal]:
         num_blocks = div_up(history_length, tokens_per_block)
-        start = min(num_blocks, self.num_sink_blocks)
+        start = BlockOrdinal(min(num_blocks, self.num_sink_blocks))
         if self.window_size is None:
             return HalfOpenRange(start, start)
         return HalfOpenRange(
-            start, max(start, (history_length + 1 - self.window_size) // tokens_per_block)
+            start,
+            BlockOrdinal(max(start, (history_length + 1 - self.window_size) // tokens_per_block)),
         )
 
 
 class SsmLifeCycle(NamedTuple):
-    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange:
-        return HalfOpenRange(0, history_length // tokens_per_block)
+    def get_stale_range(
+        self, history_length: int, tokens_per_block: int
+    ) -> HalfOpenRange[BlockOrdinal]:
+        return HalfOpenRange(BlockOrdinal(0), BlockOrdinal(history_length // tokens_per_block))
 
 
 ssm_life_cycle = SsmLifeCycle()
@@ -125,3 +130,28 @@ class LifeCycleRegistry:
         for lc_id, lc in self.items():
             if isinstance(lc, AttnLifeCycle):
                 yield lc_id, lc
+
+
+def compute_scratch_range(
+    life_cycle: LifeCycle,
+    history_length: int,
+    capacity: int,
+    tokens_per_block: int,
+) -> HalfOpenRange[BlockOrdinal]:
+    """
+    Range of blocks that should use scratch (shared) slots during SWA prefill.
+
+    Scratch = stale_at_capacity ∩ input_blocks, where:
+    - stale_at_capacity: blocks out-of-window when all capacity tokens become history.
+    - input_blocks: [div_up(history_length, tpb), div_up(capacity, tpb)) — new blocks
+      for the current chunk. Blocks before this range already contain real KV data
+      from previous chunks and must not be overwritten.
+    """
+    if not isinstance(life_cycle, AttnLifeCycle) or life_cycle.window_size is None:
+        return HalfOpenRange(BlockOrdinal(0), BlockOrdinal(0))
+    cap_stale = life_cycle.get_stale_range(capacity, tokens_per_block)
+    input_range = HalfOpenRange(
+        BlockOrdinal(div_up(history_length, tokens_per_block)),
+        BlockOrdinal(div_up(capacity, tokens_per_block)),
+    )
+    return intersect(cap_stale, input_range)
