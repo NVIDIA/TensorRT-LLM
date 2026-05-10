@@ -34,8 +34,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
-from ...utils import (replace_parameter_and_save_metadata, swizzle_sf,
-                      unswizzle_sf)
+from ...utils import (ActivationType, replace_parameter_and_save_metadata,
+                      swizzle_sf, unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 from .moe_load_balancer import advise_tensor_pageout
@@ -2027,16 +2027,18 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                  requires_grad=False)
         module.register_parameter("fc2_alpha", fc2_alpha)
 
-        # Per-expert weight_scale_2 for dynamic quantization (fixed address for CUDA graph)
-        fc31_weight_scale_2 = nn.Parameter(torch.ones(
-            module.expert_size_per_partition, dtype=torch.float32),
-                                           requires_grad=False)
-        module.register_parameter("fc31_weight_scale_2", fc31_weight_scale_2)
+        # Per-expert weight_scale_2 is only needed for dynamic quantization.
+        if getattr(module, 'force_dynamic_quantization', False):
+            fc31_weight_scale_2 = nn.Parameter(torch.ones(
+                module.expert_size_per_partition, dtype=torch.float32),
+                                               requires_grad=False)
+            module.register_parameter("fc31_weight_scale_2",
+                                      fc31_weight_scale_2)
 
-        fc2_weight_scale_2 = nn.Parameter(torch.ones(
-            module.expert_size_per_partition, dtype=torch.float32),
-                                          requires_grad=False)
-        module.register_parameter("fc2_weight_scale_2", fc2_weight_scale_2)
+            fc2_weight_scale_2 = nn.Parameter(torch.ones(
+                module.expert_size_per_partition, dtype=torch.float32),
+                                              requires_grad=False)
+            module.register_parameter("fc2_weight_scale_2", fc2_weight_scale_2)
 
         # Optional per-channel act scale for NVFP4_AWQ (pre_quant_scale support)
         # This will be initialized in load_quant_scales if pre_quant_scale exists
@@ -2305,10 +2307,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                               local_shared_w2_scale_tensors,
                                               module.tmp_shared_weight_scale_2)
 
-    def _reconcile_and_compute_alphas(self, module: torch.nn.Module,
-                                      tmp_weight_scale_2: Dict,
-                                      dst_fc31_alpha: torch.Tensor,
-                                      dst_fc2_alpha: torch.Tensor):
+    def _reconcile_and_compute_alphas(
+            self,
+            module: torch.nn.Module,
+            tmp_weight_scale_2: Dict,
+            dst_fc31_alpha: torch.Tensor,
+            dst_fc2_alpha: torch.Tensor,
+            dst_fc31_weight_scale_2: Optional[torch.Tensor] = None,
+            dst_fc2_weight_scale_2: Optional[torch.Tensor] = None):
         """Reconcile w1/w3 weight_scale_2 and compute alphas for each expert.
 
         For each expert, reconciles w1 and w3 weight_scale_2 (taking the max
@@ -2336,11 +2342,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                              module.fc2_input_scale.data,
                                              dst_fc2_alpha[expert_idx])
 
-            # Store per-expert weight_scale_2 for dynamic quantization
-            module.fc31_weight_scale_2.data[expert_idx] = w1_ws2[...].reshape(
-                []).float()
-            module.fc2_weight_scale_2.data[expert_idx] = w2_ws2[...].reshape(
-                []).float()
+            if dst_fc31_weight_scale_2 is not None:
+                dst_fc31_weight_scale_2[expert_idx] = w1_ws2[...].reshape(
+                    []).float()
+            if dst_fc2_weight_scale_2 is not None:
+                dst_fc2_weight_scale_2[expert_idx] = w2_ws2[...].reshape(
+                    []).float()
 
     def _finalize_pre_quant_scales(self, module: torch.nn.Module):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
@@ -2421,9 +2428,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         self._finalize_pre_quant_scales(module)
 
         # Step 3: Reconcile weight_scale_2 and compute alphas
-        self._reconcile_and_compute_alphas(module, module.tmp_weight_scale_2,
-                                           module.fc31_alpha.data,
-                                           module.fc2_alpha.data)
+        self._reconcile_and_compute_alphas(
+            module, module.tmp_weight_scale_2, module.fc31_alpha.data,
+            module.fc2_alpha.data, module.fc31_weight_scale_2.data if hasattr(
+                module, 'fc31_weight_scale_2') else None,
+            module.fc2_weight_scale_2.data
+            if hasattr(module, 'fc2_weight_scale_2') else None)
         delattr(module, 'tmp_weight_scale_2')
 
         # Step 4: Finalize shared weight alphas if needed
@@ -2437,16 +2447,34 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 (num_shared, ) + module.fc2_alpha.data.shape[1:],
                 dtype=module.fc2_alpha.data.dtype,
                 device='cpu')
+            shared_fc31_weight_scale_2 = None
+            shared_fc2_weight_scale_2 = None
+            if hasattr(module, 'fc31_weight_scale_2'):
+                shared_fc31_weight_scale_2 = torch.empty(
+                    (num_shared, ) + module.fc31_weight_scale_2.data.shape[1:],
+                    dtype=module.fc31_weight_scale_2.data.dtype,
+                    device='cpu')
+            if hasattr(module, 'fc2_weight_scale_2'):
+                shared_fc2_weight_scale_2 = torch.empty(
+                    (num_shared, ) + module.fc2_weight_scale_2.data.shape[1:],
+                    dtype=module.fc2_weight_scale_2.data.dtype,
+                    device='cpu')
             self._reconcile_and_compute_alphas(module,
                                                module.tmp_shared_weight_scale_2,
                                                shared_fc31_alpha,
-                                               shared_fc2_alpha)
+                                               shared_fc2_alpha,
+                                               shared_fc31_weight_scale_2,
+                                               shared_fc2_weight_scale_2)
             weight_fns = {
                 'w3_w1_weight_scale': module.local_shared_w3_w1_scale_tensors,
                 'w2_weight_scale': module.local_shared_w2_scale_tensors,
                 'fc31_alpha': shared_fc31_alpha,
                 'fc2_alpha': shared_fc2_alpha,
             }
+            if shared_fc31_weight_scale_2 is not None:
+                weight_fns['fc31_weight_scale_2'] = shared_fc31_weight_scale_2
+            if shared_fc2_weight_scale_2 is not None:
+                weight_fns['fc2_weight_scale_2'] = shared_fc2_weight_scale_2
             module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
             delattr(module, 'tmp_shared_weight_scale_2')
             delattr(module, 'local_shared_w3_w1_scale_tensors')
@@ -2805,6 +2833,13 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # First let Cutlass parent do cat + pad + block_scale_interleave
         super().process_weights_after_loading(module)
 
+        # Only interleave for gated activations (SwiGLU) where the fused
+        # gather+GEMM+SwiGLU kernel expects interleaved gate/up weights.
+        # For non-gated, the parent's block_scale_interleave format is already
+        # the swizzled layout expected by the CuTe DSL grouped GEMM kernels.
+        if not module.is_gated_activation:
+            return
+
         # Then apply CuteDsl-specific interleave_linear_and_gate on the finalized buffers
         num_experts = module.w3_w1_weight.data.shape[0]
         for expert_idx in range(num_experts):
@@ -3024,7 +3059,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     def _shuffle_and_interleave_w3_w1_weight_scale(
             self,
             dst_w3_w1_weight_scale: torch.Tensor,
-            num_elts_per_sf: int = 16):
+            num_elts_per_sf: int = 16,
+            is_gated_act_gemm: bool = True):
         """Apply trtllm-gen specific shuffle + interleave to w3_w1 weight scale buffer."""
         orig_shape = dst_w3_w1_weight_scale.shape
         epilogue_tile_m = 128  # FIXME
@@ -3038,7 +3074,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype),
             self._cache_permute_indices,
             epilogue_tile_m,
-            num_elts_per_sf=num_elts_per_sf)
+            num_elts_per_sf=num_elts_per_sf,
+            is_gated_act_gemm=is_gated_act_gemm)
 
         # Shuffle the weight according to permute indices
         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
@@ -3154,7 +3191,9 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             ('local_shared_w2_tensors', self._shuffle_w2_weight),
             ('local_shared_w3_w1_scale_tensors',
              lambda t: self._shuffle_and_interleave_w3_w1_weight_scale(
-                 t, num_elts_per_sf=num_elts_per_sf)),
+                 t,
+                 num_elts_per_sf=num_elts_per_sf,
+                 is_gated_act_gemm=module.is_gated_activation)),
             ('local_shared_w2_scale_tensors',
              lambda t: self._shuffle_and_interleave_w2_weight_scale(
                  t, num_elts_per_sf=num_elts_per_sf)),
@@ -3194,7 +3233,6 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
         # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
-        from ...utils import ActivationType
         if hasattr(module, 'activation_type') and module.activation_type in [
                 ActivationType.Relu2, ActivationType.Silu
         ]:
@@ -3224,8 +3262,20 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 module, module.tmp_trtllmgen_shared_weight_scale_2,
                 local_shared_fc31_alpha, local_shared_fc2_alpha)
 
-            local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
-            ) * local_shared_fc31_alpha
+            # The shared host copy of fc31_scale_c is consumed by online EPLB
+            # when an expert is migrated into a local slot, so it must match
+            # the main-slot formula exactly (see load_quant_scales above).
+            # For Relu2/Silu: fc31_scale_c = fc2_input_scale (broadcast).
+            # For gated (SwiGlu): fc31_scale_c = fc2_input_scale * fc31_alpha.
+            if hasattr(module,
+                       'activation_type') and module.activation_type in [
+                           ActivationType.Relu2, ActivationType.Silu
+                       ]:
+                local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+                ).expand(num_shared).contiguous()
+            else:
+                local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+                ) * local_shared_fc31_alpha
 
             module.register_all_parameter_slot_and_to_fix_weight_fns({
                 'fc31_scale_c':

@@ -542,6 +542,7 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                        use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
@@ -552,6 +553,7 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False
+                        use_cute_dsl_paged_mqa_logits = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
                         indexer_k_dtype = "fp8"
@@ -564,6 +566,8 @@ class ModelConfig(Generic[TConfig]):
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
                             use_cute_dsl_topk=use_cute_dsl_topk,
+                            use_cute_dsl_paged_mqa_logits=
+                            use_cute_dsl_paged_mqa_logits,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,

@@ -1161,6 +1161,41 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
     block->freeLeafBlock();
 }
 
+void WindowBlockManager::releaseSubtree(BlockPtr const& block)
+{
+    // Iterative pre-order DFS over `block` and all its descendants.  Collect
+    // first, then detach in reverse order: cascade-prune in freeLeafBlock()
+    // removes empty parent nodes from the trie, so leaves must be detached
+    // before their parents to keep the mNextNodes map consistent.
+    std::vector<BlockPtr> subtree;
+    std::vector<BlockPtr> stack{block};
+    while (!stack.empty())
+    {
+        auto current = std::move(stack.back());
+        stack.pop_back();
+        for (auto const& [_, child] : current->getNextBlocks())
+        {
+            stack.push_back(child);
+        }
+        subtree.push_back(std::move(current));
+    }
+
+    for (auto it = subtree.rbegin(); it != subtree.rend(); ++it)
+    {
+        auto const& b = *it;
+        if (mEventManager && blockInRadixTree(b))
+        {
+            mEventManager->enqueueRemovedEvent(b, mWindowSize);
+        }
+        b->freeLeafBlock();
+        if (!b->hasRefs())
+        {
+            b->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            mEvictionPolicy->releaseBlock(b, /*toFront=*/true);
+        }
+    }
+}
+
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory, bool wantPlaceholder)
@@ -2071,6 +2106,48 @@ void WindowBlockManager::refreshBlocks()
 {
     mEvictionPolicy->refresh();
     mTransferManager->syncTransfers();
+}
+
+void BlockManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize)
+{
+    mWindowBlockManagers.at(windowSize).truncateBlocks(targetTokens, numTokensToKeep);
+}
+
+void WindowBlockManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
+    auto const numTokens = static_cast<SizeType32>(targetTokens.size());
+    auto blockedTokens = chopVectorIntoBlocks<TokenIdType>(targetTokens, numTokens, mTokensPerBlock, true);
+
+    std::vector<BlockKey> blockKeys;
+    blockKeys.reserve(blockedTokens.size());
+    for (auto const& blockedTokensList : blockedTokens)
+    {
+        blockKeys.emplace_back(blockedTokensList, std::nullopt);
+    }
+
+    SizeType32 numMatchedTokens = 0;
+    auto searchRoot = mCachedBlocksRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, mEnablePartialReuse, mCopyOnPartialReuse)
+            : std::make_tuple(false, 0, nullptr);
+        if (matchingBlock == nullptr)
+        {
+            break;
+        }
+        if (numMatchedTokens > numTokensToKeep)
+        {
+            matchingBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            releaseSubtree(matchingBlock);
+            break;
+        }
+        numMatchedTokens += (numMatched > 0) ? numMatched : static_cast<SizeType32>(blockKey.uniqueTokens.size());
+        searchRoot = matchingBlock;
+    }
 }
 
 std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
@@ -3785,6 +3862,14 @@ std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::groupLayersByW
         uniqueWindowSizeToLayers[windowSize].push_back(layerIdx);
     }
     return uniqueWindowSizeToLayers;
+}
+
+void KVCacheManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        mBlockManager.truncateBlocks(targetTokens, numTokensToKeep, windowSize);
+    }
 }
 
 std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(

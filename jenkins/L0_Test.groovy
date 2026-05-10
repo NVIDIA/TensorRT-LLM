@@ -16,6 +16,11 @@ import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
+import trtllm.FailureClassifier
+import trtllm.exceptions.InfraFailure
+import trtllm.exceptions.PipelineInterruption
+import trtllm.exceptions.TrtllmCiException
+import trtllm.exceptions.UserFailure
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -165,200 +170,16 @@ K8S_INFRA_SINGLE_RETRY_PATTERNS = [
 // independently as production telemetry comes in.
 K8S_INFRA_RETRY_MAX = 2
 
-// ============================================================================
-// Typed-exception hierarchy + unified failure classifier.
+// Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
+// flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
+// were originally inline here, but the Jenkins script-security sandbox
+// requires per-instance signature approval for `RuntimeException(String,
+// Throwable)` and `Throwable.getSuppressed()` when those operations execute
+// inside an inline pipeline script. Code under src/ in a shared library runs
+// outside the sandbox, so the same operations work without approval.
 //
-// This block is additive — the existing classifyInfraFailure() and the four
-// SLURM_/K8S_ pattern lists above remain in place. Consumers continue to use
-// classifyInfraFailure(); the new classify(ex, scope) is wired up in a follow-
-// up commit (classifier-consumers).
-//
-// Behavior-equivalence note for reviewers: PATTERN_CATALOG below is a
-// scope-tagged restatement of the legacy lists. Every entry that the legacy
-// classifier would have matched (SLURM consumer: SLURM_INFRA_FAILURE_PATTERNS
-// only; K8s consumer: SLURM list + K8S_INFRA_FAILURE_PATTERNS) is reproduced
-// with the same severity. Patterns that were effectively dead in the legacy
-// (CANCELLED — listed in single-retry but not in the failure list) are
-// omitted; they can be activated as a separate, reviewable change.
-//
-// String constants (not Groovy enums) intentionally — Groovy enums declared at
-// pipeline-script top level have historically been tricky across CPS save/
-// restore boundaries when a build resumes from disk.
-// ============================================================================
-
-class TrtllmCiException extends RuntimeException {
-    TrtllmCiException(String msg)              { super(msg) }
-    TrtllmCiException(String msg, Throwable c) { super(msg, c) }
-}
-
-class InfraFailure extends TrtllmCiException {
-    static final String TRANSIENT  = "TRANSIENT"
-    static final String PERSISTENT = "PERSISTENT"   // single-retry-only
-    static final String SLURM      = "SLURM"
-    static final String K8S        = "K8S"
-    static final String BOTH       = "BOTH"
-
-    String severity         // TRANSIENT | PERSISTENT
-    String scope            // SLURM | K8S; never BOTH on a thrown instance
-    String detectedPattern  // "<typed:...>" for direct throws, matched substring for catalog fallback
-
-    InfraFailure(String msg, Throwable c, String sev, String sc, String pat) {
-        super(msg, c)
-        severity = sev
-        scope = sc
-        detectedPattern = pat
-    }
-}
-
-class UserFailure extends TrtllmCiException {
-    UserFailure(String msg, Throwable c) { super(msg, c) }
-}
-
-class PipelineInterruption extends TrtllmCiException {
-    PipelineInterruption(String msg, Throwable c) { super(msg, c) }
-}
-
-// PATTERN_CATALOG: scope-tagged unified list. Behavior-equivalent to the
-// legacy SLURM_INFRA_*/K8S_INFRA_* combinations. Entries originating from the
-// legacy SLURM list are scope=BOTH (matched the SLURM consumer alone, AND the
-// K8s consumer, which fed the SLURM list as the first pass through
-// classifyInfraFailure). Entries from the legacy K8S list are scope=K8S
-// (matched only when the K8s consumer passed extra patterns).
-//
-// classify(ex, scope) (defined below) filters by `row.scope in {scope, BOTH}`
-// — so a stray SLURM-shaped string in a K8s exception (or vice-versa) cannot
-// cross-contaminate. With the legacy lists this isolation existed only by
-// virtue of the K8s extras being a strict superset; the catalog form makes
-// it a structural invariant.
-PATTERN_CATALOG = [
-    // ---- Jenkins remoting / durable-task / kubelet ----
-    // (legacy SLURM list -> matched both consumers -> scope BOTH)
-    [pattern: "channel is closing down or has closed down",                severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "ChannelClosedException",                                    severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "ClosedChannelException",                                    severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "RequestAbortedException",                                   severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "Connection was broken",                                     severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "marked offline",                                            severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "process apparently never started",                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "wrapper script does not seem to be touching the log file",  severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "Reason: Evicted",                                           severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    // SIGTERM from kubelet during pod eviction / drain / host shutdown.
-    // User-driven aborts surface as FlowInterruptedException upstream and are
-    // caught by classify()'s interrupt block before we reach this row.
-    [pattern: "script returned exit code 143",                             severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "job is no longer active",                                   severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "No route to host",                                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.BOTH],
-    [pattern: "Permission denied, please try again",                       severity: InfraFailure.PERSISTENT, scope: InfraFailure.BOTH],
-    [pattern: "DUE TO TIME LIMIT",                                         severity: InfraFailure.PERSISTENT, scope: InfraFailure.BOTH],
-    // ---- K8s-only (legacy K8S list -> matched only K8s consumer -> scope K8S) ----
-    [pattern: "ImagePullBackOff",                                          severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
-    [pattern: "ErrImagePull",                                              severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
-    [pattern: "OCI runtime exec failed",                                   severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
-    [pattern: "node status is not ready",                                  severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
-    [pattern: "OOMKilled",                                                 severity: InfraFailure.PERSISTENT, scope: InfraFailure.K8S],
-    [pattern: "Cannot contact ",                                           severity: InfraFailure.TRANSIENT,  scope: InfraFailure.K8S],
-    [pattern: "Connection failed",                                         severity: InfraFailure.PERSISTENT, scope: InfraFailure.K8S],
-]
-
-/**
- * Cycle-safe walk over a Throwable's .cause and .getSuppressed() chain.
- * Returns the visited Throwables in DFS order with duplicates removed
- * (using identity equality so genuinely distinct exceptions with equal
- * .toString() output are kept separate). Defends against self-referential
- * causes (rare but free to handle) and against subclasses whose
- * getSuppressed() throws.
- */
-def flattenThrowable(Throwable ex) {
-    def visited = new HashSet()
-    def stack = [ex]
-    def flat = []
-    while (!stack.isEmpty()) {
-        def t = stack.remove(stack.size() - 1)
-        if (t == null) continue
-        def id = System.identityHashCode(t)
-        if (visited.contains(id)) continue
-        visited.add(id)
-        flat.add(t)
-        if (t.cause != null) stack.add(t.cause)
-        try {
-            t.getSuppressed()?.each { if (it != null) stack.add(it) }
-        } catch (Throwable ignore) {
-            // Some Throwable subclasses override getSuppressed() to throw; skip.
-        }
-    }
-    return flat
-}
-
-/**
- * Typed-exception classifier. Returns one of:
- *   - PipelineInterruption  (user abort / SIGTERM / FlowInterruptedException)
- *   - InfraFailure          (transient or persistent retryable infra failure)
- *   - UserFailure           (default; tests/build genuinely failed, do not retry)
- *
- * Scope isolation: typed InfraFailure passes through only if its scope matches
- * the caller's scope (or is BOTH). A SLURM-scoped InfraFailure leaking into a
- * K8s consumer (e.g. from an outer K8s pod retry wrapping an inner SLURM
- * retry that already exhausted its budget) is wrapped as UserFailure so the
- * outer doesn't re-run a budget that the inner already burned.
- *
- * Wired up by the classifier-consumers commit; in this commit no callers
- * exercise it.
- */
-def classify(Throwable ex, String scope) {
-    // 1. Already typed — but enforce scope isolation.
-    if (ex instanceof TrtllmCiException) {
-        if (ex instanceof InfraFailure
-                && ex.scope != scope
-                && ex.scope != InfraFailure.BOTH) {
-            return new UserFailure(
-                "infra failure from another scope (${ex.scope}) -- not retrying at scope ${scope}: ${ex.message}",
-                ex)
-        }
-        return ex
-    }
-
-    // 2. Walk the cause + suppressed chain once; reuse for both interrupt
-    //    detection and pattern matching.
-    def chain = flattenThrowable(ex)
-
-    // 3. Interrupt markers — never retry.
-    //
-    // Note on exit code 143 (SIGTERM): we do NOT short-circuit on
-    // AbortException("script returned exit code 143") here. User-driven
-    // aborts and `timeout(...)` blocks always wrap the underlying
-    // AbortException(143) in a FlowInterruptedException (the
-    // FlowInterruptedException check above catches those cases regardless
-    // of where in the cause chain it sits). A bare AbortException(143)
-    // without FlowInterruptedException upstream means the SIGTERM was
-    // initiated by the node, not the master — i.e. pod eviction, kubelet
-    // drain, host shutdown. Those are retryable infra failures and are
-    // matched by a "script returned exit code 143" entry in PATTERN_CATALOG
-    // (TRANSIENT, BOTH).
-    if (ex instanceof InterruptedException) {
-        return new PipelineInterruption(ex.message ?: "interrupted", ex)
-    }
-    for (t in chain) {
-        if (t.getClass().name.contains("FlowInterruptedException")) {
-            return new PipelineInterruption(ex.message ?: "FlowInterrupted", ex)
-        }
-    }
-
-    // 4. Pattern catalog match, scope-filtered (BOTH always applies).
-    //    Locale.ROOT defends against locale-specific lower-case behavior
-    //    (Turkish I problem and similar).
-    def lowerBlob = chain.collect { it.toString() }.join(" ").toLowerCase(java.util.Locale.ROOT)
-    for (row in PATTERN_CATALOG) {
-        if (row.scope != scope && row.scope != InfraFailure.BOTH) {
-            continue
-        }
-        if (lowerBlob.contains(row.pattern.toLowerCase(java.util.Locale.ROOT))) {
-            return new InfraFailure(ex.message ?: row.pattern, ex, row.severity, scope, row.pattern)
-        }
-    }
-
-    // 5. Default: not infra — caller should rethrow without retry.
-    return new UserFailure(ex.message ?: "no message", ex)
-}
+// See trtllm-jenkins-shared-lib for the implementation; the imports at the
+// top of this file pull them in.
 
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
@@ -1772,7 +1593,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // typed throws + cause-chain pattern matching, returning one of
       // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
       // ensures we only match catalog rows tagged SLURM or BOTH.
-      def c = classify(e, InfraFailure.SLURM)
+      def c = FailureClassifier.classify(e, InfraFailure.SLURM)
       if (c instanceof PipelineInterruption) throw e
       if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 
@@ -1995,7 +1816,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             // for forensics; only the in-build test reporting is gated.
             boolean suppressTestReporting = false
             if (!isFinalAttempt && stageIsFailed && caughtError != null) {
-                def c = classify(caughtError, InfraFailure.K8S)
+                def c = FailureClassifier.classify(caughtError, InfraFailure.K8S)
                 if (c instanceof InfraFailure) {
                     suppressTestReporting = true
                     echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() on intermediate retryable infra failure (${c.detectedPattern})"
@@ -3687,7 +3508,7 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             // scope-isolation guard inside classify() also prevents a typed
             // SLURM-scoped InfraFailure (e.g. from an inner SLURM retry that
             // exhausted its own budget) from being treated as K8s infra here.
-            def c = classify(e, InfraFailure.K8S)
+            def c = FailureClassifier.classify(e, InfraFailure.K8S)
             if (c instanceof PipelineInterruption) throw e
             if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 

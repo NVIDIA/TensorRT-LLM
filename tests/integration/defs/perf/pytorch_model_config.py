@@ -19,6 +19,30 @@ Model pytorch/TRT yaml config for trtllm-bench perf tests
 
 from ..conftest import llm_models_root
 
+# DeepSeek FP8 (block-scale) models that hit the DeepGEMM-on-Hopper-only
+# limitation when the default CUTLASS MoE backend is used on Blackwell.
+# On SM100+ these need ``moe_config.backend: DEEPGEMM`` instead, otherwise
+# CutlassFp8BlockScaleGemmRunner -> deep_gemm::jit::Compiler::build throws
+# "DeepGEMM only supports Hopper (SM90)".
+_DEEPSEEK_FP8_BLOCK_SCALE_MODELS = (
+    'deepseek_v3_lite_fp8',
+    'deepseek_r1_fp8',
+    'deepseek_r1_0528_fp8',
+)
+
+
+def _get_sm_version_safe() -> int:
+    """Return the current device SM version, or 0 if it cannot be determined.
+
+    Imported lazily so importing this module does not require CUDA to be
+    available (e.g. during static test collection).
+    """
+    try:
+        from tensorrt_llm._utils import get_sm_version
+        return get_sm_version()
+    except Exception:
+        return 0
+
 
 def recursive_update(d, u):
     for k, v in u.items():
@@ -501,6 +525,16 @@ def get_model_yaml_config(model_label: str,
                 if pattern_config.get('config'):
                     recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
+
+    # DeepSeek FP8 (block-scale) models on Blackwell (SM100+) must use the
+    # DEEPGEMM MoE backend; the default CUTLASS backend's FP8 block-scale path
+    # JIT-compiles DeepGEMM kernels that only target Hopper (SM90).
+    if 'pytorch' in model_label and any(
+            name in model_label.lower()
+            for name in _DEEPSEEK_FP8_BLOCK_SCALE_MODELS):
+        if _get_sm_version_safe() >= 100:
+            moe_config = base_config.setdefault('moe_config', {})
+            moe_config.setdefault('backend', 'DEEPGEMM')
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:

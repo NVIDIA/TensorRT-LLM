@@ -303,6 +303,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
     elif moe_cls == DeepGemmFusedMoE:
         return moe_cls(
