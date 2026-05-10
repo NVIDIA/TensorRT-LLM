@@ -83,7 +83,19 @@ class HfWeightLoader(BaseWeightLoader):
             # If the layer number is overridden, it indicates that only a subset of layers are loaded.
             # Prefetching all layers is unnecessary.
             num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
-            enable_prefetch = (prefetch_size
+            # On platforms with NVLink-C2C unified-memory addressing (e.g.,
+            # GB200), `_prefetch_one_file`'s `f.read()` populates the OS page
+            # cache with safetensors content; those host pages can then be
+            # counted toward `cuda.mem_get_info()` GPU usage non-deterministically
+            # per rank. Downstream KV-cache budgeting (which is sized as a
+            # fraction of free GPU memory) underestimates the available budget
+            # asymmetrically across ranks, leading to `cuMemCreate` OOM at KV
+            # cache init even when the actual GPU memory is plentiful. The
+            # `TLLM_DISABLE_HF_PREFETCH=1` env var lets users opt out of the
+            # page-cache warmup on those platforms.
+            disable_prefetch = os.environ.get("TLLM_DISABLE_HF_PREFETCH",
+                                              "0") == "1"
+            enable_prefetch = (not disable_prefetch and prefetch_size
                                < self._get_local_available_host_memory() * 0.9
                                and num_layers == 0)
             if enable_prefetch:
