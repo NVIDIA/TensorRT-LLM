@@ -1695,8 +1695,94 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 }
 
 // ============================================================================
+// Explicit kernel instantiations — 9 (T × K) combos.
+// ============================================================================
+// Mirrors the same pattern used in heuristicTopKDecode.cu for the multi-row
+// kernels. Forces nvcc to emit each `gvrTopKKernel<K>` / `gvrTopKKernelDtype
+// <T,K>` host-side wrapper stub *before* `launchHeuristicTopK` takes their
+// address via `cudaLaunchKernelEx`. Without these declarations, certain nvcc
+// stubgen versions (CI containers on sm_89 / sm_120f) emit the implicit stub
+// inside the kernel body and then conflict with their own subsequent
+// "explicit specialization of __wrapper__device_stub_*<K>" pass — surfacing
+// as a "specialization after instantiation" build error against
+// cudafe1.stub.c. Header is included only by heuristicTopKDecode.cu (one TU)
+// so no ODR concern.
+template __global__ void gvrTopKKernel<512>(float const*, int, int const*, int, int, float*, int*);
+template __global__ void gvrTopKKernel<1024>(float const*, int, int const*, int, int, float*, int*);
+template __global__ void gvrTopKKernel<2048>(float const*, int, int const*, int, int, float*, int*);
+template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 512>(
+    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*);
+template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 1024>(
+    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*);
+template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 2048>(
+    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*);
+template __global__ void gvrTopKKernelDtype<__half, 512>(__half const*, int, int const*, int, int, __half*, int*);
+template __global__ void gvrTopKKernelDtype<__half, 1024>(__half const*, int, int const*, int, int, __half*, int*);
+template __global__ void gvrTopKKernelDtype<__half, 2048>(__half const*, int, int const*, int, int, __half*, int*);
+
+// ============================================================================
 // Launch Wrapper
 // ============================================================================
+
+namespace detail
+{
+// Per-(T, TopK) launcher implementation. Hoisted out of `launchHeuristicTopK`
+// (was a C++20 templated lambda `[&]<int TopK>()`) because that pattern
+// confuses nvcc's cudafe1 stub generator: taking the address of
+// `gvrTopKKernel<TopK>` / `gvrTopKKernelDtype<T, TopK>` from inside a
+// templated capturing lambda triggers an "explicit specialization of
+// `__wrapper__device_stub_gvrTopKKernel<K>` after instantiation" error
+// against the auto-generated host wrapper stub. A regular function template
+// avoids the quirk and stays in C++17 (no templated-lambda extension warning).
+//
+// Kernel body, GvrParams traits, kfn selection, opt-in smem, PDL attr, and
+// cudaLaunchKernelEx call are byte-identical to the previous lambda body —
+// SASS is unchanged for all 9 (T, K) instantiations.
+template <typename T, int TopK>
+cudaError_t launchHeuristicTopKImpl(T const* input, int N, int const* preIdx, int M, int topK, T* outputValues,
+    int* outputIndices, cudaStream_t stream, bool enablePDL)
+{
+    // dtype path uses fp32 smem keys (deferred convert). Launcher
+    // allocates smem with float keys regardless of input dtype.
+    using SmemT = KernelSmemTplK<float, GvrParams<T, TopK>::kC, GvrParams<T, TopK>::kNumBins>;
+    size_t const smemSize = sizeof(SmemT);
+
+    // Resolve target kernel function pointer at compile time.
+    auto kfn = []()
+    {
+        if constexpr (std::is_same_v<T, float>)
+            return gvrTopKKernel<TopK>;
+        else
+            return gvrTopKKernelDtype<T, TopK>;
+    }();
+
+    if (smemSize > 48u * 1024u)
+    {
+        int device;
+        cudaGetDevice(&device);
+        int maxSmem;
+        cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        if (smemSize > static_cast<size_t>(maxSmem))
+            return cudaErrorInvalidConfiguration;
+        cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
+    }
+
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(1);
+    config.blockDim = dim3(BLOCK_SIZE);
+    config.dynamicSmemBytes = smemSize;
+    config.stream = stream;
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enablePDL ? 1 : 0;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&config, kfn, input, N, preIdx, M, topK, outputValues, outputIndices);
+    return cudaGetLastError();
+}
+} // namespace detail
 
 template <typename T, typename IdxT = int>
 cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M, int topK, T* outputValues,
@@ -1714,7 +1800,7 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
     // instantiation captures its own (kFTarget, kC, kNumBins) tuple via
     // GvrParams<T, TopK> so all values are compile-time constants inside
     // the kernel body. Opt-in smem + cudaLaunchKernelEx + PDL handling is
-    // shared across all 9 paths via a template-parametric lambda.
+    // shared across all 9 paths via `detail::launchHeuristicTopKImpl`.
 
     // Honor the standard TRTLLM_ENABLE_PDL env var (default on; set "0" to
     // disable).
@@ -1725,54 +1811,17 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
             enablePDL = false;
     }
 
-    auto launchOne = [&]<int TopK>() -> cudaError_t
-    {
-        // dtype path uses fp32 smem keys (deferred convert). Launcher
-        // allocates smem with float keys regardless of input dtype.
-        using SmemT = KernelSmemTplK<float, GvrParams<T, TopK>::kC, GvrParams<T, TopK>::kNumBins>;
-        size_t const smemSize = sizeof(SmemT);
-
-        // Resolve target kernel function pointer at compile time.
-        auto kfn = []()
-        {
-            if constexpr (std::is_same_v<T, float>)
-                return gvrTopKKernel<TopK>;
-            else
-                return gvrTopKKernelDtype<T, TopK>;
-        }();
-
-        if (smemSize > 48u * 1024u)
-        {
-            int device;
-            cudaGetDevice(&device);
-            int maxSmem;
-            cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-            if (smemSize > static_cast<size_t>(maxSmem))
-                return cudaErrorInvalidConfiguration;
-            cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
-        }
-
-        cudaLaunchConfig_t config{};
-        config.gridDim = dim3(1);
-        config.blockDim = dim3(BLOCK_SIZE);
-        config.dynamicSmemBytes = smemSize;
-        config.stream = stream;
-
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = enablePDL ? 1 : 0;
-        config.attrs = attrs;
-        config.numAttrs = 1;
-
-        cudaLaunchKernelEx(&config, kfn, input, N, preIdx, M, topK, outputValues, outputIndices);
-        return cudaGetLastError();
-    };
-
     switch (topK)
     {
-    case 512: return launchOne.template operator()<512>();
-    case 1024: return launchOne.template operator()<1024>();
-    case 2048: return launchOne.template operator()<2048>();
+    case 512:
+        return detail::launchHeuristicTopKImpl<T, 512>(
+            input, N, preIdx, M, topK, outputValues, outputIndices, stream, enablePDL);
+    case 1024:
+        return detail::launchHeuristicTopKImpl<T, 1024>(
+            input, N, preIdx, M, topK, outputValues, outputIndices, stream, enablePDL);
+    case 2048:
+        return detail::launchHeuristicTopKImpl<T, 2048>(
+            input, N, preIdx, M, topK, outputValues, outputIndices, stream, enablePDL);
     default: return cudaErrorInvalidValue;
     }
 }
