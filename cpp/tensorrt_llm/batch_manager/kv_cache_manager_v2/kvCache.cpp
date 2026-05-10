@@ -493,9 +493,9 @@ void KvCache::_snapshotSsmToTreeBlock(std::shared_ptr<Block> const& treeBlock, L
         copySlotData(storageMgr, lvl, srcPage->cacheLevel, pgIdx, newSlot.slotId(), srcPage->slotId(), stream);
 
         CachedCudaEvent readyEv(reinterpret_cast<CudaStream>(stream));
-        assert(mTokensPerBlock * (treeBlock->ordinal + 1) == static_cast<int>(mCommittedTokens.size()));
+        assert(mTokensPerBlock * (treeBlock->ordinal() + 1) == static_cast<int>(mCommittedTokens.size()));
 
-        auto tempPage = std::make_shared<UncommittedPage>(*this, treeBlock->ordinal, ssmLcId, lvl, beamIdx);
+        auto tempPage = std::make_shared<UncommittedPage>(*this, treeBlock->ordinal(), ssmLcId, lvl, beamIdx);
         tempPage->setSlot(newSlot);
         auto committed = tempPage->convertToCommitted(treeBlock, std::move(readyEv));
 
@@ -853,19 +853,15 @@ void KvCache::_commitBlock(int ord, bool isLast)
     if (!isLast && !isFull)
         throw LogicError("Cannot commit block that is not full except last block");
 
-    // Parent block lookup (root or previous committed block).
+    // Prev node lookup (root or previous committed block).
     RootBlock& root = mManager->radixTree().addOrGetExisting(mLoraTaskId);
     int numLc = mManager->storage().numLifeCycles();
 
-    std::shared_ptr<Block> parentBlock;
-    std::unordered_map<BlockKey, std::shared_ptr<Block>>* parentNext = &root.next;
-    BlockKey const* parentKey = &root.key;
+    NodeBase* prevNode = &root;
     if (ord > 0)
     {
         assert(mBlocks[ord - 1].treeBlock && "prev block must be committed");
-        parentBlock = mBlocks[ord - 1].treeBlock;
-        parentNext = &parentBlock->next;
-        parentKey = &parentBlock->key;
+        prevNode = mBlocks[ord - 1].treeBlock.get();
     }
 
     // Try to find or create a block in the radix tree.
@@ -875,8 +871,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
     std::shared_ptr<Block> newBlock;
     try
     {
-        newBlock = addOrGetExistingBlock(*parentNext, *parentKey, numLc, mTokensPerBlock, tokenBlock,
-            ord == 0 ? &root : nullptr, parentBlock.get(), &blockIsNew);
+        newBlock = addOrGetExistingBlock(prevNode, numLc, tokenBlock, &blockIsNew);
     }
     catch (UselessBlockError const& e)
     {

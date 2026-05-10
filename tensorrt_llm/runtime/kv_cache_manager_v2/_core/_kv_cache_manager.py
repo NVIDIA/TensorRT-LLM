@@ -252,12 +252,7 @@ class KVCacheManager:
         self._storage.destroy()
 
     def clear_reusable_blocks(self) -> None:
-        for ref in self._radix_tree.clear():
-            assert unwrap_rawref(ref).status == PageStatus.DROPPABLE
-            self._storage.exclude_from_eviction(unwrap_rawref(ref))
-        for level in self._storage._levels:
-            for pg_idx in typed_range(level.storage.num_pool_groups):
-                assert level.controller.num_evictable_pages(pg_idx) == 0
+        self._radix_tree.clear()
 
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None

@@ -94,27 +94,22 @@ void KvCacheManager::shutdown()
 {
     clearReusableBlocks();
     assert(mStorage);
+
+    // Post-condition: after clearing all reusable blocks and with no active KvCaches,
+    // no evictable pages should remain.
+    for (auto const& lvl : mStorage->mLevels)
+    {
+        for (int pg = 0; pg < static_cast<int>(lvl.numPoolGroups()); ++pg)
+            assert(lvl.controller.numEvictablePages(static_cast<PoolGroupIndex>(pg)) == 0);
+    }
+
     mStorage->destroy();
 }
 
 void KvCacheManager::clearReusableBlocks()
 {
     assert(mRadixTree);
-
-    auto refs = mRadixTree->clear();
-    for (auto* page : refs)
-    {
-        assert(page != nullptr);
-        assert(page->status() == PageStatus::DROPPABLE);
-        mStorage->excludeFromEviction(*page);
-    }
-
-    // Post-condition: no evictable pages remain in any level.
-    for (auto const& lvl : mStorage->mLevels)
-    {
-        for (int pg = 0; pg < static_cast<int>(lvl.numPoolGroups()); ++pg)
-            assert(lvl.controller.numEvictablePages(static_cast<PoolGroupIndex>(pg)) == 0);
-    }
+    mRadixTree->clear();
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(std::optional<int64_t> loraTaskId,

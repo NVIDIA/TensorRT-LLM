@@ -657,11 +657,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("prev",
             [](kv::Block& self) -> nb::object
             {
-                if (self.parentRoot)
-                    return nb::cast(self.parentRoot, nb::rv_policy::reference);
-                if (self.parentBlock)
-                    return nb::cast(self.parentBlock->shared_from_this());
-                return nb::none();
+                if (!self.prev)
+                    return nb::none();
+                if (self.prev->type() == kv::NodeBase::Type::kROOT_BLOCK)
+                    return nb::cast(static_cast<kv::RootBlock*>(self.prev), nb::rv_policy::reference);
+                return nb::cast(static_cast<kv::Block*>(self.prev)->shared_from_this());
             })
         .def_prop_ro("storage",
             [](kv::Block const& self)
@@ -714,9 +714,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::dict d;
                 for (auto const& [key, rb] : self.roots())
                 {
-                    auto* ptr = const_cast<kv::RootBlock*>(&rb);
                     d[nb::bytes(reinterpret_cast<char const*>(key.data()), key.size())]
-                        = nb::cast(ptr, nb::rv_policy::reference);
+                        = nb::cast(rb.get(), nb::rv_policy::reference);
                 }
                 return d;
             });

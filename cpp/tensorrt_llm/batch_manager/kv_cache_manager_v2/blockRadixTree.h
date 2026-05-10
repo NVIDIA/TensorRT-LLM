@@ -36,6 +36,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations
 class CommittedPage;
 class BlockRadixTree;
+struct NodeBase;
 struct RootBlock;
 struct Block;
 
@@ -80,28 +81,63 @@ std::vector<TokenIdExt> genMultiModalTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens);
 
 // ---------------------------------------------------------------------------
+// NodeBase — common base for RootBlock and Block (nodes in the radix tree).
+// Holds shared fields: key, next map, ordinal, and tokens-per-block.
+// Mirrors Python's common interface between RootBlock and Block.
+// ---------------------------------------------------------------------------
+struct NodeBase
+{
+    enum class Type : uint8_t
+    {
+        kROOT_BLOCK,
+        kBLOCK
+    };
+
+    BlockKey key;
+    std::unordered_map<BlockKey, std::shared_ptr<Block>> next;
+
+    virtual ~NodeBase();
+
+    virtual Type type() const noexcept = 0;
+    virtual BlockOrdinal ordinal() const noexcept = 0;
+
+    std::shared_ptr<Block> detachNext(BlockKey const& key);
+
+    /// RootBlock: delegates to tree. Block: len(prev->tokens) or prev->tokensPerBlock().
+    virtual int tokensPerBlock() const noexcept = 0;
+
+protected:
+    NodeBase(BlockKey k)
+        : key(k)
+    {
+    }
+};
+
+// ---------------------------------------------------------------------------
 // RootBlock — one root per (lora_task_id) in a BlockRadixTree.
 // Holds a map of child Blocks keyed by BlockKey.
 // Mirrors Python's RootBlock.
 // ---------------------------------------------------------------------------
-struct RootBlock
+struct RootBlock : NodeBase
 {
-    BlockKey key;
     std::optional<int64_t> loraTaskId;
-    std::unordered_map<BlockKey, std::shared_ptr<Block>> next;
     BlockRadixTree* tree; // back-reference (non-owning)
 
     RootBlock(std::optional<int64_t> loraTaskId, BlockRadixTree* tree);
 
     static BlockKey makeKey(std::optional<int64_t> loraTaskId);
 
-    int ordinal() const noexcept
+    Type type() const noexcept override
+    {
+        return Type::kROOT_BLOCK;
+    }
+
+    BlockOrdinal ordinal() const noexcept override
     {
         return -1;
     }
 
-    int numLifeCycles() const;
-    int tokensPerBlock() const;
+    int tokensPerBlock() const noexcept override;
 };
 
 // ---------------------------------------------------------------------------
@@ -109,35 +145,38 @@ struct RootBlock
 // storage[lifeCycleId] = raw observer pointer to CommittedPage (null if not cached).
 // Mirrors Python's Block.
 // ---------------------------------------------------------------------------
-struct Block : std::enable_shared_from_this<Block>
+struct Block : NodeBase, std::enable_shared_from_this<Block>
 {
-    BlockKey key;
     std::vector<TokenIdExt> tokens;
-    BlockOrdinal ordinal;
 
-    // Parent: either a RootBlock (ordinal=0) or another Block.
-    // We keep a raw pointer to the parent because the parent owns us via
-    // shared_ptr in its `next` map; a shared_ptr back would be a cycle.
-    // The parent is always valid while we exist (the parent's next map holds us).
-    RootBlock* parentRoot{nullptr}; // non-null when ordinal==0
-    Block* parentBlock{nullptr};    // non-null when ordinal>0
-
-    std::unordered_map<BlockKey, std::shared_ptr<Block>> next;
+    // Previous node in the chain (RootBlock or Block). Null after detaching from the tree.
+    // Raw non-owning pointer: while attached, the prev node's `next` map owns us via shared_ptr.
+    NodeBase* prev{nullptr};
 
     // indexed by LifeCycleId; nullptr = no cached page for that lifecycle
     std::vector<CommittedPage*> storage;
 
-    ~Block();
+    Block(BlockKey key, std::vector<TokenIdExt> tokens, NodeBase* prev, int numLifeCycles);
+    ~Block() override;
 
     static BlockKey makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_t count);
 
-    // Number of lifecycle IDs (== storage.size())
+    Type type() const noexcept override
+    {
+        return Type::kBLOCK;
+    }
+
+    BlockOrdinal ordinal() const noexcept override
+    {
+        return mOrdinal;
+    }
+
+    int tokensPerBlock() const noexcept override;
+
     int numLifeCycles() const noexcept
     {
         return static_cast<int>(storage.size());
     }
-
-    int tokensPerBlock() const noexcept;
 
     bool isFull() const noexcept
     {
@@ -149,12 +188,16 @@ struct Block : std::enable_shared_from_this<Block>
     // Returns how many leading tokens match `otherTokens`.
     int partialMatchThisNode(TokenIdExt const* otherTokens, size_t count) const;
 
-    // Unset the cached page for a lifecycle (used when a CommittedPage is evicted/dropped).
-    void unsetPage(LifeCycleId lcIdx, LifeCycle const& lc);
+    // Break the bidirectional link to the cached page for a lifecycle.
+    void unlinkPage(LifeCycleId lcIdx);
 
-    // Access parent as a type-erased pointer for key lookup helpers.
-    std::unordered_map<BlockKey, std::shared_ptr<Block>>* parentNextMap();
-    BlockKey const& parentKey() const;
+    // Clear stale tree nodes after a lifecycle page has been unlinked.
+    // Returns detached blocks that must stay alive until cleanup completes.
+    static std::vector<std::shared_ptr<Block>> clearStaleBlocksAfterPageUnlink(
+        Block& block, LifeCycleId lcIdx, LifeCycle const& lc);
+
+private:
+    BlockOrdinal mOrdinal;
 };
 
 // ---------------------------------------------------------------------------
@@ -183,8 +226,8 @@ public:
     std::vector<MatchResult> match(std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens,
         bool enablePartialMatch = false) const;
 
-    // Clear all cached pages (returns raw observer pointers to detached CommittedPages).
-    std::vector<CommittedPage*> clear();
+    // Clear all cached pages. ~Block() handles excludeFromEviction for DROPPABLE pages.
+    void clear();
 
     int tokensPerBlock() const noexcept
     {
@@ -199,39 +242,44 @@ public:
     }
 
     // Read-only access to the root map (used by nanobind introspection).
-    std::unordered_map<BlockKey, RootBlock> const& roots() const noexcept
+    std::unordered_map<BlockKey, std::shared_ptr<RootBlock>> const& roots() const noexcept
     {
         return mRoots;
     }
 
-    // Remove a childless root block from the tree (mirrors Python Block.__del__ cleanup).
-    void eraseRoot(BlockKey const& key)
+    // Propose removal of an empty root block. Deferred to avoid destroying
+    // objects during destructor chains. Drained at safe points (addOrGetExisting, match).
+    void proposeToEraseEmptyRoot(BlockKey const& key)
     {
-        mRoots.erase(key);
+        mPendingRootErases.push_back(key);
     }
 
 private:
+    // Erase any pending empty root blocks from mRoots.
+    // Const-qualified: deferred cleanup is not a logical mutation.
+    void drainPendingRootErases() const;
+
     LifeCycleRegistry const& mLifeCycles;
     int mTokensPerBlock;
 
-    std::unordered_map<BlockKey, RootBlock> mRoots; // keyed by root BlockKey
+    std::unordered_map<BlockKey, std::shared_ptr<RootBlock>> mRoots;
+    mutable std::vector<BlockKey> mPendingRootErases;
 };
 
 // ---------------------------------------------------------------------------
 // Helpers used by Block and the tree traversal.
 // ---------------------------------------------------------------------------
 
-// Add a block to a parent's `next` map, or return the existing one on collision.
+// Add a block to prev's `next` map, or return the existing one on collision.
 // Throws UselessBlockError (with the sibling block) if the block's tokens are a
 // prefix of an existing sibling — mirrors Python's UselessBlockError.
 // If isNew is non-null, *isNew is set to true if a new block was created, false
 // if an existing block was returned.
-std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::shared_ptr<Block>>& parentNext,
-    BlockKey const& parentKey, int numLifeCycles, int tokensPerBlock, std::vector<TokenIdExt> tokens,
-    RootBlock* parentRoot, Block* parentBlock, bool* isNew = nullptr);
+std::shared_ptr<Block> addOrGetExistingBlock(
+    NodeBase* prev, int numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew = nullptr);
 
-// Post-order traversal helper: remove a subtree and collect orphaned page refs.
-std::vector<CommittedPage*> removeSubtree(
-    std::unordered_map<BlockKey, std::shared_ptr<Block>>& parentNext, BlockKey const& rootKey);
+// Post-order traversal: remove a subtree rooted at `root` from its parent's
+// next map. ~Block() handles page cleanup. Mirrors Python's remove_subtree().
+std::shared_ptr<Block> removeSubtree(Block& root);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
