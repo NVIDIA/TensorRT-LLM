@@ -217,6 +217,10 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_rmsnorm_quant_nvfp4:
+    stage: post_load_fusion
+    enabled: true
+    requires_shape_prop: true
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:

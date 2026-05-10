@@ -111,6 +111,17 @@ def _mock_fused_add_res_norm_fake(shared_out, routed_out, residual, weight, eps)
     return torch.nn.functional.layer_norm(combined, (combined.shape[-1],), weight=weight, eps=eps)
 
 
+@torch.library.custom_op("auto_deploy::mock_tuple_fork_moe_test", mutates_args=())
+def mock_tuple_fork(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mock tuple-producing op used to simulate fused RMSNorm + quant outputs."""
+    return x + 1, x + 2
+
+
+@mock_tuple_fork.register_fake
+def _mock_tuple_fork_fake(x):
+    return torch.empty_like(x), torch.empty_like(x)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -589,6 +600,29 @@ class MockFusedMergeNemotronHMoELayer(nn.Module):
         )
 
 
+class MockTupleForkNemotronHMoELayer(nn.Module):
+    """Nemotron-H pattern where shared and routed paths fork from tuple outputs."""
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int, num_experts: int = 8):
+        super().__init__()
+        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
+        self.shared_experts = _SimpleMLP(hidden_dim, intermediate_dim)
+        self.expert_weight = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+        self.layernorm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shared_input, routed_input = torch.ops.auto_deploy.mock_tuple_fork_moe_test(hidden_states)
+        logits = self.gate(routed_input)
+        routing_weights, selected_experts = torch.topk(logits, k=2, dim=-1)
+
+        shared_out = self.shared_experts(shared_input)
+        moe_out = torch.ops.auto_deploy.mock_fused_moe_moe_test(
+            routed_input, selected_experts, routing_weights, self.expert_weight
+        )
+
+        return self.layernorm(shared_out + moe_out)
+
+
 def test_fused_merge_pattern_and_correctness():
     """Fused merge node (MLIR-like): pattern + graph + correctness."""
     hidden_dim, intermediate_dim = 128, 256
@@ -638,4 +672,26 @@ def test_fused_merge_multi_layer():
     gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
 
     assert num == 2, f"Expected 2 replacements, got {num}"
+    _assert_numerical_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))
+
+
+def test_tuple_fork_pattern_and_correctness():
+    """Tuple fork point: begin_aux must preserve and record all tuple tensors."""
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockTupleForkNemotronHMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+
+    assert num == 1, f"Expected 1 replacement, got {num}"
+    _assert_stream_nodes_present(gm)
+    begin_nodes = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function" and n.target is begin_aux_stream_passthrough
+    ]
+    assert begin_nodes[0].args[0].target is torch.ops.auto_deploy.mock_tuple_fork_moe_test.default
     _assert_numerical_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))
