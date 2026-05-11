@@ -1861,6 +1861,66 @@ class NVFP4LinearMethod(LinearMethodBase):
                     module.rebuild_tensor_metadata)
 
 
+class NVFP4W4A16LinearMethod(NVFP4LinearMethod):
+    """W4A16 fallback for NVFP4 weights on GPUs without FP4 tensor cores.
+
+    Inherits NVFP4LinearMethod's weight storage and loading (FP4 packed weights
+    + per-block FP8 scales + global scale). Overrides apply() to dequantize
+    weights to BF16 and use standard matmul instead of nvfp4_gemm.
+    Activations remain in BF16 throughout -- no FP4 activation quantization.
+    """
+
+    _E2M1_VALUES = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
+
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
+
+    def _dequantize_weight(self, module: Linear) -> torch.Tensor:
+        """Dequantize FP4 packed weights to module.dtype (typically BF16)."""
+        weight = module.weight.data
+        N_padded = weight.shape[0]
+        K_packed = weight.shape[1]
+        K = K_packed * 2
+        N = module.out_features
+        sf_vec_size = module.scaling_vector_size
+
+        weight_uint8 = weight.view(torch.uint8)
+        low = (weight_uint8 & 0x0F).long()
+        high = ((weight_uint8 >> 4) & 0x0F).long()
+        idx = torch.empty(N_padded, K, dtype=torch.long, device=weight.device)
+        idx[:, 0::2] = low
+        idx[:, 1::2] = high
+        lut = self._E2M1_VALUES.to(weight.device)
+        vals = lut[idx]
+
+        scale_rows = fp4_utils.pad_up(N, 128)
+        ws_2d = unswizzle_sf(module.weight_scale.data, scale_rows, K,
+                             sf_vec_size)
+        ws_2d = ws_2d[:N_padded, :K // sf_vec_size].to(torch.float32)
+
+        scale_2 = module.weight_scale_2.data.to(torch.float32)
+        block_scales = (ws_2d * scale_2).unsqueeze(-1)
+        vals = vals.view(N_padded, K // sf_vec_size, sf_vec_size) * block_scales
+        vals = vals.view(N_padded, K)
+
+        return vals[:N].to(module.dtype)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        w_bf16 = self._dequantize_weight(module)
+        output = F.linear(input, w_bf16, bias)
+        return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int]):
+        output = self.apply(module, input, bias)
+        return output
+
+    def post_load_weights(self, module: Linear):
+        """Skip FP4 GEMM alignment padding -- not needed for BF16 matmul."""
+
+
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
@@ -2716,6 +2776,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.has_fp8_block_scales():
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
+        if get_sm_version() < 100:
+            return NVFP4W4A16LinearMethod()
         if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
             return NVFP4ARCLinearMethod()
         else:

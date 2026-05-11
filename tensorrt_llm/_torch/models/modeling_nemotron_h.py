@@ -218,12 +218,27 @@ class NemotronHMOE(nn.Module):
         # when loading NVFP4/W4A8_NVFP4_FP8 quantized expert weights.
         # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
         moe_model_config = model_config
+        self._nvfp4_dequant_moe = False
         if model_config.quant_config_dict is not None:
             experts_prefix = f"model.layers.{layer_idx}.mixer.experts."
             for key, cfg in model_config.quant_config_dict.items():
                 if key.startswith(experts_prefix):
-                    moe_model_config = replace(model_config, quant_config=cfg)
+                    # On GPUs without FP4 tensor cores (sm < 100), dequant NVFP4
+                    # expert weights to BF16 at load time and run MoE unquantized.
+                    if cfg.quant_mode.has_nvfp4() and get_sm_version() < 100:
+                        self._nvfp4_dequant_moe = True
+                    else:
+                        moe_model_config = replace(model_config,
+                                                   quant_config=cfg)
                     break
+
+        # When the global quant config (not per-layer dict) indicates NVFP4 on Hopper,
+        # also enable the dequant path.
+        if (not self._nvfp4_dequant_moe
+                and model_config.quant_config is not None
+                and model_config.quant_config.quant_mode.has_nvfp4()
+                and get_sm_version() < 100):
+            self._nvfp4_dequant_moe = True
 
         # Setup MoE experts.
         self.experts = create_moe(
@@ -240,6 +255,9 @@ class NemotronHMOE(nn.Module):
             bias=self.mlp_bias,
             activation_type=self.activation_type,
         )
+
+        if self._nvfp4_dequant_moe:
+            self._wrap_moe_load_weights_for_dequant()
 
         if reduce_output:
             self.allreduce = AllReduce(
@@ -294,6 +312,75 @@ class NemotronHMOE(nn.Module):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
+
+    _E2M1_VALUES = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
+
+    @staticmethod
+    def _dequant_nvfp4_tensor(packed: torch.Tensor, weight_scale: torch.Tensor,
+                              weight_scale_2: torch.Tensor,
+                              target_dtype: torch.dtype) -> torch.Tensor:
+        """Dequantize a single NVFP4 packed weight tensor to target_dtype."""
+        packed_uint8 = (packed.view(torch.uint8)
+                        if packed.dtype != torch.uint8 else packed)
+        N, K_packed = packed_uint8.shape
+        K = K_packed * 2
+
+        low = (packed_uint8 & 0x0F).long()
+        high = ((packed_uint8 >> 4) & 0x0F).long()
+        idx = torch.empty(N, K, dtype=torch.long, device=packed.device)
+        idx[:, 0::2] = low
+        idx[:, 1::2] = high
+        lut = NemotronHMOE._E2M1_VALUES.to(packed.device)
+        vals = lut[idx]
+
+        block_size = 16
+        num_blocks = N * (K // block_size)
+        ws = weight_scale.to(torch.float32).reshape(-1)[:num_blocks]
+        s2 = weight_scale_2.to(torch.float32)
+        block_scales = (ws * s2).view(N, K // block_size, 1)
+        vals = vals.view(N, K // block_size, block_size) * block_scales
+        return vals.view(N, K).to(target_dtype)
+
+    def _wrap_moe_load_weights_for_dequant(self):
+        """Wrap self.experts.load_weights to dequant NVFP4 expert weights to BF16."""
+        import functools
+        import types
+
+        original_load_weights = self.experts.load_weights.__func__
+        target_dtype = torch.bfloat16
+
+        @functools.wraps(original_load_weights)
+        def _dequant_load_weights(self_moe, weights, **kwargs):
+            if not weights:
+                return original_load_weights(self_moe, weights, **kwargs)
+            dequanted = []
+            for w_dict in weights:
+                new_dict = dict(w_dict)
+                for key in list(new_dict.keys()):
+                    if not key.endswith('.weight'):
+                        continue
+                    scale_key = key.replace('.weight', '.weight_scale')
+                    scale2_key = key.replace('.weight', '.weight_scale_2')
+                    tensor = new_dict[key]
+                    if (tensor[...].dtype == torch.uint8
+                            and scale_key in new_dict
+                            and scale2_key in new_dict):
+                        packed = tensor[...].cuda()
+                        ws = new_dict[scale_key][...].cuda()
+                        ws2 = new_dict[scale2_key][...].cuda()
+                        new_dict[key] = NemotronHMOE._dequant_nvfp4_tensor(
+                            packed, ws, ws2, target_dtype)
+                        del new_dict[scale_key]
+                        del new_dict[scale2_key]
+                        for suffix in ('.input_scale', '.input_quantizer'):
+                            k = key.replace('.weight', suffix)
+                            new_dict.pop(k, None)
+                dequanted.append(new_dict)
+            return original_load_weights(self_moe, dequanted, **kwargs)
+
+        self.experts.load_weights = types.MethodType(_dequant_load_weights,
+                                                     self.experts)
 
     def forward(
         self,
@@ -403,10 +490,12 @@ class NemotronHLayer(DecoderLayer):
 
         quant_mode = (model_config.quant_config.quant_mode
                       if model_config.quant_config is not None else None)
-        self.is_nvfp4 = quant_mode is not None and quant_mode.has_nvfp4()
+        _has_fp4_hw = get_sm_version() >= 100
+        self.is_nvfp4 = (quant_mode is not None and quant_mode.has_nvfp4()
+                         and _has_fp4_hw)
         # For MIXED_PRECISION models, the global quant_mode is QuantMode(0). Check per-layer
         # quant_config_dict to see if this specific layer is NVFP4-quantized.
-        if not self.is_nvfp4 and model_config.quant_config_dict is not None:
+        if not self.is_nvfp4 and _has_fp4_hw and model_config.quant_config_dict is not None:
             layer_prefix = f"model.layers.{layer_idx}."
             for key, cfg in model_config.quant_config_dict.items():
                 if key.startswith(layer_prefix) and cfg.quant_mode.has_nvfp4():
