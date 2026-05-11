@@ -110,7 +110,7 @@ RunMetadataResolution resolveRunMetadata(OptionalSizeVectorPtr const& multimodal
     if (!hasCompleteRunMetadata)
     {
         TLLM_LOG_WARNING(
-            "Incomplete multimodal run metadata; disabling multimodal cache hash extra keys: "
+            "Incomplete multimodal run metadata; falling back to legacy multimodal cache hash extra keys: "
             "hasItemRunCuOffsets=%d, hasRunPositions=%d, hasRunLengths=%d, "
             "itemRunCuOffsets.size=%zu, runPositions.size=%zu, runLengths.size=%zu",
             static_cast<int>(hasItemRunCuOffsets), static_cast<int>(hasRunPositions), static_cast<int>(hasRunLengths),
@@ -132,7 +132,7 @@ RunMetadataResolution resolveRunMetadata(OptionalSizeVectorPtr const& multimodal
         || runPositions.size() != runLengths.size())
     {
         TLLM_LOG_WARNING(
-            "Invalid multimodal run metadata shape; disabling multimodal cache hash extra keys: "
+            "Invalid multimodal run metadata shape; falling back to legacy multimodal cache hash extra keys: "
             "itemCount=%zu, itemRunCuOffsets.size=%zu, expectedItemRunCuOffsets.size=%zu, "
             "itemRunCuOffsets.front=%d, itemRunCuOffsets.back=%d, runPositions.size=%zu, runLengths.size=%zu",
             itemCount, itemRunCuOffsets.size(), itemCount + 1, itemRunCuOffsets.empty() ? 0 : itemRunCuOffsets.front(),
@@ -153,7 +153,7 @@ std::optional<SizeType32> getValidRunEnd(SizeType32 runStart, SizeType32 runLeng
     return static_cast<SizeType32>(runEnd64);
 }
 
-std::vector<MmKey> generateRunBasedExtraKeys(MultimodalHashes const& multimodalHashes,
+std::optional<std::vector<MmKey>> generateRunBasedExtraKeys(MultimodalHashes const& multimodalHashes,
     OptionalUuidVectorPtr const& multimodalUuids, RunMetadataView const& runMetadata, SizeType32 startTokenIdx,
     SizeType32 endTokenIdx)
 {
@@ -188,10 +188,10 @@ std::vector<MmKey> generateRunBasedExtraKeys(MultimodalHashes const& multimodalH
         if (runBegin32 < 0 || runEnd32 < runBegin32 || static_cast<size_t>(runEnd32) > runPositions.size())
         {
             TLLM_LOG_WARNING(
-                "Invalid multimodal item run offsets; disabling multimodal cache hash extra keys: "
+                "Invalid multimodal item run offsets; falling back to legacy multimodal cache hash extra keys: "
                 "itemIdx=%zu, runBegin=%d, runEnd=%d, runPositions.size=%zu",
                 itemIdx, runBegin32, runEnd32, runPositions.size());
-            return {};
+            return std::nullopt;
         }
 
         auto const mmHashArray = makeHashArray(multimodalHashes[itemIdx]);
@@ -206,11 +206,11 @@ std::vector<MmKey> generateRunBasedExtraKeys(MultimodalHashes const& multimodalH
             {
                 auto const runEnd64 = static_cast<int64_t>(runStart) + static_cast<int64_t>(runLength);
                 TLLM_LOG_WARNING(
-                    "Invalid multimodal run range; disabling multimodal cache hash extra keys: "
+                    "Invalid multimodal run range; falling back to legacy multimodal cache hash extra keys: "
                     "itemIdx=%zu, runIdx=%zu, runStart=%d, runLength=%d, runEnd=%lld, maxSizeType32=%d",
                     itemIdx, runIdx, runStart, runLength, static_cast<long long>(runEnd64),
                     std::numeric_limits<SizeType32>::max());
-                return {};
+                return std::nullopt;
             }
 
             if (endTokenIdx > runStart && startTokenIdx < *runEnd)
@@ -257,7 +257,18 @@ std::vector<MmKey> generateLegacyContiguousExtraKeys(MultimodalHashes const& mul
         auto const& startPos = positions[itemIdx];
         auto const& length = lengths[itemIdx];
 
-        if (endTokenIdx > startPos && startTokenIdx < startPos + length)
+        auto const runEnd = getValidRunEnd(startPos, length);
+        if (!runEnd)
+        {
+            auto const runEnd64 = static_cast<int64_t>(startPos) + static_cast<int64_t>(length);
+            TLLM_LOG_WARNING(
+                "Invalid legacy multimodal range; disabling multimodal cache hash extra keys: "
+                "itemIdx=%zu, startPos=%d, length=%d, runEnd=%lld, maxSizeType32=%d",
+                itemIdx, startPos, length, static_cast<long long>(runEnd64), std::numeric_limits<SizeType32>::max());
+            return {};
+        }
+
+        if (endTokenIdx > startPos && startTokenIdx < *runEnd)
         {
             auto const mmStartInBlock = startPos >= startTokenIdx ? 0 : startTokenIdx - startPos;
             extraKeys.emplace_back(
@@ -292,11 +303,19 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         = resolveRunMetadata(multimodalItemRunCuOffsets, multimodalRunPositions, multimodalRunLengths, hashes.size());
     if (runMetadata.status == RunMetadataStatus::kInvalid)
     {
-        return {};
+        return generateLegacyContiguousExtraKeys(
+            hashes, multimodalPositions, multimodalLengths, multimodalUuids, startTokenIdx, endTokenIdx);
     }
     if (runMetadata.status == RunMetadataStatus::kPresent)
     {
-        return generateRunBasedExtraKeys(hashes, multimodalUuids, runMetadata.metadata, startTokenIdx, endTokenIdx);
+        auto runBasedExtraKeys
+            = generateRunBasedExtraKeys(hashes, multimodalUuids, runMetadata.metadata, startTokenIdx, endTokenIdx);
+        if (runBasedExtraKeys)
+        {
+            return std::move(runBasedExtraKeys.value());
+        }
+        return generateLegacyContiguousExtraKeys(
+            hashes, multimodalPositions, multimodalLengths, multimodalUuids, startTokenIdx, endTokenIdx);
     }
 
     return generateLegacyContiguousExtraKeys(

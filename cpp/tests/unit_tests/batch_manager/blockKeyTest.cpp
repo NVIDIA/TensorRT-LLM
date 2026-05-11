@@ -210,7 +210,48 @@ TEST_F(BlockKeyTest, GenerateExtraKeysUsesExactMultimodalRuns)
     EXPECT_EQ(secondRunKeys[0].uuid.value(), "item-0");
 }
 
-TEST_F(BlockKeyTest, GenerateExtraKeysDisablesHashingForIncompleteRunMetadata)
+TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForIncompleteRunMetadata)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInputA({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
+    MultimodalInput multimodalInputB({{8, 7, 6, 5, 4, 3, 2, 1}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
+
+    Request executorRequestA({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(),
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInputA);
+    Request executorRequestB({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(),
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInputB);
+    LlmRequest llmRequestA(/*requestId=*/0, executorRequestA);
+    LlmRequest llmRequestB(/*requestId=*/1, executorRequestB);
+
+    auto keysA = generateBlockHashExtraKeys(llmRequestA, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    auto keysB = generateBlockHashExtraKeys(llmRequestB, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(keysA.size(), 1);
+    ASSERT_EQ(keysB.size(), 1);
+    EXPECT_EQ(keysA[0].startOffset, 0);
+    EXPECT_EQ(keysB[0].startOffset, 0);
+    EXPECT_NE(keysA[0].hash, keysB[0].hash);
+}
+
+TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForInvalidRunRange)
 {
     using tensorrt_llm::batch_manager::LlmRequest;
     using tensorrt_llm::executor::MultimodalInput;
@@ -220,18 +261,22 @@ TEST_F(BlockKeyTest, GenerateExtraKeysDisablesHashingForIncompleteRunMetadata)
 
     MultimodalInput multimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}},
         /*multimodalPositions=*/{1},
-        /*multimodalLengths=*/{4},
+        /*multimodalLengths=*/{2},
         /*multimodalUuids=*/std::nullopt,
-        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1},
+        /*multimodalRunPositions=*/std::vector<SizeType32>{1},
+        /*multimodalRunLengths=*/std::vector<SizeType32>{-1});
 
-    Request executorRequest({0, 1, 2, 3, 4}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(), OutputConfig(),
-        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
-        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+    Request executorRequest({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(), /*endId=*/std::nullopt, /*padId=*/std::nullopt,
+        /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
+        /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
         /*pTuningConfig=*/std::nullopt, multimodalInput);
     LlmRequest llmRequest(/*requestId=*/0, executorRequest);
 
-    auto keys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/1, /*endTokenIdx=*/2);
-    EXPECT_TRUE(keys.empty());
+    auto keys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(keys.size(), 1);
+    EXPECT_EQ(keys[0].startOffset, 0);
 }
 
 // ---------------------------------------------------------------------------
