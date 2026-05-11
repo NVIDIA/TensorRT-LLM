@@ -1094,6 +1094,18 @@ def collectTestResults(pipeline, testFilter)
                 // if (currentBuild.currentResult == 'SUCCESS') {
                 if (true) {
                     try {
+                        // The Jenkins SCM step created ${LLM_ROOT}/.git on the host agent
+                        // (owned by the `jenkins` user). This alpine container runs as
+                        // root and uses a fresh apk-installed git, which enforces the
+                        // safe.directory ownership check. Install git up-front and
+                        // whitelist all paths so the shared lib's `git config` calls
+                        // can locate the repo. Same pattern used at lines 321/345/404.
+                        sh """
+                            apk add --no-cache git
+                            git config --global --add safe.directory "*"
+                            echo "--- .git diagnostic ---"
+                            ls -la ${LLM_ROOT}/.git 2>&1 | head -n 5 || echo "${LLM_ROOT}/.git missing"
+                        """
                         // Rolling branch: each post-merge force-pushes onto the same
                         // `auto/update_test_durations` branch in the svc_tensorrt fork, so
                         // there is at most one open duration-update PR at a time. The
