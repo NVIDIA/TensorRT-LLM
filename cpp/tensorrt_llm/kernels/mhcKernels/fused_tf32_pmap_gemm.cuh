@@ -650,9 +650,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // values: out[t,h] = bf16(li[t,h] * rsqrt(mean(li²)+norm_eps) * w[h]).
         // norm_weight must be bf16 [HIDDEN]; norm_eps is the RMSNorm epsilon.
         // When kFuseNorm is false, norm_weight/norm_eps are ignored.
-        __nv_bfloat16 const* __restrict__ norm_weight,
-        float norm_eps,
-        float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, uint32_t sinkhorn_repeat)
+        __nv_bfloat16 const* __restrict__ norm_weight, float norm_eps, float rms_eps, float hc_pre_eps,
+        float hc_sinkhorn_eps, float hc_post_mult_value, uint32_t sinkhorn_repeat)
 {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -1530,8 +1529,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 sum_sq_local = team_sum;
             }
 
-            float const rsqrt_val
-                = rsqrtf(sum_sq_local / static_cast<float>(HIDDEN) + norm_eps);
+            float const rsqrt_val = rsqrtf(sum_sq_local / static_cast<float>(HIDDEN) + norm_eps);
 
             // Pass 2: re-LDG the un-normalized layer_input we just wrote
             // (L2-hot), LDG norm_weight, normalize, STG back. No FMA recompute.
@@ -1550,8 +1548,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 {
                     float2 li_f = __bfloat1622float2(li_pairs[v]);
                     float2 nw_f = __bfloat1622float2(nw_pairs[v]);
-                    opairs[v] = __float22bfloat162_rn(make_float2(
-                        li_f.x * rsqrt_val * nw_f.x, li_f.y * rsqrt_val * nw_f.y));
+                    opairs[v]
+                        = __float22bfloat162_rn(make_float2(li_f.x * rsqrt_val * nw_f.x, li_f.y * rsqrt_val * nw_f.y));
                 }
                 *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
             }
@@ -1573,8 +1571,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                     {
                         float2 li_f = __bfloat1622float2(li_pairs[v]);
                         float2 nw_f = __bfloat1622float2(nw_pairs[v]);
-                        opairs[v] = __float22bfloat162_rn(make_float2(
-                            li_f.x * rsqrt_val * nw_f.x, li_f.y * rsqrt_val * nw_f.y));
+                        opairs[v] = __float22bfloat162_rn(
+                            make_float2(li_f.x * rsqrt_val * nw_f.x, li_f.y * rsqrt_val * nw_f.y));
                     }
                     *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
                 }

@@ -954,8 +954,8 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                     {
                         float2 lif = __bfloat1622float2(li_pairs[v]);
                         float2 nwf = __bfloat1622float2(nw_pairs[v]);
-                        opairs[v] = __float22bfloat162_rn(
-                            make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
+                        opairs[v]
+                            = __float22bfloat162_rn(make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
                     }
                     *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
                 }

@@ -258,7 +258,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 2);
             sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 1);
 
-            int const warp_in_bf = warp_id - 1;  // bigfuse warps are 1..N
+            int const warp_in_bf = warp_id - 1; // bigfuse warps are 1..N
             if ((tid & 31) == 0)
                 s_sumsq[warp_in_bf] = sum_sq_local;
         }
@@ -305,8 +305,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
                 {
                     float2 lif = __bfloat1622float2(li_pairs[v]);
                     float2 nwf = __bfloat1622float2(nw_pairs[v]);
-                    opairs[v] = __float22bfloat162_rn(
-                        make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
+                    opairs[v]
+                        = __float22bfloat162_rn(make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
                 }
                 *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
             }
