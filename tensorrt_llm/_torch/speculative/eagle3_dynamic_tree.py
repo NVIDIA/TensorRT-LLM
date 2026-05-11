@@ -180,7 +180,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self, spec_config: "EagleDecodingConfig", mapping, use_separate_draft_kv_cache: bool = False
     ):
         """Initialize dynamic-tree specific buffers and helper ops."""
-        super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
+        super().__init__(
+            spec_config,
+            mapping=mapping,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
         assert self.use_dynamic_tree, (
             "Eagle3OneModelDynamicTreeWorker requires use_dynamic_tree=True"
         )
@@ -453,8 +457,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
     @nvtx_range("eagle3_dyn.sample_and_accept_draft_tokens")
-    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
-        """Override to handle dynamic tree verification."""
+    def sample_and_accept_draft_tokens(self, input_ids, logits, attn_metadata, spec_metadata):
+        """Override to handle dynamic tree verification.
+
+        ``input_ids`` is unused here (relaxed acceptance is not supported in
+        dynamic-tree mode); accepted to match the base class signature.
+        """
+        del input_ids
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts

@@ -944,8 +944,9 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         self,
         model_config: ModelConfig[Qwen3NextConfig],
     ):
-        if (model_config.spec_config is not None
-                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
+        if (model_config.spec_config is not None and
+            (model_config.spec_config.spec_dec_mode.is_mtp_one_model() or
+             model_config.spec_config.spec_dec_mode.is_mtp_eagle_one_model())):
             ckpt_num_nextn = getattr(model_config.pretrained_config,
                                      "num_nextn_predict_layers", None)
             if ckpt_num_nextn not in (None, 1):
@@ -962,8 +963,9 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
-        if (model_config.spec_config is not None
-                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
+        if (model_config.spec_config is not None and
+            (model_config.spec_config.spec_dec_mode.is_mtp_one_model() or
+             model_config.spec_config.spec_dec_mode.is_mtp_eagle_one_model())):
 
             self.model.layers.extend(self.draft_model.mtp_layers)
 
