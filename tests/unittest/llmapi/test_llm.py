@@ -320,7 +320,7 @@ class MyTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, **kwargs)
+        return self.tokenizer(texts, **kwargs)
 
 
 @pytest.mark.part0
@@ -2177,6 +2177,45 @@ def validate_stats(
         #TODO: For some reason, with stats_async and TRT backend, numCompleted is 0 at first iteration
         if pytorch_backend:
             assert result["numCompletedRequests"] == expected_num_completed
+
+            # Per-iteration request-aggregate fields populated by
+            # PyExecutor._update_iter_stats inside inflightBatchingStats.
+            # Assert presence (a missing key indicates a serializer or
+            # RPC-path regression) and sane per-iteration values (a
+            # zero-under-load value indicates a mis-wired populate block).
+            new_aggregate_keys = (
+                "numCtxKvTokens",
+                "numGenKvTokens",
+                "numQueuedContextRequests",
+                "numQueuedCtxTokens",
+                "numQueuedGenRequests",
+                "numQueuedGenKvTokens",
+                "numPausedKvTokens",
+            )
+            for k in new_aggregate_keys:
+                assert k in ifbStats, f"iter {iter}: missing ifbStats key {k}"
+                assert isinstance(
+                    ifbStats[k],
+                    int), (f"iter {iter}: ifbStats key {k} not int "
+                           f"(got {type(ifbStats[k])})")
+                assert ifbStats[
+                    k] >= 0, f"iter {iter}: ifbStats key {k} negative"
+
+            if iter < context_iterations:
+                # Prefill iteration: at least one scheduled context request
+                # and nonzero numCtxTokens. numCtxTokens is sourced from
+                # model_engine.iter_states after _forward_step for this
+                # batch, so it is overlap-safe under every scheduler
+                # configuration.
+                assert ifbStats["numContextRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+                assert ifbStats["numCtxTokens"] > 0, f"iter: {iter}"
+            else:
+                # Generation iteration: at least one decode request with
+                # nonzero total KV context length.
+                assert ifbStats["numGenRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenKvTokens"] > 0, f"iter: {iter}"
+                assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
 
 
 def llm_get_stats_test_harness(tp_size: int = 1,

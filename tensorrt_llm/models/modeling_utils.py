@@ -253,17 +253,27 @@ class QuantConfig(StrictBaseModel):
     def is_module_excluded_from_quantization(self, name: str) -> bool:
         """Check if the module is excluded from quantization.
 
+        A module is excluded if its own name or any ancestor (split on
+        ``.``) matches an entry in ``exclude_modules`` via ``fnmatch``.
+        The ancestor walk means listing a parent module (without a glob
+        suffix) implicitly excludes all of its children.
+
         Args:
             name (str): The name of the module.
 
         Returns:
             bool: True if the module is excluded from quantization, False otherwise.
         """
-        if self.exclude_modules is not None:
+        if self.exclude_modules is None:
+            return False
+        candidate = name
+        while True:
             for exclude_module in self.exclude_modules:
-                if fnmatch.fnmatchcase(name, exclude_module):
+                if fnmatch.fnmatchcase(candidate, exclude_module):
                     return True
-        return False
+            if '.' not in candidate:
+                return False
+            candidate = candidate.rsplit('.', 1)[0]
 
     # NOTE: this is kept for backward compatibility with external libraries (e.g., modelopt).
     # For new code, prefer directly using QuantConfig(**config) instead.

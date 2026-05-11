@@ -189,6 +189,12 @@ class PixtralVisionModel(torch.nn.Module):
             dtype=self.config.torch_dtype,
         )
         self.transformer = PixtralTransformer(model_config)
+        if getattr(self.config, "rope_parameters", None) is None:
+            rope_theta = getattr(self.config, "rope_theta", 10000.0)
+            self.config.rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": rope_theta,
+            }
         self._patch_positional_embedding = (
             transformers.models.pixtral.modeling_pixtral.PixtralRotaryEmbedding(self.config)
         )

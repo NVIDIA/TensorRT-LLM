@@ -1,6 +1,7 @@
 import os
 import queue
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -10,7 +11,7 @@ import torch.distributed as dist
 import zmq
 
 from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.logger import logger
@@ -40,14 +41,22 @@ class DiffusionResponse:
     """Response with model-specific output.
 
     Attributes:
-        request_id: Unique identifier for the request
-        output: Generated media as MediaOutput with model-specific fields populated
-        error_msg: Error message if generation failed
+        request_id: Unique identifier for the request.
+        output: Generated media as :class:`PipelineOutput` with the
+            model-specific fields populated. Set to ``None`` on the error
+            path; on the READY signal it carries a ``dict`` instead.
+        error_msg: Error message if generation failed.
+        generation: Wall-clock time the executor measured around the
+            engine's inference call (host ``time.perf_counter()``), in
+            seconds. Default ``0.0`` so the dataclass round-trips through
+            pickling across worker/client; the error path leaves it at
+            ``0.0``.
     """
 
     request_id: int
-    output: Optional[MediaOutput] = None
+    output: Optional[PipelineOutput] = None
     error_msg: Optional[str] = None
+    generation: float = 0.0
 
 
 # Python type name → accepted Python types for ExtraParamSchema validation.
@@ -233,17 +242,13 @@ class DiffusionExecutor:
     def _validate_request(self, req: DiffusionRequest):
         """Validate *req.params* against the loaded pipeline's declared parameters.
 
-        Raises ``VisualGenParamsError`` on:
+        Raises ``ValueError`` on:
         - Unknown ``extra_params`` keys
         - Universal fields (e.g. ``num_frames``) set by the user but not
           declared in the pipeline's ``default_generation_params``
         - Type mismatches for ``extra_params`` values
         - Out-of-range ``extra_params`` values
         """
-        # Lazy import to avoid circular dependency
-        # (executor → visual_gen.visual_gen → _torch.visual_gen → executor)
-        from tensorrt_llm.visual_gen.visual_gen import VisualGenParamsError
-
         params = req.params
         errors: list[str] = []
         pipeline_name = self.pipeline.__class__.__name__
@@ -302,7 +307,7 @@ class DiffusionExecutor:
             msg = f"Parameter validation failed for {pipeline_name}:\n" + "\n".join(
                 f"  - {e}" for e in errors
             )
-            raise VisualGenParamsError(msg)
+            raise ValueError(msg)
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
@@ -318,9 +323,21 @@ class DiffusionExecutor:
                     f"torch.compile recompilation or CUDA graph capture. "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
+            # Host wall-clock around pipeline.infer(). The pipeline already
+            # syncs at the end (decode_latents path), so this captures the
+            # full executor-side envelope including any pre/post-pipeline work
+            # that the per-phase CUDA-event timings on PipelineOutput do not.
+            generation_start = time.perf_counter()
             output = self.pipeline.infer(req)
+            generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
-                self.response_queue.put(DiffusionResponse(request_id=req.request_id, output=output))
+                self.response_queue.put(
+                    DiffusionResponse(
+                        request_id=req.request_id,
+                        output=output,
+                        generation=generation,
+                    )
+                )
         except Exception as e:
             logger.error(f"Worker {self.device_id}: Error: {e}")
             logger.error(traceback.format_exc())
@@ -335,12 +352,13 @@ def run_diffusion_worker(
     world_size: int,
     master_addr: str,
     master_port: int,
-    request_queue_addr: str,
-    response_queue_addr: str,
+    request_queue_addr: Optional[str],
+    response_queue_addr: Optional[str],
     diffusion_args: "VisualGenArgs",
     log_level: str = "info",
     req_hmac_key: Optional[bytes] = None,
     resp_hmac_key: Optional[bytes] = None,
+    local_rank: Optional[int] = None,
 ):
     """Entry point for worker process."""
     try:
@@ -354,8 +372,17 @@ def run_diffusion_worker(
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Calculate device_id before init_process_group
-        device_id = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # Determine local_rank: explicit arg > LOCAL_RANK env > global rank.
+        # In multi-node runs (torchrun / srun --ntasks-per-node) SLURM/torchelastic
+        # sets LOCAL_RANK; in single-node mp.Process mode it equals the global rank.
+        _local_rank = (
+            local_rank if local_rank is not None else int(os.environ.get("LOCAL_RANK", rank))
+        )
+        os.environ["LOCAL_RANK"] = str(_local_rank)
+
+        # Use local_rank for device assignment so that each node's ranks map to
+        # GPUs 0..gpus_per_node-1 rather than wrapping the global rank.
+        device_id = _local_rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
 

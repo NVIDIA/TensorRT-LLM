@@ -89,11 +89,13 @@ add_library(
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
+  fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   ncclCommunicatorOp.cpp
+  allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp

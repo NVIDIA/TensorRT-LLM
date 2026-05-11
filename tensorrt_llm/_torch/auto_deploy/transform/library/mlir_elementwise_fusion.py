@@ -166,9 +166,15 @@ class MLIRElementwiseFusion(BaseTransform):
         back_converter = MLIRToFXConverter(gm)
         new_gm = back_converter.convert(mlir_module, converter.metadata)
 
+        # Step 6: Re-validate the graph and propagate shapes.
+        from ...utils._graph import canonicalize_graph, run_shape_prop
+
+        canonicalize_graph(new_gm)
+        run_shape_prop(new_gm)
+
         return new_gm, TransformInfo(
             skipped=False,
             num_matches=num_replaced,
-            is_clean=False,
-            has_valid_shapes=False,
+            is_clean=True,
+            has_valid_shapes=True,
         )

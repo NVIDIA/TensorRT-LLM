@@ -274,6 +274,10 @@ struct MHARunnerParams
     void const* kPtr;
     // The V buffer ptr (for separate V input).
     void const* vPtr;
+    // The V tensor token stride in bytes (0 = compute from head dimensions).
+    // Set this when V's actual stride differs from the default (e.g. contiguous V in AutoDeploy
+    // vs non-contiguous V from kv.split() in PyTorch backend).
+    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The paged kv cache array for scaling factor.
@@ -298,6 +302,11 @@ struct MHARunnerParams
     void const* cuMaskRowsPtr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
+    // Scratch buffer (partialO + partialStats) for MultiCtasKv mode in trtllm-gen generation-style kernels.
+    // Only required when the sparse context path selects a GmemReduction cubin; nullptr otherwise.
+    void* multiCtasKvScratchPtr = nullptr;
+    // Per-CTA counter buffer for MultiCtasKv mode synchronization; sized as sizeof(int32_t) * SM count.
+    int32_t* multiCtasKvCounterPtr = nullptr;
     // The bmm1 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).

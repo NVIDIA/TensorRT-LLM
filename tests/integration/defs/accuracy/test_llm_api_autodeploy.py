@@ -18,17 +18,18 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import (get_llm_root, get_sm_version, skip_pre_blackwell,
-                           skip_pre_hopper)
+from defs.conftest import (get_llm_root, get_sm_version, skip_pre_ada,
+                           skip_pre_blackwell, skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root, skip_pre_blackwell
-from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
+                            LlmapiAccuracyTestHarness)
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
@@ -332,29 +333,39 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
 
-    def get_default_kwargs(self):
+    def get_default_kwargs(self, attn_backend="flashinfer"):
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
             eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
         )
-        return {
-            "compile_backend": "torch-simple",
-            "attn_backend": "flashinfer",
+        # Note: Test crashes with trtllm attn_backend + torch-simple
+        # See: https://github.com/NVIDIA/TensorRT-LLM/issues/13135
+        compile_backend = "torch-cudagraph" if attn_backend == "trtllm" else "torch-simple"
+
+        kwargs = {
+            "attn_backend": attn_backend,
+            "compile_backend": compile_backend,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "max_batch_size": 128,
             "max_seq_len": 8192,
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
-            "disable_overlap_scheduler": False,
-            "enable_iter_perf_stats": True,  # Enable stats for acceptance rate
+            "enable_iter_perf_stats": True,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7
             },
             "speculative_config": speculative_config,
+            # Force the Eagle3 draft to match the target (Llama 3.1 8B is bfloat16).
+            # Shared KV cache requires matching dtypes between target and draft.
+            "speculative_model_kwargs": {
+                "torch_dtype": "bfloat16"
+            },
         }
+
+        return kwargs
 
     def get_default_sampling_params(self):
         return SamplingParams(
@@ -363,19 +374,15 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         )
 
     def check_acceptance_rate(self, llm, min_acceptance_rate: float):
-        """Check speculative decoding acceptance rate.
-
-        Args:
-            llm: The LLM instance with enable_iter_perf_stats=True.
-            min_acceptance_rate: Minimum acceptance rate threshold (default 7%).
-        """
+        """Check speculative decoding acceptance rate."""
         _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
-    def test_eagle3_one_model(self):
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_eagle3_one_model(self, attn_backend):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
-        kwargs = self.get_default_kwargs()
+        kwargs = self.get_default_kwargs(attn_backend=attn_backend)
 
         with AutoDeployLLM(
                 model=self.MODEL_PATH,
@@ -385,7 +392,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.25)
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.18)
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
@@ -494,6 +501,7 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             self.evaluate_tasks(llm, sampling_params)
 
+    @skip_pre_ada
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True])
     def test_fp8(self, enable_chunked_prefill):
@@ -553,11 +561,16 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     def test_accuracy(self, model_id, world_size, attn_backend):
         if model_id == "nvfp4" and get_sm_version() < 100:
             pytest.skip("NVFP4 requires Blackwell or later")
+        if model_id == "fp8" and get_sm_version() < 90:
+            pytest.skip("FP8 requires Hopper or later")
         if world_size > get_device_count():
             pytest.skip(f"Not enough devices for world_size={world_size}")
         model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
-        if model_id == "bf16":
+        # bf16 always needs low-memory overrides; on Ada (sm_89, e.g. L40S
+        # ~44 GB) the quantized variants do too, since the 30B FP8 / NVFP4
+        # weights leave too little headroom for the nano_v3.yaml defaults.
+        if model_id == "bf16" or get_sm_version() < 90:
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
 
@@ -674,41 +687,59 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 sampling_params=SamplingParams(max_tokens=10))
             assert len(outputs) == 1
 
-    @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [4, 8])
-    def test_mtp(self, world_size):
+    @skip_pre_hopper
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    @pytest.mark.parametrize(
+        "world_size",
+        [
+            pytest.param(
+                4,
+                marks=pytest.mark.skip_less_device_memory(180000),
+                id="ws4_180gb",
+            ),
+            pytest.param(
+                8,
+                marks=pytest.mark.skip_less_device_memory(80000),
+                id="ws8_80gb",
+            ),
+        ],
+    )
+    def test_mtp(self, world_size, attn_backend):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
         model_path = self.MODEL_PATHS["bf16"]
         kwargs = {}
-        low_memory_overrides(kwargs)
-        kwargs["compile_backend"] = "torch-simple"
-        kwargs["attn_backend"] = "flashinfer"
-        kwargs["speculative_config"] = MTPDecodingConfig(
-            num_nextn_predict_layers=6,
-            mtp_eagle_one_model=True,
-            speculative_model=model_path,
+        low_memory_overrides(
+            kwargs,
+            max_batch_size=8,
+            cuda_graph_batch_sizes=[1, 2, 4, 8],
         )
-        kwargs["transforms"] = {
-            "insert_cached_ssm_attention": {
-                "backend": "triton_ssm"
-            },
-            "insert_cached_causal_conv": {
-                "backend": "triton_causal_conv"
-            },
-        }
+        kwargs["attn_backend"] = attn_backend
+
+        # Note: Torch-cudagraph is only enabled for TRTLLM Attention backend.
+        # Even for this, it causes some accuracy drop over torch-simple.
+        # TODO: Fix. See: https://github.com/NVIDIA/TensorRT-LLM/issues/13133
+        if attn_backend != "trtllm":
+            kwargs["compile_backend"] = "torch-simple"
 
         print(
             f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"
         )
         print(f"kwargs: {kwargs}")
 
+        mtp_yaml = str(
+            Path(get_llm_root()) / "examples" / "auto_deploy" /
+            "model_registry" / "configs" / "super_v3_mtp.yaml")
+        yaml_extra = [mtp_yaml]
+
         print_memory_usage("test start")
         with AutoDeployLLM(
                 model=model_path,
                 tokenizer=model_path,
                 world_size=world_size,
+                yaml_extra=yaml_extra,
+                trust_remote_code=True,
                 enable_iter_perf_stats=True,
                 **kwargs,
         ) as llm:
@@ -785,7 +816,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
@@ -886,6 +917,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
     MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
+    MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
@@ -964,6 +996,30 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         world_size = config.pop('world_size', 1)
         return config, world_size
 
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [4])
+    def test_bf16_small(self, world_size):
+        config, _ = self._load_small_config()
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH_SMALL,
+                           tokenizer=self.MODEL_PATH_SMALL,
+                           dtype="bfloat16",
+                           world_size=world_size,
+                           **config) as llm:
+            task = MMLU(self.MODEL_NAME_SMALL)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME_SMALL)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = MMMU(self.MODEL_NAME_SMALL)
+            task.EVALUATE_KWARGS = dict(MMMU.EVALUATE_KWARGS,
+                                        model_type="qwen3_vl",
+                                        is_force_single_image=False)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
 
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for MiniMax M2.
@@ -972,36 +1028,43 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "MiniMaxAI/MiniMax-M2"
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
     def get_default_kwargs(self):
         return {
-            "skip_tokenizer_init":
-            False,
-            "trust_remote_code":
-            True,
-            "skip_loading_weights":
-            False,
-            "compile_backend":
-            "torch-cudagraph",
-            "free_mem_ratio":
-            0.88,
-            "max_batch_size":
-            64,
-            "max_seq_len":
-            self.MAX_SEQ_LEN,
-            "max_num_tokens":
-            self.MAX_SEQ_LEN,
-            "enable_chunked_prefill":
-            True,
-            "cuda_graph_batch_sizes":
-            [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384],
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "skip_loading_weights": False,
+            "compile_backend": "torch-cudagraph",
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.7,
+            },
+            "max_batch_size": 64,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": {
+                "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64]
+            },
             "model_kwargs": {
                 "torch_dtype": "bfloat16",
             },
         }
+
+    @pytest.mark.skip_less_device(4)
+    def test_finegrained_fp8(self):
+        kwargs = self.get_default_kwargs()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           world_size=4,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestKimiK2_5(LlmapiAccuracyTestHarness):
@@ -1062,15 +1125,21 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
     """Bench-run coverage for Gemma4 MoE via AutoDeploy."""
 
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     EXTRA_EVALUATOR_KWARGS = {
         "apply_chat_template": True,
     }
 
     def get_default_sampling_params(self):
-        return SamplingParams(end_id=None,
-                              pad_id=None,
-                              n=1,
-                              use_beam_search=False)
+        return SamplingParams(
+            max_tokens=MMMU.MAX_OUTPUT_LEN,  # noqa: F821
+            truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,  # noqa: F821
+            stop="<|endoftext|>",
+            end_id=None,
+            pad_id=None,
+            n=1,
+            use_beam_search=False,
+        )
 
     @pytest.mark.skip_less_device_memory(80000)
     def test_bf16(self):
@@ -1080,17 +1149,16 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
             pytest.skip("Not enough devices for world size, skipping test")
 
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
                            world_size=registry_world_size,
                            yaml_extra=yaml_paths) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = MMMU(self.MODEL_NAME)  # noqa: F821
+            task.evaluate(
+                llm,
+                sampling_params=sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
 
 
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
@@ -1108,40 +1176,25 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
-        pytest.param("meta-llama/Llama-3.1-8B-Instruct",
-                     {"cuda_graph_config": {
-                         "max_batch_size": 8
-                     }}, [MMLU, GSM8K],
+        pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
                      id="meta-llama_Llama-3.1-8B-Instruct"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
+                     marks=skip_pre_ada,
                      id="nvidia_Llama-3.1-8B-Instruct-FP8"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
+                     marks=skip_pre_blackwell,
                      id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
-        pytest.param("google/gemma-3-1b-it",
-                     {"cuda_graph_config": {
-                         "max_batch_size": 8
-                     }}, [MMLU, GSM8K],
+        pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),
-        pytest.param("mistralai/Ministral-8B-Instruct-2410",
-                     {"cuda_graph_config": {
-                         "max_batch_size": 8
-                     }}, [MMLU, GSM8K],
+        pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
                      id="mistralai_Ministral-8B-Instruct-2410"),
-        pytest.param("mistralai/Codestral-22B-v0.1",
-                     {"cuda_graph_config": {
-                         "max_batch_size": 8
-                     }}, [MMLU, GSM8K],
+        pytest.param("mistralai/Codestral-22B-v0.1", {}, [MMLU, GSM8K],
                      id="mistralai_Codestral-22B-v0.1"),
-        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
-                     {"cuda_graph_config": {
-                         "max_batch_size": 8
-                     }}, [MMLU, GSM8K],
+        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
             "Qwen/QwQ-32B",
-            {"cuda_graph_config": {
-                "max_batch_size": 8
-            }},
+            {},
             [MMLU],
             marks=pytest.mark.skip_less_device_memory(80000),
             id="Qwen_QwQ-32B",

@@ -122,7 +122,7 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
         """Return baseline/threshold fields from the most recent entry that has them.
 
         Returns a dict of just the d_baseline_* and d_threshold_* fields,
-        or None if no entry has baseline fields.
+        or None if no entry has baseline or threshold fields.
         """
         if not data_list:
             return None
@@ -131,7 +131,9 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
             key=lambda x: parse_timestamp(x.get("@timestamp", 0)),
             reverse=True)
         for entry in sorted_data:
-            if any(k.startswith("d_baseline_") for k in entry):
+            if any(
+                    k.startswith("d_baseline_") or k.startswith("d_threshold_")
+                    for k in entry):
                 return {
                     k: v
                     for k, v in entry.items() if k.startswith("d_baseline_")

@@ -21,6 +21,7 @@
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
+#include <tensorrt_llm/thop/outputTensor.h>
 #include <torch/extension.h>
 
 namespace nb = nanobind;
@@ -30,6 +31,12 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m)
 {
+    // Sync with torch_ext::BufferKind in tensorrt_llm/thop/outputTensor.h
+    nb::enum_<torch_ext::BufferKind>(m, "BufferKind", nb::is_arithmetic())
+        .value("DEFAULT", torch_ext::BufferKind::Default)
+        .value("USERBUFFERS", torch_ext::BufferKind::Userbuffers)
+        .value("NCCL_WINDOW", torch_ext::BufferKind::NcclWindow);
+
     // Export MoE A2A constants
     for (auto const& kv : torch_ext::moe_comm::getMoeA2AMetaInfoIndexPairs())
     {
@@ -58,12 +65,13 @@ void initBindings(nb::module_& m)
         nb::arg("attention_input_type").none(), nb::arg("is_mla_enable"),
         nb::arg("chunked_prefill_buffer_batch_size").none(), nb::arg("q_lora_rank").none(),
         nb::arg("kv_lora_rank").none(), nb::arg("qk_nope_head_dim").none(), nb::arg("qk_rope_head_dim").none(),
-        nb::arg("v_head_dim").none(), nb::arg("mrope_rotary_cos_sin").none(), nb::arg("mrope_position_deltas").none(),
-        nb::arg("helix_tensor_params"), nb::arg("attention_chunk_size").none(), nb::arg("softmax_stats_tensor").none(),
-        nb::arg("spec_decoding_bool_params"), nb::arg("spec_decoding_tensor_params"),
-        nb::arg("sparse_kv_indices").none(), nb::arg("sparse_kv_offsets").none(), nb::arg("sparse_attn_indices").none(),
+        nb::arg("v_head_dim").none(), nb::arg("rope_append").none(), nb::arg("mrope_rotary_cos_sin").none(),
+        nb::arg("mrope_position_deltas").none(), nb::arg("helix_tensor_params"), nb::arg("attention_chunk_size").none(),
+        nb::arg("softmax_stats_tensor").none(), nb::arg("spec_decoding_bool_params"),
+        nb::arg("spec_decoding_tensor_params"), nb::arg("sparse_kv_indices").none(),
+        nb::arg("sparse_kv_offsets").none(), nb::arg("sparse_attn_indices").none(),
         nb::arg("sparse_attn_offsets").none(), nb::arg("sparse_attn_indices_block_size"),
-        nb::arg("num_sparse_topk") = std::nullopt,
+        nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_mla_topk_lens") = std::nullopt,
         nb::arg("skip_softmax_threshold_scale_factor_prefill") = std::nullopt,
         nb::arg("skip_softmax_threshold_scale_factor_decode") = std::nullopt,
         nb::arg("skip_softmax_stat") = std::nullopt, nb::arg("cu_q_seqlens") = std::nullopt,
@@ -73,7 +81,8 @@ void initBindings(nb::module_& m)
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("sage_attn_num_elts_per_blk_q") = 0,
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
-        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt, "Multi-head attention operation",
+        nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",
