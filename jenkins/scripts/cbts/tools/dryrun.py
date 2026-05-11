@@ -94,36 +94,6 @@ def _resolve_pr(subject: str, sha: str) -> tuple[str, str]:
     return f"sha-{sha[:8]}", f"(no PR number; sha={sha})"
 
 
-# --- snapshot inputs at a given commit --------------------------------------
-
-
-def _snapshot_test_db(repo: Path, sha: str, dst: Path) -> Path:
-    out = _git(repo, "ls-tree", "-r", "--name-only", sha, "--", TEST_DB_REL)
-    files = [ln for ln in out.stdout.splitlines() if ln.endswith(".yml")]
-    if not files:
-        raise RuntimeError(
-            f"no test-db .yml files at {sha[:8]} under {TEST_DB_REL} — "
-            f"path missing at this revision"
-        )
-    db = dst / "test-db"
-    db.mkdir(parents=True, exist_ok=True)
-    for f in files:
-        content = _git(repo, "show", f"{sha}:{f}").stdout
-        (db / Path(f).name).write_text(content)
-    return db
-
-
-def _snapshot_groovy(repo: Path, sha: str, dst: Path) -> Path:
-    content = _git(repo, "show", f"{sha}:{GROOVY_REL}").stdout
-    if not content:
-        raise RuntimeError(
-            f"empty {GROOVY_REL} snapshot at {sha[:8]} — path missing at this revision"
-        )
-    p = dst / "L0_Test.groovy"
-    p.write_text(content)
-    return p
-
-
 # --- run main.py ------------------------------------------------------------
 
 
@@ -246,20 +216,7 @@ def _replay_one(
     pr_dir = out_dir / label
     pr_dir.mkdir(parents=True, exist_ok=True)
 
-    if not files:
-        result: dict = {"_error": "commit touched no files"}
-    else:
-        diffs = {f: _file_diff(repo, sha, f) for f in files}
-        payload = {"changed_files": files, "diffs": diffs, "post_merge": post_merge}
-        with tempfile.TemporaryDirectory() as td:
-            tdpath = Path(td)
-            test_db = _snapshot_test_db(repo, sha, tdpath)
-            groovy = _snapshot_groovy(repo, sha, tdpath)
-            shared_out = repo / "cbts_test_db"
-            if shared_out.exists():
-                shutil.rmtree(shared_out)
-            result = _run_cbts(payload, test_db, groovy, repo)
-
+    # Wipe any stale artifacts from a previous run before writing fresh ones.
     for old in pr_dir.iterdir():
         if old.name == "summary.txt":
             continue
@@ -267,10 +224,30 @@ def _replay_one(
             shutil.rmtree(old)
         else:
             old.unlink()
-    shared_out = repo / "cbts_test_db"
-    if shared_out.exists():
-        for yml in shared_out.glob("*.yml"):
-            shutil.copy2(yml, pr_dir / yml.name)
+
+    if not files:
+        result: dict = {"_error": "commit touched no files"}
+    else:
+        diffs = {f: _file_diff(repo, sha, f) for f in files}
+        payload = {"changed_files": files, "diffs": diffs, "post_merge": post_merge}
+        with tempfile.TemporaryDirectory() as td:
+            wt = Path(td) / "wt"
+            # Materialize the SHA's tree as a detached worktree so every
+            # path CBTS reads (post-PR YAML, .py source, accuracy refs)
+            # is the state at PR-decision time, not whatever HEAD is now.
+            _git(repo, "worktree", "add", "--detach", str(wt), sha)
+            try:
+                test_db = wt / TEST_DB_REL
+                groovy = wt / GROOVY_REL
+                shared_out = wt / "cbts_test_db"
+                result = _run_cbts(payload, test_db, groovy, wt)
+                # Copy filtered test-db YAMLs out before the worktree
+                # is torn down in the finally block.
+                if shared_out.exists():
+                    for yml in shared_out.glob("*.yml"):
+                        shutil.copy2(yml, pr_dir / yml.name)
+            finally:
+                _git(repo, "worktree", "remove", "--force", str(wt), check=False)
 
     (pr_dir / "summary.txt").write_text(
         _fmt_summary(pr_url, sha, subject, files, result, post_merge, tests_only)
@@ -379,6 +356,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"error: cbts main.py not found at {CBTS_MAIN}", file=sys.stderr)
         return 2
 
+    # Drop stale worktree metadata from interrupted prior runs so
+    # `git worktree add` doesn't trip on dangling entries.
+    _git(repo, "worktree", "prune", check=False)
+
     out_dir = Path(args.out)
     if not out_dir.is_absolute():
         out_dir = (Path.cwd() / out_dir).resolve()
@@ -412,9 +393,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             row = _replay_one(repo, sha, out_dir, args.post_merge)
         except subprocess.CalledProcessError as e:
             print(f"  {sha[:8]}: git error: {e.stderr.strip()}", file=sys.stderr)
-            continue
-        except RuntimeError as e:
-            print(f"  {sha[:8]}: snapshot error: {e}", file=sys.stderr)
             continue
         rows.append(row)
         label, _, _, _, result, _ = row
