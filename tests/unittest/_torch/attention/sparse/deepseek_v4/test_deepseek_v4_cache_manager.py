@@ -824,6 +824,7 @@ class TestDeepseekV4CacheManager:
         for req in requests:
             req.context_current_position = prompt_lens[req.py_request_id]
             req.add_new_token(prompt_lens[req.py_request_id], 0)
+        cache_manager.update_context_resources(scheduled_batch)
         cache_manager.update_resources(scheduled_batch)
 
         # Read context from cache and verify

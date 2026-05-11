@@ -1118,6 +1118,11 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
         )
         print("  PASSED")
 
+    for req, ctx_len in zip(requests, context_lengths):
+        req.context_current_position = ctx_len
+        req.add_new_token(ctx_len, 0)
+    cache_manager.update_context_resources(scheduled_batch)
+
     # 8. Generation steps
     for step in range(num_generation_steps):
         print(f"\n=== Generation step {step + 1} ===")
@@ -1412,6 +1417,14 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
             is_generation=False,
         )
 
+    gen_requests = requests[1:]
+    gen_prefill_batch = ScheduledRequests()
+    gen_prefill_batch.context_requests_last_chunk = gen_requests
+    for req, ctx_len in zip(gen_requests, gen_ctx_lengths):
+        req.context_current_position = ctx_len
+        req.add_new_token(ctx_len, 0)
+    cache_manager.update_context_resources(gen_prefill_batch)
+
     # Pre-fill COMPRESS buffers for ratio > 1.
     compress_ref_data: Dict[int, List[torch.Tensor]] = {}
     for li in TEST_LAYERS:
@@ -1427,7 +1440,6 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
             )
 
     # 3. Allocate 1 gen step for gen requests.
-    gen_requests = requests[1:]
     _allocate_kv_cache_for_generation(cache_manager, gen_requests)
     gen_cached_lens = [cl + generation_seq_len_q for cl in gen_ctx_lengths]
 
