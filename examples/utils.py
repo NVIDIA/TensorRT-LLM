@@ -53,7 +53,8 @@ class SentencePieceTokenizer:
         self.padding_side = padding_side
         self.truncation_side = truncation_side
         self.vocab_size = sp.GetPieceSize()
-        _opt = lambda i: i if i >= 0 else None
+        def _opt(i: int) -> int | None:
+            return i if i >= 0 else None
         self.pad_token_id = _opt(sp.pad_id())
         self.eos_token_id = _opt(sp.eos_id())
         self.bos_token_id = _opt(sp.bos_id())
