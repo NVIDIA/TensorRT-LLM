@@ -29,7 +29,7 @@ respective model files and registered via get_eagle_layers().
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -104,9 +104,11 @@ class EagleConfig(PretrainedConfig):
         model_type: The base model type (e.g., "llama", "nemotron_h") used to look up defaults.
     """
 
-    # Map model_type -> default Eagle config values
-    # Includes _checkpoint_conversion_mapping for model-specific weight key transformations
-    _drafter_defaults: Dict[str, Dict[str, Any]] = {
+    # Map model_type -> default Eagle config values.
+    # Annotated as ClassVar so transformers 5.5.x's @dataclass(kw_only=True)
+    # treatment of PretrainedConfig subclasses skips this (otherwise the
+    # mutable-dict default is rejected at class-creation time).
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": True,
             "load_lm_head_from_target": False,
@@ -140,7 +142,7 @@ class EagleConfig(PretrainedConfig):
     # Some custom HF config classes expose backward-compatibility fields as properties instead of
     # storing them directly in __dict__. Those values do not survive config.to_dict(), so carry
     # them over explicitly before rebuilding a generic EagleConfig.
-    _preserved_config_attrs: Dict[str, tuple[str, ...]] = {
+    _preserved_config_attrs: ClassVar[Dict[str, tuple[str, ...]]] = {
         "nemotron_h": ("mtp_hybrid_override_pattern",),
     }
 
