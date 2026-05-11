@@ -26,6 +26,7 @@ from tqdm import tqdm
 import tensorrt_llm.profiler as profiler
 
 from ..llmapi import RequestOutput
+from ..llmapi.reasoning_parser import ReasoningParserFactory
 from ..logger import logger
 from ..sampling_params import SamplingParams
 
@@ -47,6 +48,26 @@ def get_chat_template_kwargs(
     if isinstance(chat_template, str) and "enable_thinking" in chat_template:
         effective_kwargs.setdefault("enable_thinking", False)
     return effective_kwargs
+
+
+def strip_reasoning_content(
+        text: str,
+        reasoning_parser: str = "minimax_m2_append_think") -> str:
+    """Return the final answer text after a model-emitted reasoning block."""
+
+    def strip_blank_lines(value: str) -> str:
+        lines = value.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
+
+    parser = ReasoningParserFactory.create_reasoning_parser(reasoning_parser)
+    result = parser.parse(text)
+    if result.content or getattr(parser, "reasoning_end", None) in text:
+        return strip_blank_lines(result.content)
+    return strip_blank_lines(text)
 
 
 class Evaluator(ABC):

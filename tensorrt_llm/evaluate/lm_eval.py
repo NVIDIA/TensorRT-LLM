@@ -44,7 +44,7 @@ from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .interface import (Evaluator, dump_inference_results,
-                        get_chat_template_kwargs)
+                        get_chat_template_kwargs, strip_reasoning_content)
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -60,13 +60,15 @@ class LmEvalWrapper(TemplateLM):
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
                  model_type: str | None = None,
                  is_force_single_image: bool = False,
-                 output_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None,
+                 strip_thinking_output: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
         self.streaming = streaming
         self.chat_template_kwargs = chat_template_kwargs
         self.output_dir = output_dir
+        self.strip_thinking_output = strip_thinking_output
 
     @property
     def eot_token_id(self) -> int:
@@ -105,6 +107,7 @@ class LmEvalWrapper(TemplateLM):
         raise NotImplementedError()
 
     def _get_sampling_params(self, gen_kwargs: dict) -> SamplingParams:
+        gen_kwargs = copy.deepcopy(gen_kwargs)
         params_mapping = {
             "temperature": "temperature",
             "top_p": "top_p",
@@ -162,7 +165,13 @@ class LmEvalWrapper(TemplateLM):
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        return [output.outputs[0].text for output in outputs]
+        output_texts = [output.outputs[0].text for output in outputs]
+        if self.strip_thinking_output:
+            output_texts = [
+                strip_reasoning_content(text) for text in output_texts
+            ]
+
+        return output_texts
 
 
 class MultimodalLmEvalWrapper(LmEvalWrapper):
@@ -181,7 +190,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
                  model_type: str | None = None,
                  is_force_single_image: bool = False,
-                 output_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None,
+                 strip_thinking_output: bool = False):
         """
         Initialize the multimodal wrapper.
 
@@ -193,7 +203,14 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             chat_template_kwargs: Chat template kwargs as JSON string
             output_dir: Directory to save the task infos.
         """
-        super().__init__(llm, sampling_params, streaming, output_dir=output_dir)
+        super().__init__(llm,
+                         sampling_params,
+                         streaming,
+                         chat_template_kwargs=chat_template_kwargs,
+                         model_type=model_type,
+                         is_force_single_image=is_force_single_image,
+                         output_dir=output_dir,
+                         strip_thinking_output=strip_thinking_output)
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
         self.MULTIMODAL = True
@@ -352,7 +369,13 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        return [output.outputs[0].text for output in outputs]
+        output_texts = [output.outputs[0].text for output in outputs]
+        if self.strip_thinking_output:
+            output_texts = [
+                strip_reasoning_content(text) for text in output_texts
+            ]
+
+        return output_texts
 
 
 class LmEvalEvaluator(Evaluator):
@@ -893,8 +916,41 @@ class LongBenchV1(LmEvalEvaluator):
         to aggregate over subtasks.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self,
+                 max_output_length: Optional[int] = None,
+                 ignore_lm_eval_stop: bool = False,
+                 **kwargs):
         super().__init__("longbench", **kwargs)
+        self.max_output_length = max_output_length
+        self.ignore_lm_eval_stop = ignore_lm_eval_stop
+
+    def _get_generation_kwargs(self) -> Optional[dict[str, Any]]:
+        gen_kwargs: dict[str, Any] = {}
+        if self.max_output_length is not None:
+            gen_kwargs["max_gen_toks"] = self.max_output_length
+        if self.ignore_lm_eval_stop:
+            gen_kwargs["until"] = []
+        return gen_kwargs or None
+
+    def _apply_generation_kwargs(self) -> None:
+        gen_kwargs = self._get_generation_kwargs()
+        if gen_kwargs is None:
+            return
+
+        def _apply(task_dict: dict) -> None:
+            for task_obj in task_dict.values():
+                if isinstance(task_obj, dict):
+                    _apply(task_obj)
+                else:
+                    task_obj.set_config(
+                        key="generation_kwargs",
+                        value=gen_kwargs,
+                        update=True)
+
+        _apply(self.task_dict)
+        logger.info(
+            f"Overriding LongBench V1 lm-eval generation kwargs: {gen_kwargs}"
+        )
 
     @staticmethod
     def _flatten_task_dict(task_dict: dict) -> List[str]:
@@ -932,12 +988,14 @@ class LongBenchV1(LmEvalEvaluator):
         import lm_eval
 
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
+        self._apply_generation_kwargs()
         results = lm_eval.evaluate(
             lm=lm_cls(llm,
                       sampling_params=sampling_params,
                       streaming=streaming,
                       chat_template_kwargs=self.chat_template_kwargs,
-                      output_dir=self.output_dir),
+                      output_dir=self.output_dir,
+                      strip_thinking_output=True),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
@@ -1016,6 +1074,17 @@ class LongBenchV1(LmEvalEvaluator):
         callback=lambda ctx, param, value: json.loads(value) if value else None,
         help=
         'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
+    @click.option("--max_output_length",
+                  type=int,
+                  default=None,
+                  help="Override lm-eval LongBench V1 max_gen_toks.")
+    @click.option(
+        "--ignore_lm_eval_stop",
+        is_flag=True,
+        default=False,
+        help=
+        "Ignore lm-eval LongBench V1 task stop strings. Useful for thinking models whose reasoning starts with newlines."
+    )
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -1044,6 +1113,8 @@ class LongBenchV1(LmEvalEvaluator):
             apply_chat_template=kwargs.pop("apply_chat_template", True),
             system_prompt=kwargs.pop("system_prompt", None),
             chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
+            max_output_length=kwargs.pop("max_output_length", None),
+            ignore_lm_eval_stop=kwargs.pop("ignore_lm_eval_stop", False),
             log_samples=kwargs.pop("log_samples", False),
             output_path=kwargs.pop("output_path", None),
             output_dir=kwargs.pop("output_dir", None))

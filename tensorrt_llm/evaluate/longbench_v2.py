@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,7 @@ from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .interface import Evaluator
+from .interface import Evaluator, strip_reasoning_content
 
 
 class LongBenchV2(Evaluator):
@@ -300,12 +300,7 @@ class LongBenchV2(Evaluator):
             Cleaned prediction string that strips thinking content (if any)
         """
 
-        try:
-            idx = pred.rindex("</think>") + len("</think>")
-        except ValueError:
-            idx = 0
-
-        return pred[idx:].strip()
+        return strip_reasoning_content(pred)
 
     def _truncate_prompt(self, prompt: str, tokenizer: Any) -> str:
         """Truncate prompt to max_input_length tokens using needle-in-haystack strategy.
