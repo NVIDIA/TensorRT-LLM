@@ -932,20 +932,76 @@ def _time_kernel(
 # Per-config benchmark (consolidated baseline + replay)
 
 
+def _warm_one_config(args, cfg, baseline_fn) -> None:
+    """Module-level worker for the compile-warmup process pool.
+
+    Module-level so ProcessPoolExecutor can pickle it (nested functions
+    aren't picklable).  Each worker process holds its own GIL → no
+    serialization between concurrent compiles.
+
+    ``cfg`` is a tuple of (outer_cfg, inner_overrides):
+      * outer_cfg = (batch, mtp_len, prev_ks, state_dtype, act_dtype,
+                     sr_mode, rect, write_ckpt, mode,
+                     sort_slots, reverse_nowrite, hardcode_sort)
+      * inner_overrides = dict of args attribute name -> single-value string
+                         to clamp the per-cell inner-knob sweep to ONE
+                         combination.  Triggers exactly one Triton compile
+                         per worker invocation, so N workers achieve
+                         N-way concurrency regardless of outer config
+                         count.  (Prior design fanned out only at outer
+                         granularity, capping concurrency at ~10 even
+                         with --compile-threads 50.)
+
+    ``baseline_fn`` is optional — when ``None``, only the checkpointing
+    kernel is warmed (the baseline-selection kernel can be warmed once in
+    the parent if needed).  This lets us avoid pickling C-extension
+    function references across processes.
+    """
+    outer_cfg, inner_overrides = cfg
+    (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode,
+     rect, write_ckpt, mode, sort_slots, reverse_nowrite, hardcode_sort) = outer_cfg
+    # Clone args and override inner-knob sweep lists to single values.
+    # _bench_config then iterates a 1×1×...×1 cartesian inside.
+    import argparse as _ap
+    args_copy = _ap.Namespace(**vars(args))
+    for k, v in inner_overrides.items():
+        setattr(args_copy, k, v)
+    _bench_config(
+        args_copy, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
+        sr_mode=sr_mode, rectangle_for_nowrite=rect,
+        write_checkpoint=write_ckpt, mode=mode,
+        sort_slots=sort_slots, reverse_nowrite=reverse_nowrite,
+        hardcode_sort=hardcode_sort,
+        warmup_only=True,
+    )
+
+
 def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
                           baseline_fn, max_workers: int) -> None:
-    """Run each config once in parallel to compile + cache Triton kernels.
+    """Parallel compile-warmup using a ProcessPoolExecutor with `spawn`
+    start method.
 
-    Triton's ``compile()`` releases the GIL, so a ThreadPoolExecutor
-    fans out shape compilations across CPU cores in one shared CUDA
-    context.  Compiled binaries land in Triton's on-disk cache (default
-    ``~/.triton/cache``) and the subsequent sequential measurement
-    phase loads them with no compile cost.
+    Each worker process holds its own GIL and its own CUDA context, so
+    Triton compiles (Python AST/codegen + LLVM/ptxas) run truly in
+    parallel.  Previous ThreadPoolExecutor design hit GIL contention
+    in the Python codegen phase, capping throughput at ~1-2 cores even
+    with 28 threads (observed: 4 R threads vs 28 in pool).
 
-    Parallel measurement would race for GPU time and skew numbers, so
-    only the warmup is parallelized; timing stays serial.
+    Compiled binaries land in Triton's on-disk cache (TRITON_CACHE_DIR
+    or default ~/.triton/cache).  Workers share the cache via filesystem
+    — first to write any given (kernel_source × constexpr_set) hash
+    wins; concurrent writes to the SAME hash are wasteful but not
+    corrupting.
+
+    spawn start method avoids inheriting parent CUDA state (which is
+    unsafe after fork on Linux with active CUDA contexts).  Per-worker
+    import + CUDA init costs ~10s, amortized over each worker's many
+    compiles.  baseline_fn is intentionally NOT passed to workers to
+    avoid pickling complications; the parent compiles the baseline
+    kernel itself before launching the pool when applicable.
     """
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
 
     sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
 
@@ -956,8 +1012,17 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
     rev_list = getattr(args, "reverse_nowrite_list", [False])
     hsort_list = getattr(args, "hardcode_sort_list", [False])
 
+    # Compile-warmup task enumeration: outer × inner cartesian.
+    # CRITICAL: only enumerate axes that change the kernel's COMPILE signature.
+    # Drop runtime axes (batch, prev_k) that produce identical kernel hashes —
+    # otherwise we'd pay ~50-100ms of bench setup per redundant cache-hit task.
+    #
+    # Batches collapsed to first only: batch is a runtime int passed to the
+    # kernel, not a constexpr; all batches share the same compiled kernel.
+    # prev_k is already a list passed into _bench_config (not enumerated here).
     configs = []
-    for batch in batch_sizes:
+    _compile_batches = batch_sizes[:1]  # collapse runtime axis
+    for batch in _compile_batches:
         for mtp_len in mtp_lengths:
             prev_ks = _resolve_prev_ks(args, mtp_len)
             for state_dtype in state_dtypes:
@@ -1014,29 +1079,83 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                                                     hardcode_sort,
                                                 ))
 
-    print(f"[compile-warmup] {len(configs)} configs across {max_workers} threads")
+    # Enumerate inner-knob cartesian — same axes _bench_config iterates
+    # internally.  Each (outer × inner) tuple becomes one task; workers
+    # then trigger exactly one Triton compile per task, giving true
+    # N-way concurrency with --compile-threads N.
+    def _ps(val):
+        if val is None or (isinstance(val, str) and not val):
+            return [None]
+        if isinstance(val, str):
+            return [v.strip() for v in val.split(",") if v.strip()]
+        return [val]
+
+    # CPS (cta_per_sm) collapsed to first value: NUM_PERSISTENT is runtime now,
+    # so different CPS values share the same compiled kernel.  Collapsing here
+    # avoids enumerating 4-8x redundant tasks that would each pay ~50-100ms
+    # bench setup overhead for a cache hit on the same kernel hash.
+    _cps_for_compile = _ps(args.cta_per_sm)[:1]
+    knob_axes = [
+        ("block_size_m",                 _ps(args.block_size_m)),
+        ("num_warps",                    _ps(args.num_warps)),
+        ("num_stages",                   _ps(args.num_stages)),
+        ("precompute_num_warps",         _ps(args.precompute_num_warps)),
+        ("precompute_num_stages",        _ps(args.precompute_num_stages)),
+        ("heads_per_block",              _ps(args.heads_per_block)),
+        ("maxnreg",                      _ps(args.maxnreg)),
+        ("num_ctas",                     _ps(args.num_ctas)),
+        ("cta_per_sm",                   _cps_for_compile),  # collapsed (runtime)
+        ("num_loop_stages",              _ps(args.num_loop_stages)),
+        ("flatten",                      _ps(args.flatten)),
+        ("warp_specialize",              _ps(args.warp_specialize)),
+        ("use_tma_rect_load",            _ps(args.use_tma_rect_load)),
+        ("use_tma_replay_write_load",    _ps(args.use_tma_replay_write_load)),
+        ("use_tma_replay_nowrite_load",  _ps(args.use_tma_replay_nowrite_load)),
+        ("use_tma_replay_write_store",   _ps(args.use_tma_replay_write_store)),
+    ]
+    import itertools as _it
+    inner_combos = list(_it.product(*(values for _, values in knob_axes)))
+
+    # Cross product outer × inner.  Override only knobs that have an
+    # explicit value (skip None — those leave args.<knob> at its CLI default,
+    # which _bench_config handles via its own _parse_sweep).
+    tasks = []
+    for outer in configs:
+        for inner_tuple in inner_combos:
+            inner_overrides = {
+                name: str(val)
+                for (name, _), val in zip(knob_axes, inner_tuple)
+                if val is not None
+            }
+            tasks.append((outer, inner_overrides))
+
+    # Shuffle to reduce cross-worker race on the same kernel hash.  Two
+    # workers picking adjacent tasks (same mode, neighboring knob value)
+    # could both miss + compile the same kernel hash; shuffling spreads
+    # workloads across different kernel hash families.
+    import random as _r
+    _r.shuffle(tasks)
+
+    print(f"[compile-warmup] {len(tasks)} compile tasks "
+          f"({len(configs)} outer × {len(inner_combos)} inner combos) "
+          f"across {max_workers} processes (ProcessPoolExecutor, spawn start)")
     t0 = time.perf_counter()
 
-    def _warm(cfg):
-        (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode,
-         rect, write_ckpt, mode, sort_slots, reverse_nowrite, hardcode_sort) = cfg
-        _bench_config(
-            args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
-            sr_mode=sr_mode, rectangle_for_nowrite=rect,
-            write_checkpoint=write_ckpt, mode=mode,
-            sort_slots=sort_slots, reverse_nowrite=reverse_nowrite,
-            hardcode_sort=hardcode_sort,
-            warmup_only=True,
-        )
-
+    ctx = multiprocessing.get_context("spawn")
     errors = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_warm, cfg) for cfg in configs]
-        for cfg, fut in zip(configs, futures):
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+        # baseline_fn=None: workers compile only the checkpointing kernel.
+        # Baseline kernels (if any) get compiled lazily in the parent during
+        # the timing phase — usually just one extra compile, negligible.
+        futures = {
+            ex.submit(_warm_one_config, args, task, None): task
+            for task in tasks
+        }
+        for fut in futures:
             try:
                 fut.result()
             except Exception as e:
-                errors.append((cfg, e))
+                errors.append((futures[fut], e))
 
     if errors:
         for cfg, e in errors:

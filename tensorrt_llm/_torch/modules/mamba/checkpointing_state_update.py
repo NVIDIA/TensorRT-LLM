@@ -3990,7 +3990,16 @@ def _persistent_main_kernel(
     WRITE_CHECKPOINT: tl.constexpr,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
     USE_PERM: tl.constexpr,
-    NUM_PERSISTENT: tl.constexpr,
+    # NUM_PERSISTENT: runtime int (not constexpr).  Used ONLY as the loop
+    # stride in `tl.range(pid, total_work, NUM_PERSISTENT, ...)`.  Making it
+    # runtime collapses the cta_per_sm tuning dim from the kernel's compile
+    # signature: 8 CPS values used to mean 8x recompiles; now they share one
+    # compiled kernel.  Work decomposition (pid_m, pid_b_local, pid_h) does
+    # NOT depend on NUM_PERSISTENT — it uses constexpr NUM_PID_M_BLOCKS and
+    # runtime n_slots_local — so loop unrolling and flatten=/num_stages=/
+    # warp_specialize= optimizations on `tl.range` operate independently of
+    # the stride value.
+    NUM_PERSISTENT,
     NUM_LOOP_STAGES: tl.constexpr,
     NUM_PID_M_BLOCKS: tl.constexpr,
     FLATTEN: tl.constexpr,
