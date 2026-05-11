@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -291,6 +291,44 @@ class TestSwitchToGeneratePageBoundary:
 
 class TestSwitchToGenerateHostArgHandling:
     """Validate host arg warning and d2h sync behavior."""
+
+    def test_inactive_host_mirror_not_synced_by_switch_to_generate(self):
+        """Inactive host mirrors should keep pre-transition staging values."""
+        si = _make_seq_info()
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        host_cu_before = si._input_buffer.get_host_view("cu_seqlen")[:3].clone()
+
+        si.switch_to_generate_()
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert host_cu[:3].tolist() == host_cu_before.tolist()
+        assert host_cu[:3].tolist() == [0, 3, 7]
+
+    def test_active_host_mirror_synced_by_switch_to_generate(self):
+        """Active host mirrors should be refreshed from device metadata."""
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        si.switch_to_generate_()
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+        assert host_cu[:3].tolist() == [0, 1, 2]
 
     def test_non_native_host_arg_syncs_device_to_host(self):
         """Activating a non-native host arg should sync device -> host instead of raising."""
