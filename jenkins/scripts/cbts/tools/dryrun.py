@@ -250,7 +250,11 @@ def _replay_one(
             result = _run_cbts(payload, test_db, groovy, repo)
 
     for old in pr_dir.iterdir():
-        if old.name != "summary.txt":
+        if old.name == "summary.txt":
+            continue
+        if old.is_dir():
+            shutil.rmtree(old)
+        else:
             old.unlink()
     shared_out = repo / "cbts_test_db"
     if shared_out.exists():
