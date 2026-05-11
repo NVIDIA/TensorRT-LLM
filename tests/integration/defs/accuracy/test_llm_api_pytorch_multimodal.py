@@ -597,6 +597,8 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
             ),
         ],
     )
+    # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
+    @pytest.mark.threadleak(enabled=False)
     def test_auto_dtype(
         self,
         model_name: str,

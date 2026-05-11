@@ -2174,19 +2174,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
         expanded_text = self._expand_audio_placeholders(text, audios, extractor)
 
-        audio_inputs = extractor(
-            audios,
-            sampling_rate=extractor.sampling_rate,
-            return_tensors="pt",
-        )
-        audio_data = {
-            "input_audio_features": audio_inputs.input_features,
-            "feature_attention_mask": audio_inputs.attention_mask,
-        }
-        # audio_num_clips records how many clips each audio stream was split
-        # into. Needed to regroup per-clip embeddings back to per-video.
-        audio_data["audio_num_clips"] = audio_inputs.audio_num_clips
-        return expanded_text, audio_data
+        audio_inputs = extractor(audios)
+        return expanded_text, audio_inputs
 
     def _process_audio(
         self,
