@@ -39,8 +39,9 @@ def build_rope_cos_sin_cache(
     """Build full RoPE cos/sin tables from a small inv_freq buffer.
 
     This intentionally returns graph-computed tensors instead of registering large
-    module buffers. Later AutoDeploy RoPE transforms can materialize a fused cache
-    after the pipeline-cache boundary.
+    module buffers. ``optimize_rope`` recognizes this pattern after the
+    pipeline-cache boundary and materializes a fused ``_prefused_rope_cache`` on
+    the exported ``GraphModule`` when possible.
     """
     inv_freq = inv_freq.to(device=target.device)
     positions = torch.arange(
