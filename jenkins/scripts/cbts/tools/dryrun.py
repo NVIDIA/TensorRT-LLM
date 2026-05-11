@@ -98,18 +98,29 @@ def _resolve_pr(subject: str, sha: str) -> tuple[str, str]:
 
 
 def _snapshot_test_db(repo: Path, sha: str, dst: Path) -> Path:
-    out = _git(repo, "ls-tree", "-r", "--name-only", sha, "--", TEST_DB_REL, check=False)
+    out = _git(repo, "ls-tree", "-r", "--name-only", sha, "--", TEST_DB_REL)
     files = [ln for ln in out.stdout.splitlines() if ln.endswith(".yml")]
+    if not files:
+        raise RuntimeError(
+            f"no test-db .yml files at {sha[:8]} under {TEST_DB_REL} — "
+            f"path missing at this revision"
+        )
     db = dst / "test-db"
     db.mkdir(parents=True, exist_ok=True)
     for f in files:
-        (db / Path(f).name).write_text(_git(repo, "show", f"{sha}:{f}", check=False).stdout)
+        content = _git(repo, "show", f"{sha}:{f}").stdout
+        (db / Path(f).name).write_text(content)
     return db
 
 
 def _snapshot_groovy(repo: Path, sha: str, dst: Path) -> Path:
+    content = _git(repo, "show", f"{sha}:{GROOVY_REL}").stdout
+    if not content:
+        raise RuntimeError(
+            f"empty {GROOVY_REL} snapshot at {sha[:8]} — path missing at this revision"
+        )
     p = dst / "L0_Test.groovy"
-    p.write_text(_git(repo, "show", f"{sha}:{GROOVY_REL}", check=False).stdout)
+    p.write_text(content)
     return p
 
 
@@ -401,6 +412,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             row = _replay_one(repo, sha, out_dir, args.post_merge)
         except subprocess.CalledProcessError as e:
             print(f"  {sha[:8]}: git error: {e.stderr.strip()}", file=sys.stderr)
+            continue
+        except RuntimeError as e:
+            print(f"  {sha[:8]}: snapshot error: {e}", file=sys.stderr)
             continue
         rows.append(row)
         label, _, _, _, result, _ = row
