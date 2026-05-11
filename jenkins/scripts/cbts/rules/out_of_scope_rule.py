@@ -38,12 +38,17 @@ from .base import PRInputs, Rule, RuleResult
 #   consumed by any L0 pipeline.
 # - tests/integration/defs/.test_durations : pytest-split timing cache;
 #   used at runtime, doesn't affect test selection.
+# - tests/integration/defs/agg_unit_mem_df.csv : per-(gpu, case)
+#   pytest-xdist parallel_factor table consumed by test_unittests.py;
+#   tunes worker count only, no impact on which tests run or their
+#   results.
 # - tests/microbenchmarks/             : benchmarking scripts, not run
 #   by any L0 stage.
 OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "tests/integration/test_lists/qa/",
     "tests/integration/test_lists/dev/",
     "tests/integration/defs/.test_durations",
+    "tests/integration/defs/agg_unit_mem_df.csv",
     "tests/microbenchmarks/",
 )
 
