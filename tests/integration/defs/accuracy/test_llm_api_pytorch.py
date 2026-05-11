@@ -3435,7 +3435,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         # 4x B200 178GB. TRTLLM backend required because V4-Flash MXFP4
         # routed experts are unsupported by WIDEEP (raises "Unsupported
         # quantization mode: [65536]"). is_integration_test=True keeps this
-        # to a 1-sample smoke (no GSM8K reference required).
+        # to a 1-sample smoke.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
@@ -3445,6 +3445,8 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
     @pytest.mark.skip_less_mpi_world_size(4)
@@ -3512,6 +3514,8 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
     @pytest.mark.skip_less_mpi_world_size(4)

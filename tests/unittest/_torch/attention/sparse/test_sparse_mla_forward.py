@@ -47,6 +47,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .deepseek_v4.test_compressor_module import RefCompressor
 
+# DSACacheManager creates background ThreadPoolExecutor threads.
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 try:
     HAS_FLASH_MLA = True
 except ImportError:
