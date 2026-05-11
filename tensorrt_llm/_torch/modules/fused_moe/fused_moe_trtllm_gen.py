@@ -213,6 +213,10 @@ class TRTLLMGenFusedMoE(MoE):
             activation_type=activation_type,
         )
 
+        # Cached for autotune profile sizing (forward path passes
+        # tune_max_num_tokens to the MoE op).
+        self.max_num_tokens = model_config.max_num_tokens
+
         sm_version = get_sm_version()
         if sm_version >= 120:
             raise NotImplementedError(
@@ -646,6 +650,8 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
                 output=moe_output,
+                tune_max_num_tokens=self.max_num_tokens,
+                use_dp=self.use_dp,
             )
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result
@@ -696,6 +702,9 @@ class TRTLLMGenFusedMoE(MoE):
                     None),
                 gated_act_type=act_type,
                 output=moe_output,
+                # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
+                tune_max_num_tokens=self.max_num_tokens,
+                use_dp=self.use_dp,
             )
 
             if not do_finalize:

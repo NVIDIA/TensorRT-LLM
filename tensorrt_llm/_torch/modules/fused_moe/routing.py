@@ -348,16 +348,15 @@ class Deepseekv3RoutingImpl:
 
         _, num_experts = logits.shape
         if self.n_group > 1:
-            if self.top_k > 8 or (num_experts / n_group) > 32 or (
-                    num_experts / n_group) * self.topk_group > 128:
+            experts_per_group = num_experts // n_group
+            if (self.top_k > 8 or num_experts > 256 or experts_per_group > 32
+                    or experts_per_group * self.topk_group > 256):
                 if self.is_fused:
                     warnings.warn(
                         "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
                     )
                 self.is_fused = False
-        elif num_experts > 512 or (self.top_k > 8 and self.top_k != 22):
-            # The fused noaux_tc_op kernel supports n_group==1 with top_k<=8
-            # or top_k==22, and num_experts<=512.
+        elif num_experts > 1024 or self.top_k > 32:
             if self.is_fused:
                 warnings.warn(
                     "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."

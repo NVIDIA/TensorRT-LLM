@@ -300,6 +300,9 @@ transforms:
   multi_stream_gemm:
     stage: compile
     enabled: false
+  cleanup_identity_dtype_cast:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     expect_mem_change: true

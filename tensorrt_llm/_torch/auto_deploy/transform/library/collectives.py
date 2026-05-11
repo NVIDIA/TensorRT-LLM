@@ -30,31 +30,38 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 # ============================================================================
 
 
-def _make_allreduce_residual_rmsnorm_pattern(
-    add_order: str = "residual_first", strategy: str = "AUTO"
-):
-    """Factory function to create pattern functions for allreduce+residual+torch_rmsnorm fusion.
+_RMSNORM_OPS = {
+    "torch_rmsnorm": torch.ops.auto_deploy.torch_rmsnorm,
+    "triton_rms_norm": torch.ops.auto_deploy.triton_rms_norm,
+}
 
-    This pattern matches the graph after match_rmsnorm_pattern has replaced
-    RMSNorm patterns with torch_rmsnorm ops.
+
+def _make_allreduce_residual_rmsnorm_pattern(
+    add_order: str = "residual_first",
+    strategy: str = "AUTO",
+    rmsnorm_op_name: str = "torch_rmsnorm",
+):
+    """Factory function to create pattern functions for allreduce+residual+rmsnorm fusion.
 
     Args:
         add_order: Either "residual_first" (residual + x) or "x_first" (x + residual)
         strategy: AllReduce strategy to use in the pattern
+        rmsnorm_op_name: Which rmsnorm op to match ("torch_rmsnorm" or "triton_rms_norm")
 
     Returns:
         A pattern function that can be used with register_ad_pattern
     """
+    rmsnorm_op = _RMSNORM_OPS[rmsnorm_op_name]
 
     def pattern_fn(
         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 0.1253
     ):
-        """Pattern: trtllm_dist_all_reduce(x) -> add residual -> torch_rmsnorm
+        """Pattern: trtllm_dist_all_reduce(x) -> add residual -> rmsnorm
 
         Reference PyTorch composition:
             y = trtllm_dist_all_reduce(x)
             z = residual + y  (or y + residual)
-            normed = torch_rmsnorm(z, weight, eps)
+            normed = rmsnorm_op(z, weight, eps)
         Returns (normed, z)
         """
         hidden_states = torch.ops.auto_deploy.trtllm_dist_all_reduce(x, strategy)
@@ -65,8 +72,7 @@ def _make_allreduce_residual_rmsnorm_pattern(
         else:  # x_first
             add = hidden_states + residual
 
-        # Use torch_rmsnorm op (already replaced by match_rmsnorm_pattern)
-        normed = torch.ops.auto_deploy.torch_rmsnorm(add, weight, eps)
+        normed = rmsnorm_op(add, weight, eps)
 
         return normed, add
 
@@ -106,22 +112,12 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        patterns = ADPatternMatcherPass()
-
-        # Dummy shapes for tracing
-        bsz, hidden = 8, 512
-        dummy_args = [
-            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # x
-            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # residual
-            torch.randn(hidden, device="meta", dtype=torch.bfloat16),  # weight
-            0.1253,  # eps
-        ]
-
-        scalar_workaround = {"eps": 0.1253}
-
-        # ============================================================================
-        # Instantiate Pattern Functions
-        # ============================================================================
+        # Collectives fusion depends on sharding (reads _sharding_transform_container).
+        # Draft models are not sharded, so skip them.
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         if shared_config.dist_config is not None:
             # Primary production path: DistConfig built by LlmArgs.init_dist_config
@@ -141,32 +137,34 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             )
         ad_logger.info(f"allreduce strategy selected = {strategy!r}")
 
-        # TRT-LLM backend (MPI mode) - two patterns for different addition orders
-        _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(
-            add_order="residual_first", strategy=strategy
-        )
-        _allreduce_residual_rmsnorm_pattern2_trtllm = _make_allreduce_residual_rmsnorm_pattern(
-            add_order="x_first", strategy=strategy
-        )
+        # ============================================================================
+        # Instantiate Pattern Functions
+        # ============================================================================
 
-        # Register TRT-LLM backend patterns only (no torch backend fusion)
-        # Pattern 1: residual + allreduce(x)
-        register_ad_pattern(
-            search_fn=_allreduce_residual_rmsnorm_pattern_trtllm,
-            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
-            patterns=patterns,
-            dummy_args=dummy_args,
-            scalar_workaround=scalar_workaround,
-        )
+        patterns = ADPatternMatcherPass()
 
-        # Pattern 2: allreduce(x) + residual
-        register_ad_pattern(
-            search_fn=_allreduce_residual_rmsnorm_pattern2_trtllm,
-            replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
-            patterns=patterns,
-            dummy_args=dummy_args,
-            scalar_workaround=scalar_workaround,
-        )
+        # Dummy shapes for tracing
+        bsz, hidden = 8, 512
+        dummy_args = [
+            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # x
+            torch.randn(bsz, hidden, device="meta", dtype=torch.bfloat16),  # residual
+            torch.randn(hidden, device="meta", dtype=torch.bfloat16),  # weight
+            0.1253,  # eps
+        ]
+        scalar_workaround = {"eps": 0.1253}
+
+        for rmsnorm_op_name in _RMSNORM_OPS:
+            for add_order in ("residual_first", "x_first"):
+                pattern = _make_allreduce_residual_rmsnorm_pattern(
+                    add_order=add_order, strategy=strategy, rmsnorm_op_name=rmsnorm_op_name
+                )
+                register_ad_pattern(
+                    search_fn=pattern,
+                    replace_fn=partial(_allreduce_residual_rmsnorm_replacement, strategy=strategy),
+                    patterns=patterns,
+                    dummy_args=dummy_args,
+                    scalar_workaround=scalar_workaround,
+                )
 
         num_matches = patterns.apply(gm.graph)
 

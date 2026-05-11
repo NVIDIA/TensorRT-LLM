@@ -72,6 +72,8 @@ struct FmhaOptions : public KernelConfigBase {
   int mMinSeqLenQ{INT_MAX};
   // The minimum sequence length (used to generate variable Kv sequence length).
   int mMinSeqLenKv{INT_MAX};
+  // The minimum sparse MLA topK length.
+  int mMinSparseMlaTopK{1};
   // Benchmark steps.
   int mNumBenchmarkSteps{1};
   // The number of Ctas per sequenceKv from the arguments.
@@ -132,6 +134,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mMinFirstSparseMaskOffsetKv);
     TO_JSON(mMinSeqLenQ);
     TO_JSON(mMinSeqLenKv);
+    TO_JSON(mMinSparseMlaTopK);
     TO_JSON(mNumBenchmarkSteps);
     TO_JSON(mNumCtasPerSeqKv);
     TO_JSON(mNumLoopItersForPrint);
@@ -155,6 +158,8 @@ struct FmhaOptions : public KernelConfigBase {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct FmhaOptionsFromArgs {
+  // Attention window size.
+  bool mIsAttentionWindowSizeSet{false};
   // Relative error tolerance.
   bool mIsAtolSet{false};
   // The head dimension per stage for Kv.
@@ -258,8 +263,9 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Check if head dim is valid.
   auto headDimQk{options.mHeadDimQk}, headDimV{options.mHeadDimV};
   if (swapsMmaAb && headDimQk == headDimV) {
-    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 128 || headDimQk == 256 || headDimQk == 512,
-                     "The headDim must be 64, 128, 256 or 512");
+    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 80 || headDimQk == 128 || headDimQk == 256 ||
+                       headDimQk == 512,
+                     "The headDim must be 64, 80, 128, 256 or 512");
   }
   // MLA kernels.
   if (headDimQk != headDimV) {
@@ -438,6 +444,16 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     TLLM_CHECK_ERROR(
       options.mSparseAttnTopK % 4 == 0,
       "SparseAttnTopK must be a multiple of 4 in order to use 16bytes cpAsync loads");
+  }
+  if (options.mHasSlidingWindowKvPool) {
+    TLLM_CHECK_ERROR(
+      supportsVarSparseMlaTopKLens(options),
+      "The sliding-window KV pool is only supported by dynamic-token sparse MLA kernels.");
+    TLLM_CHECK_ERROR(options.mSingleTokenQPerCta,
+                     "mSingleTokenQPerCta must be true when sliding-window KV pool is enabled.");
+    TLLM_CHECK_ERROR(options.mAttentionWindowSize == options.mTileSizeKv,
+                     "attentionWindowSize must equal tileSizeKv when sliding-window KV pool is "
+                     "enabled.");
   }
 
   // Always enable skipsSoftmaxWhenPossible for outputSkipSoftmaxStats.

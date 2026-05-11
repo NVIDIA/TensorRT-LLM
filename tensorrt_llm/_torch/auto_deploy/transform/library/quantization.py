@@ -205,6 +205,10 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
+        if self.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(self.post_load_hook, weight_name=lin_weight.node_key)
+            )
 
         with gm.graph.inserting_before(node):
             scales = {}
@@ -882,6 +886,15 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 # Rename to match our buffer name
                 mod_prefix = weight_name.rsplit(".", 1)[0]
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    # NOTE: post_load_hook intentionally inherited as None from the base
+    # `Quantization`. UE8M0 conversion + TMA col-major layout for DeepGEMM is
+    # done atomically inside `_dispatch_trtllm_finegrained_fp8_to_deepgemm`
+    # (transform/library/fuse_quant.py) for every node we actually swap to
+    # `trtllm_fp8_deepgemm`. Doing it there guarantees the graph never carries
+    # a UE8M0 scale paired with a raw-FP32-scale op, which previously caused
+    # NaN whenever dispatch failed to swap (deepgemm op missing in build,
+    # fuse_finegrained_fp8_linear disabled, partial pipeline, etc.).
 
     def _apply(
         self,

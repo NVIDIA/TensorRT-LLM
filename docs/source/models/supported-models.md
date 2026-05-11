@@ -14,7 +14,7 @@ The following is a table of supported models for the PyTorch backend:
 | `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma3nForConditionalGeneration` [^8]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
-| `Gemma4ForConditionalGeneration` [^7]| Gemma 4                            | `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
+| `Gemma4ForConditionalGeneration` [^10]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^7], `google/gemma-4-31B-it` [^7] |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^6]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
@@ -55,6 +55,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Qwen3_5MoeForCausalLM` [^5]  | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No                                 | No                                  | No                        | Yes           | Untested         | Yes       | N/A                      | Untested              | Untested        |
 | `Glm4MoeLiteForCausalLM` [^6] | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No                                 | No                                  | No                        | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
 | `NemotronHForCausalLM` (Super) | Yes               | Yes        | Untested                   | Untested              | Yes             | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Untested       | N/A                      | Untested              | Untested        |
+| `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | No              | No  | No                                 | No                                  | No                        | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
@@ -62,9 +63,11 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^4]: Overlap scheduler isn't supported when using EAGLE-3(Two Model Engine) for GPT-OSS.
 [^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml).
 [^6]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/glm-4.7-flash.yaml).
-[^7]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See AD configs for [MoE](../../../examples/auto_deploy/model_registry/configs/gemma4_moe.yaml) and [dense](../../../examples/auto_deploy/model_registry/configs/gemma4_dense.yaml).
+[^7]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See AD configs for [MoE](../../../examples/auto_deploy/model_registry/configs/gemma4_moe.yaml) and [dense](../../../examples/auto_deploy/model_registry/configs/gemma4_dense.yaml).
 [^8]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/gemma3n_e2b_it.yaml).
 [^9]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/minimax_m2.7.yaml).
+[^10]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
+[^11]: Audio modality only supported on E2B/E4B variants.
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
@@ -72,6 +75,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality  |
 | ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | ---------------- | -------------- | --------------------- | ------------------------- | --------- |
 | `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | Yes              | N/A            | Yes                   | No                        | L + I     |
+| `Gemma4ForConditionalGeneration`     | Untested          | Yes        | No              | Yes           | Untested         | No             | Untested              | No                        | L + I + A [^11] |
 | `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes              | Yes            | Yes                   | No                        | L + I     |
 | `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I + V |
 | `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I     |

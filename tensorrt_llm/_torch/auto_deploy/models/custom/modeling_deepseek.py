@@ -275,6 +275,12 @@ class DeepSeekV3MoE(nn.Module):
 
         selected_experts, routing_weights = self.gate(hidden_states)
 
+        # Compute shared expert BEFORE routed experts so that in the FX graph
+        # the shared-expert nodes precede the MoE node.  This lets the
+        # multi_stream_moe transform overlap them on separate CUDA streams.
+        if self.shared_experts is not None:
+            shared_expert_output = self.shared_experts(identity)
+
         # Use torch_moe custom op for routed experts
         final_hidden_states = torch.ops.auto_deploy.torch_moe(
             hidden_states.view(-1, hidden_states.shape[-1]),
@@ -289,9 +295,8 @@ class DeepSeekV3MoE(nn.Module):
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
 
-        # Add shared experts output if present
         if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(identity)
+            final_hidden_states = final_hidden_states + shared_expert_output
 
         return final_hidden_states.to(hidden_states.dtype)
 

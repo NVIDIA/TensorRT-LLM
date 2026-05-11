@@ -1092,6 +1092,7 @@ def _register_fake():
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
         v_head_dim: int,
+        rope_append: bool,
     ) -> None:
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place

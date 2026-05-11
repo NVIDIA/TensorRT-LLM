@@ -25,11 +25,10 @@ import torch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
-from tensorrt_llm.serve.media_storage import MediaStorage
 from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
+from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,26 +96,34 @@ class MockVisualGen:
 
     # --- VisualGen interface ---
 
-    def generate(self, inputs=None, params=None) -> MediaOutput:
+    def generate(self, inputs=None, params=None) -> VisualGenOutput:
         self.last_inputs = inputs
         self.last_params = params
         if self._should_fail:
             raise RuntimeError("Generation intentionally failed")
-        return MediaOutput(
+        return VisualGenOutput(
+            request_id=self._next_request_id(),
             image=self._image,
             video=self._video,
             audio=self._audio,
+            metrics=VisualGenMetrics(),
         )
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
         self.last_params = params
         return MockVisualGenResult(
+            request_id=self._next_request_id(),
             image=self._image,
             video=self._video,
             audio=self._audio,
             should_fail=self._should_fail,
         )
+
+    def _next_request_id(self) -> int:
+        rid = self._req_counter
+        self._req_counter += 1
+        return rid
 
     @property
     def default_params(self):
@@ -137,27 +144,50 @@ class MockVisualGen:
 
 
 class MockVisualGenResult:
-    """Mock future-like result for generate_async."""
+    """Mock future-like result for generate_async.
+
+    Mirrors the real :class:`VisualGenResult` surface enough for the server:
+    ``__await__``, ``aresult``, and a sync ``result``. Resolves to a
+    :class:`VisualGenOutput` (single-prompt path).
+    """
 
     def __init__(
         self,
+        request_id: int = 0,
         image: Optional[torch.Tensor] = None,
         video: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         should_fail: bool = False,
     ):
+        self.request_id = request_id
         self._image = image
         self._video = video
         self._audio = audio
         self._should_fail = should_fail
 
-    async def result(self, timeout=None):
+    def __await__(self):
+        return self.aresult().__await__()
+
+    async def aresult(self, timeout=None):
         if self._should_fail:
             raise RuntimeError("Async generation intentionally failed")
-        return MediaOutput(
+        return VisualGenOutput(
+            request_id=self.request_id,
             image=self._image,
             video=self._video,
             audio=self._audio,
+            metrics=VisualGenMetrics(),
+        )
+
+    def result(self, timeout=None):
+        if self._should_fail:
+            raise RuntimeError("Async generation intentionally failed")
+        return VisualGenOutput(
+            request_id=self.request_id,
+            image=self._image,
+            video=self._video,
+            audio=self._audio,
+            metrics=VisualGenMetrics(),
         )
 
 
@@ -249,20 +279,20 @@ def _clear_video_store():
 def _mock_video_encoding():
     """Mock video encoding to avoid ffmpeg dependency in unit tests.
 
-    Replaces MediaStorage._save_encoded_video with a stub that writes a small
-    dummy file so FileResponse can serve it. Also mocks ffmpeg availability
-    so resolve_video_format always resolves to mp4.
+    Replaces ``tensorrt_llm.media.encoding._save_encoded_video`` with a stub
+    that writes a small dummy file so FileResponse can serve it; also mocks
+    ffmpeg availability so ``resolve_video_format`` always resolves to mp4.
     """
 
-    def _dummy_save_encoded_video(video, audio, output_path, frame_rate):
+    def _dummy_save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate=24000):
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
         with open(str(output_path), "wb") as f:
             f.write(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 32)
         return str(output_path)
 
     with (
-        patch.object(MediaStorage, "_save_encoded_video", staticmethod(_dummy_save_encoded_video)),
-        patch("tensorrt_llm.serve.media_storage._check_ffmpeg_available", return_value=True),
+        patch("tensorrt_llm.media.encoding._save_encoded_video", _dummy_save_encoded_video),
+        patch("tensorrt_llm.media.encoding._check_ffmpeg_available", return_value=True),
     ):
         yield
 
@@ -363,7 +393,7 @@ class TestImageGeneration:
         assert resp.status_code == 400
 
     def test_image_generation_null_output(self, tmp_path):
-        """Generator returns MediaOutput with image=None."""
+        """Generator returns VisualGenOutput with image=None."""
         gen = MockVisualGen(image_output=None)
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         client = _create_server(gen)
@@ -412,11 +442,10 @@ class TestImageGeneration:
     def test_image_generation_b64_no_save_image_no_disk_write(self, image_client, tmp_path):
         """Regression guard for NVBug 6064029.
 
-        The b64_json hot path must not call MediaStorage.save_image(),
-        which caused a redundant PNG encode plus an unnecessary disk
-        write before fix #12903.
+        The b64_json hot path must not call ``save_image()``, which caused a
+        redundant PNG encode plus an unnecessary disk write before fix #12903.
         """
-        with patch.object(MediaStorage, "save_image") as mock_save:
+        with patch("tensorrt_llm.media.encoding.save_image") as mock_save:
             resp = image_client.post(
                 "/v1/images/generations",
                 json={
@@ -437,12 +466,13 @@ class TestImageGeneration:
         the first."""
         # Use deterministic distinct images (all-zeros vs all-255) so
         # we can verify per-image output mapping, not just call counts.
+        from tensorrt_llm.media.encoding import image_to_bytes
+
         img0 = torch.zeros((64, 64, 3), dtype=torch.uint8)
         img1 = torch.full((64, 64, 3), 255, dtype=torch.uint8)
         batch = torch.stack([img0, img1])  # (2, H, W, C)
         expected_b64 = [
-            base64.b64encode(MediaStorage.convert_image_to_bytes(img)).decode("utf-8")
-            for img in (img0, img1)
+            base64.b64encode(image_to_bytes(img)).decode("utf-8") for img in (img0, img1)
         ]
 
         gen = MockVisualGen(image_output=batch)
@@ -450,12 +480,11 @@ class TestImageGeneration:
         try:
             client = _create_server(gen)
             with (
-                patch.object(
-                    MediaStorage,
-                    "convert_image_to_bytes",
-                    wraps=MediaStorage.convert_image_to_bytes,
+                patch(
+                    "tensorrt_llm.serve.openai_server.image_to_bytes",
+                    wraps=image_to_bytes,
                 ) as mock_cvt,
-                patch.object(MediaStorage, "save_image") as mock_save,
+                patch("tensorrt_llm.media.encoding.save_image") as mock_save,
             ):
                 resp = client.post(
                     "/v1/images/generations",
@@ -483,7 +512,16 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    def test_basic_image_edit(self, image_client):
+    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+
+    No in-tree pipeline implements image editing: Flux/Flux2 are
+    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+    video, not edited images. Restore the full happy-path coverage when an
+    edit-capable pipeline lands.
+    """
+
+    def test_image_edit_returns_not_implemented(self, image_client):
+        """Valid request body still short-circuits to 501 NotImplemented."""
         b64_img = _b64_white_png_1x1()
         resp = image_client.post(
             "/v1/images/edits",
@@ -493,85 +531,14 @@ class TestImageEdit:
                 "num_inference_steps": 10,
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "data" in data
-        assert len(data["data"]) >= 1
-        assert data["data"][0]["b64_json"] is not None
-
-    def test_image_edit_with_list_images(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": [b64_img, b64_img],
-                "prompt": "Merge them",
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 200
-
-    def test_image_edit_with_mask(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        b64_mask = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Remove object",
-                "mask": b64_mask,
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 200
-
-        # Verify image + mask were base64-decoded and forwarded.
-        params = image_client.mock_gen.last_params
-        expected_bytes = base64.b64decode(b64_img)
-        assert params.image == [expected_bytes]
-        assert params.mask == base64.b64decode(b64_mask)
-        assert params.num_inference_steps == 10
-
-    def test_image_edit_with_optional_params(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Enhance colors",
-                "size": "128x128",
-                "guidance_scale": 8.0,
-                "num_inference_steps": 15,
-                "seed": 42,
-                "negative_prompt": "dark",
-            },
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["size"] == "128x128"
-
-        params = image_client.mock_gen.last_params
-        assert params.width == 128
-        assert params.height == 128
-        assert params.guidance_scale == 8.0
-        assert params.num_inference_steps == 15
-        assert params.negative_prompt == "dark"
-        assert params.image == [base64.b64decode(b64_img)]
-
-    def test_image_edit_failure(self, failing_client):
-        b64_img = _b64_white_png_1x1()
-        resp = failing_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Edit this",
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 500
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body.get("type") == "NotImplementedError"
+        assert "not supported" in body.get("message", "").lower()
 
     def test_missing_image_for_edit(self, image_client):
-        """Missing required field → RequestValidationError → custom handler → 400."""
+        """Missing required field is rejected by FastAPI request validation
+        (400) before the 501 short-circuit, so this contract is unchanged."""
         resp = image_client.post(
             "/v1/images/edits",
             json={
@@ -579,24 +546,6 @@ class TestImageEdit:
             },
         )
         assert resp.status_code == 400
-
-    def test_image_edit_b64_no_save_image(self, image_client, tmp_path):
-        """NVBug 6064029: /v1/images/edits had the same redundant
-        save_image() call on the b64 path. The fix removed it entirely
-        (the edit endpoint has no url branch)."""
-        b64_img = _b64_white_png_1x1()
-        with patch.object(MediaStorage, "save_image") as mock_save:
-            resp = image_client.post(
-                "/v1/images/edits",
-                json={
-                    "image": b64_img,
-                    "prompt": "Make it blue",
-                    "num_inference_steps": 10,
-                },
-            )
-        assert resp.status_code == 200
-        mock_save.assert_not_called()
-        assert list(tmp_path.glob("*.png")) == []
 
 
 # =========================================================================
@@ -734,10 +683,10 @@ class TestVideoGenerationSync:
             },
             headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 500
 
     def test_sync_video_null_output(self, tmp_path):
-        """Generator returns MediaOutput with video=None."""
+        """Generator returns VisualGenOutput with video=None."""
         gen = MockVisualGen(video_output=None)
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         client = _create_server(gen)

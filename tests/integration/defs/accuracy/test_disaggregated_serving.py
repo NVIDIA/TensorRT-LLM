@@ -1059,11 +1059,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
             gen_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1209,11 +1209,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
             gen_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
         disaggregated_server_config = {
             "hostname": "localhost",
