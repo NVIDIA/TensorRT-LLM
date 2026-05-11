@@ -569,6 +569,14 @@ class TestPiecewiseCapturedGraphOutputHandling:
 class TestPiecewiseCapturedGraphStaticInputBuffers:
     """Tests for static kwarg buffers used by piecewise capture."""
 
+    @staticmethod
+    def _add_static_runner_with_inputs(pcg, *input_names):
+        graph = Graph()
+        placeholders = [graph.placeholder(name) for name in input_names]
+        graph.output(placeholders[0])
+        submodule = GraphModule(nn.Module(), graph)
+        pcg._static_runners[0] = ADPiecewiseRunner(submodule)
+
     @pytest.mark.parametrize(
         ("buf_shape", "src_shape", "dyn_dim"),
         [
@@ -593,6 +601,7 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
 
     def test_allocate_static_input_buffers_handles_static_shape_unstable_kwarg(self):
         pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        self._add_static_runner_with_inputs(pcg, "input_ids")
 
         def get_args_kwargs(_):
             return (), {"input_ids": torch.arange(8, dtype=torch.float32)}
@@ -611,6 +620,41 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
         assert copied.data_ptr() == static_buffer.data_ptr()
         assert copied is static_buffer
         assert torch.equal(copied, src)
+
+    def test_allocate_static_input_buffers_skips_dynamic_only_kwargs(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        self._add_static_runner_with_inputs(pcg, "inputs_embeds")
+
+        def get_args_kwargs(num_tokens):
+            return (), {
+                "inputs_embeds": torch.ones((1, num_tokens, 4), dtype=torch.float32),
+                "mm_item_cu_seqlen": torch.arange(2, dtype=torch.int32),
+                "mm_special_offsets_cu_seqlen": torch.arange(2, dtype=torch.int32),
+            }
+
+        pcg._allocate_static_input_buffers(get_args_kwargs)
+
+        assert set(pcg._static_input_buffers) == {"inputs_embeds"}
+
+        inputs_embeds = torch.zeros((1, 3, 4), dtype=torch.float32)
+        mm_item_cu_seqlen = torch.arange(25, dtype=torch.int32)
+        mm_special_offsets_cu_seqlen = torch.arange(25, dtype=torch.int32)
+        kwargs = {
+            "inputs_embeds": inputs_embeds,
+            "mm_item_cu_seqlen": mm_item_cu_seqlen,
+            "mm_special_offsets_cu_seqlen": mm_special_offsets_cu_seqlen,
+        }
+
+        pcg._copy_to_static_buffers(kwargs)
+
+        copied_embeds = kwargs["inputs_embeds"]
+        assert copied_embeds.shape == inputs_embeds.shape
+        assert copied_embeds.data_ptr() == pcg._static_input_buffers["inputs_embeds"][0].data_ptr()
+        assert torch.equal(copied_embeds, inputs_embeds)
+        assert kwargs["mm_item_cu_seqlen"] is mm_item_cu_seqlen
+        assert kwargs["mm_special_offsets_cu_seqlen"] is mm_special_offsets_cu_seqlen
+        assert kwargs["mm_item_cu_seqlen"].shape == torch.Size([25])
+        assert kwargs["mm_special_offsets_cu_seqlen"].shape == torch.Size([25])
 
 
 # ============================================================================

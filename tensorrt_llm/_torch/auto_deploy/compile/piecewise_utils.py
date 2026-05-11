@@ -60,6 +60,7 @@ _CACHED_DELTA_OPS = [
 _METADATA_PREP_OPS = [
     "auto_deploy::flashinfer_attention_prepare_metadata",
     "auto_deploy::flashinfer_mla_prepare_metadata",
+    "auto_deploy::gemma4_prepare_multimodal_mask",
     "auto_deploy::triton_paged_prepare_metadata",
     "auto_deploy::mamba_ssm_prepare_metadata",
 ]

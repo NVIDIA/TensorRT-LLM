@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +32,7 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import (
     _get_all_dynamic_op_names,
     _submod_has_stream_switch,
     is_dynamic_cached_op,
+    is_metadata_prep,
     needs_out_buffer,
     split_graph_at_dynamic_ops,
     submod_has_cuda_ops,
@@ -187,6 +188,20 @@ class TestIsDynamicCachedOp:
         target = _FakeOpOverload("auto_deploy::flashinfer_attention_prepare_metadata")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+
+    def test_gemma4_prepare_multimodal_mask_is_metadata_prep(self):
+        target = _FakeOpOverload("auto_deploy::gemma4_prepare_multimodal_mask")
+        node = _make_mock_node("call_function", target=target)
+        assert is_dynamic_cached_op(node) is True
+
+        graph = Graph()
+        x = graph.placeholder("x")
+        mask = graph.create_node("call_function", target, args=(x,), name="gemma4_mask")
+        graph.output(mask)
+        gm = GraphModule(nn.Module(), graph)
+
+        assert is_metadata_prep(gm) is True
+        assert needs_out_buffer(gm) is False
 
     def test_known_logits_gather_op_returns_true(self):
         target = _FakeOpOverload("auto_deploy::gather_tokens")

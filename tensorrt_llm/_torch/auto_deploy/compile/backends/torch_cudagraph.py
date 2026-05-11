@@ -574,23 +574,41 @@ class PiecewiseCapturedGraph(nn.Module):
             f"Cannot pre-allocate out= buffers — downstream static runners require stable addresses."
         )
 
+    def _static_runner_input_names(self) -> Set[str]:
+        """Return model-level input names consumed by captured static runners."""
+        names: Set[str] = set()
+        for runner in self._static_runners.values():
+            graph = getattr(runner.submodule, "graph", None)
+            if graph is None:
+                continue
+            for node in graph.nodes:
+                if node.op == "placeholder":
+                    names.add(str(node.target))
+        return names
+
     def _allocate_static_input_buffers(
         self,
         get_args_kwargs: Callable[[int], Any],
     ) -> None:
-        """Allocate static buffers for kwargs whose addresses change between calls.
+        """Allocate static buffers for captured static-runner kwargs with unstable addresses.
 
         Calls `get_args_kwargs` twice with the largest bucket to check address
         stability (data_ptr), and once with a different size to detect the
-        dynamic dimension by shape comparison.  Any kwarg with unstable
-        addresses gets a pre-allocated static buffer.
+        dynamic dimension by shape comparison.  Only kwargs consumed by captured
+        static runners get pre-allocated static buffers.
         """
+        static_input_names = self._static_runner_input_names()
+        if not static_input_names:
+            return
+
         max_bucket = max(self.piecewise_num_tokens)
         _, kw1 = get_args_kwargs(max_bucket)
         _, kw2 = get_args_kwargs(max_bucket)
         _, kw_probe = get_args_kwargs(max(1, max_bucket - 1))
 
         for key in kw1:
+            if key not in static_input_names:
+                continue
             v1, v2 = kw1.get(key), kw2.get(key)
             if (
                 isinstance(v1, torch.Tensor)
