@@ -102,6 +102,16 @@ def _is_perf_stem(stem: str) -> bool:
     return stem == "l0_perf" or "perf_sanity" in stem
 
 
+def _diff_has_deletions(diff: str) -> bool:
+    """True if any `-` content line (not the `---` file header) appears."""
+    for line in diff.splitlines():
+        if not line or line.startswith(("+++", "---", "@@")):
+            continue
+        if line.startswith("-"):
+            return True
+    return False
+
+
 def _yaml_top_keys_for_lines(content: str, line_numbers: set[int]) -> set[str]:
     """Return the set of top-level YAML keys whose section contains any line in `line_numbers`.
 
@@ -169,8 +179,18 @@ class TestsDefRule(Rule):
         `find_match_for_path`'s lineage walk match every parametrization
         of those classes. Falls back to `[yaml_path]` (→ dir walk-up to
         `accuracy/`) when refinement isn't possible.
+
+        Refinement is only sound when every changed line has a post-
+        image position whose top-level key can be read directly. A `-`
+        line has no post-image position; `iter_diff_post_line_numbers`
+        anchors it to the next surviving line, which may belong to a
+        different model section (e.g. deleting `ModelA:` and its body
+        attributes those `-` lines to the start of `ModelB:`). Any
+        deletion therefore triggers fallback.
         """
         if not diff:
+            return [yaml_path]
+        if _diff_has_deletions(diff):
             return [yaml_path]
         line_numbers = iter_diff_post_line_numbers(diff)
         if not line_numbers:
