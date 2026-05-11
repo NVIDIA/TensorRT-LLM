@@ -549,14 +549,28 @@ class MoeLoadBalancerConfig(StrictBaseModel):
             self, layer_idx: int) -> Optional[List[int]]:
         """
         Retrieves the initial global assignments for a specific layer.
+
+        Returns None when no assignments file was provided, or when the
+        provided file does not contain an entry for ``layer_idx``. The
+        missing-layer case is treated as advisory (warn and fall back to
+        auto-derived assignments) instead of fatal, because offline EPLB
+        dumps are typically produced from a base-model trace and do not
+        cover dynamically added layers such as MTP / speculative-decoding
+        decoder layers (e.g. ``layer_idx == num_hidden_layers``).
         """
         if self.initial_global_assignments is None:
             return None
 
         if layer_idx not in self.initial_global_assignments:
-            raise KeyError(
-                f"layer_idx {layer_idx} not found in `initial_global_assignments`."
-            )
+            logger.warning(
+                f"layer_idx {layer_idx} not found in `initial_global_assignments` "
+                f"(file covers layers "
+                f"{min(self.initial_global_assignments)}.."
+                f"{max(self.initial_global_assignments)}); "
+                f"falling back to auto-derived assignments for this layer. "
+                f"This is expected for MTP / speculative-decoding layers "
+                f"appended after the base model.")
+            return None
 
         assignments = self.initial_global_assignments[layer_idx]
 

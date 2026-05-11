@@ -34,7 +34,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
-                                          LookaheadDecodingConfig, MoeConfig,
+                                          LookaheadDecodingConfig,
+                                          MoeLoadBalancerConfig, MoeConfig,
                                           PeftCacheConfig, PybindMirror,
                                           RayPlacementConfig, SleepConfig,
                                           SpeculativeConfig, StrictBaseModel,
@@ -774,6 +775,33 @@ class TestTorchLlmArgs:
         with pytest.raises(ValueError):
             args = TorchLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
+
+    @print_traceback_on_error
+    def test_moe_load_balancer_missing_layer_returns_none(self):
+        # `initial_global_assignments` files are usually dumped from a
+        # base-model trace and do not contain entries for dynamically
+        # appended layers (MTP, speculative-decoding decoder layers).
+        # `get_layer_initial_global_assignments` should warn and return None
+        # for those layers instead of raising KeyError, so that callers can
+        # fall back to auto-derived assignments.
+        num_slots = 4
+        cfg = MoeLoadBalancerConfig(
+            num_slots=num_slots,
+            initial_global_assignments={
+                0: [0, 1, 2, 3],
+                1: [3, 2, 1, 0],
+            },
+        )
+        cfg.setup(ep_rank=0, ep_size=1)
+        # Present layer: returns the recorded list.
+        assert cfg.get_layer_initial_global_assignments(0) == [0, 1, 2, 3]
+        # Missing layer (e.g. MTP at layer_idx == num_hidden_layers):
+        # returns None instead of raising KeyError.
+        assert cfg.get_layer_initial_global_assignments(99) is None
+        # No file at all: returns None for any layer.
+        cfg_none = MoeLoadBalancerConfig(num_slots=num_slots)
+        cfg_none.setup(ep_rank=0, ep_size=1)
+        assert cfg_none.get_layer_initial_global_assignments(0) is None
 
     def test_speculative_model_alias(self):
         spec_config = EagleDecodingConfig(
