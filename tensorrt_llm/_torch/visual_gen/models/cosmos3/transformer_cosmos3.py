@@ -352,8 +352,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             hidden_size=hidden_size,
             num_attention_heads=model_config.pretrained_config.num_attention_heads,
             num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
-            head_dim=model_config.pretrained_config.hidden_size
-            // model_config.pretrained_config.num_attention_heads,
+            head_dim=model_config.pretrained_config.head_dim,
             model_config=model_config,
             layer_idx=layer_idx,
         )
@@ -415,8 +414,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             hidden_size=hidden_size,
             num_attention_heads=model_config.pretrained_config.num_attention_heads,
             num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
-            head_dim=model_config.pretrained_config.hidden_size
-            // model_config.pretrained_config.num_attention_heads,
+            head_dim=model_config.pretrained_config.head_dim,
             model_config=model_config,
             layer_idx=layer_idx,
         )
@@ -499,10 +497,7 @@ def _compute_default_rope_parameters(
     """
     base = model_config.pretrained_config.rope_theta
     partial_rotary_factor = 1
-    head_dim = (
-        model_config.pretrained_config.hidden_size
-        // model_config.pretrained_config.num_attention_heads
-    )
+    head_dim = model_config.pretrained_config.head_dim
     dim = int(head_dim * partial_rotary_factor)
 
     attention_factor = 1.0  # Unused in this type of RoPE

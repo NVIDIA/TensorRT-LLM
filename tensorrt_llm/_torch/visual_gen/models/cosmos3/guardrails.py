@@ -180,9 +180,18 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
         from PIL import Image
         from transformers import SiglipModel, SiglipProcessor
 
-        siglip_id = "google/siglip-so400m-patch14-384"
-        siglip_model = SiglipModel.from_pretrained(siglip_id).to("cuda", dtype=torch.float32).eval()
-        siglip_processor = SiglipProcessor.from_pretrained(siglip_id)
+        siglip_dir = os.path.join(
+            guardrail_ckpt_dir,
+            "video_content_safety_filter",
+            "models--google--siglip-so400m-patch14-384/snapshots/9fdffc58afc957d1a03a25b10dba0329ab15c2a3",
+        )
+        if not os.path.exists(siglip_dir):
+            raise FileNotFoundError(siglip_dir)
+
+        siglip_model = (
+            SiglipModel.from_pretrained(siglip_dir).to("cuda", dtype=torch.float32).eval()
+        )
+        siglip_processor = SiglipProcessor.from_pretrained(siglip_dir)
 
         classifier = SafetyClassifier(input_size=1152, num_classes=7)
         ckpt_path = os.path.join(

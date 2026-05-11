@@ -93,7 +93,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             and PipelineComponent.TEXT_GUARDRAIL not in skip_components
             and PipelineComponent.VIDEO_GUARDRAIL not in skip_components
         ):
-            guardrail_ckpt_dir = download_guardrail_checkpoint()
+            if self.model_config.extra_attrs.get("guardrail_checkpoint_dir", None) is not None:
+                logger.info(
+                    f"Loading guardrails from {self.model_config.extra_attrs['guardrail_checkpoint_dir']}"
+                )
+                guardrail_ckpt_dir = self.model_config.extra_attrs["guardrail_checkpoint_dir"]
+            else:
+                guardrail_ckpt_dir = download_guardrail_checkpoint()
             self.text_guardrail = build_text_guardrail(guardrail_ckpt_dir)
             self.video_guardrail = build_video_guardrail(guardrail_ckpt_dir)
 
