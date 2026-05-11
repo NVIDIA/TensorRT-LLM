@@ -107,6 +107,10 @@ def _register_fake():
           trigger_completion_at_end):
         return [torch.empty_like(q), torch.empty_like(k)]
 
+    @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
+    def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
+        return torch.empty_like(q)
+
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
         if sizes is None:
