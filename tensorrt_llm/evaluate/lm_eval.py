@@ -134,8 +134,8 @@ class LmEvalWrapper(TemplateLM):
         else:
             sampling_params = copy.deepcopy(self.sampling_params)
 
-        # If sampling_override is set, CLI-provided temperature / top_k / top_p
-        # win over gen_kwargs.  We still respect gen_kwargs' ``until`` stop
+        # If sampling_override is set, CLI-provided temperature / top_p win
+        # over gen_kwargs.  We still respect gen_kwargs' ``until`` stop
         # tokens and ``max_gen_toks`` (harness computes them from task config).
         override_keys = {"temperature", "top_p"
                          } if self.sampling_override else set()
