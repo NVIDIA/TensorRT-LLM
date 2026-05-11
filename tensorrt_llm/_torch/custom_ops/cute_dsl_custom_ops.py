@@ -17,10 +17,11 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import (deep_gemm_gen_tuning_buckets, fp4_scale_infer_shape,
-                     fp8_scale_infer_shape,
+from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+                     fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2, next_positive_power_of_2)
+                     is_gated_activation, last_positive_power_of_2,
+                     next_positive_power_of_2)
 
 try:
     from cuda.bindings import driver as cuda
@@ -251,7 +252,7 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
     def inputs_pre_hook(self, inputs: List) -> List:
-        """Pre-hook for gather-based SwiGLU fusion kernel.
+        """Pre-hook for gather-based activation fusion kernel.
 
         Generates:
             - tile_idx_to_group_idx
@@ -325,8 +326,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
-    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import \
-        BlockScaledContiguousGatherGroupedGemmKernel
+    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
         Sm100BlockScaledContiguousGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import \
@@ -2680,7 +2681,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    device=input_scale.device)
         return output, output_scale
 
-    class Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+    class Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             TunableRunner):
         kernel_class = BlockScaledContiguousGatherGroupedGemmKernel
         kernel_cache = dict()
@@ -2696,14 +2697,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      scaling_vector_size: int = 16,
-                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
+                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+                     activation_type: ActivationType = ActivationType.Swiglu):
             """Initialize the runner.
 
             Args:
                 b_tensor_l_sizes: Tuple of L sizes for each B tensor in multi-B mode.
                     None for single-B mode. Used for kernel cache key.
+                activation_type: ``ActivationType`` for the fused epilogue. Only
+                    ``Swiglu`` (gated) and ``Relu2`` (non-gated) are supported.
             """
             super().__init__()
+            self.activation_type = validate_activation_type(activation_type)
+            self.is_gated = is_gated_activation(self.activation_type)
             self.num_experts = num_experts
             self.top_k = top_k
             self.num_local_experts = num_local_experts
@@ -2735,6 +2741,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.scaling_vector_size,
                 self.b_tensor_l_sizes,
+                self.activation_type,
             )
 
         def get_valid_tactics(
@@ -2858,11 +2865,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b0.size(1)
             sum(bi.size(0) for bi in b_list)
             scale_k = k // self.scaling_vector_size
-            interm_size = n // 2
+            interm_size = n // 2 if self.is_gated else n
 
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
-            assert n % (self.scaling_vector_size * 4 * 2) == 0
+            if self.is_gated:
+                assert n % (self.scaling_vector_size * 4 * 2) == 0
+            else:
+                assert n % (self.scaling_vector_size * 4) == 0
             assert b0.size(2) * 2 == k
             assert a_sf.size(0) == orig_m
             assert a_sf.size(1) == scale_k
@@ -2945,7 +2955,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         b_tensor_l_sizes)
+                         b_tensor_l_sizes, self.activation_type)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -2956,6 +2966,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     topk=self.top_k,
                     raster_along_m=raster_along_m,
                     b_tensor_l_sizes=b_tensor_l_sizes,
+                    activation_type=self.activation_type,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -2987,6 +2998,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     scaling_vector_size=self.scaling_vector_size,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
+                    activation_type=self.activation_type,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
@@ -3016,10 +3028,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c, c_sf
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
         mutates_args=(),
         device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
         input_scale: torch.Tensor,
@@ -3036,21 +3048,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (multi-B list interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (multi-B list interface).
+
+        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
+        (non-gated) epilogues; other ``ActivationType`` values raise an assertion.
 
         Args:
             weight: List of B tensors. Single-B mode: [b], multi-B mode: [b0, b1, ...].
             weight_scale: List of scale tensors, matching weight.
             alpha: List of alpha tensors, matching weight.
+            activation_type: ``ActivationType`` value selecting the fused activation.
         """
         tuner = AutoTuner.get()
 
         b_tensor_l_sizes = tuple(w.size(0) for w in weight)
 
-        runner = Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size, b_tensor_l_sizes)
+            tile_size, scaling_vector_size, b_tensor_l_sizes, activation_type)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -3058,7 +3075,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ]
 
         _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
             [runner],
             runner.get_tuning_config(),
             inputs,
@@ -3069,7 +3086,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b")
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b"
+    )
     def _fake_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
@@ -3087,10 +3105,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight[0].size(1)
-        interm_size = n // 2
+        is_gated = is_gated_activation(ActivationType(activation_type))
+        interm_size = n // 2 if is_gated else n
         output = torch.empty(m,
                              interm_size // 2,
                              dtype=input.dtype,
@@ -3101,10 +3121,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output, output_scale
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell",
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
         mutates_args=(),
         device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
         input_scale: torch.Tensor,
@@ -3121,13 +3141,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (single-B tensor interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (single-B tensor interface).
 
         Thin wrapper: wraps single tensors into lists and calls
-        cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b.
+        cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b.
+        ``activation_type`` must be ``ActivationType.Swiglu`` or ``ActivationType.Relu2``.
         """
-        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
             input,
             [weight],
             input_scale,
@@ -3144,10 +3166,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             local_expert_offset,
             tile_size,
             scaling_vector_size,
+            activation_type,
         )
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell")
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell")
     def _fake_single_b(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -3165,10 +3188,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
-        interm_size = n // 2
+        is_gated = is_gated_activation(ActivationType(activation_type))
+        interm_size = n // 2 if is_gated else n
         output = torch.empty(m,
                              interm_size // 2,
                              dtype=input.dtype,
@@ -5924,6 +5949,270 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
             f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
             f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")
+
+    # ------------------------------------------------------------------ #
+    #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
+    # ------------------------------------------------------------------ #
+    from ..cute_dsl_kernels.blackwell.paged_mqa_logits import FP8MQALogitsKernel
+
+    def _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
+                                           block_table, schedule_meta,
+                                           epi_dtype, acc_dtype, output_dtype):
+        errs = []
+        if q.dtype != torch.float8_e4m3fn:
+            errs.append(f"q must be float8_e4m3fn, got {q.dtype}")
+        if kv_fused.dtype != torch.uint8:
+            errs.append(f"kv_fused must be uint8, got {kv_fused.dtype}")
+        # TODO: update to (torch.float32, torch.float16) once fp16 weights
+        # are validated end-to-end and the in-kernel .half() conversion is removed.
+        if weights.dtype != torch.float32:
+            errs.append(f"weights must be float32, got {weights.dtype}")
+        if context_lens.dtype != torch.int32:
+            errs.append(f"context_lens must be int32, got {context_lens.dtype}")
+        if block_table.dtype != torch.int32:
+            errs.append(f"block_table must be int32, got {block_table.dtype}")
+        if schedule_meta.dtype != torch.int32:
+            errs.append(
+                f"schedule_meta must be int32, got {schedule_meta.dtype}")
+        for name, dt in [("epi_dtype", epi_dtype), ("acc_dtype", acc_dtype),
+                         ("output_dtype", output_dtype)]:
+            if dt not in (torch.float16, torch.float32):
+                errs.append(f"{name} must be float16 or float32, got {dt}")
+        if errs:
+            raise ValueError("FP8 Paged MQA Logits dtype errors:\n  " +
+                             "\n  ".join(errs))
+
+    class CuteDSLPagedMQALogitsRunner:
+        """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
+
+        Caches compiled kernels keyed by static params
+        (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n, num_sms).
+        """
+
+        kernel_cache = dict()
+
+        @classmethod
+        def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
+                     next_n, num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
+                     output_dtype):
+            """Compile kernel using fake tensors + TVM FFI."""
+            key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
+                   num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
+                   output_dtype)
+            if key in cls.kernel_cache:
+                return
+
+            to_cutlass = _TORCH_TO_CUTLASS_DTYPE
+            N = next_n * num_heads
+            block_bytes = phys_block_kv * (head_dim + 4)
+
+            sym_num_phys_blocks = cute.sym_int()
+            sym_B = cute.sym_int()
+            max_ctx = cute.sym_int()
+            max_blocks_per_seq = cute.sym_int()
+            num_ctas = cute.sym_int()
+
+            kv_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
+                stride_order=(1, 0))
+
+            q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8,
+                                                           (N, head_dim, sym_B),
+                                                           stride_order=(1, 0,
+                                                                         2))
+
+            w_dtype = (cutlass.Float16
+                       if epi_dtype == torch.float16 else to_cutlass[epi_dtype])
+            w_fake = cute.runtime.make_fake_compact_tensor(w_dtype, (N, sym_B),
+                                                           stride_order=(0, 1))
+
+            logits_fake = cute.runtime.make_fake_tensor(
+                to_cutlass[output_dtype], (cute.sym_int(), max_ctx),
+                stride=(cute.sym_int64(), 1))
+
+            bt_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0))
+
+            cl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                            (sym_B, ),
+                                                            stride_order=(0, ))
+
+            sm_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                            (num_ctas, 2),
+                                                            stride_order=(1, 0))
+
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+
+            kernel = FP8MQALogitsKernel(
+                block_kv=compute_block_kv,
+                phys_block_kv=phys_block_kv,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                next_n=next_n,
+                num_sms=num_sms,
+                num_epi_subtiles=num_epi_subtiles,
+                epi_dtype=to_cutlass[epi_dtype],
+                acc_dtype=to_cutlass[acc_dtype],
+                output_dtype=to_cutlass[output_dtype],
+            )
+
+            compiled = cute.compile(
+                kernel,
+                kv_fake,
+                q_fake,
+                w_fake,
+                logits_fake,
+                bt_fake,
+                cl_fake,
+                sm_fake,
+                cutlass.Int32(1),
+                cutlass.Int32(1),
+                fake_stream,
+                options="--enable-tvm-ffi",
+            )
+            cls.kernel_cache[key] = compiled
+            logger.debug(f"[compile cute_dsl fp8_paged_mqa_logits] {key}"
+                         f" kv_stages={kernel.num_kv_stages}"
+                         f" umma_stages={kernel.num_umma_stages}")
+
+        @classmethod
+        def forward(
+            cls,
+            q: torch.Tensor,
+            kv_fused: torch.Tensor,
+            weights: torch.Tensor,
+            context_lens: torch.Tensor,
+            block_table: torch.Tensor,
+            schedule_meta: torch.Tensor,
+            max_context_len: int,
+            num_epi_subtiles: int = 1,
+            epi_dtype: torch.dtype = torch.float32,
+            acc_dtype: torch.dtype = torch.float32,
+            output_dtype: torch.dtype = torch.float32,
+        ) -> torch.Tensor:
+            """Execute FP8 paged MQA logits kernel.
+
+            Args:
+                q: [B, next_n, H, D] FP8
+                kv_fused: [num_blocks, phys_block_kv, 1, D+4] uint8
+                weights: [B*next_n, H] float32
+                context_lens: [B] int32
+                block_table: [B, max_blocks] int32
+                schedule_meta: [num_sms+1, 2] int32
+                max_context_len: int
+                num_epi_subtiles: epilogue sub-tile count (1, 2, or 4)
+                epi_dtype: epilogue compute dtype
+                acc_dtype: MMA accumulator dtype
+                output_dtype: output logits dtype
+            Returns:
+                logits: [B*next_n, max_context_len] output_dtype
+            """
+            B, next_n, H, D = q.shape
+            N = next_n * H
+            phys_block_kv = kv_fused.shape[1]
+            compute_block_kv = 128
+            num_phys_blocks = kv_fused.shape[0]
+            num_sms = _get_num_sms()
+
+            # Reshape Q: [B, next_n, H, D] -> [B, N, D] -> [N, D, B]
+            q_3d = q.reshape(B, N, D).permute(1, 2, 0)
+
+            # Reshape weights: [B*next_n, H] -> [B, N] -> [N, B]
+            if epi_dtype == torch.float16:
+                # TODO: move type conversion to weight loading
+                w_2d = weights.reshape(B, N).half().t()
+            else:
+                w_2d = weights.reshape(B, N).t()
+
+            # Flatten fused KV to [num_phys_blocks, block_bytes]
+            kv_flat = kv_fused.reshape(num_phys_blocks, -1)
+
+            # Allocate output with alignment padding
+            SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2
+            aligned_max_ctx = (
+                (max_context_len + SPLIT_KV - 1) // SPLIT_KV) * SPLIT_KV
+            logits = torch.empty(
+                (B * next_n, aligned_max_ctx),
+                device=q.device,
+                dtype=output_dtype,
+            )
+            logits = logits[:, :max_context_len]
+
+            # Compile if needed (fake tensors, no real data required)
+            key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
+                   num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
+            if key not in cls.kernel_cache:
+                cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
+                             num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
+                             output_dtype)
+            compiled = cls.kernel_cache[key]
+
+            # FP8 q needs uint8 view to match compile-time dtype
+            q_for_ffi = (q_3d.view(torch.uint8) if q_3d.dtype
+                         in (torch.float8_e4m3fn, torch.float8_e5m2) else q_3d)
+
+            # TVM FFI: pass raw tensors, no dlpack/stream needed
+            compiled(kv_flat, q_for_ffi, w_2d, logits, block_table,
+                     context_lens, schedule_meta, num_phys_blocks, B)
+            return logits
+
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_fp8_paged_mqa_logits(
+        q: torch.Tensor,
+        kv_fused: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        schedule_meta: torch.Tensor,
+        max_context_len: int,
+        num_epi_subtiles: int = 1,
+        epi_dtype: torch.dtype = torch.float32,
+        acc_dtype: torch.dtype = torch.float32,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL FP8 Paged MQA Logits only supports SM 100 family.")
+        _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
+                                           block_table, schedule_meta,
+                                           epi_dtype, acc_dtype, output_dtype)
+        return CuteDSLPagedMQALogitsRunner.forward(
+            q,
+            kv_fused,
+            weights,
+            context_lens,
+            block_table,
+            schedule_meta,
+            max_context_len,
+            num_epi_subtiles=num_epi_subtiles,
+            epi_dtype=epi_dtype,
+            acc_dtype=acc_dtype,
+            output_dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_paged_mqa_logits")
+    def _(
+        q: torch.Tensor,
+        kv_fused: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        schedule_meta: torch.Tensor,
+        max_context_len: int,
+        num_epi_subtiles: int = 1,
+        epi_dtype: torch.dtype = torch.float32,
+        acc_dtype: torch.dtype = torch.float32,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        B = q.shape[0]
+        next_n = q.shape[1]
+        return torch.empty(B * next_n,
+                           max_context_len,
+                           dtype=output_dtype,
+                           device=q.device)
 
     # ======================================================================
     # BF16 Dense Persistent BMM (CuTe DSL) for Blackwell

@@ -18,6 +18,18 @@ from ..modules.mlp import MLP
 from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_utils import _load_weights_impl, register_auto_model
 
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import (get_parameter_device,
+                                             get_parameter_dtype)
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
+
+    def get_parameter_dtype(module):
+        return next(module.parameters()).dtype
+
 
 class CLIPAttention(Attention):
 

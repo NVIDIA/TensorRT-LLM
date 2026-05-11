@@ -17,8 +17,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     get_unique_rid,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
+    CacheReuseAdapter,
+    create_cache_reuse_adapter,
+)
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
-from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -26,7 +29,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
     PythonMambaCacheManager,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
@@ -64,6 +67,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
         self._check_compatible()
+        self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
@@ -92,7 +96,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
-        self._is_v2_manager = isinstance(kv_cache_manager, KVCacheManagerV2)
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -148,35 +151,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
 
-    def _get_block_ids(self, req: LlmRequest, group_idx: int, lg) -> np.ndarray:
-        if self._is_v2_manager:
-            kv_cache_map = getattr(self._kv_cache_manager, "kv_cache_map")
-            # Returns Iterator[int], consume directly into ndarray
-            return np.fromiter(
-                kv_cache_map[req.py_request_id].get_aggregated_page_indices(
-                    group_idx, valid_only=True
-                ),
-                dtype=np.int64,
-            )
-        else:
-            first_layer = get_global_layer_ids(lg)[0]
-            return np.asarray(
-                self._kv_cache_manager.get_batch_cache_indices(
-                    [req.py_request_id], layer_idx=first_layer
-                )[0],
-                dtype=np.int64,
-            )
-
     def _create_kv_slice(
         self,
         req: LlmRequest,
         token_range: Optional[TokenRange] = None,
         is_last_slice: bool = True,
     ) -> KVSlice:
-        tpb = self._kv_cache_manager.tokens_per_block
+        adapter = self._reuse_adapter
+        tpb = adapter.tokens_per_block
 
-        if token_range is None and req.prompt_len > 0:
-            token_range = TokenRange(start=0, end=req.prompt_len)
+        is_gen_only = req.is_generation_only_request()
+        cached_tokens = adapter.get_cached_token_count(req) if is_gen_only else 0
+        num_cached_blocks = cached_tokens // tpb
+
+        if token_range is None and req.prompt_len > 0 and cached_tokens < req.prompt_len:
+            token_range = TokenRange(start=cached_tokens, end=req.prompt_len)
 
         groups = []
         assert self._page_table is not None
@@ -185,18 +174,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Mamba layer groups have no KV cache blocks; skip.
                 groups.append(np.array([], dtype=np.int64))
                 continue
-            block_ids = self._get_block_ids(req, idx, lg)
+            block_ids = adapter.get_block_ids(req, idx, lg)
 
-            # Filter to only window-relevant blocks for sliding window layer groups.
-            # Computes the expected number of non-stale blocks (using the same
-            # eviction formula as update_resources) and keeps only the tail.
-            # This works correctly regardless of whether update_resources has
-            # been called:
-            #   - Pre-eviction: all blocks present → trim to last N.
-            #   - Post-eviction (V2 valid_only=True): stale blocks already
-            #     removed → len == expected_valid, so the condition is false.
             window_size = lg.sliding_window_size
             if window_size is not None:
+                # Filter to only window-relevant blocks.
+                # Computes the expected number of non-stale blocks (using the same
+                # eviction formula as update_resources) and keeps only the tail.
+                # This works correctly regardless of whether update_resources has
+                # been called:
+                #   - Pre-eviction: all blocks present → trim to last N.
+                #   - Post-eviction (V2 valid_only=True): stale blocks already
+                #     removed → len == expected_valid, so the condition is false.
                 total_blocks = (req.prompt_len + tpb - 1) // tpb
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = total_blocks - stale_end
@@ -204,6 +193,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     block_ids = np.array([], dtype=np.int64)
                 elif block_ids.size > expected_valid:
                     block_ids = block_ids[-expected_valid:]
+
+                # For window layers, only skip blocks that fall within BOTH the
+                # cached prefix [0, num_cached_blocks) AND the valid window
+                # [stale_end, total_blocks).  Plain block_ids[num_cached_blocks:]
+                # is wrong here because the window-trimmed list starts at
+                # stale_end, not 0.
+                cached_in_window = max(0, num_cached_blocks - stale_end)
+                if cached_in_window >= block_ids.size:
+                    block_ids = np.array([], dtype=np.int64)
+                elif cached_in_window > 0:
+                    block_ids = block_ids[cached_in_window:]
+            else:
+                if num_cached_blocks > 0 and block_ids.size > num_cached_blocks:
+                    block_ids = block_ids[num_cached_blocks:]
 
             groups.append(block_ids)
 
@@ -635,6 +638,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"KvCacheTransceiverV2: _check_compatible: only support context parallelism is 1: "
                 f"cp_size: {self._mapping.cp_size}"
             )
+
+    def commit_blocks_for_reuse(self, req) -> None:
+        self._reuse_adapter.commit_blocks_for_reuse(req)
 
     def get_context_state(self):
         raise NotImplementedError("get_context_state is not implemented")

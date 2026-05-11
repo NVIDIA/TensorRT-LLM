@@ -5,13 +5,27 @@ from utils.util import check_accuracy
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import cute_dsl_nvfp4_grouped_gemm_ref
 from tensorrt_llm._torch.modules.fused_moe.quantization import interleave_linear_and_gate
-from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    is_gated_activation,
+    relu2,
+    swizzle_sf,
+    unswizzle_sf,
+)
 from tensorrt_llm._utils import get_sm_version
 
 
 def swiglu_ref(x: torch.Tensor) -> torch.Tensor:
     x, gate = x.chunk(2, dim=-1)
     return x * torch.nn.functional.silu(gate)
+
+
+def apply_activation_ref(x: torch.Tensor, activation_type: ActivationType) -> torch.Tensor:
+    if activation_type == ActivationType.Swiglu:
+        return swiglu_ref(x)
+    if activation_type == ActivationType.Relu2:
+        return relu2(x)
+    raise ValueError(f"Unsupported activation_type: {activation_type}")
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
@@ -743,21 +757,32 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.Relu2],
+    ids=["swiglu", "relu2"],
+)
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
 @pytest.mark.parametrize("num_tokens", [128, 515, 1024, 8192])
-def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
-    num_tokens: int, top_k: int, ep_size: int, tile_size: int
+def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    tile_size: int,
+    activation_type: ActivationType,
 ):
-    """Test gather-based grouped GEMM with SwiGLU fusion.
+    """Test gather-based grouped GEMM with fused activation.
 
     This test validates the gather kernel which:
     1. Uses LDGSTS for A/SFA loading with permuted_idx_to_expanded_idx
-    2. Performs GEMM with interleaved weights
-    3. Applies SwiGLU activation fusion
+    2. Performs GEMM with (interleaved for gated) weights
+    3. Applies the fused activation (SwiGLU for gated, Relu2 for non-gated)
     4. Quantizes output to FP4 with scale factor generation
     """
+    is_gated = is_gated_activation(activation_type)
+    weight_n_multiplier = 2 if is_gated else 1
     sf_vec_size = 16
     hidden_size = 4096
     interm_size = 8192
@@ -799,7 +824,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     b = torch.randint(
         -5,
         5,
-        (num_local_experts, interm_size * 2, hidden_size),
+        (num_local_experts, interm_size * weight_n_multiplier, hidden_size),
         dtype=torch.int32,
         device="cuda",
     ).to(torch.bfloat16)
@@ -812,22 +837,32 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     a_sf_unswizzled = unswizzle_sf(a_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
     b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
     b = b.view(torch.float4_e2m1fn_x2)
-    b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
+    b_sf = b_sf.view(
+        num_local_experts, interm_size * weight_n_multiplier, hidden_size // sf_vec_size
+    )
     alpha = a_global_sf * b_global_sf
 
-    # Interleave weights for SwiGLU
-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
-        torch.float4_e2m1fn_x2
-    )
-    b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
-        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
-    )
-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
-    b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
-        num_local_experts, interm_size * 2, hidden_size // sf_vec_size
-    )
+    # Interleave weights for gated activations (SwiGLU); non-gated uses plain weights.
+    if is_gated:
+        b_kernel = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+            torch.float4_e2m1fn_x2
+        )
+        b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * weight_n_multiplier, hidden_size).view(
+            num_local_experts, interm_size * weight_n_multiplier, hidden_size // sf_vec_size
+        )
+        b_sf_unswizzled_interleaved = interleave_linear_and_gate(
+            b_sf_unswizzled, group_size=64, dim=1
+        )
+        b_sf_kernel = swizzle_sf(
+            b_sf_unswizzled_interleaved, interm_size * weight_n_multiplier, hidden_size
+        ).view(num_local_experts, interm_size * weight_n_multiplier, hidden_size // sf_vec_size)
+    else:
+        b_kernel = b
+        b_sf_kernel = b_sf.view(
+            num_local_experts, interm_size * weight_n_multiplier, hidden_size // sf_vec_size
+        )
 
-    # Compute reference: manually gather, compute GEMM, apply SwiGLU, then quantize
+    # Compute reference: manually gather, compute GEMM, apply fused activation, then quantize
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
@@ -864,16 +899,16 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = swiglu_ref(c_ref)
+    c_ref = apply_activation_ref(c_ref, activation_type)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call gather kernel (single-B via multi_b op with single-element lists)
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
         a,
-        [b_interleaved],
+        [b_kernel],
         a_sf_unswizzled,
-        [b_sf_interleaved],
+        [b_sf_kernel],
         [alpha],
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
@@ -886,6 +921,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
         local_expert_offset=0,
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
+        activation_type=activation_type,
     )
 
     # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
@@ -926,15 +962,15 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
                 num_local_experts // 2,
                 num_local_experts - num_local_experts // 2,
             )
-            b_interleaved_list = list(torch.split(b_interleaved, split_sizes, dim=0))
-            b_sf_interleaved_list = list(torch.split(b_sf_interleaved, split_sizes, dim=0))
+            b_kernel_list = list(torch.split(b_kernel, split_sizes, dim=0))
+            b_sf_kernel_list = list(torch.split(b_sf_kernel, split_sizes, dim=0))
             alpha_list = list(torch.split(alpha, split_sizes, dim=0))
             c_multi, c_sf_multi = (
-                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
                     a,
-                    b_interleaved_list,
+                    b_kernel_list,
                     a_sf_unswizzled,
-                    b_sf_interleaved_list,
+                    b_sf_kernel_list,
                     alpha_list,
                     tile_idx_to_group_idx,
                     tile_idx_to_mn_limit,
@@ -947,6 +983,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
                     local_expert_offset=0,
                     tile_size=tile_size,
                     scaling_vector_size=sf_vec_size,
+                    activation_type=activation_type,
                 )
             )
             c_multi_valid = c_multi[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
