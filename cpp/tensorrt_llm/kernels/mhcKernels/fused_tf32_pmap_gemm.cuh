@@ -628,7 +628,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
-    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1>
+    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kFuseNorm = false>
 __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     fused_allinone_tf32_pmap_gemm_atomic_impl(const uint32_t shape_m,
         const __grid_constant__ cute::TmaDescriptor tensor_map_residual,     // residual_prev, bf16
@@ -646,6 +646,12 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         float const* __restrict__ hc_base,       // [HC_MULT*(2+HC_MULT)]
         float* __restrict__ post_mix_out,        // [M, HC_MULT]
         float* __restrict__ comb_mix_out,        // [M, HC_MULT, HC_MULT]
+        // When kFuseNorm: layer_input_out receives the RMSNorm-normalized
+        // values: out[t,h] = bf16(li[t,h] * rsqrt(mean(li²)+norm_eps) * w[h]).
+        // norm_weight must be bf16 [HIDDEN]; norm_eps is the RMSNorm epsilon.
+        // When kFuseNorm is false, norm_weight/norm_eps are ignored.
+        __nv_bfloat16 const* __restrict__ norm_weight,
+        float norm_eps,
         float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, uint32_t sinkhorn_repeat)
 {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
@@ -1325,52 +1331,14 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         constexpr uint32_t H_VEC_END = (HIDDEN / H_STRIDE) * H_STRIDE;
         const uint32_t h_start = warp_in_team * WARP_SIZE_BF * BF16_VEC_LI + lane_bf * BF16_VEC_LI;
 
-#pragma unroll
-        for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
+        if constexpr (!kFuseNorm)
         {
-            // Issue all HC_MULT=4 residual_cur reads first so their L2 latency
-            // is hidden by the bf16→fp32 arithmetic that follows.  The compiler
-            // schedules the 4 independent __ldg's in parallel.
-            uint4 raws[HC_MULT];
 #pragma unroll
-            for (uint32_t j = 0; j < HC_MULT; ++j)
+            for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
             {
-                raws[j] = __ldg(reinterpret_cast<uint4 const*>(&rbase[j * HIDDEN + h]));
-            }
-            float acc_li[BF16_VEC_LI] = {};
-#pragma unroll
-            for (uint32_t j = 0; j < HC_MULT; ++j)
-            {
-                __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
-#pragma unroll
-                for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
-                {
-                    float2 f = __bfloat1622float2(pairs[v]);
-                    acc_li[2 * v + 0] += pm[j] * f.x;
-                    acc_li[2 * v + 1] += pm[j] * f.y;
-                }
-            }
-            uint4 out_raw;
-            __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
-#pragma unroll
-            for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
-                opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
-            *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
-        }
-
-        // Scalar-vec tail: hidden residue [H_VEC_END, HIDDEN) is shorter than a
-        // full team stride. Distribute leftover BF16_VEC_LI-sized chunks across
-        // the team's threads in lane-major order (skip threads whose chunk
-        // falls past HIDDEN). Each chunk is still a single uint4 LDG/STG, so
-        // tail throughput matches the main loop's per-thread bandwidth — the
-        // only loss is that some lanes/warps in the team idle.
-        if constexpr (H_VEC_END < HIDDEN)
-        {
-            constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
-            const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
-            if (my_chunk < TAIL_CHUNKS)
-            {
-                const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                // Issue all HC_MULT=4 residual_cur reads first so their L2 latency
+                // is hidden by the bf16→fp32 arithmetic that follows.  The compiler
+                // schedules the 4 independent __ldg's in parallel.
                 uint4 raws[HC_MULT];
 #pragma unroll
                 for (uint32_t j = 0; j < HC_MULT; ++j)
@@ -1396,6 +1364,220 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
                     opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
                 *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+            }
+
+            // Scalar-vec tail: hidden residue [H_VEC_END, HIDDEN) is shorter than a
+            // full team stride. Distribute leftover BF16_VEC_LI-sized chunks across
+            // the team's threads in lane-major order (skip threads whose chunk
+            // falls past HIDDEN). Each chunk is still a single uint4 LDG/STG, so
+            // tail throughput matches the main loop's per-thread bandwidth — the
+            // only loss is that some lanes/warps in the team idle.
+            if constexpr (H_VEC_END < HIDDEN)
+            {
+                constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
+                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                if (my_chunk < TAIL_CHUNKS)
+                {
+                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    uint4 raws[HC_MULT];
+#pragma unroll
+                    for (uint32_t j = 0; j < HC_MULT; ++j)
+                    {
+                        raws[j] = __ldg(reinterpret_cast<uint4 const*>(&rbase[j * HIDDEN + h]));
+                    }
+                    float acc_li[BF16_VEC_LI] = {};
+#pragma unroll
+                    for (uint32_t j = 0; j < HC_MULT; ++j)
+                    {
+                        __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
+#pragma unroll
+                        for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                        {
+                            float2 f = __bfloat1622float2(pairs[v]);
+                            acc_li[2 * v + 0] += pm[j] * f.x;
+                            acc_li[2 * v + 1] += pm[j] * f.y;
+                        }
+                    }
+                    uint4 out_raw;
+                    __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+                    for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                        opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
+                    *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+                }
+            }
+        }
+        else
+        {
+            // -----------------------------------------------------------------
+            // Fused RMSNorm path: layer_input[t,h] = bf16(li[t,h] * rsqrt(
+            //   mean(li²)+norm_eps) * norm_weight[h]).
+            //
+            // Pass 1: identical to the un-fused path — compute li per chunk
+            //   and STG to layer_input_out as bf16. The bf16 store lands in L2;
+            //   pass 2 re-reads from L2 (no extra HBM read in the steady case).
+            //   In parallel we accumulate per-thread `sum_sq_local`.
+            // Reduce: intra-warp __shfl_xor; cross-warp via SMEM + per-team
+            //   named PTX barrier when WARPS_PER_TOK > 1 (KS ≥ 16 instances).
+            //   Inactive teams `continue`'d above and never reach this barrier.
+            // Pass 2: re-LDG layer_input_out from L2, multiply by
+            //   rsqrt * norm_weight, STG normalized bf16 back to the same
+            //   address. Avoids the FMA recompute that doubling pass 1 would
+            //   require (Path D Phase 4 is already FMA-heavy).
+            //
+            // Saves the separate RMSNorm kernel launch + its HBM round-trip
+            // (~14 KB read + ~14 KB write per token) vs the un-fused path.
+            // -----------------------------------------------------------------
+            float sum_sq_local = 0.f;
+
+#pragma unroll
+            for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
+            {
+                uint4 raws[HC_MULT];
+#pragma unroll
+                for (uint32_t j = 0; j < HC_MULT; ++j)
+                    raws[j] = __ldg(reinterpret_cast<uint4 const*>(&rbase[j * HIDDEN + h]));
+                float acc_li[BF16_VEC_LI] = {};
+#pragma unroll
+                for (uint32_t j = 0; j < HC_MULT; ++j)
+                {
+                    __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
+#pragma unroll
+                    for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                    {
+                        float2 f = __bfloat1622float2(pairs[v]);
+                        acc_li[2 * v + 0] += pm[j] * f.x;
+                        acc_li[2 * v + 1] += pm[j] * f.y;
+                    }
+                }
+                // Round-to-bf16 *before* squaring so sum_sq matches the value
+                // we actually store (a separate RMSNorm kernel would also
+                // compute sum_sq from the bf16-rounded layer_input).
+                uint4 out_raw;
+                __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+                for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                    opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
+                *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+#pragma unroll
+                for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                {
+                    float2 b = __bfloat1622float2(opairs[v]);
+                    sum_sq_local += b.x * b.x + b.y * b.y;
+                }
+            }
+            if constexpr (H_VEC_END < HIDDEN)
+            {
+                constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
+                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                if (my_chunk < TAIL_CHUNKS)
+                {
+                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    uint4 raws[HC_MULT];
+#pragma unroll
+                    for (uint32_t j = 0; j < HC_MULT; ++j)
+                        raws[j] = __ldg(reinterpret_cast<uint4 const*>(&rbase[j * HIDDEN + h]));
+                    float acc_li[BF16_VEC_LI] = {};
+#pragma unroll
+                    for (uint32_t j = 0; j < HC_MULT; ++j)
+                    {
+                        __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
+#pragma unroll
+                        for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                        {
+                            float2 f = __bfloat1622float2(pairs[v]);
+                            acc_li[2 * v + 0] += pm[j] * f.x;
+                            acc_li[2 * v + 1] += pm[j] * f.y;
+                        }
+                    }
+                    uint4 out_raw;
+                    __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+                    for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                        opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
+                    *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+#pragma unroll
+                    for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                    {
+                        float2 b = __bfloat1622float2(opairs[v]);
+                        sum_sq_local += b.x * b.x + b.y * b.y;
+                    }
+                }
+            }
+
+            // Intra-warp reduce sum_sq → one value broadcast to all 32 lanes.
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 16);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 8);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 4);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 2);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 1);
+
+            // Cross-warp reduce when WARPS_PER_TOK > 1.  Use a per-team named
+            // PTX barrier (bar.sync %0, %1) instead of __syncthreads so that
+            // inactive teams (which `continue`'d above) don't deadlock.
+            // Barrier IDs 1..TOKS_PER_PASS are private to each team.
+            if constexpr (WARPS_PER_TOK > 1)
+            {
+                __shared__ float team_sumsq[TOKS_PER_PASS][WARPS_PER_TOK];
+                if (lane_bf == 0)
+                    team_sumsq[warp_tok_pos][warp_in_team] = sum_sq_local;
+                asm volatile("bar.sync %0, %1;" ::"r"(warp_tok_pos + 1u),
+                    "n"(static_cast<uint32_t>(WARPS_PER_TOK * WARP_SIZE_BF)));
+                float team_sum = 0.f;
+#pragma unroll
+                for (uint32_t w = 0; w < WARPS_PER_TOK; ++w)
+                    team_sum += team_sumsq[warp_tok_pos][w];
+                sum_sq_local = team_sum;
+            }
+
+            float const rsqrt_val
+                = rsqrtf(sum_sq_local / static_cast<float>(HIDDEN) + norm_eps);
+
+            // Pass 2: re-LDG the un-normalized layer_input we just wrote
+            // (L2-hot), LDG norm_weight, normalize, STG back. No FMA recompute.
+            __nv_bfloat16 const* nbase = norm_weight;
+#pragma unroll
+            for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
+            {
+                uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
+                __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
+                __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
+                uint4 out_raw;
+                __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+                for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                {
+                    float2 li_f = __bfloat1622float2(li_pairs[v]);
+                    float2 nw_f = __bfloat1622float2(nw_pairs[v]);
+                    opairs[v] = __float22bfloat162_rn(make_float2(
+                        li_f.x * rsqrt_val * nw_f.x, li_f.y * rsqrt_val * nw_f.y));
+                }
+                *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+            }
+            if constexpr (H_VEC_END < HIDDEN)
+            {
+                constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
+                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                if (my_chunk < TAIL_CHUNKS)
+                {
+                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                    uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
+                    __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
+                    __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
+                    uint4 out_raw;
+                    __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+                    for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                    {
+                        float2 li_f = __bfloat1622float2(li_pairs[v]);
+                        float2 nw_f = __bfloat1622float2(nw_pairs[v]);
+                        opairs[v] = __float22bfloat162_rn(make_float2(
+                            li_f.x * rsqrt_val * nw_f.x, li_f.y * rsqrt_val * nw_f.y));
+                    }
+                    *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+                }
             }
         }
     }

@@ -81,9 +81,23 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
     torch::Tensor y_acc_workspace, torch::Tensor r_acc_workspace, torch::Tensor done_counter_workspace, int64_t M,
     int64_t hidden_size, int64_t hc_mult, double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
     double hc_post_mult_value, int64_t sinkhorn_repeat, int64_t backend, int64_t tile_n, int64_t num_k_splits,
-    int64_t bigfuse_block_size, int64_t tile_m)
+    int64_t bigfuse_block_size, int64_t tile_m, c10::optional<torch::Tensor> norm_weight, double norm_eps)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Fused next-layer RMSNorm on layer_input_cur. Only Path D (backend == 2)
+    // supports this; other backends ignore norm_weight (or fail if it's set).
+    __nv_bfloat16 const* norm_weight_ptr = nullptr;
+    if (norm_weight.has_value() && norm_weight->defined())
+    {
+        TORCH_CHECK(backend == 2,
+            "mhc_fused_hc: norm_weight is only supported with backend=2 (fused_all_mma / Path D)");
+        TORCH_CHECK(norm_weight->dtype() == torch::kBFloat16, "mhc_fused_hc: norm_weight must be bfloat16");
+        TORCH_CHECK(norm_weight->is_contiguous(), "mhc_fused_hc: norm_weight must be contiguous");
+        TORCH_CHECK(norm_weight->numel() == hidden_size,
+            "mhc_fused_hc: norm_weight numel=%ld must equal hidden_size=%ld", norm_weight->numel(), hidden_size);
+        norm_weight_ptr = reinterpret_cast<__nv_bfloat16 const*>(norm_weight->data_ptr<at::BFloat16>());
+    }
 
     // backend codes:
     //   0 = fused_half_mma (2-kernel: fused_tf32_pmap_gemm_rout + mhcBigFuseKernel)
@@ -118,7 +132,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             done_counter_workspace.data_ptr<int>(), static_cast<int>(M), static_cast<int>(hidden_size),
             static_cast<int>(hc_mult), static_cast<int>(num_k_splits), static_cast<float>(rms_eps),
             static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
-            static_cast<int>(sinkhorn_repeat), stream);
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream);
         return;
     }
     if (backend == 1)
@@ -195,7 +209,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
         "float hc_post_mult_value, int sinkhorn_repeat, "
         "int backend=0, int tile_n=0, int num_k_splits=0, int bigfuse_block_size=0, "
-        "int tile_m=1) -> ()");
+        "int tile_m=1, Tensor? norm_weight=None, float norm_eps=0.0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

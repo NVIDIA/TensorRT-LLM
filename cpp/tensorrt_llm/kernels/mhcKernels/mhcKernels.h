@@ -109,12 +109,18 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 //   hidden_size in {4096, 7168} for SM100/tcgen05 MMA fused-HC paths.
 // FMA fused-HC paths use runtime hidden_size but still require hidden_size % 64 == 0.
 // Passing num_k_splits == 0 falls back to internal heuristics.
+// `norm_weight` (optional, bf16 [hidden_size]) enables fused next-layer RMSNorm
+// on `layer_input_cur`: when non-null, the kernel writes
+//   layer_input_cur[t,h] = bf16(li[t,h] * rsqrt(mean(li²)+norm_eps) * norm_weight[h]).
+// When null, layer_input_cur receives the un-normalized weighted sum (current
+// behavior; caller must run RMSNorm separately).
 void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
     float const* post_mix_prev, float const* comb_mix_prev, float const* w_t, float const* hc_scale,
     float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int num_k_splits, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
-    float hc_post_mult_value, int sinkhorn_repeat, cudaStream_t stream);
+    float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
+    cudaStream_t stream);
 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (FMA path).
 //

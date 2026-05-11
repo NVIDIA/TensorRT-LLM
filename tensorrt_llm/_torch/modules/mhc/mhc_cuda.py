@@ -627,6 +627,8 @@ def _fused_hc_call(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ):
     torch.ops.trtllm.mhc_fused_hc(
         x_prev,
@@ -656,6 +658,8 @@ def _fused_hc_call(
         num_k_splits,
         bigfuse_bs,
         tile_m,
+        norm_weight,
+        norm_eps,
     )
 
 
@@ -840,6 +844,10 @@ class MhcFusedHcRunner(TunableRunner):
     def get_valid_tactics(self, inputs, profile: OptimizationProfile, **kwargs):
         M = inputs[0].shape[0]
         tactics = []
+        # Only Path D (fused_all_mma) supports the fused next-layer RMSNorm
+        # epilogue. When the caller passes norm_weight, restrict the autotuner
+        # to Path D tactics — other backends raise in the op wrapper.
+        fuse_norm = kwargs.get("norm_weight") is not None
         # The MMA (tcgen05) paths require SM100+. On older archs only the FMA
         # paths are compilable/runnable — we simply never emit MMA tactics.
         mma_ks = tuple(
@@ -849,7 +857,7 @@ class MhcFusedHcRunner(TunableRunner):
         # Path F (fused_all_fma, 1-kernel FMA) — preferred at small M (<=32)
         # where MMA can't fill BLOCK_M=64. Include for M <= 64 as the
         # crossover is measured per-M.
-        if M <= 64:
+        if not fuse_norm and M <= 64:
             for tn, ks, tm in _FUSED_HC_ALL_FMA_TN_KS_TM:
                 # Skip grids that wildly oversubscribe SMs.
                 m_batches = (M + tm - 1) // tm
@@ -860,7 +868,7 @@ class MhcFusedHcRunner(TunableRunner):
         # Path D (fused_all_mma, 1-kernel TF32 MMA) — preferred at mid/large
         # M (>=64). Include when M >= 48 to overlap with Path F at the
         # crossover boundary.
-        if mma_ok and M >= 48:
+        if mma_ok and (fuse_norm or M >= 48):
             for ks in mma_ks:
                 m_tiles = (M + 63) // 64
                 if m_tiles * ks > 148 * 4:
@@ -868,7 +876,7 @@ class MhcFusedHcRunner(TunableRunner):
                 tactics.append(("fused_all_mma", 0, ks, 0, 1))
         # Half-fused FMA path (2-kernel) — useful at smallish M; kept as a
         # fallback option for the autotuner at small M.
-        if M <= 512:
+        if not fuse_norm and M <= 512:
             for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
                 if ks > 1 and M * (self.n * (2 + self.n) // tn) >= 148 * 2:
                     continue
@@ -876,7 +884,7 @@ class MhcFusedHcRunner(TunableRunner):
                     tactics.append(("fused_half_fma", tn, ks, bs, 1))
         # Half-fused MMA path (2-kernel) — always an option when tcgen05 is
         # available.
-        if mma_ok:
+        if not fuse_norm and mma_ok:
             for ks in mma_ks:
                 m_tiles = (M + 63) // 64
                 if m_tiles * ks > 148 * 4:
@@ -908,6 +916,15 @@ class MhcFusedHcRunner(TunableRunner):
             tactic = _get_fused_hc_fallback_tactic(self.hidden_size)
         backend, tile_n, num_k_splits, bigfuse_bs, tile_m = tactic
         backend_code = _FUSED_HC_BACKEND_CODE[backend]
+
+        # Fused next-layer RMSNorm on layer_input. Only Path D supports it;
+        # get_valid_tactics already filtered to Path D when norm_weight is set.
+        norm_weight = kwargs.get("norm_weight")
+        norm_eps = float(kwargs.get("norm_eps", 0.0))
+        if norm_weight is not None and norm_weight.dtype != torch.bfloat16:
+            norm_weight = norm_weight.to(torch.bfloat16)
+        if norm_weight is not None and not norm_weight.is_contiguous():
+            norm_weight = norm_weight.contiguous()
 
         B = residual_prev.shape[0]
         (
@@ -948,6 +965,8 @@ class MhcFusedHcRunner(TunableRunner):
             self.hc_sinkhorn_eps,
             self.hc_post_mult_value,
             self.sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
@@ -1006,6 +1025,8 @@ def mhc_fused_hc(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ):
     """Fuse the previous block's post_mapping with the current block's pre_mapping.
 
@@ -1015,11 +1036,19 @@ def mhc_fused_hc(
       * "fused_all_mma"  — 1-kernel TF32 tcgen05 all-in-one (Path D).
       * "fused_all_fma"  — 1-kernel FMA all-in-one (Path F).
 
+    If ``norm_weight`` is provided, the next-layer RMSNorm is folded into the
+    Path D Phase 4 layer_input epilogue:
+      layer_input_cur[t, h] = bf16(li[t,h] * rsqrt(mean(li²)+norm_eps)
+                                   * norm_weight[h]).
+    Only Path D supports the fused norm; the autotuner is restricted to Path D
+    tactics in this mode (other backends would error).
+
     Returns:
         residual_cur:      [B, n, hidden] bf16 (new residual, input to the next post_mapping)
         post_mix_cur:      [B, n]         fp32
         comb_mix_cur:      [B, n*n]       fp32
-        layer_input_cur:   [B, hidden]    bf16 (input to this block's attn/MoE)
+        layer_input_cur:   [B, hidden]    bf16 (input to this block's attn/MoE;
+                                                RMSNorm-normalized when norm_weight is given)
     """
     runner = _get_fused_hc_runner(
         n=n,
@@ -1037,6 +1066,8 @@ def mhc_fused_hc(
         [runner],
         MhcFusedHcRunner.tuning_config,
         [x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t_cur, hc_scale_cur, hc_base_cur],
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
     return runner(
@@ -1050,6 +1081,8 @@ def mhc_fused_hc(
             hc_base_cur,
         ],
         tactic=best_tactic,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     )
 
 
