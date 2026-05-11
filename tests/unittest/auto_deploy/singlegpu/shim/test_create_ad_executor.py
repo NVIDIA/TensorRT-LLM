@@ -63,6 +63,7 @@ class MockPyExecutor:
     max_beam_width: int
     guided_decoder: Any
     drafter: Any
+    resource_governor_queue: Any = None
 
 
 @dataclass
@@ -152,3 +153,4 @@ def test_create_autodeploy_executor_with_guided_decoding(
         assert guided_decoder.guided_decoding_config == mock_guided_decoding_config
         assert guided_decoder.max_num_sequences == ad_config.max_batch_size
         assert guided_decoder.vocab_size_padded == vocab_size_padded
+        assert result.resource_governor_queue is None

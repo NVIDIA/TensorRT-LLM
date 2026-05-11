@@ -6,12 +6,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import PIL
 import torch
 from blake3 import blake3
 
-import tensorrt_llm
 from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm.inputs.multimodal_data import (BaseModalityData, VideoData,
+                                                 serialize_item)
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -553,35 +553,24 @@ class MultimodalServerConfig():
     media_io_kwargs: Optional[dict] = None
 
 
-# adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py
-def serialize_item(obj: object) -> bytes:
-    # Simple cases
-    if isinstance(obj, str):
-        return obj.encode("utf-8")
-    if isinstance(obj, bytes):
-        return obj
-    if isinstance(obj, (int, float)):
-        return np.array(obj).tobytes()
+def _update_hash(hasher, item: object) -> None:
+    """Hash the content of a multimodal item into the provided hasher."""
+    if isinstance(item, BaseModalityData):
+        item.update_hash(hasher)
+        return
+    if isinstance(item, torch.Tensor):
+        item = item.detach().cpu().contiguous()
+        hasher.update(serialize_item(item))
+        return
+    if isinstance(item, list):
+        for element in item:
+            hasher.update(b"<frame>")
+            if isinstance(element, torch.Tensor):
+                element = element.detach().cpu().contiguous()
+            hasher.update(serialize_item(element))
+        return
 
-    if isinstance(obj, PIL.Image.Image):
-        return np.array(obj.convert("RGBA")).tobytes()
-    if isinstance(obj, torch.Tensor):
-        return obj.numpy().tobytes()
-    if isinstance(obj, np.ndarray):
-        return obj.tobytes()
-    if isinstance(obj, (tuple, list)):
-        # Support compound types like audio (np.ndarray, sample_rate).
-        # Use length-delimited framing so sequences with different element
-        # boundaries (e.g. ["ab", "c"] vs ["a", "bc"]) cannot collide.
-        container_tag = b"T" if isinstance(obj, tuple) else b"L"
-        parts = [container_tag, len(obj).to_bytes(8, "big", signed=False)]
-        for x in obj:
-            payload = serialize_item(x)
-            parts.append(len(payload).to_bytes(8, "big", signed=False))
-            parts.append(payload)
-        return b"".join(parts)
-
-    raise ValueError(f"Unsupported object type: {type(obj)}")
+    hasher.update(serialize_item(item))
 
 
 def apply_mm_hashes(
@@ -609,44 +598,11 @@ def apply_mm_hashes(
         - Flattened list of original UUID strings (or None for content-hashed items)
     """
 
-    def _hash_content(hasher, item):
-        """Hash the content of a multimodal item into the provided hasher."""
-        if isinstance(item, torch.Tensor):
-            # Ensure tensor is on CPU and contiguous for consistent hashing
-            item = item.detach().cpu().contiguous()
-            hasher.update(serialize_item(item))
-        elif isinstance(item, list):
-            # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
-            for frame in item:
-                hasher.update(b"<frame>")
-                if isinstance(frame, torch.Tensor):
-                    frame = frame.detach().cpu().contiguous()
-                hasher.update(serialize_item(frame))
-        elif isinstance(item, tensorrt_llm.inputs.utils.VideoData):
-            frames = item.frames
-            for frame in frames:
-                hasher.update(b"<frame>")
-                if isinstance(frame, torch.Tensor):
-                    frame = frame.detach().cpu().contiguous()
-                hasher.update(serialize_item(frame))
-            metadata = item.metadata
-            if (isinstance(metadata, dict) and "audio_samples" in metadata
-                    and "audio_sample_rate" in metadata):
-                audio_samples = metadata["audio_samples"]
-                if isinstance(audio_samples, torch.Tensor):
-                    audio_samples = audio_samples.detach().cpu().contiguous()
-                hasher.update(b"<audio>")
-                hasher.update(
-                    serialize_item(
-                        (audio_samples, metadata["audio_sample_rate"])))
-        else:
-            hasher.update(serialize_item(item))
-
     def _hash_item(item):
         """Hash only the content of a multimodal item (no UUID)."""
         # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
         hasher = hash_lib()
-        _hash_content(hasher, item)
+        _update_hash(hasher, item)
         return hasher.hexdigest()
 
     def _hash_item_with_uuid(item, uuid: str):
@@ -663,7 +619,7 @@ def apply_mm_hashes(
         hasher.update(b"</uuid>")
         # Then hash the content
         hasher.update(b"<content>")
-        _hash_content(hasher, item)
+        _update_hash(hasher, item)
         hasher.update(b"</content>")
         return hasher.hexdigest()
 
@@ -794,17 +750,19 @@ def find_mm_token_lengths(
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
                 video_metadata = None
-                if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                video_audio = None
+                if isinstance(item, VideoData):
                     video_metadata = item.metadata
+                    video_audio = item.audio
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 call_kwargs = {"video": item}
                 if video_metadata is not None:
                     # Used by per-model overrides that need to account for
-                    # video-derived auxiliary modalities (e.g. Nemotron Nano
-                    # adds <so_*> token slots when metadata carries
-                    # `audio_samples` from extract_audio=true).
+                    # per-video metadata such as sampled frame positions.
                     call_kwargs["video_metadata"] = video_metadata
+                if video_audio is not None:
+                    call_kwargs["video_audio"] = video_audio
                 if video_grid_thw_for_items is not None:
                     # TODO(TRTLLM-11951): Replace this Qwen-VL-specific
                     # metadata wiring with a generic per-item processed

@@ -37,6 +37,12 @@ from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
+from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
+    BOT_TOKEN, CALL_PREFIX, EOT_TOKEN, STRING_DELIM, _extract_tool_calls,
+    _find_matching_brace, _parse_gemma4_args, _parse_gemma4_array,
+    _parse_gemma4_value,
+)
+
 
 # Test fixtures for common tools
 @pytest.fixture
@@ -2672,6 +2678,367 @@ class TestInterleavedThinkingReasoningParsers:
 
 
 # ============================================================================
+# Gemma4 Tool Parser Tests
+# ============================================================================
+
+# Gemma4 helpers
+
+
+def _g4_tc(func_name: str, args_str: str) -> str:
+    """Build a Gemma4 tool call string."""
+    return (f'{BOT_TOKEN}{CALL_PREFIX}{func_name}'
+            f'{{{args_str}}}{EOT_TOKEN}')
+
+
+def _g4_s(val: str) -> str:
+    """Wrap a string value in Gemma4 string delimiters."""
+    return f'{STRING_DELIM}{val}{STRING_DELIM}'
+
+
+class TestGemma4ParsingHelpers:
+    """Tests for low-level Gemma4 format parsing functions."""
+
+    @pytest.mark.parametrize(
+        "text,start,expected",
+        [
+            ("{hello}", 0, 6),
+            ("{a:{b:1}}", 0, 8),
+            # Brace inside a string-delim'd value is ignored.
+            ('{key:' + STRING_DELIM + 'v{al}' + STRING_DELIM + '}', 0,
+             len('{key:' + STRING_DELIM + 'v{al}' + STRING_DELIM + '}') - 1),
+            # No matching closer => -1.
+            ("{incomplete", 0, -1),
+        ],
+        ids=["simple", "nested", "string_delim", "unmatched"],
+    )
+    def test_find_matching_brace(self, text, start, expected):
+        assert _find_matching_brace(text, start) == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (STRING_DELIM + "hello" + STRING_DELIM, "hello"),
+            ("42", 42),
+            ("3.14", 3.14),
+            ("true", True),
+            ("false", False),
+            ("null", None),
+        ],
+        ids=["string", "int", "float", "bool_true", "bool_false", "null"],
+    )
+    def test_parse_value(self, raw, expected):
+        assert _parse_gemma4_value(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("[]", []),
+            (f'[{_g4_s("a")},{_g4_s("b")}]', ["a", "b"]),
+            (f'[{_g4_s("hello")},42,true]', ["hello", 42, True]),
+            (
+                f'[{{name:{_g4_s("Alice")}}},{{name:{_g4_s("Bob")}}}]',
+                [{
+                    "name": "Alice"
+                }, {
+                    "name": "Bob"
+                }],
+            ),
+        ],
+        ids=["empty", "strings", "mixed_types", "nested_objects"],
+    )
+    def test_parse_array(self, raw, expected):
+        assert _parse_gemma4_array(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (f'location:{_g4_s("Tokyo")}', {
+                "location": "Tokyo"
+            }),
+            (
+                f'location:{_g4_s("Tokyo")},unit:{_g4_s("celsius")}',
+                {
+                    "location": "Tokyo",
+                    "unit": "celsius"
+                },
+            ),
+            (
+                f'name:{_g4_s("test")},count:42,active:true',
+                {
+                    "name": "test",
+                    "count": 42,
+                    "active": True
+                },
+            ),
+            (
+                f'loc:{{city:{_g4_s("Tokyo")},country:{_g4_s("Japan")}}}',
+                {
+                    "loc": {
+                        "city": "Tokyo",
+                        "country": "Japan"
+                    }
+                },
+            ),
+            (f'tags:[{_g4_s("a")},{_g4_s("b")}]', {
+                "tags": ["a", "b"]
+            }),
+            ("", {}),
+            # Strings carrying : or { must not be parsed as separators / braces.
+            (f'url:{_g4_s("http://example.com:8080")}', {
+                "url": "http://example.com:8080"
+            }),
+            ('tpl:' + _g4_s('Hello {name}'), {
+                "tpl": "Hello {name}"
+            }),
+        ],
+        ids=[
+            "single_string",
+            "multiple_values",
+            "mixed_types",
+            "nested_object",
+            "with_array",
+            "empty",
+            "string_with_colon",
+            "string_with_braces",
+        ],
+    )
+    def test_parse_args(self, raw, expected):
+        assert _parse_gemma4_args(raw) == expected
+
+    def test_extract_tool_calls_single(self):
+        text = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
+        calls = _extract_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0][0] == "get_weather"
+
+    def test_extract_tool_calls_multiple(self):
+        text = (_g4_tc("get_weather", f'location:{_g4_s("Tokyo")}') +
+                _g4_tc("search_web", f'query:{_g4_s("AI")}'))
+        calls = _extract_tool_calls(text)
+        assert len(calls) == 2
+        assert calls[0][0] == "get_weather"
+        assert calls[1][0] == "search_web"
+
+    def test_extract_tool_calls_none(self):
+        assert _extract_tool_calls("regular text") == []
+
+    def test_extract_tool_calls_incomplete(self):
+        # Missing EOT_TOKEN — must yield no calls.
+        text = (f'{BOT_TOKEN}{CALL_PREFIX}'
+                f'func{{arg:{_g4_s("val")}}}')
+        assert _extract_tool_calls(text) == []
+
+
+class TestGemma4ToolParser(BaseToolParserTestClass):
+    """Test suite for Gemma4ToolParser class."""
+
+    def make_parser(self):
+        return Gemma4ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        single_text = _g4_tc("get_weather", f'location:{_g4_s("NYC")}')
+        single_expected_normal = ""
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "NYC"}
+
+        multiple_text = (_g4_tc("get_weather", f'location:{_g4_s("LA")}') +
+                         _g4_tc("search_web", f'query:{_g4_s("AI")}'))
+        multiple_names = ("get_weather", "search_web")
+
+        # Malformed: missing call: prefix, so no function name is found
+        malformed_text = (f'{BOT_TOKEN}'
+                          f'MALFORMED_NO_CALL_PREFIX{EOT_TOKEN}')
+
+        with_parameters_text = _g4_tc("search_web", f'query:{_g4_s("test")}')
+        with_parameters_name = "search_web"
+        with_parameters_params = {"query": "test"}
+
+        partial_bot_token = "<|tool"
+
+        undefined_tool_text = _g4_tc("undefined_func", f'arg:{_g4_s("val")}')
+
+        return ToolParserTestCases(
+            has_tool_call_true=(
+                f'Text {BOT_TOKEN}{CALL_PREFIX}'
+                f'get_weather{{loc:{_g4_s("NYC")}}}{EOT_TOKEN}'),
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_text,
+                with_parameters_name,
+                with_parameters_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+    def test_initialization(self, parser):
+        assert parser.bot_token == BOT_TOKEN
+        assert parser.eot_token == EOT_TOKEN
+        assert parser.needs_raw_special_tokens is True
+
+    def test_detect_and_parse_with_text_before(self, sample_tools, parser):
+        text = ("Let me check. " +
+                _g4_tc("get_weather", f'location:{_g4_s("NYC")}'))
+        result = parser.detect_and_parse(text, sample_tools)
+        assert result.normal_text == "Let me check."
+        assert len(result.calls) == 1
+
+    def test_detect_and_parse_multiple_params(self, sample_tools, parser):
+        text = _g4_tc("get_weather",
+                      f'location:{_g4_s("NYC")},unit:{_g4_s("celsius")}')
+        result = parser.detect_and_parse(text, sample_tools)
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "NYC", "unit": "celsius"}
+
+    def test_detect_and_parse_nested_object(self, sample_tools, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="create_event",
+                    description="Create event",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "data": {
+                                "type": "object"
+                            }
+                        },
+                    },
+                ),
+            ),
+        ]
+        text = _g4_tc("create_event",
+                      f'data:{{city:{_g4_s("Tokyo")},pop:1400}}')
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"data": {"city": "Tokyo", "pop": 1400}}
+
+    def test_detect_and_parse_array_param(self, sample_tools, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="add_tags",
+                    description="Add tags",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "tags": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+        text = _g4_tc("add_tags", f'tags:[{_g4_s("py")},{_g4_s("ai")}]')
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"tags": ["py", "ai"]}
+
+    def test_detect_and_parse_empty_args(self, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get time",
+                    parameters={},
+                ),
+            ),
+        ]
+        text = _g4_tc("get_time", "")
+        result = parser.detect_and_parse(text, tools)
+        assert len(result.calls) == 1
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_structure_info(self, parser):
+        info_fn = parser.structure_info()
+        info = info_fn("get_weather")
+        assert info.begin == f'{BOT_TOKEN}{CALL_PREFIX}get_weather{{'
+        assert info.end == f'}}{EOT_TOKEN}'
+        assert info.trigger == BOT_TOKEN
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Complete tool call in a single streaming chunk."""
+        text = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
+        result = parser.parse_streaming_increment(text, sample_tools)
+        assert len(result.calls) >= 1
+        assert result.calls[0].name == "get_weather"
+
+    def test_parse_streaming_increment_multi_chunk(self, sample_tools, parser):
+        """Tool call split across two chunks."""
+        chunk1 = (f'{BOT_TOKEN}{CALL_PREFIX}'
+                  f'get_weather{{location:')
+        result1 = parser.parse_streaming_increment(chunk1, sample_tools)
+        assert len(result1.calls) == 1
+        assert result1.calls[0].name == "get_weather"
+
+        chunk2 = f'{_g4_s("Tokyo")}}}{EOT_TOKEN}'
+        result2 = parser.parse_streaming_increment(chunk2, sample_tools)
+        assert len(result2.calls) >= 1
+
+    def test_parse_streaming_increment_multiple_tools(self, sample_tools,
+                                                      parser):
+        """Multiple tool calls in streaming mode."""
+        tc1 = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
+        result1 = parser.parse_streaming_increment(tc1, sample_tools)
+        assert len(result1.calls) >= 1
+
+        tc2 = _g4_tc("search_web", f'query:{_g4_s("weather")}')
+        result2 = parser.parse_streaming_increment(tc2, sample_tools)
+        assert len(result2.calls) >= 1
+
+    def test_parse_streaming_increment_text_then_tool(self, sample_tools,
+                                                      parser):
+        """Normal text followed by tool call."""
+        result1 = parser.parse_streaming_increment("Checking...", sample_tools)
+        assert result1.normal_text == "Checking..."
+
+        tc = _g4_tc("get_weather", f'location:{_g4_s("NYC")}')
+        result2 = parser.parse_streaming_increment(tc, sample_tools)
+        assert len(result2.calls) >= 1
+
+    def test_real_world_weather_query(self, sample_tools, parser):
+        """Simulate real model output: text + tool call."""
+        text = ("I'll check. " +
+                _g4_tc("get_weather", (f'location:{_g4_s("San Francisco, CA")},'
+                                       f'unit:{_g4_s("fahrenheit")}')))
+        result = parser.detect_and_parse(text, sample_tools)
+        assert result.normal_text == "I'll check."
+        params = json.loads(result.calls[0].parameters)
+        assert params == {
+            "location": "San Francisco, CA",
+            "unit": "fahrenheit",
+        }
+
+    def test_factory_creates_gemma4_parser(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        p = ToolParserFactory.create_tool_parser("gemma4")
+        assert isinstance(p, Gemma4ToolParser)
+
+    def test_model_type_mapping(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            MODEL_TYPE_TO_TOOL_PARSER
+        assert MODEL_TYPE_TO_TOOL_PARSER.get("gemma4") == "gemma4"
+        assert MODEL_TYPE_TO_TOOL_PARSER.get("gemma4_text") == "gemma4"
+
+
+# ============================================================================
 # Tool Parser Factory Tests
 # ============================================================================
 
@@ -2977,166 +3344,6 @@ class TestBuildToolStrictGuidedDecoding:
         assert fmt["type"] == "triggered_tags"
         assert len(fmt["tags"]) == 1
         assert "calculate" in fmt["tags"][0]["begin"]
-
-
-# ============================================================================
-# Gemma 4 Tool Parser Tests
-# ============================================================================
-
-
-class TestGemma4ToolParser:
-    """Test suite for Gemma4ToolParser."""
-
-    def _call(self, name: str, args_body: str) -> str:
-        return f"<|tool_call>call:{name}{args_body}<tool_call|>"
-
-    def test_has_tool_call(self):
-        parser = Gemma4ToolParser()
-        assert parser.has_tool_call("plain text") is False
-        assert parser.has_tool_call(self._call("f", "{x:1}")) is True
-
-    def test_needs_raw_special_tokens(self):
-        """Delimiters are special tokens; skip_special_tokens must be off."""
-        assert Gemma4ToolParser.needs_raw_special_tokens is True
-
-    def test_detect_and_parse_no_tool_call(self, sample_tools):
-        parser = Gemma4ToolParser()
-        result = parser.detect_and_parse("hello", sample_tools)
-        assert result.normal_text == "hello"
-        assert result.calls == []
-
-    def test_detect_and_parse_string_arg(self, sample_tools):
-        parser = Gemma4ToolParser()
-        text = self._call("get_weather", '{location:<|"|>San Francisco<|"|>}')
-        result = parser.detect_and_parse(text, sample_tools)
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-        assert json.loads(result.calls[0].parameters) == {
-            "location": "San Francisco"
-        }
-
-    def test_detect_and_parse_mixed_arg_types(self, sample_tools):
-        parser = Gemma4ToolParser()
-        # String, number, boolean, nested object, array.
-        args = ('{active:true,count:3,'
-                'location:<|"|>NYC<|"|>,'
-                'meta:{key:<|"|>v<|"|>},'
-                'tags:[<|"|>a<|"|>,<|"|>b<|"|>]}')
-        result = parser.detect_and_parse(self._call("get_weather", args),
-                                         sample_tools)
-        assert len(result.calls) == 1
-        parsed = json.loads(result.calls[0].parameters)
-        assert parsed == {
-            "active": True,
-            "count": 3,
-            "location": "NYC",
-            "meta": {
-                "key": "v"
-            },
-            "tags": ["a", "b"],
-        }
-
-    def test_detect_and_parse_multiple_calls(self, sample_tools):
-        parser = Gemma4ToolParser()
-        text = (self._call("get_weather", '{location:<|"|>SF<|"|>}') +
-                self._call("search_web", '{query:<|"|>gemma<|"|>}'))
-        result = parser.detect_and_parse(text, sample_tools)
-        assert len(result.calls) == 2
-        assert result.calls[0].name == "get_weather"
-        assert json.loads(result.calls[0].parameters) == {"location": "SF"}
-        assert result.calls[1].name == "search_web"
-        assert json.loads(result.calls[1].parameters) == {"query": "gemma"}
-
-    def test_detect_and_parse_preserves_prefix(self, sample_tools):
-        parser = Gemma4ToolParser()
-        text = "some prefix text  " + self._call("get_weather",
-                                                 '{location:<|"|>SF<|"|>}')
-        result = parser.detect_and_parse(text, sample_tools)
-        assert result.normal_text == "some prefix text"
-        assert len(result.calls) == 1
-
-    def test_streaming_simple(self, sample_tools):
-        parser = Gemma4ToolParser()
-        chunks = [
-            "prefix",
-            "<|tool_call>call:get_weather{loca",
-            'tion:<|"|>SF<|"|>}',
-            "<tool_call|>",
-            "tail",
-        ]
-        normal_text = ""
-        calls: list = []
-        for chunk in chunks:
-            r = parser.parse_streaming_increment(chunk, sample_tools)
-            normal_text += r.normal_text
-            calls.extend(r.calls)
-        assert normal_text == "prefixtail"
-        # Emitted as: (name, ""), (None, args_json).
-        assert len(calls) == 2
-        assert calls[0].name == "get_weather"
-        assert calls[0].parameters == ""
-        assert calls[1].name is None
-        assert json.loads(calls[1].parameters) == {"location": "SF"}
-        assert calls[0].tool_index == calls[1].tool_index == 0
-
-    def test_streaming_holds_partial_bot_token(self, sample_tools):
-        parser = Gemma4ToolParser()
-        # Partial open tag at end should be buffered, not leaked as normal.
-        r1 = parser.parse_streaming_increment("text<|tool_", sample_tools)
-        assert r1.normal_text == "text"
-        assert r1.calls == []
-        r2 = parser.parse_streaming_increment(
-            'call>call:search_web{query:<|"|>q<|"|>}<tool_call|>', sample_tools)
-        assert r2.normal_text == ""
-        assert len(r2.calls) == 2
-        assert r2.calls[0].name == "search_web"
-        assert json.loads(r2.calls[1].parameters) == {"query": "q"}
-
-    def test_structure_info(self):
-        parser = Gemma4ToolParser()
-        info = parser.structure_info()("my_func")
-        assert info.begin == "<|tool_call>call:my_func{"
-        assert info.end == "}<tool_call|>"
-        assert info.trigger == "<|tool_call>"
-
-    def test_supports_structural_tag_disabled(self):
-        """Structural-tag guided decoding is disabled for the custom format.
-
-        Gemma 4 argument bodies are not standard JSON, so guided decoding via
-        structural tags would not produce valid output.
-        """
-        assert Gemma4ToolParser().supports_structural_tag() is False
-
-
-class TestGemma4ArgsToJson:
-    """Test the gemma4 args-to-JSON conversion helper."""
-
-    def test_empty_object(self):
-        from tensorrt_llm.serve.tool_parser.gemma4_parser import \
-            _gemma4_args_to_json
-        assert json.loads(_gemma4_args_to_json("{}")) == {}
-
-    def test_string_with_special_chars(self):
-        from tensorrt_llm.serve.tool_parser.gemma4_parser import \
-            _gemma4_args_to_json
-
-        # Ensure braces/commas inside a string literal are not treated as
-        # structural tokens.
-        body = '{msg:<|"|>hello, {world}<|"|>}'
-        assert json.loads(_gemma4_args_to_json(body)) == {
-            "msg": "hello, {world}"
-        }
-
-    def test_nested_bare_keys(self):
-        from tensorrt_llm.serve.tool_parser.gemma4_parser import \
-            _gemma4_args_to_json
-        body = '{outer:{inner:<|"|>v<|"|>,n:1}}'
-        assert json.loads(_gemma4_args_to_json(body)) == {
-            "outer": {
-                "inner": "v",
-                "n": 1
-            }
-        }
 
 
 if __name__ == "__main__":
