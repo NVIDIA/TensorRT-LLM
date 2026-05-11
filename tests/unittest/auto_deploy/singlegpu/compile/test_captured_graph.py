@@ -19,6 +19,7 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     DualModeCapturedGraph,
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
+    _inject_out_param,
 )
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner, OutputInfo
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
@@ -43,6 +44,162 @@ class ModelWithMultipleInputs(torch.nn.Module):
         if x2 is not None:
             out = out + self.base_model(x2)
         return out
+
+
+class _FakeSchemaArgument:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeSchema:
+    def __init__(self, argument_names):
+        self.arguments = [_FakeSchemaArgument(name) for name in argument_names]
+
+
+class _FakeDynamicOpOverload:
+    """Mimics torch._ops.OpOverload enough for FX codegen and dynamic-op matching."""
+
+    def __init__(self, qualified_name, argument_names):
+        self._name = qualified_name
+        self._schema = _FakeSchema(argument_names)
+        short = qualified_name.split("::")[-1]
+        self.__name__ = short
+        self.__qualname__ = qualified_name
+        self.__module__ = __name__
+
+    def name(self):
+        return self._name
+
+    def __call__(self, *args, **kwargs):
+        return args[0] if args else None
+
+
+_TRTLLM_ATTENTION_ARG_NAMES = [
+    "q",
+    "k",
+    "v",
+    "batch_info_host",
+    "seq_len",
+    "seq_len_with_cache",
+    "kv_cache_block_offsets",
+    "kv_cache",
+    "scale",
+    "sliding_window",
+    "kv_scale_orig_quant",
+    "kv_scale_quant_orig",
+    "out_scale",
+    "out",
+    "rotary_cos_sin",
+    "position_embedding_type",
+    "rotary_embedding_dim",
+]
+
+
+def _find_out_placeholder(gm):
+    return next(
+        node for node in gm.graph.nodes if node.op == "placeholder" and node.target == "out"
+    )
+
+
+def _find_dynamic_op_node(gm):
+    return next(
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and hasattr(node.target, "name")
+        and "trtllm_attention_mha_with_cache" in node.target.name()
+    )
+
+
+def test_inject_out_param_reuses_positional_out_schema_slot():
+    graph = Graph()
+    q = graph.placeholder("q")
+    k = graph.placeholder("k")
+    v = graph.placeholder("v")
+    batch_info_host = graph.placeholder("batch_info_host")
+    seq_len = graph.placeholder("seq_len")
+    seq_len_with_cache = graph.placeholder("seq_len_with_cache")
+    kv_cache_block_offsets = graph.placeholder("kv_cache_block_offsets")
+    kv_cache = graph.placeholder("kv_cache")
+    target = _FakeDynamicOpOverload(
+        "auto_deploy::trtllm_attention_mha_with_cache",
+        _TRTLLM_ATTENTION_ARG_NAMES,
+    )
+    attn = graph.create_node(
+        "call_function",
+        target,
+        args=(
+            q,
+            k,
+            v,
+            batch_info_host,
+            seq_len,
+            seq_len_with_cache,
+            kv_cache_block_offsets,
+            kv_cache,
+            None,
+            None,
+            1.0,
+            1.0,
+            None,
+            None,
+            None,
+            0,
+            0,
+        ),
+        name="attention",
+    )
+    graph.output(attn)
+    gm = GraphModule(nn.Module(), graph)
+
+    _inject_out_param(gm)
+
+    out_placeholder = _find_out_placeholder(gm)
+    dynamic_node = _find_dynamic_op_node(gm)
+    assert len(dynamic_node.args) == len(_TRTLLM_ATTENTION_ARG_NAMES)
+    assert dynamic_node.args[_TRTLLM_ATTENTION_ARG_NAMES.index("out")] is out_placeholder
+    assert "out" not in dynamic_node.kwargs
+
+
+def test_inject_out_param_uses_kwarg_when_out_slot_not_materialized():
+    graph = Graph()
+    q = graph.placeholder("q")
+    k = graph.placeholder("k")
+    v = graph.placeholder("v")
+    batch_info_host = graph.placeholder("batch_info_host")
+    seq_len = graph.placeholder("seq_len")
+    seq_len_with_cache = graph.placeholder("seq_len_with_cache")
+    kv_cache_block_offsets = graph.placeholder("kv_cache_block_offsets")
+    kv_cache = graph.placeholder("kv_cache")
+    target = _FakeDynamicOpOverload(
+        "auto_deploy::trtllm_attention_mha_with_cache",
+        _TRTLLM_ATTENTION_ARG_NAMES,
+    )
+    attn = graph.create_node(
+        "call_function",
+        target,
+        args=(
+            q,
+            k,
+            v,
+            batch_info_host,
+            seq_len,
+            seq_len_with_cache,
+            kv_cache_block_offsets,
+            kv_cache,
+            None,
+        ),
+        name="attention",
+    )
+    graph.output(attn)
+    gm = GraphModule(nn.Module(), graph)
+
+    _inject_out_param(gm)
+
+    out_placeholder = _find_out_placeholder(gm)
+    dynamic_node = _find_dynamic_op_node(gm)
+    assert len(dynamic_node.args) == 9
+    assert dynamic_node.kwargs["out"] is out_placeholder
 
 
 # Using pytest.mark.parametrize to test multiple cases

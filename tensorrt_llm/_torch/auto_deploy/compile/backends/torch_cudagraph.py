@@ -64,11 +64,27 @@ def _coalesce_output(
     return out if out is not None else op_result
 
 
+def _schema_out_arg_index(target: Any) -> Optional[int]:
+    """Return the positional schema index for an ``out`` argument, if available."""
+    schema = getattr(target, "_schema", None)
+    arguments = getattr(schema, "arguments", None)
+    if arguments is None:
+        return None
+
+    for idx, argument in enumerate(arguments):
+        if getattr(argument, "name", None) == "out":
+            return idx
+    return None
+
+
 def _inject_out_param(submod: GraphModule) -> None:
     """Rewrite a dynamic submodule's FX graph to accept and forward an ``out`` kwarg.
 
-    Adds an ``out`` placeholder (default ``None``) and wires it as a kwarg to
-    the dynamic custom-op ``call_function`` node.  Because custom ops must not
+    Adds an ``out`` placeholder (default ``None``) and wires it to the dynamic
+    custom-op ``call_function`` node.  If the op's schema already has the
+    ``out`` argument materialized positionally as ``None``, the placeholder
+    replaces that positional slot instead of also adding an ``out=`` kwarg.
+    Because custom ops must not
     return a tensor that aliases an input, the op returns a 0-element dummy
     tensor when ``out`` is provided.  A ``_coalesce_output`` node is inserted
     after the op call to select ``out`` (the mutated buffer) over the dummy.
@@ -99,7 +115,16 @@ def _inject_out_param(submod: GraphModule) -> None:
     with graph.inserting_after(last_placeholder):
         out_placeholder = graph.placeholder("out", default_value=None)
 
-    target_node.kwargs = {**dict(target_node.kwargs), "out": out_placeholder}
+    target_kwargs = dict(target_node.kwargs)
+    out_arg_index = _schema_out_arg_index(target_node.target)
+    if out_arg_index is not None and out_arg_index < len(target_node.args):
+        target_args = list(target_node.args)
+        target_args[out_arg_index] = out_placeholder
+        target_node.args = tuple(target_args)
+        target_kwargs.pop("out", None)
+    else:
+        target_kwargs["out"] = out_placeholder
+    target_node.kwargs = target_kwargs
 
     with graph.inserting_after(target_node):
         coalesce_node = graph.call_function(_coalesce_output, args=(target_node, out_placeholder))
