@@ -1483,6 +1483,8 @@ class VideoJob(OpenAIBaseModel):
                                 description="Video dimensions in 'WxH' format")
     output_path: Optional[str] = Field(
         default=None, description="Actual path where the video file was saved")
+    output_paths: Optional[List[str]] = Field(
+        default=None, description="Paths for all generated videos when n > 1")
 
 
 class VideoJobList(OpenAIBaseModel):
