@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 from typing import Dict, Optional, Type
 
@@ -18,6 +20,7 @@ from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
+from .mega_moe import MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
@@ -92,7 +95,7 @@ def get_moe_cls(
         if quant_config is None or not quant_config.quant_mode.has_w4a8_mxfp4_mxfp8(
         ):
             logger.warning(
-                "MegaMoEDeepGemmFusedMoE only supports W4A8_MXFP4_MXFP8. "
+                "MegaMoEDeepGemm only supports W4A8_MXFP4_MXFP8. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -100,29 +103,32 @@ def get_moe_cls(
         # surface. ``can_implement`` already does this full check; call it
         # with ``swiglu_gptoss_style=False`` (MegaMoE rejects that anyway,
         # and the create path doesn't know the model's SwiGLU flavor yet).
-        from .mega_moe import MegaMoEDeepGemmFusedMoE
+        # Use the same dtype / intermediate size as create_moe will use when
+        # instantiating the backend (prefer moe_intermediate_size for MoE).
         pretrained = model_config.pretrained_config
-        # Resolve dtype + intermediate_size from pretrained_config so the
-        # capability check matches the values create_moe will use to
-        # actually instantiate the backend (mirrors create_moe's logic
-        # below: prefer moe_intermediate_size for MoE models).
-        pretrained_dtype = getattr(pretrained, "torch_dtype", torch.bfloat16)
-        pretrained_inter = getattr(pretrained, "moe_intermediate_size", None)
-        if pretrained_inter is None:
-            pretrained_inter = getattr(pretrained, "intermediate_size", None)
-        ok, reason = MegaMoEDeepGemmFusedMoE.can_implement(
+        pretrained_dtype = (getattr(pretrained, "torch_dtype", torch.bfloat16)
+                            if pretrained is not None else torch.bfloat16)
+        pretrained_inter = None
+        if pretrained is not None:
+            pretrained_inter = getattr(pretrained, "moe_intermediate_size",
+                                       None)
+            if pretrained_inter is None:
+                pretrained_inter = getattr(pretrained, "intermediate_size",
+                                           None)
+        ok, reason = MegaMoEDeepGemm.can_implement(
             QuantAlgo.W4A8_MXFP4_MXFP8,
             dtype_activation=pretrained_dtype,
             swiglu_gptoss_style=False,
-            hidden_size=getattr(pretrained, "hidden_size", None),
+            hidden_size=getattr(pretrained, "hidden_size", None)
+            if pretrained is not None else None,
             intermediate_size=pretrained_inter,
         )
         if not ok:
             logger.warning(
-                f"MegaMoEDeepGemmFusedMoE rejected current environment: {reason}. "
+                f"MegaMoEDeepGemm rejected current environment: {reason}. "
                 "Falling back to CutlassFusedMoE.")
             return CutlassFusedMoE
-        return MegaMoEDeepGemmFusedMoE
+        return MegaMoEDeepGemm
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
@@ -196,10 +202,19 @@ def create_moe_backend(
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
-        assert moe_cls in [
-            WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-            DeepGemmFusedMoE, DenseGEMMFusedMoE
-        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE, DeepGemmFusedMoE, and DenseGEMMFusedMoE."
+        supported_load_balancer_backends = (
+            WideEPMoE,
+            CutlassFusedMoE,
+            TRTLLMGenFusedMoE,
+            CuteDslFusedMoE,
+            DeepGemmFusedMoE,
+            DenseGEMMFusedMoE,
+            MegaMoEDeepGemm,
+        )
+        assert moe_cls in supported_load_balancer_backends, (
+            "MoE Load Balance is only supported in "
+            f"{', '.join(cls.__name__ for cls in supported_load_balancer_backends)}."
+        )
 
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
@@ -358,10 +373,10 @@ def create_moe_backend(
         )
     else:
         # Mega MoE fall-through: new backend not in the hard-coded chain.
-        # Import lazily to avoid pulling DG at module import time on boxes
+        # ``mega_moe_deepgemm`` lazily resolves DG via ``_import_deep_gemm``
+        # at runtime, so a top-level import here doesn't pull DG on boxes
         # that don't use this backend.
-        from .mega_moe import MegaMoEDeepGemmFusedMoE
-        if moe_cls is MegaMoEDeepGemmFusedMoE:
+        if moe_cls is MegaMoEDeepGemm:
             return moe_cls(
                 routing_method=routing_method,
                 num_experts=num_experts,
@@ -448,17 +463,9 @@ def create_moe(
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
-    # Build the ConfigurableMoE-supported set lazily so non-MegaMoE
-    # callers don't have to import DeepGEMM at module load time.
-    configurable_supported = (DeepGemmFusedMoE, TRTLLMGenFusedMoE,
-                              CuteDslFusedMoE, CutlassFusedMoE,
-                              DenseGEMMFusedMoE)
-    if model_config.moe_backend.upper() == "MEGAMOE_DEEPGEMM":
-        from .mega_moe import MegaMoEDeepGemmFusedMoE
-        configurable_supported = configurable_supported + (
-            MegaMoEDeepGemmFusedMoE, )
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
-        if moe_cls in configurable_supported:
+        if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
+                       CutlassFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

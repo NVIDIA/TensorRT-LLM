@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
 
 # ---------------------------------------------------------------------------
@@ -88,11 +88,15 @@ def _make_creator(
 @pytest.fixture(autouse=True)
 def _no_gpu():
     """Stub out CUDA memory queries and per-token KV size so the test runs on
-    any machine and the memory cap never constrains the result."""
+    any machine and the memory cap never constrains the result.
+
+    _get_kv_size_per_token now returns a CacheCost; using slope=1 + zero
+    intercept keeps the legacy ``budget // bytes_per_token`` arithmetic
+    untouched downstream."""
     huge = 100 * (1 << 30)
     with (
         patch("torch.cuda.mem_get_info", return_value=(huge, huge)),
-        patch.object(KvCacheCreator, "_get_kv_size_per_token", return_value=1),
+        patch.object(KvCacheCreator, "_get_kv_size_per_token", return_value=CacheCost(slope=1)),
     ):
         yield
 

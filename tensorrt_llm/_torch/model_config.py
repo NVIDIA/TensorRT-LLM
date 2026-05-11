@@ -12,8 +12,8 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers, is_hybrid_linear, is_nemotron_hybrid,
-    is_qwen3_hybrid, load_pretrained_config)
+    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
+    load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -31,6 +31,28 @@ if TYPE_CHECKING:
                                               SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
+
+
+def _unified_kv_pool_includes_mamba(
+        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
+    """Whether the KV cache pool will include mamba layers for a hybrid model.
+
+    True for the default Python ``MambaHybridCacheManager`` route, where
+    mamba state is allocated alongside attention KV inside one pool (with
+    zero KV heads on mamba layers). False for the V1-route managers used
+    when:
+
+      * disaggregated serving forces the C++ mamba manager
+        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
+      * one-model speculative decoding splits mamba and attention into
+        separate caches.
+
+    Single source of truth for the binding-side layer-counting decision; do
+    not duplicate the predicate at call sites.
+    """
+    use_disagg = is_disagg or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    use_spec = spec_config is not None
+    return not (use_disagg or use_spec)
 
 
 @contextlib.contextmanager
@@ -704,8 +726,7 @@ class ModelConfig(Generic[TConfig]):
 
         hidden_size = ceil_div(self.pretrained_config.hidden_size, attn_tp_size)
         num_layers = self.pretrained_config.num_hidden_layers
-        num_attention_layers = self.get_num_attention_layers(
-            is_disagg, kv_cache_config, spec_config)
+        num_attention_layers = self.get_num_attention_layers()
         if (self.spec_config is not None
                 and self.spec_config.spec_dec_mode.is_mtp_one_model()):
             assert self.spec_config.num_nextn_predict_layers is not None, (
@@ -839,38 +860,31 @@ class ModelConfig(Generic[TConfig]):
         else:
             return None
 
-    def get_num_attention_layers(
-            self,
-            is_disagg: bool,
-            kv_cache_config: Optional[KvCacheConfig] = None,
-            spec_config: Optional['SpeculativeConfig'] = None):
-        """Return the number of layers that need KV cache blocks.
+    def get_num_attention_layers(self) -> int:
+        """Number of full-attention layers in the model.
 
-        For hybrid models using the MixedMambaHybridCacheManager path
-        (TRTLLM_USE_CPP_MAMBA=1 for disagg), only attention layers need KV
-        cache blocks, so we return the attention-only count.
-
-        For the default CppMambaHybridCacheManager path (including speculative
-        decoding), both attention and mamba layers are managed in the unified
-        KV cache pool, so we return num_hidden_layers (all layers).
+        Pure model property: independent of which KV cache manager will run.
+        For non-hybrid models this equals num_hidden_layers. For hybrid Mamba
+        models (Nemotron-hybrid, Qwen3-hybrid) it returns only the attention
+        count derived from the layer pattern; mamba layers are reported by
+        ``get_num_mamba_layers``.
         """
-        use_disagg = is_disagg or os.environ.get('TRTLLM_USE_CPP_MAMBA',
-                                                 '0') == '1'
-        use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
-        use_spec = spec_config is not None
+        cfg = self.pretrained_config
+        if is_nemotron_hybrid(cfg):
+            return cfg.hybrid_override_pattern.count("*")
+        if is_qwen3_hybrid(cfg):
+            return get_qwen3_hybrid_num_attention_layers(cfg)
+        return cfg.num_hidden_layers
 
-        use_v1_mamba_manager = use_disagg or use_spec
-        if is_hybrid_linear(
-                self.pretrained_config) and use_v1_mamba_manager and use_reuse:
-            logger.warning(
-                "Block reuse does not work with MTP or disagg for hybrid linear models"
-            )
-        if is_nemotron_hybrid(self.pretrained_config) and use_v1_mamba_manager:
-            return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif is_qwen3_hybrid(self.pretrained_config) and use_v1_mamba_manager:
-            return get_qwen3_hybrid_num_attention_layers(self.pretrained_config)
-        else:
-            return self.pretrained_config.num_hidden_layers
+    def get_num_mamba_layers(self) -> int:
+        """Number of Mamba / linear-attention layers (0 for non-hybrid)."""
+        cfg = self.pretrained_config
+        if is_nemotron_hybrid(cfg):
+            return cfg.hybrid_override_pattern.count("M")
+        if is_qwen3_hybrid(cfg):
+            return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
+                cfg)
+        return 0
 
 
 def _mirror_text_subconfig_attrs(

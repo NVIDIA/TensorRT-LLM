@@ -662,6 +662,7 @@ def test_disaggregated_diff_max_tokens(disaggregated_test_root,
                            "2_ranks_diff_max_tokens",
                            env=llm_venv._new_env,
                            prompt_file="long_prompts.json",
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -678,6 +679,7 @@ def test_disaggregated_single_gpu(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -694,6 +696,7 @@ def test_disaggregated_single_gpu_trt_backend(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks_trt_backend",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -710,6 +713,7 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -741,6 +745,7 @@ def test_disaggregated_router(disaggregated_test_root,
                            router_type,
                            env=llm_venv._new_env,
                            extra_endpoints_test=fetch_perf_metrics,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -757,6 +762,7 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_trt_backend",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -781,6 +787,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file,
+                             model_name=llama_model_root,
                              env=env,
                              cwd=llm_venv.get_working_directory())
 
@@ -834,6 +841,7 @@ def test_disaggregated_genbs1(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_bs1",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -849,6 +857,7 @@ def test_disaggregated_multi_gpu(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -864,6 +873,7 @@ def test_disaggregated_multi_gpu_trt_backend(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks_trt_backend",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -877,6 +887,7 @@ def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "cuda_graph",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -890,6 +901,7 @@ def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "mixed",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -903,6 +915,7 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -926,6 +939,7 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
         disaggregated_example_root,
         "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
         env=llm_venv._new_env,
+        model_path=llama_model_root,
         cwd=llm_venv.get_working_directory(),
         disagg_schedule_style="generation_first")
 
@@ -943,6 +957,7 @@ def test_disaggregated_overlap_transceiver_runtime_python(
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -963,6 +978,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=llm_venv._new_env,
                            extra_endpoints_test=extra_endpoints_test,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -980,6 +996,7 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                            num_iters=1,
                            prompt_file="tool_call_prompts.json",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -996,6 +1013,7 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=llm_venv._new_env
                            | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
     send_file = os.path.join(output_path, "rank_0_send.csv")
@@ -1036,6 +1054,7 @@ def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "trtllm_sampler",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1050,6 +1069,7 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "load_balance",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1064,6 +1084,7 @@ def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "cache_aware_balance",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1078,6 +1099,7 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "conditional",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1090,6 +1112,7 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1149,6 +1172,7 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1163,6 +1187,7 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
