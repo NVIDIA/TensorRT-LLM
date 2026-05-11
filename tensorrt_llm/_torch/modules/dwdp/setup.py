@@ -150,20 +150,26 @@ def setup_dwdp(
         f"weight_names={weight_names}"
     )
 
-    # 2. Build weight specs
-    layer_weight_specs = build_weight_specs(local_params, weight_names, mapping)
+    # Query the model's *actual* gate-side num_experts from the first MoE
+    # layer.  This is the routing-side expert count (e.g., 72 for DSv3-Lite,
+    # 256 for DeepSeek-V3 / R1).  It is distinct from the per-rank storage
+    # extent (``num_experts_per_worker * dwdp_size``) which may be larger
+    # under non-uniform / redundancy Mode B partitioning.  All Phase 1+2
+    # plumbing — composite VA size, peer_ranges cap, validation — uses
+    # this gate-side count, not storage extent.
+    num_experts_total = _get_model_num_experts(model, layer_indices)
+
+    # 2. Build weight specs (full_shape uses the gate-side num_experts)
+    layer_weight_specs = build_weight_specs(
+        local_params, weight_names, mapping, num_experts_total
+    )
     logger.info(
-        f"[DWDP Setup] Built weight specs for {len(layer_weight_specs)} layers"
+        f"[DWDP Setup] Built weight specs for {len(layer_weight_specs)} layers, "
+        f"num_experts={num_experts_total}"
     )
 
-    # 3. Compute local expert range from DwdpConfig fields (SSOT).
-    # Range size = num_experts_per_worker, stride = num_prefetch_experts.
-    # When the two are equal (uniform integer-division partitioning, the
-    # only currently supported mode) this matches num_experts // dwdp_size
-    # and is consistent with the chunk shape produced by the fused MoE
-    # backend during weight loading.
+    # 3. Validate partition config against the gate-side expert count.
     first_spec = _get_first_spec(layer_weight_specs)
-    num_experts_total = first_spec.num_experts
     _validate_partition_config(
         num_experts_per_worker=num_experts_per_worker,
         num_prefetch_experts=num_prefetch_experts,
@@ -346,22 +352,33 @@ def build_weight_specs(
     local_params: Dict[Tuple[int, str], torch.Tensor],
     weight_names: List[str],
     mapping,
+    num_experts_total: int,
 ) -> LayerWeightSpecs:
     """Convert collected parameters to ``LayerWeightSpecs``.
 
-    Each local parameter has shape ``(experts_per_rank, ...)``.  The full shape
-    is ``(num_experts_total, ...)`` where ``num_experts_total = experts_per_rank * dwdp_size``.
+    Each local parameter has shape ``(experts_per_rank, ...)`` where
+    ``experts_per_rank`` is the per-rank storage size
+    (``num_experts_per_worker`` from ``DwdpConfig`` after
+    ``_init_dwdp_expert_layout`` runs).  The composite VA's ``full_shape``
+    uses ``num_experts_total`` (gate-side, e.g. 72 for DSv3-Lite) so
+    every expert id in ``[0, num_experts_total)`` is addressable — and
+    *only* those.  Under Mode B redundancy ``experts_per_rank *
+    dwdp_size`` may exceed ``num_experts_total`` (overlap duplicates),
+    but those duplicates live within each peer's MNNVL handle, not in
+    the composite VA.
 
     Args:
         local_params: Dict from ``collect_moe_params``.
         weight_names: Weight names list.
         mapping: Mapping with dwdp_size.
+        num_experts_total: Gate-side expert count read from the model
+            (``MoE.num_experts``), used as ``WeightSpec.num_experts`` /
+            ``full_shape[0]``.
 
     Returns:
         LayerWeightSpecs: ``Dict[layer_idx, Dict[weight_name, WeightSpec]]``.
     """
     layer_weight_specs: LayerWeightSpecs = {}
-    dwdp_size = mapping.dwdp_size
 
     # Group params by layer
     layers_seen: Dict[int, List[str]] = {}
@@ -378,8 +395,6 @@ def build_weight_specs(
                 continue
             param = local_params[key]
             chunk_shape = tuple(param.shape)
-            experts_per_rank = chunk_shape[0]
-            num_experts_total = experts_per_rank * dwdp_size
             full_shape = (num_experts_total,) + chunk_shape[1:]
             specs[wname] = WeightSpec(
                 num_experts=num_experts_total,
@@ -390,6 +405,44 @@ def build_weight_specs(
         layer_weight_specs[layer_idx] = specs
 
     return layer_weight_specs
+
+
+def _get_model_num_experts(model: nn.Module, layer_indices: List[int]) -> int:
+    """Read the gate-side ``num_experts`` from the first MoE layer.
+
+    The fused MoE backend stores the routing-side expert count
+    (``MoE.num_experts`` from the model config, e.g.
+    ``n_routed_experts``) on each ``experts_module``.  All MoE layers in
+    a given model share the same value, so reading the first one is
+    sufficient.
+
+    Args:
+        model: Top-level CausalLM model.
+        layer_indices: Non-empty list of MoE layer indices.
+
+    Returns:
+        Gate-side expert count (positive integer).
+
+    Raises:
+        RuntimeError: If the first MoE layer's experts module cannot be
+            found or does not expose ``num_experts``.
+    """
+    decoder_model = _get_decoder_model(model)
+    layers = decoder_model.layers
+    first_layer_idx = sorted(layer_indices)[0]
+    _, experts_module = _get_moe_and_experts(layers[first_layer_idx])
+    if experts_module is None:
+        raise RuntimeError(
+            f"[DWDP Setup] Cannot read num_experts: layer {first_layer_idx} "
+            f"has no experts module."
+        )
+    n = getattr(experts_module, "num_experts", None)
+    if not isinstance(n, int) or n <= 0:
+        raise RuntimeError(
+            f"[DWDP Setup] Layer {first_layer_idx} experts module has "
+            f"invalid num_experts={n!r}."
+        )
+    return n
 
 
 # ---------------------------------------------------------------------------
