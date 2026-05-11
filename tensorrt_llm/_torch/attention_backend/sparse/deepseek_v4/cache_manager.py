@@ -114,9 +114,8 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 
 class DeepseekV4CacheManager(KVCacheManagerV2):
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
-    # kv_cache_pool_pointers contains pool pointers swa pool, shape: [1, 2]
-    # It assume the KVCacheManagerPy has only one pool for swa attention.
-    # The second column is always 0.
+    # kv_cache_pool_pointers contains one virtual attention-op pool per local
+    # SWA layer, shape: [num_local_layers, 2]. The second column is always 0.
     kv_cache_pool_pointers: torch.Tensor
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_mapping contains pool id and layer offset for each layer's swa attention,
@@ -450,23 +449,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             kv_cache.get_scratch_desc(pool_id),
         )
 
-    def _get_converted_batch_page_indices(
+    def _fill_converted_batch_page_indices(
         self,
+        dst_offsets: torch.Tensor,
         request_ids: List[int],
         copy_idx: torch.Tensor,
         layer_id: LayerId,
         data_role: DataRole,
         page_index_mode: PageIndexMode = PageIndexMode.PER_LAYER,
-    ) -> torch.Tensor:
+    ) -> None:
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         converter = self.impl.get_page_index_converter(layer_id, data_role)
-        offsets = torch.full(
-            (len(request_ids), self.max_blocks_per_seq),
-            BAD_PAGE_INDEX,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-            device="cpu",
-        )
+        assert dst_offsets.device.type == "cpu"
+        assert dst_offsets.dtype == torch.int32
+        assert dst_offsets.size(0) >= len(request_ids)
+        assert dst_offsets.size(1) >= self.max_blocks_per_seq
+        dst_offsets_np = dst_offsets.numpy()
 
         for row, request_id in enumerate(request_ids):
             kv_cache = self.kv_cache_map[request_id]
@@ -477,8 +475,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     f"Converted page indices length {len(converted)} exceeds "
                     f"max_blocks_per_seq {self.max_blocks_per_seq}"
                 )
-            offsets[row, : len(converted)] = torch.tensor(converted, dtype=torch.int32)
-        return offsets
+            dst_offsets_np[row, : len(converted)] = converted
 
     def _get_cache_quota(self, max_tokens: int) -> int:
         quota = int(max_tokens * self.get_cache_bytes_per_token())
@@ -866,13 +863,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         staging = self._host_attention_op_block_offsets_staging
         staging[: self.num_attention_op_pools, :num_seqs].fill_(BAD_PAGE_INDEX)
         for local_layer_idx, pp_layer in enumerate(self.pp_layers):
-            offsets = self._get_converted_batch_page_indices(
+            self._fill_converted_batch_page_indices(
+                staging[local_layer_idx, :num_seqs, 0],
                 request_ids,
                 copy_idx,
                 self._layer_attn_to_layer_id[pp_layer, DeepseekV4AttentionType.SWA],
                 DeepseekV4AttentionType.SWA.role,
             )
-            staging[local_layer_idx, :num_seqs, :, :] = offsets[:, None, :]
+            staging[local_layer_idx, :num_seqs, 1, :] = staging[local_layer_idx, :num_seqs, 0, :]
         dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
             staging[: self.num_attention_op_pools, :num_seqs], non_blocking=True
         )
@@ -900,14 +898,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             for attention_type in DEEPSEEK_V4_SLIDING_ATTENTION:
                 if not compress_ratio_has_attention(compress_ratio, attention_type):
                     continue
-                offsets = self._get_converted_batch_page_indices(
+                self._fill_converted_batch_page_indices(
+                    staging[local_layer_idx, attention_type.value, :num_seqs],
                     request_ids,
                     copy_idx,
                     self._layer_attn_to_layer_id[pp_layer, attention_type],
                     attention_type.role,
                     PageIndexMode.PER_LAYER,
                 )
-                staging[local_layer_idx, attention_type.value, :num_seqs] = offsets[:num_seqs]
 
         dst_tensor[: self.num_local_layers, :, :num_seqs].copy_(
             staging[: self.num_local_layers, :, :num_seqs], non_blocking=True
@@ -932,14 +930,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         for pp_layer in self.pp_layers:
             if self._compress_ratios[pp_layer] != compress_ratio:
                 continue
-            offsets = self._get_converted_batch_page_indices(
+            self._fill_converted_batch_page_indices(
+                staging[:num_seqs],
                 request_ids,
                 copy_idx,
                 self._layer_attn_to_layer_id[pp_layer, DeepseekV4AttentionType.COMPRESS],
                 DeepseekV4AttentionType.COMPRESS.role,
                 PageIndexMode.SHARED,
             )
-            staging[:num_seqs] = offsets[:num_seqs]
             break
 
         dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
@@ -965,14 +963,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # INDEXER_COMPRESS uses shared page indices. One 2D table is
             # enough for the generic DSA indexer path and the indexer
             # compressor, even when multiple PP-local sparse layers exist.
-            offsets = self._get_converted_batch_page_indices(
+            self._fill_converted_batch_page_indices(
+                host_block_table[:num_seqs],
                 request_ids,
                 copy_idx,
                 self._layer_attn_to_layer_id[pp_layer, DeepseekV4AttentionType.INDEXER_COMPRESS],
                 DeepseekV4AttentionType.INDEXER_COMPRESS.role,
                 PageIndexMode.SHARED,
             )
-            host_block_table[:num_seqs] = offsets[:num_seqs]
             return
 
     @staticmethod
