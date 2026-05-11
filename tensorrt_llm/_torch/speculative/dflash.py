@@ -675,8 +675,8 @@ class DFlashWorker(SpecWorkerBase):
                     proj_flat.to(self._ctx_k_buf.dtype), pos_flat
                 )
                 mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
-                k_new = k_new * mask_bc
-                v_new = v_new * mask_bc
+                k_new.mul_(mask_bc)
+                v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
                 self._ctx_k_buf[slot_long, :, col_long] = k_new
