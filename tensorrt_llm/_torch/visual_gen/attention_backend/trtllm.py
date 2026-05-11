@@ -85,10 +85,14 @@ class TrtllmAttentionMetadata:
         )
 
     def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
-        """Check if we need to call prepare() (seq_lens changed).
+        """Check if we need to call prepare() (current request seq_lens or shared metadata object seq_lens changed).
 
         Assumes uniform sequence length per batch; if per-sample lengths vary,
         we may need to check seq_lens tensor instead.
+
+        In addition, multiple visual gen attention modules share one metadata object.  A
+        different module may have prepared it for another sequence length even
+        when this wrapper's local cached seq_lens are unchanged.
         """
         if not self._prepared:
             return True
@@ -96,7 +100,26 @@ class TrtllmAttentionMetadata:
             return True
         if self._cached_seq_lens.shape[0] != batch_size:
             return True
-        return not torch.equal(self._cached_seq_lens[:batch_size], seq_lens)
+        if not torch.equal(self._cached_seq_lens[:batch_size], seq_lens):
+            return True
+
+        metadata = self._metadata_state["metadata"]
+        if metadata is None:
+            return True
+        if getattr(metadata, "num_contexts", None) != batch_size:
+            return True
+
+        max_seq_len = seq_lens.max().item()
+        if getattr(metadata, "max_seq_len", None) != max_seq_len:
+            return True
+
+        metadata_seq_lens = getattr(metadata, "seq_lens", None)
+        if metadata_seq_lens is None or metadata_seq_lens.shape[0] < batch_size:
+            return True
+        if not torch.equal(metadata_seq_lens[:batch_size].to(seq_lens.device), seq_lens):
+            return True
+
+        return False
 
     def _create_metadata(self, batch_size: int, max_seq_len: int) -> None:
         """Create new metadata with given capacity."""

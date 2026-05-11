@@ -8,12 +8,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.multiprocessing as mp
 
-from ....executor import GenerationExecutor
-from ....executor.request import GenerationRequest
-from ....executor.result import CompletionOutput, GenerationResult
-from ....inputs.multimodal import MultimodalParams
-from ....sampling_params import SamplingParams
-from ...pyexecutor.sampling_utils import greedy_search_sampling_batch, top_k_sampling_batch
+from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+    greedy_search_sampling_batch,
+    top_k_sampling_batch,
+)
+from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.sampling_params import SamplingParams
+
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine

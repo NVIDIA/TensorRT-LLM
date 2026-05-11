@@ -1,9 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
     BaseConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
 
 
+@register_config_loader("MX")
 @register_config_loader("HF")
 class HfConfigLoader(BaseConfigLoader):
 

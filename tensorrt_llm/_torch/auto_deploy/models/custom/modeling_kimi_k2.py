@@ -859,7 +859,7 @@ class KimiK2ForCausalLM(KimiK2PreTrainedModel, GenerationMixin):
       model.embed_tokens, model.layers.*, model.norm, lm_head
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

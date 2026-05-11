@@ -24,25 +24,23 @@ import time
 import traceback
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Set, Tuple, Union
 
 import torch.multiprocessing as mp
 import zmq
 
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.output import VisualGenOutput
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
 __all__ = [
     "VisualGen",
     "VisualGenParams",
     "ExtraParamSchema",
-    "MediaOutput",
-    "VisualGenError",
-    "VisualGenParamsError",
     "VisualGenResult",
 ]
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -118,22 +116,6 @@ def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
     return None
 
 
-@set_api_status("prototype")
-class VisualGenError(RuntimeError):
-    """Base exception for all VisualGen operations."""
-
-
-@set_api_status("prototype")
-class VisualGenParamsError(ValueError):
-    """Raised when request parameters fail validation.
-
-    This covers unknown parameter keys, unsupported universal fields
-    for the loaded pipeline, type mismatches, and out-of-range values.
-    Caught by the executor so it returns an error response rather than
-    crashing the server.
-    """
-
-
 class DiffusionRemoteClient:
     """Client proxy for remote DiffusionExecutor in worker processes.
 
@@ -203,6 +185,11 @@ class DiffusionRemoteClient:
         self.responses_ipc = None
         self.pending_requests = queue.Queue()
         self.completed_responses: Dict[int, DiffusionResponse] = {}
+        # Request ids the caller has given up on (e.g., aresult timed out).
+        # _store_response drops late-arriving responses for these ids so a
+        # full PipelineOutput tensor does not pin in completed_responses for
+        # the process lifetime.
+        self._abandoned_request_ids: Set[int] = set()
 
         # We'll create asyncio primitives in the background thread's event loop
         self._event_loop = None
@@ -406,10 +393,34 @@ class DiffusionRemoteClient:
             logger.error(f"DiffusionClient: Error processing response: {e}")
 
     async def _store_response(self, response: DiffusionResponse):
-        """Store response in the completed_responses dict (async helper)."""
+        """Store response in the completed_responses dict (async helper).
+
+        Drops the response if the request id has been abandoned so that
+        late-arriving responses for timed-out requests do not leak into
+        ``completed_responses`` for the process lifetime.
+        """
         async with self.lock:
+            if response.request_id in self._abandoned_request_ids:
+                self._abandoned_request_ids.discard(response.request_id)
+                return
             self.completed_responses[response.request_id] = response
         self.response_event.set()
+
+    async def abandon_request_id(self, request_id: int):
+        """Mark a request id as abandoned and drop any cached response.
+
+        Called from the result handle's timeout branch to prevent the
+        executor from holding a full ``PipelineOutput`` for a request whose
+        caller has stopped waiting. Handles both orderings:
+
+        - Response already arrived between the timeout firing and the
+          abandon call → ``pop`` releases it here.
+        - Response arrives after the abandon call → ``_store_response``
+          checks the abandoned set and drops it on arrival.
+        """
+        async with self.lock:
+            self.completed_responses.pop(request_id, None)
+            self._abandoned_request_ids.add(request_id)
 
     def _cleanup_ipc(self):
         """Cleanup IPC."""
@@ -537,61 +548,127 @@ class DiffusionRemoteClient:
 
 @set_api_status("prototype")
 class VisualGenResult:
-    """Future-like object for async generation."""
+    """Future-like awaitable handle for a VisualGen request.
 
-    def __init__(self, request_id: int, executor: DiffusionRemoteClient):
+    A single instance backs both single-prompt and batch-prompt requests:
+
+    - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
+      Underlying-request failure raises :class:`RuntimeError`.
+    - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
+      Per-item or whole-batch failure never raises; failed items carry
+      ``error != None`` (Option B semantics).
+
+    Three wait flavors are supported:
+
+    - ``await handle`` — preferred async style; equivalent to
+      ``await handle.aresult()``.
+    - ``handle.aresult(timeout=None)`` — explicit async coroutine; usable
+      from any async context (e.g., FastAPI handlers).
+    - ``handle.result(timeout=None)`` — blocking call for non-async callers.
+    """
+
+    def __init__(
+        self,
+        request_id: int,
+        executor: "DiffusionRemoteClient",
+        batch_size: Optional[int] = None,
+    ):
         self.request_id = request_id
         self.executor = executor
-        self._result = None
+        # ``None`` means single-prompt; an int means batch and is the
+        # number of per-item outputs to fan out from one wire response.
+        self._batch_size = batch_size
+        self._resolved = None
         self._finished = False
-        self._error = None
 
     @property
     def done(self) -> bool:
-        """True if the generation has completed (successfully or with error)."""
+        """True once the underlying request has completed (success or error)."""
         return self._finished
 
-    async def result(self, timeout: Optional[float] = None) -> Any:
-        """Wait for and return result (async version).
+    def __await__(self):
+        return self.aresult().__await__()
 
-        Can be awaited from any async context (e.g., FastAPI background tasks).
+    async def aresult(self, timeout: Optional[float] = None):
+        """Wait for the underlying request and return the resolved value.
+
+        For single-prompt requests, returns a :class:`VisualGenOutput`. Raises
+        :class:`RuntimeError` on underlying-request failure.
+
+        For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
+        raises; failed items carry ``error != None``.
         """
         if self._finished:
-            if self._error:
-                raise VisualGenError(self._error)
-            return self._result
+            return self._resolved_value()
 
-        # Use run_coroutine_threadsafe to execute in the background thread's event loop
         future = asyncio.run_coroutine_threadsafe(
             self.executor.await_responses(self.request_id, timeout=timeout),
             self.executor._event_loop,
         )
-
-        # Await the future in the current event loop
         response = await asyncio.wrap_future(future)
 
         if response is None:
-            raise VisualGenError("Generation timed out")
-
-        if response.error_msg:
-            self._error = response.error_msg
+            # Timeout before any response. Tell the executor to drop any
+            # late-arriving response for this id so a full PipelineOutput
+            # tensor does not leak into completed_responses for the process
+            # lifetime, then persist the timeout as resolved error state so
+            # subsequent aresult()/result() calls replay the same outcome
+            # via the ``self._finished`` fast path instead of returning None.
+            abandon_future = asyncio.run_coroutine_threadsafe(
+                self.executor.abandon_request_id(self.request_id),
+                self.executor._event_loop,
+            )
+            await asyncio.wrap_future(abandon_future)
+            if self._batch_size is None:
+                self._resolved = VisualGenOutput(
+                    request_id=self.request_id, error="Generation timed out"
+                )
+            else:
+                self._resolved = [
+                    VisualGenOutput(request_id=self.request_id, error="Generation timed out")
+                    for _ in range(self._batch_size)
+                ]
             self._finished = True
-            raise VisualGenError(f"Generation failed: {response.error_msg}")
+            return self._resolved_value()
 
-        self._result = response.output
+        self._resolved = self._build_resolved(response)
         self._finished = True
-        return self._result
+        return self._resolved_value()
 
-    def result_sync(self, timeout: Optional[float] = None) -> Any:
-        """Blocking wrapper around result() for non-async callers."""
+    def result(self, timeout: Optional[float] = None):
+        """Blocking variant of :meth:`aresult` for non-async callers.
+
+        Internally dispatches to the executor's background event loop, so it
+        works even when called from inside a different event loop's thread.
+        """
+        # Only the inner ``aresult`` carries a timeout; it owns the
+        # ``abandon_request_id`` cleanup on the timeout branch. A second
+        # ``timeout`` on ``future.result`` would let the cross-thread wait
+        # raise before that cleanup runs, so a late-arriving response could
+        # leak into ``completed_responses``.
         future = asyncio.run_coroutine_threadsafe(
-            self.result(timeout=timeout),
+            self.aresult(timeout=timeout),
             self.executor._event_loop,
         )
-        return future.result(timeout=timeout)
+        return future.result()
 
     def cancel(self):
         raise NotImplementedError("Cancel request (not yet implemented).")
+
+    # ----- internals -----
+
+    def _build_resolved(self, response: "DiffusionResponse"):
+        if self._batch_size is None:
+            return to_visual_gen_output(response)
+        return split_visual_gen_output(response, self._batch_size)
+
+    def _resolved_value(self):
+        # For single prompts, surface failure via RuntimeError. For batch,
+        # return the list as-is so callers can inspect per-item ``error``.
+        if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
+            if self._resolved.error is not None:
+                raise RuntimeError(f"Generation failed: {self._resolved.error}")
+        return self._resolved
 
 
 class VisualGen:
@@ -688,29 +765,27 @@ class VisualGen:
         self,
         inputs: Union[str, List[str]],
         params: Optional[VisualGenParams] = None,
-    ) -> MediaOutput:
+    ) -> Union[VisualGenOutput, List[VisualGenOutput]]:
         """Synchronous generation. Blocks until complete.
 
         Args:
-            inputs: Text prompt string or list of prompt strings.
-            params: Generation parameters (optional; uses model defaults when None).
+            inputs: Text prompt or list of prompts. A list triggers batch
+                inference and returns one :class:`VisualGenOutput` per prompt.
+            params: Single :class:`VisualGenParams` shared by every prompt
+                in the batch. A list of params is not yet supported.
 
         Returns:
-            MediaOutput: Generated media with model-specific fields populated:
-                - FLUX2: MediaOutput(image=torch.Tensor)
-                - WAN: MediaOutput(video=torch.Tensor)
-                - LTX2: MediaOutput(video=torch.Tensor, audio=torch.Tensor)
-        """
-        future = self.generate_async(
-            inputs=inputs,
-            params=params,
-        )
+            For a single prompt, a :class:`VisualGenOutput`. For a list of
+            prompts, ``List[VisualGenOutput]`` of the same length.
 
-        # Use the sync wrapper to get result
-        response = self.executor.await_responses_sync(future.request_id, timeout=None)
-        if response.error_msg:
-            raise VisualGenError(f"Generation failed: {response.error_msg}")
-        return response.output
+        Raises:
+            RuntimeError: Single-prompt path on underlying-request failure.
+                The batch path never raises on per-item or whole-batch
+                failure; failed items carry ``error != None``.
+            NotImplementedError: ``params`` is a list (per-item parameters
+                are not yet supported).
+        """
+        return self.generate_async(inputs=inputs, params=params).result(timeout=None)
 
     @set_api_status("prototype")
     def generate_async(
@@ -718,26 +793,41 @@ class VisualGen:
         inputs: Union[str, List[str]],
         params: Optional[VisualGenParams] = None,
     ) -> VisualGenResult:
-        """Async generation. Returns immediately with future-like object.
+        """Async generation. Returns a :class:`VisualGenResult` handle.
+
+        ``await`` on the handle (or :meth:`VisualGenResult.aresult`) resolves
+        to a :class:`VisualGenOutput` for single-prompt input or a
+        ``List[VisualGenOutput]`` for batch input.
 
         Args:
-            inputs: Text prompt string or list of prompt strings.
-            params: Generation parameters (optional; uses model defaults when None).
+            inputs: Text prompt or list of prompts.
+            params: Single :class:`VisualGenParams` shared by every prompt.
+                A list of params is not yet supported.
 
-        Returns:
-            VisualGenResult: Call result() to get output dict.
+        Raises:
+            ValueError: ``inputs`` is empty or contains non-strings.
+            NotImplementedError: ``params`` is a list.
         """
+        if isinstance(params, list):
+            raise NotImplementedError(
+                "Per-item params (List[VisualGenParams]) are not supported in this "
+                "release; pass a single VisualGenParams shared across the batch."
+            )
+
         req_id = next(self._req_counter)
 
-        # Normalize to List[str] for DiffusionRequest.prompt
+        # Normalize inputs to List[str] and remember whether the caller
+        # passed a single prompt so the handle resolves to the right shape.
         if isinstance(inputs, str):
             prompt = [inputs]
+            batch_size: Optional[int] = None
         elif isinstance(inputs, (list, tuple)):
             if not inputs:
                 raise ValueError("Batch inputs must contain at least one item")
             if not all(isinstance(item, str) for item in inputs):
                 raise ValueError("Batch inputs must contain only strings (prompt text)")
             prompt = list(inputs)
+            batch_size = len(prompt)
         else:
             raise ValueError(f"Invalid inputs type: {type(inputs)}")
 
@@ -750,7 +840,7 @@ class VisualGen:
         )
 
         self.executor.enqueue_requests([request])
-        return VisualGenResult(req_id, self.executor)
+        return VisualGenResult(req_id, self.executor, batch_size=batch_size)
 
     @staticmethod
     def _atexit_shutdown(self_ref):

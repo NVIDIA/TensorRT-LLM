@@ -33,9 +33,17 @@ def _has_fused_linear_fp8(gm):
 
 
 def _has_fused_finegrained_fp8_linear(gm):
-    """Check if FineGrained FP8 fake quant ops were replaced with TRT-LLM ops."""
+    """Check if FineGrained FP8 fake quant ops were replaced with TRT-LLM ops.
+
+    On SM100f, the fuse_finegrained_fp8_linear transform additionally swaps
+    fused nodes to ``trtllm_fp8_deepgemm`` when the weight is 128x128-aligned.
+    Either fused target counts as "successfully fused" for this check.
+    """
+    deepgemm_op = getattr(torch.ops.auto_deploy, "trtllm_fp8_deepgemm", None)
     found_fused = any(
-        is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear) for n in gm.graph.nodes
+        is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear)
+        or (deepgemm_op is not None and is_op(n, deepgemm_op))
+        for n in gm.graph.nodes
     )
     found_ref = any(
         is_op(n, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear)

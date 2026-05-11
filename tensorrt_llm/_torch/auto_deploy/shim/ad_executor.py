@@ -23,6 +23,7 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
@@ -32,11 +33,28 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager,
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler, TRTLLMSampler
+from tensorrt_llm._torch.pyexecutor.scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    RequestList,
+    ScheduledRequests,
+    SimpleScheduler,
+)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
@@ -47,27 +65,8 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.mapping import Mapping
 
-from ...._utils import get_free_port, mpi_rank, mpi_world_size
-from ....mapping import Mapping
-from ...distributed import Distributed
-from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
-from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
-from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import (
-    BaseResourceManager,
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
-from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
-from ...pyexecutor.scheduler import (
-    BindCapacityScheduler,
-    BindMicroBatchScheduler,
-    RequestList,
-    ScheduledRequests,
-    SimpleScheduler,
-)
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -771,6 +770,7 @@ class ADEngine(ModelEngine):
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
         prompt_lens: List[int] = []
         dummy_token = -1
+        has_context_multimodal_data = False
 
         # look at context requests first
         for request in context_requests:
@@ -793,6 +793,7 @@ class ADEngine(ModelEngine):
 
             # store extra arguments
             if request.py_multimodal_data is not None:
+                has_context_multimodal_data = True
                 for k, v in request.py_multimodal_data.items():
                     if k in _RESERVED_MM_DATA_KEYS:
                         continue
@@ -826,7 +827,7 @@ class ADEngine(ModelEngine):
                 slot_gather_indices.append(start)
                 flat_gather_indices.extend(range(start, start + (1 + draft_len) * stride, stride))
             else:
-                input_ids.append(request.get_token(0, request.get_num_tokens(0) - 1))
+                input_ids.append(request.get_last_tokens(0))
                 input_ids.extend([] if draft_len == 0 else request.py_draft_tokens)
 
             cu_seqlen.append(len(input_ids))
@@ -837,14 +838,21 @@ class ADEngine(ModelEngine):
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
         # store cache information for all requests now
+        _tokens_per_block = kv_cache_manager.tokens_per_block
+        _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
         cache_loc: List[int] = []
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
         state_slot_idx: List[int] = []
+
+        batch_cache_indices = kv_cache_manager.get_batch_cache_indices(
+            [r.py_request_id for r in ordered_requests]
+        )
+
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
             request.py_batch_idx = request.py_seq_slot
-            if hasattr(kv_cache_manager, "mamba_cache_index"):
+            if _use_mamba:
                 state_slot_idx_i = kv_cache_manager.mamba_cache_index[request.py_request_id]
             else:
                 state_slot_idx_i = request.py_seq_slot
@@ -853,10 +861,11 @@ class ADEngine(ModelEngine):
             # get some info on the current request
             seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
             end_compute_i = input_pos[i] + seq_len_i
-            num_active_blocks_i = kv_cache_manager.get_num_kv_blocks(end_compute_i)
+            # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
+            num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
             # construct cache information for the current request
-            cache_indices = kv_cache_manager.get_cache_indices(request)
+            cache_indices = batch_cache_indices[i]
             cache_loc.extend(cache_indices[:num_active_blocks_i])
             cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
             if len(cache_indices) > num_active_blocks_i:
@@ -910,6 +919,7 @@ class ADEngine(ModelEngine):
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
+        self.iter_states["has_context_multimodal_data"] = has_context_multimodal_data
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_decode_tokens + num_extend_tokens
         self.iter_states["ordered_requests"] = ordered_requests
@@ -923,6 +933,12 @@ class ADEngine(ModelEngine):
             model_output = self.model(**csi.named_args, cache_seq_interface=csi)
         else:
             model_output = self.model(**csi.named_args)
+        if self.iter_states.get("has_context_multimodal_data", False):
+            # Multimodal prefill can leave image/context work in flight on the execution
+            # stream after model.forward returns. Synchronize before the overlap scheduler
+            # advances to the next step so later batch-state reuse does not race that work
+            # and surface as a delayed CUDA illegal memory access.
+            torch.cuda.current_stream().synchronize()
 
         # construct output dictionary
         if isinstance(model_output, abc.Mapping):
@@ -1168,7 +1184,11 @@ def instantiate_sampler(
     return sampler
 
 
-def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[TokenizerBase] = None):
+def create_autodeploy_executor(
+    ad_config: LlmArgs,
+    tokenizer: Optional[TokenizerBase] = None,
+    resource_governor_queue=None,
+):
     """Create an AutoDeploy executor from the given configuration and tokenizer.
     The tokenizer is required for guided decoding.
 
@@ -1366,5 +1386,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
         drafter=drafter,
+        resource_governor_queue=resource_governor_queue,
     )
     return py_executor

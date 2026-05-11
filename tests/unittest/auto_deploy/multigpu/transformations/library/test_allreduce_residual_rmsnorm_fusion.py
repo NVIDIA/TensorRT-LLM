@@ -3,6 +3,7 @@
 import pytest
 import torch
 from _dist_test_utils import get_device_counts
+from torch.distributed import DistNetworkError
 from torch.export import export
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
@@ -65,7 +66,7 @@ class AllreduceResidualNorm2(torch.nn.Module):
         return normed, y
 
 
-def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
+def _test_allreduce_fusion(port: int, ModuleCls, strategy: str, rmsnorm_op: str):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
@@ -87,22 +88,30 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
         # Run the original
         original_outputs, residual_original = gm(x, residual)
 
-        # Fuse ops with the specified strategy
-        gm_transformed = InferenceOptimizer(
-            None,
-            {
-                "match_rmsnorm_pattern": {
-                    "stage": "pattern_matcher",
-                },
-                "detect_sharding": {
-                    "stage": "post_export",
-                    "allreduce_strategy": strategy,
-                },
-                "fuse_allreduce_residual_rmsnorm": {
-                    "stage": "post_load_fusion",
-                },
+        # Build optimizer config. When testing the triton rmsnorm variant, run
+        # `fuse_rmsnorm` (with rmsnorm_backend="triton") before
+        # `fuse_allreduce_residual_rmsnorm` so the graph contains triton_rms_norm
+        # ops at the time the allreduce-residual-rmsnorm fusion runs.
+        optimizer_config = {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
             },
-        )(None, gm)
+            "detect_sharding": {
+                "stage": "post_export",
+                "allreduce_strategy": strategy,
+            },
+        }
+        if rmsnorm_op == "triton_rms_norm":
+            optimizer_config["fuse_rmsnorm"] = {
+                "stage": "post_load_fusion",
+                "rmsnorm_backend": "triton",
+            }
+        optimizer_config["fuse_allreduce_residual_rmsnorm"] = {
+            "stage": "post_load_fusion",
+        }
+
+        # Fuse ops with the specified strategy
+        gm_transformed = InferenceOptimizer(None, optimizer_config)(None, gm)
 
         # Run the fused graph
         fused_outputs, residual_fused = gm_transformed(x, residual)
@@ -149,19 +158,43 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
     ["AUTO", "NCCL", "ONESHOT"],
     ids=["strategy_auto", "strategy_nccl", "strategy_oneshot"],
 )
-def test_allreduce_fusion(device_count, ModuleCls, strategy):
+@pytest.mark.parametrize(
+    "rmsnorm_op",
+    ["torch_rmsnorm", "triton_rms_norm"],
+    ids=["rmsnorm_torch", "rmsnorm_triton"],
+)
+def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
+    # Test the allreduce, residual, and rmsnorm fusion.
+    # MpiPoolSession is required because the test exercises trtllm's MPI-mode allreduce ops,
+    # which only activate when is_ompi() is true.
     if device_count <= 1:
         pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
-    port = get_free_port()
 
     n_workers = device_count
-    mpi_pool = MpiPoolSession(n_workers=n_workers)
-    try:
-        mpi_pool.submit_sync(
-            _test_allreduce_fusion,
-            port=port,
-            ModuleCls=ModuleCls,
-            strategy=strategy,
-        )
-    finally:
-        mpi_pool.shutdown()
+    # Retry on EADDRINUSE: there is a Time-of-check-to-time-of-use (TOCTOU) race between get_free_port() in
+    # the parent and dist.init_process_group("nccl") in the workers. The
+    # spawn_multiprocess_job path handles this internally; the MpiPoolSession
+    # path used here does not, so retry with a fresh port and pool.
+    max_retries = 5
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        port = get_free_port()
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
+        try:
+            mpi_pool.submit_sync(
+                _test_allreduce_fusion,
+                port=port,
+                ModuleCls=ModuleCls,
+                strategy=strategy,
+                rmsnorm_op=rmsnorm_op,
+            )
+            return
+        except DistNetworkError as e:
+            last_exc = e
+            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
+                raise
+        finally:
+            mpi_pool.shutdown()
+    raise RuntimeError(
+        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
+    ) from last_exc

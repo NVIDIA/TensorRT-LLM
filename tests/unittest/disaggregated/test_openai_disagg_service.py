@@ -1,12 +1,33 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 import torch
 
 from tensorrt_llm.executor.result import Logprob
-from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
+from tensorrt_llm.llmapi.disagg_utils import (
+    DisaggClusterConfig,
+    DisaggServerConfig,
+    MinimalInstances,
+    ServerRole,
+)
+from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -77,6 +98,34 @@ async def _mock_streaming_response(chunks):
     for chunk in chunks:
         await asyncio.sleep(0)
         yield chunk
+
+
+@pytest.mark.asyncio
+async def test_is_ready_waits_for_router_preparation():
+    service = _make_service("context_first")
+    cluster_manager = DisaggClusterManager(
+        DisaggClusterConfig(
+            cluster_uri="http://localhost:18000",
+            minimal_instances=MinimalInstances(context_servers=1, generation_servers=1),
+        ),
+        AsyncMock(),
+    )
+    service._disagg_cluster_manager = cluster_manager
+
+    cluster_manager._current_ctx_workers["ctx"] = WorkerInfo(
+        worker_id="ctx", role=ServerRole.CONTEXT
+    )
+    service._ctx_router = SimpleNamespace(num_prepared_servers=0)
+    service._gen_router = SimpleNamespace(num_prepared_servers=1)
+    assert await service.is_ready() is False
+
+    service._ctx_router.num_prepared_servers = 1
+    assert await service.is_ready() is False
+
+    cluster_manager._current_gen_workers["gen"] = WorkerInfo(
+        worker_id="gen", role=ServerRole.GENERATION
+    )
+    assert await service.is_ready() is True
 
 
 @pytest.mark.asyncio
