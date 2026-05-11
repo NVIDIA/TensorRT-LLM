@@ -79,6 +79,30 @@ class AlltoallMethodType(IntEnum):
     DeepEPLowLatency = 4
 
 
+class MoESchedulerKind(Enum):
+    """Selects which forward-execution scheduler ConfigurableMoE picks for a backend.
+
+    Backends declare this via the ``scheduler_kind`` class attribute on
+    ``MoE``. ``ConfigurableMoE`` reads it once at init time to construct the
+    matching scheduler and to gate communication-strategy creation.
+
+    The axis is whether the cross-rank EP exchange is fused into the MoE
+    kernel or is a separate host-orchestrated step:
+
+    - ``EXTERNAL_COMM``: comm lives outside the MoE kernel boundary; the
+      scheduler issues ``Communication.dispatch`` / ``Communication.combine``
+      from the host with per-chunk EPLB hooks and optional multi-stream
+      chunk overlap (Cutlass, DeepGemm, CuteDSL, DenseGEMM, TRTLLMGen).
+    - ``FUSED_COMM``: comm is fused into the backend's fused kernel via
+      NVLink SymmBuffer (DeepGEMM ``fp8_fp4_mega_moe``). No host comm;
+      lockstep chunk launches; EPLB statistic update with
+      ``ignore_allreduce=False``.
+    """
+
+    EXTERNAL_COMM = "external_comm"
+    FUSED_COMM = "fused_comm"
+
+
 def extract_extra_attrs(layer_idx: str):
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Model extra attrs are not set"
@@ -169,6 +193,11 @@ class MoE(nn.Module):
         model_config (ModelConfig): Configuration object for the model.
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
+
+    # Default scheduler kind for ConfigurableMoE forward dispatch. Backends
+    # whose fused kernel owns cross-rank exchange (e.g. MegaMoE-style)
+    # override this to ``MoESchedulerKind.FUSED_COMM``.
+    scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
 
     @classmethod
     @abstractmethod
@@ -485,6 +514,18 @@ class MoE(nn.Module):
         Subclasses can override this to indicate load balancer support.
         """
         return False
+
+    def validate_configurable_moe(self, moe: "nn.Module") -> None:
+        """Backend-specific validation hook called by ``ConfigurableMoE``.
+
+        ``ConfigurableMoE.validate_backend`` invokes this AFTER the generic
+        EPLB/load-balancer compatibility check, so backends may inspect
+        ``moe.num_slots``, ``moe.ep_size``, ``moe._using_load_balancer()``,
+        ``moe._using_dynamic_load_balancer()``. Default is a no-op; backends
+        with extra constraints (e.g. fused-comm backends rejecting
+        dynamic EPLB) override this.
+        """
+        del moe
 
     def _using_load_balancer(self) -> bool:
         """Check if this MoE is using load balancer."""

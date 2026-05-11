@@ -34,6 +34,15 @@ class CacheTier(enum.IntEnum):
     DISK = 2
 
 
+class PageIndexMode(enum.IntEnum):
+    # Converted index list is shared across layers in the same LayerGroup.
+    # Base pointer is per-layer (includes attr.offset).
+    SHARED = 0
+    # Converted index list is per-layer.
+    # Base pointer is shared (pool group base, no attr.offset).
+    PER_LAYER = 1
+
+
 CacheLevel = NewType("CacheLevel", int)
 
 GPU_LEVEL: Final[CacheLevel] = CacheLevel(0)

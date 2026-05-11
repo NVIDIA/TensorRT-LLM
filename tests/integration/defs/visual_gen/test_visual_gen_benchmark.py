@@ -255,7 +255,8 @@ def test_online_benchmark(
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_e2e_latency_ms" in data
+    assert "mean_latency" in data
+    assert "mean_generation" in data
 
 
 # ===========================================================================
@@ -319,4 +320,5 @@ def test_offline_benchmark(tmp_path):
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_e2e_latency_ms" in data
+    assert "mean_latency" in data
+    assert "mean_generation" in data

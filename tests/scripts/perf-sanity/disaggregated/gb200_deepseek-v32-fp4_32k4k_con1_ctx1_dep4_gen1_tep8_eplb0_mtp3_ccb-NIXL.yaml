@@ -73,7 +73,7 @@ worker_config:
     disable_overlap_scheduler: true
     speculative_config: &id001
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     num_postprocess_workers: 4
     stream_interval: 20
     nvfp4_gemm_config:

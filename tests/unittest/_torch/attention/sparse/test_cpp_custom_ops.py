@@ -16,13 +16,22 @@
 
 - ``torch.ops.trtllm.indexer_k_cache_gather_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
+- ``torch.ops.trtllm.fused_cat_fp4``
 """
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 # Import tensorrt_llm to load C++ custom operators
 import tensorrt_llm  # noqa: F401
+
+try:
+    from tensorrt_llm.deep_gemm.utils.math import per_token_cast_to_fp4
+
+    HAS_DEEPGEMM_REF = True
+except ImportError:
+    HAS_DEEPGEMM_REF = False
 
 # ---------------------------------------------------------------------------
 # Constants matching the C++ kernel (DeepSeek-V3.2 indexer config)
@@ -152,7 +161,7 @@ def test_indexer_k_cache_gather_contiguous(
 
     # C++ op
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens, HEAD_DIM
     )
 
     # Reference
@@ -219,7 +228,7 @@ def test_indexer_k_cache_gather_noncontiguous(
 
     # C++ op (handles non-contiguous strides internally)
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens
+        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens, HEAD_DIM
     )
 
     # Reference uses contiguous copy
@@ -237,6 +246,63 @@ def test_indexer_k_cache_gather_noncontiguous(
     )
 
 
+@pytest.mark.parametrize(
+    "total_kv_len,num_blocks,block_size,k_token_start,num_tokens",
+    [
+        # FP4 indexer K cache layout: 64 bytes of packed E2M1 codes (two per
+        # byte) + 4 bytes of int32 scale (four UE8M0 exponents packed
+        # little-endian) = 68 bytes per token. The gather op must accept
+        # head_dim=64 and return (num_tokens, 64) bytes that the caller
+        # reinterprets as int8 via .view(torch.int8).
+        (64, 8, 8, 0, 64),
+        (128, 16, 8, 32, 64),
+        (512, 64, 8, 100, 300),
+    ],
+)
+def test_indexer_k_cache_gather_contiguous_fp4(
+    total_kv_len,
+    num_blocks,
+    block_size,
+    k_token_start,
+    num_tokens,
+):
+    """Exercise the FP4 cache layout (head_dim=64, per-token size=68 B)."""
+    device = torch.device("cuda")
+    fp4_head_dim = 64
+    fp4_bytes_per_token = fp4_head_dim + SCALE_BYTES  # 68
+
+    k_cache = torch.randint(
+        0,
+        256,
+        (num_blocks, block_size, 1, fp4_bytes_per_token),
+        dtype=torch.uint8,
+        device=device,
+    )
+    total_slots = num_blocks * block_size
+    perm = torch.randperm(total_slots, device=device)[:total_kv_len]
+    flat_starts = perm.to(torch.int64) * fp4_bytes_per_token
+    slot_fp8 = flat_starts
+    slot_scale = flat_starts + fp4_head_dim
+
+    cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
+        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens, fp4_head_dim
+    )
+
+    # Reference: flat-byte gather mirroring the C++ op.
+    k_cache_flat = k_cache.contiguous().reshape(-1)
+    fp8_bases = slot_fp8[k_token_start : k_token_start + num_tokens]
+    byte_offsets_fp8 = torch.arange(fp4_head_dim, device=device, dtype=torch.int64)
+    ref_fp8 = k_cache_flat[fp8_bases.unsqueeze(1) + byte_offsets_fp8.unsqueeze(0)]
+    scale_bases = slot_scale[k_token_start : k_token_start + num_tokens]
+    byte_offsets_scale = torch.arange(SCALE_BYTES, device=device, dtype=torch.int64)
+    ref_scale = k_cache_flat[scale_bases.unsqueeze(1) + byte_offsets_scale.unsqueeze(0)]
+
+    assert cpp_fp8.shape == (num_tokens, fp4_head_dim)
+    assert cpp_scale.shape == (num_tokens, 1)
+    assert torch.equal(cpp_fp8.view(torch.uint8), ref_fp8), "FP4 gather data mismatch"
+    assert torch.equal(cpp_scale.view(torch.uint8), ref_scale), "FP4 gather scale mismatch"
+
+
 def test_indexer_k_cache_gather_empty():
     """Zero-length gather should return correctly shaped empty tensors."""
     device = torch.device("cuda")
@@ -245,7 +311,7 @@ def test_indexer_k_cache_gather_empty():
     slot_scale = torch.zeros(10, dtype=torch.int64, device=device)
 
     k_fp8, k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0
+        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0, head_dim=HEAD_DIM
     )
 
     assert k_fp8.shape == (0, HEAD_DIM)
@@ -419,3 +485,137 @@ def test_convert_req_index_to_global_block_table_padding():
     )
 
     assert (out == -1).all(), "All outputs should be -1 when block_table is all padding"
+
+
+# ===================================================================
+# Test 3: fused_cat_fp4 — bit-exact vs DeepGEMM per_token_cast_to_fp4
+# ===================================================================
+
+
+@pytest.mark.skipif(
+    not HAS_DEEPGEMM_REF,
+    reason="tensorrt_llm.deep_gemm.utils.math.per_token_cast_to_fp4 unavailable",
+)
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4, 128),
+        (1, 32, 128),
+        (3, 7, 128),
+        (2, 5, 4, 128),
+    ],
+)
+@pytest.mark.parametrize("seed", [0, 42, 2026])
+def test_fused_cat_fp4_matches_deepgemm(shape, seed):
+    """Packed bytes and UE8M0 scale int32 must match DeepGEMM byte-for-byte."""
+    torch.manual_seed(seed)
+    head_dim = shape[-1]
+    leading = shape[:-1]
+    rope_dim = head_dim // 2
+    pe = torch.randn(*leading, rope_dim, device="cuda", dtype=torch.bfloat16)
+    nope = torch.randn(*leading, head_dim - rope_dim, device="cuda", dtype=torch.bfloat16)
+
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(pe, nope)
+
+    # Reference expects 2D (M, head_dim); flatten leading dims.
+    cat_2d = torch.cat([pe, nope], dim=-1).reshape(-1, head_dim).contiguous()
+    ref_packed, ref_scale = per_token_cast_to_fp4(
+        cat_2d, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+
+    M = packed.size(0)
+    assert packed.shape == (M, head_dim // 2)
+    assert scale.shape == (M, 1)
+    assert torch.equal(
+        packed.view(-1).contiguous(),
+        ref_packed.reshape(-1).to(torch.int8).contiguous(),
+    ), "FP4 packed bytes mismatch vs DeepGEMM reference"
+    assert torch.equal(
+        scale.view(-1).contiguous(),
+        ref_scale.reshape(-1).to(torch.int32).contiguous(),
+    ), "UE8M0 scale int32 mismatch vs DeepGEMM reference"
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "pe_dim,nope_dim",
+    [
+        (64, 64),
+        (32, 96),
+        (16, 112),
+        (96, 32),
+    ],
+)
+def test_fused_cat_fp4_shape_dispatch(pe_dim, nope_dim):
+    """Verify the op handles asymmetric pe/nope splits and returns correct shapes."""
+    torch.manual_seed(0)
+    M = 8
+    pe = torch.randn(M, pe_dim, device="cuda", dtype=torch.bfloat16)
+    nope = torch.randn(M, nope_dim, device="cuda", dtype=torch.bfloat16)
+
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(pe, nope)
+
+    assert packed.dtype == torch.int8
+    assert scale.dtype == torch.int32
+    assert packed.shape == (M, (pe_dim + nope_dim) // 2)
+    assert scale.shape == (M, 1)
+
+
+@skip_pre_blackwell
+def test_fused_cat_fp4_noncontiguous_split():
+    """Op must accept non-contiguous pe/nope views from torch.split()."""
+    torch.manual_seed(0)
+    M = 16
+    head_dim = 128
+    x = torch.randn(M, head_dim, device="cuda", dtype=torch.bfloat16)
+    pe, nope = x.split([head_dim // 2, head_dim // 2], dim=-1)
+    assert not pe.is_contiguous()
+
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(pe, nope)
+
+    # Contiguous reference via pre-materialized copies.
+    packed_ref, scale_ref = torch.ops.trtllm.fused_cat_fp4(pe.contiguous(), nope.contiguous())
+
+    assert torch.equal(packed, packed_ref)
+    assert torch.equal(scale, scale_ref)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "num_tokens,n_heads",
+    [
+        # DSV3.2 production shapes from the 8192-token prefill warmup that
+        # caused CUDA illegal-memory-access in test_nvfp4_multi_gpus[fp4_indexer]:
+        # q has shape (num_tokens, n_heads=64, head_dim=128) and is split into
+        # q_pe / q_nope along dim -1 — pe/nope are 3D non-contiguous views with
+        # stride(-2) = 128 (inherited from the pre-split tensor).
+        (24, 64),  # generation-warmup batch size with n_heads=64
+        (2048, 64),  # smaller prefill chunk
+        (8192, 64),  # full prefill warmup
+    ],
+)
+def test_fused_cat_fp4_dsv32_prefill_shape(num_tokens, n_heads):
+    """Reproduces the 3D split pattern the real DSV3.2 model feeds to
+    fused_cat_fp4 during prefill, across growing token counts.
+
+    After `q.view(-1, n_heads, head_dim).split([64, 64], dim=-1)`:
+      q_pe   shape (num_tokens, n_heads, 64), stride (n_heads*128, 128, 1)
+      q_nope shape (num_tokens, n_heads, 64), stride (n_heads*128, 128, 1)
+    """
+    torch.manual_seed(0)
+    head_dim = 128
+    q = torch.randn(num_tokens, n_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    q_pe, q_nope = q.split([head_dim // 2, head_dim // 2], dim=-1)
+    assert not q_pe.is_contiguous()
+    assert q_pe.stride(-2) == head_dim, f"expected stride(-2)={head_dim}, got {q_pe.stride(-2)}"
+
+    packed, scale = torch.ops.trtllm.fused_cat_fp4(q_pe, q_nope)
+
+    assert packed.shape == (num_tokens * n_heads, head_dim // 2)
+    assert scale.shape == (num_tokens * n_heads, 1)
+
+    # Bit-exact vs contiguous copies — stride independence.
+    packed_ref, scale_ref = torch.ops.trtllm.fused_cat_fp4(q_pe.contiguous(), q_nope.contiguous())
+    assert torch.equal(packed, packed_ref)
+    assert torch.equal(scale, scale_ref)

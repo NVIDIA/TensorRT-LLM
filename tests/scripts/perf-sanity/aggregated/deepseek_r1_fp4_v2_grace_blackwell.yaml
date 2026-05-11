@@ -32,7 +32,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
     client_configs:
       - name: "con1024_iter10_1k1k"
         concurrency: 1024
@@ -63,7 +63,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con32_iter10_1k1k"
         concurrency: 32
@@ -94,7 +94,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con2_iter10_1k1k"
         concurrency: 2
@@ -130,7 +130,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
     client_configs:
       - name: "con256_iter10_8k1k"
         concurrency: 256
@@ -161,7 +161,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con32_iter10_8k1k"
         concurrency: 32
@@ -192,7 +192,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con2_iter10_8k1k"
         concurrency: 2
@@ -228,7 +228,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
     client_configs:
       - name: "con2048_iter5_1k8k"
         concurrency: 2048
@@ -259,7 +259,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con32_iter10_1k8k"
         concurrency: 32
@@ -290,7 +290,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con4_iter10_1k8k"
         concurrency: 4

@@ -168,6 +168,8 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
                 # CUTLASS and others use weight_alignment for both
                 quant_kwargs["weight_alignment"] = 128
                 quant_kwargs["input_hidden_alignment"] = 128
+            elif backend_name == "MEGAMOE_DEEPGEMM":
+                quant_kwargs["ref_cls"] = MXFP4MXFP8RefMegaMoEDeepGemm
     elif quant_algo == QuantAlgo.W4A16_MXFP4:
         quantize_util_cls = WFP4A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
@@ -1344,6 +1346,41 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
             check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=0.85)
 
 
+class MXFP4MXFP8RefMegaMoEDeepGemm(MXFP4MXFP8RefGatedMLPFusedMoE):
+    """Reference matching DeepGEMM MegaMoE's pre-L2 routing-weight placement."""
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        if self.hidden_size_unpadded < self.hidden_size:
+            pad_size = self.hidden_size - self.hidden_size_unpadded
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, pad_size))
+
+        assert hidden_states.shape[-1] == self.hidden_size
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        selected_experts, routing_weights = self.routing_method.apply(router_logits)
+        final_hidden_states = torch.zeros(
+            hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        for expert_id in range(self.num_experts):
+            if not torch.any(selected_experts == expert_id):
+                continue
+            batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+            expert_inputs = hidden_states[batch_idx]
+            expert = self.experts[expert_id]
+            l1_output = expert.gate_up_proj(expert_inputs)
+            act_output = expert._apply_activation(l1_output)
+            act_output = act_output * routing_weights[batch_idx, nth_expert, None].to(
+                act_output.dtype
+            )
+            output = expert.down_proj(act_output)
+            final_hidden_states[batch_idx] += output.float()
+
+        final_hidden_states = final_hidden_states.reshape(hidden_states.shape)
+        if self.hidden_size_unpadded < self.hidden_size:
+            final_hidden_states = final_hidden_states[:, : self.hidden_size_unpadded]
+        return final_hidden_states
+
+
 class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
     """
     MXFP4MXFP8QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing
@@ -1364,23 +1401,29 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
         Returns:
             (backend_weights, ref_weights, ref_module_kwargs)
         """
-        # Get actual shapes from backend
+        # Get actual shapes from backend.  MoE TP stores per-rank
+        # intermediate shards, but the checkpoint-style weights passed to
+        # load_weights are global and are sharded by the loader.
         num_elts_per_dtype = torch.iinfo(backend.quant_method.weight_dtype).bits // 4
         hidden_size_in = backend.w3_w1_weight.shape[-1] * num_elts_per_dtype
         # hidden_size_out_padded is used for weight creation (padded value)
         hidden_size_out_padded = backend.w2_weight.shape[-2]
-        inter_size = backend.w2_weight.shape[-1] * num_elts_per_dtype
+        local_inter_size = backend.w2_weight.shape[-1] * num_elts_per_dtype
+        tp_size = getattr(backend, "tp_size", 1)
+        inter_size = local_inter_size * tp_size
         weight_align = backend.quant_method.weight_alignment
         input_hidden_align = getattr(backend.quant_method, "input_hidden_alignment", weight_align)
 
-        # Backend weights: contamination padding
+        # Backend weights: TP pads global checkpoint weights before sharding.
+        # The padded intermediate extent participates in CUTLASS kernels, so
+        # zero TP padding to preserve the original unpadded model semantics.
         backend_kwargs = dict(
             quant_kwargs,
             hidden_size_in=hidden_size_in,
             hidden_size_out=hidden_size_out_padded,
             intermediate_size=inter_size,
             input_hidden_alignment=input_hidden_align,
-            pad_zero_or_val=False,
+            pad_zero_or_val=tp_size > 1,
             bias=self.bias,  # Pass bias from self to create bias weights
         )
         backend_weights = self.create_weights(**backend_kwargs)

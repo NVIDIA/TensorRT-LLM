@@ -212,7 +212,9 @@ def test_starcoder2_attention_equivalence(B, S, dtype):
     # Compute custom position embeddings (full table, slicing happens inside attention)
     head_dim = config.hidden_size // config.num_attention_heads
     custom_rotary = Starcoder2RotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=config.rope_parameters["rope_theta"],
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x)  # full tables [max_seq_len, head_dim]
@@ -283,7 +285,9 @@ def test_starcoder2_decoder_layer_equivalence(B, S, dtype):
     # Compute custom position embeddings (full table, slicing happens inside attention)
     head_dim = config.hidden_size // config.num_attention_heads
     custom_rotary = Starcoder2RotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=config.rope_parameters["rope_theta"],
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x)  # full tables

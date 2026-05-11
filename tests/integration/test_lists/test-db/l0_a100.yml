@@ -35,6 +35,9 @@ l0_a100:
     - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[qwen2-7b]
     - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[qwen3-0.6b]
     - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[starcoder2-3b]
+    # Moved from l0_a10.yml: Llama-7B + KV cache + spec resources OOM on A10's 22 GB.
+    - test_e2e.py::test_openai_lora
+    - test_e2e.py::test_trtllm_serve_lora_example
 - condition:
     ranges:
       system_gpu_count:

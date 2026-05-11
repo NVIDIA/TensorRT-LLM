@@ -26,6 +26,22 @@ include(sanitizers)
 
 project(tensorrt_llm LANGUAGES CXX)
 
+# Single source of truth for the inline ABI namespace. Read by both the C++ side
+# (via tensorrt_llm/common/config.h's `#ifndef TRTLLM_ABI_NAMESPACE` guard) and
+# the cubin INCBIN aggregator (cpp/cmake/modules/ tllm_cubin_archive.cmake bakes
+# the same value into Itanium-mangled linker names). Override at configure time
+# with `-DTRTLLM_ABI_NAMESPACE=_v2` to ship a parallel ABI version that won't
+# collide at static-link time. The compile definition propagates to every C++ TU
+# under this directory so the macro expansion stays in sync with the CMake
+# variable.
+set(TRTLLM_ABI_NAMESPACE
+    "_v1"
+    CACHE
+      STRING
+      "Inline namespace used to version the TRT-LLM ABI (see tensorrt_llm/common/config.h)."
+)
+add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
+
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
