@@ -913,5 +913,38 @@ class TestResourceManager(unittest.TestCase):
         self.assertTrue(peft_cache_manager.impl.enabled)
 
 
+def test_torch_sampler_args_overlap_doubles_slot_pool():
+    """Regression: under overlap + PP=1 the slot pool must be 2 * max_batch_size
+    so finished previous-iter requests holding slots cannot starve the next
+    iter's prepare_resources (nvbugs/disagg + max_batch_size=2 + ADP)."""
+    from tensorrt_llm._torch.pyexecutor._util import create_torch_sampler_args
+
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+
+    overlap_args = create_torch_sampler_args(
+        mapping,
+        max_seq_len=64,
+        max_batch_size=2,
+        speculative_config=None,
+        max_beam_width=1,
+        disable_overlap_scheduler=False,
+        disable_flashinfer_sampling=False,
+        enable_async_worker=False,
+    )
+    assert overlap_args.max_num_sequences == 4
+
+    no_overlap_args = create_torch_sampler_args(
+        mapping,
+        max_seq_len=64,
+        max_batch_size=2,
+        speculative_config=None,
+        max_beam_width=1,
+        disable_overlap_scheduler=True,
+        disable_flashinfer_sampling=False,
+        enable_async_worker=False,
+    )
+    assert no_overlap_args.max_num_sequences == 2
+
+
 if __name__ == "__main__":
     unittest.main()
