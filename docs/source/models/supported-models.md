@@ -23,9 +23,9 @@ The following is a table of supported models for the PyTorch backend:
 | `GraniteForCausalLM` [^14]           | Granite 3.x                        | `ibm-granite/granite-3.3-8b-instruct`        |
 | `GraniteMoeHybridForCausalLM` [^15]  | Granite 4.0 Hybrid MoE             | `ibm-granite/granite-4.0-h-small`            |
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
-| `HunYuanDenseForCausalLM` [^16]      | Hunyuan Dense                      | `tencent/Hunyuan-7B-Instruct`                |
+| `HunYuanDenseForCausalLM` [^14]      | Hunyuan Dense                      | `tencent/Hunyuan-7B-Instruct`                |
 | `HunYuanMoEForCausalLM` [^17]        | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
-| `InternLM3ForCausalLM` [^18]         | InternLM3                          | `internlm/internlm3-8b-instruct`             |
+| `InternLM3ForCausalLM` [^14]         | InternLM3                          | `internlm/internlm3-8b-instruct`             |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
@@ -36,8 +36,8 @@ The following is a table of supported models for the PyTorch backend:
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
 | `NemotronHForCausalLM`               | Nemotron-3-Nano, Nemotron-3-Super  | `nvidia/nvidia-nemotron-v3`                  |
 | `NemotronNASForCausalLM`             | NemotronNAS                        | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`     |
-| `Olmo3ForCausalLM` [^19]             | OLMo 3, OLMo 3.1                   | `allenai/Olmo-3.1-32B-Instruct`              |
-| `OpenELMForCausalLM` [^20]           | OpenELM                            | `apple/OpenELM-270M-Instruct`                |
+| `Olmo3ForCausalLM` [^14]             | OLMo 3, OLMo 3.1                   | `allenai/Olmo-3.1-32B-Instruct`              |
+| `OpenELMForCausalLM` [^18]           | OpenELM                            | `apple/OpenELM-270M-Instruct`                |
 | `Phi3ForCausalLM`                    | Phi-4                              | `microsoft/Phi-4`                            |
 | `Qwen2ForCausalLM`                   | QwQ, Qwen2                         | `Qwen/Qwen2-7B-Instruct`                     |
 | `Qwen2ForProcessRewardModel`         | Qwen2-based                        | `Qwen/Qwen2.5-Math-PRM-7B`                   |
@@ -46,9 +46,9 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
 | `Qwen3_5MoeForCausalLM` [^5]         | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
-| `SeedOssForCausalLM` [^21]           | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
-| `SkyworkR1V2ForConditionalGeneration` [^22] | Skywork R1V2, Skywork SWE   | `Skywork/Skywork-R1V2-38B`                   |
-| `SmolLM3ForCausalLM` [^23]           | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
+| `SeedOssForCausalLM` [^14]           | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
+| `SkyworkR1V2ForConditionalGeneration` [^14] | Skywork R1V2, Skywork SWE   | `Skywork/Skywork-R1V2-38B`                   |
+| `SmolLM3ForCausalLM` [^14]           | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
 
 
 ## Model-Feature Support Matrix (Key Models)
@@ -84,14 +84,8 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^13]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/exaone.yaml).
 [^14]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^15]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample AD configs for [micro](../../../examples/auto_deploy/model_registry/configs/granite_4.0_micro.yaml), [h-small](../../../examples/auto_deploy/model_registry/configs/granite_4.0_h_small.yaml), and [tiny-preview](../../../examples/auto_deploy/model_registry/configs/granite_4.0_tiny_preview.yaml).
-[^16]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^17]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/hunyuan_a13b_ep.yaml).
-[^18]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^19]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^20]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/openelm.yaml).
-[^21]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^22]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^23]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^18]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/openelm.yaml).
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
