@@ -180,6 +180,18 @@ static_assert(MAX_CANDIDATES % BLOCK_SIZE == 0);
 // Phase-1 pmean lands near the right tail of the prev-row top-K, so the
 // Phase-2 secant initial bracket is biased high. A tighter K-proportional
 // target converges faster than the M=2048 era's flat target.
+//
+// `kFTarget` is the secant solver's **soft steering target**, not the
+// convergence condition. The Phase-2 loop converges whenever the
+// candidate count falls within `[kK, kCC]` (see the `done = 1` check at
+// the end of `gvrTopKJob`'s P1+P2 scope). A `kFTarget` below `kK` is
+// intentional and useful for small K — with preIdx-seeded P1 landing
+// the initial threshold near the right tail of the prev-row top-K, the
+// secant's first interpolation often overshoots; biasing the target
+// below kK pulls the next iteration's threshold down more aggressively
+// and reaches the legal `[kK, kCC]` band in fewer secant steps. The
+// concrete multipliers below were tuned empirically over V4 M=K cells
+// (commit 8 in this PR):
 //   K=512:  0.75K = 384
 //   K=1024: 2.5K  = 2560
 //   K=2048: kept at 1.5K (3072) for fp32 to preserve SASS byte-identity
@@ -498,16 +510,12 @@ __device__ __forceinline__ void blockFusedSnapIter(SmemT* smem, int count, int t
 // ============================================================================
 // Dtype-templated helpers (bf16 / fp16)
 // ============================================================================
-// Mirror blockCountGE / blockFusedSnapIter for bf16/fp16 inputs. fp32
-// path uses the originals.
-//
-// blockCountGEDtype:
-//   - 8-wide vector load (int4 = 8 × 16-bit) instead of 4-wide (float4 = 4 × fp32)
-//   - up-cast each element to fp32 before threshold compare
-//
-// blockFusedSnapIterDtype:
-//   - reads SmemKey (bf16 / fp16) from smem->keys, up-casts to fp32 for
-//     min/max/count work; threshold remains fp32.
+// Mirror of `blockCountGE` for bf16/fp16 inputs (8-wide vector load via
+// `Trait::unpack8` + fp32 up-cast before threshold compare). The Phase-4
+// snap iter is NOT mirrored: `gvrTopKJobDtype` stores smem `keys[]` as
+// fp32 even on bf16/fp16 paths (deferred-conversion optimization, see
+// the `gvrTopKJobDtype` comment block below), so it reuses the fp32
+// `blockFusedSnapIter<TopK>` helper directly.
 
 // Templated on SmemT so K=512/1024 dtype paths can pass a kC=5120 layout.
 // Default targets the K=2048 kC=6144 layout.
@@ -546,71 +554,6 @@ __device__ __forceinline__ void blockCountGEDtype(
             t += smem->warp_counts[w];
         smem->cand_count = t;
     }
-}
-
-// Templated on (SmemKey, TopK, SmemT). Default targets the K=2048 dtype path.
-template <typename SmemKey, int TopK = TOP_K, typename SmemT = KernelSmemTpl<SmemKey>>
-__device__ __forceinline__ void blockFusedSnapIterDtype(SmemT* smem, int count, int tid, int warp_id, int lane)
-{
-    using Trait = GvrDtypeTraits<SmemKey>;
-
-    float const thr = smem->threshold;
-
-    int lge = 0, lgt = 0;
-    float s_up = FLT_MAX, s_down = -FLT_MAX;
-
-    for (int i = tid; i < count; i += BLOCK_SIZE)
-    {
-        float v = Trait::to_fp32(smem->keys[i]);
-        lge += (v >= thr);
-        lgt += (v > thr);
-        if (v > thr)
-            s_up = fminf(s_up, v);
-        if (v < thr)
-            s_down = fmaxf(s_down, v);
-    }
-
-    int packed = (lge << 16) | lgt;
-    packed = warpReduceSum(packed);
-    s_up = warpReduceMin(s_up);
-    s_down = warpReduceMax(s_down);
-
-    if (lane == 0)
-    {
-        smem->warp_counts[warp_id] = packed;
-        smem->histogram[warp_id] = __float_as_int(s_up);
-        smem->histogram[NUM_WARPS + warp_id] = __float_as_int(s_down);
-    }
-    __syncthreads();
-
-    if (tid == 0)
-    {
-        int tp = 0;
-        float total_up = FLT_MAX, total_down = -FLT_MAX;
-        for (int w = 0; w < NUM_WARPS; w++)
-        {
-            tp += smem->warp_counts[w];
-            total_up = fminf(total_up, __int_as_float(smem->histogram[w]));
-            total_down = fmaxf(total_down, __int_as_float(smem->histogram[NUM_WARPS + w]));
-        }
-        smem->cnt_lo = tp >> 16;
-        smem->cnt_hi = tp & 0xFFFF;
-
-        int cge = smem->cnt_lo;
-        int cgt = smem->cnt_hi;
-
-        if (cgt >= TopK)
-        {
-            if (total_up < FLT_MAX)
-                smem->threshold = total_up;
-        }
-        else if (cge < TopK)
-        {
-            if (total_down > -FLT_MAX)
-                smem->threshold = total_down;
-        }
-    }
-    __syncthreads();
 }
 
 // ============================================================================
@@ -1171,11 +1114,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 // ============================================================================
 // Mirror of gvrTopKJob with trait-driven dtype substitutions:
 //   - HBM input read   : Trait::to_fp32(__ldg(&input[i]))
-//   - smem keys read   : Trait::to_fp32(keys[i]) for arithmetic
-//   - outputValues     : InputT
+//   - outputValues     : InputT (Trait::from_fp32 at writeback)
 //   - vector load      : 8-wide via Trait::unpack8
 //   - blockCountGE     : blockCountGEDtype<InputT>
-//   - blockFusedSnapIter: blockFusedSnapIterDtype<SmemKey>
+// `blockFusedSnapIter<TopK>` is reused directly from the fp32 path —
+// smem `keys[]` are stored as fp32 here (see deferred-conversion note
+// below) so no dtype-specialized snap helper is needed.
 // All arithmetic (threshold, accumulators, bin index) stays fp32. The fp32
 // dtype path uses gvrTopKJob (above), not this template; instantiated only
 // for bf16 and fp16.
