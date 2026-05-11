@@ -34,10 +34,10 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
-#include <cstring>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <list>
 #include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -174,7 +174,7 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
 // Cache scope: per-host-thread (`thread_local`). Same host thread launching to
 // multiple CUDA streams shares one cache (descriptor content depends only on
 // (device, ptr, shape), not on the stream the kernel runs on). Multi-thread
-// callers each get their own cache (no synchronization overhead).
+// callers each get their own cache.
 //
 // Multi-GPU: device_id is part of the key so a host thread that switches CUDA
 // devices never reuses a descriptor across address spaces.
@@ -185,13 +185,17 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
 // holds those bytes and replays correctly under workspace-stable replay
 // (already enforced by _FusedHcWorkspaceCache in mhc_cuda.py).
 //
-// Return-by-value: CUtensorMap is a 128-byte POD; we copy out before any
-// further insertion can rehash the underlying unordered_map.
-//
-// Lifetime: entries are never explicitly evicted. Steady-state working set is
-// O(B-bucket × hidden) per thread, typically O(20) entries / ~5 KB.
+// Eviction: LRU bounded to kTmaDescCacheCap entries per thread. Eager mode
+// without CUDA-graph capture sees the PyTorch caching allocator hand out
+// fresh `base` pointers when the workspace cache misses, so the unbounded
+// version would grow on every shape transition. 128 entries × ~256 B = ~32 KB
+// per host thread — fits in L1, sized to cover the working set of any single
+// model (~4-8 distinct shapes × 4 descriptors each = O(20) live, with
+// headroom for shape transitions).
 namespace
 {
+constexpr size_t kTmaDescCacheCap = 128;
+
 struct TmaDescKey
 {
     void const* base;       // GMEM base pointer (device pointer)
@@ -227,23 +231,43 @@ struct TmaDescKeyHash
     }
 };
 
+// Standard hash+intrusive-LRU container. The list keeps the eviction order
+// (front=MRU, back=LRU) and the map points at the list node for O(1) move-to-
+// front on hit. On miss we evict from the back if at capacity, then push the
+// new entry to the front.
+struct TmaDescCache
+{
+    using ListIt = std::list<std::pair<TmaDescKey, CUtensorMap>>::iterator;
+    std::list<std::pair<TmaDescKey, CUtensorMap>> order;
+    std::unordered_map<TmaDescKey, ListIt, TmaDescKeyHash> index;
+};
+
 CUtensorMap getCachedTma2D(void* base, CUtensorMapDataType dtype, uint64_t gmemInner, uint64_t gmemOuter,
     uint32_t smemInner, uint32_t smemOuter, uint64_t gmemOuterStrideBytes, uint32_t swizzleBytes, uint32_t elemBytes)
 {
-    static thread_local std::unordered_map<TmaDescKey, CUtensorMap, TmaDescKeyHash> cache;
+    static thread_local TmaDescCache cache;
     int device_id = 0;
     cudaGetDevice(&device_id);
     TmaDescKey const key{base, gmemInner, gmemOuter, smemInner, smemOuter, gmemOuterStrideBytes, swizzleBytes,
         elemBytes, dtype, device_id};
-    auto it = cache.find(key);
-    if (it != cache.end())
+    auto it = cache.index.find(key);
+    if (it != cache.index.end())
     {
-        // Copy 128 bytes; iterator goes out of scope immediately afterwards.
-        return it->second;
+        // Move to front (MRU) and copy out by value before any future insert
+        // invalidates the list node.
+        cache.order.splice(cache.order.begin(), cache.order, it->second);
+        return it->second->second;
     }
     CUtensorMap const tm = makeTma2D(
         base, dtype, gmemInner, gmemOuter, smemInner, smemOuter, gmemOuterStrideBytes, swizzleBytes, elemBytes);
-    cache.emplace(key, tm);
+    if (cache.order.size() >= kTmaDescCacheCap)
+    {
+        // Evict LRU. unordered_map.erase by key is O(1) avg.
+        cache.index.erase(cache.order.back().first);
+        cache.order.pop_back();
+    }
+    cache.order.emplace_front(key, tm);
+    cache.index.emplace(key, cache.order.begin());
     return tm;
 }
 
@@ -782,6 +806,12 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     int const m_batches = (M + tile_m - 1) / tile_m;
 
     // ---- Zero workspace buffers (atomic accumulators + done counter) ----
+    // NOTE: Path F's kernel epilogue always uses atomicAdd into y_acc/r_acc
+    // (no KS=1 direct-store fast path like the MMA Path D in
+    // mhcFusedHcAllInOneLaunchImpl), so we cannot skip the zero even at
+    // num_k_splits == 1. Adding the direct-store branch would require kernel
+    // changes in fused_pmap_gemm_fma_allinone; deferred since Path F is the
+    // small-M (M <= 32) winner where the workspace zero is ~1 µs anyway.
     fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * static_cast<uint32_t>(N), r_acc_workspace,
         static_cast<uint32_t>(M), done_counter_workspace, static_cast<uint32_t>(m_batches), stream);
 

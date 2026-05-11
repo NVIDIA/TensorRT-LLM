@@ -532,8 +532,13 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
         for hidden_size in (4096, 7168, 8192)
     }
 
+    # After P0 (Path D KS=112 enable + scalar-vec tail in Phase 4), the
+    # support trait reduces to `hidden % bf16_vec == 0` and `h_tiles % ks == 0`,
+    # so any KS in the table that divides HIDDEN/BLOCK_K is supported.
+    # h_tiles(4096) = 64 → KS divisors of 64; h_tiles(7168) = 112 → divisors
+    # of 112; hidden=8192 is not in the supported-hidden allowlist.
     assert supported_by_hidden_size[4096] == {1, 2, 4, 8, 16, 32, 64}
-    assert supported_by_hidden_size[7168] == {1, 2, 4, 8, 16}
+    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 56, 112}
     assert supported_by_hidden_size[8192] == set()
 
 

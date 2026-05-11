@@ -916,8 +916,10 @@ class MhcFusedHcRunner(TunableRunner):
         backend, tile_n, num_k_splits, bigfuse_bs, tile_m = tactic
         backend_code = _FUSED_HC_BACKEND_CODE[backend]
 
-        # Fused next-layer RMSNorm on layer_input. Only Path D supports it;
-        # get_valid_tactics already filtered to Path D when norm_weight is set.
+        # Fused next-layer RMSNorm on layer_input. All four backends support
+        # it (Path B/E inside mhcBigFuseKernel, Path D/F inside the all-in-one
+        # Phase 4 epilogue); get_valid_tactics returns all backends regardless
+        # of norm_weight.
         norm_weight = kwargs.get("norm_weight")
         norm_eps = float(kwargs.get("norm_eps", 0.0))
         if norm_weight is not None and norm_weight.dtype != torch.bfloat16:
@@ -1036,11 +1038,12 @@ def mhc_fused_hc(
       * "fused_all_fma"  — 1-kernel FMA all-in-one (Path F).
 
     If ``norm_weight`` is provided, the next-layer RMSNorm is folded into the
-    Path D Phase 4 layer_input epilogue:
+    layer_input epilogue:
       layer_input_cur[t, h] = bf16(li[t,h] * rsqrt(mean(li²)+norm_eps)
                                    * norm_weight[h]).
-    Only Path D supports the fused norm; the autotuner is restricted to Path D
-    tactics in this mode (other backends would error).
+    All four backends support the fused norm: Path B/E inside mhcBigFuseKernel
+    Phase 2, Path D/F inside the all-in-one Phase 4 epilogue. The autotuner
+    explores the full tactic space regardless of ``norm_weight``.
 
     Returns:
         residual_cur:      [B, n, hidden] bf16 (new residual, input to the next post_mapping)
