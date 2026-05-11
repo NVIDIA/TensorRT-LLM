@@ -14,6 +14,7 @@
 # limitations under the License.
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
+import math
 from typing import Dict, List, Optional, Type
 
 import torch
@@ -216,6 +217,18 @@ class LagunaAttention(QKNormRoPEAttention):
     """Laguna attention with per-head softplus gating, per-layer heads,
     dual RoPE, and sliding window."""
 
+    @staticmethod
+    def _yarn_mscale_from_attention_factor(factor: float, attention_factor: float) -> float:
+        if factor <= 1.0:
+            if attention_factor != 1.0:
+                raise ValueError(
+                    "Laguna YaRN RoPE cannot encode attention_factor != 1.0 "
+                    f"when factor <= 1.0: factor={factor}, "
+                    f"attention_factor={attention_factor}"
+                )
+            return 0.0
+        return (attention_factor - 1.0) / (0.1 * math.log(factor))
+
     def __init__(
         self,
         model_config,
@@ -301,7 +314,12 @@ class LagunaAttention(QKNormRoPEAttention):
             rp.scale = float(rp_dict.get("factor", 1.0))
             rp.beta_fast = float(rp_dict.get("beta_fast", 32.0))
             rp.beta_slow = float(rp_dict.get("beta_slow", 1.0))
-            rp.mscale = float(rp_dict.get("attention_factor", 1.0))
+            attention_factor = rp_dict.get("attention_factor")
+            if attention_factor is not None:
+                rp.mscale = LagunaAttention._yarn_mscale_from_attention_factor(
+                    rp.scale, float(attention_factor)
+                )
+                rp.mscale_all_dim = 0.0
             rp.original_max_positions = int(
                 rp_dict.get("original_max_position_embeddings", config.max_position_embeddings)
             )
