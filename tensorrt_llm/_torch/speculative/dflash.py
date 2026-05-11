@@ -191,12 +191,14 @@ class DFlashWorker(SpecWorkerBase):
 
     @property
     def _draft_tokens_per_req(self) -> int:
-        """Total tokens per gen request in the draft forward.
+        """Target-forward tokens per gen request: K drafts + 1 bonus.
 
-        Uses 2K to fit all accepted tokens (up to K+1) plus K-1 mask tokens,
-        ensuring K unique predictions regardless of how many tokens were accepted.
+        Previously this was 2K (K+1 accepted + K-1 mask fillers), but the
+        fillers contribute nothing beyond the K+1 prefix the acceptance
+        check and context store consume, so carrying them through every
+        target layer is wasted work that dominates step time at large batch.
         """
-        return 2 * self.max_draft_len
+        return self.max_draft_len + 1
 
     def _lazy_init_ctx_buffers(self, draft_model, spec_metadata):
         if self._ctx_buf_inited:
@@ -389,22 +391,14 @@ class DFlashWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts
+        # Target now emits K+1 logits per gen request and the previous step
+        # stored K draft tokens per gen request (no filler padding).
         if num_gens > 0:
-            draft_tokens_raw = spec_metadata.draft_tokens
-            draft_tokens = draft_tokens_raw.reshape(num_gens, 2 * K - 1)[:, :K]
+            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
         else:
             draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
 
-        # logits have 2K entries per gen request; extract K+1 for acceptance
-        if num_gens > 0:
-            ctx_logits = logits[:num_contexts]
-            vocab_size = logits.shape[-1]
-            gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
-            gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
-            logits_for_accept = torch.cat([ctx_logits, gen_logits_kp1], dim=0)
-        else:
-            logits_for_accept = logits
+        logits_for_accept = logits
 
         accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
@@ -417,13 +411,6 @@ class DFlashWorker(SpecWorkerBase):
                 num_accepted_tokens=num_accepted_tokens,
                 state_indices=attn_metadata.mamba_metadata.state_indices,
             )
-
-        # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
-        if K > 1:
-            acc_padding = torch.zeros(
-                (batch_size, K - 1), dtype=accepted_tokens.dtype, device=accepted_tokens.device
-            )
-            accepted_tokens = torch.cat([accepted_tokens, acc_padding], dim=1)
 
         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
         self._prepare_kv_for_draft_forward(
@@ -503,23 +490,14 @@ class DFlashWorker(SpecWorkerBase):
 
                 gen_draft_tokens = gen_draft_tokens.type(torch.int32)
 
-                # Pad from (num_gens, K) to (num_gens, 2K-1).
-                if K > 1:
-                    pad = torch.zeros((num_gens, K - 1), dtype=torch.int32, device="cuda")
-                    gen_draft_tokens = torch.cat([gen_draft_tokens, pad], dim=1)
-
         else:
-            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
+            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
         if num_contexts > 0 and num_gens > 0:
-            ctx_draft_tokens = torch.zeros(
-                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-            )
+            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
             next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
         elif num_contexts > 0:
-            next_draft_tokens = torch.zeros(
-                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-            )
+            next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
         else:
             next_draft_tokens = gen_draft_tokens
 
@@ -599,7 +577,7 @@ class DFlashWorker(SpecWorkerBase):
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
 
-            total_tokens_per_req = self._draft_tokens_per_req  # 2K
+            total_tokens_per_req = self._draft_tokens_per_req  # K+1
             K = self.max_draft_len
 
             # Get captured multi-layer hidden states from spec_metadata
@@ -645,11 +623,10 @@ class DFlashWorker(SpecWorkerBase):
             # Accumulate new accepted features into context buffers
             if has_target_features:
                 gen_start = attn_metadata.num_ctx_tokens
+                # Target now processes exactly K+1 tokens per gen req, so the
+                # captured slice is already the full set we need to project.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
-                gen_hs = gen_hs.reshape(num_gens, total_tokens_per_req, -1)
-
-                # Only project K+1 tokens (the accepted ones), not all 2K
-                gen_hs_to_project = gen_hs[:, : K + 1, :].reshape(-1, gen_hs.shape[-1])
+                gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.fc(
                     gen_hs_to_project.to(draft_model.fc.weight.dtype)
                 )
@@ -689,7 +666,8 @@ class DFlashWorker(SpecWorkerBase):
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
-            # Update seq_lens for gen requests to 2K
+            # Update seq_lens for gen requests to K+1 (the number of tokens
+            # the target forward actually processed).
             attn_metadata._seq_lens_cuda[num_contexts : num_contexts + num_gens] = (
                 total_tokens_per_req
             )

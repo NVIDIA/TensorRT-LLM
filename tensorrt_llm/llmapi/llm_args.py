@@ -1753,8 +1753,12 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     @property
     def tokens_per_gen_step(self) -> int:
-        """DFlash needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
-        return 2 * self.max_draft_len
+        """DFlash only needs K+1 tokens per gen request (K drafts + 1 bonus).
+
+        The draft produces its own mask queries internally; passing mask
+        fillers through the target is pure wasted work at large batch size.
+        """
+        return self.max_draft_len + 1
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
