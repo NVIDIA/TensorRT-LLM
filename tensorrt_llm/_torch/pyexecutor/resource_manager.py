@@ -1560,7 +1560,7 @@ class KVCacheManager(BaseResourceManager):
         if self.spec_config is not None:
             # cuda graph has different request ids for different draft len (CUDAGraphRunner::_get_padded_batch)
             # TODO: we can use a same slot for all these
-            max_snapshots += self.spec_config.max_draft_tokens
+            max_snapshots += self.spec_config.max_draft_len
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
             max_snapshots = max_tokens // interval

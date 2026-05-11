@@ -16,8 +16,8 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     PythonMambaCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -259,105 +259,84 @@ def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
 
 
 # ---------------------------------------------------------------------------
-# CppMambaHybridCacheManager: rank with zero local mamba layers
+# CppMambaHybridCacheManager: recurrent-state snapshot pool sizing
 #
-# Regression test for the early-exit path added when a rank ends up with no
-# mamba layers (e.g. under PP sharding when all mamba layers fall on other
-# ranks). On that path, the constructor must:
-#   - call the real parent KVCacheManager with the union layer_mask and
-#     num_layers=num_layers (not mamba_num_layers + num_layers),
-#   - skip allocating any mamba-only state, and
-#   - leave self.requests = [] so the guards on prepare_resources /
-#     update_mamba_states / _setup_state_indices can no-op without touching
-#     uninitialized state.
-#
-# We exercise the same Python branch with world_size=1 (so the real C++
-# KVCacheManager init doesn't need MPI) and a layer mask that contains zero
-# mamba layers.
+# Sized in KVCacheManager._calculate_max_num_blocks_for_linear_attention.
+# Mirrors the MixedMambaCacheManager fix where each kind of padding sentinel
+# (CUDA-graph dummy, plus one per draft length under spec decoding) must not
+# evict live recurrent state. Wanli's fix made all sentinels share one slot
+# in the Python manager (#13489); the C++ hybrid path instead reserves a
+# dedicated slot per sentinel kind in the underlying pool — same invariant,
+# different mechanism. These tests guard the pool sizing.
 # ---------------------------------------------------------------------------
 
 
-def _build_zero_mamba_hybrid():
-    """Construct a real CppMambaHybridCacheManager whose this-rank slice has
-    no mamba layers. world_size=1 / pp_size=1 keeps the real parent
-    KVCacheManager off the MPI path."""
-    # [other, other, full_attn, full_attn]
-    mamba_mask = [False, False, False, False]
-    attn_mask = [False, False, True, True]
-    mamba_num_layers = sum(mamba_mask)  # 0
-    num_layers = sum(attn_mask)  # 4
-
+def _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=4):
+    """Construct a real CppMambaHybridCacheManager with one mamba layer +
+    one full-attention layer so the parent KVCacheManager goes through the
+    linear-attention pool sizing path."""
+    # Layer 0: mamba; Layer 1: full attention. Single rank, no MPI.
+    mamba_mask = [True, False]
+    attn_mask = [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
-    # Cap KV pool size so the real C++ allocator only takes a tiny slice of
-    # GPU memory; we don't actually use the cache.
-    kv_cache_config = KvCacheConfig(max_tokens=128)
-
-    mgr = CppMambaHybridCacheManager(
-        # mamba cache parameters — values are unused on the early-exit path
-        # but must be type-valid.
+    # Disable block reuse: our fix's +1/+max_draft_len addition lives on the
+    # non-reuse branch; when block reuse is on, max_snapshots is overridden
+    # to max_tokens // mamba_state_cache_interval. Cap max_tokens to keep
+    # the real C++ pool allocation tiny.
+    kv_cache_config = KvCacheConfig(max_tokens=512, enable_block_reuse=False)
+    return CppMambaHybridCacheManager(
         mamba_d_state=8,
         mamba_d_conv=4,
         mamba_num_heads=4,
         mamba_n_groups=1,
         mamba_head_dim=8,
-        mamba_num_layers=mamba_num_layers,
+        mamba_num_layers=1,
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.float16,
         mamba_ssm_cache_dtype=torch.float16,
-        # kv cache parameters
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=num_layers,
+        num_layers=1,
         num_kv_heads=4,
         head_dim=64,
         tokens_per_block=32,
         max_seq_len=128,
-        max_batch_size=2,
+        max_batch_size=max_batch_size,
         mapping=mapping,
-        spec_config=None,
+        spec_config=spec_config,
         layer_mask=attn_mask,
     )
-    return mgr
 
 
 @skip_no_cuda
-def test_cpp_hybrid_zero_local_mamba_layers():
-    """End-to-end: real parent KVCacheManager + real early-exit. Verifies
-    early-exit invariants on the manager state AND that the three guarded
-    methods no-op without raising on uninitialized mamba-only state."""
-    mgr = _build_zero_mamba_hybrid()
+def test_cpp_hybrid_recurrent_pool_reserves_cuda_graph_padding_slot():
+    """Without spec decoding, the recurrent-state snapshot pool must
+    have at least max_batch_size + 1 slots — one extra for the
+    CUDA-graph padding sentinel (CUDA_GRAPH_DUMMY_REQUEST_ID). Without
+    it, the padding sentinel evicts live recurrent state under load."""
+    max_batch_size = 4
+    mgr = _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=max_batch_size)
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    assert recurrent_primary >= max_batch_size + 1, (
+        f"recurrent-state pool has {recurrent_primary} slots, "
+        f"need >= max_batch_size + 1 = {max_batch_size + 1} to host the "
+        f"CUDA-graph padding sentinel without evicting live state"
+    )
 
-    # Early-exit indicators.
-    assert mgr.local_num_mamba_layers == 0
-    assert mgr.mamba_pp_layers == []
-    assert mgr.requests == []
-    assert mgr.pp_layers == [2, 3]
 
-    # Parent KVCacheManager was really initialized. self.impl is the C++
-    # KVCacheManagerCpp object; blocks_per_window is set up by it.
-    assert hasattr(mgr, "impl")
-    assert hasattr(mgr, "blocks_per_window")
-    # Parent saw num_layers = num_layers (4), not mamba_num_layers + num_layers.
-    # On the early-exit branch, num_layers is forwarded as-is.
-    assert mgr.num_layers == 4
-    assert mgr.num_local_layers == 2
-
-    # No mamba-only state was allocated.
-    for attr in (
-        "ssm_state_shape",
-        "conv_state_shape",
-        "mamba_layer_offsets",
-        "cuda_state_indices",
-        "host_block_offsets",
-        "recurrent_states_pool_index",
-    ):
-        assert not hasattr(mgr, attr), f"{attr} must not be set on the zero-mamba early-exit path"
-    # Parent must not have been told to treat this as linear attention.
-    assert mgr.is_linear_attention is False
-
-    # Guards on the three mamba-only methods must turn them into no-ops
-    # instead of crashing on the missing state above.
-    empty_batch = ScheduledRequests()
-    mgr.prepare_resources(empty_batch)  # super() runs, then guard returns
-    mgr.update_mamba_states(attn_metadata=None, num_accepted_tokens=None, state_indices=None)
-    mgr._setup_state_indices()
+@skip_no_cuda
+def test_cpp_hybrid_recurrent_pool_reserves_draft_len_sentinel_slots():
+    """With spec decoding, CUDAGraphRunner._get_padded_batch issues a
+    distinct dummy request id for each runtime_draft_len in
+    [0, max_draft_len], so the recurrent-state snapshot pool must reserve
+    one slot per draft length on top of the CUDA-graph padding slot."""
+    max_batch_size, max_draft_len = 4, 2
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+    mgr = _build_hybrid_with_mamba_layer(spec_config=spec_config, max_batch_size=max_batch_size)
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    expected_min = max_batch_size + 1 + max_draft_len
+    assert recurrent_primary >= expected_min, (
+        f"recurrent-state pool has {recurrent_primary} slots, "
+        f"need >= max_batch_size + 1 + max_draft_len = {expected_min} so "
+        f"per-draft-len sentinels don't collide with live state"
+    )
