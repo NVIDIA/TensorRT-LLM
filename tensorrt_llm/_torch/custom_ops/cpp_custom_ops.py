@@ -993,6 +993,17 @@ def _register_fake():
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=output_dtype)
 
+    @torch.library.register_fake("trtllm::ulysses_lsa_barrier")
+    def _(group, pg) -> None:
+        # NCCL device-API LSA barrier; void op.
+        return None
+
+    @torch.library.register_fake("trtllm::ulysses_alltoall_hybrid_symm")
+    def _(input: torch.Tensor, group, pg, self_copy_stream: int) -> torch.Tensor:
+        # Hybrid SM(self) + CE(peer) alltoall via NCCL Window symmetric memory.
+        # Output shape matches input (in-place a2a on pre-permuted tensor).
+        return input.new_empty(input.shape)
+
     @torch.library.register_fake("trtllm::alltoall_helix")
     def _(input_list, group, num_lists):
         num_ranks = len(group)
