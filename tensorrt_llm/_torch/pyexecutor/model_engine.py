@@ -853,6 +853,36 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
+    def _require_warmup_batch_on_all_tp_ranks(
+            self, batch: Optional[ScheduledRequests], num_tokens: int,
+            num_gen_tokens: int, warmup_name: str) -> ScheduledRequests:
+        """Return batch iff every TP rank has a valid warmup batch.
+
+        Warmup forward passes issue tp_comm collectives (e.g.
+        ``_get_all_rank_num_tokens`` under attention-DP). If only some TP
+        ranks run the forward, they deadlock against peers that skipped, and
+        those skipped peers subsequently reach the ``COMM_WORLD`` barrier in
+        ``PyExecutor._set_global_steady_clock_offset``, producing a cross-comm
+        deadlock. Raise instead of silently skipping so a missing autotuner
+        warmup is exposed rather than turning into an unexpected perf drop.
+        """
+        local_has_batch = int(batch is not None)
+        if self.mapping.tp_size <= 1:
+            flags = [local_has_batch]
+        else:
+            flags = self.dist.tp_allgather(local_has_batch)
+        flags = [int(flag) for flag in flags]
+
+        if all(flags):
+            assert batch is not None
+            return batch
+
+        raise RuntimeError(
+            f"Cannot run {warmup_name} warmup with {num_tokens} tokens and "
+            f"{num_gen_tokens} generation tokens: at least one TP rank could "
+            "not allocate a dummy warmup batch from KV cache. "
+            f"Per-TP-rank batch availability: {list(flags)}.")
+
     def _general_warmup_impl(
             self, resource_manager: ResourceManager,
             warmup_requests_configs: List[Tuple[int, int]]) -> None:
@@ -866,8 +896,8 @@ class PyTorchModelEngine(ModelEngine):
                         self._create_warmup_request(resource_manager,
                                                     num_tokens, num_gen_tokens),
                         resource_manager) as batch:
-                    if batch is None:
-                        continue  # Not enough KV cache space
+                    batch = self._require_warmup_batch_on_all_tp_ranks(
+                        batch, num_tokens, num_gen_tokens, "general")
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
@@ -901,28 +931,29 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,
                                              resource_manager) as batch:
-                if batch is not None:
-                    # Reset the flag is_first_draft for the draft model.
-                    # This is necessary for overlap scheduler.
-                    spec_resource_manager = resource_manager.get_resource_manager(
-                        ResourceManagerType.SPEC_RESOURCE_MANAGER)
-                    if self.is_draft_model and isinstance(
-                            spec_resource_manager, Eagle3ResourceManager):
-                        spec_resource_manager.is_first_draft = True
+                batch = self._require_warmup_batch_on_all_tp_ranks(
+                    batch, curr_max_num_tokens, 0, "autotuner")
+                # Reset the flag is_first_draft for the draft model.
+                # This is necessary for overlap scheduler.
+                spec_resource_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                if self.is_draft_model and isinstance(
+                        spec_resource_manager, Eagle3ResourceManager):
+                    spec_resource_manager.is_first_draft = True
 
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
+                self.forward(batch,
+                             new_tensors_device=None,
+                             resource_manager=resource_manager)
 
-                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
-                    # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
-                    AutoTuner.get().cache_pp_recv()
-                    # Send the cache after the tuning process to the next PP rank
-                    AutoTuner.get().cache_pp_send()
-                    # Clean the pp flag to avoid deadlock with synchronous send/recv
-                    AutoTuner.get().clean_pp_flag()
+                # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
+                # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
+                AutoTuner.get().cache_pp_recv()
+                # Send the cache after the tuning process to the next PP rank
+                AutoTuner.get().cache_pp_send()
+                # Clean the pp flag to avoid deadlock with synchronous send/recv
+                AutoTuner.get().clean_pp_flag()
 
-                    torch.cuda.synchronize()
+                torch.cuda.synchronize()
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
