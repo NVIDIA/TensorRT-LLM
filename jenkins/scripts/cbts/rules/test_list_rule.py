@@ -35,12 +35,7 @@ from typing import Optional
 
 from blocks import Stage, YAMLIndex, normalize_test_id
 
-from ._helpers import (
-    iter_diff_post_line_numbers,
-    lookup_ids_into_block_filters,
-    resolve_affected_stages,
-    stages_by_yaml_stem,
-)
+from ._helpers import lookup_ids_into_block_filters, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 TEST_DB_DIR = "tests/integration/test_lists/test-db/"
@@ -85,9 +80,8 @@ def _line_key(body: str) -> Optional[str]:
 def _diff_edits_stage_select_key(diff: str) -> bool:
     """True if any +/- line creates or deletes a stage-select key line.
 
-    Catches whole-block deletions (e.g. `- - condition:`) where the
-    deleted lines anchor past end-of-file in the post-PR content and
-    the ancestor walk-up can't see them.
+    Catches whole-block deletions (e.g. `- - condition:`) regardless of
+    where the deleted lines anchor in the post-PR content.
     """
     for raw in diff.splitlines():
         if not raw or raw.startswith(("+++", "---")):
@@ -102,6 +96,63 @@ def _diff_edits_stage_select_key(diff: str) -> bool:
         key = _line_key(body)
         if key is not None and key in STAGE_SELECT_KEYS:
             return True
+    return False
+
+
+def _added_line_numbers(diff: str) -> set[int]:
+    """Post-image line numbers for `+` lines only.
+
+    `iter_diff_post_line_numbers` also reports an anchor for each `-`
+    line — the next surviving line in post-PR — which can land on the
+    start of an unrelated sibling block (e.g. the `- condition:` of the
+    next block when the last `tests:` entry of the previous block is
+    deleted). Ancestor walk-up on those anchors mis-classifies the
+    deletion as a stage-select edit. We only ancestor-walk `+` lines,
+    whose post-image positions truly describe their content.
+    """
+    out: set[int] = set()
+    new_line = 0
+    for line in diff.splitlines():
+        m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m is not None:
+            new_line = int(m.group(1))
+            continue
+        if not line or line.startswith(("+++", "---")):
+            continue
+        sign = line[0]
+        if sign == "+":
+            out.add(new_line)
+            new_line += 1
+        elif sign == " ":
+            new_line += 1
+        # `-` lines: do not record, do not advance the post-image cursor.
+    return out
+
+
+def _diff_has_suspicious_minus(diff: str) -> bool:
+    """True if any `-` line is something other than a clean tests-entry list item.
+
+    Comment / blank `-` lines are ignored. A `-` line whose body parses
+    as a `<path>.py::...` test id under the list-item form is a clean
+    tests-entry removal. Anything else (key edits, sub-key removals
+    like `stage: pre_merge`, wildcard glob values like `- "*newgpu*"`)
+    is suspicious — we can't ancestor-walk it against the post-PR file,
+    so fall back conservatively.
+    """
+    for raw in diff.splitlines():
+        if not raw or raw.startswith(("+++", "---")):
+            continue
+        if _HUNK_HEADER_RE.match(raw):
+            continue
+        if not raw.startswith("-"):
+            continue
+        body = raw[1:]
+        if not body.strip() or _COMMENT_RE.match(body):
+            continue
+        lm = _LIST_ITEM_RE.match(body)
+        if lm and normalize_test_id(lm.group("body")):
+            continue  # clean tests-entry removal
+        return True
     return False
 
 
@@ -210,23 +261,32 @@ class TestListRule(Rule):
             diff = pr.diffs.get(path, "")
 
             # Cheap pre-check: any +/- line edits a stage-select key
-            # directly (catches whole-block adds/removes whose anchor
-            # may fall past EOF in post-PR content).
+            # directly (covers whole-block adds/removes regardless of
+            # where their anchors land in post-PR content).
             if _diff_edits_stage_select_key(diff):
                 stage_select_files.append(path)
                 continue
 
-            # Deep check: walk the post-PR file's ancestor key chain
-            # from each changed line. If any line is inside a stage-
-            # select subtree, the edit changed stage-selection semantics.
+            # `-` lines have no reliable post-PR position. Bodies that
+            # are not clean tests-entry list items (sub-key edits,
+            # wildcard glob values, ...) could be stage-select
+            # changes; fall back conservatively for those.
+            if _diff_has_suspicious_minus(diff):
+                stage_select_files.append(path)
+                continue
+
+            # Deep check on `+` lines only: walk the post-PR file's
+            # ancestor key chain from each added line's position. `-`
+            # line anchors are intentionally excluded — they can land
+            # on neighboring blocks and trigger false positives.
             try:
                 post_lines = (self._repo_root / path).read_text(encoding="utf-8").splitlines()
             except (OSError, UnicodeDecodeError):
                 unverifiable_files.append(path)
                 continue
 
-            line_nums = iter_diff_post_line_numbers(diff)
-            if any(_line_is_in_stage_select(post_lines, ln) for ln in line_nums):
+            added_line_nums = _added_line_numbers(diff)
+            if any(_line_is_in_stage_select(post_lines, ln) for ln in added_line_nums):
                 stage_select_files.append(path)
                 continue
 
