@@ -1431,8 +1431,8 @@ class SequenceInfo:
         use_initial_states[:] = input_pos > 0
 
         # --- Bulk device-to-host sync ---
-        # TODO: we have to continue thinking about this and dissect more what fields are needed in
-        # the forward pass if we use cudagraph...
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
         if sync_to_host:
             self._input_buffer.copy_to_host()
 
@@ -1465,13 +1465,9 @@ class SequenceInfo:
         an all-decode layout where each sequence has exactly 1 token. We assume that we just take
         the last position of each sequence for the metadata.
 
-        NOTE: update device tensors first and mirror back to host only for active host graph
-        inputs. This matches offset_pos_and_cache_ and avoids rewriting inactive host staging
-        buffers during the drafting loop.
-
-        NOTE: we assume the same structure as in nest_sequences for when to update the arguments.
-        In particular, arguments that are always updated in nest_sequences are also updated here.
-        Others are updated optionally depending on the argument being active.
+        NOTE: update device tensors first and mirror back to host only when an updated host-side
+        argument is active. This avoids rewriting inactive host staging buffers during the drafting
+        loop.
         """
         # already in generate mode
         if self.is_generate_only:
@@ -1484,6 +1480,7 @@ class SequenceInfo:
         self.batch_info.update([0, 0, 0, 0, num_seq, num_seq])
         self.batch_info.update_tokens_gather_info(num_seq, False)
 
+        # check if we need a d2h sync
         _REQUIRES_UPDATE = {
             "input_ids",
             "input_pos",
@@ -1521,6 +1518,9 @@ class SequenceInfo:
         self.copy_("position_ids", input_pos, strict=False)
         self.copy_("use_initial_states", input_pos > 0)
 
+        # --- Bulk device-to-host sync ---
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
         if sync_to_host:
             self._input_buffer.copy_to_host()
 
