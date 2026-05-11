@@ -828,7 +828,6 @@ class Runner:
                 mamba_layer_mask,
                 config.torch_dtype,
                 model_config.quant_config.mamba_ssm_cache_dtype,
-                False,  # is_disagg
                 # kv cache parameters
                 kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -865,7 +864,6 @@ class Runner:
                 mamba_layer_mask,
                 config.torch_dtype,
                 model_config.quant_config.mamba_ssm_cache_dtype,
-                False,  # is_disagg
                 # kv cache parameters
                 kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,

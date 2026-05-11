@@ -1,7 +1,9 @@
+import dataclasses
 import re
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
+import torch
 import transformers
 
 from tensorrt_llm.logger import logger
@@ -107,6 +109,162 @@ def get_qwen3_hybrid_layer_masks(config):
 def get_qwen3_hybrid_num_attention_layers(config):
     layer_mask, _ = get_qwen3_hybrid_layer_masks(config)
     return sum(layer_mask)
+
+
+@dataclasses.dataclass
+class MambaKVCacheParams:
+    """Normalized mamba-related inputs for kv_cache_manager_cls.
+
+    Field naming is consistent across the Nemotron-hybrid and Qwen3-hybrid
+    families so call sites don't special-case per family.
+    """
+    # Mamba / linear-attention state dimensions
+    state_size: int  # ssm_state_size      | linear_key_head_dim
+    conv_kernel: int  # conv_kernel         | linear_conv_kernel_dim
+    num_heads: int  # mamba_num_heads     | linear_num_value_heads
+    n_groups: int  # n_groups            | linear_num_key_heads
+    head_dim: int  # mamba_head_dim      | linear_value_head_dim
+
+    # Per-layer masks and counts (trailing entries cover MTP/draft layers,
+    # which are attention-only and carry no Mamba state).
+    mamba_layer_mask: List[bool]
+    full_attention_layer_mask: List[bool]
+    num_mamba_layers: int
+    num_full_attention_layers: int
+
+    # Dtypes
+    dtype: torch.dtype  # config.torch_dtype
+    mamba_ssm_cache_dtype: Optional[
+        torch.dtype]  # quant_config.mamba_ssm_cache_dtype
+
+    def get_states_bytes_per_layer(self, mapping) -> int:
+        """Return the total bytes of Mamba state per layer, used for budgeting."""
+        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        d_inner = self.head_dim * self.num_heads
+        conv_dim = (d_inner + 2 * self.n_groups * self.state_size) // tp_size
+        nheads = self.num_heads // tp_size
+
+        conv_dtype = self.dtype
+        ssm_dtype = (self.mamba_ssm_cache_dtype
+                     if self.mamba_ssm_cache_dtype is not None else self.dtype)
+        conv_bytes = conv_dim * (self.conv_kernel - 1) * conv_dtype.itemsize
+        ssm_bytes = (nheads * self.head_dim * self.state_size *
+                     ssm_dtype.itemsize)
+        state_bytes_per_layer = conv_bytes + ssm_bytes
+        return state_bytes_per_layer
+
+
+def _nemotron_hybrid_layer_masks(config, layer_mask):
+    pattern = config.hybrid_override_pattern
+    if layer_mask is None:
+        return ([c == "*" for c in pattern], [c == "M" for c in pattern])
+
+    # One-model speculative decoding: layer_mask may extend past the hybrid
+    # pattern; treat trailing positions as attention-only draft layers.
+    full_attn, mamba = [], []
+    for i, include in enumerate(layer_mask):
+        if i < len(pattern):
+            is_attn = pattern[i] == "*"
+            is_mamba = pattern[i] == "M"
+        else:
+            is_attn, is_mamba = True, False
+        full_attn.append(is_attn and include)
+        mamba.append(is_mamba and include)
+    return full_attn, mamba
+
+
+def _qwen3_hybrid_layer_masks(config, layer_mask):
+    full_attn, mamba = get_qwen3_hybrid_layer_masks(config)
+    if layer_mask is None:
+        return full_attn, mamba
+
+    if len(layer_mask) < len(full_attn):
+        raise ValueError(
+            "layer_mask is shorter than the Qwen3 hybrid layer pattern")
+    base_len = len(full_attn)
+    new_full_attn, new_mamba = [], []
+    for i, include in enumerate(layer_mask):
+        if i < base_len:
+            new_full_attn.append(full_attn[i] and include)
+            new_mamba.append(mamba[i] and include)
+        else:
+            new_full_attn.append(include)
+            new_mamba.append(False)
+    return new_full_attn, new_mamba
+
+
+def extract_mamba_kv_cache_params(
+    config,
+    layer_mask: Optional[List[bool]] = None,
+    spec_config=None,
+    quant_config=None,
+) -> MambaKVCacheParams:
+    """Build the mamba-related inputs for kv_cache_manager_cls.
+
+    Supports Nemotron-hybrid and Qwen3-hybrid (Qwen3-Next + Qwen3.5).
+
+    Args:
+        config: HuggingFace model config of a hybrid Mamba model.
+        layer_mask: Optional per-layer keep mask used by one-model speculative
+            decoding. Entries past the underlying hybrid pattern length are
+            treated as attention-only draft layers. When provided, the caller
+            is responsible for already including spec layers in the mask.
+        spec_config: When `layer_mask` is None, used to extend the masks with
+            MTP/draft attention layers (no Mamba state) so they receive KV
+            cache entries.
+        quant_config: Optional, used only to surface `mamba_ssm_cache_dtype`.
+
+    Returns:
+        MambaKVCacheParams with normalized field names.
+    """
+    if is_nemotron_hybrid(config):
+        state_size = config.ssm_state_size
+        conv_kernel = config.conv_kernel
+        num_heads = config.mamba_num_heads
+        n_groups = config.n_groups
+        head_dim = config.mamba_head_dim
+        full_attn_mask, mamba_mask = _nemotron_hybrid_layer_masks(
+            config, layer_mask)
+    elif is_qwen3_hybrid(config):
+        state_size = config.linear_key_head_dim
+        conv_kernel = config.linear_conv_kernel_dim
+        num_heads = config.linear_num_value_heads
+        n_groups = config.linear_num_key_heads
+        head_dim = config.linear_value_head_dim
+        full_attn_mask, mamba_mask = _qwen3_hybrid_layer_masks(
+            config, layer_mask)
+    else:
+        raise ValueError(
+            f"{type(config).__name__} is not a supported hybrid Mamba config")
+
+    # When no explicit layer_mask is given, extend the masks here so MTP/draft
+    # layers (attention-only, no Mamba state) get KV cache entries. With an
+    # explicit layer_mask, the caller already encoded those entries.
+    if layer_mask is None and spec_config is not None:
+        # Imported lazily to avoid a circular dependency between
+        # config_utils and tensorrt_llm._torch.speculative.
+        from ..speculative.utils import get_num_spec_layers
+        num_spec_layers = get_num_spec_layers(spec_config)
+        if num_spec_layers > 0:
+            full_attn_mask.extend([True] * num_spec_layers)
+            mamba_mask.extend([False] * num_spec_layers)
+
+    mamba_ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
+                             if quant_config is not None else None)
+
+    return MambaKVCacheParams(
+        state_size=state_size,
+        conv_kernel=conv_kernel,
+        num_heads=num_heads,
+        n_groups=n_groups,
+        head_dim=head_dim,
+        mamba_layer_mask=mamba_mask,
+        full_attention_layer_mask=full_attn_mask,
+        num_mamba_layers=sum(mamba_mask),
+        num_full_attention_layers=sum(full_attn_mask),
+        dtype=config.torch_dtype,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
 
 
 class _Qwen35ConfigCompat:

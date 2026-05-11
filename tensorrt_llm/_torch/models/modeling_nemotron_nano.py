@@ -17,6 +17,7 @@ from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...inputs import (
+    AudioData,
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
     ExtraProcessedInputs,
@@ -1140,12 +1141,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             return feature_size
         return self.num_image_token
 
+    # TODO(TRTLLM-12465): Accept a VideoData container here instead of passing
+    # frames, metadata, and audio as separate arguments.
     def get_num_tokens_per_video(
         self,
         *,
         video: List[Union[Image.Image, torch.Tensor]],
         video_pruning_rate: Optional[float] = None,
         video_metadata: Optional[dict] = None,
+        video_audio: Optional[AudioData] = None,
         **kwargs,
     ):
         # Use VIDEO_PRUNING_RATIO if not explicitly provided
@@ -1189,16 +1193,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # _extract_audio_from_video). Account for those tokens so
         # total_mm_tokens_in_request matches the actual mm-token count in the
         # tokenized prompt and len(mm_embed) at forward time.
-        if (
-            isinstance(video_metadata, dict)
-            and "audio_samples" in video_metadata
-            and self._audio_extractor is not None
-        ):
+        if video_audio is not None and self._audio_extractor is not None:
             num_total_tokens += self.get_num_tokens_per_audio(
-                audio=(
-                    video_metadata["audio_samples"],
-                    video_metadata["audio_sample_rate"],
-                )
+                audio=(video_audio.samples, video_audio.sample_rate)
             )
 
         return num_total_tokens
@@ -1544,16 +1541,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         video_evs_expansions: Optional[List[List[int]]] = [] if evs_enabled else None
         for video_data in videos:
             # `video_data` comes in two shapes:
-            #   - A `VideoData`-like object (with `.frames` / `.metadata`
-            #     attributes) — the production case (openai_server wraps
-            #     video inputs this way) and the unit-test case (tests use
-            #     `SimpleNamespace(frames=..., metadata=...)`).
+            #   - A `VideoData`-like object (with `.frames` / `.metadata` /
+            #     `.audio` attributes) — the production case (openai_server
+            #     wraps video inputs this way).
             #   - A plain list of frames (no metadata) — the defensive
             #     fallback when callers pass raw frames directly, matching
             #     the pattern in `find_mm_token_lengths` in multimodal.py.
             # `getattr` with a default handles both uniformly.
             frames = getattr(video_data, "frames", video_data)
             metadata = getattr(video_data, "metadata", None)
+            audio = getattr(video_data, "audio", None)
 
             video_size = self._compute_video_shape_descriptor(frames)
             # When EVS is enabled, `_compute_token_numbers_per_video`
@@ -1590,19 +1587,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             # an unnecessary librosa.resample (we only need the resampled length, not
             # the resampled samples themselves).
             # Audio is NOT pruned by EVS, so both streams need identical audio slots.
-            if (
-                isinstance(metadata, dict)
-                and "audio_samples" in metadata
-                and self._audio_extractor is not None
-            ):
+            if audio is not None and self._audio_extractor is not None:
                 num_audio_context = (
-                    self.get_num_tokens_per_audio(
-                        audio=(
-                            metadata["audio_samples"],
-                            metadata["audio_sample_rate"],
-                        )
-                    )
-                    - 2
+                    self.get_num_tokens_per_audio(audio=(audio.samples, audio.sample_rate)) - 2
                 )
                 audio_ids = (
                     [self._sound_start_token_id]
@@ -2106,9 +2093,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             )
         elif videos is not None:
             modality_type = "video"
-            video_frames, video_metadatas = (
+            video_frames, video_metadatas, video_audios = (
                 [video_data.frames for video_data in videos],
                 [video_data.metadata for video_data in videos],
+                [getattr(video_data, "audio", None) for video_data in videos],
             )
             num_videos = len(video_frames)
             processed_images = self._process_videos_frames(video_frames)
@@ -2122,7 +2110,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 processed_images["video_size"], video_metadatas
             )
 
-            text_prompt, audio_data = self._extract_audio_from_video(text_prompt, video_metadatas)
+            text_prompt, audio_data = self._extract_audio_from_video(text_prompt, video_audios)
 
             split_text_prompt = text_prompt.split(self.video_context_token)
             if len(split_text_prompt) - 1 != num_videos:
@@ -2204,9 +2192,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _extract_audio_from_video(
         self,
         text_prompt: str,
-        video_metadatas: List[dict],
+        video_audios: List[Optional[AudioData]],
     ) -> Tuple[str, Optional[dict]]:
-        """Extract audio streams from video metadata and prepare audio features.
+        """Extract structured video audio streams and prepare audio features.
 
         Injects audio placeholder tokens after each video that carries an audio stream, resamples
         audio to the extractor's target sample rate, expands placeholder tokens, and computes
@@ -2215,11 +2203,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         Returns the (possibly modified) text prompt and an audio data dict (or
         `None` when no audio is present).
         """
-        has_audio = [meta is not None and "audio_samples" in meta for meta in video_metadatas]
+        has_audio = [audio is not None for audio in video_audios]
         audio_from_video = [
-            (meta["audio_samples"], meta["audio_sample_rate"])
-            for meta in video_metadatas
-            if meta is not None and "audio_samples" in meta
+            (audio.samples, audio.sample_rate) for audio in video_audios if audio is not None
         ]
 
         if not audio_from_video or self._audio_extractor is None:
@@ -2229,10 +2215,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Split on <video> and rebuild so each placeholder lands after the
         # correct video, not all after the first one.
         parts = text_prompt.split(self.video_context_token)
-        if len(parts) - 1 != len(video_metadatas):
+        if len(parts) - 1 != len(video_audios):
             raise ValueError(
                 f"Number of {self.video_context_token} tokens ({len(parts) - 1}) "
-                f"doesn't match the number of videos ({len(video_metadatas)})"
+                f"doesn't match the number of videos ({len(video_audios)})"
             )
         rebuilt = [parts[0]]
         for i, part in enumerate(parts[1:]):

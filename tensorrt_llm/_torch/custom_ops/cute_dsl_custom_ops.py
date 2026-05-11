@@ -17,10 +17,11 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..utils import (deep_gemm_gen_tuning_buckets, fp4_scale_infer_shape,
-                     fp8_scale_infer_shape,
+from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+                     fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2, next_positive_power_of_2)
+                     is_gated_activation, last_positive_power_of_2,
+                     next_positive_power_of_2)
 
 try:
     from cuda.bindings import driver as cuda
@@ -251,7 +252,7 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
     def inputs_pre_hook(self, inputs: List) -> List:
-        """Pre-hook for gather-based SwiGLU fusion kernel.
+        """Pre-hook for gather-based activation fusion kernel.
 
         Generates:
             - tile_idx_to_group_idx
@@ -325,8 +326,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
-    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import \
-        BlockScaledContiguousGatherGroupedGemmKernel
+    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
         Sm100BlockScaledContiguousGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import \
@@ -2680,7 +2681,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    device=input_scale.device)
         return output, output_scale
 
-    class Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+    class Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             TunableRunner):
         kernel_class = BlockScaledContiguousGatherGroupedGemmKernel
         kernel_cache = dict()
@@ -2696,14 +2697,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      scaling_vector_size: int = 16,
-                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
+                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+                     activation_type: ActivationType = ActivationType.Swiglu):
             """Initialize the runner.
 
             Args:
                 b_tensor_l_sizes: Tuple of L sizes for each B tensor in multi-B mode.
                     None for single-B mode. Used for kernel cache key.
+                activation_type: ``ActivationType`` for the fused epilogue. Only
+                    ``Swiglu`` (gated) and ``Relu2`` (non-gated) are supported.
             """
             super().__init__()
+            self.activation_type = validate_activation_type(activation_type)
+            self.is_gated = is_gated_activation(self.activation_type)
             self.num_experts = num_experts
             self.top_k = top_k
             self.num_local_experts = num_local_experts
@@ -2735,6 +2741,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.scaling_vector_size,
                 self.b_tensor_l_sizes,
+                self.activation_type,
             )
 
         def get_valid_tactics(
@@ -2858,11 +2865,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b0.size(1)
             sum(bi.size(0) for bi in b_list)
             scale_k = k // self.scaling_vector_size
-            interm_size = n // 2
+            interm_size = n // 2 if self.is_gated else n
 
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
-            assert n % (self.scaling_vector_size * 4 * 2) == 0
+            if self.is_gated:
+                assert n % (self.scaling_vector_size * 4 * 2) == 0
+            else:
+                assert n % (self.scaling_vector_size * 4) == 0
             assert b0.size(2) * 2 == k
             assert a_sf.size(0) == orig_m
             assert a_sf.size(1) == scale_k
@@ -2945,7 +2955,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         b_tensor_l_sizes)
+                         b_tensor_l_sizes, self.activation_type)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -2956,6 +2966,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     topk=self.top_k,
                     raster_along_m=raster_along_m,
                     b_tensor_l_sizes=b_tensor_l_sizes,
+                    activation_type=self.activation_type,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -2987,6 +2998,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     scaling_vector_size=self.scaling_vector_size,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
+                    activation_type=self.activation_type,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
@@ -3016,10 +3028,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c, c_sf
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
         mutates_args=(),
         device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
         input_scale: torch.Tensor,
@@ -3036,21 +3048,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (multi-B list interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (multi-B list interface).
+
+        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
+        (non-gated) epilogues; other ``ActivationType`` values raise an assertion.
 
         Args:
             weight: List of B tensors. Single-B mode: [b], multi-B mode: [b0, b1, ...].
             weight_scale: List of scale tensors, matching weight.
             alpha: List of alpha tensors, matching weight.
+            activation_type: ``ActivationType`` value selecting the fused activation.
         """
         tuner = AutoTuner.get()
 
         b_tensor_l_sizes = tuple(w.size(0) for w in weight)
 
-        runner = Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size, b_tensor_l_sizes)
+            tile_size, scaling_vector_size, b_tensor_l_sizes, activation_type)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -3058,7 +3075,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ]
 
         _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
             [runner],
             runner.get_tuning_config(),
             inputs,
@@ -3069,7 +3086,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b")
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b"
+    )
     def _fake_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
@@ -3087,10 +3105,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight[0].size(1)
-        interm_size = n // 2
+        is_gated = is_gated_activation(ActivationType(activation_type))
+        interm_size = n // 2 if is_gated else n
         output = torch.empty(m,
                              interm_size // 2,
                              dtype=input.dtype,
@@ -3101,10 +3121,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output, output_scale
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell",
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
         mutates_args=(),
         device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
         input_scale: torch.Tensor,
@@ -3121,13 +3141,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (single-B tensor interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (single-B tensor interface).
 
         Thin wrapper: wraps single tensors into lists and calls
-        cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b.
+        cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b.
+        ``activation_type`` must be ``ActivationType.Swiglu`` or ``ActivationType.Relu2``.
         """
-        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
             input,
             [weight],
             input_scale,
@@ -3144,10 +3166,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             local_expert_offset,
             tile_size,
             scaling_vector_size,
+            activation_type,
         )
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell")
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell")
     def _fake_single_b(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -3165,10 +3188,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
-        interm_size = n // 2
+        is_gated = is_gated_activation(ActivationType(activation_type))
+        interm_size = n // 2 if is_gated else n
         output = torch.empty(m,
                              interm_size // 2,
                              dtype=input.dtype,

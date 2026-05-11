@@ -561,6 +561,11 @@ public:
         return mCacheBlockIds.at(windowSize);
     }
 
+    [[nodiscard]] std::vector<std::vector<SizeType32>>& getCacheBlockIds(SizeType32 windowSize)
+    {
+        return mCacheBlockIds.at(windowSize);
+    }
+
     [[nodiscard]] runtime::ITensor& getCacheBlockIndices(SizeType32 windowSize)
     {
         return *(mCacheBlockIndices.at(windowSize));

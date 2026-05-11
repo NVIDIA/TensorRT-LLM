@@ -29,19 +29,19 @@
 """Example usage of the kernel.
 
 Functional testing:
-python run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py \
+python run_blockscaled_contiguous_gather_grouped_gemm_act_fusion.py \
         --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
         --mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
         --nkl 4096,7168,8 --fixed_m 128
 or use a benchmark file:
-python run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py \
+python run_blockscaled_contiguous_gather_grouped_gemm_act_fusion.py \
         --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
         --mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
         --benchmark benchmark.txt
 Perf testing:
-python run_blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py \
+python run_blockscaled_contiguous_gather_grouped_gemm_act_fusion.py \
         --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
         --mma_tiler_mn 128,128 --cluster_shape_mn 1,1 \
@@ -72,11 +72,11 @@ from cutlass.cute.runtime import from_dlpack
 
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
-        blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion as kernel_module,
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion as kernel_module,
     )
 except (ModuleNotFoundError, ImportError):
     sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell import blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion as kernel_module
+    from blackwell import blockscaled_contiguous_gather_grouped_gemm_act_fusion as kernel_module
 
 BlockScaledContiguousGatherGroupedGemmKernel = (
     kernel_module.BlockScaledContiguousGatherGroupedGemmKernel
