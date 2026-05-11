@@ -144,6 +144,7 @@ def build_text_guardrail(guardrail_ckpt_dir: str) -> TextGuardrailFn:
                 tokenize=True,
                 return_tensors="pt",
                 add_generation_prompt=True,
+                return_dict=False,
             ).to("cuda")
             with torch.no_grad():
                 output_ids = qwen_model.generate(input_ids, max_new_tokens=128)
@@ -203,7 +204,8 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
                     "cuda", dtype=torch.float32
                 )
                 with torch.no_grad():
-                    features = siglip_model.get_image_features(**inputs)
+                    siglip_out = siglip_model.get_image_features(**inputs)
+                    features = siglip_out.pooler_output
                     features = features / features.norm(dim=-1, keepdim=True)
                     logits = classifier(features)
                     pred = logits.argmax(dim=-1).item()
