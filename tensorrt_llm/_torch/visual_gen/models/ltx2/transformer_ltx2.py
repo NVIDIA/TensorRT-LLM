@@ -218,20 +218,9 @@ class LTX2Attention(Attention):
 
         Calls trtllm.fused_dit_split_norm_rope. Used by the cross-attn fast path.
         """
-        # Auto-detect cos last-dim: head_dim (shared) or num_heads*head_dim (per-head).
         B, T, _ = tensor.shape
-        total_tokens = B * T
-        cos_total = cos.numel()
-        full_inner = num_heads * self.head_dim
-        if cos_total in (T * self.head_dim, total_tokens * self.head_dim):
-            cos_last = self.head_dim
-        elif cos_total in (T * full_inner, total_tokens * full_inner):
-            cos_last = full_inner
-        else:
-            raise AssertionError(
-                f"cos numel ({cos_total}) doesn't match expected for T={T}, B*T={total_tokens}, "
-                f"head_dim={self.head_dim} or num_heads*head_dim={full_inner}"
-            )
+        # LTX-2 always uses full-dim per-head cos: cos_last = num_heads * head_dim.
+        cos_last = num_heads * self.head_dim
         # cos/sin are token-major [B, T, H, D] (or [B, T, D] for shared per-token);
         # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
         # B-2: kernel accepts bf16 cos (upcasts in registers); skip the .float() cast.

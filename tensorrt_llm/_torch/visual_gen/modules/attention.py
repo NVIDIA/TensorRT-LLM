@@ -267,22 +267,10 @@ class Attention(nn.Module):
         Op auto-detects via cos_emb.size(1) and dispatches the kernel template.
         """
         B, S, D = qkv.shape
-        total_tokens = B * S
-        # Determine cos last-dim by looking at total numel and which divisor fits.
-        cos_total = freqs_cos.numel()
-        if cos_total == total_tokens * self.head_dim:
-            cos_last = self.head_dim
-        elif cos_total == total_tokens * self.num_attention_heads * self.head_dim:
-            cos_last = self.num_attention_heads * self.head_dim
-        elif cos_total == S * self.head_dim:
-            cos_last = self.head_dim
-        elif cos_total == S * self.num_attention_heads * self.head_dim:
-            cos_last = self.num_attention_heads * self.head_dim
-        else:
-            raise AssertionError(
-                f"cos_emb numel ({cos_total}) doesn't match S={S} or B*S={total_tokens} "
-                f"× (head_dim={self.head_dim} or num_heads*head_dim={self.num_attention_heads * self.head_dim})"
-            )
+        # cos last-dim is fixed by qk_norm_mode:
+        #   "full"     → num_heads * head_dim (LTX-2 / WAN per-head cos)
+        #   "per_head" → head_dim             (FLUX / Cosmos shared-across-heads cos)
+        cos_last = self.q_dim if self.qk_norm_mode == "full" else self.head_dim
         # cos/sin are token-major [B, T, H, D] (or shared per-token [B, T, D]);
         # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
         # B-2: full-dim LTX-2 path accepts bf16 cos directly (kernel upcasts in registers).
