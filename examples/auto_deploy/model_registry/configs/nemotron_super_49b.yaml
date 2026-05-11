@@ -11,4 +11,5 @@
 max_batch_size: 4
 max_num_tokens: 1024
 max_seq_len: 2048
-cuda_graph_batch_sizes: [1, 2, 4]
+cuda_graph_config:
+  batch_sizes: [1, 2, 4]
