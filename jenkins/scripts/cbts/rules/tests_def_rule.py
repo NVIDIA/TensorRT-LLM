@@ -147,10 +147,11 @@ class TestsDefRule(Rule):
     def _compute_anchors(self, git_path: str, yaml_path: str, diff: str) -> list[str]:
         """Return lookup anchors for one file.
 
-        File-level fallback when no diff, file unreadable, AST parse
-        fails, or any line is module-level. accuracy/references/*.yaml
-        diffs are refined to per-test-class anchors via the model-name
-        mapping in `_compute_accuracy_reference_anchors`.
+        File-level fallback when no diff, file unreadable or not UTF-8
+        (e.g. binary fixtures), AST parse fails, or any line is module-
+        level. accuracy/references/*.yaml diffs are refined to per-test-
+        class anchors via the model-name mapping in
+        `_compute_accuracy_reference_anchors`.
         """
         if git_path.startswith(ACCURACY_REFS_PREFIX) and git_path.endswith((".yaml", ".yml")):
             return self._compute_accuracy_reference_anchors(git_path, yaml_path, diff)
@@ -158,7 +159,7 @@ class TestsDefRule(Rule):
             return [yaml_path]
         try:
             content = (self._repo_root / git_path).read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return [yaml_path]
         line_numbers = iter_diff_post_line_numbers(diff)
         if not line_numbers:
@@ -197,7 +198,7 @@ class TestsDefRule(Rule):
             return [yaml_path]
         try:
             content = (self._repo_root / git_path).read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return [yaml_path]
         changed_models = _yaml_top_keys_for_lines(content, line_numbers)
         if not changed_models:
@@ -221,7 +222,7 @@ class TestsDefRule(Rule):
             for py in sorted(acc_dir.glob("test_*.py")):
                 try:
                     tree = ast.parse(py.read_text(encoding="utf-8"))
-                except (OSError, SyntaxError):
+                except (OSError, SyntaxError, UnicodeDecodeError):
                     continue
                 rel = f"accuracy/{py.name}"
                 for node in tree.body:
