@@ -355,6 +355,15 @@ def create_py_executor(
         max_batch_size,
     ) = llm_args.get_runtime_sizes()
 
+    if (kv_connector_config is not None and max_beam_width is not None
+            and max_beam_width > 1):
+        # The block-hash chain exposed to connectors only covers beam 0, and the
+        # C++ ``commitAndGetBlockHashesForRequest`` path asserts this invariant.
+        raise NotImplementedError(
+            f"KV connector is not supported with beam search "
+            f"(max_beam_width={max_beam_width}). The block-hash chain passed "
+            f"to the connector only covers beam 0.")
+
     tokens_per_block = kv_cache_config.tokens_per_block
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens

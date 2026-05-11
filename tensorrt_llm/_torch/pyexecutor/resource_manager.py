@@ -1098,6 +1098,26 @@ class KVCacheManager(BaseResourceManager):
         assert len(result) == 1
         return result[0]
 
+    def commit_and_get_block_hashes(
+            self,
+            request: LlmRequest,
+            window_size: Optional[int] = None) -> List[int]:
+        """Commit and return the chain of stored block hashes for ``request``.
+
+        Wraps ``BaseKVCacheManager::commitAndGetBlockHashesForRequest``. The C++
+        side sets each block's ``mBlockKey`` and ``mHash`` on first call so the
+        hash matches what ``storeBlocks`` would later compute. Beam-width-1
+        only; the connector enforces this at startup.
+        """
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        return list(
+            self.impl.commit_and_get_block_hashes_for_request(
+                request, window_size))
+
     def unpin_blocks_by_id(self, kv_cache_block_id: int):
         self.impl.unpin_blocks_by_id(kv_cache_block_id)
 

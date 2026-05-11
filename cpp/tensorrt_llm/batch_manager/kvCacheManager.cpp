@@ -3868,6 +3868,59 @@ std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(
     return getSequence(requestId).getCacheBlockIds(windowSize);
 }
 
+std::vector<executor::IdType> KVCacheManager::commitAndGetBlockHashesForRequest(
+    LlmRequest const& llmRequest, SizeType32 windowSize)
+{
+    constexpr SizeType32 beamIdx = 0;
+    TLLM_CHECK_WITH_INFO(
+        llmRequest.getTokens().size() == 1, "commitAndGetBlockHashesForRequest only supports beam width 1.");
+
+    auto const& perBeamBlockIds = getSequence(llmRequest.mRequestId).getCacheBlockIds(windowSize);
+    if (perBeamBlockIds.empty() || perBeamBlockIds[beamIdx].empty())
+    {
+        return {};
+    }
+    auto const& blockIds = perBeamBlockIds[beamIdx];
+
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+    auto const tokensPerBlock = getTokensPerBlock();
+    auto const numFullTokenBlocks = static_cast<SizeType32>(uniqueTokens.size()) / tokensPerBlock;
+    auto const numAllocatedBlocks = static_cast<SizeType32>(blockIds.size());
+    // The allocator may have allocated a (partial) trailing block; clip to whichever count is
+    // smaller so we never index past either side.
+    auto const limit = std::min(numFullTokenBlocks, numAllocatedBlocks);
+    if (limit == 0)
+    {
+        return {};
+    }
+
+    bool const usesExtraIds = llmRequest.getInputTokensExtraIds().has_value();
+    auto const loraTaskId = llmRequest.getLoraTaskId();
+    auto const cacheSaltID = llmRequest.getCacheSaltID();
+
+    std::vector<executor::IdType> hashes;
+    hashes.reserve(static_cast<size_t>(limit));
+    for (SizeType32 b = 0; b < limit; ++b)
+    {
+        auto block = mBlockManager.getBlockById(blockIds[b], windowSize);
+        if (!block->isFull())
+        {
+            SizeType32 const tokenStart = b * tokensPerBlock;
+            SizeType32 const tokenEnd = tokenStart + tokensPerBlock;
+            auto extraKeys = generateBlockHashExtraKeys(llmRequest, tokenStart, tokenEnd);
+            VecUniqueTokens blockTokens(uniqueTokens.begin() + tokenStart, uniqueTokens.begin() + tokenEnd);
+            BlockKey blockKey(usesExtraIds, loraTaskId, std::move(blockTokens), std::move(extraKeys), cacheSaltID);
+            block->setBlockKey(blockKey, /*isFull=*/true);
+            // setHash() chains through mPrevBlockInSeq, which was wired in addBlockToBeam. The
+            // loop walks blocks in allocation order, so by the time we reach block b its
+            // predecessor (if any) has already been committed and exposes a stable hash.
+            block->setHash();
+        }
+        hashes.push_back(static_cast<executor::IdType>(block->getHash()));
+    }
+    return hashes;
+}
+
 std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheBlockIds(
     std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 windowSize) const
 {
