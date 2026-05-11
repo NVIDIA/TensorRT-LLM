@@ -2216,18 +2216,12 @@ class PyExecutor:
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
-            # simultaneously. If some requests are stuck in INIT state and the
-            # scheduler could not allocate KV for any of them, the benchmark
-            # will hang forever because in-progress generation requests won't
-            # release their KV cache.
-            #
-            # Suppress during the fill phase: INIT requests are expected
-            # while KV transfers are still in progress.  The state-based
-            # gate (_is_benchmark_disagg_fill_complete) will open once all
-            # transfers complete; only after that does a stuck INIT request
-            # indicate genuine KV insufficiency.
+            # simultaneously because generation requests do not release their
+            # KV until the full benchmark batch can run. If the scheduler
+            # cannot fit any INIT request after all benchmark requests have
+            # been fetched, the fill gate would never open; raise an explicit
+            # error instead of hanging forever.
             if (self.benchmark_req_queues_size > 0 and not self.is_warmup
-                    and not self._benchmark_fill_phase_active
                     and not fitting_disagg_gen_init_requests):
                 stuck_init_requests = [
                     req for req in self.active_requests
@@ -2288,14 +2282,9 @@ class PyExecutor:
             requests cumulatively.
         (B) Every request in ``active_requests`` on this rank is past the
             KV-transfer phase (not in INIT or TRANS_IN_PROGRESS).
-        (C) The KV cache transceiver has no pending receive sessions
-            (no transfers about to complete that would change state).
+        (C) The KV cache transceiver has no pending receive sessions.
 
         For ADP, (B) and (C) are AND-ed across TP ranks via allgather.
-
-        This predicate is immune to ADP router distribution skew: it asks
-        "are all admitted requests ready for generation?" not "did the
-        router put >= threshold/tp_size on every rank?"
 
         This method must only be called when ``is_benchmark_disagg`` is True.
 
@@ -2327,7 +2316,8 @@ class PyExecutor:
             or req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests)
 
-        # (C) No pending receive sessions on the transceiver.
+        # Also require the transceiver's async receive bookkeeping to be
+        # drained before opening the fill gate.
         local_no_inflight = (
             self.kv_cache_transceiver is None
             or self.kv_cache_transceiver.check_gen_transfer_complete())
@@ -2336,30 +2326,30 @@ class PyExecutor:
 
         if self.enable_attention_dp:
             all_ranks_ok = self.dist.tp_allgather(local_ok)
-            global_ok = min(all_ranks_ok) == 1
         else:
-            all_ranks_ok = None
-            global_ok = bool(local_ok)
+            all_ranks_ok = [local_ok]
+        global_ok = min(all_ranks_ok) == 1
 
-        if not global_ok and self.dist.rank == 0:
-            blocked_ranks = [
-                rank for rank, ok in enumerate(all_ranks_ok or [local_ok])
-                if not ok
-            ]
-            num_init = sum(1 for req in self.active_requests
-                           if req.is_disagg_generation_init_state)
-            num_in_progress = sum(
-                1 for req in self.active_requests
-                if req.is_disagg_generation_transmission_in_progress)
-            logger.debug(
-                f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
-                f"(rank {self.dist.rank} local: {num_init} INIT, "
-                f"{num_in_progress} in-progress, "
-                f"inflight={not local_no_inflight})")
-        if global_ok and self.dist.rank == 0:
-            logger.info(f"Benchmark disagg fill complete: "
-                        f"{len(self.active_requests)} active requests ready, "
-                        f"gate opening.")
+        if self.dist.rank == 0:
+            if global_ok:
+                logger.info(
+                    f"Benchmark disagg fill complete: "
+                    f"{len(self.active_requests)} active requests ready, "
+                    f"gate opening.")
+            else:
+                blocked_ranks = [
+                    rank for rank, ok in enumerate(all_ranks_ok) if not ok
+                ]
+                num_init = sum(1 for req in self.active_requests
+                               if req.is_disagg_generation_init_state)
+                num_in_progress = sum(
+                    1 for req in self.active_requests
+                    if req.is_disagg_generation_transmission_in_progress)
+                logger.debug(
+                    f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
+                    f"(rank {self.dist.rank} local: {num_init} INIT, "
+                    f"{num_in_progress} in-progress, "
+                    f"inflight={not local_no_inflight})")
         return global_ok
 
     def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
@@ -3109,15 +3099,12 @@ class PyExecutor:
 
         max_new_requests = total_max - total_num_active_requests
 
-        # Benchmark disagg fill-phase admission control. Without this cap, the
-        # executor can admit up to `total_max` requests in a single iteration as
-        # soon as the benchmark queue is preloaded, which spikes peak KV-cache
-        # reservations + recv-buffer reservations and can OOM-kill the GEN
-        # server before any KV transfer drains.  The `tp_size` cap restores the
-        # conservative per-rank rate that PR #12091 had in its blocking fill
-        # loop: one new request per rank per executor iteration.  It is scoped
-        # to the initial fill only; once the gate fires, normal admission
-        # resumes.
+        # Benchmark disagg fill-phase admission throttle: without it, the
+        # executor admits `total_max` requests in one iteration when the
+        # benchmark queue is preloaded, putting that many KV recvs in
+        # flight at once.  The transient transfer-staging peak can OOM-
+        # kill the GEN server before any transfer drains.  Cap at
+        # `tp_size` (one per rank per iteration) until the fill gate opens.
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
                 and not self.is_warmup):
             max_new_requests = min(max_new_requests, self.dist.tp_size)

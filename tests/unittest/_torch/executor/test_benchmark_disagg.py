@@ -103,14 +103,15 @@ class MockBenchmarkExecutor:
 class TestFillCompleteStateBased:
     """Test the state-based fill-complete predicate.
 
-    Gate opens when (A) all fetched, (B) all past transfer, (C) no inflight.
+    Gate opens when (A) all fetched, (B) all active requests are past
+    KV-transfer states, and (C) the transceiver is drained.
     """
 
     def test_opens_when_all_conditions_met(self):
         reqs = [_make_active_request() for _ in range(4)]
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=4,
-            kv_cache_transceiver=_make_transceiver(transfer_complete=True),
+            kv_cache_transceiver=_make_transceiver(),
             num_fetch_requests=4,
             active_requests=reqs,
         )
@@ -758,25 +759,32 @@ class TestADPRouterPerRankCap:
 
 
 # ---------------------------------------------------------------------------
-# Fail-fast suppression during fill phase (prevents false-positive kills)
+# Insufficient-KV fail-fast during benchmark fill
 # ---------------------------------------------------------------------------
 
 
-class TestFailFastSuppressedDuringFill:
-    """Verify that the PR #12206 fail-fast (Insufficient KV cache) does not
-    fire while the benchmark fill phase is active.
+class TestFailFastDuringBenchmarkFill:
+    """Verify that the insufficient-KV fail-fast distinguishes healthy fill
+    progress from a stalled fill.
 
-    During fill, INIT requests are expected — they're waiting for KV
-    transfer, not for KV allocation.  The fail-fast should only fire after
-    the gate opens (fill phase complete), when stuck INIT requests genuinely
-    indicate insufficient KV cache.
+    During healthy fill, the scheduler can fit at least one INIT request for
+    KV transfer.  If all benchmark requests have been fetched and the scheduler
+    cannot fit any INIT request, the fill gate can never open and we should
+    return an explicit error instead of hanging.
 
-    This is the root cause of the CI failure on pipeline 49471411: the
-    fail-fast fired with "61 request(s) are waiting for KV cache allocation"
-    during the fill phase, before the gate had a chance to open.
+    This covers the CI regression where the fill-phase guard suppressed the
+    fail-fast forever and
+    ``test_disaggregated_benchmark_gen_only_insufficient_kv`` timed out.
     """
 
-    def _make_executor(self, *, fill_phase_active, num_init_requests=3):
+    def _make_executor(
+        self,
+        *,
+        fill_phase_active,
+        num_init_requests=3,
+        num_fetch_requests=8,
+        fitting_init_requests=None,
+    ):
         """Build a minimal PyExecutor stub for _prepare_and_schedule_batch."""
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
@@ -786,7 +794,7 @@ class TestFailFastSuppressedDuringFill:
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
         ex.enable_attention_dp = False
-        ex.num_fetch_requests = 8
+        ex.num_fetch_requests = num_fetch_requests
         ex.dist = Mock(rank=0, tp_size=1)
         ex.is_shutdown = False
         ex._is_warmup = False
@@ -812,20 +820,47 @@ class TestFailFastSuppressedDuringFill:
         ex._handle_errors = Mock()
 
         scheduled = ScheduledRequests()
-        ex._schedule = Mock(return_value=(scheduled, [], 0))
+        if fitting_init_requests is None:
+            fitting_init_requests = []
+        ex._schedule = Mock(return_value=(scheduled, fitting_init_requests, 0))
 
         return ex
 
-    def test_no_kill_during_fill_phase(self):
-        """During fill phase, stuck INIT requests must not trigger fail-fast."""
+    def test_stalled_fill_phase_kills_after_all_requests_fetched(self):
+        """A fill phase with no fitting INIT requests is a deadlock."""
         ex = self._make_executor(fill_phase_active=True)
 
         result, _ = ex._prepare_and_schedule_batch()
 
-        assert result is not None, (
-            "Fail-fast should NOT fire during fill phase — "
-            "INIT requests are expected while KV transfers are in progress"
+        assert result is None, (
+            "Fail-fast SHOULD fire during a stalled fill phase — "
+            "otherwise the fill gate never opens"
         )
+        ex._handle_errors.assert_called_once()
+
+    def test_healthy_fill_phase_does_not_kill(self):
+        """During healthy fill, a fitting INIT request means progress exists."""
+        fitting_req = _make_active_request(in_init=True)
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None, (
+            "Fail-fast should NOT fire while the scheduler can still fit an "
+            "INIT request for KV transfer"
+        )
+        ex._handle_errors.assert_not_called()
+
+    def test_mid_fetch_does_not_kill(self):
+        """Before all benchmark requests are fetched, keep filling."""
+        ex = self._make_executor(fill_phase_active=True, num_fetch_requests=4)
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None, (
+            "Fail-fast should NOT fire before the full benchmark queue has been fetched"
+        )
+        ex._handle_errors.assert_not_called()
 
     def test_kills_after_fill_phase(self):
         """After fill phase completes, stuck INIT requests trigger fail-fast."""
@@ -837,11 +872,12 @@ class TestFailFastSuppressedDuringFill:
             "Fail-fast SHOULD fire after fill phase — "
             "stuck INIT requests indicate genuine KV insufficiency"
         )
+        ex._handle_errors.assert_called_once()
 
     @pytest.mark.parametrize(
         "fill_active, is_warmup, expected_alive",
         [
-            pytest.param(True, False, True, id="fill_phase_suppresses"),
+            pytest.param(True, False, False, id="stalled_fill_kills"),
             pytest.param(False, False, False, id="post_fill_kills"),
             pytest.param(False, True, True, id="warmup_suppresses"),
             pytest.param(True, True, True, id="both_suppress"),
@@ -858,11 +894,13 @@ class TestFailFastSuppressedDuringFill:
             assert result is not None, (
                 f"fill_active={fill_active}, warmup={is_warmup}: should NOT kill requests"
             )
+            ex._handle_errors.assert_not_called()
         else:
             assert result is None, (
                 f"fill_active={fill_active}, warmup={is_warmup}: "
                 "SHOULD kill requests (genuine KV insufficiency)"
             )
+            ex._handle_errors.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -877,14 +915,14 @@ class TestFillPhaseEndToEnd:
     1. All requests fetched (num_fetch_requests >= benchmark_req_queues_size)
     2. KV cache full with transferred requests, some INIT requests remain
     3. Scheduler can't fit INIT requests
-    4. Verify: fail-fast does NOT fire during fill phase
+    4. Verify: fail-fast does NOT fire while scheduler fits INIT requests
     5. Transfers complete, gate opens, fill phase clears
     6. Verify: fail-fast DOES fire if INIT requests remain after fill
 
     This test catches all three bugs we found iteratively:
     - Bug 1: Count-based gate unsatisfiable under ADP router skew
     - Bug 2: Router overshooting max_batch_size
-    - Bug 3: Fail-fast firing during fill phase
+    - Bug 3: Fail-fast must distinguish healthy fill from stalled fill
     """
 
     TOTAL_REQUESTS = 8
@@ -965,11 +1003,12 @@ class TestFillPhaseEndToEnd:
             "Gate should not open: 3 requests still in INIT"
         )
 
-        # Phase 2b: Fail-fast must NOT fire during fill phase
+        # Phase 2b: Healthy fill keeps making progress, so fail-fast must not
+        # fire even though some active requests remain in INIT.
+        ex._schedule = Mock(return_value=(ScheduledRequests(), [init_reqs[0]], 0))
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None, (
-            "Fail-fast must not kill requests during fill phase, "
-            "even though scheduler can't fit INIT requests"
+            "Fail-fast must not kill requests while the scheduler can still fit INIT requests"
         )
 
         # Phase 3: All transfers complete, gate opens

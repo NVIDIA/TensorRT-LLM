@@ -73,21 +73,12 @@ worker_config:
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false
-      # GEN KV memory budget — DO NOT lower below 0.78 without also lowering
-      # max_batch_size or max_seq_len.
-      #
-      # Floor (0.78): minimum fraction that fits max_batch_size=256 at
-      # max_seq_len=9256 (~2.37M KV tokens/rank). Below this the scheduler
-      # cannot keep all 256 ADP-routed slots resident and chronically
-      # preempts (e.g. at 0.6 only ~203/256 fit, costing ~21% of decode
-      # throughput and pushing the 90-min wall over the test timeout).
-      #
-      # Ceiling (~0.85): leaves ~15 GiB headroom on B200/GB200 (184 GiB).
-      # Above this, NIXL receive buffers + NCCL workspace + EPLB layer
-      # churn + CUDA caching-allocator fragmentation can OOM under burst.
-      #
-      # 0.78 leaves ~22 GiB headroom — comfortable for all transient
-      # allocations with margin for future runtime growth.
+      # GEN KV memory budget — DO NOT lower below 0.78 without also
+      # lowering max_batch_size or max_seq_len.  At 0.78 the KV pool fits
+      # max_batch_size=256 at max_seq_len=9256. Lowering it can
+      # under-provision the KV pool and chronically preempt requests.
+      # Stay below ~0.85 to leave headroom for NIXL recv buffers,
+      # NCCL workspace, and CUDA fragmentation.
       free_gpu_memory_fraction: 0.78
       dtype: fp8
     moe_config:
