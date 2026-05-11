@@ -133,5 +133,5 @@ namespace tensorrt_llm::runtime::kernels
 //! \param cudaStream the CUDA stream on which to perform the operation.
 
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream);
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream, runtime::SizeType32 batchSlot = 0);
 } // namespace tensorrt_llm::runtime::kernels

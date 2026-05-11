@@ -728,7 +728,7 @@ namespace tensorrt_llm::runtime::kernels
 {
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream)
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream, runtime::SizeType32 batchSlot)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -781,7 +781,11 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     lengthPenaltyPtr = manager.copyFrom(lengthPenaltyVec, ITensor::makeShape({batchSize}), runtime::MemoryType::kGPU);
 
     tensorrt_llm::kernels::BeamHypotheses bh;
-    bh.nMaxBatchSize = batchSize;
+    // logProbsTiled has shape [MSL, maxNumSequences, BM] and is passed unsliced.
+    // Use its actual dim-1 as nMaxBatchSize (stride), and offset the pointer to
+    // the correct batch slot so insertUnfinishedPathKernel indexes correctly.
+    auto const logProbsTiledMaxBatchSize = static_cast<SizeType32>(decodingOutput.logProbsTiled->getShape().d[1]);
+    bh.nMaxBatchSize = logProbsTiledMaxBatchSize;
     bh.nBatchSize = batchSize;
     bh.nBeamWidth = beamWidth;
     bh.nMaxSeqLen = maxSeqLength;
@@ -789,7 +793,7 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     bh.inputLengths = bufferCast<SizeType32>(*decodingInput.lengths);
     bh.outputIds = bufferCast<TokenIdType>(finalOutputIds);
     bh.logProbs = bufferCastOrNull<float>(decodingOutput.logProbs);
-    bh.logProbsTiled = bufferCast<float>(*decodingOutput.logProbsTiled);
+    bh.logProbsTiled = bufferCast<float>(*decodingOutput.logProbsTiled) + batchSlot * beamWidth;
     bh.sequenceLengths = bufferCast<SizeType32>(*decodingOutput.lengths);
     bh.cumLogProbs = bufferCast<float>(*decodingOutput.cumLogProbs);
     bh.outputIdsCBA = bufferCast<TokenIdType>(*decodingOutput.beamHypotheses.outputIdsCBA);

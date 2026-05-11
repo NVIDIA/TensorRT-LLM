@@ -335,7 +335,9 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     BeamHypotheses bh;
     // bh's members not used in this function: outputIds, logProbs, outputIdsUnfinish, parentIdsUnfinish
     bh.bVBWS = this->mVBWS;
-    bh.nMaxBatchSize = static_cast<std::int32_t>(op->outputIdsPtr->getDimension<0>());
+    bh.nMaxBatchSize = op->outputLogProbsTiled.has_value()
+        ? static_cast<std::int32_t>(op->outputLogProbsTiled.value()->getShape().d[1])
+        : static_cast<std::int32_t>(op->outputIdsPtr->getDimension<0>());
     bh.nBatchSize = ip->localBatchSize;
     bh.nBeamWidth = op->outputIds->getDimension<1>();
     bh.nMaxSeqLen = op->outputIds->getDimension<2>();
