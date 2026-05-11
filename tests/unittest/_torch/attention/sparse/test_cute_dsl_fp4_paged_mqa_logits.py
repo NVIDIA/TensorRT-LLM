@@ -200,8 +200,8 @@ def _ref_paged_mqa_logits(
     Returns logits in float32; the kernel output is cast to float for
     comparison.
     """
-    batch_size, next_n, num_heads, dim = q.size()
-    num_block, block_size, _, dim = kv_cache.size()
+    batch_size, next_n, _num_heads, dim = q.size()
+    _num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),

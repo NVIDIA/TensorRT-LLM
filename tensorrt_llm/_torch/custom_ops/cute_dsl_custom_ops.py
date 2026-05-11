@@ -6775,6 +6775,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if dt not in (torch.float16, torch.bfloat16, torch.float32):
                 errs.append(
                     f"{name} must be float16, bfloat16, or float32, got {dt}")
+        # Shape checks: forward() reinterprets q/sf_q/weights via reshape(),
+        # so a same-numel but differently ordered tensor would silently
+        # scramble the token/head mapping. Validate ranks and cross-tensor
+        # shapes here to fail fast.
+        if q.dim() != 4:
+            errs.append(f"q must be 4D [B, next_n, H, D//2], got {q.dim()}D")
+        else:
+            B, next_n, H, half_D = q.shape
+            if tuple(sf_q.shape) != (B, next_n, H):
+                errs.append(
+                    f"sf_q must have shape {(B, next_n, H)}, got {tuple(sf_q.shape)}"
+                )
+            if tuple(weights.shape) != (B * next_n, H):
+                errs.append(
+                    f"weights must have shape {(B * next_n, H)}, got {tuple(weights.shape)}"
+                )
+            if tuple(context_lens.shape) != (B, ):
+                errs.append(
+                    f"context_lens must have shape {(B,)}, got {tuple(context_lens.shape)}"
+                )
+            if block_table.dim() != 2 or block_table.shape[0] != B:
+                errs.append(
+                    f"block_table must be 2D with batch dim {B}, got {tuple(block_table.shape)}"
+                )
+            if (kv_fused.dim() != 4 or kv_fused.shape[2] != 1
+                    or kv_fused.shape[3] != half_D + 4):
+                errs.append(
+                    f"kv_fused must be 4D [num_blocks, phys_block_kv, 1, D//2 + 4={half_D + 4}], "
+                    f"got {tuple(kv_fused.shape)}")
         if errs:
             raise ValueError("FP4 Paged MQA Logits dtype errors:\n  " +
                              "\n  ".join(errs))
@@ -6998,6 +7027,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL: SM version {get_sm_version()} is not supported. "
                 f"CuteDSL FP4 Paged MQA Logits only supports SM 100 family.")
+        if num_epi_subtiles not in (1, 2, 4):
+            raise ValueError(
+                f"num_epi_subtiles must be one of (1, 2, 4), got {num_epi_subtiles}"
+            )
         _check_fp4_paged_mqa_logits_dtypes(q, sf_q, kv_fused, weights,
                                            context_lens, block_table,
                                            schedule_meta, epi_dtype,
