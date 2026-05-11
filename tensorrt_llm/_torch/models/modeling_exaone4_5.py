@@ -8,6 +8,22 @@ import torch
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.models.auto import CONFIG_MAPPING
 
+# transformers < 5.8 doesn't ship ``Exaone4_5_VisionConfig``; register a
+# minimal stand-in so ``CONFIG_MAPPING["exaone4_5_vision"]`` resolves when
+# loading the nested vision sub-config from JSON. Fields are accepted via
+# ``**kwargs`` on ``PretrainedConfig``.
+if "exaone4_5_vision" not in CONFIG_MAPPING:
+
+    class _Exaone4_5_VisionConfigFallback(PretrainedConfig):
+        model_type = "exaone4_5_vision"
+        base_config_key = "vision_config"
+
+    AutoConfig.register(
+        _Exaone4_5_VisionConfigFallback.model_type,
+        _Exaone4_5_VisionConfigFallback,
+        exist_ok=True,
+    )
+
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 
