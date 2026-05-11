@@ -302,6 +302,16 @@ def _write_index(
     (out_dir / "INDEX.md").write_text("\n".join(lines) + "\n")
 
 
+def _positive_int(s: str) -> int:
+    try:
+        n = int(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"expected integer, got {s!r}") from e
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"expected positive integer (>= 1), got {n}")
+    return n
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -311,7 +321,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--ref", default="upstream/main", help="git ref to walk (default: upstream/main)"
     )
     ap.add_argument(
-        "--window", type=int, default=500, help="commits back from --ref (default: 500)"
+        "--window",
+        type=_positive_int,
+        default=500,
+        help="commits back from --ref, must be >= 1 (default: 500)",
     )
     ap.add_argument(
         "--filter",
@@ -319,7 +332,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="tests-only",
         help="commit filter (default: tests-only)",
     )
-    ap.add_argument("--limit", type=int, default=None, help="cap commits after filter")
+    ap.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="cap commits after filter, must be >= 1 (default: no cap)",
+    )
     ap.add_argument(
         "--sha",
         action="append",
