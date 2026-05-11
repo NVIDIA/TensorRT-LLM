@@ -1,14 +1,18 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from transformers import AutoConfig
 
+from tensorrt_llm.inputs import MultimodalDataTracker
+from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.serve.chat_utils import (
     load_chat_template,
     parse_chat_message_content,
     parse_chat_message_content_part,
     parse_chat_messages_coroutines,
+    resolve_media_io_kwargs,
 )
 
 
@@ -410,9 +414,7 @@ class TestMultimodalLoadErrorPropagation:
 
     @pytest.fixture
     def mm_tracker(self):
-        tracker = MagicMock()
-        tracker._multimodal_server_config.media_io_kwargs = None
-        return tracker
+        return MultimodalDataTracker(model_type="dummy")
 
     @pytest.mark.parametrize(
         "part, loader_path",
@@ -443,3 +445,121 @@ class TestMultimodalLoadErrorPropagation:
             assert result is not None
             with pytest.raises(CustomError):
                 await result["data"]
+
+
+class TestResolveMediaIoKwargs:
+    """Resolution of server defaults vs per-request media_io_kwargs."""
+
+    def test_server_only_used_when_request_absent(self):
+        server = MultimodalServerConfig(media_io_kwargs={"video": {"num_frames": 8, "fps": 1}})
+        assert resolve_media_io_kwargs(server, None, "video") == {
+            "num_frames": 8,
+            "fps": 1,
+        }
+
+    def test_request_keys_shallow_merge_over_server(self):
+        server = MultimodalServerConfig(
+            media_io_kwargs={"image": {"format": "pil", "device": "cuda"}}
+        )
+        request = {"image": {"format": "pt"}}
+        assert resolve_media_io_kwargs(server, request, "image") == {
+            "format": "pt",
+            "device": "cuda",
+        }
+
+    def test_other_modalities_fall_back_to_server(self):
+        server = MultimodalServerConfig(
+            media_io_kwargs={
+                "video": {"num_frames": 8},
+                "image": {"format": "pil"},
+            }
+        )
+        request = {"video": {"num_frames": 32}}
+        assert resolve_media_io_kwargs(server, request, "image") == {"format": "pil"}
+
+    def test_video_num_frames_override_drops_server_fps(self):
+        """Overriding only `num_frames` drops the server's `fps` so the loader's built-in is used."""
+        server = MultimodalServerConfig(media_io_kwargs={"video": {"num_frames": 8, "fps": 1}})
+        request = {"video": {"num_frames": 32}}
+        assert resolve_media_io_kwargs(server, request, "video") == {"num_frames": 32}
+
+
+class TestVideoMediaIOMergeInteraction:
+    """`VideoMediaIO.merge_kwargs` couples `fps` and `num_frames`."""
+
+    @pytest.mark.parametrize(
+        "runtime, expected",
+        [
+            ({"num_frames": 32}, {"num_frames": 32}),
+            ({"fps": 4}, {"fps": 4}),
+            ({"num_frames": 32, "fps": 4}, {"num_frames": 32, "fps": 4}),
+        ],
+    )
+    def test_overriding_one_drops_partner_unless_both_given(self, runtime, expected):
+        server = {"num_frames": 8, "fps": 1}
+        assert VideoMediaIO.merge_kwargs(server, runtime) == expected
+
+    def test_unrelated_request_key_does_not_trigger_drop(self):
+        merged = VideoMediaIO.merge_kwargs(
+            {"num_frames": 8, "fps": 1},
+            {"format": "pt"},
+        )
+        assert merged == {"num_frames": 8, "fps": 1, "format": "pt"}
+
+    @pytest.mark.parametrize("media_io_cls", [BaseMediaIO, ImageMediaIO, AudioMediaIO])
+    def test_non_video_classes_use_plain_shallow_merge(self, media_io_cls):
+        merged = media_io_cls.merge_kwargs(
+            {"num_frames": 8, "fps": 1},
+            {"num_frames": 32},
+        )
+        assert merged == {"num_frames": 32, "fps": 1}
+
+
+class TestMediaIoKwargsLoaderForwarding:
+    """Resolved kwargs reach the per-modality loaders."""
+
+    @pytest.fixture
+    def mm_tracker_factory(self):
+        def _make(server_kwargs=None, request_kwargs=None):
+            return MultimodalDataTracker(
+                model_type="dummy",
+                multimodal_server_config=MultimodalServerConfig(media_io_kwargs=server_kwargs),
+                request_media_io_kwargs=request_kwargs,
+            )
+
+        return _make
+
+    def test_loader_called_with_resolved_kwargs(self, mm_tracker_factory):
+        tracker = mm_tracker_factory(
+            server_kwargs={"image": {"format": "pil", "device": "cuda"}},
+            request_kwargs={"image": {"format": "pt"}},
+        )
+        part = {"type": "image_url", "image_url": {"url": "i"}}
+        with patch(
+            "tensorrt_llm.serve.chat_utils.async_load_image", return_value=MagicMock()
+        ) as mock_loader:
+            parse_chat_message_content_part(part, tracker)
+        mock_loader.assert_called_once()
+        _, called_kwargs = mock_loader.call_args
+        assert called_kwargs == {"format": "pt", "device": "cuda"}
+
+    @pytest.mark.asyncio
+    async def test_input_audio_bypasses_media_io_kwargs(self, mm_tracker_factory):
+        """`input_audio` is base64-decoded inline; merged `audio` kwargs must not reach the loader."""
+        tracker = mm_tracker_factory(
+            server_kwargs={"audio": {"format": "pil"}},
+            request_kwargs={"audio": {"format": "pt"}},
+        )
+        part = {
+            "type": "input_audio",
+            "input_audio": {"data": "AAAA", "format": "wav"},
+        }
+        with patch(
+            "tensorrt_llm.serve.chat_utils.async_load_audio", new_callable=AsyncMock
+        ) as mock_loader:
+            result = parse_chat_message_content_part(part, tracker)
+            await result["data"]
+        mock_loader.assert_called_once()
+        _, called_kwargs = mock_loader.call_args
+        assert "format" not in called_kwargs
+        assert called_kwargs.get("is_base64") is True

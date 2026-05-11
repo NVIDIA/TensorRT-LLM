@@ -18,6 +18,7 @@ import os
 import warnings
 from collections import deque
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Iterator, Sequence, cast
 
 from . import rawref
@@ -25,6 +26,7 @@ from ._common import (
     GPU_LEVEL,
     NDEBUG,
     Address,
+    BlockOrdinal,
     CacheLevel,
     CacheTier,
     LayerId,
@@ -35,10 +37,10 @@ from ._config import BatchDesc, CacheTierConfig, DataRole, DiskCacheTierConfig, 
 from ._copy_engine import CopyTask, batched_copy
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import OutOfPagesError
-from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
+from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry, compute_scratch_range
 from ._page import Page
 from ._storage import CacheLevelStorage
-from ._storage._config import BufferAttr, BufferId, SlotDesc, StorageConfig
+from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
 from ._storage._core import (
     DiskCacheLevelStorage,
     GpuCacheLevelStorage,
@@ -162,6 +164,8 @@ class StorageManager:
         "_layer_to_life_cycle_ids",
         "_slot_to_page_indices",
         "_buffer_attr",
+        "_layer_attributes",
+        "_slot_util_frac_max",
         "_life_cycle_grouping",
         "_slot_desc_list",
         "_levels",
@@ -171,7 +175,9 @@ class StorageManager:
     _life_cycles: LifeCycleRegistry
     _layer_to_life_cycle_ids: dict[LayerId, LifeCycleId]
     _slot_to_page_indices: TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]
+    _slot_util_frac_max: TypedIndexList[LifeCycleId, Fraction]
     _buffer_attr: dict[BufferId, BufferAttr]
+    _layer_attributes: dict[LayerId, LayerAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
@@ -183,6 +189,7 @@ class StorageManager:
         life_cycles: LifeCycleRegistry,
         config: StorageConfig,
         tokens_per_block: int,
+        enable_swa_scratch_reuse: bool,
         typical_batch: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
     ) -> None:
@@ -193,6 +200,11 @@ class StorageManager:
         self._life_cycles = life_cycles
         self._layer_to_life_cycle_ids = config.layer_to_life_cycle_ids()
         self._slot_to_page_indices = config.slot_to_page_indices()
+        self._layer_attributes = config.layer_attributes()
+        self._slot_util_frac_max = filled_list(Fraction(0, 1), life_cycles.size)
+        for attr in self._layer_attributes.values():
+            if attr.slot_util_frac_max > self._slot_util_frac_max[attr.life_cycle_id]:
+                self._slot_util_frac_max[attr.life_cycle_id] = attr.slot_util_frac_max
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         self._slot_desc_list = config.slot_desc_list
@@ -204,12 +216,14 @@ class StorageManager:
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints or [], tokens_per_block
+            constraints or [], tokens_per_block, enable_swa_scratch_reuse
         )
 
         # Compute init_ratio from typical_batch, constraints, or fallback.
         if typical_batch is not None:
-            init_ratio = self.ratio_from_batch(typical_batch, tokens_per_block, gpu_granularity)
+            init_ratio = self.ratio_from_batch(
+                typical_batch, tokens_per_block, enable_swa_scratch_reuse, gpu_granularity
+            )
         elif constraints:
             # Use the constraint slot counts as the ratio basis.
             min_bytes = self._slots_to_bytes(self._min_slots, gpu_granularity)
@@ -219,6 +233,7 @@ class StorageManager:
             init_ratio = self.ratio_from_batch(
                 BatchDesc([KVCacheDesc(capacity=2049, history_length=2048)]),
                 tokens_per_block,
+                enable_swa_scratch_reuse,
                 gpu_granularity,
             )
 
@@ -556,16 +571,15 @@ class StorageManager:
         assert page.node_ref is not None
         self._levels[page.cache_level].controller.remove(page.node_ref)
 
-    def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
+    def get_mem_pool_base_address(self, pg_idx: PoolGroupIndex, pool_idx: PoolIndex) -> MemAddress:
         storage = self._levels[GPU_LEVEL].storage
-        attr = self.get_buffer_attr(layer_id, data_role)
-        pg_idx = self.get_pool_group_index(attr.life_cycle_id)
-        return MemAddress(
-            cast(int, storage.slot_address(pg_idx, attr.pool_index, SlotId(0))) + attr.offset
-        )
+        return MemAddress(cast(int, storage.slot_address(pg_idx, pool_idx, SlotId(0))))
 
     def get_buffer_attr(self, layer_id: LayerId, data_role: DataRole) -> BufferAttr:
         return self._buffer_attr[BufferId(layer_id, data_role)]
+
+    def get_layer_attr(self, layer_id: LayerId) -> LayerAttr:
+        return self._layer_attributes[layer_id]
 
     def slot_address(
         self, level: CacheLevel, pg_idx: PoolGroupIndex, slot_id: SlotId, pool_idx: PoolIndex
@@ -731,17 +745,21 @@ class StorageManager:
         return typed_map(num_bytes, lambda x: x / total)
 
     def ratio_from_batch(
-        self, batch: BatchDesc, tokens_per_block: int, granularity: int
+        self,
+        batch: BatchDesc,
+        tokens_per_block: int,
+        enable_swa_scratch_reuse: bool,
+        granularity: int,
     ) -> TypedIndexList[PoolGroupIndex, float]:
         """Compute the ratio of bytes needed per pool group for a batch described by a BatchDesc."""
-        num_slots = self._compute_slots_for_batch(batch, tokens_per_block)
+        num_slots = self._compute_slots_for_batch(batch, tokens_per_block, enable_swa_scratch_reuse)
         num_bytes = self._slots_to_bytes(num_slots, granularity)
         total = sum(num_bytes)
         assert total > 0
         return typed_map(num_bytes, lambda x: x / total)
 
     def _compute_min_slots_from_constraints(
-        self, constraints: list[BatchDesc], tokens_per_block: int
+        self, constraints: list[BatchDesc], tokens_per_block: int, enable_swa_scratch_reuse: bool
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
@@ -752,13 +770,13 @@ class StorageManager:
         for pg_idx in self._life_cycle_grouping:
             max_slots[pg_idx] += 1
         for batch in constraints:
-            slots = self._compute_slots_for_batch(batch, tokens_per_block)
+            slots = self._compute_slots_for_batch(batch, tokens_per_block, enable_swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):
                 max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
         return max_slots
 
     def _compute_slots_for_batch(
-        self, batch: BatchDesc, tokens_per_block: int
+        self, batch: BatchDesc, tokens_per_block: int, enable_swa_scratch_reuse: bool
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum number of slots per pool group to support a BatchDesc."""
         num_slots = filled_list(0, self.num_pool_groups)
@@ -773,7 +791,7 @@ class StorageManager:
             # Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
             # A sys block needs memory if it's non-stale for ANY request.
             # = sys_blocks - (blocks stale for ALL requests within [0, sys_blocks))
-            sys_range = HalfOpenRange(0, sys_blocks)
+            sys_range = HalfOpenRange(BlockOrdinal(0), BlockOrdinal(sys_blocks))
             # Intersection of per-request stale ranges, clamped to sys_range.
             stale_intersection = sys_range
             for kv in batch.kv_caches:
@@ -787,7 +805,20 @@ class StorageManager:
                 non_stale = total_blocks - len(stale)
                 # Non-stale sys blocks for this request.
                 non_stale_sys = sys_blocks - len(intersect(stale, sys_range))
-                num_slots[pg_idx] += max(0, non_stale - non_stale_sys)
+                unique_non_stale = max(0, non_stale - non_stale_sys)
+                if enable_swa_scratch_reuse:
+                    scratch = compute_scratch_range(
+                        lc, kv.history_length, kv.capacity, tokens_per_block
+                    )
+                    # Scratch blocks are always input blocks, so they never
+                    # overlap with shared sys blocks (which are history).
+                    num_scratch = len(scratch)
+                    frac_max = self._slot_util_frac_max[lc_idx]
+                    num_slots[pg_idx] += (unique_non_stale - num_scratch) + math.ceil(
+                        num_scratch * frac_max
+                    )
+                else:
+                    num_slots[pg_idx] += unique_non_stale
         return num_slots
 
     def _slots_to_bytes(

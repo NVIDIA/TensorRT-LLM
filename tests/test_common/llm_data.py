@@ -65,21 +65,27 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "mistralai/Codestral-22B-v0.1": "Codestral-22B-v0.1",
     "mistralai/Ministral-8B-Instruct-2410": "Ministral-8B-Instruct-2410",
     "nvidia/Llama-3.1-Nemotron-Nano-8B-v1": "Llama-3.1-Nemotron-Nano-8B-v1",
+    "google/gemma-4-26B-A4B-it": "gemma/gemma-4-26B-A4B-it",
+    "Qwen/Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
+    "MiniMaxAI/MiniMax-M2": "MiniMax-M2",
 }
 
 
 def llm_models_root(check: bool = False) -> Optional[Path]:
-    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
 
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/home/scratch.trt_llm_data/llm-models/")
 
     if not root.exists():
         root = Path("/scratch.trt_llm_data/llm-models/")
 
     if check:
         assert root.exists(), (
-            "You must set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
+            "You must set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data_ci to run this test"
         )
 
     return root if root.exists() else None

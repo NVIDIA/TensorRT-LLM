@@ -400,11 +400,12 @@ def main():
             f'export GEN_WORKER_ENV_VARS="{gen_worker_env_vars}"',
             f'export SERVER_ENV_VARS="{server_env_vars}"',
             f'export BENCHMARK_ENV_VARS="{env_config["benchmark_env_var"]}"',
-            'export pytestCommandCTXWorker="unset UCX_TLS && $CTX_WORKER_ENV_VARS'
+            'export pytestCommandCTXWorker="unset UCX_TLS UCX_NET_DEVICES && $CTX_WORKER_ENV_VARS'
             ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
-            'export pytestCommandGENWorker="unset UCX_TLS && $GEN_WORKER_ENV_VARS'
+            'export pytestCommandGENWorker="unset UCX_TLS UCX_NET_DEVICES && $GEN_WORKER_ENV_VARS'
             ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
-            'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandDisaggServer"',
+            'export pytestCommandDisaggServer="unset UCX_TLS UCX_NET_DEVICES &&'
+            ' $SERVER_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandDisaggServer"',
             'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandBenchmark"',
             f"export runScript={args.run_sh}",
             f"export installScript={install_script}",

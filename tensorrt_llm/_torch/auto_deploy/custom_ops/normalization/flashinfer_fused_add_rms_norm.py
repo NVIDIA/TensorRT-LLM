@@ -13,7 +13,7 @@ import flashinfer
 import torch
 
 try:
-    from ....flashinfer_utils import get_env_enable_pdl
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 except (ModuleNotFoundError, ImportError):
     import os
 

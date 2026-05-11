@@ -190,6 +190,7 @@ def test_finegrained_fp8_quantization():
     ],
 )
 def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
+    torch.manual_seed(0)
     batch_size, seq_len, hidden_dim, num_experts = 2, 2, 16, 1
 
     # Create model based on class

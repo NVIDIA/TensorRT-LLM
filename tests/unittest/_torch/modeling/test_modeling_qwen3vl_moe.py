@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -121,9 +121,14 @@ class TestQwen3VLMoe(TestModelingMultimodal):
         multimodal_params_list,
         is_gen: bool = False,
         num_cached_tokens_per_seq: List[int] = None,
+        total_prompt_len: Optional[int] = None,
     ):
         trtllm_inputs = super().get_trtllm_inputs(
-            input_ids, multimodal_params_list, is_gen, num_cached_tokens_per_seq
+            input_ids,
+            multimodal_params_list,
+            is_gen,
+            num_cached_tokens_per_seq,
+            total_prompt_len=total_prompt_len,
         )
 
         if is_gen:

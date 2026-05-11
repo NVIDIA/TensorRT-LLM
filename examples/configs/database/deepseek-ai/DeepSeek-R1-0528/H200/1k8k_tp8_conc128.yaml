@@ -10,7 +10,7 @@ moe_config:
   backend: CUTLASS
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 3
+  max_draft_len: 3
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8
 trust_remote_code: true

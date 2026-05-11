@@ -6,15 +6,15 @@ import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from tensorrt_llm.mapping import Mapping
-
-from ...llmapi.llm_args import (
+from tensorrt_llm.llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
+
+from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.dist_config import DistConfig
@@ -229,7 +229,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    mode: Literal["graph", "transformers", "export_edgellm_onnx"] = Field(
+    mode: Literal["graph", "transformers"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
         "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
@@ -351,7 +351,27 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             self.max_batch_size = self.max_num_tokens
         return self
 
+    @model_validator(mode="after")
+    def disable_cudagraph_for_speculative_flashinfer(self):
+        if (
+            self.speculative_config is not None
+            and self.attn_backend == "flashinfer"
+            and self.is_cuda_graph_enabled()
+        ):
+            ad_logger.warning(
+                "Speculative decoding with FlashInfer attention does not currently support CUDA "
+                "graph replay in AutoDeploy; falling back to compile_backend='torch-simple'."
+            )
+            self.compile_backend = "torch-simple"
+            self.update_transforms_with_shortcuts()
+        return self
+
     ### UTILITY METHODS ############################################################################
+    @property
+    def requires_uniform_kv_caches(self) -> bool:
+        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
+        return self.attn_backend.lower() == "trtllm"
+
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.
 
@@ -370,6 +390,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
             # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
+            sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
@@ -400,48 +421,41 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         sharding_config = (
             ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
         )
-        dist_mapping_config = sharding_config.get("dist_mapping", {})
+        dist_mapping = sharding_config.get("dist_mapping", {})
         enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
 
         if enable_attention_dp:
-            moe_ep_size = self.world_size
-            moe_tp_size = 1
+            # Attention-DP forces EP-only MoE topology regardless of YAML moe_tp/moe_ep.
+            dist_mapping = {**dist_mapping, "moe_ep": self.world_size, "moe_tp": 1}
             ad_logger.info(
-                f"Attention-DP with EP-only MoE: moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+                f"Attention-DP with EP-only MoE: moe_ep_size={self.world_size}, moe_tp_size=1"
             )
-        else:
-            moe_tp_size = dist_mapping_config.get("moe_tp", 1)
-            moe_ep_size = dist_mapping_config.get("moe_ep", self.world_size)
+
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
 
         try:
-            dc = DistConfig(
-                world_size=world_size,
+            dc = DistConfig.from_sharding_params(
                 rank=rank,
-                tp_size=dist_mapping_config.get("tp", self.world_size),
-                moe_tp_size=moe_tp_size,
-                moe_ep_size=moe_ep_size,
-                moe_cluster_size=dist_mapping_config.get("moe_cluster", 1),
+                world_size=world_size,
+                dist_mapping=dist_mapping,
                 enable_attention_dp=enable_attention_dp,
+                allreduce_strategy=allreduce_strategy,
             )
         except ValueError as e:
             raise ValueError(
                 f"Invalid parallel grid config: {e}. "
-                f"Please check your dist_mapping configuration: {dist_mapping_config}"
+                f"Please check your dist_mapping configuration: {dist_mapping}"
             ) from e
 
         return dc
 
-    def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
-        """Build a Mapping for external APIs that still require it."""
-        return self.init_dist_config(rank, world_size).to_mapping()
-
     ### PRIVATE METHODS ############################################################################
     @classmethod
     def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
-        config_path = files("tensorrt_llm._torch.auto_deploy.config")
+        config_path = files(_ad_config_pkg)
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),
-            "export_edgellm_onnx": str(config_path / "export_edgellm_onnx.yaml"),
         }
         return mapping.get(mode)

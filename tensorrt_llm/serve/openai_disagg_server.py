@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,8 @@ from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole,
-                                              get_ctx_gen_server_addrs)
+                                              get_ctx_gen_server_addrs,
+                                              get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
                                                 create_cluster_storage)
@@ -79,6 +80,12 @@ class RawRequestResponseHooks(ResponseHooks):
 
 
 class OpenAIDisaggServer:
+    _CONVERSATION_ID_HEADERS = (
+        "x-session-id",
+        "x-correlation-id",
+        "x-session-affinity",
+        "x-multi-turn-session-id",
+    )
 
     def __init__(self,
                  config: DisaggServerConfig,
@@ -141,7 +148,10 @@ class OpenAIDisaggServer:
         self.register_routes()
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
-        client = OpenAIHttpClient(router, role, self._req_timeout_secs, max_retries)
+        node_id = self._config.node_id
+        client = OpenAIHttpClient(
+            router, role, self._req_timeout_secs, max_retries,
+            disagg_id_generator=lambda: get_global_disagg_request_id(node_id))
         self._perf_metrics_collector.add_client(client)
         return client
 
@@ -160,15 +170,16 @@ class OpenAIDisaggServer:
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_id from the X-Correlation-ID header.
+        """Populate conversation_id from supported session headers.
 
         When not already set in the request body, copies the header value
         into ``disaggregated_params.conversation_id``.
 
-        aiperf sends multi-turn session IDs via the ``X-Correlation-ID``
-        header (see aiperf ``base_transports.build_headers``).  We mirror
-        that convention so the ConversationRouter can provide session
-        affinity without requiring clients to set the body field.
+        Supported headers are checked in priority order: ``X-Session-ID``,
+        ``X-Correlation-ID``, ``x-session-affinity``, and
+        ``x-multi-turn-session-id``.  We mirror these conventions so the
+        ConversationRouter can provide session affinity without requiring
+        clients to set the body field.
 
         When ``disaggregated_params`` is ``None`` (standard OpenAI
         requests without disagg fields), a minimal instance is created
@@ -176,9 +187,14 @@ class OpenAIDisaggServer:
         ``disaggregated_params`` in ``_get_ctx_request`` /
         ``_get_gen_request`` before forwarding to workers.
         """
-        header_conv_id = raw_req.headers.get("x-correlation-id")
-        if header_conv_id is None:
+        header_conv_id = None
+        for header_name in OpenAIDisaggServer._CONVERSATION_ID_HEADERS:
+            header_conv_id = raw_req.headers.get(header_name)
+            if header_conv_id is not None and header_conv_id.strip():
+                break
+        else:
             return
+
         if req.disaggregated_params is None:
             req.disaggregated_params = DisaggregatedParams(
                 request_type="context_only",

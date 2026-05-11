@@ -6,7 +6,6 @@ import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -230,7 +229,25 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses (sequence) parallel size within each CFG group.",
+        help="Ulysses (head-sharding) parallel size within each CFG group. "
+        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
     )
 
     # CUDA graph
@@ -328,6 +345,8 @@ def _build_diffusion_args(args) -> VisualGenArgs:
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
         },
         torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
@@ -361,10 +380,25 @@ def main():
             f"--distilled_lora_path, but {missing} was not provided."
         )
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
+
     diffusion_args = _build_diffusion_args(args)
 
+    if args.ulysses_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size})"
+    elif attn2d_size > 1:
+        parallel_str = (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
+        )
+    else:
+        parallel_str = "None"
     logger.info(
-        f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}"
+        f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, parallelism={parallel_str}"
     )
     visual_gen = VisualGen(
         model=args.model_path,
@@ -382,8 +416,6 @@ def main():
         )
 
         start_time = time.time()
-
-        inputs = {"prompt": args.prompt}
 
         extra_params = {
             "guidance_rescale": args.guidance_rescale,
@@ -411,18 +443,12 @@ def main():
             extra_params=extra_params,
         )
 
-        output = visual_gen.generate(inputs=inputs, params=params)
+        output = visual_gen.generate(inputs=args.prompt, params=params)
 
         end_time = time.time()
         logger.info(f"Generation completed in {end_time - start_time:.2f}s")
 
-        # Save Output
-        MediaStorage.save_video(
-            output.video,
-            args.output_path,
-            audio=output.audio,
-            frame_rate=args.frame_rate,
-        )
+        output.save(args.output_path)
 
     finally:
         # Shutdown

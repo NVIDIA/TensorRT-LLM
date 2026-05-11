@@ -33,7 +33,6 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <cstdint>
-#include <type_traits>
 
 using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
@@ -260,6 +259,17 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         = mAttentionChunkSize && !tc::getEnvDisableChunkedAttentionInGenPhase() ? *mAttentionChunkSize : INT_MAX;
     xqaParams.max_attention_window_size = generationsParams.max_attention_window_size;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
+    // Treat the layer as sliding-window-causal only for explicit SWA masks or
+    // in-attention positional encodings whose max position exceeds the layer window.
+    // Exclude sparse attention and chunked attention
+    bool const has_in_attention_pos_encoding = mPositionEmbeddingType != PositionEmbeddingType::kLEARNED_ABSOLUTE;
+    // chunked_attention_size is set to INT_MAX above as the "disabled" sentinel.
+    bool const chunked_attention_enabled
+        = xqaParams.chunked_attention_size > 0 && xqaParams.chunked_attention_size != INT_MAX;
+    xqaParams.is_sliding_window = !mUseSparseAttention && !chunked_attention_enabled
+        && ((mMaskType == AttentionMaskType::SLIDING_WINDOW_CAUSAL)
+            || (has_in_attention_pos_encoding && generationsParams.max_attention_window_size > 0
+                && generationsParams.max_attention_window_size < mRotaryEmbeddingMaxPositions));
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;
     xqaParams.sink_token_length = generationsParams.sink_token_length;
     xqaParams.max_past_kv_length = generationsParams.max_past_kv_length;
@@ -723,6 +733,21 @@ int AttentionOp::getHeadSize(bool checkInit) const
     return mHeadSize;
 }
 
+size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
+{
+    static constexpr size_t kMultiCtasKvRowsPerCta = 256;
+    static constexpr size_t kMultiCtasKvStatsPerRow = 2;
+    static constexpr size_t kMultiCtasKvPartialOElementSize = 2;
+
+    size_t const headDimV
+        = mIsMLAEnabled ? static_cast<size_t>(mMLAParams.kv_lora_rank) : static_cast<size_t>(getHeadSize());
+    size_t const maxRows = kMultiCtasKvRowsPerCta * static_cast<size_t>(mMultiProcessorCount);
+    size_t const partialStatsSize = sizeof(float) * kMultiCtasKvStatsPerRow * maxRows;
+    size_t const partialOSize = kMultiCtasKvPartialOElementSize * maxRows * headDimV;
+
+    return partialStatsSize + partialOSize;
+}
+
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
     int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
 {
@@ -770,7 +795,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     {
         dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        dim_v_per_head = mMLAParams.kv_lora_rank;
+        dim_v_per_head
+            = mMLAParams.rope_append ? mMLAParams.kv_lora_rank : mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     }
 
     // Total dimension per token across all heads for Q, K, and V components respectively
@@ -828,8 +854,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     // Each token holds (batch_idx, token_idx_in_seq) int2.
     size_t const tokens_info_size = sizeof(int2) * max_num_tokens;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
-    size_t const fmha_bmm1_scale_size = mFP8ContextFMHA ? sizeof(float) * 2 : 0;
-    size_t const fmha_bmm2_scale_size = mFP8ContextFMHA ? sizeof(float) : 0;
+    size_t const fmha_bmm1_scale_size = (mFP8ContextFMHA || mFP8ContextMLA) ? sizeof(float) * 2 : 0;
+    size_t const fmha_bmm2_scale_size = (mFP8ContextFMHA || mFP8ContextMLA) ? sizeof(float) : 0;
 
     // cp workspace size upper bound
     size_t const cpMaxPaddedSequenceLength = max_num_tokens + batch_size * (mCpSize - 1);
@@ -837,7 +863,9 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         ? 0
         : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads) + cu_seqlens_size);
 
-    int const NUM_BUFFERS = 26;
+    size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
+
+    int const NUM_BUFFERS = 27;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -865,6 +893,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     workspaces[23] = sage_k_sfs_buffer_size;
     workspaces[24] = sage_v_sfs_buffer_size;
     workspaces[25] = cpWorkspaceSize;
+    workspaces[26] = fmha_multi_ctas_kv_scratch_size;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     return context_workspace_size;
@@ -897,7 +926,9 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
 
             int num_q_heads = mNumHeads / mCpSize;
             int num_kv_heads = mNumKVHeads;
-            int head_size_v = mMLAParams.kv_lora_rank;
+            int head_size_v = (mUseSparseAttention && !mMLAParams.rope_append)
+                ? mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim
+                : mMLAParams.kv_lora_rank;
 
             int num_sm_parts = getFlashMlaNumSmParts(s_q, num_q_heads, num_kv_heads, head_size_v);
 
@@ -914,23 +945,17 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
             flash_mla_workspace_size = tc::calculateTotalWorkspaceSize(flash_mla_workspaces, FLASH_MLA_NUM_BUFFERS);
         }
 
-        size_t cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
-        size_t fmha_scheduler_counter = sizeof(uint32_t);
-        size_t headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        size_t const cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
+        size_t const fmha_scheduler_counter = sizeof(uint32_t);
+        size_t const fmha_multi_ctas_kv_scratch_size = getFmhaMultiCtasKvScratchSize();
 
-        int const NUM_BUFFERS = 7;
+        int const NUM_BUFFERS = 5;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_q_len
         workspaces[1] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_kv_len
         workspaces[2] = mIsGenerationMLA ? 0 : fmha_scheduler_counter;
-        // The multiCtasKvMode buffers. Each CTA at most handles 256 rows.
-        // And the seqLenKv is split into at most mMultiProcessorCount tiles.
-        workspaces[3] = size * 256 * mMultiProcessorCount * headDim;
-        // The partialSum size.
-        workspaces[4] = sizeof(float) * 256 * mMultiProcessorCount;
-        // The partialMax size.
-        workspaces[5] = sizeof(float) * 256 * mMultiProcessorCount;
-        workspaces[6] = flash_mla_workspace_size;
+        workspaces[3] = fmha_multi_ctas_kv_scratch_size;
+        workspaces[4] = flash_mla_workspace_size;
 
         fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
@@ -1019,6 +1044,7 @@ int AttentionOp::mlaGeneration(
 
     int const num_kv_heads = 1;
     int const head_size = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+    int const head_size_v = (useSparseMLA() && !mMLAParams.rope_append) ? head_size : mMLAParams.kv_lora_rank;
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
 
     // The element size of the KV cache.
@@ -1067,7 +1093,9 @@ int AttentionOp::mlaGeneration(
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
         // Parameters to select kernels.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        // MLA generation kernels use dense mask. For multi-token generation, TRTLLM-Gen applies causality by
+        // shrinking each token's effective KV length.
+        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = mMultiBlockMode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
@@ -1099,9 +1127,12 @@ int AttentionOp::mlaGeneration(
         // softmax stats if needed
         tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
 
+        // Per-head attention sink added to the softmax denominator.
+        tllmRunnerParams.attentionSinksPtr = generation_params.attention_sinks;
+
         // MLA uses different head dimensions for Qk and V.
-        tllmRunnerParams.mHeadDimQk = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        tllmRunnerParams.mHeadDimV = mMLAParams.kv_lora_rank;
+        tllmRunnerParams.mHeadDimQk = head_size;
+        tllmRunnerParams.mHeadDimV = head_size_v;
 
         auto const num_q_heads = mNumAttnHeads;
         tllmRunnerParams.mNumHeadsQ = num_q_heads;
@@ -1113,7 +1144,13 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
+        // Override mMaxSeqLenKv with the max cache capacity so FMHA picks the same kernel as
+        // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. This is safe for
+        // PagedKv on this path because the strides do not depend on mMaxSeqLenKv, and extra
+        // KV CTAs exit early through seqLensKvPtr.
+        // TODO: mirror the is_swa + W+1 logic from xqaDispatcher.cpp when MLA gains SWA
+        // support (also requires adding Sliding cubins to the MLA gen kernel set).
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_attention_window_size;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
@@ -1145,11 +1182,29 @@ int AttentionOp::mlaGeneration(
         // Set the following parameters if sparseAttention is used.
         if (useSparseMLA())
         {
-            tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
-            tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.sparse_topk;
+            bool const useDynamicSparseMLA = mRuntimeSparseAttentionParams.sparse_mla_topk_lens != nullptr;
+            tllmRunnerParams.mSparseAttention
+                = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;
+            tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.num_sparse_topk;
+            tllmRunnerParams.ptrSparseMlaTopKLens = mRuntimeSparseAttentionParams.sparse_mla_topk_lens;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool;
+            if (useDynamicSparseMLA)
+            {
+                TLLM_CHECK_WITH_INFO(mRuntimeSparseAttentionParams.sliding_window_kv_cache_pool != nullptr,
+                    "SWA KV pool must be set for dynamic sparse MLA.");
+                // Dynamic sparse MLA always has an SWA pool. The compressed pool is optional; when it
+                // is absent (ratio == 1), use SWA as kvPtr only to keep TG's primary TMA descriptor valid.
+                tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool != nullptr
+                    ? mRuntimeSparseAttentionParams.sparse_kv_cache_pool
+                    : mRuntimeSparseAttentionParams.sliding_window_kv_cache_pool;
+                tllmRunnerParams.slidingWindowKvPoolBasePtr
+                    = mRuntimeSparseAttentionParams.sliding_window_kv_cache_pool;
+            }
+            else
+            {
+                tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool;
+            }
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
@@ -1431,7 +1486,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     {
         dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        dim_v_per_head = mMLAParams.kv_lora_rank;
+        dim_v_per_head
+            = mMLAParams.rope_append ? mMLAParams.kv_lora_rank : mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     }
 
     // Total dimension per token across all heads for Q, K, and V components respectively
@@ -1500,6 +1556,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : 2 * sizeof(T) * cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
 
+    size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
+
     bool const is_qk_buf_float_ = true;
 
     // Workspace pointer shift
@@ -1550,6 +1608,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     T* gatherOutBuffer = gatherInBuffer + cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
     int* cu_cp_partial_seqlens = reinterpret_cast<int*>(
         gatherOutBuffer + cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
+
+    // sparse attention MultiCtasKv scratch pool
+    void* fmha_multi_ctas_kv_scratch_ptr
+        = nextWorkspacePtr(workspace_byte_ptr, offset, fmha_multi_ctas_kv_scratch_size);
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     // Note: self attn and cross attn should use different params
@@ -1961,6 +2023,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (useTllmGenSparseAttention())
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
+            // Sparse context reuses generation-style trtllm-gen kernels; provide the scratch pool
+            // and per-CTA counter so the autotuner can select MultiCtasKv variants.
+            fmhaParams.multiCtasKvScratchPtr = fmha_multi_ctas_kv_scratch_ptr;
+            fmhaParams.multiCtasKvCounterPtr = multiBlockSemaphores();
         }
 
         // Skip-softmax attention parameters
@@ -2757,8 +2823,12 @@ int AttentionOp::initialize() noexcept
         TLLM_CHECK_WITH_INFO(!mCrossAttention, "MLA(Deepseek v2) do not support cross attention right now");
         TLLM_CHECK_WITH_INFO(mMaskType != tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK,
             "MLA(Deepseek v2) do not support custom mask right now");
-        TLLM_CHECK_WITH_INFO(mMLAParams.qk_rope_head_dim == 64 && mMLAParams.kv_lora_rank == 512,
-            "MLA(Deepseek v2) only support fixed kv_lora_rank(512) and fixed qk_rope_head_dim(64) right now.");
+        bool const mla_dims_supported = mMLAParams.qk_rope_head_dim == 64
+            && ((mMLAParams.rope_append && mMLAParams.kv_lora_rank == 512)
+                || (!mMLAParams.rope_append && mMLAParams.kv_lora_rank == 448));
+        TLLM_CHECK_WITH_INFO(mla_dims_supported,
+            "MLA(Deepseek v2) only supports qk_rope_head_dim=64 with kv_lora_rank=512 (rope_append=true) or "
+            "kv_lora_rank=448 (rope_append=false).");
     }
 
     mDriver = CUDADriverWrapper::getInstance();
@@ -2891,7 +2961,8 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.attentionInputLayout = AttentionInputLayout::Q_PAGED_KV;
                 fmhaParams.numKvHeads = 1;
                 fmhaParams.headSize = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-                fmhaParams.headSizeV = mMLAParams.kv_lora_rank;
+                fmhaParams.headSizeV = mMLAParams.rope_append ? mMLAParams.kv_lora_rank
+                                                              : mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
                 fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
                 // Adjust the qScaling for the absorption mode.
                 fmhaParams.qScaling = mQScaling

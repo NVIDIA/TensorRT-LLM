@@ -36,7 +36,6 @@ class TRTLLMInstance:
         self.llm = None
 
 
-@pytest.mark.gpu4
 @pytest.mark.parametrize(
     "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_2instances", "tp1_4instances"]
 )

@@ -40,6 +40,11 @@ class DeepEP(Communication):
 
     """
 
+    # Upper bound of `num_experts / num_ranks` enforced by
+    # `notify_dispatch` in the DeepEP intranode kernel
+    # (`kNumThreads = 128` in intranode.cu).
+    INTRANODE_MAX_EXPERTS_PER_RANK: int = 128
+
     def __init__(
         self,
         mapping: Mapping,
@@ -59,6 +64,25 @@ class DeepEP(Communication):
                 f"DeepEP supports: "
                 f"1) Intranode: 2, 4, or 8 ranks; "
                 f"2) Internode: 2, 4, 8, or 16 nodes with 8 ranks per node."
+            )
+
+        # Intranode kernel (`notify_dispatch` in intranode.cu) asserts
+        # `num_experts % num_ranks == 0` and
+        # `num_experts / num_ranks <= kNumThreads (= 128)`. With EPLB,
+        # `num_experts` is `num_slots`, so raise early if the constraint is
+        # violated so the caller can fall back to another strategy.
+        if num_slots % mapping.moe_ep_size != 0:
+            raise RuntimeError(
+                f"DeepEP intranode kernel requires num_slots ({num_slots}) "
+                f"to be divisible by moe_ep_size ({mapping.moe_ep_size})."
+            )
+        slots_per_rank = num_slots // mapping.moe_ep_size
+        if slots_per_rank > self.INTRANODE_MAX_EXPERTS_PER_RANK:
+            raise RuntimeError(
+                f"DeepEP intranode kernel supports at most "
+                f"{self.INTRANODE_MAX_EXPERTS_PER_RANK} experts per rank, but "
+                f"num_slots={num_slots} / moe_ep_size={mapping.moe_ep_size} = "
+                f"{slots_per_rank}."
             )
 
         # Store needed parameters

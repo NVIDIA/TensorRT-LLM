@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
 
-from .._utils import release_gc, str_dtype_to_torch
+from .._utils import get_hf_rope_theta, release_gc, str_dtype_to_torch
 from ..logger import logger
 from ..mapping import Mapping
 from .image_processing import MllamaImageProcessor
@@ -437,11 +437,11 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                       shuffle=False,
                                       collate_fn=tokenizer.collate_function)
     else:
-        batch_encoded = tokenizer.batch_encode_plus(dataset,
-                                                    return_tensors="pt",
-                                                    padding=True,
-                                                    truncation=True,
-                                                    max_length=block_size)
+        batch_encoded = tokenizer(dataset,
+                                  return_tensors="pt",
+                                  padding=True,
+                                  truncation=True,
+                                  max_length=block_size)
         if device:
             batch_encoded = batch_encoded.to(device)
 
@@ -888,7 +888,8 @@ def quantize_and_export(*,
                 if qwen_config.model_type == "qwen2":
                     tensorrt_llm_config[
                         "norm_epsilon"] = qwen_config.rms_norm_eps
-                    tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
+                    tensorrt_llm_config["rotary_base"] = get_hf_rope_theta(
+                        qwen_config, 100000.0)
                 tensorrt_llm_config[
                     "intermediate_size"] = qwen_config.intermediate_size
                 with open(f"{export_path}/config.json", "w") as f:

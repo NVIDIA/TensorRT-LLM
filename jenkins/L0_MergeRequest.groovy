@@ -120,6 +120,8 @@ def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
+@Field
+def CBTS_RESULT = "cbts_result"
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -138,6 +140,7 @@ def testFilter = [
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (CBTS_RESULT): null,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -308,6 +311,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
@@ -696,6 +700,154 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     return autoTriggerTagList
 }
 
+// ============================================================================
+// CBTS (Change-Based Testing Selection)
+//
+// Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
+// a result map (or null = defer to existing filter chain). Result keys:
+// scope, affected_stages, reasons, test_db_dir_override, affected_stage_test_counts.
+// CBTS narrows test cases only — Build always runs. See cbts/README.md.
+// ============================================================================
+
+def getCbtsResult(pipeline, testFilter, globalVars)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
+        return null
+    }
+
+    // CBTS only activates on bare `/bot run`. If the user specified any
+    // stage-selection flag, defer entirely to their explicit choice.
+    def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
+    if (!triggeredFlags.isEmpty()) {
+        pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
+        return null
+    }
+
+    def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
+    if (!changedFiles) {
+        pipeline.echo("CBTS: deferring — no changed files detected")
+        return null
+    }
+
+    try {
+        // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
+        sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
+
+        // Ask Python which file patterns need diffs, fetch them.
+        def patternsOut = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
+            returnStdout: true,
+        ).trim()
+        def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
+        def diffs = [:]
+        for (f in changedFiles) {
+            if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
+                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f)
+            }
+        }
+
+        // Write INPUT_JSON; Python reads stages/yaml itself.
+        def inputJson = groovy.json.JsonOutput.toJson([
+            changed_files: changedFiles,
+            diffs: diffs,
+            post_merge: testFilter[(IS_POST_MERGE)] ?: false,
+        ])
+        def inputPath = "${LLM_ROOT}/cbts_input.json"
+        writeFile file: inputPath, text: inputJson
+
+        def output = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json",
+            returnStdout: true,
+        )
+
+        def result = _cbtsParseSelectionResult(output)
+        if (result.scope == null) {
+            pipeline.echo("CBTS: deferring — Python returned scope=null. " +
+                          "Reasons: ${result.reasons.join('; ')}")
+            return null
+        }
+        // Piggyback input JSON on testFilter so each L0_Test stage agent can
+        // re-run main.py and regenerate cbts_test_db/ locally. Capped at
+        // 256 KB; oversize → drop piggyback, Layer 3 falls back to source.
+        final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
+        def inputJsonSize = inputJson.length()
+        if (inputJsonSize <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
+            result.cbts_input_json = inputJson
+            pipeline.echo("CBTS Layer 3: cbts_input_json piggyback enabled (${inputJsonSize} bytes)")
+        } else {
+            pipeline.echo("CBTS Layer 3: cbts_input_json is ${inputJsonSize} bytes, " +
+                          "exceeds ${CBTS_INPUT_PIGGYBACK_MAX_BYTES}-byte piggyback limit; " +
+                          "downstream stages will fall back to source test-db " +
+                          "(Layer 2 stage filtering still applies)")
+        }
+        pipeline.echo("CBTS: scope=${result.scope}, " +
+                      "stages=${result.affected_stages.size()}")
+        return result
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS failed, falling back to full run: ${e}")
+        return null
+    }
+}
+
+// Translate an Ant-style glob to a regex:
+//   **/  zero or more path segments
+//   **   any chars (including /)
+//   *    any chars except /
+//   ?    single char except /
+def _cbtsGlobToRegex(String glob)
+{
+    def escaped = glob.collect { c ->
+        (c == '*' || c == '?') ? c
+            : ('.+()[]{}|^$\\'.contains(c) ? '\\' + c : c)
+    }.join('')
+    return '^' + escaped
+        .replace('**/', '__CBTSDOUBLESLASH__')
+        .replace('**',  '__CBTSDOUBLESTAR__')
+        .replace('*',   '[^/]*')
+        .replace('?',   '[^/]')
+        .replace('__CBTSDOUBLESLASH__', '(?:.*/)?')
+        .replace('__CBTSDOUBLESTAR__',  '.*') + '$'
+}
+
+def _cbtsMatchesAnyPattern(String filePath, List patterns)
+{
+    return patterns.any { filePath ==~ _cbtsGlobToRegex(it) }
+}
+
+// Returns user-set stage-selection flags that should force CBTS to defer.
+// IS_POST_MERGE and orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG, ...)
+// are intentionally absent.
+def _cbtsTriggeredUserFlags(testFilter)
+{
+    def deferFlags = [
+        ENABLE_SKIP_TEST, TEST_STAGE_LIST, EXTRA_STAGE_LIST, GPU_TYPE_LIST,
+        TEST_BACKEND, ADD_MULTI_GPU_TEST, ONLY_MULTI_GPU_TEST, DISABLE_MULTI_GPU_TEST,
+    ]
+    return deferFlags.findAll { testFilter[it] }
+                     .collect { "${it}=${testFilter[it]}" }
+}
+
+// Parse CBTS JSON stdout into a map. `scope == null` → no decision; caller
+// logs reasons and defers.
+def _cbtsParseSelectionResult(String text)
+{
+    def data = new groovy.json.JsonSlurper().parseText(text)
+    return [
+        scope: data.scope,
+        affected_stages: data.affected_stages ?: [],
+        reasons: data.reasons ?: [],
+        test_db_dir_override: data.test_db_dir_override,
+        affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
+        // Explicit null check preserves `false`; default True is safe.
+        sanity_required: data.sanity_required != null ? data.sanity_required : true,
+        perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
+    ]
+}
+
 def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
 {
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
@@ -764,6 +916,16 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
+        "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
+        "tensorrt_llm/_torch/visual_gen/modules/vae/",
+        "tensorrt_llm/_torch/visual_gen/modules/attention.py",
+        "tensorrt_llm/_torch/visual_gen/executor.py",
+        "tensorrt_llm/_torch/visual_gen/mapping.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline_loader.py",
+        "tensorrt_llm/_torch/visual_gen/models/wan/parallel_vae.py",
+        "tensorrt_llm/visual_gen/",
+        "tensorrt_llm/bench/benchmark/visual_gen.py",
         "tensorrt_llm/evaluate/json_mode_eval.py",
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
@@ -779,6 +941,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
@@ -827,7 +990,8 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         return ""
     }
     def groupFileMap = [
-        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+        "Docs": [
+            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
             "docs/",
         ],
         "PyTorch": [
@@ -858,17 +1022,20 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
 
     for (group in groupFileMap.keySet()) {
         def groupPrefixes = groupFileMap[group]
-        def allFilesInGroup = changedFileList.every { file ->
-            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        def matchesGroup = { file ->
+            // Any *.md file, anywhere in the repo, counts as Docs-only.
+            if (group == "Docs" && file.endsWith(".md")) {
+                return true
+            }
+            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
         }
+        def allFilesInGroup = changedFileList.every(matchesGroup)
 
         if (allFilesInGroup) {
             pipeline.echo("Only ${group} files changed.")
             return group
         } else {
-            def nonGroupFile = changedFileList.find { file ->
-                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
-            }
+            def nonGroupFile = changedFileList.find { file -> !matchesGroup(file) }
             if (nonGroupFile != null) {
                 pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
@@ -1068,6 +1235,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
+                // CBTS deliberately does NOT short-circuit at the arch / Build
+                // layer. Build always runs so a wheel exists for sanity checks
+                // and post-merge consumers; case-level narrowing happens later
+                // in L0_Test.groovy::launchTestJobs (Layer 2) and renderTestDB
+                // (Layer 3).
                 def testStageName = "[Build-x86_64] Remote Run"
                 stage(testStageName) {
                     def additionalParameters = [
@@ -1179,6 +1351,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
+                // CBTS deliberately does NOT short-circuit the SBSA Build —
+                // see x86 track above for the rationale.
 
                 def testStageName = "[Build-SBSA] Remote Run"
                 stage(testStageName) {
@@ -1392,20 +1566,74 @@ pipeline {
                     def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
                         this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
                     if (analysis) {
-                        writeFile file: 'ci_agent_analysis.txt', text: analysis
                         def bucket = 'sw-tensorrt-ci-analysis'
-                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.txt"
+                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.html"
+                        def htmlUrl = "https://pbss.s8k.io/v1/AUTH_svc_tensorrt/${bucket}/${key}"
+                        // Self-rendering HTML page: marked.js parses the analysis at page load
+                        // and DOMPurify sanitises the result before injection into the DOM. The
+                        // analysis text comes from the CI agent which consumes build logs (which
+                        // can include attacker-controlled PR content), so we treat it as untrusted.
+                        // Hardening:
+                        //   1. CDN scripts pinned to specific versions and protected with SRI.
+                        //   2. Analysis embedded in a `<script type="application/json">` data
+                        //      block read via textContent + JSON.parse — never inlined into
+                        //      executable JS source. Every `<` in the JSON is rewritten to its
+                        //      JSON unicode escape so a payload cannot smuggle a `</script>`
+                        //      and break out of the data block.
+                        //   3. marked output is run through DOMPurify before innerHTML assignment
+                        //      to strip event-handler attributes and other XSS vectors.
+                        def jsonAnalysis = groovy.json.JsonOutput.toJson(analysis).replace("<", "\\u003c")
+                        def htmlDoc = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>CI Failure Analysis &middot; ${env.JOB_NAME} #${env.BUILD_NUMBER}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js" integrity="sha384-lqPzN0kmFw9t2syAMwVPM4VbAyqsz/lPyYWbb2Xt6nSPM0WPNrpSWCUBgdcAdgnC" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#24292e}h1,h2,h3{border-bottom:1px solid #eaecef;padding-bottom:.3em}pre{background:#f6f8fa;padding:1em;overflow:auto;border-radius:6px}code{background:#f6f8fa;padding:.2em .4em;border-radius:3px}pre code{background:none;padding:0}a{color:#0366d6}blockquote{border-left:4px solid #dfe2e5;padding:0 1em;color:#6a737d}table{border-collapse:collapse}th,td{border:1px solid #dfe2e5;padding:6px 13px}header{margin-bottom:1.5em;color:#586069}</style>
+</head><body>
+<header><a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a></header>
+<main id="md"></main>
+<script id="md-source" type="application/json">${jsonAnalysis}</script>
+<script>
+  // Disable marked's strikethrough tokenizer: CI failure-analysis text routinely
+  // contains literal tildes (~/path, ~50ms, regex anchors, etc.) that should not
+  // be interpreted as markup. Other GFM extensions (tables, fences, autolinks,
+  // task lists) stay enabled.
+  marked.use({ tokenizer: { del() { return false; } } });
+  const src = JSON.parse(document.getElementById('md-source').textContent);
+  document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(src));
+</script>
+</body></html>
+"""
+                        writeFile file: 'failure_analysis.html', text: htmlDoc
                         container("alpine") {
                             trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
+                            // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
+                            // returns SERVFAIL and musl treats that as a fatal lookup failure (glibc would
+                            // not). Pin the A-record IP in /etc/hosts so getaddrinfo resolves from files.
+                            trtllm_utils.llmExecStepWithRetry(this, script: '''
+                                if ! grep -q 'pbss.s8k.io' /etc/hosts; then
+                                    ip=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
+                                    if [ -n "$ip" ]; then
+                                        printf '%s\\n' "$ip pbss.s8k.io" >> /etc/hosts
+                                    fi
+                                fi
+                            ''')
                             withCredentials([string(
                                     credentialsId: 'svc_tensorrt-swift-stack-key',
                                     variable: 'AWS_SECRET_ACCESS_KEY')]) {
                                 trtllm_utils.llmExecStepWithRetry(this, script:
-                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp ci_agent_analysis.txt" +
-                                    " s3://${bucket}/${key} --endpoint-url https://pbss.s8k.io")
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp failure_analysis.html" +
+                                    " 's3://${bucket}/${key}' --endpoint-url https://pbss.s8k.io" +
+                                    " --content-type text/html")
                             }
                         }
-                        echo "CI Agent Failure Analysis: https://pbss.s8k.io/${bucket}/${key}"
+                        // Surface the URL via currentBuild.description so the upstream PR_Github
+                        // wrapper can extract it and include it in the GitHub PR comment.
+                        def existingDesc = currentBuild.description ?: ""
+                        currentBuild.description = existingDesc +
+                            (existingDesc ? "<br/>" : "") +
+                            "<a href='${htmlUrl}'>CI Agent Failure Analysis</a>"
+                        echo "CI Agent Failure Analysis: ${htmlUrl}"
                     }
                 } catch (Exception e) {
                     // Analysis is best-effort; do not fail the pipeline
