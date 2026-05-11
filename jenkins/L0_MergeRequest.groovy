@@ -1468,11 +1468,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
                         }
 
+                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
+                        // instead of the BuildDockerImages helper job's own counter.
+                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                        def branchTag = branch.replaceAll('/', '_')
+                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
+
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
                             'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                             'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                            'defaultTag': defaultTag,
                         ]
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
