@@ -3,7 +3,7 @@
 """
 CuTe DSL FP4 (MXFP4) paged MQA logits kernel for Blackwell (SM100).
 
-Mirrors DeepGEMM `sm100_fp4_paged_mqa_logits.cuh`. Reuses the FP8 DSL kernel's
+Implement from DeepGEMM's `sm100_fp4_paged_mqa_logits.cuh` and reuse the FP8 DSL kernel's
 warp partition / barrier choreography with the following deltas (see plan
 `study-deepseek-v4/cute_dsl_fp4_indexer/plan_detailed.md` for full design):
 
@@ -12,7 +12,7 @@ warp partition / barrier choreography with the following deltas (see plan
   * MMA = `tcgen05` MXF4 SS (block-scaled), UMMA_K=64
   * UTCCP copies SF SMEM -> TMEM in MMA-required chunk layout. SMEM is flat
     (matches paged KV writer); a lane-cooperative warp transpose runs in SMEM
-    before UTCCP to reshuffle flat -> chunk byte layout (DeepGEMM line 267-277).
+    before UTCCP to reshuffle flat -> chunk byte layout.
   * SF Q (4 UE8M0 packed per int32 token) and SF KV (4 UE8M0 packed per int32
     token, embedded in the fused KV buffer tail) flow as flat int32.
   * Scale apply: Block-scaled MMA bakes the SF into acc; epilogue drops the
@@ -314,8 +314,8 @@ def utccp_required_smem_warp_transpose(smem_ptr) -> None:
     SF atom = 512 bytes) from flat M-row-major layout to the chunk byte layout
     required by UTCCP / MMA for block-scaled FP4.
 
-    Translation of DeepGEMM `sm100_fp4_paged_mqa_logits.cuh:267-277`. The XOR
-    pattern `i ^ (lane_idx >> 3)` avoids SMEM bank conflicts and must be
+    Learn from DeepGEMM's implementation `sm100_fp4_paged_mqa_logits.cuh:267-277`.
+    The XOR pattern `i ^ (lane_idx >> 3)` avoids SMEM bank conflicts and must be
     preserved (M4 reminder).
 
     Args:
@@ -415,12 +415,12 @@ class FP4MQALogitsKernel:
         self.umma_warp_base = 10
 
         self.num_q_stages = 3
-        # FP4 acc is fp32 (硬件锁死). num_umma_stages=1 keeps TMEM within 512
-        # cols including SF cols (see plan TMEM accounting table).
-        # next_n=1 stages=2 实验：bench 平均 +1%、PIC 待对比；先保留 stages=1。
+        # Note, when next_n=1, num_umma_stages could be 2. But test on silicon shows,
+        # num_umma_stages=2 don't improve perf much, so we use num_umma_stages=1 now.
+        # This parameter could be tuned when needed.
         # self.num_umma_stages = 2 if next_n == 1 else 1
         self.num_umma_stages = 1
-        # KV pipeline depth — DeepGEMM FP4 default is 6.
+        # KV pipeline depth
         self.num_kv_stages = 6
         # Step 5.11: smem_pad_bytes (FP8 sub-partition opt knob) dropped.
 
@@ -848,7 +848,7 @@ class FP4MQALogitsKernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
 
-        # Warp roles (matches DeepGEMM SM100)
+        # Warp roles
         warpgroup_idx = warp_idx // 4
         is_math_warp = warp_idx < 8
         is_tma_warp_0 = warp_idx == 8
@@ -1210,7 +1210,7 @@ class FP4MQALogitsKernel:
         # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
         end_kv_idx = end_kv_half * NUM_MATH_WG
 
-        # Convert start to KV block units (matching DeepGEMM)
+        # Convert start to KV block units
         current_q_idx = start_q
         current_kv_idx = start_kv_half * NUM_MATH_WG
 
@@ -1221,9 +1221,9 @@ class FP4MQALogitsKernel:
         next_q_idx = current_q_idx
         next_kv_idx = current_kv_idx
         next_num_kv = current_num_kv
-        # Sentinel: no previous batch (matches DeepGEMM's q_idx = batch_size)
+        # Sentinel: no previous batch (q_idx = batch_size)
         q_idx = batch_size
-        # While-loop termination flag (matches DeepGEMM's fetch_next_task pattern).
+        # While-loop termination flag (fetch_next_task pattern).
         # True if this CTA has work assigned (start != end in schedule_meta).
         has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
 
@@ -1233,17 +1233,16 @@ class FP4MQALogitsKernel:
 
         if is_tma_warp_0:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
-            # Matches DeepGEMM's TMA warp with kv_group_idx == 0
             cute.arch.warpgroup_reg_dealloc(24)
             lane_idx = tidx % 32
 
             # Block table prefetch: 32 lanes cache block indices,
             # distributed via shuffle. Each lane holds num_blocks_per_mma
-            # physical block indices per compute tile. (DeepGEMM L233-244)
+            # physical block indices per compute tile.
             cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
             kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
 
-            # Prefetch first Q before loop (like DeepGEMM line 203-204)
+            # Prefetch first Q before loop
             q_pipeline.producer_acquire(q_prod_state)
             q_bar = q_pipeline.producer_get_barrier(q_prod_state)
             cute.copy(
@@ -1329,7 +1328,7 @@ class FP4MQALogitsKernel:
                             )
                             q_prod_state.advance()
 
-                # Block table prefetch for group 0 (like DeepGEMM L233-241).
+                # Block table prefetch for group 0.
                 # Each lane loads num_blocks_per_mma physical block indices
                 # for one compute tile (kv_idx counts compute tiles).
                 if kv_blk_ptr == 32:
@@ -1343,7 +1342,7 @@ class FP4MQALogitsKernel:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
 
-                # Get block indices via shuffle before barrier (like DeepGEMM L244)
+                # Get block indices via shuffle before barrier.
                 phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
                 for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                     phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
@@ -1381,7 +1380,6 @@ class FP4MQALogitsKernel:
 
         elif is_tma_warp_1:
             # TMA warp 1: loads KV + Scale for group 1 only
-            # Matches DeepGEMM's TMA warp with kv_group_idx == 1
             cute.arch.warpgroup_reg_dealloc(24)
             lane_idx = tidx % 32
 
@@ -1400,7 +1398,7 @@ class FP4MQALogitsKernel:
                 if q_idx != q_idx_old:
                     kv_blk_ptr = cutlass.Int32(32)
 
-                # Block table prefetch for group 1 (like DeepGEMM L233-241).
+                # Block table prefetch for group 1
                 if kv_blk_ptr == 32:
                     kv_blk_ptr = cutlass.Int32(0)
                     prefetch_kv = kv_idx + 1 + lane_idx * NUM_MATH_WG
@@ -1412,7 +1410,7 @@ class FP4MQALogitsKernel:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
 
-                # Get block indices via shuffle before barrier (like DeepGEMM L244)
+                # Get block indices via shuffle before barrier
                 phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
                 for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                     phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
@@ -1529,10 +1527,10 @@ class FP4MQALogitsKernel:
                         sfb_sync_barrier.arrive_and_wait()
 
                     # Process KV block for group 0 (kv_idx + 0)
-                    # Unconditional UMMA (like DeepGEMM): OOB iterations
+                    # Unconditional UMMA: OOB iterations
                     # compute on garbage data; results written to aligned
                     # padding region in logits buffer.
-                    # Wait KV first, then TMEM empty (like DeepGEMM)
+                    # Wait KV first, then TMEM empty
                     kv_pipeline_0.consumer_wait(kv_cons_state_umma_0)
                     umma_pipeline_0.producer_acquire(umma_prod_state_0)
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1668,8 +1666,8 @@ class FP4MQALogitsKernel:
                         sfb_sync_barrier.arrive_and_wait()
 
                     # Process KV block for group 1 (kv_idx + 1)
-                    # Unconditional UMMA (like DeepGEMM)
-                    # Wait KV first, then TMEM empty (like DeepGEMM)
+                    # Unconditional UMMA
+                    # Wait KV first, then TMEM empty
                     kv_pipeline_1.consumer_wait(kv_cons_state_umma_1)
                     umma_pipeline_1.producer_acquire(umma_prod_state_1)
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1810,7 +1808,7 @@ class FP4MQALogitsKernel:
                                 ]
 
                     # Process KV block for group 0 (kv_idx + 0)
-                    # Unconditional Math (like DeepGEMM): OOB results
+                    # Unconditional Math: OOB results
                     # written to aligned padding region in logits buffer.
                     kv_pos = kv_idx * block_kv_val + m_coord
 
@@ -2057,7 +2055,7 @@ class FP4MQALogitsKernel:
                                 ]
 
                     # Process KV block for group 1 (kv_idx + 1)
-                    # Unconditional Math (like DeepGEMM)
+                    # Unconditional Math
                     kv_idx_1 = kv_idx + 1
 
                     kv_pos = kv_idx_1 * block_kv_val + m_coord

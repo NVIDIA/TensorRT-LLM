@@ -776,6 +776,7 @@ def benchmark_fp4_paged_mqa_logits(
                             data["block_table"],
                             dg_schedule_meta,
                             data["max_model_len"],
+                            logits_dtype=output_dtype,
                         )
 
                     dg_us = _bench_kineto(dg_fn, "paged_mqa_logits", num_iterations) * 1e6
@@ -822,8 +823,8 @@ if __name__ == "__main__":
         "--context_len",
         type=int,
         nargs="+",
-        default=[4096, 8192, 16384, 32768, 65536],
-        help="context lengths (default: 4096 8192 16384 32768 65536)",
+        default=[4096, 8192, 16384, 32768, 65536, 131072],
+        help="context lengths (default: 4096 8192 16384 32768 65536 131072)",
     )
     parser.add_argument(
         "--repeat",
