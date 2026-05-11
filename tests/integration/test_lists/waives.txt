@@ -11,7 +11,6 @@ accuracy/test_llm_api_autodeploy.py::TestGemma4MoE::test_bf16 SKIP (https://nvbu
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer] SKIP (https://nvbugs/6117814)
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[trtllm] SKIP (https://nvbugs/6117814)
 accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8 SKIP (https://nvbugs/6158397)
-accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[deepseek-ai_DeepSeek-R1-0528-True] SKIP (https://nvbugs/6162323)
 accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.3-70B-Instruct-False] SKIP (https://nvbugs/6143811)
 accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_bf16_small[4] SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_nvfp4[8] SKIP (https://nvbugs/6080024)
