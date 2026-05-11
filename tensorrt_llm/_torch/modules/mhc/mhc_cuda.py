@@ -762,11 +762,31 @@ def _alloc_fused_hc_outputs(
 _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
+# Hidden sizes for which the half-fused tcgen05 MMA path makes DSv4-Pro
+# bench warmup exceed practical wall budgets (25-40 min SLURM walls hit
+# TIME LIMIT before iterations begin). Observed on hidden=7168.
+#
+# The kernel itself completes correctly per call (verified via OpTrace
+# inside the failing bench: 9260+ mhc_fused_hc calls per rank in 10 min,
+# including the supposedly-bad ('fused_half_mma', 0, 16, 512, 1) tactic at
+# M=320 in sub-ms steady state). What appears to be a hang is in fact the
+# cumulative cost of (autotuner profiling × all M-buckets × all ops) +
+# cudagraph capture for ~15 batch sizes — slower with MMA tactics cached
+# in than with FMA. The FMA fallback fits the bench within 20-25 min;
+# the MMA fallback consistently times out at 40 min.
+#
+# This is a perf workaround, not a kernel fix. The autotuner-cached tactics
+# for inference-time shapes are unaffected; only the rare eager-mode
+# cache-miss fallback is routed to FMA here.
+_FUSED_HC_MMA_FALLBACK_BLOCKED_HIDDEN_SIZES = {7168}
+
 
 def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
     mma_ok = _fused_hc_mma_supported()
     if hidden_size is not None:
         mma_ok = mma_ok and hidden_size in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES
+        if hidden_size in _FUSED_HC_MMA_FALLBACK_BLOCKED_HIDDEN_SIZES:
+            mma_ok = False
     return _FUSED_HC_FALLBACK_TACTIC_MMA if mma_ok else _FUSED_HC_FALLBACK_TACTIC_FMA
 
 
