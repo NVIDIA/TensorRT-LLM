@@ -18,6 +18,13 @@ verification: the test either still runs elsewhere (unchanged) or is
 fully retired. Comment lines and whitespace-only edits are ignored;
 any other non-entry +/- line (condition / mako / whole-block change)
 falls back since Layer 2 stage matching depends on those.
+
+A diff list-item line counts as a `tests:` entry only when the most
+recent enclosing key visible in its hunk is `tests:`. Wildcard / term
+list items (e.g. `- "*h100*"` under `wildcards.gpu:`) thus stay
+classified as structural. When the enclosing key is not visible in
+the hunk, the line is structural too — the rule errs on the side of
+fallback rather than silently misclassifying.
 """
 
 from __future__ import annotations
@@ -27,20 +34,14 @@ from typing import Optional
 
 from blocks import Stage, YAMLIndex, normalize_test_id
 
-from ._helpers import (
-    iter_diff_changes,
-    lookup_ids_into_block_filters,
-    resolve_affected_stages,
-    stages_by_yaml_stem,
-)
+from ._helpers import lookup_ids_into_block_filters, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 TEST_DB_DIR = "tests/integration/test_lists/test-db/"
 
-# `<2+ space indent>- <pytest_id>`. Top-level `- condition:` (column-0
-# block-list item) intentionally does not match — the leading `\s+`
-# discriminates entry-within-block from block-boundary edits.
-_ENTRY_RE = re.compile(r"^\s+-\s+(\S.*)$")
+_HUNK_HEADER_RE = re.compile(r"^@@ ")
+_KEY_LINE_RE = re.compile(r"^(?P<indent>\s*)(?P<key>[A-Za-z_][\w-]*)\s*:")
+_LIST_ITEM_RE = re.compile(r"^(?P<indent>\s*)-\s+(?P<body>\S.*)$")
 _COMMENT_RE = re.compile(r"^\s*#")
 
 
@@ -70,18 +71,10 @@ class TestListRule(Rule):
         structural: list[str] = []
 
         for path in touched:
-            for sign, body in iter_diff_changes(pr.diffs.get(path, "")):
-                if not body.strip():
-                    continue
-                if _COMMENT_RE.match(body):
-                    continue
-                m = _ENTRY_RE.match(body)
-                if m is None:
-                    structural.append(f"{path}:{sign}{body.rstrip()}")
-                    continue
-                tid = normalize_test_id(m.group(1))
-                if tid:
-                    (added if sign == "+" else removed).add(tid)
+            a, r, s = _scan_test_db_diff(pr.diffs.get(path, ""))
+            added |= a
+            removed |= r
+            structural.extend(f"{path}:{sign}{body}" for sign, body in s)
 
         if structural:
             preview = "; ".join(structural[:3])
@@ -150,3 +143,66 @@ class TestListRule(Rule):
                 f"{miss_note}"
             ),
         )
+
+
+def _scan_test_db_diff(
+    diff: str,
+) -> tuple[set[str], set[str], list[tuple[str, str]]]:
+    """Walk a unified diff for a test-db YAML; classify each +/- line.
+
+    A list-item line counts as a `tests:` entry only when its enclosing
+    key — resolved from a per-hunk key stack updated by context, +,
+    and - lines — is `tests:`. Items under `wildcards:`, `terms:`, or
+    any other key (including the unresolved case where no enclosing
+    key is visible in the hunk) are structural and force fallback.
+    """
+    added: set[str] = set()
+    removed: set[str] = set()
+    structural: list[tuple[str, str]] = []
+    key_stack: list[tuple[int, str]] = []  # (indent, key_name)
+
+    for raw in diff.splitlines():
+        if raw.startswith(("+++", "---")):
+            continue
+        if _HUNK_HEADER_RE.match(raw):
+            key_stack = []
+            continue
+        if not raw:
+            continue
+        sign = raw[0]
+        if sign not in (" ", "+", "-"):
+            continue
+        body = raw[1:]
+        if not body.strip() or _COMMENT_RE.match(body):
+            continue
+
+        list_match = _LIST_ITEM_RE.match(body)
+        if list_match:
+            indent = len(list_match.group("indent"))
+            while key_stack and key_stack[-1][0] > indent:
+                key_stack.pop()
+            top_key = key_stack[-1][1] if key_stack else None
+            if sign == " ":
+                continue
+            entry_text = list_match.group("body")
+            tid = normalize_test_id(entry_text)
+            if top_key == "tests" and tid:
+                (added if sign == "+" else removed).add(tid)
+            else:
+                structural.append((sign, body.rstrip()))
+            continue
+
+        key_match = _KEY_LINE_RE.match(body)
+        if key_match:
+            indent = len(key_match.group("indent"))
+            while key_stack and key_stack[-1][0] >= indent:
+                key_stack.pop()
+            key_stack.append((indent, key_match.group("key")))
+            if sign in ("+", "-"):
+                structural.append((sign, body.rstrip()))
+            continue
+
+        if sign in ("+", "-"):
+            structural.append((sign, body.rstrip()))
+
+    return added, removed, structural
