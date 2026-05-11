@@ -844,10 +844,9 @@ class MhcFusedHcRunner(TunableRunner):
     def get_valid_tactics(self, inputs, profile: OptimizationProfile, **kwargs):
         M = inputs[0].shape[0]
         tactics = []
-        # Only Path D (fused_all_mma) supports the fused next-layer RMSNorm
-        # epilogue. When the caller passes norm_weight, restrict the autotuner
-        # to Path D tactics — other backends raise in the op wrapper.
-        fuse_norm = kwargs.get("norm_weight") is not None
+        # All four backends support the fused next-layer RMSNorm now (Path B/E
+        # in bigfuse, Path D/F in the all-in-one epilogue), so the autotuner
+        # explores the full tactic space regardless of norm_weight.
         # The MMA (tcgen05) paths require SM100+. On older archs only the FMA
         # paths are compilable/runnable — we simply never emit MMA tactics.
         mma_ks = tuple(
@@ -857,7 +856,7 @@ class MhcFusedHcRunner(TunableRunner):
         # Path F (fused_all_fma, 1-kernel FMA) — preferred at small M (<=32)
         # where MMA can't fill BLOCK_M=64. Include for M <= 64 as the
         # crossover is measured per-M.
-        if not fuse_norm and M <= 64:
+        if M <= 64:
             for tn, ks, tm in _FUSED_HC_ALL_FMA_TN_KS_TM:
                 # Skip grids that wildly oversubscribe SMs.
                 m_batches = (M + tm - 1) // tm
@@ -868,7 +867,7 @@ class MhcFusedHcRunner(TunableRunner):
         # Path D (fused_all_mma, 1-kernel TF32 MMA) — preferred at mid/large
         # M (>=64). Include when M >= 48 to overlap with Path F at the
         # crossover boundary.
-        if mma_ok and (fuse_norm or M >= 48):
+        if mma_ok and M >= 48:
             for ks in mma_ks:
                 m_tiles = (M + 63) // 64
                 if m_tiles * ks > 148 * 4:
@@ -876,7 +875,7 @@ class MhcFusedHcRunner(TunableRunner):
                 tactics.append(("fused_all_mma", 0, ks, 0, 1))
         # Half-fused FMA path (2-kernel) — useful at smallish M; kept as a
         # fallback option for the autotuner at small M.
-        if not fuse_norm and M <= 512:
+        if M <= 512:
             for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
                 if ks > 1 and M * (self.n * (2 + self.n) // tn) >= 148 * 2:
                     continue
@@ -884,7 +883,7 @@ class MhcFusedHcRunner(TunableRunner):
                     tactics.append(("fused_half_fma", tn, ks, bs, 1))
         # Half-fused MMA path (2-kernel) — always an option when tcgen05 is
         # available.
-        if not fuse_norm and mma_ok:
+        if mma_ok:
             for ks in mma_ks:
                 m_tiles = (M + 63) // 64
                 if m_tiles * ks > 148 * 4:

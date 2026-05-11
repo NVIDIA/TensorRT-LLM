@@ -38,7 +38,7 @@ void mhcBigFuseOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor residu
         reinterpret_cast<__nv_bfloat16*>(layer_input.data_ptr<at::BFloat16>()), static_cast<int>(M),
         static_cast<int>(K), static_cast<int>(hidden_size), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value), static_cast<int>(sinkhorn_repeat),
-        static_cast<int>(num_splits), static_cast<int>(block_size), stream);
+        static_cast<int>(num_splits), static_cast<int>(block_size), /*norm_weight=*/nullptr, /*norm_eps=*/0.f, stream);
 }
 
 void mhcGemmSqrsumFmaOp(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch::Tensor r, int64_t M, int64_t N,
@@ -85,13 +85,14 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
 {
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Fused next-layer RMSNorm on layer_input_cur. Only Path D (backend == 2)
-    // supports this; other backends ignore norm_weight (or fail if it's set).
+    // Fused next-layer RMSNorm on layer_input_cur. All four backends (Path B/D
+    // for MMA and Path E/F for FMA) support it now: Path B/E fuse the norm into
+    // the bigfuse kernel's Phase 2 layer_input write; Path D/F fuse it into the
+    // single-kernel Phase 4 epilogue. When norm_weight is null, layer_input is
+    // left un-normalized (caller must run RMSNorm separately).
     __nv_bfloat16 const* norm_weight_ptr = nullptr;
     if (norm_weight.has_value() && norm_weight->defined())
     {
-        TORCH_CHECK(backend == 2,
-            "mhc_fused_hc: norm_weight is only supported with backend=2 (fused_all_mma / Path D)");
         TORCH_CHECK(norm_weight->dtype() == torch::kBFloat16, "mhc_fused_hc: norm_weight must be bfloat16");
         TORCH_CHECK(norm_weight->is_contiguous(), "mhc_fused_hc: norm_weight must be contiguous");
         TORCH_CHECK(norm_weight->numel() == hidden_size,
@@ -117,7 +118,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             static_cast<int>(hc_mult), static_cast<int>(tile_n), static_cast<int>(num_k_splits),
             static_cast<int>(tile_m), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
             static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
-            static_cast<int>(sinkhorn_repeat), stream);
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream);
         return;
     }
     if (backend == 2)
@@ -147,7 +148,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             static_cast<int>(hidden_size), static_cast<int>(hc_mult), static_cast<int>(tile_n),
             static_cast<int>(num_k_splits), static_cast<int>(bigfuse_block_size), static_cast<float>(rms_eps),
             static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
-            static_cast<int>(sinkhorn_repeat), stream);
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream);
         return;
     }
 
@@ -160,7 +161,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
         static_cast<int>(hidden_size), static_cast<int>(hc_mult), static_cast<int>(num_k_splits),
         static_cast<int>(bigfuse_block_size), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value), static_cast<int>(sinkhorn_repeat),
-        stream);
+        norm_weight_ptr, static_cast<float>(norm_eps), stream);
 }
 
 } // anonymous namespace

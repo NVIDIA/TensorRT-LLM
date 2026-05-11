@@ -349,7 +349,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult,
     int num_k_splits, int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
-    float hc_post_mult_value, int sinkhorn_repeat, cudaStream_t stream)
+    float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
+    cudaStream_t stream)
 {
     if (M <= 0)
         return;
@@ -411,7 +412,7 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     // instantiating the mhcBigFuseKernel template in this TU.
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
         layer_input_cur, M, /*K=*/static_cast<int>(SHAPE_K), hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-        hc_post_mult_value, sinkhorn_repeat, /*num_splits=*/1, /*block_size=*/bs, stream);
+        hc_post_mult_value, sinkhorn_repeat, /*num_splits=*/1, /*block_size=*/bs, norm_weight, norm_eps, stream);
 }
 
 void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
@@ -419,7 +420,7 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, cudaStream_t stream)
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
 {
     if (M <= 0)
         return;
@@ -433,13 +434,13 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
         mhcFusedHcLaunchImpl<FHC_HIDDEN_FLASH>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
             hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, M,
             hidden_size, hc_mult, num_k_splits, bigfuse_block_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-            hc_post_mult_value, sinkhorn_repeat, stream);
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
         return;
     case static_cast<int>(FHC_HIDDEN_PRO):
         mhcFusedHcLaunchImpl<FHC_HIDDEN_PRO>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
             hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, M,
             hidden_size, hc_mult, num_k_splits, bigfuse_block_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-            hc_post_mult_value, sinkhorn_repeat, stream);
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
         return;
     default: return;
     }
@@ -498,7 +499,7 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int tile_n, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, cudaStream_t stream)
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
 {
     if (M <= 0)
         return;
@@ -523,7 +524,7 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     // ---- Step 2: big-fuse postlogue (reduces ks splits internally) ----
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
         layer_input_cur, M, /*K=*/K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat, /*num_splits=*/num_k_splits, bigfuse_block_size, stream);
+        sinkhorn_repeat, /*num_splits=*/num_k_splits, bigfuse_block_size, norm_weight, norm_eps, stream);
 }
 
 // ===================================================================
@@ -706,19 +707,21 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
 
 using FmaAllInOneFn = void (*)(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float const*, float const*,
     float const*, float const*, __nv_bfloat16*, float*, float*, __nv_bfloat16*, float*, float*, int*, int, int, int,
-    float, float, float, float, int);
+    float, float, float, float, int, __nv_bfloat16 const*, float);
 
-template <int TN, int KS, int TM>
+template <int TN, int KS, int TM, bool kFuseNorm>
 static FmaAllInOneFn fhcFmaAllInOneInstance()
 {
-    return &fused_fma_kernels::fused_pmap_gemm_fma_allinone<TN, KS, TM, /*FULL_N=*/24, /*BF16_VEC_OVERRIDE=*/0>;
+    return &fused_fma_kernels::fused_pmap_gemm_fma_allinone<TN, KS, TM, /*FULL_N=*/24, /*BF16_VEC_OVERRIDE=*/0,
+        kFuseNorm>;
 }
 
+template <bool kFuseNorm>
 static FmaAllInOneFn pickFhcFmaAllInOne(int tile_n, int ks, int tile_m)
 {
 #define FHC_FMA_AIO_CASE(TN, KS, TM)                                                                                   \
     if (tile_n == (TN) && ks == (KS) && tile_m == (TM))                                                                \
-    return fhcFmaAllInOneInstance<TN, KS, TM>()
+    return fhcFmaAllInOneInstance<TN, KS, TM, kFuseNorm>()
 
     FHC_FMA_AIO_CASE(1, 1, 1);
     FHC_FMA_AIO_CASE(1, 2, 1);
@@ -761,7 +764,8 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int tile_n, int num_k_splits, int tile_m, float rms_eps, float hc_pre_eps,
-    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, cudaStream_t stream)
+    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight,
+    float norm_eps, cudaStream_t stream)
 {
     if (M <= 0)
         return;
@@ -781,14 +785,16 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * static_cast<uint32_t>(N), r_acc_workspace,
         static_cast<uint32_t>(M), done_counter_workspace, static_cast<uint32_t>(m_batches), stream);
 
-    FmaAllInOneFn fn = pickFhcFmaAllInOne(tile_n, num_k_splits, tile_m);
+    bool const fuse_norm = (norm_weight != nullptr);
+    FmaAllInOneFn fn = fuse_norm ? pickFhcFmaAllInOne</*kFuseNorm=*/true>(tile_n, num_k_splits, tile_m)
+                                 : pickFhcFmaAllInOne</*kFuseNorm=*/false>(tile_n, num_k_splits, tile_m);
     dim3 const grid(
         static_cast<unsigned>(m_batches), static_cast<unsigned>(N / tile_n), static_cast<unsigned>(num_k_splits));
     dim3 const block(256);
     fn<<<grid, block, 0, stream>>>(residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale, hc_base,
         residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace,
         done_counter_workspace, M, K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat);
+        sinkhorn_repeat, norm_weight, norm_eps);
 }
 
 } // namespace kernels::mhc
