@@ -765,13 +765,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
-                # Run draft model (mode-specific via helper).  For Eagle3 the
-                # helper mutates ``attn_metadata.all_rank_num_tokens`` to the
-                # right per-step value; for MTP Eagle the value is passed as
-                # a kwarg to ``mtp_layers[0]`` directly.
+                # Run draft model (mode-specific via helper). The helper
+                # passes ``all_rank_num_tokens`` as a kwarg so the draft model
+                # handles save/restore internally (Eagle3DraftModel.forward
+                # uses try/finally); attn_metadata is left untouched here.
                 hidden_states, hidden_states_to_save = self._run_draft_forward(
-                    draft_model, inputs, spec_metadata, i,
-                    original_all_rank_num_tokens)
+                    draft_model, inputs, spec_metadata, i)
 
                 # Compute gather_ids: on the first draft step each generation
                 # request may have accepted multiple tokens, so we index into
@@ -948,32 +947,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         return next_draft_tokens
 
-    def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int,
-                                      fallback):
+    def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int):
         """Pick the right ``all_rank_num_tokens`` for this draft iteration.
 
-        Step 0 uses ``spec_metadata.all_rank_num_tokens`` (or the fallback
-        captured from attn_metadata before the loop); subsequent steps use
-        ``spec_metadata.subseq_all_rank_num_tokens`` since every sequence
+        Step 0 uses ``spec_metadata.all_rank_num_tokens``; subsequent steps
+        use ``spec_metadata.subseq_all_rank_num_tokens`` since every sequence
         contributes a single token per iteration.
         """
-        if step_idx == 0:
-            return (spec_metadata.all_rank_num_tokens
-                    if spec_metadata.all_rank_num_tokens is not None else
-                    fallback)
-        return spec_metadata.subseq_all_rank_num_tokens
+        return (spec_metadata.all_rank_num_tokens if step_idx == 0 else
+                spec_metadata.subseq_all_rank_num_tokens)
 
     def _run_draft_forward(self, draft_model, inputs, spec_metadata,
-                           step_idx: int, original_all_rank_num_tokens):
+                           step_idx: int):
         """Invoke the draft model for one iteration, branching on mode.
 
-        For MTP Eagle, ``all_rank_num_tokens`` is passed directly as a kwarg
-        to ``mtp_layers[0]``. For Eagle3, it is set on ``attn_metadata`` so
-        the EAGLE draft model picks it up; the outer ``forward()`` is
-        responsible for restoring the original value after the loop.
+        ``all_rank_num_tokens`` is passed as a kwarg in both modes. For MTP
+        Eagle it goes directly to ``mtp_layers[0]``; for Eagle3 it goes to
+        ``Eagle3DraftModel.forward`` which guards it with a try/finally so
+        attn_metadata sees the original value on return.
         """
         all_rank_num_tokens = self._get_step_all_rank_num_tokens(
-            spec_metadata, step_idx, original_all_rank_num_tokens)
+            spec_metadata, step_idx)
 
         if self.is_mtp_eagle:
             hidden_states = draft_model.mtp_layers[0](
@@ -982,12 +976,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 **inputs)
             return hidden_states, None
 
-        # Eagle3: route per-step token counts through attn_metadata. Commit 2
-        # of this refactor migrates this to a kwarg + try/finally inside
-        # ``Eagle3DraftModel.forward``.
-        attn_metadata = inputs["attn_metadata"]
-        if all_rank_num_tokens is not None:
-            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+        inputs["all_rank_num_tokens"] = all_rank_num_tokens
         hidden_states, hidden_states_to_save = draft_model.model(**inputs)
         return hidden_states, hidden_states_to_save
 
