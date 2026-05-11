@@ -240,8 +240,8 @@ A complete example can be found in `sample_performance_alignment.sh`. Below is a
        --seq-len-kv-cache 2090 \
        --balance-method NotModified \
        --replay-file-path profiles/calibration_data.json \
-       --replay-start 47 \
-       --replay-stop 67
+       --replay-start-iter 47 \
+       --replay-stop-iter 67
    ```
 
    Argument explanations:
@@ -255,7 +255,7 @@ A complete example can be found in `sample_performance_alignment.sh`. Below is a
    | `--seq-len-q 1` | Should match (1 + MTP) of the end-to-end run. |
    | `--seq-len-kv-cache 2090` | An estimate of the average context length for the captured iterations. The first 5 iterations should be excluded from this estimate because they will be dropped by the parser. |
    | `--replay-file-path` | The calibration file obtained from Step 1. |
-   | `--replay-start` and `--replay-stop` | Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations because they will be dropped by the parser. |
+   | `--replay-start-iter` and `--replay-stop-iter` | Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations because they will be dropped by the parser. |
 
 4. Parse end-to-end profiles with `parse_e2e.py`, and parse layer-wise benchmarks profiles with `parse.py`.
 
