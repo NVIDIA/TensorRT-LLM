@@ -73,13 +73,19 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     int64_t num_tokens = qkv.size(0);
     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
     TORCH_CHECK(qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total_heads * head_dim");
-    TORCH_CHECK(cos_emb.size(0) == num_tokens, "cos_emb token count must match qkv (got ", cos_emb.size(0), " vs ",
-        num_tokens, ")");
+    // Auto-detect broadcast: cos rows == num_tokens (flat) or num_tokens / B (broadcast over B).
+    int64_t const cos_rows = cos_emb.size(0);
+    int cos_seq_per_batch = 0;
+    if (cos_rows != num_tokens)
+    {
+        TORCH_CHECK(cos_rows > 0 && num_tokens % cos_rows == 0, "cos_emb.size(0) (", cos_rows,
+            ") must equal num_tokens (", num_tokens, ") or evenly divide it (broadcast); got non-divisor count");
+        cos_seq_per_batch = static_cast<int>(cos_rows);
+    }
     bool const per_head_cos = (cos_emb.size(1) == num_heads_q * head_dim);
     TORCH_CHECK(per_head_cos || cos_emb.size(1) == head_dim, "cos_emb last dim must be head_dim (", head_dim,
         ") or num_heads_q*head_dim (", num_heads_q * head_dim, "); got ", cos_emb.size(1));
-    TORCH_CHECK(
-        sin_emb.size(0) == num_tokens && sin_emb.size(1) == cos_emb.size(1), "sin_emb shape must match cos_emb");
+    TORCH_CHECK(sin_emb.size(0) == cos_rows && sin_emb.size(1) == cos_emb.size(1), "sin_emb shape must match cos_emb");
 
     // Auto-dispatch by weight shape:
     //   weight.size(0) == head_dim                   → per-head norm (FLUX/Cosmos3, original kernel)
@@ -103,11 +109,15 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
         tensorrt_llm::kernels::launchFusedDiTQKNormRopeFullDim(qkv.data_ptr(), static_cast<int>(num_tokens),
             static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
             static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
-            cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, stream);
+            cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, cos_seq_per_batch, stream);
         return;
     }
 
-    // Per-head path (original FLUX/Cosmos3 kernel) — only fp32 cos supported here.
+    // Per-head path (original FLUX/Cosmos3 kernel) — only fp32 cos supported here, no broadcast.
+    TORCH_CHECK(cos_seq_per_batch == 0,
+        "Per-head fused_dit_qk_norm_rope (FLUX/Cosmos) does not support cos broadcast over B; "
+        "got cos_emb rows = ",
+        cos_rows, ", num_tokens = ", num_tokens);
     TORCH_CHECK(!cos_is_bf16,
         "Per-head fused_dit_qk_norm_rope (FLUX/Cosmos) requires fp32 cos/sin; bf16 cos is only supported "
         "by the full-dim path (LTX-2)");

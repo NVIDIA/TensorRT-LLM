@@ -41,7 +41,7 @@ namespace kernels
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ tensor, int const num_tokens,
     int const num_heads, float const eps, __nv_bfloat16 const* __restrict__ weight, CosT const* __restrict__ cos_emb,
-    CosT const* __restrict__ sin_emb)
+    CosT const* __restrict__ sin_emb, int const cos_seq_per_batch)
 {
     constexpr int BLOCK_SIZE = 256;
     constexpr int N_WARPS = BLOCK_SIZE / 32;                    // 8
@@ -63,9 +63,12 @@ __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ t
     int const num_chunks = (N + CHUNK_BLOCK_ELEMS - 1) / CHUNK_BLOCK_ELEMS;
 
     int64_t const tokenBase = static_cast<int64_t>(tokenIdx) * N;
-    // cos/sin per-token base; PER_HEAD_COS adds head_idx * HEAD_DIM in the load.
-    int64_t const embBase = PER_HEAD_COS ? static_cast<int64_t>(tokenIdx) * num_heads * HEAD_DIM
-                                         : static_cast<int64_t>(tokenIdx) * HEAD_DIM;
+    // cos/sin per-token base. When cos_seq_per_batch > 0, cos has only one row
+    // per token-in-batch (cos shape [cos_seq_per_batch, ...]) and the kernel
+    // broadcasts it across the B grouping — saves the upstream cos.repeat(B, 1).
+    int const cos_tokenIdx = (cos_seq_per_batch > 0) ? (tokenIdx % cos_seq_per_batch) : tokenIdx;
+    int64_t const embBase = PER_HEAD_COS ? static_cast<int64_t>(cos_tokenIdx) * num_heads * HEAD_DIM
+                                         : static_cast<int64_t>(cos_tokenIdx) * HEAD_DIM;
 
     __shared__ float warp_sums[32];
 
@@ -219,7 +222,7 @@ __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ t
 
 void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_heads, int head_dim, float eps,
     void const* weight, void const* cos_emb, void const* sin_emb, bool interleave, bool per_head_cos, bool cos_is_bf16,
-    cudaStream_t stream)
+    int cos_seq_per_batch, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(num_heads <= 32,
         "fusedDiTSplitNormFullDimRope: num_heads (%d) must be <= 32 (block_size = num_heads*32 <= 1024)", num_heads);
@@ -241,7 +244,7 @@ void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_he
     cudaLaunchKernelEx(&cfg, fusedDiTSplitNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T>,                \
         reinterpret_cast<__nv_bfloat16*>(tensor), num_tokens, num_heads, eps,                                          \
         reinterpret_cast<__nv_bfloat16 const*>(weight), reinterpret_cast<COS_T const*>(cos_emb),                       \
-        reinterpret_cast<COS_T const*>(sin_emb))
+        reinterpret_cast<COS_T const*>(sin_emb), cos_seq_per_batch)
 #define DISPATCH(INTERLEAVE, PER_HEAD, COS_T)                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \

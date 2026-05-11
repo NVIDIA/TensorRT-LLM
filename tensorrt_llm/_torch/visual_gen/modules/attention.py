@@ -277,12 +277,16 @@ class Attention(nn.Module):
         # FLUX per-head path requires fp32; cos is already fp32 upstream there, so this is a no-op.
         cos_2d = freqs_cos.reshape(-1, cos_last).contiguous()
         sin_2d = freqs_sin.reshape(-1, cos_last).contiguous()
-        if cos_2d.shape[0] == S and B > 1:
-            cos_tiled = cos_2d.repeat(B, 1)
-            sin_tiled = sin_2d.repeat(B, 1)
-        else:
+        # LTX-2 / WAN full-dim path: kernel broadcasts cos over B internally
+        # (cos_tokenIdx = tokenIdx % cos_seq_per_batch in the fused kernel), so we
+        # pass cos as-is regardless of B. FLUX / Cosmos per-head path: kernel does
+        # not support broadcast, so host still has to tile when B > 1.
+        if self.qk_norm_mode == "full" or cos_2d.shape[0] != S or B == 1:
             cos_tiled = cos_2d
             sin_tiled = sin_2d
+        else:
+            cos_tiled = cos_2d.repeat(B, 1)
+            sin_tiled = sin_2d.repeat(B, 1)
         qkv_2d = qkv.view(B * S, D)
 
         # Dual-stream batch correction: when B>1 and dual-stream is active,

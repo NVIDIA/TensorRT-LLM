@@ -221,7 +221,7 @@ __global__ void fusedDiTQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, tot
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const num_heads_q, int const num_heads_k,
     int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
-    CosT const* cos_emb, CosT const* sin_emb, int const num_tokens)
+    CosT const* cos_emb, CosT const* sin_emb, int const num_tokens, int const cos_seq_per_batch)
 {
     constexpr int BLOCK_SIZE = 256;
     constexpr int N_WARPS = BLOCK_SIZE / 32;                    // 8
@@ -253,8 +253,12 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
     // cos/sin per-token base. PER_HEAD_COS=true: stride = num_heads * HEAD_DIM;
     // each head reads its own slice. PER_HEAD_COS=false: stride = HEAD_DIM;
     // all heads share the same cos.
-    int64_t const embBase = PER_HEAD_COS ? static_cast<int64_t>(tokenIdx) * num_heads_q * HEAD_DIM
-                                         : static_cast<int64_t>(tokenIdx) * HEAD_DIM;
+    // When cos_seq_per_batch > 0, cos has only one row per token-in-batch
+    // (cos shape [cos_seq_per_batch, ...]) and the kernel broadcasts it across
+    // the B grouping — saves the upstream cos.repeat(B, 1).
+    int const cos_tokenIdx = (cos_seq_per_batch > 0) ? (tokenIdx % cos_seq_per_batch) : tokenIdx;
+    int64_t const embBase = PER_HEAD_COS ? static_cast<int64_t>(cos_tokenIdx) * num_heads_q * HEAD_DIM
+                                         : static_cast<int64_t>(cos_tokenIdx) * HEAD_DIM;
 
     __shared__ float warp_sums[32];
 
@@ -720,7 +724,7 @@ void launchFusedDiTCrossHeadQKNormRope(void* qkv, int num_tokens, int num_heads_
 
 void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
     int head_dim, float eps, void const* q_weight, void const* k_weight, void const* cos_emb, void const* sin_emb,
-    bool interleave, bool per_head_cos, bool cos_is_bf16, cudaStream_t stream)
+    bool interleave, bool per_head_cos, bool cos_is_bf16, int cos_seq_per_batch, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(num_heads_q == num_heads_k,
         "fusedDiTQKNormRopeFullDim: requires num_heads_q == num_heads_k (got %d, %d)", num_heads_q, num_heads_k);
@@ -745,7 +749,8 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q,
     cudaLaunchKernelEx(&cfg, fusedDiTQKNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T>,                   \
         reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,                             \
         reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),            \
-        reinterpret_cast<COS_T const*>(cos_emb), reinterpret_cast<COS_T const*>(sin_emb), num_tokens)
+        reinterpret_cast<COS_T const*>(cos_emb), reinterpret_cast<COS_T const*>(sin_emb), num_tokens,                  \
+        cos_seq_per_batch)
 #define DISPATCH_FULL_DIM(INTERLEAVE, PER_HEAD, COS_T)                                                                 \
     do                                                                                                                 \
     {                                                                                                                  \

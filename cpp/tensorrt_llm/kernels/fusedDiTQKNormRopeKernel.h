@@ -89,6 +89,7 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     void const* sin_emb,                        // same dtype as cos_emb
     bool interleave, bool per_head_cos,
     bool cos_is_bf16,                           // true → cos/sin are bf16
+    int cos_seq_per_batch,                      // 0 = flat cos [num_tokens, …]; >0 = cos broadcast over B
     cudaStream_t stream);
 
 } // namespace kernels

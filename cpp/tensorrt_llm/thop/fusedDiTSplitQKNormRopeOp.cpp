@@ -60,13 +60,21 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
     int64_t const num_tokens = tensor.size(0);
     TORCH_CHECK(
         tensor.size(1) == num_heads * head_dim, "tensor inner dim must be num_heads*head_dim; got ", tensor.size(1));
-    TORCH_CHECK(
-        cos_emb.size(0) == num_tokens, "cos_emb token count mismatch: got ", cos_emb.size(0), " expected ", num_tokens);
+    // Auto-detect broadcast: cos may carry one row per token (num_tokens) or one row
+    // per token-in-batch (num_tokens / B); in the latter case the kernel broadcasts
+    // cos across B via cos_tokenIdx = tokenIdx % cos_seq_per_batch.
+    int64_t const cos_rows = cos_emb.size(0);
+    int cos_seq_per_batch = 0;
+    if (cos_rows != num_tokens)
+    {
+        TORCH_CHECK(cos_rows > 0 && num_tokens % cos_rows == 0, "cos_emb.size(0) (", cos_rows,
+            ") must equal num_tokens (", num_tokens, ") or evenly divide it (broadcast); got non-divisor count");
+        cos_seq_per_batch = static_cast<int>(cos_rows);
+    }
     bool const per_head_cos = (cos_emb.size(1) == num_heads * head_dim);
     TORCH_CHECK(per_head_cos || cos_emb.size(1) == head_dim, "cos_emb last dim must be head_dim (", head_dim,
         ") or num_heads*head_dim (", num_heads * head_dim, "); got ", cos_emb.size(1));
-    TORCH_CHECK(
-        sin_emb.size(0) == num_tokens && sin_emb.size(1) == cos_emb.size(1), "sin_emb shape must match cos_emb");
+    TORCH_CHECK(sin_emb.size(0) == cos_rows && sin_emb.size(1) == cos_emb.size(1), "sin_emb shape must match cos_emb");
     TORCH_CHECK(weight.size(0) == num_heads * head_dim, "weight must be [num_heads*head_dim] (full-dim norm), got ",
         weight.size(0), " expected ", num_heads * head_dim);
 
@@ -74,7 +82,7 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
 
     tensorrt_llm::kernels::launchFusedDiTSplitNormFullDimRope(tensor.data_ptr(), static_cast<int>(num_tokens),
         static_cast<int>(num_heads), static_cast<int>(head_dim), static_cast<float>(eps), weight.data_ptr(),
-        cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, stream);
+        cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, cos_seq_per_batch, stream);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

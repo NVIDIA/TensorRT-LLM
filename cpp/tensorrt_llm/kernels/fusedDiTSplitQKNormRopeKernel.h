@@ -51,6 +51,7 @@ void launchFusedDiTSplitNormFullDimRope(void* tensor, // [num_tokens, num_heads 
     bool interleave,                                  // true = pair (2i, 2i+1); false = rotate_half
     bool per_head_cos,                                // false: cos shape [N, head_dim]; true: [N, num_heads*head_dim]
     bool cos_is_bf16,                                 // true → cos/sin are bf16 (no fp32 cast needed upstream)
+    int cos_seq_per_batch, // 0 = flat cos [num_tokens, …]; >0 = cos broadcast over B (cos rows = cos_seq_per_batch)
     cudaStream_t stream);
 
 } // namespace kernels

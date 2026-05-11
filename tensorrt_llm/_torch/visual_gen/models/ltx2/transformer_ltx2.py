@@ -226,12 +226,10 @@ class LTX2Attention(Attention):
         # B-2: kernel accepts bf16 cos (upcasts in registers); skip the .float() cast.
         cos_2d = cos.reshape(-1, cos_last).contiguous()
         sin_2d = sin.reshape(-1, cos_last).contiguous()
-        if cos_2d.shape[0] == T and B > 1:
-            cos_tiled = cos_2d.repeat(B, 1)
-            sin_tiled = sin_2d.repeat(B, 1)
-        else:
-            cos_tiled = cos_2d
-            sin_tiled = sin_2d
+        # Split kernel broadcasts cos over B internally (cos_tokenIdx = tokenIdx %
+        # cos_seq_per_batch); pass cos as-is regardless of B.
+        cos_tiled = cos_2d
+        sin_tiled = sin_2d
         tensor_2d = tensor.view(B * T, -1)
         torch.ops.trtllm.fused_dit_split_norm_rope(
             tensor_2d,
