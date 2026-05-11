@@ -268,10 +268,12 @@ def make_hf_hybrid_cache_for_tests(
 ):
     """Build Hugging Face ``past_key_values`` for hybrid / sliding-window models in tests.
 
-    Transformers v5 removed ``HybridCache`` in favor of ``StaticCache`` for fixed-length
-    pre-allocated KV.
+    Transformers v5 removed ``HybridCache``. ``StaticCache`` (pre-allocated)
+    doesn't respect per-layer sliding-window semantics, which silently corrupts
+    accuracy when comparing against TRT-LLM's per-layer KV management. Use
+    ``DynamicCache`` so HF's hybrid / sliding-window models manage cache state
+    layer-by-layer through their own ``layer_types`` metadata.
     """
-    del max_batch_size, device, dtype  # StaticCache doesn't accept these kwargs.
-    from transformers.cache_utils import StaticCache
+    from transformers.cache_utils import DynamicCache
 
-    return StaticCache(config=config, max_cache_len=max_cache_len)
+    return DynamicCache(config=config)

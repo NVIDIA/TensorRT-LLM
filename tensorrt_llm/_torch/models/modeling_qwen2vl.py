@@ -571,14 +571,23 @@ class Qwen2_5_VLVisionAttention(Attention):
                  reduce_output: bool = True) -> None:
 
         config = model_config.pretrained_config.vision_config
+        # Composite VLM configs (transformers 5.x strict mode) keep
+        # ``max_position_embeddings`` inside ``text_config`` rather than at
+        # the top level; fall back to it when the parent doesn't expose it.
+        max_position_embeddings = getattr(model_config.pretrained_config,
+                                          "max_position_embeddings", None)
+        if max_position_embeddings is None:
+            text_config = getattr(model_config.pretrained_config, "text_config",
+                                  None)
+            max_position_embeddings = getattr(text_config,
+                                              "max_position_embeddings", None)
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_heads,
             num_key_value_heads=config.num_key_value_heads if getattr(
-                config, "num_key_value_heads",
-                None) is not None else config.num_heads,
-            max_position_embeddings=model_config.pretrained_config.
-            max_position_embeddings,
+                config, "num_key_value_heads", None) is not None else
+            config.num_heads,
+            max_position_embeddings=max_position_embeddings,
             bias=True,
             pos_embd_params=None,
             rope_fusion=False,
@@ -633,19 +642,6 @@ class Qwen2_5_VLVisionAttention(Attention):
         v = v.view(seq_len, -1, self.head_dim)
         q = RotaryEmbedding.apply_rotary_pos_emb(q, cos, sin)
         k = RotaryEmbedding.apply_rotary_pos_emb(k, cos, sin)
-        q, k, v = q.reshape(seq_len, -1), k.reshape(seq_len,
-                                                    -1), v.reshape(seq_len, -1)
-        return q, k, v
-
-    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
-                   v: Optional[torch.Tensor],
-                   position_embeddings: Tuple[torch.Tensor, torch.Tensor]):
-        seq_len, _ = q.size()
-        q = q.view(seq_len, -1, self.head_dim)
-        k = k.view(seq_len, -1, self.head_dim)
-        v = v.view(seq_len, -1, self.head_dim)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
         q, k, v = q.reshape(seq_len, -1), k.reshape(seq_len,
                                                     -1), v.reshape(seq_len, -1)
         return q, k, v

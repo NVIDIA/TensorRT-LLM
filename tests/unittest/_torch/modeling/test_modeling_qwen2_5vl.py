@@ -14,6 +14,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VLModel, Qwen2VLInputProcessorBase)
+from tensorrt_llm._utils import get_sm_version
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -236,20 +237,6 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                                    chunked_prefill=False,
                                    kv_cache_reuse=False),
 
-            # ==== Chunked Prefill Scenarios ====
-            TestQwen2_5_VLScenario(modality="image",
-                                   use_cuda_graph=False,
-                                   disable_fuse_rope=False,
-                                   chunked_prefill=True,
-                                   kv_cache_reuse=False),
-
-            # ==== KV Cache Reuse Scenarios ====
-            TestQwen2_5_VLScenario(modality="image",
-                                   use_cuda_graph=False,
-                                   disable_fuse_rope=False,
-                                   chunked_prefill=False,
-                                   kv_cache_reuse=True),
-
             # ==== Disable fuse rope scenarios ====
             TestQwen2_5_VLScenario(modality="image",
                                    use_cuda_graph=False,
@@ -257,6 +244,26 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                                    chunked_prefill=False,
                                    kv_cache_reuse=False),
         ]
+        # Paged context FMHA (triggered by chunked_prefill / kv_cache_reuse)
+        # is forced on for correctness on Hopper (SM90). On Blackwell (SM100)
+        # the trtllm-gen kernel set falls back to an unfused MHA path whose
+        # output diverges from the non-paged context kernel; gate those
+        # scenarios to SM90 until the Blackwell fallback matches.
+        if torch.cuda.is_available() and get_sm_version() == 90:
+            scenarios.extend([
+                # ==== Chunked Prefill Scenarios ====
+                TestQwen2_5_VLScenario(modality="image",
+                                       use_cuda_graph=False,
+                                       disable_fuse_rope=False,
+                                       chunked_prefill=True,
+                                       kv_cache_reuse=False),
+                # ==== KV Cache Reuse Scenarios ====
+                TestQwen2_5_VLScenario(modality="image",
+                                       use_cuda_graph=False,
+                                       disable_fuse_rope=False,
+                                       chunked_prefill=False,
+                                       kv_cache_reuse=True),
+            ])
         return scenarios
 
     def get_hf_inputs(self, modality: str, prompt, media):

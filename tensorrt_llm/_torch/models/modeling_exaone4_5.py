@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedModel
+from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
@@ -48,9 +49,18 @@ class Exaone4_5Config(PretrainedConfig):
         **kwargs,
     ):
         if isinstance(text_config, dict):
-            text_config = PretrainedConfig.from_dict(copy.deepcopy(text_config))
+            text_config = copy.deepcopy(text_config)
+            model_type = text_config.get("model_type", "exaone4")
+            # BC: EXAONE 4.5 first released with the text model type as `exaone4_5_text`, now changed to `exaone4`
+            if model_type == "exaone4_5_text":
+                model_type = "exaone4"
+            text_config["model_type"] = model_type
+            text_config = CONFIG_MAPPING[model_type](**text_config)
         if isinstance(vision_config, dict):
-            vision_config = PretrainedConfig.from_dict(copy.deepcopy(vision_config))
+            vision_config = copy.deepcopy(vision_config)
+            model_type = vision_config.get("model_type", "exaone4_5_vision")
+            vision_config["model_type"] = model_type
+            vision_config = CONFIG_MAPPING[model_type](**vision_config)
         super().__init__(text_config=text_config, vision_config=vision_config, **kwargs)
 
 
