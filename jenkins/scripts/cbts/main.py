@@ -66,7 +66,7 @@ def build_rules(
     return [
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
-        TestListRule(yaml_index, stages),
+        TestListRule(yaml_index, stages, repo_root=repo_root),
         OutOfScopeRule(yaml_index, stages),
     ]
 
