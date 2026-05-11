@@ -24,8 +24,81 @@ import pytest
 import torch
 from _torch_test_utils import fp8_compatible
 
+import tensorrt_llm._torch.auto_deploy  # noqa: F401
+
 # Skip all tests if CUDA is not available
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
+
+@torch.inference_mode()
+def test_gemma4_prepare_multimodal_mask_can_drive_triton_paged_custom_mask():
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+        prepare_triton_paged_metadata,
+        triton_paged_mha_with_cache,
+    )
+
+    n_heads, n_kv_heads, head_dim, page_size = 8, 2, 128, 16
+    seq_len = 5
+    num_pages = (seq_len + page_size - 1) // page_size
+    num_blocks = num_pages + 2
+
+    q = torch.randn(1, seq_len, n_heads, head_dim, dtype=torch.float16, device="cuda")
+    k = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    v = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+    batch_info_host = torch.zeros(12, dtype=torch.int32, pin_memory=True)
+    batch_info_host[0] = 1
+    batch_info_host[1] = seq_len
+    cu_seqlen_host = torch.tensor([0, seq_len], dtype=torch.int32)
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
+    cu_num_pages_host = cu_num_pages.cpu()
+    cache_loc = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+    last_page_len = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    last_page_len_host = last_page_len.cpu()
+    seq_len_with_cache_host = torch.tensor([seq_len], dtype=torch.int32)
+    kv_cache = torch.zeros(
+        num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+    )
+
+    position_ids = torch.arange(seq_len, device="cuda")
+    batch_indices, positions = prepare_triton_paged_metadata(
+        position_ids,
+        batch_info_host,
+        cu_seqlen_host.to("cuda", non_blocking=True),
+        seq_len_with_cache_host.to("cuda", non_blocking=True),
+    )
+
+    custom_attn_mask = torch.ops.auto_deploy.gemma4_prepare_multimodal_mask.default(
+        batch_info_host,
+        cu_seqlen_host,
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([1, 3], dtype=torch.int32),
+        torch.tensor([2, 2], dtype=torch.int32),
+        torch.tensor([0, 2], dtype=torch.int32),
+    ).to("cuda")
+
+    output = triton_paged_mha_with_cache(
+        q,
+        k,
+        v,
+        batch_info_host,
+        cu_seqlen_host,
+        cu_num_pages,
+        cu_num_pages_host,
+        cache_loc,
+        last_page_len,
+        last_page_len_host,
+        seq_len_with_cache_host,
+        batch_indices,
+        positions,
+        kv_cache,
+        1.0,
+        page_size,
+        custom_attn_mask=custom_attn_mask,
+    )
+
+    assert output.shape == q.shape
+    assert not torch.isnan(output).any()
 
 
 def create_paged_kv_cache(
@@ -265,6 +338,261 @@ class TestTritonPagedContextKernel:
 
         torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
+    def test_context_with_custom_bool_mask_matches_torch_attention(self):
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context_with_custom_mask,
+            update_paged_kv_cache,
+        )
+
+        batch_size, seq_len = 1, 5
+        n_heads, n_kv_heads, head_dim = 8, 8, 64
+        page_size = 16
+        num_pages_per_seq = 1
+        num_blocks = 4
+        total_tokens = batch_size * seq_len
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        qo_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda")
+        kv_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+
+        batch_indices = torch.zeros(total_tokens, dtype=torch.int32, device="cuda")
+        positions = torch.arange(seq_len, dtype=torch.int32, device="cuda")
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        token_type_ids = torch.tensor([[0, 1, 1, 2, 2]], device="cuda", dtype=torch.int64)
+        non_text = token_type_ids != 0
+        prev = torch.cat(
+            [
+                torch.zeros(batch_size, 1, device="cuda", dtype=token_type_ids.dtype),
+                token_type_ids[:, :-1],
+            ],
+            dim=1,
+        )
+        blob_starts = non_text & (token_type_ids != prev)
+        blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+        token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+        media_mask = (token_blob_ids.unsqueeze(2) == token_blob_ids.unsqueeze(1)) & (
+            token_blob_ids.unsqueeze(2) != 0
+        )
+        pos = torch.arange(seq_len, device="cuda")
+        custom_attn_mask = (
+            (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0) | media_mask
+        ).unsqueeze(1)
+
+        output = triton_paged_context_with_custom_mask(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_len_with_cache,
+            custom_attn_mask,
+            sm_scale,
+        )
+
+        output_ref = torch.ops.auto_deploy.torch_attention(
+            q.view(batch_size, seq_len, n_heads, head_dim),
+            k.view(batch_size, seq_len, n_kv_heads, head_dim),
+            v.view(batch_size, seq_len, n_kv_heads, head_dim),
+            attn_mask=custom_attn_mask,
+            is_causal=False,
+            scale=sm_scale,
+            layout="bsnd",
+        ).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    def test_context_with_custom_bool_mask_and_sliding_window_with_cache_prefix(self):
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context_with_custom_mask,
+            update_paged_kv_cache,
+        )
+
+        torch.manual_seed(0)
+
+        batch_size = 1
+        total_kv_len = 18
+        query_len = 16
+        n_heads = 4
+        n_kv_heads = 4
+        head_dim = 32
+        page_size = 16
+        num_blocks = 4
+        num_pages_per_seq = (total_kv_len + page_size - 1) // page_size
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        sliding_window = 3
+
+        q_full = torch.randn(
+            batch_size, total_kv_len, n_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        k_full = torch.randn(
+            batch_size, total_kv_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v_full = torch.randn(
+            batch_size, total_kv_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        q = q_full[:, -query_len:].reshape(batch_size * query_len, n_heads, head_dim)
+        k = k_full.reshape(batch_size * total_kv_len, n_kv_heads, head_dim)
+        v = v_full.reshape(batch_size * total_kv_len, n_kv_heads, head_dim)
+
+        qo_indptr = torch.tensor([0, query_len], dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(num_pages_per_seq, dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.tensor([total_kv_len], dtype=torch.int32, device="cuda")
+
+        batch_indices = torch.zeros(total_kv_len, dtype=torch.int32, device="cuda")
+        positions = torch.arange(total_kv_len, dtype=torch.int32, device="cuda")
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        token_type_ids = torch.tensor(
+            [[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2]],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        non_text = token_type_ids != 0
+        prev = torch.cat(
+            [
+                torch.zeros(batch_size, 1, device="cuda", dtype=token_type_ids.dtype),
+                token_type_ids[:, :-1],
+            ],
+            dim=1,
+        )
+        blob_starts = non_text & (token_type_ids != prev)
+        blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+        token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+        media_mask = (token_blob_ids.unsqueeze(2) == token_blob_ids.unsqueeze(1)) & (
+            token_blob_ids.unsqueeze(2) != 0
+        )
+        positions_full = torch.arange(total_kv_len, device="cuda")
+        full_mask = (
+            (positions_full.unsqueeze(0) <= positions_full.unsqueeze(1)).unsqueeze(0) | media_mask
+        ).unsqueeze(1)
+        custom_attn_mask = full_mask[:, :, -query_len:, :]
+
+        output = triton_paged_context_with_custom_mask(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_len_with_cache,
+            custom_attn_mask,
+            sm_scale,
+            sliding_window=sliding_window,
+        )
+
+        query_positions = torch.arange(total_kv_len - query_len, total_kv_len, device="cuda")
+        key_positions = torch.arange(total_kv_len, device="cuda")
+        sliding_mask = (
+            (
+                (query_positions.unsqueeze(1) >= key_positions.unsqueeze(0))
+                & ((query_positions.unsqueeze(1) - key_positions.unsqueeze(0)) < sliding_window)
+            )
+            .unsqueeze(0)
+            .unsqueeze(1)
+        )
+        output_ref = torch.ops.auto_deploy.torch_attention(
+            q_full[:, -query_len:],
+            k_full,
+            v_full,
+            attn_mask=custom_attn_mask & sliding_mask,
+            is_causal=False,
+            scale=sm_scale,
+            layout="bsnd",
+        ).reshape(batch_size * query_len, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    def test_context_with_custom_bool_mask_and_sliding_window_matches_torch_attention(self):
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context_with_custom_mask,
+            update_paged_kv_cache,
+        )
+
+        batch_size, seq_len = 1, 18
+        n_heads, n_kv_heads, head_dim = 8, 8, 64
+        page_size = 16
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = 4
+        total_tokens = batch_size * seq_len
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        sliding_window = 3
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        qo_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(num_pages_per_seq, dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+
+        batch_indices = torch.zeros(total_tokens, dtype=torch.int32, device="cuda")
+        positions = torch.arange(seq_len, dtype=torch.int32, device="cuda")
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        token_type_ids = torch.tensor(
+            [[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2]],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        non_text = token_type_ids != 0
+        prev = torch.cat(
+            [
+                torch.zeros(batch_size, 1, device="cuda", dtype=token_type_ids.dtype),
+                token_type_ids[:, :-1],
+            ],
+            dim=1,
+        )
+        blob_starts = non_text & (token_type_ids != prev)
+        blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+        token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+        media_mask = (token_blob_ids.unsqueeze(2) == token_blob_ids.unsqueeze(1)) & (
+            token_blob_ids.unsqueeze(2) != 0
+        )
+        pos = torch.arange(seq_len, device="cuda")
+        custom_attn_mask = (
+            (pos.unsqueeze(0) <= pos.unsqueeze(1)).unsqueeze(0) | media_mask
+        ).unsqueeze(1)
+
+        output = triton_paged_context_with_custom_mask(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_len_with_cache,
+            custom_attn_mask,
+            sm_scale,
+            sliding_window=sliding_window,
+        )
+
+        output_ref = torch.ops.auto_deploy.torch_attention(
+            q.view(batch_size, seq_len, n_heads, head_dim),
+            k.view(batch_size, seq_len, n_kv_heads, head_dim),
+            v.view(batch_size, seq_len, n_kv_heads, head_dim),
+            attn_mask=custom_attn_mask,
+            is_causal=False,
+            scale=sm_scale,
+            sliding_window=sliding_window,
+            layout="bsnd",
+        ).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
 
 class TestCacheUpdate:
     """Tests for the KV cache update kernel."""
@@ -417,6 +745,7 @@ class TestTritonPagedMHAIntegration:
             batch_indices,
             positions,
             kv_cache,
+            custom_attn_mask=None,
             scale=None,
         )
 
@@ -442,6 +771,73 @@ class TestTritonPagedMHAIntegration:
         assert num_prefill == 3  # 1 + 2
         assert num_prefill_tokens == 96  # 32 + 64
         assert num_decode == 3
+
+    def test_accepts_positional_constants_with_keyword_custom_mask(self):
+        """Regression test for transform-emitted call style.
+
+        The KV-cache transform passes scale/sliding_window positionally and
+        custom_attn_mask by keyword. This should bind correctly.
+        """
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            prepare_triton_paged_metadata,
+            triton_paged_mha_with_cache,
+        )
+
+        n_heads, n_kv_heads, head_dim, page_size = 8, 2, 128, 16
+        seq_len = 8
+        num_pages = (seq_len + page_size - 1) // page_size
+        num_blocks = num_pages + 4
+
+        q = torch.randn(1, seq_len, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        batch_info_host = self._make_batch_info(
+            num_prefill=1, num_prefill_tokens=seq_len, num_decode=0
+        )
+        cu_seqlen_host = torch.tensor([0, seq_len], dtype=torch.int32)
+        cu_num_pages = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
+        cu_num_pages_host = cu_num_pages.cpu()
+        cache_loc = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+        last_page_len = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        last_page_len_host = last_page_len.cpu()
+        seq_len_with_cache_host = torch.tensor([seq_len], dtype=torch.int32)
+        kv_cache = torch.zeros(
+            num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        position_ids = torch.arange(seq_len, device="cuda")
+        batch_indices, positions = prepare_triton_paged_metadata(
+            position_ids,
+            batch_info_host,
+            cu_seqlen_host.to("cuda", non_blocking=True),
+            seq_len_with_cache_host.to("cuda", non_blocking=True),
+        )
+        custom_attn_mask = torch.ones(1, 1, seq_len, seq_len, dtype=torch.bool, device="cuda")
+
+        output = triton_paged_mha_with_cache(
+            q,
+            k,
+            v,
+            batch_info_host,
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            batch_indices,
+            positions,
+            kv_cache,
+            1.0,
+            page_size,
+            custom_attn_mask=custom_attn_mask,
+        )
+
+        assert output.shape == q.shape
+        assert not torch.isnan(output).any(), "Output contains NaN"
+        assert not torch.isinf(output).any(), "Output contains Inf"
 
     def test_prepare_metadata_with_12_element_batch_info(self):
         """Test prepare_triton_paged_metadata with 12-element batch_info_host."""

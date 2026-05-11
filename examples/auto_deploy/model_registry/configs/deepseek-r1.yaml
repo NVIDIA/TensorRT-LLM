@@ -1,31 +1,54 @@
-# Conservative runtime settings for DeepSeek-R1 bring-up.
+runtime: trtllm
 compile_backend: torch-cudagraph
-max_batch_size: 64
+max_batch_size: 256
 max_seq_len: 8192
 max_num_tokens: 15360
 enable_chunked_prefill: true
 # Opt into FP8 KV cache for ~2x capacity; default ("auto") keeps bf16.
 kv_cache_config:
   dtype: fp8
+  tokens_per_block: 32
+  free_gpu_memory_fraction: 0.7
 cuda_graph_config:
-  # Override dashboard_default.yaml's max_batch_size=8 so batch_sizes up to 64 are captured.
-  max_batch_size: 64
-  batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+  # Override dashboard_default.yaml's max_batch_size=8 so batch_sizes up to 256 are captured.
+  max_batch_size: 256
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 80, 96, 112, 128, 192, 208, 224, 240, 256]
 transforms:
+  fuse_gemms_mixed_children:
+    enabled: false
+  mlir_elementwise_fusion:
+    enabled: true
+  match_swiglu_pattern:
+    enabled: true
+  match_nvfp4_swiglu_pattern:
+    enabled: true
   fuse_nvfp4_moe:
     allow_different_input_scales: true
+  fuse_nvfp4_swiglu:
+    enabled: true
   fuse_swiglu:
     enabled: true
   multi_stream_moe:
-    # causes crash during inference, fix as part of #12593
-    enabled: false
+    enabled: true
   insert_cached_mla_attention:
     backend: trtllm_mla
   fuse_rope_into_trtllm_mla:
     enabled: true
   multi_stream_mla_attn:
-    stage: compile
     enabled: true
-  compile_model:
-    piecewise_enabled: true
-    piecewise_num_tokens: [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192]
+  fuse_allreduce_residual_rmsnorm:
+    enabled: true
+  detect_sharding:
+    allreduce_strategy: SYMM_MEM
+    allgather_strategy: SYMM_MEM
+    shard_all_unprocessed: true
+    simple_shard_filter: "lm_head"
+  cleanup_identity_dtype_cast:
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
+# TODO: Enable once pwcudagraph + multi stream error fixed
+# (Relevant PR: https://github.com/NVIDIA/TensorRT-LLM/pull/13396)
+#  compile_model:
+#    piecewise_enabled: true
+#    piecewise_num_tokens: [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192]

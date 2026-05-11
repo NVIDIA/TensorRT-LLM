@@ -18,6 +18,27 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
+async def _iter_sse_data(response_content):
+    """Yield SSE data payloads from a byte stream.
+
+    Buffers incoming bytes on newline boundaries, decodes UTF-8, strips
+    non-data lines and the ``data:`` prefix, and skips ``[DONE]`` sentinels.
+    Callers receive only JSON-ready strings.
+    """
+    buf = b""
+    async for chunk in response_content:
+        buf += chunk
+        while b"\n" in buf:
+            line_bytes, buf = buf.split(b"\n", 1)
+            line = line_bytes.decode("utf-8").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line.removeprefix("data:").lstrip()
+            if payload == "[DONE]":
+                continue
+            yield payload
+
+
 @dataclass
 class RequestFuncInput:
     prompt: str
@@ -88,14 +109,7 @@ async def async_request_trt_llm(
             if response.status == 200:
                 output.success = True
                 if streaming:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data:")
-
+                    async for chunk in _iter_sse_data(response.content):
                         data = json.loads(chunk)
                         output.generated_text += data["text_output"]
                         timestamp = time.perf_counter()
@@ -197,45 +211,38 @@ async def async_request_openai_completions(
             if response.status == 200:
                 if streaming:
                     first_chunk_received = False
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+                    async for chunk in _iter_sse_data(response.content):
+                        data = json.loads(chunk)
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
-                        if chunk != "[DONE]":
-                            data = json.loads(chunk)
+                        # NOTE: Some completion API might have a last
+                        # usage summary response without a token so we
+                        # want to check a token was generated
+                        if choices := data.get("choices"):
+                            # Note that text could be empty here
+                            # e.g. for special tokens
+                            text = choices[0].get("text")
+                            timestamp = time.perf_counter()
+                            # First token
+                            if not first_chunk_received:
+                                first_chunk_received = True
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if choices := data.get("choices"):
-                                # Note that text could be empty here
-                                # e.g. for special tokens
-                                text = choices[0].get("text")
-                                timestamp = time.perf_counter()
-                                # First token
-                                if not first_chunk_received:
-                                    first_chunk_received = True
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp -
+                                                  most_recent_timestamp)
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp -
-                                                      most_recent_timestamp)
+                            most_recent_timestamp = timestamp
+                            generated_text += text or ""
 
-                                most_recent_timestamp = timestamp
-                                generated_text += text or ""
-
-                                # Extract avg_decoded_tokens_per_iter from streaming response
-                                if "avg_decoded_tokens_per_iter" in choices[0]:
-                                    output.avg_decoded_tokens_per_iter = choices[
-                                        0]["avg_decoded_tokens_per_iter"]
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get(
-                                    "completion_tokens")
+                            # Extract avg_decoded_tokens_per_iter from streaming response
+                            if "avg_decoded_tokens_per_iter" in choices[0]:
+                                output.avg_decoded_tokens_per_iter = choices[0][
+                                    "avg_decoded_tokens_per_iter"]
+                        elif usage := data.get("usage"):
+                            output.output_tokens = usage.get(
+                                "completion_tokens")
                     if first_chunk_received:
                         output.success = True
                     else:
@@ -342,40 +349,33 @@ async def async_request_openai_chat_completions(
             if response.status == 200:
                 output.success = True
                 if streaming:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+                    async for chunk in _iter_sse_data(response.content):
+                        timestamp = time.perf_counter()
+                        data = json.loads(chunk)
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
-                        if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
-                            data = json.loads(chunk)
+                        if choices := data.get("choices"):
+                            content = choices[0]["delta"].get("content")
+                            # First token
+                            if ttft == 0.0:
+                                ttft = timestamp - st
+                                output.ttft = ttft
 
-                            if choices := data.get("choices"):
-                                content = choices[0]["delta"].get("content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp -
+                                                  most_recent_timestamp)
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp -
-                                                      most_recent_timestamp)
+                            generated_text += content or ""
 
-                                generated_text += content or ""
+                            # Extract avg_decoded_tokens_per_iter from streaming chat response
+                            if "avg_decoded_tokens_per_iter" in choices[0]:
+                                output.avg_decoded_tokens_per_iter = choices[0][
+                                    "avg_decoded_tokens_per_iter"]
+                        elif usage := data.get("usage"):
+                            output.output_tokens = usage.get(
+                                "completion_tokens")
 
-                                # Extract avg_decoded_tokens_per_iter from streaming chat response
-                                if "avg_decoded_tokens_per_iter" in choices[0]:
-                                    output.avg_decoded_tokens_per_iter = choices[
-                                        0]["avg_decoded_tokens_per_iter"]
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get(
-                                    "completion_tokens")
-
-                            most_recent_timestamp = timestamp
+                        most_recent_timestamp = timestamp
 
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st

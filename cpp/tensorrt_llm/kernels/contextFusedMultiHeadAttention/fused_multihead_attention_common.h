@@ -302,6 +302,11 @@ struct MHARunnerParams
     void const* cuMaskRowsPtr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
+    // Scratch buffer (partialO + partialStats) for MultiCtasKv mode in trtllm-gen generation-style kernels.
+    // Only required when the sparse context path selects a GmemReduction cubin; nullptr otherwise.
+    void* multiCtasKvScratchPtr = nullptr;
+    // Per-CTA counter buffer for MultiCtasKv mode synchronization; sized as sizeof(int32_t) * SM count.
+    int32_t* multiCtasKvCounterPtr = nullptr;
     // The bmm1 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).

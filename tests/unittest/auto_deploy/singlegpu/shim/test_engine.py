@@ -161,6 +161,9 @@ class _DummyKVCacheManager:
         # Return many dummy page IDs; ADEngine will truncate as needed
         return list(range(1024))
 
+    def get_batch_cache_indices(self, request_ids):
+        return [list(range(1024)) for _ in request_ids]
+
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:
             return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -182,6 +185,7 @@ class _DummyRequest:
         self.context_chunk_size = size
         self.seq_slot = seq_slot
         self.py_seq_slot = seq_slot
+        self.py_request_id = seq_slot
         self.py_batch_idx = None
         self.py_multimodal_data = None
         self.multimodal_positions = None
@@ -543,6 +547,9 @@ class _DummyHybridKVCacheManager:
             return list(range(num_blocks))
         return list(range(1024))
 
+    def get_batch_cache_indices(self, request_ids):
+        return [list(range(1024)) for _ in request_ids]
+
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:
             return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -679,6 +686,7 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
     # Create generation request
     class _GenRequest:
         def __init__(self, request_id: int, seq_slot: int, num_tokens: int):
+            self._num_tokens = num_tokens
             self.py_request_id = request_id
             self.seq_slot = seq_slot
             self.py_seq_slot = seq_slot
@@ -687,13 +695,16 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
             self.py_draft_tokens = []
             self.py_prompt_len = num_tokens
 
-            # Mock methods for generation request
-            def get_token(beam, idx):
-                return 42  # Dummy token
-
-            self.get_token = get_token
-            self.get_num_tokens = lambda beam: num_tokens
             self.max_beam_num_tokens = num_tokens
+
+        def get_token(self, _beam: int, _idx: int) -> int:
+            return 42
+
+        def get_num_tokens(self, _beam: int) -> int:
+            return self._num_tokens
+
+        def get_last_tokens(self, beam: int) -> int:
+            return self.get_token(beam, self.get_num_tokens(beam) - 1)
 
         def get_draft_token_length(self):
             return 0

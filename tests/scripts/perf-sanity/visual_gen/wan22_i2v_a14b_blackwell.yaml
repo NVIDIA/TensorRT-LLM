@@ -1,0 +1,38 @@
+metadata:
+  model_name: Wan2.2-I2V-A14B-Diffusers
+  supported_gpus:
+    - B200
+hardware:
+  gpus_per_node: 8
+environment:
+  server_env_var: TLLM_LOG_LEVEL=info
+  client_env_var: ""
+server_configs:
+  - name: wan22_i2v_a14b_nvfp4_trtllm_cfg2_ulysses4
+    model_path: Wan-AI/Wan2.2-I2V-A14B-Diffusers
+    server_config:
+      quant_config:
+        quant_algo: NVFP4
+        dynamic: true
+      attention:
+        backend: TRTLLM
+      parallel:
+        enable_parallel_vae: true
+        dit_cfg_size: 2
+        dit_ulysses_size: 4
+      cuda_graph:
+        enable_cuda_graph: false
+    client_configs:
+      - name: 1280x720_81f_40s_con1_i2v
+        prompt: A cat walks through a field of flowers
+        backend: openai-videos
+        generation_mode: i2v
+        size: 1280x720
+        num_frames: 81
+        fps: 16
+        num_inference_steps: 40
+        seed: 42
+        max_concurrency: 1
+        num_prompts: 1
+        extra_body:
+          input_reference: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4h8AAAAASUVORK5CYII=

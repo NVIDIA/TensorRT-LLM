@@ -88,8 +88,10 @@ def test_recursive_update_config(mock_factory):
     config = Llama4Config()
 
     # Create an update dictionary with both simple and nested values
+    # NOTE: In transformers 5.x, bos_token_id moved into text_config for
+    # Llama4Config, so use boi_token_index (a root-level attribute) instead.
     update_dict = {
-        "bos_token_id": 42,  # Simple value at root level
+        "boi_token_index": 42,  # Simple value at root level
         "text_config": {  # Nested config update
             "hidden_size": 4096,
             "num_attention_heads": 32,
@@ -108,7 +110,7 @@ def test_recursive_update_config(mock_factory):
     assert updated_config is config
 
     # Check root level updates
-    assert config.bos_token_id == 42
+    assert config.boi_token_index == 42
 
     # Check nested updates in text_config
     assert config.text_config.hidden_size == 4096

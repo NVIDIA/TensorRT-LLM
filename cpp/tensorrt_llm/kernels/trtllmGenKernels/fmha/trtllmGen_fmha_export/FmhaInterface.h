@@ -62,6 +62,10 @@ struct FmhaData {
     // Start token index in the O scaling-factor tensor. Used for FP4 SF offset in generation when
     // inflight batching is enabled (TRT-LLM). Context uses 0.
     int32_t startTokenIdxSfO{0};
+
+    // The variable sparseMla topK lengths with shape of [numTokensQ]
+    //  where each tokenQ has a corresponding topK length.
+    int32_t const* sparseMlaTopKLensPtrD;
   };
 
   struct Scales {
@@ -100,6 +104,9 @@ struct FmhaData {
     // [sumOfSeqLensKv * numHeadsKv, hiddenDimKv] for sparse attention.
     void const* kBasePtr;
     void const* vBasePtr;
+
+    // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
+    void const* slidingWindowKvPoolBasePtr{nullptr};
 
     // Attention sinks
     float const* attentionSinksPtrD;
@@ -159,7 +166,7 @@ public:
 
   void generateAndCompileKernel(FmhaConfig& fmhaConfig) const;
 
-  std::string getKernelName(FmhaConfig const& fmhaConfig) const;
+  std::string getKernelNameFromConfigs(FmhaConfig const& fmhaConfig) const;
 
   int32_t run(FmhaConfig const& config,
               FmhaData& data,

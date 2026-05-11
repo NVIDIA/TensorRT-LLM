@@ -140,6 +140,9 @@ class KvCacheTransceiver(ABC):
         """
         ...
 
+    def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
+        """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
+
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 

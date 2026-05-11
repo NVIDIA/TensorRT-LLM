@@ -249,14 +249,17 @@ def test_llm_partial_update_weights(model_dir):
         ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B-FP8"),
     ],
 )
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.part2
-def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
+def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir, kv_cache_dtype):
     model_dir = str(llm_models_root() / model_dir)
     fp8_model_dir = str(llm_models_root() / fp8_model_dir)
     num_hidden_layers = 1
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
+    )
     moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
     llm = LLM(
         model=model_dir,

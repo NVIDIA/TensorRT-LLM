@@ -28,6 +28,7 @@ from tensorrt_llm.inputs.multimodal import (
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
+from tensorrt_llm.inputs.utils import AudioData
 
 
 def make_tiler(**overrides):
@@ -1702,13 +1703,13 @@ class TestFastPathVideoWithExtractedAudio:
     """Fast-path-only tests for handling audio extracted from video.
 
     These exercise the tokenized+MM fast path
-    (`_expand_video_placeholders_in_token_ids` and the `video_metadata` kwarg of
+    (`_expand_video_placeholders_in_token_ids` and the `video_audio` kwarg of
     `get_num_tokens_per_video`). The slow text path (`_extract_audio_from_video`
     -> `_prepare_audio_features` -> `_expand_audio_placeholders`) is covered by
     `TestAudioInputProcessor`.
 
     When `--media_io_kwargs '{"video": {"extract_audio": true}}'` is set, the
-    video loader stashes audio samples under `VideoData.metadata["audio_samples"]`.
+    video loader stores the extracted stream as `VideoData.audio`.
     The fast-path video branch must append `<so_start><so_embedding>*M<so_end>`
     after the per-video frame tokens so the prompt has placeholder slots for the
     audio embeddings produced by `_interleave_video_audio_embeddings` at forward
@@ -1744,9 +1745,8 @@ class TestFastPathVideoWithExtractedAudio:
         return proc
 
     @staticmethod
-    def _audio_metadata(num_frames=2, num_samples=16000, sample_rate=16000):
-        """Build a metadata dict matching what the cv2/PyAV video loader emits
-        when extract_audio=True (see inputs/utils.py:_load_video_by_cv2).
+    def _video_metadata(num_frames=2):
+        """Build video metadata matching the cv2 video loader.
         `frames_indices` length must equal the actual number of frames passed
         to the processor — otherwise `_get_frame_separators` produces a
         separator list that mismatches `_compute_token_numbers_per_video`'s
@@ -1756,12 +1756,17 @@ class TestFastPathVideoWithExtractedAudio:
             "fps": 30.0,
             "duration": num_frames / 30.0,
             "frames_indices": list(range(num_frames)),
-            "audio_samples": np.random.randn(num_samples).astype(np.float32),
-            "audio_sample_rate": sample_rate,
         }
 
+    @staticmethod
+    def _audio_data(num_samples=16000, sample_rate=16000):
+        """Build structured video audio matching `VideoData.audio`."""
+        return AudioData(
+            samples=np.random.randn(num_samples).astype(np.float32), sample_rate=sample_rate
+        )
+
     def test_fast_path_appends_audio_tokens_after_video(self):
-        """When metadata carries audio_samples, the per-video expansion must end
+        """When VideoData carries audio, the per-video expansion must end
         with `<so_start>` + `<so_embedding>` * M + `<so_end>`, where M is the
         Parakeet-extractor's audio_token_count for the resampled audio length."""
         proc = self._make_video_audio_processor()
@@ -1771,14 +1776,15 @@ class TestFastPathVideoWithExtractedAudio:
 
         prompt = [1, 2, vid_ctx, 3]
         frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
-        metadata = self._audio_metadata(num_frames=num_frames)
-        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=metadata)]}
+        metadata = self._video_metadata(num_frames=num_frames)
+        audio = self._audio_data()
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=metadata, audio=audio)]}
 
         # Match accounting in get_num_tokens_per_video: per-frame video tokens
         # (256 + <img>/</img>) plus audio M+2 (start/end).
         per_frame = 256 + 2
         audio_total = proc.get_num_tokens_per_audio(
-            audio=(metadata["audio_samples"], metadata["audio_sample_rate"])
+            audio=(audio.samples, audio.sample_rate)
         )  # = M + 2
         total_mm = num_frames * per_frame + audio_total
 
@@ -1814,8 +1820,8 @@ class TestFastPathVideoWithExtractedAudio:
         # And no audio tokens before the video region.
         assert expanded.index(img_ctx) < start_idx
 
-    def test_fast_path_no_audio_tokens_when_metadata_has_no_audio(self):
-        """Regression check: video without `audio_samples` in metadata must not
+    def test_fast_path_no_audio_tokens_when_video_has_no_audio(self):
+        """Regression check: video without `audio` must not
         emit any audio token IDs (otherwise we'd inject phantom slots that the
         encoder produces no embeddings for)."""
         proc = self._make_video_audio_processor()
@@ -1824,17 +1830,10 @@ class TestFastPathVideoWithExtractedAudio:
 
         prompt = [1, vid_ctx, 2]
         frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
-        # Metadata present but missing audio_samples (the common
-        # extract_audio=False case). `frames_indices` length must match
-        # num_frames so `_get_frame_separators` produces a separator list of
-        # the right length.
-        metadata_no_audio = {
-            "total_num_frames": num_frames,
-            "fps": 30.0,
-            "duration": num_frames / 30.0,
-            "frames_indices": list(range(num_frames)),
+        metadata_no_audio = self._video_metadata(num_frames=num_frames)
+        mm_data = {
+            "video": [SimpleNamespace(frames=frames, metadata=metadata_no_audio, audio=None)]
         }
-        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=metadata_no_audio)]}
         total_mm = num_frames * (256 + 2)
 
         expanded, _ = proc._expand_video_placeholders_in_token_ids(prompt, [total_mm], mm_data)
@@ -1843,24 +1842,25 @@ class TestFastPathVideoWithExtractedAudio:
         assert proc._sound_end_token_id not in expanded
         assert proc._sound_context_token_id not in expanded
 
-    def test_get_num_tokens_per_video_includes_audio_when_metadata_has_audio(self):
+    def test_get_num_tokens_per_video_includes_audio_when_video_has_audio(self):
         """`get_num_tokens_per_video` must add `M + 2` to its return value when
-        the video metadata carries extracted audio. Without this,
+        the video carries extracted audio. Without this,
         `find_mm_token_lengths` under-reports total mm-tokens and the fast path's
         `_find_mm_token_start_pos_from_masks` assertion fires."""
         proc = self._make_video_audio_processor()
         num_frames = 2
         frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
-        metadata = self._audio_metadata(num_frames=num_frames)
+        metadata = self._video_metadata(num_frames=num_frames)
+        audio = self._audio_data()
 
         video_only = proc.get_num_tokens_per_video(video=frames)
-        with_audio = proc.get_num_tokens_per_video(video=frames, video_metadata=metadata)
-        audio_alone = proc.get_num_tokens_per_audio(
-            audio=(metadata["audio_samples"], metadata["audio_sample_rate"])
+        with_audio = proc.get_num_tokens_per_video(
+            video=frames, video_metadata=metadata, video_audio=audio
         )
+        audio_alone = proc.get_num_tokens_per_audio(audio=(audio.samples, audio.sample_rate))
 
         assert with_audio == video_only + audio_alone
-        # Without metadata or with metadata missing audio_samples, the count must
+        # Without structured audio, the count must
         # match the video-only path exactly (no implicit audio accounting).
         assert proc.get_num_tokens_per_video(video=frames, video_metadata=None) == video_only
         assert (
@@ -1877,10 +1877,13 @@ class TestFastPathVideoWithExtractedAudio:
         vid_ctx = proc.video_context_token_id
         num_frames = 2
         frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
-        metadata = self._audio_metadata(num_frames=num_frames)
-        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=metadata)]}
+        metadata = self._video_metadata(num_frames=num_frames)
+        audio = self._audio_data()
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=metadata, audio=audio)]}
 
-        declared = proc.get_num_tokens_per_video(video=frames, video_metadata=metadata)
+        declared = proc.get_num_tokens_per_video(
+            video=frames, video_metadata=metadata, video_audio=audio
+        )
         prompt = [1, vid_ctx, 2]
         expanded, _ = proc._expand_video_placeholders_in_token_ids(prompt, [declared], mm_data)
 

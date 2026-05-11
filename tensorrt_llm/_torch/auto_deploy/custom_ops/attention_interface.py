@@ -416,12 +416,21 @@ class BatchInfo:
         # Use the tensor view directly so fake tensors can flow through
         # torch.compile metadata tracing without requiring a real .numpy() view.
         self._batch_info = batch_info_host
+        # Cached zero-copy numpy view for fast scalar/list writes on the host path.
+        # `.numpy()` raises RuntimeError on fake tensors, so guard the call.
+        try:
+            self._batch_info_np = batch_info_host.numpy()
+        except RuntimeError:
+            self._batch_info_np = None
 
     def serialize(self) -> torch.Tensor:
         return self._batch_info_host
 
     def update(self, batch_info: List[int]) -> None:
-        self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
+        if self._batch_info_np is not None:
+            self._batch_info_np[:6] = batch_info
+        else:
+            self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
 
     def is_generate_only(self) -> bool:
         return self._batch_info[:4].sum().item() == 0
@@ -1061,7 +1070,13 @@ class SequenceInfo:
                         tnsr_like = torch.cat(tnsr_like)
                     else:
                         tnsr_like = tnsr_like[0]
-                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
+                if tnsr_like.device.type == "cpu":
+                    tnsr_like = tnsr_like.contiguous()
+                # Extra args are small model/runtime metadata tensors that currently bypass
+                # the pinned host staging path used by the core attention inputs. Copy them
+                # synchronously so the source tensor lifetime cannot race the next executor
+                # step under overlap scheduling.
+                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=False)
             else:
                 self._extra_args[name] = None
 
@@ -1158,15 +1173,6 @@ class SequenceInfo:
         ### UPDATE REQUIRED INPUTS #################################################################
         # set new input_ids and make sure to flatten it
         self._stage_arg("input_ids", input_ids, reset_val=0)
-
-        # position_ids for each sequence is in the range [input_pos, input_pos + seq_len - 1]
-        ip_np = ip_host.numpy()
-        sl_np = sl_host.numpy()
-        base = np.repeat(ip_np, sl_np)
-        group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
-        offsets = np.arange(sl_np.sum()) - group_starts
-        position_ids = torch.from_numpy(base + offsets)  # zero-copy back
-        self._stage_arg("position_ids", position_ids)
 
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}

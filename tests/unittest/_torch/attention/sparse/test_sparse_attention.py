@@ -11,6 +11,7 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.kernel import (
     triton_convert_req_index_to_global_index,
 )
@@ -139,10 +140,10 @@ class TestSparseAttention(TrtllmAttention):
         self._sparse_attn_indices = sparse_attn_indices
         self._sparse_attn_offsets = sparse_attn_offsets
 
-    def sparse_kv_predict(self, q, k, metadata, **kwargs):
+    def sparse_kv_predict(self, q, k, metadata, forward_args: AttentionForwardArgs):
         return self._sparse_kv_indices, self._sparse_kv_offsets
 
-    def sparse_attn_predict(self, q, k, metadata, **kwargs):
+    def sparse_attn_predict(self, q, k, metadata, forward_args: AttentionForwardArgs):
         return self._sparse_attn_indices, self._sparse_attn_offsets
 
 

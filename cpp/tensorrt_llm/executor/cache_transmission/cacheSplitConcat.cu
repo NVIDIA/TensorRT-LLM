@@ -53,7 +53,12 @@ static inline int computeDimsPerHead(kv_cache::CacheState const& cacheState, boo
     }
     auto const dim = cacheState.getIndexerDimPerHead();
     auto const q = cacheState.getIndexerKCacheQuantBlockSize();
-    return dim + dim / q * 4;
+    // Scale bytes: dim / quantBlockSize * 4 (same for FP8 and FP4).
+    // Data bytes: dim for FP8 (one byte per element), dim / 2 for FP4
+    // (two packed E2M1 codes per byte).
+    auto const scaleBytes = dim / q * 4;
+    auto const dataBytes = cacheState.getIndexerKCacheUseFp4() ? dim / 2 : dim;
+    return dataBytes + scaleBytes;
 }
 
 int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks)

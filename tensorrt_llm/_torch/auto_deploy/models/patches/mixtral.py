@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
@@ -23,21 +22,12 @@ def _is_silu_activation(act_fn) -> bool:
 
 def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
     # check if we can apply the patch
-    unsupported_reasons = []
-    if not all(_is_silu_activation(expert.act_fn) for expert in self.experts):
-        unsupported_reasons.append("expert activation is not SiLU")
-
     if any(getattr(mod, "bias", None) is not None for mod in self.experts.modules()):
-        unsupported_reasons.append("expert modules have bias")
-
-    # Raise informative error for unsupported configurations
-    # (fallback to original forward is not export-compatible with transformers >= 4.57.1)
-    if unsupported_reasons:
         raise NotImplementedError(
-            f"MixtralSparseMoeBlock forward patch does not support this model configuration: "
-            f"{', '.join(unsupported_reasons)}. "
-            f"The original transformers forward uses torch.nonzero() and tensor indexing "
-            f"which are not compatible with torch.export on meta tensors."
+            "MixtralSparseMoeBlock forward patch does not support this model configuration: "
+            "expert modules have bias. "
+            "The original transformers forward uses torch.nonzero() and tensor indexing "
+            "which are not compatible with torch.export on meta tensors."
         )
 
     batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -46,25 +36,33 @@ def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
             1.0 - self.jitter_noise, 1.0 + self.jitter_noise
         )
     hidden_states = hidden_states.view(-1, hidden_dim)
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
 
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
-    routing_weights = routing_weights.to(hidden_states.dtype)
+    # In transformers 5.x, gate returns (router_logits, routing_weights, selected_experts).
+    # The routing logic (softmax, topk, normalization) is now inside the gate.
+    _, routing_weights, selected_experts = self.gate(hidden_states)
 
-    final_hidden_states = torch.ops.auto_deploy.torch_moe(
+    # In transformers 5.x, self.experts is a fused object with stacked weight tensors
+    # (Parameters directly, not modules with .weight).
+    # Use torch_moe_fused directly since weights are already stacked.
+    gate_up_param = self.experts.gate_up_proj
+    gate_up = gate_up_param.weight if hasattr(gate_up_param, "weight") else gate_up_param
+    down_param = self.experts.down_proj
+    down = down_param.weight if hasattr(down_param, "weight") else down_param
+
+    # HF format: gate_up is [E, 2*I, H] with gate(w1) first, up(w3) second.
+    # TRT-LLM format: w3_w1 is [E, 2*I, H] with up(w3) first, gate(w1) second.
+    half = gate_up.shape[1] // 2
+    w3_w1_stacked = torch.cat([gate_up[:, half:, :], gate_up[:, :half, :]], dim=1)
+
+    final_hidden_states = torch.ops.auto_deploy.torch_moe_fused(
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.w1.weight for expert in self.experts],  # gate projection
-        w2_weight=[expert.w2.weight for expert in self.experts],  # down projection
-        w3_weight=[expert.w3.weight for expert in self.experts],  # up projection
+        w3_w1_stacked_weight=w3_w1_stacked,
+        w2_stacked_weight=down,
     )
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
+    return final_hidden_states
 
 
 @ExportPatchRegistry.register("hf_mixtral_moe")

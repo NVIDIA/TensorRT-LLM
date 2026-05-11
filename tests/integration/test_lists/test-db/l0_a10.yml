@@ -36,6 +36,7 @@ l0_a10:
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py
+  - unittest/inputs/test_url_validation.py
   - unittest/inputs/test_multimodal.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
@@ -44,6 +45,7 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_openai_disagg_server.py
   - unittest/disaggregated/test_openai_disagg_service.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
@@ -88,9 +90,9 @@ l0_a10:
   - test_e2e.py::test_openai_mmencoder_example
   - test_e2e.py::test_openai_perf_metrics
   - test_e2e.py::test_openai_prometheus
-  - test_e2e.py::test_openai_lora
+  # test_openai_lora and test_trtllm_serve_lora_example moved to l0_a100.yml
+  # (Llama-7B + KV cache + spec resources exceeds A10's 22 GB).
   - test_e2e.py::test_trtllm_serve_multimodal_example
-  - test_e2e.py::test_trtllm_serve_lora_example
   - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
@@ -102,7 +104,8 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
   - unittest/_torch/visual_gen/test_visual_gen_params.py
-  - unittest/_torch/visual_gen/test_media_storage.py
+  - unittest/visual_gen/test_output.py
+  - unittest/media/test_encoding.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py
