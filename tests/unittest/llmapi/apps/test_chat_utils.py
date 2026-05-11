@@ -8,11 +8,11 @@ from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.serve.chat_utils import (
+    _make_media_io,
     load_chat_template,
     parse_chat_message_content,
     parse_chat_message_content_part,
     parse_chat_messages_coroutines,
-    resolve_media_io_kwargs,
 )
 
 
@@ -417,55 +417,62 @@ class TestMultimodalLoadErrorPropagation:
         return MultimodalDataTracker(model_type="dummy")
 
     @pytest.mark.parametrize(
-        "part, loader_path",
+        "part, patch_target",
         [
             (
                 {"type": "image_url", "image_url": {"url": "http://bad-url/img.png"}},
-                "tensorrt_llm.serve.chat_utils.async_load_image",
+                "tensorrt_llm.inputs.media_io.ImageMediaIO.async_load",
             ),
             (
                 {"type": "video_url", "video_url": {"url": "http://bad-url/vid.mp4"}},
-                "tensorrt_llm.serve.chat_utils.async_load_video",
+                "tensorrt_llm.inputs.media_io.VideoMediaIO.async_load",
             ),
             (
                 {"type": "audio_url", "audio_url": {"url": "http://bad-url/aud.wav"}},
-                "tensorrt_llm.serve.chat_utils.async_load_audio",
-            ),
-            (
-                {"type": "image_embeds", "image_embeds": {"data": "notbase64"}},
-                "tensorrt_llm.serve.chat_utils.load_base64_image_embeds",
+                "tensorrt_llm.inputs.media_io.AudioMediaIO.async_load",
             ),
         ],
     )
     @pytest.mark.asyncio
-    async def test_loader_exception_propagates(self, mm_tracker, part, loader_path):
+    async def test_loader_exception_propagates(self, mm_tracker, part, patch_target):
         """Exceptions from async loaders must propagate, not be swallowed."""
-        with patch(loader_path, side_effect=CustomError):
+        with patch(patch_target, new_callable=AsyncMock, side_effect=CustomError):
+            result = parse_chat_message_content_part(part, mm_tracker)
+            assert result is not None
+            with pytest.raises(CustomError):
+                await result["data"]
+
+    @pytest.mark.asyncio
+    async def test_image_embeds_exception_propagates(self, mm_tracker):
+        """Exceptions from image embed decoding must propagate."""
+        part = {"type": "image_embeds", "image_embeds": {"data": "notbase64"}}
+        with patch(
+            "tensorrt_llm.serve.chat_utils.load_base64_image_embeds",
+            side_effect=CustomError,
+        ):
             result = parse_chat_message_content_part(part, mm_tracker)
             assert result is not None
             with pytest.raises(CustomError):
                 await result["data"]
 
 
-class TestResolveMediaIoKwargs:
-    """Resolution of server defaults vs per-request media_io_kwargs."""
+class TestMakeMediaIo:
+    """_make_media_io constructs correctly-configured MediaIO instances."""
 
     def test_server_only_used_when_request_absent(self):
         server = MultimodalServerConfig(media_io_kwargs={"video": {"num_frames": 8, "fps": 1}})
-        assert resolve_media_io_kwargs(server, None, "video") == {
-            "num_frames": 8,
-            "fps": 1,
-        }
+        io = _make_media_io("video", server, None)
+        assert io.num_frames == 8
+        assert io.fps == 1
 
     def test_request_keys_shallow_merge_over_server(self):
         server = MultimodalServerConfig(
             media_io_kwargs={"image": {"format": "pil", "device": "cuda"}}
         )
         request = {"image": {"format": "pt"}}
-        assert resolve_media_io_kwargs(server, request, "image") == {
-            "format": "pt",
-            "device": "cuda",
-        }
+        io = _make_media_io("image", server, request)
+        assert io.format == "pt"
+        assert io.device == "cuda"
 
     def test_other_modalities_fall_back_to_server(self):
         server = MultimodalServerConfig(
@@ -475,13 +482,16 @@ class TestResolveMediaIoKwargs:
             }
         )
         request = {"video": {"num_frames": 32}}
-        assert resolve_media_io_kwargs(server, request, "image") == {"format": "pil"}
+        io = _make_media_io("image", server, request)
+        assert io.format == "pil"
 
     def test_video_num_frames_override_drops_server_fps(self):
         """Overriding only `num_frames` drops the server's `fps` so the loader's built-in is used."""
         server = MultimodalServerConfig(media_io_kwargs={"video": {"num_frames": 8, "fps": 1}})
         request = {"video": {"num_frames": 32}}
-        assert resolve_media_io_kwargs(server, request, "video") == {"num_frames": 32}
+        io = _make_media_io("video", server, request)
+        assert io.num_frames == 32
+        assert io.fps == 30  # default, not the server's overridden value
 
 
 class TestVideoMediaIOMergeInteraction:
@@ -529,37 +539,43 @@ class TestMediaIoKwargsLoaderForwarding:
 
         return _make
 
-    def test_loader_called_with_resolved_kwargs(self, mm_tracker_factory):
+    def test_io_constructed_with_resolved_kwargs(self, mm_tracker_factory):
+        """Merged kwargs are baked into the MediaIO instance, not forwarded as call-time args."""
         tracker = mm_tracker_factory(
             server_kwargs={"image": {"format": "pil", "device": "cuda"}},
             request_kwargs={"image": {"format": "pt"}},
         )
         part = {"type": "image_url", "image_url": {"url": "i"}}
-        with patch(
-            "tensorrt_llm.serve.chat_utils.async_load_image", return_value=MagicMock()
-        ) as mock_loader:
+
+        from tensorrt_llm.serve import chat_utils as _chat_utils
+
+        captured = []
+        original = _chat_utils._make_media_io
+
+        def spy(*args, **kwargs):
+            io = original(*args, **kwargs)
+            captured.append(io)
+            return io
+
+        with patch.object(_chat_utils, "_make_media_io", side_effect=spy):
             parse_chat_message_content_part(part, tracker)
-        mock_loader.assert_called_once()
-        _, called_kwargs = mock_loader.call_args
-        assert called_kwargs == {"format": "pt", "device": "cuda"}
+
+        assert len(captured) == 1
+        assert captured[0].format == "pt"
+        assert captured[0].device == "cuda"
 
     @pytest.mark.asyncio
-    async def test_input_audio_bypasses_media_io_kwargs(self, mm_tracker_factory):
-        """`input_audio` is base64-decoded inline; merged `audio` kwargs must not reach the loader."""
+    async def test_input_audio_uses_load_base64_async(self, mm_tracker_factory):
+        """`input_audio` goes through `load_base64_async`, not `async_load`."""
         tracker = mm_tracker_factory(
-            server_kwargs={"audio": {"format": "pil"}},
-            request_kwargs={"audio": {"format": "pt"}},
+            server_kwargs={"audio": {"some_kwarg": "value"}},
+            request_kwargs=None,
         )
         part = {
             "type": "input_audio",
             "input_audio": {"data": "AAAA", "format": "wav"},
         }
-        with patch(
-            "tensorrt_llm.serve.chat_utils.async_load_audio", new_callable=AsyncMock
-        ) as mock_loader:
+        with patch.object(AudioMediaIO, "load_base64_async", new_callable=AsyncMock) as mock_b64:
             result = parse_chat_message_content_part(part, tracker)
             await result["data"]
-        mock_loader.assert_called_once()
-        _, called_kwargs = mock_loader.call_args
-        assert "format" not in called_kwargs
-        assert called_kwargs.get("is_base64") is True
+        mock_b64.assert_called_once_with("audio/raw", "AAAA")

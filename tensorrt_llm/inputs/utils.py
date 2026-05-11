@@ -762,7 +762,7 @@ class MultimodalDataTracker:
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
-        # time; see `resolve_media_io_kwargs` in `serve/chat_utils.py`.
+        # time; see `merge_media_io_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
 
     @property
