@@ -273,8 +273,8 @@ class Attention(nn.Module):
         cos_last = self.q_dim if self.qk_norm_mode == "full" else self.head_dim
         # cos/sin are token-major [B, T, H, D] (or shared per-token [B, T, D]);
         # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
-        # B-2: full-dim LTX-2 path accepts bf16 cos directly (kernel upcasts in registers).
-        # FLUX per-head path requires fp32; cos is already fp32 upstream there, so this is a no-op.
+        # Full-dim LTX-2 / WAN path accepts bf16 cos (kernel upcasts in registers, lossless);
+        # FLUX per-head path requires fp32 (and cos is already fp32 upstream there).
         cos_2d = freqs_cos.reshape(-1, cos_last).contiguous()
         sin_2d = freqs_sin.reshape(-1, cos_last).contiguous()
         # LTX-2 / WAN full-dim path: kernel broadcasts cos over B internally

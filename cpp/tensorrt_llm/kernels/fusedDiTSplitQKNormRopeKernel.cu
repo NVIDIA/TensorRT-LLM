@@ -37,7 +37,7 @@ namespace kernels
 //
 // PER_HEAD_COS=false: cos/sin shape [num_tokens, HEAD_DIM] (FLUX-style, head broadcast).
 // PER_HEAD_COS=true:  cos/sin shape [num_tokens, num_heads * HEAD_DIM] (LTX-2 3D RoPE).
-// CosT: float (fp32 cos) or __nv_bfloat16 (B-2: kernel upcasts in registers).
+// CosT: float (fp32 cos) or __nv_bfloat16 (kernel upcasts bf16 to fp32 in registers, lossless).
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ tensor, int const num_tokens,
     int const num_heads, float const eps, __nv_bfloat16 const* __restrict__ weight, CosT const* __restrict__ cos_emb,
@@ -188,12 +188,15 @@ __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ t
         {
             // rotate-half: partner element at +HEAD_DIM/2 within the same head.
             // Inline partner exchange (single reg `p` per iter, no array).
+            // Use __activemask() because the surrounding chunk loop can have
+            // `continue` early-exit on partial warps for small num_heads*HEAD_DIM.
             constexpr int xor_mask = HEAD_DIM / 16;
             bool const negate = ((laneId & xor_mask) == 0);
+            unsigned const activeMask = __activemask();
 #pragma unroll
             for (int i = 0; i < CHUNK_ELEMS; i++)
             {
-                float p = __shfl_xor_sync(0xffffffff, elements[i], xor_mask);
+                float p = __shfl_xor_sync(activeMask, elements[i], xor_mask);
                 if (negate)
                 {
                     p = -p;

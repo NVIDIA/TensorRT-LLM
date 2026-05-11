@@ -117,6 +117,9 @@ class LTX2Attention(Attention):
             eps=norm_eps,
             bias=True,
             interleave=(rope_type == LTXRopeType.INTERLEAVED),
+            # LTX-2 defaults to fused norm+RoPE. Override via config.attention.fuse_qk_norm_rope=False
+            # to fall back to the naive eager rope path (rare; head_dim must still be 64/128).
+            fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
         )
@@ -219,17 +222,13 @@ class LTX2Attention(Attention):
         Calls trtllm.fused_dit_split_norm_rope. Used by the cross-attn fast path.
         """
         B, T, _ = tensor.shape
-        # LTX-2 always uses full-dim per-head cos: cos_last = num_heads * head_dim.
+        # LTX-2 full-dim per-head cos: [B, T, H, D] reshape(-1, H*D) -> [B*T, H*D]
+        # is what the kernel reads. Kernel broadcasts cos over B internally
+        # (cos_tokenIdx = tokenIdx % cos_seq_per_batch), so we pass cos as-is.
+        # bf16 cos is also accepted (kernel upcasts to fp32 in registers).
         cos_last = num_heads * self.head_dim
-        # cos/sin are token-major [B, T, H, D] (or [B, T, D] for shared per-token);
-        # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
-        # B-2: kernel accepts bf16 cos (upcasts in registers); skip the .float() cast.
         cos_2d = cos.reshape(-1, cos_last).contiguous()
         sin_2d = sin.reshape(-1, cos_last).contiguous()
-        # Split kernel broadcasts cos over B internally (cos_tokenIdx = tokenIdx %
-        # cos_seq_per_batch); pass cos as-is regardless of B.
-        cos_tiled = cos_2d
-        sin_tiled = sin_2d
         tensor_2d = tensor.view(B * T, -1)
         torch.ops.trtllm.fused_dit_split_norm_rope(
             tensor_2d,
@@ -237,8 +236,8 @@ class LTX2Attention(Attention):
             self.head_dim,
             self.eps,
             weight,
-            cos_tiled,
-            sin_tiled,
+            cos_2d,
+            sin_2d,
             self.interleave,
         )
 
@@ -327,9 +326,11 @@ class LTX2Attention(Attention):
             uncached path requires `context`. pe optional (None = norm-only).
             k_pe overrides pe for K (e.g. AV cross-attn) when provided.
         """
-        # Hard kernel limit: head_dim must be in {64, 128}. LTX-2 always
-        # satisfies this; the fallback below only ever runs for non-LTX-2 use.
-        if self.head_dim not in (64, 128):
+        # Fallback to the naive eager rope path when fusion is disabled or
+        # the kernel doesn't support this head_dim. LTX-2 prod has
+        # fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
+        # never fires in production.
+        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128):
             return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv)
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
@@ -388,11 +389,21 @@ class LTX2Attention(Attention):
         k_pe: tuple[torch.Tensor, torch.Tensor] | None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Fallback path for unsupported configs (e.g. head_dim ∉ {64, 128}).
+        """Fallback path for unsupported configs (e.g. head_dim ∉ {64, 128} or
+        fuse_qk_norm_rope=False).
 
-        LTX-2 head_dim is always 64 or 128, so in practice this is never
-        entered. Kept for safety in case the class is reused for other models.
+        LTX-2 prod uses fused (head_dim ∈ {64, 128} and fuse_qk_norm_rope=True
+        by default), so in practice this is never entered. Kept for safety in
+        case the class is reused for other models or fusion is explicitly off.
+
+        Contract: caller must pass *pe* / *k_pe* in 4D layout
+        ([B, T, H, D] for SPLIT rope, [B, T, D] for INTERLEAVED). The fused
+        kernel's 2D form is not compatible with the naive ``apply_rotary_emb``.
         """
+        if pe is not None:
+            assert isinstance(pe, tuple) and pe[0].ndim >= 3, (
+                "_forward_unfused requires 4D PE (caller passed 2D — only fused kernel accepts that)"
+            )
         if pre_projected_kv is not None:
             k, v = pre_projected_kv
             q = self.to_q(x)
@@ -670,12 +681,7 @@ class BasicAVTransformerBlock(nn.Module):
             )
             if not skip_v_self:
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
-                v_self_out = (
-                    self.attn1(
-                        norm_vx, pe=video.positional_embeddings_2d or video.positional_embeddings
-                    )
-                    * vgate_msa
-                )
+                v_self_out = self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
                 ):
@@ -700,12 +706,7 @@ class BasicAVTransformerBlock(nn.Module):
             )
             if not skip_a_self:
                 norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
-                a_self_out = (
-                    self.audio_attn1(
-                        norm_ax, pe=audio.positional_embeddings_2d or audio.positional_embeddings
-                    )
-                    * agate_msa
-                )
+                a_self_out = self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
                 ):
@@ -768,8 +769,7 @@ class BasicAVTransformerBlock(nn.Module):
                 # seq-dim concat), so the cos/sin all-gather is unneeded and K
                 # rope work is U× cheaper.
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
-                    ax_scaled,
-                    pe=audio.cross_positional_embeddings_2d or audio.cross_positional_embeddings,
+                    ax_scaled, pe=audio.cross_positional_embeddings
                 )
                 if self._audio_is_sharded:
                     k_a2v = self._sp_all_gather(k_a2v)
@@ -779,8 +779,7 @@ class BasicAVTransformerBlock(nn.Module):
                     self.audio_to_video_attn(
                         vx_scaled,
                         pre_projected_kv=(k_a2v, v_a2v),
-                        pe=video.cross_positional_embeddings_2d
-                        or video.cross_positional_embeddings,
+                        pe=video.cross_positional_embeddings,
                         k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_a2v
@@ -800,8 +799,7 @@ class BasicAVTransformerBlock(nn.Module):
                 # Project-before-gather (video → audio direction).  RoPE applied
                 # to K in project_kv on local shard; see audio→video branch above.
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
-                    vx_scaled,
-                    pe=video.cross_positional_embeddings_2d or video.cross_positional_embeddings,
+                    vx_scaled, pe=video.cross_positional_embeddings
                 )
                 if self._sharder.is_active:
                     k_v2a = self._sp_all_gather(k_v2a)
@@ -811,8 +809,7 @@ class BasicAVTransformerBlock(nn.Module):
                     self.video_to_audio_attn(
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
-                        pe=audio.cross_positional_embeddings_2d
-                        or audio.cross_positional_embeddings,
+                        pe=audio.cross_positional_embeddings,
                         k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_v2a
@@ -1307,53 +1304,51 @@ class LTXModel(nn.Module):
     # -- Sequence sharding / gathering ----------------------------------------
 
     def _shard_transformer_args(self, args: TransformerArgs) -> TransformerArgs:
-        """Shard sequence-dependent fields of *args* across sequence-parallel ranks.
+        """Shard step-dependent fields of *args* across sequence-parallel ranks.
 
-        Fields whose dim-1 doesn't match ``args.x``'s sequence length are passed
-        through unchanged (broadcast-compatible scalars, etc.).
+        PE (``positional_embeddings`` / ``cross_positional_embeddings``) is
+        already sharded-local in ``TextCache`` (one-time in
+        ``prepare_text_cache``) so we leave it untouched. Only step-varying
+        fields (``x``, timesteps, etc.) need slicing each step.
         """
         seq_len = args.x.shape[1]
         sh = self._sharder
-        # 538f624ec1: SPLIT cos/sin produced token-major [B, S, H, D] (ndim==4)
-        # and INTERLEAVED cos/sin are [B, S, D] (ndim==3). Both have seq at
-        # index 1, so pe/cross_pe both shard on dim 1 regardless of ndim.
-        pe_seq_dim = 1
-        cross_pe_seq_dim = 1
         return replace(
             args,
             x=sh.shard(args.x, dim=1),
             timesteps=sh.shard(args.timesteps, dim=1, expected_seq_len=seq_len),
             embedded_timestep=sh.shard(args.embedded_timestep, dim=1, expected_seq_len=seq_len),
-            positional_embeddings=sh.shard_rope(
-                args.positional_embeddings, seq_len=seq_len, seq_dim=pe_seq_dim
-            ),
-            cross_positional_embeddings=sh.shard_rope(
-                args.cross_positional_embeddings, seq_len=seq_len, seq_dim=cross_pe_seq_dim
-            ),
             cross_scale_shift_timestep=sh.shard(
                 args.cross_scale_shift_timestep, dim=1, expected_seq_len=seq_len
             ),
             cross_gate_timestep=sh.shard(args.cross_gate_timestep, dim=1, expected_seq_len=seq_len),
         )
 
-    def _make_pe_2d_local(
+    def _make_pe_local(
         self,
         pe: tuple[torch.Tensor, torch.Tensor] | None,
         *,
         is_audio: bool,
+        fuse: bool,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Sharded-local 2D contiguous [T_local, H*D] form of a SPLIT-rope PE.
+        """Sharded-local PE in the form the consumer wants.
 
-        Slices along seq dim by Ulysses rank if this modality is sharded,
-        then reshapes to 2D + ``.contiguous()`` so fused norm+rope kernels
-        can consume it directly. Returns None for ndim != 4 (e.g. INTERLEAVED
-        rope) — those paths take the un-fused fallback.
+        Slices the source 4D PE along seq dim by Ulysses rank (one-time, in
+        ``prepare_text_cache``), then either:
+          - ``fuse=True``  → reshape to 2D ``[T_local, H*D]`` contiguous, the
+            layout the fused norm+rope kernel consumes directly.
+          - ``fuse=False`` → keep 4D ``[B, T_local, H, D]`` for the naive
+            ``apply_rotary_emb`` eager path.
+
+        Returns None for ndim != 4 SPLIT-rope inputs (e.g. INTERLEAVED rope
+        produces 3D PE) — caller can carry the original through unchanged.
         """
         if pe is None:
             return None
         cos, sin = pe
         if cos.ndim != 4:
             return None
+        # Shard along seq dim (one-time, at cache build).
         sh = self._sharder
         shard_this = sh.is_active and (not is_audio or self._audio_is_sharded)
         if shard_this and cos.shape[1] % sh.size == 0:
@@ -1365,14 +1360,19 @@ class LTXModel(nn.Module):
         else:
             cos_local = cos
             sin_local = sin
-        # [B, T_local, H, D] -> [B*T_local, H*D] contiguous.
-        # PE source from precompute_freqs_cis is B=1, so this collapses to
-        # [T_local, H*D]; the fused kernel (post C7) broadcasts over B.
         cos_local = cos_local.contiguous()
         sin_local = sin_local.contiguous()
-        cos_2d = cos_local.reshape(cos_local.shape[0] * cos_local.shape[1], -1)
-        sin_2d = sin_local.reshape(sin_local.shape[0] * sin_local.shape[1], -1)
-        return (cos_2d, sin_2d)
+        if fuse:
+            # [B, T_local, H, D] -> [B*T_local, H*D]. PE source from
+            # precompute_freqs_cis has B=1 so this collapses to [T_local, H*D];
+            # the fused kernel broadcasts cos over B internally.
+            cos_out = cos_local.reshape(cos_local.shape[0] * cos_local.shape[1], -1)
+            sin_out = sin_local.reshape(sin_local.shape[0] * sin_local.shape[1], -1)
+        else:
+            # Keep 4D for naive apply_rotary_emb path.
+            cos_out = cos_local
+            sin_out = sin_local
+        return (cos_out, sin_out)
 
     def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather hidden states along the sequence dim."""
@@ -1487,29 +1487,38 @@ class LTXModel(nn.Module):
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
 
-        # Pre-compute sharded-local 2D contiguous [T_local, H*D] forms for the
-        # fused norm+rope kernels. The 4D form above stays around for the
-        # un-fused fallback path (apply_rotary_emb). This eliminates the
-        # per-step reshape + .contiguous() copy inside the helper.
-        v_pe_2d = self._make_pe_2d_local(v_pe, is_audio=False)
-        v_cross_pe_2d = self._make_pe_2d_local(v_cross_pe, is_audio=False)
-        a_pe_2d = self._make_pe_2d_local(a_pe, is_audio=True)
-        a_cross_pe_2d = self._make_pe_2d_local(a_cross_pe, is_audio=True)
+        # Build sharded-local PE in the form the attention consumer expects.
+        # fuse_qk_norm_rope=True (LTX-2 default) -> 2D [T_local, H*D] contiguous,
+        # ready for the fused kernel; False -> 4D [B, T_local, H, D] for the
+        # naive apply_rotary_emb path. Done one-time here, so the inner loop
+        # has no reshape/contiguous/shard work on PE.
+        # Inspect any LTX2Attention to learn whether fusion is on (per-modality
+        # attentions are constructed with the same flag in this codepath).
+        fuse_video = (
+            self.transformer_blocks[0].attn1.fuse_qk_norm_rope
+            if video_context is not None
+            else True
+        )
+        fuse_audio = (
+            self.transformer_blocks[0].audio_attn1.fuse_qk_norm_rope
+            if audio_context is not None and hasattr(self.transformer_blocks[0], "audio_attn1")
+            else True
+        )
+        v_pe = self._make_pe_local(v_pe, is_audio=False, fuse=fuse_video)
+        v_cross_pe = self._make_pe_local(v_cross_pe, is_audio=False, fuse=fuse_video)
+        a_pe = self._make_pe_local(a_pe, is_audio=True, fuse=fuse_audio)
+        a_cross_pe = self._make_pe_local(a_cross_pe, is_audio=True, fuse=fuse_audio)
 
         return TextCache(
             video_context=v_ctx,
             video_mask=v_mask,
             video_pe=v_pe,
-            video_pe_2d=v_pe_2d,
             video_cross_pe=v_cross_pe,
-            video_cross_pe_2d=v_cross_pe_2d,
             video_kv=v_kv,
             audio_context=a_ctx,
             audio_mask=a_mask,
             audio_pe=a_pe,
-            audio_pe_2d=a_pe_2d,
             audio_cross_pe=a_cross_pe,
-            audio_cross_pe_2d=a_cross_pe_2d,
             audio_kv=a_kv,
         )
 
@@ -1545,8 +1554,6 @@ class LTXModel(nn.Module):
                 text_cache.video_mask,
                 text_cache.video_pe,
                 text_cache.video_cross_pe,
-                static_pe_2d=text_cache.video_pe_2d,
-                static_cross_pe_2d=text_cache.video_cross_pe_2d,
             )
             if video is not None
             else None
@@ -1558,8 +1565,6 @@ class LTXModel(nn.Module):
                 text_cache.audio_mask,
                 text_cache.audio_pe,
                 text_cache.audio_cross_pe,
-                static_pe_2d=text_cache.audio_pe_2d,
-                static_cross_pe_2d=text_cache.audio_cross_pe_2d,
             )
             if audio is not None
             else None

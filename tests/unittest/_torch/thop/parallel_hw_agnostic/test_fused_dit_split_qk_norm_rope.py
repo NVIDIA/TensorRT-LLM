@@ -62,7 +62,7 @@ def _call_split_op(tensor, weight, cos, sin, num_heads, head_dim, eps, interleav
 def _generate_cos_sin(num_tokens, head_dim, device, dtype=torch.float32):
     """Generate paired cos/sin (matches original DiT test format: freqs.cos/sin in [-1,1]).
 
-    dtype: cos/sin output dtype — fp32 (default) or bf16 (B-2: kernel upcasts).
+    dtype: cos/sin output dtype — fp32 (default) or bf16 (kernel upcasts bf16 to fp32 in registers).
     """
     half_dim = head_dim // 2
     freqs = torch.randn(num_tokens, half_dim, device=device, dtype=torch.float32)

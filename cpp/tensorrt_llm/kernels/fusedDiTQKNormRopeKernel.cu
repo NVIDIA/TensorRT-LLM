@@ -217,7 +217,7 @@ __global__ void fusedDiTQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, tot
 //                     each head h reads its own slice (LTX-2 INTERLEAVED RoPE).
 // Note: when PER_HEAD_COS=true, Q and K share the same cos/sin buffer (same
 //       num_heads_q == num_heads_k for LTX-2 self-attn).
-// CosT: float (fp32 cos) or __nv_bfloat16 (B-2: kernel upcasts in registers).
+// CosT: float (fp32 cos) or __nv_bfloat16 (kernel upcasts bf16 to fp32 in registers, lossless).
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const num_heads_q, int const num_heads_k,
     int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
@@ -274,6 +274,10 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
 #pragma unroll
         for (int w = 0; w < N_WARPS; w++)
             total += warp_sums[w];
+        // Trailing barrier: this lambda is called twice (Q then K) and reuses
+        // warp_sums; without this, warp X's next-iteration lane-0 write can race
+        // warp Y's pending read of the previous iteration.
+        __syncthreads();
         return total;
     };
 
@@ -405,13 +409,16 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
             else
             {
                 // rotate-half (LTX-2 SPLIT): partner element at +HEAD_DIM/2 within head.
-                // Inline partner exchange to avoid 8-reg partner array (Step 1 reg-pressure opt).
+                // Inline partner exchange to avoid 8-reg partner array (reg-pressure opt).
+                // Use __activemask() because the surrounding chunk loop can have
+                // `continue` early-exit on partial warps for small N.
                 constexpr int xor_mask = HEAD_DIM / 16;
                 bool const negate = ((laneId & xor_mask) == 0);
+                unsigned const activeMask = __activemask();
 #pragma unroll
                 for (int i = 0; i < CHUNK_ELEMS; i++)
                 {
-                    float p = __shfl_xor_sync(0xffffffff, elements[i], xor_mask);
+                    float p = __shfl_xor_sync(activeMask, elements[i], xor_mask);
                     if (negate)
                     {
                         p = -p;

@@ -39,7 +39,7 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
 
     CHECK_INPUT(tensor, torch::kBFloat16);
     CHECK_INPUT(weight, torch::kBFloat16);
-    // Cos/sin may be fp32 (legacy) or bf16 (B-2: kernel upcasts in registers).
+    // Cos/sin may be fp32 or bf16 (kernel upcasts bf16 to fp32 in registers, lossless).
     auto const cos_dtype = cos_emb.scalar_type();
     TORCH_CHECK(cos_dtype == torch::kFloat32 || cos_dtype == torch::kBFloat16,
         "cos_emb dtype must be float32 or bfloat16, got ", cos_dtype);
