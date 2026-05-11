@@ -6340,9 +6340,9 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
 
 class TestLagunaXS(LlmapiAccuracyTestHarness):
     MODEL_NAME = "poolside/laguna-XS.2"
-    MODEL_PATH = "/tmp/laguna-minimal-Laguna-XS.2"
-    FP8_MODEL_PATH = "/tmp/laguna-minimal-Laguna-XS.2-FP8"
-    NVFP4_MODEL_PATH = "/tmp/laguna-minimal-Laguna-XS.2-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Laguna-XS.2"
+    FP8_MODEL_PATH = f"{llm_models_root()}/Laguna-XS.2-FP8"
+    NVFP4_MODEL_PATH = f"{llm_models_root()}/Laguna-XS.2-NVFP4"
     MAX_SEQ_LEN = 4096
     MAX_NUM_TOKENS = 4096
     MAX_BATCH_SIZE = 128
