@@ -17,6 +17,10 @@ Emits scope="noop" with empty stages and sanity / perfsanity off, so when
 this is the only rule that fires, no test stage runs (Build still runs
 upstream of CBTS Layer 2). When other rules also fire, the "noop" scope
 gives way in `_combine_scopes` to the actionable scope.
+
+`is_out_of_scope` is the single source of truth for these path patterns;
+`TestsDefRule` imports it to skip the same paths, so out-of-scope claims
+are not overridden by a same-file narrow contribution.
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
 OUT_OF_SCOPE_TESTS_SUFFIXES: tuple[str, ...] = (".md",)
 
 
-def _is_out_of_scope(path: str) -> bool:
+def is_out_of_scope(path: str) -> bool:
     if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
         return True
     if path.startswith("tests/") and path.endswith(OUT_OF_SCOPE_TESTS_SUFFIXES):
@@ -64,7 +68,7 @@ class OutOfScopeRule(Rule):
         self.yaml_index = yaml_index
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        claimed = {f for f in pr.changed_files if _is_out_of_scope(f)}
+        claimed = {f for f in pr.changed_files if is_out_of_scope(f)}
         if not claimed:
             return None
         return RuleResult(

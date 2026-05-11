@@ -21,6 +21,11 @@ otherwise file-level. For non-test_*.py paths (conftest, helpers, data
 files like `references/*.yaml` or `disaggregated/test_configs/*.yaml`),
 `find_match_for_path` walks up enclosing directories to the narrowest
 YAML-covered ancestor.
+
+Paths matched by `out_of_scope_rule.is_out_of_scope` (QA / dev test
+lists, `.test_durations`, `microbenchmarks/`, `tests/**/*.md`) are
+excluded from candidates so `OutOfScopeRule`'s noop claim is not
+overridden by a same-file narrow contribution.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from ._helpers import (
     stages_by_yaml_stem,
 )
 from .base import PRInputs, Rule, RuleResult
+from .out_of_scope_rule import is_out_of_scope
 
 # Changes touching at least this fraction of all blocks (top-level conftest,
 # common.py, …) are too broad to narrow usefully and trigger fallback.
@@ -216,7 +222,9 @@ class TestsDefRule(Rule):
         return out
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        candidates = [f for f in pr.changed_files if f.startswith("tests/")]
+        candidates = [
+            f for f in pr.changed_files if f.startswith("tests/") and not is_out_of_scope(f)
+        ]
         if not candidates:
             return None
 
