@@ -1267,6 +1267,7 @@ class CompressorWrapper:
                 req.context_current_position = token_count
             # Call add_new_token for BOTH prefill and generation requests.
             req.add_new_token(token_count, 0)
+        self.cache_manager.update_context_resources(scheduled_batch)
         self.cache_manager.update_resources(scheduled_batch)
 
         # Compressor.forward() returns (kv_comp, scale) tuple.
