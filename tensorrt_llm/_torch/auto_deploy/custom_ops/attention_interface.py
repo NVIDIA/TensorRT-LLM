@@ -1496,25 +1496,25 @@ class SequenceInfo:
         ]
         sync_to_host = any(needs_d2h_sync)
 
-        # --- input_ids ---
+        # --- input_ids (device) ---
         # use cu_seqlen as heuristic to get the input_ids if available
         input_ids_flat = self.get_arg("input_ids", truncate=False, unflatten=False)
         extraction_indices = (self.get_arg("cu_seqlen", truncate=True)[1:] - 1).long()
         self.copy_("input_ids", input_ids_flat[extraction_indices], strict=False)
 
-        # --- input_pos ---
+        # --- input_pos (device) ---
         input_pos = self.get_arg("input_pos", truncate=True)
         input_pos += self.get_arg("seq_len", truncate=True) - 1
 
-        # --- cu_seqlen ---
+        # --- cu_seqlen (device) ---
         cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=self.device)
         self.copy_("cu_seqlen", cu_seqlen)
 
-        # --- seq_len ---
+        # --- seq_len (device) ---
         seq_len = self.get_arg("seq_len", truncate=True)
         seq_len.fill_(1)
 
-        # --- update derivative metadata that change in generate-only mode if active ---
+        # ---  update derivative metadata that change in generate-only mode if active (device) ---
         self.copy_("position_ids", input_pos, strict=False)
         self.copy_("use_initial_states", input_pos > 0)
 
