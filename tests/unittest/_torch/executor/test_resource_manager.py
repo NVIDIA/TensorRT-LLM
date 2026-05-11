@@ -921,8 +921,8 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
         try:
             mock_cpp_manager.assert_called_once()
             self.assertEqual(
-                mock_cpp_manager.call_args.kwargs[
-                    "secondary_offload_min_priority"], 0)
+                mock_cpp_manager.call_args.
+                kwargs["secondary_offload_min_priority"], 0)
         finally:
             kv_cache_manager.shutdown()
 
