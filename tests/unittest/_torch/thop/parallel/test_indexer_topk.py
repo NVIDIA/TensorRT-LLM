@@ -965,23 +965,7 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
 @pytest.mark.parametrize("dist_cfg", _DECODE_DIST_CONFIGS, ids=_DECODE_DIST_IDS)
 @pytest.mark.parametrize("batch_size", [1, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
-@pytest.mark.parametrize(
-    "index_topk",
-    [
-        # K=512 / K=1024 hit a known ~0.09 % kernel-side intermittent at the
-        # edge corner (numRows ~= 384, success_ratio in {0.5, 0.9}, mean-zero
-        # distributions). Root cause is in P4's atomic-snap step at small
-        # kNumBins (cpp/tensorrt_llm/kernels/heuristic_topk.cuh
-        # GvrParams<*, 512|1024>); tracked as a kernel-side follow-up. Mark as
-        # flaky with 2 reruns to absorb the noise without widening the
-        # value-comparison tolerance (which would silently mask real
-        # wrong-answer regressions). K=2048 is the production-blessed path,
-        # observed 100 % stable across 6804 cells of local validation.
-        pytest.param(512, marks=pytest.mark.flaky(reruns=2)),
-        pytest.param(1024, marks=pytest.mark.flaky(reruns=2)),
-        2048,
-    ],
-)
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_tokens", [8192, 16384])
 @pytest.mark.parametrize(
     "dtype",
@@ -1043,13 +1027,12 @@ def test_indexer_topk_decode_dist(
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
     torch_indices = torch_indices.masked_fill(~(mask_lo & mask_hi), -1)
 
-    # Tolerance reflects the kernel's histogram precision (full_range/256 is a
-    # safe upper bound across all (T,K) specializations) plus dtype quantization
-    # noise: bf16/fp16 may collapse near-K-th values into ties, causing the
-    # kernel and torch.topk to pick different but equivalent tie members.
-    bin_tolerance = dist_cfg["full_range"] / 256
-    if dtype != torch.float32:
-        bin_tolerance = max(bin_tolerance, abs(dist_cfg["mean"]) * torch.finfo(dtype).eps * 4)
+    # GVR Top-K is an exact algorithm: with same-dtype `logits.topk` as the
+    # reference, the sorted output values must be bit-identical (bf16 -> fp32
+    # promotion inside the kernel is lossless and order-preserving, so the
+    # K-th cutoff is identical in both comparison spaces). Any value gap is
+    # a real kernel bug, not algorithmic noise — keep the default 1e-5
+    # tolerance and let CI surface regressions.
     assert compare_top_k_results(
         logits,
         indices,
@@ -1057,7 +1040,6 @@ def test_indexer_topk_decode_dist(
         row_starts,
         row_ends,
         index_topk,
-        tolerance=bin_tolerance,
     ), (
         f"heuristic indexer_topk_decode mismatch: dist={dist_cfg['dist']}, "
         f"mean={dist_cfg['mean']}, std={dist_cfg['std']}, "

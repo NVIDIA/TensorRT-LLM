@@ -1028,8 +1028,18 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         }
         __syncthreads(); // S-4b3c
 
+        // snap_limit must equal cand_count to guarantee convergence: each
+        // iteration either strictly decreases cgt (raise thr to next
+        // distinct value above) or strictly increases cge (lower thr to
+        // next distinct value below) by >= 1, so worst-case convergence
+        // takes cand_count - kK + 1 iters. The older bound `cand_count/4`
+        // silently accepted a non-converged threshold; Pass 1 then picked
+        // K elements in scan order from `cgt > kK` candidates, missing
+        // some true top-K members (~0.09 % intermittent at small-kNumBins
+        // mean-zero distributions). Common path still converges in 1-3
+        // iters; the higher upper bound only affects the long-tail cells.
         bool snap_converged = false;
-        int snap_limit = (cand_count > 128 ? cand_count / 4 : 32);
+        int snap_limit = cand_count;
         for (int si = 0; si < snap_limit; si++)
         {
             blockFusedSnapIter<TopK>(smem, cand_count, tid, warp_id, lane);
@@ -1575,8 +1585,10 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         }
         __syncthreads();
 
+        // snap_limit must equal cand_count to guarantee convergence; see
+        // detailed rationale in the fp32 `gvrTopKJob` path.
         bool snap_converged = false;
-        int snap_limit = (cand_count > 128 ? cand_count / 4 : 32);
+        int snap_limit = cand_count;
         for (int si = 0; si < snap_limit; si++)
         {
             blockFusedSnapIter<TopK>(smem, cand_count, tid, warp_id, lane); // P0: keys fp32 → use fp32 snap helper
