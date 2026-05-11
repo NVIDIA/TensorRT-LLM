@@ -449,34 +449,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             kv_cache.get_scratch_desc(pool_id),
         )
 
-    def _fill_converted_batch_page_indices(
-        self,
-        dst_offsets: torch.Tensor,
-        request_ids: List[int],
-        copy_idx: torch.Tensor,
-        layer_id: LayerId,
-        data_role: DataRole,
-        page_index_mode: PageIndexMode = PageIndexMode.PER_LAYER,
-    ) -> None:
-        pool_id = self.layer_to_pool_mapping_dict[layer_id]
-        converter = self.impl.get_page_index_converter(layer_id, data_role)
-        assert dst_offsets.device.type == "cpu"
-        assert dst_offsets.dtype == torch.int32
-        assert dst_offsets.size(0) >= len(request_ids)
-        assert dst_offsets.size(1) >= self.max_blocks_per_seq
-        dst_offsets_np = dst_offsets.numpy()
-
-        for row, request_id in enumerate(request_ids):
-            kv_cache = self.kv_cache_map[request_id]
-            base_indices = self.host_kv_cache_block_offsets[pool_id, int(copy_idx[row]), 0].tolist()
-            converted = converter(base_indices, page_index_mode, kv_cache.get_scratch_desc(pool_id))
-            if len(converted) > self.max_blocks_per_seq:
-                raise ValueError(
-                    f"Converted page indices length {len(converted)} exceeds "
-                    f"max_blocks_per_seq {self.max_blocks_per_seq}"
-                )
-            dst_offsets_np[row, : len(converted)] = converted
-
     def _get_cache_quota(self, max_tokens: int) -> int:
         quota = int(max_tokens * self.get_cache_bytes_per_token())
         # Add extra quota to ensure sufficient space for small max_tokens cases.
