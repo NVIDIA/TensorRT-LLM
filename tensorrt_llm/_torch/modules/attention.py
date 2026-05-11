@@ -1618,14 +1618,29 @@ class MLA(nn.Module):
                 requires_grad=False,
             )
             if is_sm_100f():
-                self.o_a_proj_dequant = nn.Parameter(
-                    torch.empty(
-                        (self.n_local_groups, self.o_lora_rank,
-                         self.num_heads * self.qk_head_dim // self.num_groups),
-                        dtype=self.dtype,
-                    ),
-                    requires_grad=False,
-                )
+                # On DSv4 with the cute_dsl FP8 BMM enabled, keep o_a_proj in
+                # its native FP8 e4m3 form (no load-time dequant) so
+                # cute_dsl_fp8_bmm_blackwell can consume it directly.
+                if self.is_deepseek_v4 and self.use_cute_dsl_blockscaling_bmm:
+                    self.o_a_proj = nn.Parameter(
+                        torch.empty(
+                            (self.n_local_groups, self.o_lora_rank,
+                             self.num_heads * self.qk_head_dim //
+                             self.num_groups),
+                            dtype=torch.float8_e4m3fn,
+                        ),
+                        requires_grad=False,
+                    )
+                else:
+                    self.o_a_proj_dequant = nn.Parameter(
+                        torch.empty(
+                            (self.n_local_groups, self.o_lora_rank,
+                             self.num_heads * self.qk_head_dim //
+                             self.num_groups),
+                            dtype=self.dtype,
+                        ),
+                        requires_grad=False,
+                    )
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
@@ -1699,6 +1714,39 @@ class MLA(nn.Module):
         num_tokens = attn_out_latent.shape[0]
         attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
                                                -1)
+
+        # When o_a_proj is FP8 and the cute_dsl FP8 BMM is enabled on SM100,
+        # fuse the inverse-RoPE into the FP8-quant epilogue (vLLM-ported
+        # Triton kernel) and call cute_dsl_fp8_bmm_blackwell directly. Saves
+        # one BF16 read+write of the latent vs the
+        # mla_rope_inplace + fp8_batched_quantize_1x128_permute102 pair.
+        fused_inv_rope_fp8 = (self.o_a_proj.dtype == torch.float8_e4m3fn
+                              and self.use_cute_dsl_blockscaling_bmm
+                              and is_sm_100f())
+        if fused_inv_rope_fp8:
+            heads_per_group = self.num_heads_tp // self.n_local_groups
+            attn_fp8, attn_scale = (
+                torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
+                    attn_out_latent,
+                    position_ids.view(-1),
+                    self.inverse_rotary_emb.rotary_cos_sin,
+                    self.n_local_groups,
+                    heads_per_group,
+                    self.qk_nope_head_dim,
+                    self.qk_rope_head_dim,
+                    128,
+                    self.inverse_rotary_emb.is_neox,
+                ))
+            o_lora = torch.empty(
+                [num_tokens, self.n_local_groups, self.o_lora_rank],
+                device=attn_out_latent.device,
+                dtype=self.dtype)
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(attn_fp8, self.o_a_proj,
+                                                        attn_scale,
+                                                        self.o_a_proj_scale,
+                                                        o_lora.transpose(0, 1))
+            o_lora = o_lora.flatten(1)
+            return self.o_b_proj(o_lora)
 
         # Fused in-place inverse RoPE on the rope portion of each head
         torch.ops.trtllm.mla_rope_inplace(

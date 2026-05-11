@@ -1,3 +1,5 @@
+# Imported first to register the op before the chain via ..modules.attention re-enters this package.
+from . import triton_fused_inv_rope_fp8_quant  # noqa: F401  # isort: skip
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE

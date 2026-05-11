@@ -427,7 +427,6 @@ class _StubADPExecutor:
         self.max_total_draft_tokens = 0
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
-        self._adp_dummy_role_locked = False
         self.add_dummy_calls = []
 
         kv_cache_manager = Mock()
@@ -450,27 +449,11 @@ def _run_pad(stub):
     PyExecutor._pad_attention_dp_dummy_request(stub)
 
 
-def _run_role_lock(stub, validated_requests):
-    from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
-
-    if (
-        stub.enable_attention_dp
-        and stub.kv_cache_transceiver is not None
-        and not stub._adp_dummy_role_locked
-    ):
-        for request in validated_requests:
-            rt = getattr(request, "llm_request_type", None)
-            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
-                stub._adp_dummy_is_gen = False
-                stub._adp_dummy_role_locked = True
-                break
-            if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
-                stub._adp_dummy_is_gen = True
-                stub._adp_dummy_role_locked = True
-                break
+def _run_update_role(stub, candidates):
+    PyExecutor._update_adp_dummy_role(stub, candidates)
 
 
-def test_adp_dummy_role_locks_to_ctx_on_first_context_only_request():
+def test_adp_dummy_role_set_to_ctx_on_context_only_request():
     from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 
     stub = _StubADPExecutor()
@@ -478,13 +461,12 @@ def test_adp_dummy_role_locks_to_ctx_on_first_context_only_request():
         _STATE_GENERATION_IN_PROGRESS,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
     )
-    _run_role_lock(stub, [req])
+    _run_update_role(stub, [req])
 
-    assert stub._adp_dummy_role_locked is True
     assert stub._adp_dummy_is_gen is False
 
 
-def test_adp_dummy_role_locks_to_gen_on_first_generation_only_request():
+def test_adp_dummy_role_set_to_gen_on_generation_only_request():
     from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 
     stub = _StubADPExecutor()
@@ -493,13 +475,31 @@ def test_adp_dummy_role_locks_to_gen_on_first_generation_only_request():
         _STATE_GENERATION_IN_PROGRESS,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
-    _run_role_lock(stub, [req])
+    _run_update_role(stub, [req])
 
-    assert stub._adp_dummy_role_locked is True
     assert stub._adp_dummy_is_gen is True
 
 
-def test_adp_dummy_role_does_not_lock_for_non_disagg_worker():
+def test_adp_dummy_role_flips_when_request_type_changes():
+    from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
+
+    stub = _StubADPExecutor()
+    ctx_req = _make_adp_request(
+        _STATE_GENERATION_IN_PROGRESS,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    _run_update_role(stub, [ctx_req])
+    assert stub._adp_dummy_is_gen is False
+
+    gen_req = _make_adp_request(
+        _STATE_GENERATION_IN_PROGRESS,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    _run_update_role(stub, [gen_req])
+    assert stub._adp_dummy_is_gen is True
+
+
+def test_adp_dummy_role_unchanged_for_non_disagg_worker():
     from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 
     stub = _StubADPExecutor(kv_cache_transceiver=None)
@@ -507,13 +507,12 @@ def test_adp_dummy_role_does_not_lock_for_non_disagg_worker():
         _STATE_GENERATION_IN_PROGRESS,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
     )
-    _run_role_lock(stub, [req])
+    _run_update_role(stub, [req])
 
-    assert stub._adp_dummy_role_locked is False
     assert stub._adp_dummy_is_gen is True
 
 
-def test_adp_dummy_role_does_not_lock_when_attention_dp_disabled():
+def test_adp_dummy_role_unchanged_when_attention_dp_disabled():
     from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 
     stub = _StubADPExecutor(enable_attention_dp=False)
@@ -521,9 +520,9 @@ def test_adp_dummy_role_does_not_lock_when_attention_dp_disabled():
         _STATE_GENERATION_IN_PROGRESS,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
     )
-    _run_role_lock(stub, [req])
+    _run_update_role(stub, [req])
 
-    assert stub._adp_dummy_role_locked is False
+    assert stub._adp_dummy_is_gen is True
 
 
 def test_pad_dummy_excludes_generation_to_complete_in_disagg():
@@ -561,7 +560,6 @@ def test_pad_dummy_skips_when_active_request_present():
 def test_pad_dummy_ctx_pads_to_max_num_tokens():
     stub = _StubADPExecutor(max_num_tokens=4096)
     stub._adp_dummy_is_gen = False
-    stub._adp_dummy_role_locked = True
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -575,7 +573,6 @@ def test_pad_dummy_ctx_pads_to_max_num_tokens():
 def test_pad_dummy_gen_keeps_default_token_nums():
     stub = _StubADPExecutor(max_num_tokens=4096)
     stub._adp_dummy_is_gen = True
-    stub._adp_dummy_role_locked = True
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -589,7 +586,6 @@ def test_pad_dummy_gen_keeps_default_token_nums():
 def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():
     stub = _StubADPExecutor(max_num_tokens=None)
     stub._adp_dummy_is_gen = False
-    stub._adp_dummy_role_locked = True
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)

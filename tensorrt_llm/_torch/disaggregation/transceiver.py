@@ -427,6 +427,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+        if failed:
+            logger.warning(
+                f"Disagg gen transfer FAILED rank={self._dist.rank} "
+                f"rids={failed} gen_need_sync={self._gen_need_sync}"
+            )
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
         return completed, failed
