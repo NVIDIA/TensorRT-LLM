@@ -11,7 +11,7 @@ from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
@@ -105,7 +105,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def default_warmup_num_frames(self):
-        return [61, 81]
+        return [189]
 
     @property
     def default_generation_params(self):
@@ -210,6 +210,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             conversations,
             tokenize=True,
             add_generation_prompt=True,
+            return_dict=False,
         )
         token_ids = token_ids[:max_sequence_length]
         token_ids.append(self.tokenizer.eos_token_id)  # 151645
@@ -408,6 +409,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
     ):
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
+
         use_guardrails = use_guardrails and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
 
         if isinstance(prompt, str):
@@ -431,7 +435,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 is_safe, msg = self.text_guardrail(p)
                 if not is_safe:
                     logger.warning(f"Text guardrail blocked prompt: {msg}")
-                    return MediaOutput()
+                    timer.mark_end()
+                    return timer.fill(PipelineOutput())
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -535,6 +540,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.transformer.reset_cache()
 
         # 6. Denoise
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -544,6 +550,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             forward_fn=forward_fn,
             extra_cfg_tensors=extra_cfg_tensors,
         )
+        timer.mark_post_start()
 
         # 7. Decode
         logger.info("Decoding video...")
@@ -563,6 +570,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video = check_video_safety(video, self.video_guardrail)
                 if video is None:
                     logger.warning("Video guardrail blocked video generation")
-                    return MediaOutput()
+                    timer.mark_end()
+                    return timer.fill(PipelineOutput())
 
-        return MediaOutput(video=video)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
