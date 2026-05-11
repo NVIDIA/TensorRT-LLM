@@ -8,22 +8,6 @@ import torch
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.models.auto import CONFIG_MAPPING
 
-# transformers < 5.8 doesn't ship ``Exaone4_5_VisionConfig``; register a
-# minimal stand-in so ``CONFIG_MAPPING["exaone4_5_vision"]`` resolves when
-# loading the nested vision sub-config from JSON. Fields are accepted via
-# ``**kwargs`` on ``PretrainedConfig``.
-if "exaone4_5_vision" not in CONFIG_MAPPING:
-
-    class _Exaone4_5_VisionConfigFallback(PretrainedConfig):
-        model_type = "exaone4_5_vision"
-        base_config_key = "vision_config"
-
-    AutoConfig.register(
-        _Exaone4_5_VisionConfigFallback.model_type,
-        _Exaone4_5_VisionConfigFallback,
-        exist_ok=True,
-    )
-
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 
@@ -52,35 +36,51 @@ from .modeling_qwen2vl import (
 )
 from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
 
+# transformers >= 5.8 ships native Exaone4.5 configs with the same
+# sub-config-instantiation logic we'd otherwise re-implement here. Prefer
+# the HF classes when available and only register local fallbacks on older
+# releases (where the modules don't exist at all).
+try:
+    from transformers.models.exaone4_5.configuration_exaone4_5 import (
+        Exaone4_5_Config as Exaone4_5Config,
+    )
+    from transformers.models.exaone4_5.configuration_exaone4_5 import Exaone4_5_VisionConfig
+except ImportError:
 
-class Exaone4_5Config(PretrainedConfig):
-    """VLM config: nested ``text_config`` / ``vision_config`` from JSON become real sub-configs."""
+    class Exaone4_5_VisionConfig(PretrainedConfig):
+        model_type = "exaone4_5_vision"
+        base_config_key = "vision_config"
 
-    model_type = "exaone4_5"
+    AutoConfig.register(Exaone4_5_VisionConfig.model_type, Exaone4_5_VisionConfig, exist_ok=True)
 
-    def __init__(
-        self,
-        text_config: Optional[Union[PretrainedConfig, dict]] = None,
-        vision_config: Optional[Union[PretrainedConfig, dict]] = None,
-        **kwargs,
-    ):
-        if isinstance(text_config, dict):
-            text_config = copy.deepcopy(text_config)
-            model_type = text_config.get("model_type", "exaone4")
-            # BC: EXAONE 4.5 first released with the text model type as `exaone4_5_text`, now changed to `exaone4`
-            if model_type == "exaone4_5_text":
-                model_type = "exaone4"
-            text_config["model_type"] = model_type
-            text_config = CONFIG_MAPPING[model_type](**text_config)
-        if isinstance(vision_config, dict):
-            vision_config = copy.deepcopy(vision_config)
-            model_type = vision_config.get("model_type", "exaone4_5_vision")
-            vision_config["model_type"] = model_type
-            vision_config = CONFIG_MAPPING[model_type](**vision_config)
-        super().__init__(text_config=text_config, vision_config=vision_config, **kwargs)
+    class Exaone4_5Config(PretrainedConfig):
+        """VLM config: nested ``text_config`` / ``vision_config`` from JSON become real sub-configs."""
 
+        model_type = "exaone4_5"
 
-AutoConfig.register(Exaone4_5Config.model_type, Exaone4_5Config, exist_ok=True)
+        def __init__(
+            self,
+            text_config: Optional[Union[PretrainedConfig, dict]] = None,
+            vision_config: Optional[Union[PretrainedConfig, dict]] = None,
+            **kwargs,
+        ):
+            if isinstance(text_config, dict):
+                text_config = copy.deepcopy(text_config)
+                model_type = text_config.get("model_type", "exaone4")
+                # BC: EXAONE 4.5 first released with the text model type
+                # as ``exaone4_5_text``, later renamed to ``exaone4``.
+                if model_type == "exaone4_5_text":
+                    model_type = "exaone4"
+                text_config["model_type"] = model_type
+                text_config = CONFIG_MAPPING[model_type](**text_config)
+            if isinstance(vision_config, dict):
+                vision_config = copy.deepcopy(vision_config)
+                model_type = vision_config.get("model_type", "exaone4_5_vision")
+                vision_config["model_type"] = model_type
+                vision_config = CONFIG_MAPPING[model_type](**vision_config)
+            super().__init__(text_config=text_config, vision_config=vision_config, **kwargs)
+
+    AutoConfig.register(Exaone4_5Config.model_type, Exaone4_5Config, exist_ok=True)
 
 
 class Exaone4_5InputProcessor(Qwen2VLInputProcessorBase):
