@@ -38,7 +38,7 @@ from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrap
 from ..piecewise_utils import (
     SplitInfo,
     is_dynamic_cached_op,
-    is_metadata_prep,
+    needs_metadata_wrapper,
     needs_out_buffer,
     split_graph_at_dynamic_ops,
     submod_has_cuda_ops,
@@ -139,7 +139,24 @@ class CapturedGraph(nn.Module):
         self._out_spec = None
 
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
-        return tuple(hash(a) for a in flat_args)
+        static_hash = []
+        for arg in flat_args:
+            if isinstance(arg, torch.Tensor):
+                static_hash.append(
+                    hash(
+                        (
+                            arg.data_ptr(),
+                            tuple(arg.shape),
+                            tuple(arg.stride()),
+                            arg.storage_offset(),
+                            arg.dtype,
+                            arg.device,
+                        )
+                    )
+                )
+            else:
+                static_hash.append(hash(arg))
+        return tuple(static_hash)
 
     def _capture_one_graph(
         self,
@@ -246,10 +263,16 @@ class CapturedGraph(nn.Module):
             args_batched = all_args_flat[: self.num_batched_inputs]
             args_static = all_args_flat[self.num_batched_inputs :]
 
-            # assert that static args match the stored hash
-            assert self._args_hash == self._get_hash(args_static), (
-                "Static args mismatch during capture"
-            )
+            # Static CUDA graph inputs must be shared across captured batch sizes.
+            # If a batch-size-specific metadata tensor lands in args_static, skip
+            # that graph instead of failing executor initialization. Runtime will
+            # fall back to eager for uncaptured or static-mismatched shapes.
+            if self._args_hash != self._get_hash(args_static):
+                ad_logger.warning(
+                    f"Skipping CUDA graph capture for batch size {bs} because static args "
+                    "do not match the canonical capture args."
+                )
+                continue
 
             # copy new inputs to input buffers along their respective dynamic dims
             input_sizes: List[int] = []
@@ -322,13 +345,14 @@ class CapturedGraph(nn.Module):
 class PiecewiseCapturedGraph(nn.Module):
     """Manages piecewise CUDA graph capture/replay for prefill/mixed batches.
 
-    The model is split at dynamic op boundaries (attention, SSM, conv, delta).
+    The model is split at registered dynamic op boundaries.
     Static segments are wrapped in ADPiecewiseRunner for CUDA graph capture.
-    Non-inplace dynamic ops are wrapped in DynamicOpWrapper, which passes a
-    pre-allocated output buffer (out=) from the preceding static runner's graph pool.
-    Metadata-prep ops are wrapped in MetadataWrapper to keep their output
-    addresses stable across capture and replay (prevents CUDA graph crashes).
-    Inplace dynamic ops (see _INPLACE_DYNAMIC_OPS) run eagerly without wrapping.
+    Dynamic submodules are handled according to DynamicOpPolicy:
+    - OUT_BUFFER: wrap with DynamicOpWrapper and pass a pre-allocated out= buffer
+      from the preceding static runner's graph pool.
+    - METADATA_WRAPPER: wrap with MetadataWrapper when metadata output addresses
+      must stay stable for downstream captured segments.
+    - EAGER: leave unwrapped and run eagerly as a split boundary.
     """
 
     def __init__(
@@ -446,9 +470,9 @@ class PiecewiseCapturedGraph(nn.Module):
             num_wrapped_static += 1
 
         # Phase 2: wrap dynamic ops.
-        # - Metadata-prep ops → MetadataWrapper (stable output addresses)
+        # - Metadata-prep ops → MetadataWrapper when downstream captures need stable addresses
         # - Attention/SSM/delta/logits → DynamicOpWrapper (out= pre-alloc)
-        # - Inplace ops (e.g. conv) → left unwrapped (mutate input, return None)
+        # - Inplace or runtime-shaped ops → left unwrapped
         # Iterate over all actual submod indices in order (not range(N), because
         # indices are partition IDs that may have gaps from empty partitions).
         dynamic_set = set(self.split_info.dynamic_submod_indices)
@@ -478,7 +502,7 @@ class PiecewiseCapturedGraph(nn.Module):
                 submod = getattr(self.split_gm, submod_name)
 
                 if not needs_out_buffer(submod):
-                    if is_metadata_prep(submod):
+                    if needs_metadata_wrapper(submod):
                         wrapper = MetadataWrapper(submod, max_batch_size=self.max_batch_size)
                         setattr(self.split_gm, submod_name, wrapper)
                         num_metadata_wrapped += 1
@@ -999,7 +1023,7 @@ class TorchCudagraphCompiler(CompilerBackend):
     """Compiler that uses CUDA graphs.
 
     Supports two modes:
-    - piecewise_enabled=False (default): monolithic CG only (decode-only batches)
+    - piecewise_enabled=False: monolithic CG only (decode-only batches)
     - piecewise_enabled=True: dual-mode (monolithic for decode + piecewise for prefill/mixed)
 
     When the top-level model is a wrapper (not a GraphModule), the compiler

@@ -21,18 +21,14 @@ import torch.nn as nn
 from torch.fx import Graph, GraphModule
 
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import (
-    _CACHED_ATTENTION_OPS,
-    _CACHED_CONV_OPS,
-    _CACHED_DELTA_OPS,
-    _CACHED_SSM_OPS,
-    _LOGITS_GATHER_OPS,
-    _METADATA_PREP_OPS,
-    _PERSISTENT_BUFFER_OPS,
+    _DYNAMIC_OP_POLICIES,
     _STREAM_SWITCH_FUNCTION_NAMES,
+    DynamicOpPolicy,
     _get_all_dynamic_op_names,
+    _get_dynamic_op_policy,
     _submod_has_stream_switch,
     is_dynamic_cached_op,
-    is_metadata_prep,
+    needs_metadata_wrapper,
     needs_out_buffer,
     split_graph_at_dynamic_ops,
     submod_has_cuda_ops,
@@ -168,31 +164,37 @@ class TestIsDynamicCachedOp:
         target = _FakeOpOverload("auto_deploy::flashinfer_attention_mha_with_cache")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.OUT_BUFFER
 
     def test_known_ssm_op_returns_true(self):
         target = _FakeOpOverload("auto_deploy::triton_cached_ssm")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.OUT_BUFFER
 
     def test_known_conv_op_returns_true(self):
         target = _FakeOpOverload("auto_deploy::triton_cached_causal_conv1d")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.EAGER
 
     def test_known_delta_op_returns_true(self):
         target = _FakeOpOverload("auto_deploy::fla_cached_delta_rule")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.OUT_BUFFER
 
     def test_known_metadata_prep_op_returns_true(self):
         target = _FakeOpOverload("auto_deploy::flashinfer_attention_prepare_metadata")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.METADATA_WRAPPER
 
-    def test_gemma4_prepare_multimodal_mask_is_metadata_prep(self):
+    def test_gemma4_prepare_multimodal_mask_uses_eager_policy(self):
         target = _FakeOpOverload("auto_deploy::gemma4_prepare_multimodal_mask")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.EAGER
 
         graph = Graph()
         x = graph.placeholder("x")
@@ -200,13 +202,27 @@ class TestIsDynamicCachedOp:
         graph.output(mask)
         gm = GraphModule(nn.Module(), graph)
 
-        assert is_metadata_prep(gm) is True
+        assert needs_metadata_wrapper(gm) is False
+        assert needs_out_buffer(gm) is False
+
+    def test_regular_metadata_prep_needs_metadata_wrapper(self):
+        target = _FakeOpOverload("auto_deploy::flashinfer_attention_prepare_metadata")
+        graph = Graph()
+        x = graph.placeholder("x")
+        metadata = graph.create_node("call_function", target, args=(x,), name="metadata")
+        graph.output(metadata)
+        gm = GraphModule(nn.Module(), graph)
+
+        node = _make_mock_node("call_function", target=target)
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.METADATA_WRAPPER
+        assert needs_metadata_wrapper(gm) is True
         assert needs_out_buffer(gm) is False
 
     def test_known_logits_gather_op_returns_true(self):
         target = _FakeOpOverload("auto_deploy::gather_tokens")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
+        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.EAGER
 
     def test_static_op_returns_false(self):
         # torch.relu is not a dynamic op
@@ -227,16 +243,8 @@ class TestIsDynamicCachedOp:
         assert is_dynamic_cached_op(node) is True
 
     def test_all_registry_entries_recognized(self):
-        """Every op in every registry list should be recognized as dynamic."""
-        all_ops = (
-            _CACHED_ATTENTION_OPS
-            + _CACHED_SSM_OPS
-            + _CACHED_CONV_OPS
-            + _CACHED_DELTA_OPS
-            + _METADATA_PREP_OPS
-            + _LOGITS_GATHER_OPS
-        )
-        for op_name in all_ops:
+        """Every op in the policy registry should be recognized as dynamic."""
+        for op_name in _DYNAMIC_OP_POLICIES:
             target = _FakeOpOverload(op_name)
             node = _make_mock_node("call_function", target=target)
             assert is_dynamic_cached_op(node) is True, f"{op_name} should be recognized as dynamic"
@@ -244,13 +252,7 @@ class TestIsDynamicCachedOp:
     def test_get_all_dynamic_op_names_returns_full_set(self):
         all_names = _get_all_dynamic_op_names()
         assert isinstance(all_names, set)
-        # Should include all registries
-        for op in _CACHED_ATTENTION_OPS:
-            assert op in all_names
-        for op in _CACHED_SSM_OPS:
-            assert op in all_names
-        for op in _LOGITS_GATHER_OPS:
-            assert op in all_names
+        assert all_names == set(_DYNAMIC_OP_POLICIES)
 
 
 # ============================================================================
@@ -459,17 +461,15 @@ def _build_graphmodule_stream_switch_before_dynamic():
     rec = graph.call_function(record_event_passthrough, args=(x,))
     relu0 = graph.call_function(torch.relu, args=(rec,))
 
-    # Partition 1: persistent buffer dynamic op
-    persistent_target = _FakeOpOverload(_PERSISTENT_BUFFER_OPS[0])
-    persistent_node = graph.create_node(
-        "call_function", persistent_target, args=(relu0,), name="persistent_buf"
-    )
+    # Partition 1: eager dynamic op
+    eager_target = _FakeOpOverload("auto_deploy::trtllm_attention_prepare_metadata")
+    eager_node = graph.create_node("call_function", eager_target, args=(relu0,), name="eager_op")
 
     # Partition 2: trivial static (only a view, no CUDA ops)
-    view_node = graph.call_method("view", args=(persistent_node, -1))
+    view_node = graph.call_method("view", args=(eager_node, -1))
 
     # Partition 3: attention dynamic op (needs out= buffer)
-    attn_target = _FakeOpOverload(_CACHED_ATTENTION_OPS[0])
+    attn_target = _FakeOpOverload("auto_deploy::flashinfer_attention_mha_with_cache")
     attn_node = graph.create_node("call_function", attn_target, args=(view_node,), name="attn_op")
 
     # Partition 4: static with CUDA ops

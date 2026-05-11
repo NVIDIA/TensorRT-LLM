@@ -281,6 +281,35 @@ class TestCapturedGraphCapture:
 
         assert compiled_model.model.seen == [(2, 2)]
 
+    def test_capture_graph_skips_static_arg_mismatched_batch_size(self, monkeypatch):
+        class ModelWithStaticMetadata(nn.Module):
+            def forward(self, x, meta):
+                return x + meta[: x.shape[0], None]
+
+        compiled_model = CapturedGraph(
+            ModelWithStaticMetadata(),
+            num_batched_inputs=1,
+        )
+        captured_shapes = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            captured_shapes.append(args[0].shape)
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        meta_by_batch_size = {}
+
+        def get_args_kwargs(bs):
+            meta = meta_by_batch_size.setdefault(bs, torch.arange(bs, dtype=torch.float32))
+            x = torch.arange(bs, dtype=torch.float32).reshape(bs, 1)
+            return (x,), {"meta": meta}
+
+        compiled_model.capture_graph(get_args_kwargs, [4, 2])
+
+        assert captured_shapes == [torch.Size([4, 1])]
+        assert set(compiled_model.cudagraphs) == {(4, 1)}
+
 
 # ============================================================================
 # Helpers for piecewise / submod_has_cuda_ops tests
