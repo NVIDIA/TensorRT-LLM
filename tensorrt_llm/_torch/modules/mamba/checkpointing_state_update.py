@@ -4952,6 +4952,15 @@ def checkpointing_state_update(
     num_loop_stages_arg = _num_loop_stages if _num_loop_stages else 2
     flatten_arg = True if _flatten is None else bool(_flatten)
     warp_specialize_arg = False if _warp_specialize is None else bool(_warp_specialize)
+    # Per-launch work-item count.  At small batch, total_work may be < the
+    # full persistent grid; capping `grid` at `min(NUM_PERSISTENT, total_work)`
+    # avoids launching empty CTAs that pay setup cost for no work.  Correctness:
+    # the kernel's `tl.range(pid, total_work, NUM_PERSISTENT)` ensures each
+    # tile_id is covered exactly once across all live pids in [0, grid) when
+    # grid <= NUM_PERSISTENT (each CTA does 1 tile; loop step >= total_work
+    # exits immediately) AND when grid == NUM_PERSISTENT (each CTA loops over
+    # multiple tiles).  NUM_PERSISTENT stays a constexpr = cta_per_sm * num_sms.
+    _num_pid_m = (dim + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
     def launch_persistent_main(write_checkpoint: bool,
                                n_writes_dev: torch.Tensor,
@@ -4972,7 +4981,19 @@ def checkpointing_state_update(
             n_slots_for_kernel = host_n_writes if write_checkpoint else (batch - host_n_writes)
             if n_slots_for_kernel <= 0:
                 return
-        grid = (num_persistent_arg,)
+        # Grid sizing: cap at min(full persistent grid, actual total_work).
+        # `n_slots` for this launch is `host_n_writes` (write half) / `batch -
+        # host_n_writes` (nowrite half) when host knows it (pure); else upper
+        # bound `batch` for mix scenarios where host can't read n_writes_dev
+        # without a sync.  Upper-bound is fine — the kernel's runtime check
+        # only iterates actual work; the only cost of overcounting is a few
+        # extra CTAs.
+        if host_n_writes is not None:
+            _n_slots_for_launch = host_n_writes if write_checkpoint else (batch - host_n_writes)
+        else:
+            _n_slots_for_launch = batch
+        _total_work_launch = max(1, _n_slots_for_launch * _num_pid_m * nheads)
+        grid = (min(num_persistent_arg, _total_work_launch),)
         _persistent_main_kernel[grid](
             state, state_tma_descriptor, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
@@ -5041,7 +5062,11 @@ def checkpointing_state_update(
         # We still pass `n_writes_dev` (the same tensor the persistent_main
         # path uses) so the kernel signature is uniform; the value is
         # immaterial.
-        grid = (num_persistent_arg,)
+        # Grid sizing: cap at total_work (= batch * num_pid_m * nheads) for
+        # the dynamic case (full-batch coverage); see launch_persistent_main
+        # comment for correctness rationale.
+        _total_work_launch = max(1, batch * _num_pid_m * nheads)
+        grid = (min(num_persistent_arg, _total_work_launch),)
         _persistent_main_kernel[grid](
             state, state_tma_descriptor, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
