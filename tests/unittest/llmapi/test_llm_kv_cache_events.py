@@ -17,8 +17,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.inputs.multimodal import (MultimodalInput, apply_mm_hashes,
-                                            _find_mm_token_runs_from_mask)
+from tensorrt_llm.inputs.multimodal import (MultimodalInput,
+                                            _find_mm_token_runs_from_mask,
+                                            apply_mm_hashes)
 from tensorrt_llm.inputs.utils import AudioData, VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
