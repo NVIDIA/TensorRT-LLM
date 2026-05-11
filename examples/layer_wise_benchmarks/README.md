@@ -2,6 +2,44 @@
 
 This tool profiles individual layers of LLM models to help understand the performance characteristics of each layer and compare layer-wise benchmarks with end-to-end profiling results.
 
+Only a contiguous slice of transformer layers runs under `nsys` — no full model, no scheduler, no decoding loop. The resulting trace is post-processed into a per-module, per-kernel breakdown. Each profiled iteration calls `model.forward(position_ids, hidden_states, attn_metadata, residual)` directly, with embedding, LM head, sampling, and KV admission stripped out, so the GPU work in the trace comes only from the target layers.
+
+## Code layout
+
+| Where | What it owns |
+|-------|--------------|
+| `examples/layer_wise_benchmarks/` (this directory) | CLI (`run.py`), launchers (`run.sh`, `mpi_launch.sh`, `slurm_*.sh`), parsers (`parse.py`, `parse_e2e.py`, `correlation.py`), HTML templates, sample configs. |
+| `tensorrt_llm/tools/layer_wise_benchmarks/` | Runtime library: `Runner`, `Calibrator`, `mark_ranges()`. Handles model construction, KV-cache setup, and MoE routing manipulation. |
+
+The example directory is thin glue; the library does the real work.
+
+### How the files coordinate
+
+```text
+   config_ctx.yaml / config_gen.yaml  +  CLI flags
+                       │
+                       ▼
+       mpi_launch.sh  ──►  run.sh  ──►  nsys profile python3 run.py
+                                                       │
+                                                       │  uses tensorrt_llm.tools.layer_wise_benchmarks:
+                                                       │    Runner, Calibrator, mark_ranges()
+                                                       ▼
+                                    profiles/report_np<N>_rank<K>.nsys-rep
+                                                       │
+                                                       ▼
+                                                   parse.py
+                                                       │
+                                                       ▼
+                                  stdout  +  CSV  +  HTML breakdown  +  JSON
+```
+
+- **`mpi_launch.sh`** / **`slurm_launch.sh`** — rank dispatch; sets `RANK` and `WORLD_SIZE`.
+- **`run.sh`** — wraps `python3 run.py` with `nsys profile` and writes `profiles/report_np<N>_rank<K>.nsys-rep`.
+- **`run.py`** — drives one rank: builds the `Runner`, runs prefill (GEN only) and warmup, then loops through the profiled iterations with NVTX ranges.
+- **`parse.py`** — exports the `.nsys-rep` to SQLite via `nsys export`, then aggregates kernels grouped by NVTX module ranges (`MLA`, `MoE`, `GatedMLP`, …) into the breakdown reports.
+
+The same flow extends to end-to-end correlation; see [Performance alignment](#performance-alignment-between-end-to-end-performance-and-layer-wise-benchmarks).
+
 ## Generate profiles
 
 ### Run with OpenMPI
@@ -177,6 +215,33 @@ You will receive four reports, each containing kernel timing statistics grouped 
 ## Performance alignment between end-to-end performance and layer-wise benchmarks
 
 A complete example can be found in `sample_performance_alignment.sh`. Below is an overview of the main steps.
+
+```text
+       E2E (trtllm-bench / trtllm-serve)                  Layer-wise (run.py)
+       ─────────────────────────────────                  ───────────────────
+
+  Step 1: COLLECT mode, with CUDA Graphs ──► calibration_data.json ──┐
+            │                                                        │
+            ▼                                                        ▼
+       report_e2e_collect_rank<K>.nsys-rep              Step 3: run.py --replay-file-path
+            │                                                        │
+            │                                                        ▼
+  Step 2: MARK mode, eager (no graphs)                report_np<N>_rank<K>.nsys-rep
+            │                                                        │
+            ▼                                                        │
+       report_e2e_mark_rank<K>.nsys-rep                              │
+            │                                                        │
+            ▼                                                        ▼
+  Step 4: parse_e2e.py ────────► JSON      Step 4: parse.py ───────► JSON
+                                   |                 |
+                                   ▼                 ▼
+                                  Step 5: correlation.py
+                                                │
+                                                ▼
+                                         correlation.html
+```
+
+Two E2E traces are required because the two pieces of information cannot be captured together: routing data must come from the CUDA Graphs run (the production execution path), while iteration- and layer-level NVTX boundaries are only visible in the eager run (NVTX ranges are not re-emitted on graph replay). All three runs (both E2E captures and the layer-wise replay) must share `TLLM_AUTOTUNER_CACHE_PATH` so the same kernel tactics are selected.
 
 1. Run end-to-end serving in **COLLECT** mode and capture nsys profiles. This step generates a calibration file.
 
