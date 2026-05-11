@@ -330,6 +330,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
+        requires_global_quant_config_fallback = False
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -341,7 +342,17 @@ class ModelLoader:
                 hf_quant_config = hf_quant_config["quantization"]
 
             hf_quant_algo = hf_quant_config.pop("quant_algo", None)
-            if hf_quant_algo is not None:
+            if hf_quant_algo is None:
+                if hf_quant_config.get("quantized_layers") is not None:
+                    requires_global_quant_config_fallback = True
+                    logger.info(
+                        "hf_quant_config.json does not set a global quant_algo; "
+                        "falling back to config.json or model_kwargs for global "
+                        "quantization.")
+                else:
+                    raise ValueError(
+                        "Pre-quantized checkpoint must have quant_algo.")
+            else:
                 # fp8_pb_wo from modelopt is the same as fp8_block_scales
                 if hf_quant_algo == "fp8_pb_wo":
                     hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
@@ -356,57 +367,54 @@ class ModelLoader:
                     raise ValueError(
                         f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
                     )
-            else:
-                raise ValueError(
-                    "Pre-quantized checkpoint must have quant_algo.")
 
-            hf_kv_cache_quant_algo = hf_quant_config.pop(
-                "kv_cache_quant_algo", None)
-            if hf_kv_cache_quant_algo is not None:
-                hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
-                if explicit_kv_cache_quant_algo is not None:
-                    if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                        logger.warning(
-                            f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
+                hf_kv_cache_quant_algo = hf_quant_config.pop(
+                    "kv_cache_quant_algo", None)
+                if hf_kv_cache_quant_algo is not None:
+                    hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
+                    if explicit_kv_cache_quant_algo is not None:
+                        if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                            logger.warning(
+                                f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
+                            )
+                        quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
+                    elif quant_config.kv_cache_quant_algo is None:
+                        logger.info(
+                            f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
                         )
-                    quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
-                elif quant_config.kv_cache_quant_algo is None:
+                        quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
+                    elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                        raise ValueError(
+                            f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                        )
+                else:
+                    if quant_config.kv_cache_quant_algo not in [
+                            None, QuantAlgo.FP8, QuantAlgo.NVFP4
+                    ]:
+                        raise ValueError(
+                            f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                        )
+
+                # quantized_layers is handled separately (e.g. via LayerQuantConfig
+                # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
+                hf_quant_config.pop("quantized_layers", None)
+
+                quant_config_fields = set(quant_config.model_fields.keys())
+                for key, value in hf_quant_config.items():
+                    if key not in quant_config_fields:
+                        logger.warning(
+                            f"Ignoring unknown field '{key}' from HF quant config (not a QuantConfig field)."
+                        )
+                        continue
                     logger.info(
-                        f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                        f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
                     )
-                    quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
-                elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                    raise ValueError(
-                        f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                    )
-            else:
-                if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
-                ]:
-                    raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
-                    )
+                    setattr(quant_config, key, value)
 
-            # quantized_layers is handled separately (e.g. via LayerQuantConfig
-            # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
-            hf_quant_config.pop("quantized_layers", None)
+                # Update the quant_config in llm_args for pytorch
+                self.llm_args.quant_config = quant_config
 
-            quant_config_fields = set(quant_config.model_fields.keys())
-            for key, value in hf_quant_config.items():
-                if key not in quant_config_fields:
-                    logger.warning(
-                        f"Ignoring unknown field '{key}' from HF quant config (not a QuantConfig field)."
-                    )
-                    continue
-                logger.info(
-                    f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
-                )
-                setattr(quant_config, key, value)
-
-            # Update the quant_config in llm_args for pytorch
-            self.llm_args.quant_config = quant_config
-
-            return True
+                return True
 
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
@@ -428,12 +436,19 @@ class ModelLoader:
                 f"Use quantization_config from {hf_config_path}: quantization_config={hf_quant_config}"
             )
 
+        if requires_global_quant_config_fallback and hf_quant_config is None:
+            raise ValueError(
+                "hf_quant_config.json does not set a global quant_algo and no "
+                "quantization_config fallback was found.")
+
         if hf_quant_config is not None:
             # DeepSeek V3 FP8 ckpt
             if hf_quant_config.get(
                     "quant_method") == "fp8" and hf_quant_config.get(
                         "weight_block_size"):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.group_size = hf_quant_config["weight_block_size"][
+                    0]
                 quant_config.exclude_modules = ["*eh_proj"]
             elif hf_quant_config.get("quant_method") == "mxfp4":
                 from .._torch.model_config import ModelConfig

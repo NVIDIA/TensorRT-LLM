@@ -46,6 +46,103 @@ from .quantization import (
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod)
 
+_DSV4_MOE_DUMP_DIR_ENV = "TRTLLM_DSV4_DUMP_DIR"
+_DSV4_MOE_DUMP_COUNTS: Dict[str, int] = {}
+
+
+def _parse_dsv4_moe_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _parse_dsv4_moe_dump_layers() -> Optional[set[int]]:
+    value = os.environ.get("TRTLLM_DSV4_DUMP_LAYERS")
+    if not value:
+        return None
+
+    layers = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            layers.update(range(int(start), int(end) + 1))
+        else:
+            layers.add(int(part))
+    return layers
+
+
+def _dsv4_moe_dump_point_enabled(name: str) -> bool:
+    value = os.environ.get("TRTLLM_DSV4_DUMP_POINTS")
+    if not value:
+        return True
+
+    enabled = {part.strip() for part in value.split(",") if part.strip()}
+    suffix = name.rsplit(".", 1)[-1]
+    return name in enabled or suffix in enabled
+
+
+def _dsv4_moe_dump_tensor(
+    name: str,
+    tensor: Optional[torch.Tensor],
+    *,
+    layer_idx: Optional[int] = None,
+) -> None:
+    dump_dir = os.environ.get(_DSV4_MOE_DUMP_DIR_ENV)
+    if dump_dir is None or tensor is None or not isinstance(
+            tensor, torch.Tensor):
+        return
+    if layer_idx is not None:
+        layers = _parse_dsv4_moe_dump_layers()
+        if layers is not None and layer_idx not in layers:
+            return
+    if not _dsv4_moe_dump_point_enabled(name):
+        return
+    is_current_stream_capturing = getattr(torch.cuda,
+                                          "is_current_stream_capturing", None)
+    if tensor.is_cuda and is_current_stream_capturing is not None and is_current_stream_capturing(
+    ):
+        return
+
+    with torch.no_grad():
+        original_shape = tuple(tensor.shape)
+        value = tensor.detach()
+        max_tokens = _parse_dsv4_moe_int_env("TRTLLM_DSV4_DUMP_MAX_TOKENS", 8)
+        sliced_dim0 = False
+        if max_tokens > 0 and value.ndim > 0 and value.shape[0] > max_tokens:
+            value = value[-max_tokens:]
+            sliced_dim0 = True
+        value = value.cpu()
+
+    rank = (os.environ.get("OMPI_COMM_WORLD_RANK") or os.environ.get("RANK")
+            or os.environ.get("LOCAL_RANK") or "0")
+    step = _parse_dsv4_moe_int_env("TRTLLM_DSV4_DUMP_MOE_STEP", 0)
+    safe_name = name.replace(".", "_").replace("/", "_")
+    count_key = f"{rank}_{safe_name}"
+    count = _DSV4_MOE_DUMP_COUNTS.get(count_key, 0)
+    _DSV4_MOE_DUMP_COUNTS[count_key] = count + 1
+    suffix = "" if count == 0 else f"_{count}"
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(
+        dump_dir, f"moe_step_{step:06d}_rank_{rank}_{safe_name}{suffix}.pt")
+    torch.save(
+        {
+            "name": name,
+            "rank": rank,
+            "dtype": str(tensor.dtype),
+            "shape": original_shape,
+            "sliced_dim0": sliced_dim0,
+            "tensor": value,
+        },
+        path,
+    )
+
 
 class TRTLLMGenFusedMoE(MoE):
     """
@@ -836,6 +933,16 @@ class TRTLLMGenFusedMoE(MoE):
             token_selected_experts = token_selected_experts.to(torch.int32)
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_selected_experts_pre_route",
+                token_selected_experts,
+                layer_idx=self.layer_idx,
+            )
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_routing_weights_pre_route",
+                token_final_scales,
+                layer_idx=self.layer_idx,
+            )
 
             self._load_balancer_done_wait_gpu_stage(is_first_call)
 
@@ -852,6 +959,11 @@ class TRTLLMGenFusedMoE(MoE):
             # Route tokens to slots
             token_selected_slots = self._load_balancer_route(
                 token_selected_experts, self.use_dp)
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_selected_slots",
+                token_selected_slots,
+                layer_idx=self.layer_idx,
+            )
 
             # Update expert statistics
             ExpertStatistic.set_layer(self.layer_idx)
@@ -862,6 +974,16 @@ class TRTLLMGenFusedMoE(MoE):
 
         if post_quant_comm:
             x, x_sf = self.quantize_input(x)
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_x_post_quant",
+                x,
+                layer_idx=self.layer_idx,
+            )
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_x_sf_post_quant",
+                x_sf,
+                layer_idx=self.layer_idx,
+            )
 
         if self.enable_alltoall:
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
@@ -990,6 +1112,16 @@ class TRTLLMGenFusedMoE(MoE):
         else:
             # No communication path: use non-post-quant-comm quantization
             x, x_sf = self.quantize_input(x, post_quant_comm=False)
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_x_no_comm_quant",
+                x,
+                layer_idx=self.layer_idx,
+            )
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_x_sf_no_comm_quant",
+                x_sf,
+                layer_idx=self.layer_idx,
+            )
 
         moe_output: Optional[torch.Tensor] = None
         use_workspace_output = False
@@ -1003,6 +1135,26 @@ class TRTLLMGenFusedMoE(MoE):
         # Determine router_logits based on post_quant_comm
         router_logits_arg = None if (
             post_quant_comm or requires_separated_routing) else router_logits
+        _dsv4_moe_dump_tensor(
+            f"layer.{self.layer_idx}.trtllmgen_x_before_run_moe",
+            x,
+            layer_idx=self.layer_idx,
+        )
+        _dsv4_moe_dump_tensor(
+            f"layer.{self.layer_idx}.trtllmgen_x_sf_before_run_moe",
+            x_sf,
+            layer_idx=self.layer_idx,
+        )
+        _dsv4_moe_dump_tensor(
+            f"layer.{self.layer_idx}.trtllmgen_selected_experts_before_run_moe",
+            token_selected_experts,
+            layer_idx=self.layer_idx,
+        )
+        _dsv4_moe_dump_tensor(
+            f"layer.{self.layer_idx}.trtllmgen_routing_weights_before_run_moe",
+            token_final_scales,
+            layer_idx=self.layer_idx,
+        )
 
         final_hidden_states = self.run_moe(
             x=x,
@@ -1014,6 +1166,12 @@ class TRTLLMGenFusedMoE(MoE):
             do_finalize=do_finalize,
             moe_output=moe_output,
         )
+        if isinstance(final_hidden_states, torch.Tensor):
+            _dsv4_moe_dump_tensor(
+                f"layer.{self.layer_idx}.trtllmgen_output_after_run_moe",
+                final_hidden_states,
+                layer_idx=self.layer_idx,
+            )
 
         self._load_balancer_start_set_cpu_stage(is_last_call)
 
@@ -1062,6 +1220,11 @@ class TRTLLMGenFusedMoE(MoE):
             final_hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+        )
+        _dsv4_moe_dump_tensor(
+            f"layer.{self.layer_idx}.trtllmgen_output_after_reduce",
+            final_hidden_states,
+            layer_idx=self.layer_idx,
         )
 
         self._load_balancer_done_set_cpu_stage(is_last_call)
