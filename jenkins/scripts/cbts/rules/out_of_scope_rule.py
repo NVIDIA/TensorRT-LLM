@@ -44,12 +44,17 @@ from .base import PRInputs, Rule, RuleResult
 #   results.
 # - tests/microbenchmarks/             : benchmarking scripts, not run
 #   by any L0 stage.
+# - jenkins/scripts/cbts/              : CBTS itself — rules, main, and
+#   debug tools that run at decision time. Edits change narrowing logic
+#   for future PRs but cannot affect the outcome of any test stage in
+#   the current PR.
 OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "tests/integration/test_lists/qa/",
     "tests/integration/test_lists/dev/",
     "tests/integration/defs/.test_durations",
     "tests/integration/defs/agg_unit_mem_df.csv",
     "tests/microbenchmarks/",
+    "jenkins/scripts/cbts/",
 )
 
 # Path suffixes (extensions) under tests/ with no test-execution impact.
