@@ -125,9 +125,16 @@ class Attention(nn.Module):
             ]
         )
 
+        # TODO: Support combined Ulysses + CP. Ulysses shards heads while CP shards sequence.
+        # Currently kept as mutually exclusive.
+        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
+        use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+        use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
-        if ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV:
+        # Attention2D gathers sequence (not heads); inner backend sees full count
+        if use_ulysses:
             backend_num_heads = self.num_attention_heads // ulysses_size
             backend_num_kv_heads = self.num_key_value_heads // ulysses_size
         else:
@@ -147,8 +154,16 @@ class Attention(nn.Module):
             attention_metadata_state=attention_metadata_state,
         )
 
-        # Wrap with parallelism strategies (orthogonal to backend choice)
-        if ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV:
+        # Wrap with parallelism strategy (orthogonal to backend choice)
+        if use_attn2d:
+            from ..attention_backend.parallel import Attention2DAttention
+
+            self.attn = Attention2DAttention(
+                inner_backend=self.attn,
+                row_process_group=vgm.attn2d_row_group,
+                col_process_group=vgm.attn2d_col_group,
+            )
+        elif use_ulysses:
             from ..attention_backend.parallel import UlyssesAttention
 
             self.attn = UlyssesAttention(
@@ -292,7 +307,7 @@ class Attention(nn.Module):
 
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
-        2. NHD backends (TRTLLM, UlyssesAttention): [B, S, H*D] -> [B, S, H, D]
+        2. NHD backends (TRTLLM, UlyssesAttention, Attention2DAttention): [B, S, H*D] -> [B, S, H, D]
         """
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 

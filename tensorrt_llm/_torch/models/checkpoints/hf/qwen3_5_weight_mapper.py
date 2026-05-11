@@ -61,15 +61,21 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         return normalized_weights
 
     def _preprocess_modelopt_ckpt(self, weights: dict) -> tuple[bool, dict]:
+        nvfp4_prefixes = {
+            key[: -len(".weight_scale_2")] for key in weights if key.endswith(".weight_scale_2")
+        }
+
         remapped_weights = {}
         is_modelopt_ckpt = False
         for key, tensor in weights.items():
             new_key = key
             if key.endswith(".weight_scale"):
                 is_modelopt_ckpt = True
-                new_key = f"{key}_inv"
-                # modelopt fp8_pb_wo has 2 extra singleton dimensions
-                tensor = tensor.squeeze(1).squeeze(-1)
+                prefix = key[: -len(".weight_scale")]
+                if prefix not in nvfp4_prefixes:
+                    new_key = f"{key}_inv"
+                    # modelopt fp8_pb_wo has 2 extra singleton dimensions
+                    tensor = tensor.squeeze(1).squeeze(-1)
             if new_key in remapped_weights:
                 raise ValueError(f"Duplicate remapped key found: {new_key}")
             remapped_weights[new_key] = tensor

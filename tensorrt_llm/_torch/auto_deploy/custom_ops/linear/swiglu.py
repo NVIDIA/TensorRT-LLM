@@ -446,3 +446,52 @@ def _(
     # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]
     output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
     return input.new_empty(output_shape, dtype=input.dtype)
+
+
+@torch.library.custom_op("auto_deploy::fused_finegrained_fp8_deepgemm_swiglu_mlp", mutates_args=())
+def fused_finegrained_fp8_deepgemm_swiglu_mlp(
+    input: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fused FineGrained FP8 SwiGLU MLP on Blackwell (SM100f) via DeepGEMM.
+
+    Identical compute graph to ``fused_finegrained_fp8_swiglu_mlp`` but calls
+    ``trtllm_fp8_deepgemm`` for gate+up and down projections. This variant
+    expects UE8M0 packed int weight scales (produced by
+    ``FineGrainedFP8LinearQuantization.post_load_hook``). Dispatch to this op
+    is a compile-time decision performed by the ``fuse_finegrained_fp8_swiglu``
+    transform; keeping a dedicated op avoids per-call hardware / dtype branching.
+
+    Args match ``fused_finegrained_fp8_swiglu_mlp`` exactly.
+    """
+    gate_up_out = torch.ops.auto_deploy.trtllm_fp8_deepgemm(
+        input,
+        gate_up_weight,
+        None,
+        gate_up_weight_scale,
+    )
+
+    hidden = _silu_and_mul(gate_up_out)
+
+    return torch.ops.auto_deploy.trtllm_fp8_deepgemm(
+        hidden,
+        down_weight,
+        None,
+        down_weight_scale,
+    )
+
+
+@fused_finegrained_fp8_deepgemm_swiglu_mlp.register_fake
+def _(
+    input: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
+    return input.new_empty(output_shape, dtype=input.dtype)

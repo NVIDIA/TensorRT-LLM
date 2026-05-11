@@ -10,7 +10,8 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
+                                          ModelExpressConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -112,6 +113,7 @@ def initialize_dummy_weights(
     """
 
     def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
+        """Return safe (min, max) bounds for uniform sampling of ``dtype``."""
         # These values are not necessarily the largest possible min/max,
         # they need to be small enough to avoid NaNs.
         if dtype in (torch.float8_e4m3fn, torch.int8):
@@ -127,7 +129,24 @@ def initialize_dummy_weights(
         else:
             raise NotImplementedError(f"Unknown quantized type: {dtype}.")
 
-    for param in model.state_dict().values():
+    # Calibration scalars (input_scale / inv_input_scale / kv_scales /
+    # inv_kv_scales / alpha / scalar_alpha) must keep their create_weights
+    # default (typically 1.0). Randomizing them breaks FP8 attention output
+    # and KV cache scaling for any `load_format="dummy"` + IPC update_weights
+    # flow when the checkpoint doesn't ship calibrated values (e.g., HF
+    # FineGrainedFP8, which uses dynamic activation quantization by design).
+    _SKIP_NAME_SUFFIXES = (
+        ".input_scale",
+        ".inv_input_scale",
+        ".kv_scales",
+        ".inv_kv_scales",
+        ".alpha",
+        ".scalar_alpha",
+    )
+
+    for _name, param in model.state_dict().items():
+        if any(_name.endswith(_s) for _s in _SKIP_NAME_SUFFIXES):
+            continue
         generator = torch.Generator(device=param.data.device)
         generator.manual_seed(seed)
         dtype = param.data.dtype
@@ -166,8 +185,13 @@ def get_rank_model_storage(model):
 
 
 def _construct_checkpoint_loader(
-        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
-        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    backend: str,
+    checkpoint_loader: Optional[BaseCheckpointLoader],
+    checkpoint_format: Optional[str],
+    *,
+    mx_config: Optional[ModelExpressConfig] = None,
+    mx_model_name: Optional[str] = None,
+) -> Optional[BaseCheckpointLoader]:
     if backend == "_autodeploy":
         return None
 
@@ -181,11 +205,22 @@ def _construct_checkpoint_loader(
             checkpoint_format)()
         config_loader = get_config_loader(checkpoint_format)()
 
+        # Pass extra kwargs for format-specific loaders (e.g. MX).
+        extra_kwargs: dict = {}
+        if checkpoint_format == "MX":
+            if mx_config is not None:
+                extra_kwargs["mx_server_url"] = mx_config.server_url
+                extra_kwargs[
+                    "query_timeout_s"] = mx_config.server_query_timeout_s
+            if mx_model_name is not None:
+                extra_kwargs["model_name"] = mx_model_name
+
         checkpoint_loader = BaseCheckpointLoader.get(
             checkpoint_format=checkpoint_format,
             weight_loader=checkpoint_weight_loader,
             weight_mapper=None,
-            config_loader=config_loader)
+            config_loader=config_loader,
+            **extra_kwargs)
 
     return checkpoint_loader
 
@@ -381,18 +416,34 @@ class ModelLoader:
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
+            weights_preloaded = False
             if load_format == LoadFormat.AUTO:
+                # Pass model= so format-specific loaders (e.g. MX) can
+                # write weights directly into parameter buffers via P2P.
+                # Generic loaders ignore model=; loaders that can consume a
+                # live module reference (MX) use it for direct writes.
+                load_weights_kwargs: dict = {
+                    "mapping": self.mapping,
+                    "model": model,
+                }
+
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, mapping=self.mapping)
+                        model.llm_checkpoint_dir, **load_weights_kwargs)
                 else:
                     weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, mapping=self.mapping)
+                        checkpoint_dir, **load_weights_kwargs)
 
+                # When MX P2P succeeds, weights are already in model params.
+                # A non-empty dict contains size-mismatched tensors that
+                # should be merged via the standard disk pipeline.
+                weights_preloaded = checkpoint_loader.is_weights_preloaded()
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
-                self._call_load_weights(model.load_weights, weights,
-                                        self.weight_mapper)
+
+                if weights:
+                    self._call_load_weights(model.load_weights, weights,
+                                            self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -427,6 +478,13 @@ class ModelLoader:
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
+
+            checkpoint_loader.post_load_apply(
+                model, weights_preloaded=weights_preloaded)
+            checkpoint_loader.post_load_publish(
+                model,
+                checkpoint_dir=checkpoint_dir,
+                weights_preloaded=weights_preloaded)
 
             for module in model.modules():
                 if hasattr(module, 'post_load_weights') and not getattr(

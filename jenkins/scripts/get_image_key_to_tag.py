@@ -48,46 +48,78 @@ def get_latest_build_number(jenkins_base):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <branch_name>", file=sys.stderr)
-        sys.exit(1)
-
-    branch_name = sys.argv[1]
-    jenkins_base = (
-        f"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/{branch_name}/job/L0_PostMerge"
-    )
-    artifactory_base = (
-        f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic-local/"
-        f"llm-artifacts/LLM/{branch_name}/L0_PostMerge"
-    )
-
-    print(f"Fetching latest build number from Jenkins for branch: {branch_name}", file=sys.stderr)
-
-    build_number = get_latest_build_number(jenkins_base)
-    if build_number is None:
-        print(
-            f"Error: Could not determine the latest build number from {jenkins_base}",
-            file=sys.stderr,
+    if len(sys.argv) == 2:
+        # Branch mode: auto-discover latest build number
+        branch_name = sys.argv[1]
+        jenkins_base = f"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/{branch_name}/job/L0_PostMerge"
+        artifactory_base = (
+            f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic-local/"
+            f"llm-artifacts/LLM/{branch_name}/L0_PostMerge"
         )
+
+        print(
+            f"Fetching latest build number from Jenkins for branch: {branch_name}", file=sys.stderr
+        )
+
+        build_number = get_latest_build_number(jenkins_base)
+        if build_number is None:
+            print(
+                f"Error: Could not determine the latest build number from {jenkins_base}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        print(f"Latest build number: {build_number}", file=sys.stderr)
+
+        while build_number > 0:
+            artifact_url = f"{artifactory_base}/{build_number}/imageKeyToTag.json"
+            print(f"Fetching: {artifact_url}", file=sys.stderr)
+            status, data = fetch_url(artifact_url)
+            if status == 200 and data:
+                sys.stdout.write(data.decode())
+                sys.exit(0)
+            print(
+                f"Got HTTP {status} for build {build_number}, trying build {build_number - 1}...",
+                file=sys.stderr,
+            )
+            build_number -= 1
+
+        print("Error: Could not find imageKeyToTag.json in any recent build", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Latest build number: {build_number}", file=sys.stderr)
+    elif len(sys.argv) == 3:
+        # Pipeline mode: pipeline name and build number provided directly
+        pipeline_name = sys.argv[1]
+        try:
+            build_number = int(sys.argv[2])
+        except ValueError:
+            print(f"Error: build number must be an integer, got '{sys.argv[2]}'", file=sys.stderr)
+            sys.exit(1)
 
-    while build_number > 0:
-        artifact_url = f"{artifactory_base}/{build_number}/imageKeyToTag.json"
+        artifact_url = (
+            f"https://urm.nvidia.com/artifactory/sw-tensorrt-generic-local/"
+            f"llm-artifacts/{pipeline_name}/{build_number}/imageKeyToTag.json"
+        )
         print(f"Fetching: {artifact_url}", file=sys.stderr)
         status, data = fetch_url(artifact_url)
         if status == 200 and data:
             sys.stdout.write(data.decode())
             sys.exit(0)
         print(
-            f"Got HTTP {status} for build {build_number}, trying build {build_number - 1}...",
+            f"Error: Could not fetch imageKeyToTag.json (HTTP {status})"
+            f" for pipeline '{pipeline_name}' build {build_number}",
             file=sys.stderr,
         )
-        build_number -= 1
+        sys.exit(1)
 
-    print("Error: Could not find imageKeyToTag.json in any recent build", file=sys.stderr)
-    sys.exit(1)
+    else:
+        print(
+            f"Usage:\n"
+            f"  {sys.argv[0]} <branch_name>\n"
+            f"  {sys.argv[0]} <pipeline_name> <build_number>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

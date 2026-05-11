@@ -16,6 +16,7 @@ from typing import Optional, Union
 
 import transformers
 
+from ..._utils import get_hf_rope_theta
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
@@ -79,7 +80,7 @@ class CohereConfig(PretrainedConfig):
             hidden_act=hf_config.hidden_act,
             norm_epsilon=hf_config.layer_norm_eps,
             output_multiplier_scale=hf_config.logit_scale,
-            rotary_base=hf_config.rope_theta,
+            rotary_base=get_hf_rope_theta(hf_config, 10000.0),
             attn_bias=hf_config.attention_bias,
             qk_layernorm=hf_config.use_qk_norm,
             mapping=mapping,

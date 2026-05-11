@@ -222,15 +222,44 @@ class BaseMultimodalInputProcessor(ABC):
 
         Resolution order:
         1) self.config.vocab_size
-        2) self.tokenizer.vocab_size
+        2) self.tokenizer.vocab_size (guarded with try/except because some
+           tokenizers in transformers 5.x raise ``NotImplementedError`` from
+           this property)
         """
         # 1) Model config
         if hasattr(self.config, 'vocab_size'):
             return int(self.config.vocab_size)
 
         # 2) Direct tokenizer on self
-        if hasattr(self.tokenizer, 'vocab_size'):
-            return int(self.tokenizer.vocab_size)
+        # Use try/except because transformers 5.x tokenizers may raise
+        # NotImplementedError from the vocab_size property even though
+        # hasattr sees the attribute on the class.
+        try:
+            vocab_size = self.tokenizer.vocab_size
+            if vocab_size is not None:
+                return int(vocab_size)
+        except (NotImplementedError, AttributeError):
+            pass
+
+        # 3) Fallback: len(tokenizer)
+        try:
+            return len(self.tokenizer)
+        except (TypeError, AttributeError, NotImplementedError):
+            pass
+
+        # 4) Fallback: inner tokenizer's vocab_size or get_vocab()
+        inner_tok = getattr(self.tokenizer, 'tokenizer', None)
+        if inner_tok is not None:
+            try:
+                vs = getattr(inner_tok, 'vocab_size', None)
+                if vs is not None:
+                    return int(vs)
+            except (NotImplementedError, AttributeError):
+                pass
+            try:
+                return len(inner_tok.get_vocab())
+            except (AttributeError, NotImplementedError):
+                pass
 
         logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
@@ -310,6 +339,8 @@ class BaseMultimodalInputProcessor(ABC):
         self,
         *,
         video: List[Union[Image.Image, torch.Tensor]],
+        video_metadata: Optional[dict] = None,
+        video_audio: Optional[Any] = None,
         **kwargs,
     ):
         """
@@ -321,6 +352,10 @@ class BaseMultimodalInputProcessor(ABC):
         Returns the token count for the given video.
         Example: for a video item, return the prompt-side token count for that
         one video unit, not the number of video frames.
+
+        `video_metadata` and `video_audio` are consumed here (not forwarded
+        into `get_num_multimodal_tokens`) so subclasses that don't need them
+        are unaffected.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
@@ -859,10 +894,25 @@ def create_input_processor_with_hash(
                 "tokenized_multimodal_process: find_mm_token_lengths returned "
                 "no token lengths for the provided multi_modal_data.")
 
-        expanded_ids = input_processor.expand_prompt_token_ids_for_mm(
+        expanded_ids, mm_data_updates = input_processor.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
             num_mm_tokens,
-            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"))
+            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
+            mm_data=mm_data,
+        )
+
+        # Merge any model-specific auxiliary streams (e.g. video evs_ids for
+        # EVS-enabled runs) into extra_processed_inputs["multimodal_data"].
+        # The dummy-placeholder pass above produced these against the synthetic
+        # placeholder text, so they're stale w.r.t. the real prompt; overwrite
+        # them with the values rebuilt from `prompt_token_ids` here so
+        # `merge_evs_mm_embeds` picks up the correct stream at LLM forward time.
+        if mm_data_updates:
+            mm_container = extra_processed_inputs.setdefault(
+                "multimodal_data", {})
+            for modality, field_updates in mm_data_updates.items():
+                mm_container.setdefault(modality, {}).update(field_updates)
+
         return multimodal_hashing_process(
             inputs,
             sampling_params,
