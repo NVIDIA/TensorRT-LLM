@@ -8,36 +8,36 @@ The following is a table of supported models for the PyTorch backend:
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` |
 | `Cohere2ForCausalLM`                 | Command A                          | `CohereLabs/c4ai-command-a-03-2025`          |
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |
-| `DeepSeekV2ForCausalLM` [^1]         | DeepSeek V2                        | `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` |
+| `DeepSeekV2ForCausalLM` [^12]        | DeepSeek V2                        | `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` |
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
-| `ExaoneForCausalLM` [^2]             | EXAONE 3.5                         | `LGAI-EXAONE/EXAONE-3.5-32B-Instruct`        |
+| `ExaoneForCausalLM` [^13]            | EXAONE 3.5                         | `LGAI-EXAONE/EXAONE-3.5-32B-Instruct`        |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
-| `Gemma3nForConditionalGeneration` [^3]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
-| `Gemma4ForConditionalGeneration` [^4]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^5], `google/gemma-4-31B-it` [^5] |
+| `Gemma3nForConditionalGeneration` [^8]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
+| `Gemma4ForConditionalGeneration` [^10]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^7], `google/gemma-4-31B-it` [^7] |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^6]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
-| `GraniteForCausalLM` [^7]            | Granite 3.x                        | `ibm-granite/granite-3.3-8b-instruct`        |
-| `GraniteMoeHybridForCausalLM` [^8]   | Granite 4.0 Hybrid MoE             | `ibm-granite/granite-4.0-h-small`            |
-| `GptOssForCausalLM` [^12]            | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
-| `HunYuanDenseForCausalLM` [^9]       | Hunyuan Dense                      | `tencent/Hunyuan-7B-Instruct`                |
-| `HunYuanMoEForCausalLM` [^10]        | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
-| `InternLM3ForCausalLM` [^11]         | InternLM3                          | `internlm/internlm3-8b-instruct`             |
+| `GraniteForCausalLM` [^14]           | Granite 3.x                        | `ibm-granite/granite-3.3-8b-instruct`        |
+| `GraniteMoeHybridForCausalLM` [^15]  | Granite 4.0 Hybrid MoE             | `ibm-granite/granite-4.0-h-small`            |
+| `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
+| `HunYuanDenseForCausalLM` [^16]      | Hunyuan Dense                      | `tencent/Hunyuan-7B-Instruct`                |
+| `HunYuanMoEForCausalLM` [^17]        | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
+| `InternLM3ForCausalLM` [^18]         | InternLM3                          | `internlm/internlm3-8b-instruct`             |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
-| `MiniMaxM2ForCausalLM` [^12]         | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
+| `MiniMaxM2ForCausalLM` [^9]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
 | `NemotronHForCausalLM`               | Nemotron-3-Nano, Nemotron-3-Super  | `nvidia/nvidia-nemotron-v3`                  |
 | `NemotronNASForCausalLM`             | NemotronNAS                        | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`     |
-| `Olmo3ForCausalLM` [^13]             | OLMo 3, OLMo 3.1                   | `allenai/Olmo-3.1-32B-Instruct`              |
-| `OpenELMForCausalLM` [^14]           | OpenELM                            | `apple/OpenELM-270M-Instruct`                |
+| `Olmo3ForCausalLM` [^19]             | OLMo 3, OLMo 3.1                   | `allenai/Olmo-3.1-32B-Instruct`              |
+| `OpenELMForCausalLM` [^20]           | OpenELM                            | `apple/OpenELM-270M-Instruct`                |
 | `Phi3ForCausalLM`                    | Phi-4                              | `microsoft/Phi-4`                            |
 | `Qwen2ForCausalLM`                   | QwQ, Qwen2                         | `Qwen/Qwen2-7B-Instruct`                     |
 | `Qwen2ForProcessRewardModel`         | Qwen2-based                        | `Qwen/Qwen2.5-Math-PRM-7B`                   |
@@ -45,10 +45,10 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3ForCausalLM`                   | Qwen3                              | `Qwen/Qwen3-8B`                              |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
-| `Qwen3_5MoeForCausalLM` [^15]        | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
-| `SeedOssForCausalLM` [^16]           | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
-| `SkyworkR1V2ForConditionalGeneration` [^17] | Skywork R1V2, Skywork SWE   | `Skywork/Skywork-R1V2-38B`                   |
-| `SmolLM3ForCausalLM` [^18]           | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
+| `Qwen3_5MoeForCausalLM` [^5]         | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
+| `SeedOssForCausalLM` [^21]           | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
+| `SkyworkR1V2ForConditionalGeneration` [^22] | Skywork R1V2, Skywork SWE   | `Skywork/Skywork-R1V2-38B`                   |
+| `SmolLM3ForCausalLM` [^23]           | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
 
 
 ## Model-Feature Support Matrix (Key Models)
@@ -57,14 +57,14 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 
 | Model Architecture/Feature     | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | MTP | EAGLE-3(One Model Engine) — Linear | EAGLE-3(One Model Engine) — Dynamic | EAGLE-3(Two Model Engine) | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding |
 | ------------------------------ | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ---------------------------------- | ----------------------------------- | ------------------------- | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
-| `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^19]       | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Yes [^20]      | N/A                      | Yes                   | Yes             |
+| `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
 | `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                                | Yes                                 | Yes                       | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
-| `Qwen3NextForCausalLM` [^21]         | Yes                | Yes        | Yes                         | Untested                    | Yes              | No  | No                                 | No                                  | No                        | Yes            | Yes               | No             | No                       | Untested                    | Untested              |
+| `Qwen3NextForCausalLM` [^3]          | Yes                | Yes        | Yes                         | Untested                    | Yes              | No  | No                                 | No                                  | No                        | Yes            | Yes               | No             | No                       | Untested                    | Untested              |
 | `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                                | Yes                                 | Yes                       | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
-| `GptOssForCausalLM`            | Yes              | Yes         | Yes                        | Yes                   | Yes             | No   | Yes                                | No                                  | Yes [^22]                  | Yes           | Yes              | Yes             | N/A                      | Yes                    | Yes             |
-| `Qwen3_5MoeForCausalLM` [^15] | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No                                 | No                                  | No                        | Yes           | Untested         | Yes       | N/A                      | Untested              | Untested        |
+| `GptOssForCausalLM`            | Yes              | Yes         | Yes                        | Yes                   | Yes             | No   | Yes                                | No                                  | Yes [^4]                   | Yes           | Yes              | Yes             | N/A                      | Yes                    | Yes             |
+| `Qwen3_5MoeForCausalLM` [^5]  | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No                                 | No                                  | No                        | Yes           | Untested         | Yes       | N/A                      | Untested              | Untested        |
 | `Glm4MoeLiteForCausalLM` [^6] | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No                                 | No                                  | No                        | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
 | `NemotronHForCausalLM` (Super) | Yes               | Yes        | Untested                   | Untested              | Yes             | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Untested       | N/A                      | Untested              | Untested        |
 | `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | No              | No  | No                                 | No                                  | No                        | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
@@ -80,7 +80,18 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^9]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/minimax_m2.7.yaml).
 [^10]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
 [^11]: Audio modality only supported on E2B/E4B variants.
-[^12]: Also supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend (native PyTorch backend support is unchanged). See AD configs for [20B](../../../examples/auto_deploy/model_registry/configs/gpt_oss_20b.yaml) and [120B](../../../examples/auto_deploy/model_registry/configs/gpt_oss_120b.yaml).
+[^12]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/deepseek_v2_ep.yaml).
+[^13]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/exaone.yaml).
+[^14]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^15]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample AD configs for [micro](../../../examples/auto_deploy/model_registry/configs/granite_4.0_micro.yaml), [h-small](../../../examples/auto_deploy/model_registry/configs/granite_4.0_h_small.yaml), and [tiny-preview](../../../examples/auto_deploy/model_registry/configs/granite_4.0_tiny_preview.yaml).
+[^16]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^17]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/hunyuan_a13b_ep.yaml).
+[^18]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^19]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^20]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/openelm.yaml).
+[^21]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^22]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^23]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
@@ -88,7 +99,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality  |
 | ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | ---------------- | -------------- | --------------------- | ------------------------- | --------- |
 | `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | Yes              | N/A            | Yes                   | No                        | L + I     |
-| `Gemma4ForConditionalGeneration`     | Untested          | Yes        | No              | Yes           | Untested         | No             | Untested              | No                        | L + I + A [^23] |
+| `Gemma4ForConditionalGeneration`     | Untested          | Yes        | No              | Yes           | Untested         | No             | Untested              | No                        | L + I + A [^11] |
 | `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes              | Yes            | Yes                   | No                        | L + I     |
 | `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I + V |
 | `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I     |
@@ -138,27 +149,3 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **LTX-2** | No | Yes | Yes | No | No | Yes | Yes |
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
-
-[^1]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/deepseek_v2_ep.yaml).
-[^2]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/exaone.yaml).
-[^3]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/gemma3n_e2b_it.yaml).
-[^4]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
-[^5]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample AD configs for [MoE](../../../examples/auto_deploy/model_registry/configs/gemma4_moe.yaml) and [dense](../../../examples/auto_deploy/model_registry/configs/gemma4_dense.yaml).
-[^6]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/glm-4.7-flash.yaml).
-[^7]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^8]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample AD configs for [micro](../../../examples/auto_deploy/model_registry/configs/granite_4.0_micro.yaml), [h-small](../../../examples/auto_deploy/model_registry/configs/granite_4.0_h_small.yaml), and [tiny-preview](../../../examples/auto_deploy/model_registry/configs/granite_4.0_tiny_preview.yaml).
-[^9]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^10]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/hunyuan_a13b_ep.yaml).
-[^11]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^12]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/minimax_m2.7.yaml).
-[^13]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^14]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/openelm.yaml).
-[^15]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml).
-[^16]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^17]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^18]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^19]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
-[^20]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
-[^21]: Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.
-[^22]: Overlap scheduler isn't supported when using EAGLE-3(Two Model Engine) for GPT-OSS.
-[^23]: Audio modality only supported on E2B/E4B variants.
