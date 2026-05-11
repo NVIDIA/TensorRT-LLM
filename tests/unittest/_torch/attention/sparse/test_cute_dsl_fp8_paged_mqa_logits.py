@@ -719,18 +719,22 @@ if __name__ == "__main__":
         "--batch_size",
         type=int,
         nargs="+",
-        default=[1, 32, 128],
-        help="batch sizes (default: 1 32 128)",
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        help="batch sizes (default: 1 2 4 8 16 32 64 128 256)",
     )
     parser.add_argument(
-        "--next_n", type=int, nargs="+", default=[1, 2, 4], help="next_n values (default: 1 2 4)"
+        "--next_n",
+        type=int,
+        nargs="+",
+        default=[1, 2, 3, 4],
+        help="next_n values (default: 1 2 3 4)",
     )
     parser.add_argument(
         "--context_len",
         type=int,
         nargs="+",
-        default=[4096, 32768, 131072],
-        help="context lengths (default: 4096 32768 131072)",
+        default=[4096, 8192, 16384, 32768, 65536, 131072],
+        help="context lengths (default: 4096 8192 16384 32768 65536 131072)",
     )
     parser.add_argument("--warmup", type=int, default=10, help="warmup iterations (default: 10)")
     parser.add_argument("--repeat", type=int, default=30, help="profiling iterations (default: 30)")

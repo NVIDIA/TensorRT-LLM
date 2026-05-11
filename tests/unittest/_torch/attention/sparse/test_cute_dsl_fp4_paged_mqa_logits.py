@@ -493,3 +493,391 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     assert diff < 0.02, (
         f"cosine diff {diff} > 0.02 (B={batch_size}, next_n={next_n}, avg_ctx={avg_ctx})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Benchmarking entry point (run module directly).
+# ---------------------------------------------------------------------------
+
+
+def _bench_kineto(fn, kernel_names, num_tests: int = 30, flush_l2: bool = True):
+    """Verbatim port of DeepGEMM's ``bench_kineto`` (suppress + barrier removed).
+
+    See study-deepseek-v4/DeepGEMM/deep_gemm/testing/bench.py. Whitelist semantics:
+    only events whose name contains ``kernel_names`` (str or tuple of str) are
+    summed. Returns average kernel time in **seconds** (single value if
+    ``kernel_names`` is a str, tuple if it's a tuple).
+    """
+    import os as _os
+
+    assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
+    is_tuple = isinstance(kernel_names, tuple)
+
+    # Skip when running under nsys / ncu / compute-sanitizer.
+    if int(_os.environ.get("DG_USE_NVIDIA_TOOLS", 0)):
+        return (1,) * len(kernel_names) if is_tuple else 1
+
+    flush_l2_size = int(8e9 // 4)  # 8 GB / sizeof(int32)
+
+    # Trigger any one-off auto-tune / compile prints outside the profiled region.
+    fn()
+
+    sched = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
+    profiler = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        schedule=sched,
+        acc_events=True,
+    )
+    with profiler:
+        for _ in range(2):  # cycle 0 = warmup (discarded); cycle 1 = active.
+            for _ in range(num_tests):
+                if flush_l2:
+                    torch.empty(flush_l2_size, dtype=torch.int, device="cuda").zero_()
+                fn()
+            torch.cuda.synchronize()
+            profiler.step()
+
+    prof_lines = (
+        profiler.key_averages()
+        .table(sort_by="cuda_time_total", max_name_column_width=100)
+        .split("\n")
+    )
+    name_tuple = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
+    for name in name_tuple:
+        assert sum(name in line for line in prof_lines) <= 1, (
+            f"Multiple matches for kernel '{name}' in profiler table:\n{prof_lines}"
+        )
+
+    units = {"ms": 1e3, "us": 1e6}
+    kernel_times = []
+    for name in name_tuple:
+        total_time = 0.0
+        total_num = 0
+        for line in prof_lines:
+            if name in line:
+                time_str = line.split()[-2]
+                num_str = line.split()[-1]
+                for unit, scale in units.items():
+                    if unit in time_str:
+                        total_time += float(time_str.replace(unit, "")) / scale * int(num_str)
+                        total_num += int(num_str)
+                        break
+        kernel_times.append(total_time / total_num if total_num > 0 else 0)
+
+    return tuple(kernel_times) if is_tuple else kernel_times[0]
+
+
+def _generate_bench_data(
+    batch_size,
+    context_len,
+    next_n,
+    num_heads=64,
+    head_dim=128,
+    block_kv=128,
+    varlen=False,
+    device="cuda",
+):
+    """Generate FP4 benchmark data.
+
+    ``context_len`` is the max length. With ``varlen=False`` every sequence
+    uses this exact length; with ``varlen=True`` per-sequence lengths are
+    drawn uniformly from [min(2048, max), max].
+    """
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    num_blocks_per_seq = (context_len + block_kv - 1) // block_kv
+
+    if varlen:
+        lo = min(2048, context_len)
+        context_lens = torch.randint(
+            lo, context_len + 1, (batch_size,), dtype=torch.int32, device=device
+        )
+        total_blocks = ((context_lens + block_kv - 1) // block_kv).sum().item()
+        block_table = torch.zeros(
+            (batch_size, num_blocks_per_seq), dtype=torch.int32, device=device
+        )
+        cursor = 0
+        for i in range(batch_size):
+            n_blks = (context_lens[i].item() + block_kv - 1) // block_kv
+            block_table[i, :n_blks] = torch.arange(
+                cursor, cursor + n_blks, dtype=torch.int32, device=device
+            )
+            cursor += n_blks
+    else:
+        total_blocks = batch_size * num_blocks_per_seq
+        context_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device=device)
+        block_table = torch.arange(total_blocks, dtype=torch.int32, device=device).reshape(
+            batch_size, num_blocks_per_seq
+        )
+
+    # Q: bf16 → FP4 (per-token, gran_k=32, packed UE8M0 SF).
+    q_bf16 = torch.randn(
+        batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q_bf16.view(-1, head_dim),
+        use_ue8m0=True,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+
+    # KV: bf16 → FP4 fused [num_blocks, block_kv, 1, head_dim/2 + 4] uint8.
+    kv_bf16 = torch.randn(total_blocks, block_kv, 1, head_dim, device=device, dtype=torch.bfloat16)
+    kv_fused, _ = kv_cache_cast_to_fp4(kv_bf16)
+
+    weights = torch.randn(batch_size * next_n, num_heads, device=device, dtype=torch.float32)
+
+    return {
+        "q_fp4": q_fp4,
+        "sf_q": sf_q,
+        "kv_fused": kv_fused,
+        "weights": weights,
+        "context_lens": context_lens,
+        "block_table": block_table,
+        "max_model_len": context_len,
+        "total_blocks": total_blocks,
+    }
+
+
+def benchmark_fp4_paged_mqa_logits(
+    batch_sizes,
+    next_ns,
+    context_lens,
+    num_iterations=30,
+    epi_dtype=torch.float32,
+    output_dtype=torch.bfloat16,
+    num_epi_subtiles=1,
+    varlen=False,
+    block_kv=128,
+):
+    """Benchmark CuTe DSL vs C++ DeepGEMM kernel time for FP4 paged MQA logits.
+
+    Args:
+        block_kv: physical block size (tokens per page). DSL scheduler always
+            uses compute_block_kv=128; when block_kv < 128, the DSL kernel
+            issues num_blocks_per_mma TMA copies per compute tile.
+    """
+    from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits, get_paged_mqa_logits_metadata
+
+    num_heads = 64
+    head_dim = 128
+    compute_block_kv = 128
+    assert compute_block_kv % block_kv == 0, (
+        f"compute_block_kv={compute_block_kv} must be divisible by block_kv={block_kv}"
+    )
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    epi_str = str(epi_dtype).split(".")[-1]
+    out_str = str(output_dtype).split(".")[-1]
+    mode_str = "varlen" if varlen else "fix-len"
+    print(
+        f"epi_dtype={epi_str}  output_dtype={out_str}  "
+        f"num_epi_subtiles={num_epi_subtiles}  mode={mode_str}  block_kv={block_kv}"
+    )
+    hdr = (
+        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
+        f"{'DSL(us)':>8s} {'DG(us)':>8s} {'DG/DSL':>7s}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+
+    for next_n in next_ns:
+        for context_len in context_lens:
+            for batch_size in batch_sizes:
+                nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
+
+                data = _generate_bench_data(
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_heads,
+                    head_dim,
+                    block_kv,
+                    varlen=varlen,
+                )
+
+                # FP4 kernel natively supports next_n ∈ {1, 2, 3}. For
+                # next_n == 4 we apply DG's caller-side atom-split:
+                # [B,4,H,D//2] → [2B,2,H,D//2], context_lens / block_table
+                # are repeated 2× (mirrors DeepGEMM's kNextNAtom=2; 2× HBM).
+                # See study-deepseek-v4/DeepGEMM/tests/test_attention_post_merge.py
+                # for the reference pattern.
+                if next_n == 4:
+                    exp_B = batch_size * 2
+                    dsl_q_fp4 = data["q_fp4"].reshape(exp_B, 2, num_heads, head_dim // 2)
+                    dsl_sf_q = data["sf_q"].reshape(exp_B, 2, num_heads)
+                    # weights [B*4, H] is layout-equivalent to [exp_B*2, H], unchanged.
+                    dsl_ctx_lens = data["context_lens"].repeat_interleave(2)
+                    dsl_block_table = data["block_table"].repeat_interleave(2, dim=0)
+                else:
+                    dsl_q_fp4 = data["q_fp4"]
+                    dsl_sf_q = data["sf_q"]
+                    dsl_ctx_lens = data["context_lens"]
+                    dsl_block_table = data["block_table"]
+
+                # DG metadata: same convention as the FP8 bench. SPLIT_KV =
+                # block_kv * 4 must equal DSL's compute SPLIT_KV = 256, so
+                # pass DG_METADATA_BLOCK_KV=64 regardless of phys block size.
+                # 2D `(exp_B, 1)` context_lens gives num_next_n_atoms=1 — the
+                # DSL kernel processes all real next_n positions in one atom.
+                DG_METADATA_BLOCK_KV = 64
+                dsl_schedule_meta = get_paged_mqa_logits_metadata(
+                    dsl_ctx_lens.unsqueeze(-1),
+                    DG_METADATA_BLOCK_KV,
+                    num_sms,
+                )
+
+                def dsl_fn(
+                    data=data,
+                    dsl_q_fp4=dsl_q_fp4,
+                    dsl_sf_q=dsl_sf_q,
+                    dsl_ctx_lens=dsl_ctx_lens,
+                    dsl_block_table=dsl_block_table,
+                ):
+                    torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+                        dsl_q_fp4,
+                        dsl_sf_q,
+                        data["kv_fused"],
+                        data["weights"],
+                        dsl_ctx_lens,
+                        dsl_block_table,
+                        dsl_schedule_meta,
+                        data["max_model_len"],
+                        num_epi_subtiles=num_epi_subtiles,
+                        epi_dtype=epi_dtype,
+                        output_dtype=output_dtype,
+                    )
+
+                dsl_us = _bench_kineto(dsl_fn, "kernel_cutlass_kernel", num_iterations) * 1e6
+
+                dg_us = None
+                try:
+                    # 2D context_lens (B, next_n): for next_n>1 the wrapper
+                    # computes num_next_n_atoms = next_n / next_n_atom_size.
+                    dg_ctx_2d = data["context_lens"].unsqueeze(-1).expand(-1, next_n).contiguous()
+                    dg_schedule_meta = get_paged_mqa_logits_metadata(
+                        dg_ctx_2d, DG_METADATA_BLOCK_KV, num_sms
+                    )
+
+                    # DG expects q.scalar_type == kPackedFP4 (= torch::kInt8
+                    # in DeepGEMM/csrc/utils/math.hpp:11). The DSL op accepts
+                    # uint8; we only reinterpret bytes here (no copy).
+                    q_fp4_dg = data["q_fp4"].view(torch.int8)
+
+                    def dg_fn(data=data, dg_ctx_2d=dg_ctx_2d, q_fp4_dg=q_fp4_dg):
+                        # DG receives Q as a (q_fp4, sf_q) tuple.
+                        fp8_fp4_paged_mqa_logits(
+                            (q_fp4_dg, data["sf_q"]),
+                            data["kv_fused"],
+                            data["weights"],
+                            dg_ctx_2d,
+                            data["block_table"],
+                            dg_schedule_meta,
+                            data["max_model_len"],
+                        )
+
+                    dg_us = _bench_kineto(dg_fn, "paged_mqa_logits", num_iterations) * 1e6
+                except RuntimeError:
+                    pass
+
+                ratio_str = f"{dg_us / dsl_us:6.3f}x" if dg_us else "   N/A "
+                dg_str = f"{dg_us:7.1f}" if dg_us else "    N/A"
+                print(
+                    f"{batch_size:5d} {context_len:7d} {next_n:6d} "
+                    f"{nblk:7d} | {dsl_us:7.1f} {dg_str} {ratio_str}"
+                )
+
+                del data
+                torch.cuda.empty_cache()
+            print()
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir))
+
+    DT_MAP = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+
+    parser = argparse.ArgumentParser(description="Benchmark CuTe DSL fp4_paged_mqa_logits kernel")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        help="batch sizes (default: 1 32 128)",
+    )
+    parser.add_argument(
+        "--next_n",
+        type=int,
+        nargs="+",
+        default=[1, 2, 3, 4],
+        help="next_n values (default: 1 2 3 4)",
+    )
+    parser.add_argument(
+        "--context_len",
+        type=int,
+        nargs="+",
+        default=[4096, 8192, 16384, 32768, 65536],
+        help="context lengths (default: 4096 8192 16384 32768 65536)",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=30,
+        help="profiling iterations per active step (default: 30; bench_kineto runs "
+        "an equal-size warmup step before the active step automatically)",
+    )
+    parser.add_argument(
+        "--epi_dtype",
+        type=str,
+        default="fp32",
+        choices=DT_MAP.keys(),
+        help="epilogue compute dtype (default: fp32)",
+    )
+    parser.add_argument(
+        "--output_dtype",
+        type=str,
+        default="bf16",
+        choices=DT_MAP.keys(),
+        help="output dtype (default: bf16, matches the unit test's enabled config)",
+    )
+    parser.add_argument(
+        "--num_epi_subtiles",
+        type=int,
+        default=1,
+        choices=[1, 2, 4],
+        help="epilogue sub-tile count (default: 1)",
+    )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="use varlen workload (per-seq lengths in [min(2048,max), max]); "
+        "default is fix-length where all sequences use --context_len",
+    )
+    parser.add_argument(
+        "--block_kv",
+        type=int,
+        default=64,
+        choices=[32, 64, 128],
+        help="physical block size / tokens per page (default: 64). "
+        "DSL compute tile is always 128; when block_kv<128, DSL issues "
+        "num_blocks_per_mma=128/block_kv TMA copies per compute tile.",
+    )
+    args = parser.parse_args()
+
+    benchmark_fp4_paged_mqa_logits(
+        batch_sizes=args.batch_size,
+        next_ns=args.next_n,
+        context_lens=args.context_len,
+        num_iterations=args.repeat,
+        epi_dtype=DT_MAP[args.epi_dtype],
+        output_dtype=DT_MAP[args.output_dtype],
+        num_epi_subtiles=args.num_epi_subtiles,
+        varlen=args.varlen,
+        block_kv=args.block_kv,
+    )
