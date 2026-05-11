@@ -1180,7 +1180,13 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
-    max_num_sequences = max_batch_size * mapping.pp_size
+    # Slot pool needs headroom for two iterations under overlap (prev-iter
+    # finished requests still hold slots when next-iter prepare_resources runs).
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = 1 if llm_args.disable_overlap_scheduler else 2
+    max_num_sequences = max_batch_size * num_micro_batches
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
@@ -1353,7 +1359,8 @@ def create_py_executor_instance(
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
-    scheduler_capacity = max_num_sequences
+    # V1 scheduler handles overlap via two_step_lookahead, so skip the slot-pool overlap factor here.
+    scheduler_capacity = max_batch_size * mapping.pp_size
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
@@ -1469,7 +1476,12 @@ def create_torch_sampler_args(
     disable_flashinfer_sampling: bool,
     enable_async_worker: bool,
 ):
-    max_num_sequences = max_batch_size * mapping.pp_size
+    # Must match create_py_executor_instance's slot-pool sizing.
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = 1 if disable_overlap_scheduler else 2
+    max_num_sequences = max_batch_size * num_micro_batches
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
