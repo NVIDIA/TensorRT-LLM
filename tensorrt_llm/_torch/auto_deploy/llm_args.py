@@ -110,35 +110,63 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return _check_for_default_value_only(cls, value, info, msg)
 
     @model_validator(mode="after")
-    def setup_hidden_state_capture(self):
+    def validate_supported_speculative_config(self):
+        # Check raw user-set fields rather than spec_dec_mode: spec_dec_mode is a
+        # cached_property whose value depends on num_nextn_predict_layers_from_model_config,
+        # a field that can be mutated later from the model config in other backends.
         spec_config = self.speculative_config
         if spec_config is None:
             return self
 
         if isinstance(spec_config, MTPDecodingConfig):
-            if not spec_config.mtp_eagle_one_model:
-                return self
-            if spec_config.use_mtp_vanilla:
-                raise ValueError("mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled")
+            if not spec_config.mtp_eagle_one_model or spec_config.use_mtp_vanilla:
+                raise ValueError(
+                    "AutoDeploy only supports MTP speculative decoding with "
+                    "mtp_eagle_one_model=True and use_mtp_vanilla=False "
+                    f"(got mtp_eagle_one_model={spec_config.mtp_eagle_one_model}, "
+                    f"use_mtp_vanilla={spec_config.use_mtp_vanilla})."
+                )
+            return self
+
+        if isinstance(spec_config, EagleDecodingConfig):
+            if not spec_config.eagle3_one_model:
+                raise ValueError(
+                    "AutoDeploy only supports Eagle speculative decoding with "
+                    f"eagle3_one_model=True (got eagle3_one_model={spec_config.eagle3_one_model})."
+                )
+            return self
+
+        raise ValueError(
+            "AutoDeploy only supports speculative decoding via "
+            "MTPDecodingConfig(mtp_eagle_one_model=True) or "
+            "EagleDecodingConfig(eagle3_one_model=True)."
+        )
+
+    @model_validator(mode="after")
+    def setup_hidden_state_capture(self):
+        # The supported-config validator above guarantees spec_config is either an
+        # MTP one-model or Eagle3 one-model config (or None), so no further mode checks here.
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return self
+
+        if isinstance(spec_config, MTPDecodingConfig):
             if spec_config.max_draft_len is None:
                 raise ValueError(
                     "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
                     "enabled. Ensure num_nextn_predict_layers is set in the model config."
                 )
             capture_layers = {-1}
-            self.model_factory = "eagle_one_model"
-        elif isinstance(spec_config, EagleDecodingConfig):
+        else:
+            assert isinstance(spec_config, EagleDecodingConfig)
             if spec_config.max_draft_len is None:
                 raise ValueError(
                     "EagleDecodingConfig.max_draft_len must not be None. "
                     "Provide a positive integer for max_draft_len."
                 )
             capture_layers = spec_config.eagle3_layers_to_capture
-            if spec_config.eagle3_one_model:
-                self.model_factory = "eagle_one_model"
-        else:
-            return self
 
+        self.model_factory = "eagle_one_model"
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
             capture_layers
@@ -222,11 +250,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
-
-    draft_checkpoint_loader: Optional[object] = Field(
-        default=None,
-        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
-    )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
     mode: Literal["graph", "transformers"] = Field(

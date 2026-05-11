@@ -24,11 +24,22 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
+
+class _SpecDecModeForStateBindingTest:
+    def use_one_engine(self):
+        return True
+
+
+class _SpecConfigForStateBindingTest:
+    def __init__(self, max_draft_len: int):
+        self.max_draft_len = max_draft_len
+        self.tokens_per_gen_step = max_draft_len + 1
+        self.spec_dec_mode = _SpecDecModeForStateBindingTest()
 
 
 @pytest.fixture
@@ -378,6 +389,74 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     assert ssm_cache.shape[2] == head_dim
     assert ssm_cache.shape[3] == ssm_state_size
     assert ssm_cache.dtype == torch.bfloat16
+
+
+def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache_config):
+    """Verify speculative Mamba intermediate state buffers bind through CSI-managed cache."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        spec_config=_SpecConfigForStateBindingTest(max_draft_len=2),
+    )
+
+    num_heads = 4
+    head_dim = 64
+    d_state = 16
+    conv_dim = head_dim * num_heads + 2 * 2 * d_state
+    resource_names = []
+
+    for i in range(2):
+        resource_names.append(
+            interface.add_resource(
+                f"ssm_state_{i}",
+                SSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_ssm_state_{i}",
+                SpecSSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"conv_state_{i}",
+                CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_conv_state_{i}",
+                SpecCausalConvResourceHandler(
+                    conv_dim=conv_dim,
+                    d_conv=4,
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    num_caches = interface.initialize_resources()
+
+    assert num_caches == len(resource_names)
+    assert isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
+    for resource_name in resource_names:
+        cache = interface._caches[resource_name]
+        assert cache is not None
+        assert cache.is_contiguous()
+        assert resource_name not in interface._unmanaged_resources
 
 
 def test_initialize_resources_unpaged_allocated_locally(paged_kv_cache_config):
@@ -885,76 +964,6 @@ def test_typed_handlers_inherit_from_state_resource_handler():
 
     assert isinstance(ssm_handler, StateResourceHandler)
     assert isinstance(conv_handler, StateResourceHandler)
-
-
-def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache_config):
-    """Test that speculative Mamba state handlers bind through the managed cache path."""
-    spec_config = DraftTargetDecodingConfig(
-        max_draft_len=2,
-        speculative_model="dummy-model",
-    )
-    interface = CachedSequenceInterface(
-        max_seq_len=128,
-        max_batch_size=4,
-        max_num_tokens=default_max_num_tokens(128, 4),
-        device="cuda",
-        kv_cache_config=paged_kv_cache_config,
-        spec_config=spec_config,
-    )
-
-    num_heads = 4
-    head_dim = 64
-    d_state = 16
-    conv_dim = head_dim * num_heads + 2 * 2 * d_state
-    resource_names = []
-
-    for i in range(2):
-        resource_names.append(
-            interface.add_resource(
-                f"ssm_state_{i}",
-                SSMResourceHandler(
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    d_state=d_state,
-                    dtype=torch.bfloat16,
-                ),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"intermediate_ssm_state_{i}",
-                SpecSSMResourceHandler(
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    d_state=d_state,
-                    dtype=torch.bfloat16,
-                ),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"conv_state_{i}",
-                CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"intermediate_conv_state_{i}",
-                SpecCausalConvResourceHandler(
-                    conv_dim=conv_dim,
-                    d_conv=4,
-                    dtype=torch.float32,
-                ),
-            )
-        )
-
-    interface.initialize_resources()
-
-    for resource_name in resource_names:
-        cache = interface._caches[resource_name]
-        assert cache is not None
-        assert cache.is_contiguous()
-        assert resource_name not in interface._unmanaged_resources
 
 
 def test_multiple_ssm_resources_contiguous_views(paged_kv_cache_config):

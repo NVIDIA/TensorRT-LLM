@@ -553,16 +553,6 @@ def get_input_embeddings(model: nn.Module) -> torch.Tensor:
     return unique_embedding_weights[0]
 
 
-def get_output_node(model: nn.Module) -> tuple[GraphModule, Node]:
-    """Find the unique output node across all graph modules."""
-    output_nodes = []
-    for _, gm in named_graphmodules(model):
-        output_nodes.extend([(gm, node) for node in gm.graph.find_nodes(op="output")])
-
-    assert len(output_nodes) == 1, f"Expected exactly 1 output node, but found {len(output_nodes)}."
-    return output_nodes[0]
-
-
 def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Node:
     if output_node is None:
         output_node = gm.graph.find_nodes(op="output")[0]
@@ -582,12 +572,6 @@ def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Nod
         lm_head_node = lm_head_node.all_input_nodes[0]
 
     return lm_head_node
-
-
-def get_lm_head_weights(model: nn.Module) -> torch.Tensor:
-    gm, output_node = get_output_node(model)
-    lm_head_node = get_lm_head_node(gm, output_node)
-    return get_weight_tensor(lm_head_node)
 
 
 def get_attr_by_name(obj, name):
