@@ -32,6 +32,12 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
+    # Sharded-local 2D contiguous [T_local, H*D] forms of *positional_embeddings*
+    # and *cross_positional_embeddings*, computed once in prepare_text_cache
+    # (loop-external) and threaded through to fused norm+rope kernels. The 4D
+    # forms above stay around for the unfused fallback (apply_rotary_emb).
+    positional_embeddings_2d: tuple[torch.Tensor, torch.Tensor] | None = None
+    cross_positional_embeddings_2d: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -155,11 +161,14 @@ class TransformerArgsPreprocessor:
         static_mask: torch.Tensor | None,
         static_pe: tuple[torch.Tensor, torch.Tensor],
         static_cross_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+        static_pe_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
+        static_cross_pe_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TransformerArgs:
         """Build TransformerArgs for one denoise step.
 
         Step-invariant static args are always required.  *static_cross_pe*
-        is only used by the MultiModal subclass; ignored here.
+        and *static_pe_2d* / *static_cross_pe_2d* are only meaningful when
+        provided by the caller; ignored in this base class for *_cross_pe.
         """
         x = self.patchify_proj(modality.latent.contiguous())
         timestep, embedded_timestep = self._prepare_timestep(
@@ -176,6 +185,8 @@ class TransformerArgsPreprocessor:
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
+            positional_embeddings_2d=static_pe_2d,
+            cross_positional_embeddings_2d=None,
         )
 
 
@@ -255,6 +266,8 @@ class MultiModalTransformerArgsPreprocessor:
         static_mask: torch.Tensor | None,
         static_pe: tuple[torch.Tensor, torch.Tensor],
         static_cross_pe: tuple[torch.Tensor, torch.Tensor],
+        static_pe_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
+        static_cross_pe_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TransformerArgs:
         """Build TransformerArgs for one denoise step with pre-computed static outputs."""
         transformer_args = self.simple_preprocessor.prepare(
@@ -262,6 +275,7 @@ class MultiModalTransformerArgsPreprocessor:
             static_context=static_context,
             static_mask=static_mask,
             static_pe=static_pe,
+            static_pe_2d=static_pe_2d,
         )
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,
@@ -274,6 +288,7 @@ class MultiModalTransformerArgsPreprocessor:
             cross_positional_embeddings=static_cross_pe,
             cross_scale_shift_timestep=cross_scale_shift_timestep,
             cross_gate_timestep=cross_gate_timestep,
+            cross_positional_embeddings_2d=static_cross_pe_2d,
         )
 
     def _prepare_cross_attention_timestep(

@@ -23,12 +23,18 @@ class TextCache:
     Attributes:
         video_context: Projected text embedding for video cross-attention.
         video_mask: Attention mask for video text cross-attention.
-        video_pe: RoPE (cos, sin) for video.
+        video_pe: RoPE (cos, sin) for video.  4D form [1, T, H, D], un-sharded.
+        video_pe_2d: Sharded-local 2D contiguous form [T_local, H*D] of video_pe,
+            fed directly to fused norm+rope kernels — skips per-step reshape +
+            ``.contiguous()`` in the hot helper.
         audio_context: Projected text embedding for audio cross-attention.
         audio_mask: Attention mask for audio text cross-attention.
-        audio_pe: RoPE (cos, sin) for audio.
+        audio_pe: RoPE (cos, sin) for audio.  4D form, un-sharded.
+        audio_pe_2d: Sharded-local 2D contiguous form of audio_pe.
         video_cross_pe: Cross-modal RoPE for video (audio-video model only).
+        video_cross_pe_2d: Sharded-local 2D contiguous form of video_cross_pe.
         audio_cross_pe: Cross-modal RoPE for audio (audio-video model only).
+        audio_cross_pe_2d: Sharded-local 2D contiguous form of audio_cross_pe.
         video_kv: Per-layer pre-projected text K/V for video cross-attention.
         audio_kv: Per-layer pre-projected text K/V for audio cross-attention.
     """
@@ -36,10 +42,14 @@ class TextCache:
     video_context: Optional[torch.Tensor] = None
     video_mask: Optional[torch.Tensor] = None
     video_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    video_pe_2d: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     video_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    video_cross_pe_2d: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     video_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
     audio_context: Optional[torch.Tensor] = None
     audio_mask: Optional[torch.Tensor] = None
     audio_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    audio_pe_2d: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     audio_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    audio_cross_pe_2d: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     audio_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None

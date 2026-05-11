@@ -670,7 +670,12 @@ class BasicAVTransformerBlock(nn.Module):
             )
             if not skip_v_self:
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
-                v_self_out = self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa
+                v_self_out = (
+                    self.attn1(
+                        norm_vx, pe=video.positional_embeddings_2d or video.positional_embeddings
+                    )
+                    * vgate_msa
+                )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
                 ):
@@ -695,7 +700,12 @@ class BasicAVTransformerBlock(nn.Module):
             )
             if not skip_a_self:
                 norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
-                a_self_out = self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa
+                a_self_out = (
+                    self.audio_attn1(
+                        norm_ax, pe=audio.positional_embeddings_2d or audio.positional_embeddings
+                    )
+                    * agate_msa
+                )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
                 ):
@@ -758,7 +768,8 @@ class BasicAVTransformerBlock(nn.Module):
                 # seq-dim concat), so the cos/sin all-gather is unneeded and K
                 # rope work is U× cheaper.
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
-                    ax_scaled, pe=audio.cross_positional_embeddings
+                    ax_scaled,
+                    pe=audio.cross_positional_embeddings_2d or audio.cross_positional_embeddings,
                 )
                 if self._audio_is_sharded:
                     k_a2v = self._sp_all_gather(k_a2v)
@@ -768,7 +779,8 @@ class BasicAVTransformerBlock(nn.Module):
                     self.audio_to_video_attn(
                         vx_scaled,
                         pre_projected_kv=(k_a2v, v_a2v),
-                        pe=video.cross_positional_embeddings,
+                        pe=video.cross_positional_embeddings_2d
+                        or video.cross_positional_embeddings,
                         k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_a2v
@@ -788,7 +800,8 @@ class BasicAVTransformerBlock(nn.Module):
                 # Project-before-gather (video → audio direction).  RoPE applied
                 # to K in project_kv on local shard; see audio→video branch above.
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
-                    vx_scaled, pe=video.cross_positional_embeddings
+                    vx_scaled,
+                    pe=video.cross_positional_embeddings_2d or video.cross_positional_embeddings,
                 )
                 if self._sharder.is_active:
                     k_v2a = self._sp_all_gather(k_v2a)
@@ -798,7 +811,8 @@ class BasicAVTransformerBlock(nn.Module):
                     self.video_to_audio_attn(
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
-                        pe=audio.cross_positional_embeddings,
+                        pe=audio.cross_positional_embeddings_2d
+                        or audio.cross_positional_embeddings,
                         k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_v2a
@@ -1322,6 +1336,44 @@ class LTXModel(nn.Module):
             cross_gate_timestep=sh.shard(args.cross_gate_timestep, dim=1, expected_seq_len=seq_len),
         )
 
+    def _make_pe_2d_local(
+        self,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+        *,
+        is_audio: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Sharded-local 2D contiguous [T_local, H*D] form of a SPLIT-rope PE.
+
+        Slices along seq dim by Ulysses rank if this modality is sharded,
+        then reshapes to 2D + ``.contiguous()`` so fused norm+rope kernels
+        can consume it directly. Returns None for ndim != 4 (e.g. INTERLEAVED
+        rope) — those paths take the un-fused fallback.
+        """
+        if pe is None:
+            return None
+        cos, sin = pe
+        if cos.ndim != 4:
+            return None
+        sh = self._sharder
+        shard_this = sh.is_active and (not is_audio or self._audio_is_sharded)
+        if shard_this and cos.shape[1] % sh.size == 0:
+            chunk = cos.shape[1] // sh.size
+            s = sh.rank * chunk
+            e = s + chunk
+            cos_local = cos[:, s:e]
+            sin_local = sin[:, s:e]
+        else:
+            cos_local = cos
+            sin_local = sin
+        # [B, T_local, H, D] -> [B*T_local, H*D] contiguous.
+        # PE source from precompute_freqs_cis is B=1, so this collapses to
+        # [T_local, H*D]; the fused kernel (post C7) broadcasts over B.
+        cos_local = cos_local.contiguous()
+        sin_local = sin_local.contiguous()
+        cos_2d = cos_local.reshape(cos_local.shape[0] * cos_local.shape[1], -1)
+        sin_2d = sin_local.reshape(sin_local.shape[0] * sin_local.shape[1], -1)
+        return (cos_2d, sin_2d)
+
     def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather hidden states along the sequence dim."""
         return self._sharder.gather(x, dim=1)
@@ -1435,16 +1487,29 @@ class LTXModel(nn.Module):
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
 
+        # Pre-compute sharded-local 2D contiguous [T_local, H*D] forms for the
+        # fused norm+rope kernels. The 4D form above stays around for the
+        # un-fused fallback path (apply_rotary_emb). This eliminates the
+        # per-step reshape + .contiguous() copy inside the helper.
+        v_pe_2d = self._make_pe_2d_local(v_pe, is_audio=False)
+        v_cross_pe_2d = self._make_pe_2d_local(v_cross_pe, is_audio=False)
+        a_pe_2d = self._make_pe_2d_local(a_pe, is_audio=True)
+        a_cross_pe_2d = self._make_pe_2d_local(a_cross_pe, is_audio=True)
+
         return TextCache(
             video_context=v_ctx,
             video_mask=v_mask,
             video_pe=v_pe,
+            video_pe_2d=v_pe_2d,
             video_cross_pe=v_cross_pe,
+            video_cross_pe_2d=v_cross_pe_2d,
             video_kv=v_kv,
             audio_context=a_ctx,
             audio_mask=a_mask,
             audio_pe=a_pe,
+            audio_pe_2d=a_pe_2d,
             audio_cross_pe=a_cross_pe,
+            audio_cross_pe_2d=a_cross_pe_2d,
             audio_kv=a_kv,
         )
 
@@ -1480,6 +1545,8 @@ class LTXModel(nn.Module):
                 text_cache.video_mask,
                 text_cache.video_pe,
                 text_cache.video_cross_pe,
+                static_pe_2d=text_cache.video_pe_2d,
+                static_cross_pe_2d=text_cache.video_cross_pe_2d,
             )
             if video is not None
             else None
@@ -1491,6 +1558,8 @@ class LTXModel(nn.Module):
                 text_cache.audio_mask,
                 text_cache.audio_pe,
                 text_cache.audio_cross_pe,
+                static_pe_2d=text_cache.audio_pe_2d,
+                static_cross_pe_2d=text_cache.audio_cross_pe_2d,
             )
             if audio is not None
             else None
