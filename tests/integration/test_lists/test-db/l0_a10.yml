@@ -132,7 +132,7 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
   - llmapi/test_llm_api_connector.py::test_connector_async_onboard[False]
   - llmapi/test_llm_api_connector.py::test_connector_async_save[True]
-  - llmapi/test_llm_api_connector.py::test_connector_async_save[False] TIMEOUT (3)
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[False]
   - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[True]
   - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[False]
   - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[True]
