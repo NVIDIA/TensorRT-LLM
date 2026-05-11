@@ -3786,21 +3786,22 @@ class KVCacheManagerV2(BaseResourceManager):
                                            self.index_scales, self.kv_offset,
                                            self._stream.cuda_stream)
 
-    def _get_converted_batch_page_indices(
+    def _fill_converted_batch_page_indices(
         self,
+        dst_offsets: torch.Tensor,
         request_ids: List[int],
         copy_idx: torch.Tensor,
         layer_id: LayerId,
         data_role: DataRole,
         page_index_mode: PageIndexMode = PageIndexMode.PER_LAYER,
-    ) -> torch.Tensor:
+    ) -> None:
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         converter = self.impl.get_page_index_converter(layer_id, data_role)
-        offsets = torch.full((len(request_ids), self.max_blocks_per_seq),
-                             BAD_PAGE_INDEX,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned(),
-                             device='cpu')
+        assert dst_offsets.device.type == "cpu"
+        assert dst_offsets.dtype == torch.int32
+        assert dst_offsets.size(0) >= len(request_ids)
+        assert dst_offsets.size(1) >= self.max_blocks_per_seq
+        dst_offsets_np = dst_offsets.numpy()
 
         for row, request_id in enumerate(request_ids):
             kv_cache = self.kv_cache_map[request_id]
@@ -3813,9 +3814,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise ValueError(
                     f"Converted page indices length {len(converted)} exceeds "
                     f"max_blocks_per_seq {self.max_blocks_per_seq}")
-            offsets[row, :len(converted)] = torch.tensor(converted,
-                                                         dtype=torch.int32)
-        return offsets
+            dst_offsets_np[row, :len(converted)] = converted
 
     def _copy_batch_block_offsets_per_layer(self, dst_tensor: torch.Tensor,
                                             request_ids: List[int],
@@ -3826,15 +3825,16 @@ class KVCacheManagerV2(BaseResourceManager):
         staging[:self.num_attention_op_pools, :num_seqs].fill_(BAD_PAGE_INDEX)
         for local_layer_idx in range(self.num_local_layers):
             layer_id = LayerId(local_layer_idx)
-            key_offsets = self._get_converted_batch_page_indices(
-                request_ids, copy_idx, layer_id, Role.KEY)
-            staging[local_layer_idx, :num_seqs, 0, :] = key_offsets
+            self._fill_converted_batch_page_indices(
+                staging[local_layer_idx, :num_seqs, 0, :], request_ids,
+                copy_idx, layer_id, Role.KEY)
             if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
-                staging[local_layer_idx, :num_seqs, 1, :] = key_offsets
-            else:
                 staging[local_layer_idx, :num_seqs,
-                        1, :] = (self._get_converted_batch_page_indices(
-                            request_ids, copy_idx, layer_id, Role.VALUE))
+                        1, :] = staging[local_layer_idx, :num_seqs, 0, :]
+            else:
+                self._fill_converted_batch_page_indices(
+                    staging[local_layer_idx, :num_seqs, 1, :], request_ids,
+                    copy_idx, layer_id, Role.VALUE)
         dst_tensor[:self.num_attention_op_pools, :num_seqs].copy_(
             staging[:self.num_attention_op_pools, :num_seqs], non_blocking=True)
 
