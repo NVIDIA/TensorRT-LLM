@@ -16,7 +16,13 @@ float4_e2m1x2 = FLOAT4_E2M1X2
 float4_sf_dtype = SF_DTYPE
 fp4_buckets = FP4_BUCKETS
 
-__all__ = ['float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets']
+E2M1_VALUES = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
+
+__all__ = [
+    'float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets', 'E2M1_VALUES',
+    'dequantize_nvfp4'
+]
 
 
 def pad_up(x: int, y: int) -> int:
@@ -204,3 +210,49 @@ def shuffle_matrix_sf_a(
 
     # 128x4
     return torch.ops.trtllm.block_scale_interleave(w_shuffled)
+
+
+def dequantize_nvfp4(
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    out_features: int,
+    in_features: int,
+    target_dtype: torch.dtype = torch.bfloat16,
+    block_size: int = 16,
+) -> torch.Tensor:
+    """Dequantize NVFP4 packed weights to a floating-point dtype.
+
+    Args:
+        packed_weight: [N, K/2] uint8 with two E2M1 nibbles per byte.
+        weight_scale: Per-block scales (FP8 or FP32), flat or shaped.
+        weight_scale_2: Per-tensor global scale (FP32 scalar).
+        out_features: Unpadded number of output rows (N).
+        in_features: Unpadded number of input columns (K).
+        target_dtype: Output dtype (default bfloat16).
+        block_size: Number of elements per scale block (default 16).
+
+    Returns:
+        Dequantized weight tensor of shape [out_features, in_features].
+    """
+    packed_uint8 = (packed_weight.view(torch.uint8)
+                    if packed_weight.dtype != torch.uint8 else packed_weight)
+    N_stored = packed_uint8.shape[0]
+    K = packed_uint8.shape[1] * 2
+    device = packed_uint8.device
+
+    low = (packed_uint8 & 0x0F).long()
+    high = ((packed_uint8 >> 4) & 0x0F).long()
+    idx = torch.empty(N_stored, K, dtype=torch.long, device=device)
+    idx[:, 0::2] = low
+    idx[:, 1::2] = high
+    vals = E2M1_VALUES.to(device)[idx]
+
+    num_blocks = N_stored * (K // block_size)
+    ws = weight_scale.to(torch.float32).reshape(-1)[:num_blocks]
+    s2 = weight_scale_2.to(torch.float32)
+    block_scales = (ws * s2).view(N_stored, K // block_size, 1)
+    vals = vals.view(N_stored, K // block_size, block_size) * block_scales
+    vals = vals.view(N_stored, K)
+
+    return vals[:out_features, :in_features].to(target_dtype)

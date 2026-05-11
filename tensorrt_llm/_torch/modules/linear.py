@@ -1870,40 +1870,24 @@ class NVFP4W4A16LinearMethod(NVFP4LinearMethod):
     Activations remain in BF16 throughout -- no FP4 activation quantization.
     """
 
-    _E2M1_VALUES = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
-
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
 
     def _dequantize_weight(self, module: Linear) -> torch.Tensor:
         """Dequantize FP4 packed weights to module.dtype (typically BF16)."""
         weight = module.weight.data
-        N_padded = weight.shape[0]
-        K_packed = weight.shape[1]
-        K = K_packed * 2
+        K = weight.shape[1] * 2
         N = module.out_features
         sf_vec_size = module.scaling_vector_size
 
-        weight_uint8 = weight.view(torch.uint8)
-        low = (weight_uint8 & 0x0F).long()
-        high = ((weight_uint8 >> 4) & 0x0F).long()
-        idx = torch.empty(N_padded, K, dtype=torch.long, device=weight.device)
-        idx[:, 0::2] = low
-        idx[:, 1::2] = high
-        lut = self._E2M1_VALUES.to(weight.device)
-        vals = lut[idx]
-
+        # Un-interleave per-block scales from CUTLASS swizzled layout to flat 2D
         scale_rows = fp4_utils.pad_up(N, 128)
         ws_2d = unswizzle_sf(module.weight_scale.data, scale_rows, K,
                              sf_vec_size)
-        ws_2d = ws_2d[:N_padded, :K // sf_vec_size].to(torch.float32)
+        ws_flat = ws_2d[:weight.shape[0], :K // sf_vec_size]
 
-        scale_2 = module.weight_scale_2.data.to(torch.float32)
-        block_scales = (ws_2d * scale_2).unsqueeze(-1)
-        vals = vals.view(N_padded, K // sf_vec_size, sf_vec_size) * block_scales
-        vals = vals.view(N_padded, K)
-
-        return vals[:N].to(module.dtype)
+        return fp4_utils.dequantize_nvfp4(weight, ws_flat,
+                                          module.weight_scale_2.data, N, K,
+                                          module.dtype, sf_vec_size)
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):

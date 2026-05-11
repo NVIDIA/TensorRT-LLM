@@ -313,39 +313,12 @@ class NemotronHMOE(nn.Module):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
-    _E2M1_VALUES = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
-
-    @staticmethod
-    def _dequant_nvfp4_tensor(packed: torch.Tensor, weight_scale: torch.Tensor,
-                              weight_scale_2: torch.Tensor,
-                              target_dtype: torch.dtype) -> torch.Tensor:
-        """Dequantize a single NVFP4 packed weight tensor to target_dtype."""
-        packed_uint8 = (packed.view(torch.uint8)
-                        if packed.dtype != torch.uint8 else packed)
-        N, K_packed = packed_uint8.shape
-        K = K_packed * 2
-
-        low = (packed_uint8 & 0x0F).long()
-        high = ((packed_uint8 >> 4) & 0x0F).long()
-        idx = torch.empty(N, K, dtype=torch.long, device=packed.device)
-        idx[:, 0::2] = low
-        idx[:, 1::2] = high
-        lut = NemotronHMOE._E2M1_VALUES.to(packed.device)
-        vals = lut[idx]
-
-        block_size = 16
-        num_blocks = N * (K // block_size)
-        ws = weight_scale.to(torch.float32).reshape(-1)[:num_blocks]
-        s2 = weight_scale_2.to(torch.float32)
-        block_scales = (ws * s2).view(N, K // block_size, 1)
-        vals = vals.view(N, K // block_size, block_size) * block_scales
-        return vals.view(N, K).to(target_dtype)
-
     def _wrap_moe_load_weights_for_dequant(self):
         """Wrap self.experts.load_weights to dequant NVFP4 expert weights to BF16."""
         import functools
         import types
+
+        import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
         original_load_weights = self.experts.load_weights.__func__
         target_dtype = torch.bfloat16
@@ -369,8 +342,9 @@ class NemotronHMOE(nn.Module):
                         packed = tensor[...].cuda()
                         ws = new_dict[scale_key][...].cuda()
                         ws2 = new_dict[scale2_key][...].cuda()
-                        new_dict[key] = NemotronHMOE._dequant_nvfp4_tensor(
-                            packed, ws, ws2, target_dtype)
+                        N, K = packed.shape[0], packed.shape[1] * 2
+                        new_dict[key] = fp4_utils.dequantize_nvfp4(
+                            packed, ws, ws2, N, K, target_dtype)
                         del new_dict[scale_key]
                         del new_dict[scale2_key]
                         for suffix in ('.input_scale', '.input_quantizer'):

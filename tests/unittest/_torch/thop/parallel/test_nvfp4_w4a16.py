@@ -5,7 +5,7 @@ Tests:
 2. NVFP4W4A16LinearMethod forward matches manual dequant + F.linear
 3. W4A4 vs W4A16 output comparison (Blackwell-only)
 4. SM version routing in get_quant_method
-5. MoE weight dequant correctness
+5. Shared fp4_utils.dequantize_nvfp4 correctness
 """
 
 from unittest.mock import patch
@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
     _dequantize_nvfp4,
     _quantize_nvfp4,
@@ -61,40 +62,21 @@ def test_nvfp4_dequant_roundtrip(shape, dtype):
     out_features, in_features = shape
     w_orig, packed, bs_fp8, ws2 = _make_nvfp4_weights(out_features, in_features, dtype)
 
-    # Dequant using the reference AutoDeploy function
     w_recovered = _dequantize_nvfp4(packed, bs_fp8, ws2, (out_features, in_features), dtype)
 
-    # FP4 E2M1 has very coarse quantization, so tolerances are loose.
-    # The important thing is no systematic bias or index errors.
     torch.testing.assert_close(w_recovered, w_orig.to(dtype), atol=0.5, rtol=0.15)
 
 
 @pytest.mark.parametrize("shape", [(128, 256), (192, 128)])
-def test_nvfp4_dequant_w4a16_matches_reference(shape):
-    """Verify NVFP4W4A16LinearMethod._dequantize_weight matches _dequantize_nvfp4."""
+def test_nvfp4_dequant_shared_matches_reference(shape):
+    """Verify fp4_utils.dequantize_nvfp4 matches the AutoDeploy _dequantize_nvfp4 reference."""
     out_features, in_features = shape
     _, packed, bs_fp8, ws2 = _make_nvfp4_weights(out_features, in_features)
 
     ref = _dequantize_nvfp4(packed, bs_fp8, ws2, (out_features, in_features), torch.bfloat16)
+    result = fp4_utils.dequantize_nvfp4(packed, bs_fp8, ws2, out_features, in_features)
 
-    # Build the E2M1 LUT-based dequant used by NVFP4W4A16LinearMethod
-    method = NVFP4W4A16LinearMethod()
-    lut = method._E2M1_VALUES.to(packed.device)
-    low = (packed.view(torch.uint8) & 0x0F).long()
-    high = ((packed.view(torch.uint8) >> 4) & 0x0F).long()
-    idx = torch.empty(out_features, in_features, dtype=torch.long, device=packed.device)
-    idx[:, 0::2] = low
-    idx[:, 1::2] = high
-    vals = lut[idx]
-
-    num_blocks = out_features * (in_features // SCALING_VECTOR_SIZE)
-    ws = bs_fp8.to(torch.float32).reshape(-1)[:num_blocks]
-    s2 = ws2.to(torch.float32)
-    block_scales = (ws * s2).view(out_features, in_features // 16, 1)
-    vals = vals.view(out_features, in_features // 16, 16) * block_scales
-    manual = vals.view(out_features, in_features).to(torch.bfloat16)
-
-    torch.testing.assert_close(manual, ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(result, ref, atol=1e-3, rtol=1e-3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -110,10 +92,10 @@ def test_nvfp4_w4a16_linear_forward(mnk):
     torch.manual_seed(42)
 
     x = torch.randn(seq_len, in_features, dtype=dtype).cuda()
-    w_orig, packed, bs_fp8, ws2 = _make_nvfp4_weights(out_features, in_features, dtype)
+    _, packed, bs_fp8, ws2 = _make_nvfp4_weights(out_features, in_features, dtype)
 
     # Compute reference: dequant + F.linear
-    w_dequant = _dequantize_nvfp4(packed, bs_fp8, ws2, (out_features, in_features), dtype)
+    w_dequant = fp4_utils.dequantize_nvfp4(packed, bs_fp8, ws2, out_features, in_features)
     ref_output = torch.nn.functional.linear(x, w_dequant)
 
     # Build Linear with W4A16 method (force it regardless of actual SM)
@@ -127,14 +109,10 @@ def test_nvfp4_w4a16_linear_forward(mnk):
             quant_config=qc,
         )
 
-    # Verify the method is W4A16
     assert isinstance(linear.linear_method, NVFP4W4A16LinearMethod)
 
-    # Prepare weight_scale in ModelOpt format (unswizzled FP8)
     bs_unswizzled = bs_fp8.view(torch.float8_e4m3fn)
-
-    # input_scale: ModelOpt stores amax/(448*6), which becomes weight_scale_2
-    input_scale_ckpt = torch.tensor([1.0 / (FP8_MAX * E2M1_MAX)])  # dummy static scale
+    input_scale_ckpt = torch.tensor([1.0 / (FP8_MAX * E2M1_MAX)])
 
     linear.load_weights(
         [
@@ -219,11 +197,8 @@ def test_w4a4_vs_w4a16_output_comparison(mnk):
     with torch.inference_mode():
         out_w4a16 = l_w4a16(x)
 
-    # Outputs differ due to activation quantization in W4A4 and GEMM precision,
-    # but should be in the same ballpark. Use generous tolerance.
     torch.testing.assert_close(out_w4a4, out_w4a16, atol=1.0, rtol=0.15)
 
-    # Verify they're reasonably correlated (cosine sim > 0.95)
     cos_sim = torch.nn.functional.cosine_similarity(
         out_w4a4.flatten().float(), out_w4a16.flatten().float(), dim=0
     )
@@ -271,29 +246,24 @@ def test_get_quant_method_routes_w4a16_for_arc_on_hopper():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Test 5: MoE weight dequant correctness
+# Test 5: Shared fp4_utils.dequantize_nvfp4 correctness
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_moe_dequant_nvfp4_tensor():
-    """NemotronHMOE._dequant_nvfp4_tensor matches _dequantize_nvfp4 reference."""
-    from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHMOE
-
+def test_shared_dequant_matches_auto_deploy_reference():
+    """fp4_utils.dequantize_nvfp4 matches _dequantize_nvfp4 from AutoDeploy."""
     out_features, in_features = 192, 128
     _, packed, bs_fp8, ws2 = _make_nvfp4_weights(out_features, in_features)
 
     ref = _dequantize_nvfp4(packed, bs_fp8, ws2, (out_features, in_features), torch.bfloat16)
-
-    result = NemotronHMOE._dequant_nvfp4_tensor(packed, bs_fp8, ws2, torch.bfloat16)
+    result = fp4_utils.dequantize_nvfp4(packed, bs_fp8, ws2, out_features, in_features)
 
     torch.testing.assert_close(result, ref, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("num_experts", [2, 4])
-def test_moe_dequant_multiple_experts(num_experts):
-    """Verify per-expert dequant produces correct results for stacked experts."""
-    from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHMOE
-
+def test_shared_dequant_multiple_experts(num_experts):
+    """Verify dequant produces correct results across multiple expert weights."""
     hidden = 128
     intermediate = 192
     dtype = torch.bfloat16
@@ -303,7 +273,7 @@ def test_moe_dequant_multiple_experts(num_experts):
         _, packed, bs_fp8, ws2 = _make_nvfp4_weights(intermediate, hidden, dtype)
 
         ref = _dequantize_nvfp4(packed, bs_fp8, ws2, (intermediate, hidden), dtype)
-        result = NemotronHMOE._dequant_nvfp4_tensor(packed, bs_fp8, ws2, dtype)
+        result = fp4_utils.dequantize_nvfp4(packed, bs_fp8, ws2, intermediate, hidden, dtype)
 
         torch.testing.assert_close(
             result, ref, atol=1e-3, rtol=1e-3, msg=f"Expert {expert_idx} dequant mismatch"
