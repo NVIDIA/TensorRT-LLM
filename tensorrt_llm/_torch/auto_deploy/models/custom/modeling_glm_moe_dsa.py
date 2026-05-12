@@ -28,11 +28,10 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
-from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from transformers.utils import ModelOutput
 
@@ -146,14 +145,18 @@ except TypeError:
     except ValueError:
         pass
 
-# Register GlmMoeDsaConfig in TOKENIZER_MAPPING so AutoTokenizer.from_pretrained
-# can look up the tokenizer class. All GLM variants use PreTrainedTokenizerFast.
-TOKENIZER_MAPPING.register(GlmMoeDsaConfig, (None, PreTrainedTokenizerFast), exist_ok=True)
+# Register GlmMoeDsaConfig so AutoTokenizer.from_pretrained can look up the
+# tokenizer class. All GLM variants use PreTrainedTokenizerFast.
+try:
+    AutoTokenizer.register(GlmMoeDsaConfig, tokenizer_class=PreTrainedTokenizerFast, exist_ok=True)
+except TypeError:
+    AutoTokenizer.register(
+        GlmMoeDsaConfig, fast_tokenizer_class=PreTrainedTokenizerFast, exist_ok=True
+    )
 
 
 # GLM-5-FP8 specifies tokenizer_class="TokenizersBackend" in its tokenizer_config.json.
-# AutoTokenizer.from_pretrained resolves the class name via tokenizer_class_from_name(),
-# which scans TOKENIZER_MAPPING._extra_content for a tokenizer whose __name__ matches.
+# AutoTokenizer.from_pretrained resolves the class name via tokenizer_class_from_name().
 # We define a thin alias so that name lookup succeeds and falls back to PreTrainedTokenizerFast.
 class TokenizersBackend(PreTrainedTokenizerFast):
     """Alias for PreTrainedTokenizerFast to satisfy the TokenizersBackend tokenizer_class name
@@ -162,7 +165,10 @@ class TokenizersBackend(PreTrainedTokenizerFast):
     pass
 
 
-TOKENIZER_MAPPING.register(GlmMoeDsaConfig, (None, TokenizersBackend), exist_ok=True)
+try:
+    AutoTokenizer.register(GlmMoeDsaConfig, tokenizer_class=TokenizersBackend, exist_ok=True)
+except TypeError:
+    AutoTokenizer.register(GlmMoeDsaConfig, fast_tokenizer_class=TokenizersBackend, exist_ok=True)
 
 
 class GlmMoeDsaRMSNorm(nn.Module):
