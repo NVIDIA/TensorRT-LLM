@@ -786,8 +786,8 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         """
         if not data_list:
             return []
-        pixel_values = torch.cat([d["pixel_values"] for d in data_list], dim=0)
-        patches_per_request = [d["pixel_values"].shape[0] for d in data_list]
+        pixel_values = torch.cat([data["pixel_values"] for data in data_list], dim=0)
+        patches_per_request = [data["pixel_values"].shape[0] for data in data_list]
         batched_embeds = self.extract_feature(pixel_values)
         return list(torch.split(batched_embeds, patches_per_request, dim=0))
 
@@ -2491,6 +2491,19 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             model_config.video_pruning_rate if model_config.video_pruning_rate is not None else 0.0
         )
 
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return [
+            "image.pixel_values",
+            "image.evs_ids",
+            "video.pixel_values",
+            "video.evs_ids",
+            "video.audio.input_audio_features",
+            "video.audio.feature_attention_mask",
+            "audio.input_audio_features",
+            "audio.feature_attention_mask",
+        ]
+
     def load_weights(self, weights):
         # Construct vision/sound encoders here (outside MetaInitMode) so their
         # HF-based submodules allocate regular CPU tensors. Then move them to
@@ -2776,17 +2789,14 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if not audio_data_list:
             return []
 
-        target_device = next(self.sound_encoder.parameters()).device
         max_time = max(ad["input_audio_features"].shape[1] for ad in audio_data_list)
 
         padded_features: List[torch.Tensor] = []
         padded_masks: List[torch.Tensor] = []
         clips_per_input: List[int] = []
         for audio_data in audio_data_list:
-            features = audio_data["input_audio_features"].to(
-                dtype=self.model_dtype, device=target_device
-            )
-            mask = audio_data["feature_attention_mask"].to(device=target_device)
+            features = audio_data["input_audio_features"].to(dtype=self.model_dtype)
+            mask = audio_data["feature_attention_mask"]
             pad_amount = max_time - features.shape[1]
             if pad_amount > 0:
                 features = torch.nn.functional.pad(features, (0, 0, 0, pad_amount))
@@ -2803,12 +2813,12 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         valid_input_lens = all_masks.sum(dim=1)
         valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
             valid_input_lens
-        )
+        ).tolist()
 
         per_clip_embeds: List[torch.Tensor] = []
         per_clip_counts: List[int] = []
         for i in range(sound_embeds.shape[0]):
-            valid_len = int(valid_output_lens[i].item())
+            valid_len = valid_output_lens[i]
             per_clip_embeds.append(sound_embeds[i, :valid_len])
             per_clip_counts.append(valid_len)
 
