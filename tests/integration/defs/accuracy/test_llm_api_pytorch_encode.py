@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import CudaGraphConfig
 
 from ..conftest import llm_models_root
 from .accuracy_core import LlmapiAccuracyTestHarness
@@ -118,6 +119,23 @@ PER_TOKEN_REWARD_MODELS = [
     ),
 ]
 
+# Encoder CUDA graph configs for parametrization. PROMPTS tokenize to short
+# (~6-12 token) sequences, so we only need buckets that cover that range plus
+# one small/larger pair to exercise dispatch + padding. Larger grids inflate
+# warmup without adding coverage.
+ENCODER_CUDA_GRAPH_CONFIGS = [
+    pytest.param(None, id="eager"),
+    pytest.param(
+        dict(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+        ),
+        id="cuda_graph",
+    ),
+]
+
 
 class TestEncoderEncode(LlmapiAccuracyTestHarness):
     """HF logits-level accuracy for encoder-only (non-MM) architectures.
@@ -127,20 +145,34 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
     here because the model differs per parametrize invocation.
     """
 
+    @pytest.mark.parametrize("graph_kwargs", ENCODER_CUDA_GRAPH_CONFIGS)
     @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
-    def test_encode_matches_huggingface_classification(self, model_name, model_path):
+    def test_encoder_encode_matches_huggingface_classification(
+        self, model_name, model_path, graph_kwargs
+    ):
         """Encoder classification heads: direct tensor compare on pooled logits.
 
         A classification head pools over the sequence (BERT: [CLS] token) and
         emits a single [num_classes] vector per prompt.
+
+        Parametrized over the encoder CUDA graph path:
+        - `eager`: cuda_graph_config=None, baseline.
+        - `cuda_graph`: with a tight bucket grid; exercises capture/replay and
+          padding logic.
+
+        Under the `eager` ID we additionally verify the `return_raw_logits`
+        flag: same forward, just a different output wrapping, so HF accuracy
+        applies to the raw tensor as well.
         """
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         # Resolve the checkpoint's native precision.
         torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        cgc = None if graph_kwargs is None else CudaGraphConfig(**graph_kwargs)
 
-        with LLM(model_path, encode_only=True, dtype=llm_dtype) as llm:
+        with LLM(model_path, encode_only=True, dtype=llm_dtype, cuda_graph_config=cgc) as llm:
             outs = llm.encode(PROMPTS)
+            raw = llm.encode(PROMPTS, return_raw_logits=True) if cgc is None else None
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         hf_model = (
@@ -155,8 +187,38 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 
         torch.testing.assert_close(tllm_logits, hf_logits, rtol=1.5e-2, atol=1.5e-2)
 
+        if raw is not None:
+            assert isinstance(raw, torch.Tensor)
+            assert raw.shape == hf_logits.shape
+            torch.testing.assert_close(raw.cpu().float(), hf_logits, rtol=1.5e-2, atol=1.5e-2)
+
+    @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
+    def test_encoder_encode_cuda_graph_matches_eager_logits(self, model_name, model_path):
+        """Tight numerical bound: graph replay must reproduce eager logits.
+
+        This test compares graph output to eager output on the same model with a much
+        tighter rtol=1e-3 to catch those.
+        """
+        _, llm_dtype = _resolve_checkpoint_dtype(model_path)
+
+        with LLM(model_path, encode_only=True, dtype=llm_dtype) as llm_eager:
+            eager_outs = llm_eager.encode(PROMPTS)
+        cgc = CudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[64],
+            seq_lens=[32],
+            enable_padding=True,
+        )
+        with LLM(model_path, encode_only=True, dtype=llm_dtype, cuda_graph_config=cgc) as llm_graph:
+            graph_outs = llm_graph.encode(PROMPTS)
+
+        eager = torch.stack([o.logits.cpu() for o in eager_outs])
+        graph = torch.stack([o.logits.cpu() for o in graph_outs])
+
+        torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)
+
     @pytest.mark.parametrize("model_name,model_path", PER_TOKEN_REWARD_MODELS)
-    def test_encode_matches_huggingface_per_token_reward(self, model_name, model_path):
+    def test_encoder_encode_matches_huggingface_per_token_reward(self, model_name, model_path):
         """Per-token reward models: last-content-token argmax per prompt."""
         from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -285,21 +347,18 @@ class TestDecoderEncode(LlmapiAccuracyTestHarness):
     PROMPTS = [
         "The quick brown fox",
         "Hello, world! How are you today?",
-        (
-            "In a distant galaxy, an advanced civilization discovered "
-            "that time is not linear, and they"
-        ),
+        "In a distant galaxy, an advanced civilization discovered that light can be",
     ]
 
     # Top-K size used for the argmax-in-top-K containment / overlap checks.
     # Chosen to be robust to near-tie argmax flips under FP16/BF16 rounding
     # on very large vocabularies (Gemma-3 has 262K tokens).
     TOPK = 5
-    TOPK_MIN_OVERLAP = 2
+    TOPK_MIN_OVERLAP = 3
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("model_name,model_path", DECODER_MODELS)
-    def test_encode_matches_huggingface(self, model_name, model_path):
+    def test_decoder_encode_matches_huggingface(self, model_name, model_path):
         """encode() last-token logits match HF causal-LM prefill.
 
         Two checks are performed:
@@ -373,3 +432,25 @@ class TestDecoderEncode(LlmapiAccuracyTestHarness):
                     f"HF={hf_last[important_idx].tolist()}\n{m}"
                 ),
             )
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("model_name,model_path", DECODER_MODELS)
+    def test_decoder_encode_cuda_graph_matches_eager_logits(self, model_name, model_path):
+        """Tight numerical bound: decoder single-prefill graph replay must reproduce eager logits."""
+        _, llm_dtype = _resolve_checkpoint_dtype(model_path)
+
+        with LLM(model_path, encode_only=True, dtype=llm_dtype) as llm_eager:
+            eager_outs = llm_eager.encode(self.PROMPTS)
+
+        cgc = CudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+        )
+        with LLM(model_path, encode_only=True, dtype=llm_dtype, cuda_graph_config=cgc) as llm_graph:
+            graph_outs = llm_graph.encode(self.PROMPTS)
+
+        eager = torch.stack([o.logits.cpu() for o in eager_outs])
+        graph = torch.stack([o.logits.cpu() for o in graph_outs])
+        torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)

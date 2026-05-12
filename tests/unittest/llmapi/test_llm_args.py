@@ -45,6 +45,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from tensorrt_llm.plugin import PluginConfig
@@ -1315,6 +1316,37 @@ class TestStrictBaseModelArbitraryArgs:
             TorchCompileConfig(enable_fullgraph=True,
                                invalid_flag="should_fail")
         assert "invalid_flag" in str(exc_info.value)
+
+    def test_encode_only_rejects_piecewise_cuda_graph(self):
+        """Test that encode_only rejects unsupported piecewise CUDA graphs."""
+        with pytest.raises(
+                ValueError,
+                match="encode_only does not support piecewise CUDA graph"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                encode_only=True,
+                torch_compile_config=TorchCompileConfig(
+                    enable_piecewise_cuda_graph=True),
+            )
+
+    def test_encode_only_rejects_mm_encoder_only(self):
+        """Test that encode_only and mm_encoder_only cannot both be enabled."""
+        with pytest.raises(
+                ValueError,
+                match="encode_only and mm_encoder_only are mutually exclusive"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                encode_only=True,
+                mm_encoder_only=True,
+            )
+
+    def test_multimodal_encoder_rejects_encode_only(self):
+        """Test that MultimodalEncoder owns mm_encoder_only mode internally."""
+        encoder = object.__new__(MultimodalEncoder)
+        with pytest.raises(
+                ValueError,
+                match="MultimodalEncoder does not support encode_only"):
+            encoder._validate_mm_args_for_torch_backend({"encode_only": True})
 
     def test_trt_llm_args_arbitrary_args(self):
         """Test that TrtLlmArgs rejects arbitrary arguments."""
