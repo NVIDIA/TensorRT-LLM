@@ -2092,6 +2092,28 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests: set[int] = set()
         self._prepare_page_table_tensor(index_mapper_capacity)
 
+    def get_disagg_data_role(self, role: DataRole):
+        from tensorrt_llm._torch.disaggregation.base.region import \
+            DataRole as DisaggDataRole
+
+        role_to_disagg_role = {
+            Role.KEY:
+            DisaggDataRole.KEY,
+            Role.VALUE:
+            DisaggDataRole.VALUE,
+            Role.KEY_BLOCK_SCALE:
+            DisaggDataRole.KEY
+            | DisaggDataRole.BLOCK_QUANT,
+            Role.VALUE_BLOCK_SCALE:
+            DisaggDataRole.VALUE
+            | DisaggDataRole.BLOCK_QUANT,
+        }
+        if role not in role_to_disagg_role:
+            valid_roles = list(role_to_disagg_role.keys())
+            raise ValueError(
+                f"Invalid role: '{role}'. Valid roles: {valid_roles}")
+        return role_to_disagg_role[role]
+
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 
@@ -2570,6 +2592,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(kv_cache.num_committed_tokens,
                                                 self.tokens_per_block)
 
+            if req.is_disagg_generation_init_state:
+                # Disagg generation receives prompt KV from the context worker;
+                # scratch blocks are only valid for local prefill chunks.
+                kv_cache.enable_swa_scratch_reuse = False
             return self._resume_and_restore(req.py_request_id, kv_cache)
         else:
             # Subsequent chunk: cache must exist from first chunk.

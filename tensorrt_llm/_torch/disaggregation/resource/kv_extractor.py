@@ -296,21 +296,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     """
     from collections import defaultdict
 
-    from tensorrt_llm._torch.pyexecutor.resource_manager import Role
     from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
-
-    _ROLE_STR_TO_ENUM: dict[str, DataRole] = {
-        Role.KEY: DataRole.KEY,
-        Role.VALUE: DataRole.VALUE,
-        Role.KEY_BLOCK_SCALE: DataRole.KEY | DataRole.BLOCK_QUANT,
-        Role.VALUE_BLOCK_SCALE: DataRole.VALUE | DataRole.BLOCK_QUANT,
-    }
-
-    def _role_str_to_enum(role: str) -> DataRole:
-        if role not in _ROLE_STR_TO_ENUM:
-            valid_roles = list(_ROLE_STR_TO_ENUM.keys())
-            raise ValueError(f"Invalid role: '{role}'. Valid roles: {valid_roles}")
-        return _ROLE_STR_TO_ENUM[role]
 
     storage = manager.impl._storage
     config = manager.impl._init_config
@@ -331,7 +317,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         pool_idx = attr.pool_index
         pool_key = (int(lc_id), pool_idx)
         buffer_by_lc_pool[pool_key].append(
-            (layer_id, _role_str_to_enum(role), attr.offset, attr.size)
+            (layer_id, manager.get_disagg_data_role(role), attr.offset, attr.size)
         )
 
     # Iterate over life cycles (layer groups), not storage pool groups.

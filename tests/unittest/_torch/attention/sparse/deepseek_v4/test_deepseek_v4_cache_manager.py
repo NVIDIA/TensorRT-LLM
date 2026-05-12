@@ -9,7 +9,16 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.disaggregation.base.region import DataRole as RegionDataRole
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table_from_manager,
+)
+from tensorrt_llm._torch.disaggregation.resource.utils import PoolRole, get_pool_role
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import Role
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -120,6 +129,8 @@ class TestDeepseekV4CacheManager:
         compressor_dtype: DataType,
         max_input_len: Optional[int] = None,
         is_draft: bool = False,
+        tp_size: int = 1,
+        enable_attention_dp: bool = False,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -140,7 +151,13 @@ class TestDeepseekV4CacheManager:
         )
 
         # Create mapping (single GPU, no parallelism)
-        mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+        mapping = Mapping(
+            world_size=tp_size,
+            rank=0,
+            tp_size=tp_size,
+            pp_size=1,
+            enable_attention_dp=enable_attention_dp,
+        )
 
         # Create cache manager
         cache_manager = DeepseekV4CacheManager(
@@ -908,6 +925,70 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
+    def test_disagg_page_table_accepts_deepseek_v4_roles(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[1, 4, 128],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        try:
+            page_table = build_page_table_from_manager(cache_manager)
+            saw_pool_view = False
+            for layer_group in page_table.layer_groups:
+                for pool_view in layer_group.pool_views:
+                    saw_pool_view = True
+                    assert (
+                        get_pool_role(pool_view, kv_factor=cache_manager.kv_factor)
+                        == PoolRole.KV_CACHE
+                    )
+                    assert {int(entry["role"]) for entry in pool_view.buffer_entries} == {
+                        int(RegionDataRole.KEY)
+                    }
+            assert saw_pool_view
+            with pytest.raises(ValueError, match="Invalid DeepSeek-V4 data role"):
+                cache_manager.get_disagg_data_role(Role.KEY)
+        finally:
+            cache_manager.shutdown()
+
+    def test_disagg_pool_mapping_prefers_exact_pool_view_layer_set(self):
+        ctx_cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[1, 4, 128],
+            dtype=DataType.FP8,
+            compressor_dtype=DataType.FLOAT,
+            tp_size=2,
+        )
+        gen_cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[1, 4, 128],
+            dtype=DataType.FP8,
+            compressor_dtype=DataType.FLOAT,
+            tp_size=2,
+            enable_attention_dp=True,
+        )
+
+        try:
+            ctx_rank_info = RankInfo.from_kv_cache_manager("ctx", ctx_cache_manager, 0)
+            gen_rank_info = RankInfo.from_kv_cache_manager("gen", gen_cache_manager, 0)
+            registrar = PeerRegistrar(gen_rank_info, KVRegionExtractorV1(gen_cache_manager))
+            registrar.register("ctx", 0, ctx_rank_info)
+
+            pool_mapping = registrar.get_pool_mapping(ctx_rank_info)
+            assert pool_mapping
+            for self_pool_key, peer_pool_key in pool_mapping.items():
+                registrar.get_kv_map(ctx_rank_info, self_pool_key, peer_pool_key)
+        finally:
+            ctx_cache_manager.shutdown()
+            gen_cache_manager.shutdown()
+
     def test_dsv4_block_tables(self):
         prompt_len = self.tokens_per_block * 2
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
@@ -1083,6 +1164,36 @@ class TestDeepseekV4CacheManager:
 
             assert cache_manager.try_allocate_generation(req)
             assert not kv_cache.enable_swa_scratch_reuse
+        finally:
+            if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_disagg_generation_init_disables_swa_scratch_reuse(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        req = self._create_request(request_id=0, prompt_len=self.tokens_per_block + 1)
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+        allocated = False
+        try:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(
+                req,
+                req.context_remaining_length,
+                history_length=req.context_remaining_length,
+            )
+            allocated = True
+
+            kv_cache = cache_manager.kv_cache_map[req.py_request_id]
+            assert not kv_cache.enable_swa_scratch_reuse
+            assert kv_cache.history_length == req.context_remaining_length
         finally:
             if allocated:
                 cache_manager.free_resources(req)
