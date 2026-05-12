@@ -3,6 +3,7 @@ Tests for DeepSeek-V4 sparse MLA attention.
 """
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -11,6 +12,7 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
     AttentionInputType,
     MLAParams,
     PositionalEmbeddingParams,
@@ -23,6 +25,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DeepseekV4TrtllmAttentionMetadata,
+    get_token_bytes,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -536,6 +539,263 @@ def _allocate_kv_cache_for_generation(cache_manager, requests: List[LlmRequest])
         )
 
 
+def _create_rope_config(scenario: Scenario) -> RopeConfig:
+    return RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings": scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+
+
+def _create_rope_cos_sin(scenario: Scenario, device: torch.device) -> torch.Tensor:
+    rope_config = _create_rope_config(scenario)
+    return (
+        torch.tensor(
+            RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                rope_config.max_position_embeddings,
+                rope_config.qk_rope_head_dim,
+                rope_config.rope_theta,
+                rope_config.rope_scaling["factor"],
+                rope_config.rope_scaling["original_max_position_embeddings"],
+                rope_config.rope_scaling["beta_fast"],
+                rope_config.rope_scaling["beta_slow"],
+                rope_config.rope_scaling["mscale"],
+                rope_config.rope_scaling["mscale_all_dim"],
+            )[1],
+            dtype=torch.float32,
+            device=device,
+        )
+        .reshape(rope_config.max_position_embeddings, -1, 2)
+        .transpose(-2, -1)
+    )
+
+
+def _create_pos_embd_params(scenario: Scenario) -> PositionalEmbeddingParams:
+    return PositionalEmbeddingParams(
+        type=PositionEmbeddingType.yarn,
+        rope=RopeParams.from_config(_create_rope_config(scenario)),
+        is_neox=False,
+    )
+
+
+@skip_pre_blackwell
+def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
+    """Reproduce the tp=4 Flash warmup sparse-MLA kernel shape.
+
+    The full DeepSeek-V4 model has 64 effective Q heads when rope_append=False.
+    With TP=4, each rank launches the sparse MLA kernel with 16 local Q heads.
+    This single-rank test directly uses that local head count to cover the
+    attention kernel argument shape without involving TP collectives.
+    """
+    scenario = Scenario()
+    device = torch.device("cuda")
+    dtype = scenario.dtype
+    torch.manual_seed(42)
+
+    context_lengths = [1]
+    local_num_heads = int(os.environ.get("DSV4_REPRO_LOCAL_NUM_HEADS", "16"))
+    layer_idx = 0
+    ratio = scenario.compress_ratios[layer_idx]
+    assert ratio == 1
+
+    qk_nope_head_dim = scenario.qk_nope_head_dim
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    v_head_dim = scenario.v_head_dim
+    rope_append = scenario.rope_append
+    kv_lora_rank = (
+        scenario.kv_lora_rank - qk_rope_head_dim if not rope_append else scenario.kv_lora_rank
+    )
+    head_dim = kv_lora_rank + qk_rope_head_dim
+
+    cache_manager, sparse_config = _create_cache_manager(
+        scenario, context_lengths, max_seq_len=1
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=[0],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    cache_manager.prepare_context(request)
+    cache_manager.resize_context(request, request.context_chunk_size)
+
+    pos_embd_params = _create_pos_embd_params(scenario)
+    mla_params = MLAParams(
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+        rope_append=rope_append,
+        predicted_tokens_per_seq=1,
+        hidden_size=scenario.hidden_size,
+    )
+    q_scaling = 1.0 / (scenario.rope_mscale * scenario.rope_mscale)
+
+    layer = DeepseekV4TrtllmAttention(
+        layer_idx=layer_idx,
+        num_heads=local_num_heads,
+        head_dim=head_dim,
+        num_kv_heads=1,
+        q_scaling=q_scaling,
+        pos_embd_params=pos_embd_params,
+        mla_params=mla_params,
+        sparse_attention_config=sparse_config,
+        skip_create_weights_in_init=True,
+    )
+    layer.update_quant_config(None)
+    attn_sink = torch.randn(local_num_heads, dtype=torch.float32, device=device).mul_(0.5)
+    if not os.environ.get("DSV4_REPRO_NO_SINK"):
+        layer.attn_sink = torch.nn.Parameter(attn_sink, requires_grad=False)
+
+    attn_metadata = DeepseekV4TrtllmAttentionMetadata(
+        seq_lens=torch.tensor(context_lengths, dtype=torch.int),
+        request_ids=[0],
+        max_num_requests=1,
+        num_contexts=1,
+        prompt_lens=context_lengths,
+        max_num_tokens=1,
+        kv_cache_manager=cache_manager,
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        sparse_attention_config=sparse_config,
+    )
+    attn_metadata.prepare()
+
+    assert attn_metadata.sparse_mla_topk_lens[ratio][0].item() == 1
+    assert attn_metadata.swa_local_indices_cuda[0, 0].item() == 0
+    assert torch.all(attn_metadata.swa_local_indices_cuda[0, 1:] == -1)
+
+    compressed_kv = torch.empty([1, kv_lora_rank], dtype=dtype, device=device).uniform_(-1, 1)
+    k_pe = torch.empty([1, qk_rope_head_dim], dtype=dtype, device=device).uniform_(-1, 1)
+    q_nope = torch.empty(
+        [1, local_num_heads, kv_lora_rank], dtype=dtype, device=device
+    ).uniform_(-1, 1)
+    q_pe = torch.empty(
+        [1, local_num_heads, qk_rope_head_dim], dtype=dtype, device=device
+    ).uniform_(-1, 1)
+    fused_q = torch.cat([q_nope, q_pe], dim=-1).view(1, local_num_heads * head_dim)
+    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+
+    simple_swa_pool = None
+    if os.environ.get("DSV4_REPRO_SIMPLE_POOL"):
+        simple_swa_pool = torch.empty(
+            (cache_manager.tokens_per_block, head_dim), dtype=dtype, device=device)
+        simple_swa_pool.zero_()
+        simple_swa_pool_ptr = simple_swa_pool.data_ptr()
+        cache_manager.kv_cache_pool_pointers[0, 0] = simple_swa_pool_ptr
+        attn_metadata.host_kv_cache_pool_pointers[0, 0] = simple_swa_pool_ptr
+        attn_metadata.sparse_mla_base_ptrs[1] = simple_swa_pool_ptr
+        attn_metadata.swa_buffer_ptrs[layer_idx] = simple_swa_pool_ptr
+        attn_metadata.block_tables[(1, DeepseekV4AttentionType.SWA)][0].fill_(-1)
+        attn_metadata.block_tables[(1, DeepseekV4AttentionType.SWA)][0, 0] = 0
+        torch.cuda.synchronize()
+
+    if os.environ.get("DSV4_REPRO_PRINT_PARAMS"):
+        sparse_attn_indices, _ = layer.sparse_attn_predict(
+            fused_q,
+            None,
+            attn_metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=latent_cache,
+                q_pe=q_pe,
+            ),
+        )
+        torch.cuda.synchronize()
+        print("DSV4_REPRO local_num_heads", local_num_heads)
+        print("DSV4_REPRO token_stride", get_token_bytes(
+            head_dim,
+            sparse_config.index_head_dim,
+            ratio,
+            DeepseekV4AttentionType.SWA,
+            False,
+        ))
+        print("DSV4_REPRO tokens_per_block", cache_manager.tokens_per_block)
+        print("DSV4_REPRO max_blocks_per_seq", cache_manager.max_blocks_per_seq)
+        print("DSV4_REPRO max_seq_len", cache_manager.max_seq_len)
+        print("DSV4_REPRO metadata_max_seq_len", attn_metadata.max_seq_len)
+        print("DSV4_REPRO kv_lens_runtime",
+              attn_metadata.kv_lens_runtime[:1].cpu().tolist())
+        print("DSV4_REPRO host_total_kv_lens",
+              attn_metadata.host_total_kv_lens.cpu().tolist())
+        print("DSV4_REPRO prompt_lens_runtime",
+              attn_metadata.prompt_lens_cpu_runtime[:1].cpu().tolist())
+        print("DSV4_REPRO swa_pool_base_ptr", attn_metadata.sparse_mla_base_ptrs[1])
+        print("DSV4_REPRO swa_buffer_ptr", attn_metadata.swa_buffer_ptrs[layer_idx])
+        print("DSV4_REPRO block_table_swa", attn_metadata.block_tables[
+            (1, DeepseekV4AttentionType.SWA)
+        ][:1, :4].cpu().tolist())
+        print("DSV4_REPRO sparse_attn_indices", sparse_attn_indices.cpu().tolist())
+        print("DSV4_REPRO sparse_attn_indices_dtype", sparse_attn_indices.dtype)
+        print("DSV4_REPRO sparse_mla_topk_lens",
+              attn_metadata.sparse_mla_topk_lens[ratio][:1].cpu().tolist())
+        print("DSV4_REPRO sparse_mla_topk_lens_dtype",
+              attn_metadata.sparse_mla_topk_lens[ratio].dtype)
+
+    softmax_stats_tensor = None
+    if os.environ.get("DSV4_REPRO_SOFTMAX_STATS"):
+        softmax_stats_tensor = torch.empty(
+            (1, local_num_heads, 2), dtype=torch.float32, device=device)
+
+    result = layer.forward(
+        fused_q.clone(),
+        None,
+        None,
+        attn_metadata,
+        attention_input_type=AttentionInputType.context_only,
+        latent_cache=latent_cache,
+        q_pe=q_pe,
+        topk_indices=None,
+        is_generation=False,
+        softmax_stats_tensor=softmax_stats_tensor,
+    )
+
+    rope_cos_sin = _create_rope_cos_sin(scenario, device)
+    k_pe_ref = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_lengths)
+    latent_cache_ref = torch.cat([compressed_kv, k_pe_ref], dim=-1)
+    fused_q_rot = _rotate_fused_q_for_ctx(
+        fused_q,
+        rope_cos_sin,
+        context_lengths,
+        local_num_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    )
+    ref_result = calculate_deepseek_v4_ref_ctx_sparse(
+        fused_q_rot,
+        latent_cache_ref,
+        None,
+        scenario.window_size,
+        None,
+        context_lengths,
+        local_num_heads,
+        kv_lora_rank,
+        v_head_dim,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        q_scaling,
+        ratio,
+        attn_sink=attn_sink,
+    )
+
+    torch.testing.assert_close(result, ref_result, atol=0.2, rtol=0.02)
+    cache_manager.shutdown()
+
+
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("context_lengths", [[4399], [14, 508, 3947], [2, 1406, 3327]])
@@ -588,49 +848,10 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
     # 2. Create RoPE cos/sin
-    rope_config = RopeConfig(
-        hidden_size=scenario.hidden_size,
-        num_attention_heads=scenario.num_heads,
-        rope_scaling={
-            "beta_fast": scenario.rope_beta_fast,
-            "beta_slow": scenario.rope_beta_slow,
-            "factor": scenario.rope_factor,
-            "mscale": scenario.rope_mscale,
-            "mscale_all_dim": scenario.rope_mscale_all_dim,
-            "original_max_position_embeddings": scenario.rope_original_max_position_embeddings,
-            "type": scenario.rope_type,
-        },
-        max_position_embeddings=scenario.max_position_embeddings,
-        rope_theta=scenario.rope_theta,
-        qk_rope_head_dim=scenario.qk_rope_head_dim,
-        model_type=scenario.model_type,
-    )
-    rope_cos_sin = (
-        torch.tensor(
-            RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
-                rope_config.max_position_embeddings,
-                rope_config.qk_rope_head_dim,
-                rope_config.rope_theta,
-                rope_config.rope_scaling["factor"],
-                rope_config.rope_scaling["original_max_position_embeddings"],
-                rope_config.rope_scaling["beta_fast"],
-                rope_config.rope_scaling["beta_slow"],
-                rope_config.rope_scaling["mscale"],
-                rope_config.rope_scaling["mscale_all_dim"],
-            )[1],
-            dtype=torch.float32,
-            device=device,
-        )
-        .reshape(rope_config.max_position_embeddings, -1, 2)
-        .transpose(-2, -1)
-    )
+    rope_cos_sin = _create_rope_cos_sin(scenario, device)
 
     # 3. Setup attention params
-    pos_embd_params = PositionalEmbeddingParams(
-        type=PositionEmbeddingType.yarn,
-        rope=RopeParams.from_config(rope_config),
-        is_neox=False,
-    )
+    pos_embd_params = _create_pos_embd_params(scenario)
     mla_params = MLAParams(
         q_lora_rank=scenario.q_lora_rank,
         kv_lora_rank=kv_lora_rank,
@@ -1103,47 +1324,8 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
         cache_manager.resize_context(req, req.context_chunk_size)
 
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    rope_config = RopeConfig(
-        hidden_size=scenario.hidden_size,
-        num_attention_heads=scenario.num_heads,
-        rope_scaling={
-            "beta_fast": scenario.rope_beta_fast,
-            "beta_slow": scenario.rope_beta_slow,
-            "factor": scenario.rope_factor,
-            "mscale": scenario.rope_mscale,
-            "mscale_all_dim": scenario.rope_mscale_all_dim,
-            "original_max_position_embeddings": scenario.rope_original_max_position_embeddings,
-            "type": scenario.rope_type,
-        },
-        max_position_embeddings=scenario.max_position_embeddings,
-        rope_theta=scenario.rope_theta,
-        qk_rope_head_dim=scenario.qk_rope_head_dim,
-        model_type=scenario.model_type,
-    )
-    rope_cos_sin = (
-        torch.tensor(
-            RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
-                rope_config.max_position_embeddings,
-                rope_config.qk_rope_head_dim,
-                rope_config.rope_theta,
-                rope_config.rope_scaling["factor"],
-                rope_config.rope_scaling["original_max_position_embeddings"],
-                rope_config.rope_scaling["beta_fast"],
-                rope_config.rope_scaling["beta_slow"],
-                rope_config.rope_scaling["mscale"],
-                rope_config.rope_scaling["mscale_all_dim"],
-            )[1],
-            dtype=torch.float32,
-            device=device,
-        )
-        .reshape(rope_config.max_position_embeddings, -1, 2)
-        .transpose(-2, -1)
-    )
-    pos_embd_params = PositionalEmbeddingParams(
-        type=PositionEmbeddingType.yarn,
-        rope=RopeParams.from_config(rope_config),
-        is_neox=False,
-    )
+    rope_cos_sin = _create_rope_cos_sin(scenario, device)
+    pos_embd_params = _create_pos_embd_params(scenario)
     mla_params = MLAParams(
         q_lora_rank=scenario.q_lora_rank,
         kv_lora_rank=kv_lora_rank,
