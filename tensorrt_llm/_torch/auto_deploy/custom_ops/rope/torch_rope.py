@@ -53,6 +53,58 @@ def torch_apply_rope_with_explicit_cos_sin_fake(
     return torch.empty_like(q), torch.empty_like(k)
 
 
+# ---------------------------------------------------------------------------
+# IN-PLACE variant for the fused-QKV path (env-var-gated POC, default OFF).
+#
+# When the upstream attention block holds Q/K/V as views of a single
+# contiguous fused QKV buffer, out-of-place RoPE forces re-materialisation
+# (new q_embed, k_embed tensors) which in turn forces a downstream
+# torch.cat([q,k,v]) inside the attention wrapper to reconstruct the fused
+# layout that thop.attention expects. By rotating Q and K in place the
+# fused buffer remains contiguous; the wrapper then detects storage
+# continuity and skips its cat (see trtllm_attention.py
+# `AD_ATTN_FUSED_QKV_ROPE` branch).
+#
+# Returns None; mutates q and k. Implementation still uses standard PyTorch
+# ops internally (decomposes to ~4 elementwise kernels per call, same as
+# out-of-place), so the win is at the layout level (one fewer cat in the
+# wrapper), not at the per-call kernel-count level inside RoPE. A future
+# Triton fused-RoPE kernel could tighten this further; out of scope here.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_rope_with_explicit_cos_sin_inplace",
+    mutates_args=("q", "k"),
+)
+def torch_apply_rope_with_explicit_cos_sin_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> None:
+    cos = cos.type_as(q)
+    sin = sin.type_as(q)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q.copy_(q_embed)
+    k.copy_(k_embed)
+
+
+@torch_apply_rope_with_explicit_cos_sin_inplace.register_fake
+def torch_apply_rope_with_explicit_cos_sin_inplace_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> None:
+    return None
+
+
 @torch.library.custom_op("auto_deploy::torch_rope_with_complex_freqs", mutates_args=())
 def torch_apply_rope_with_complex_freqs(
     xq: torch.Tensor,

@@ -26,6 +26,7 @@ following the same design pattern as the FlashInfer backend:
 """
 
 import math
+import os
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -53,6 +54,21 @@ from ..attention_interface import (
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
 )
+
+# Env-var toggle (POC, default OFF): when the upstream modeling code uses
+# in-place RoPE on Q/K (see modeling_gpt_oss.py and modeling_gpt_oss_ir.py's
+# `AD_ATTN_FUSED_QKV_ROPE` branch), the fused QKV buffer produced by
+# fuse_gemms remains contiguous after rotation. This flag enables a
+# runtime storage-continuity check inside the attention wrapper: if Q, K, V
+# share storage and are storage-adjacent in the expected Q|K|V order, the
+# wrapper reconstructs the fused buffer with a zero-copy `set_()` view
+# instead of issuing a `torch.cat([q,k,v]).contiguous()` (one
+# CatArrayBatched kernel per layer per iter, ~40 µs/iter on V_D V9 TP=1).
+# Without the modeling-side in-place RoPE, RoPE allocates fresh
+# q_embed/k_embed tensors and storage continuity fails; the wrapper falls
+# back to the original cat path automatically. Default OFF — without the
+# env var the storage-detect branch is skipped entirely (no-op).
+_AD_ATTN_FUSED_QKV_ROPE = os.environ.get("AD_ATTN_FUSED_QKV_ROPE", "0") == "1"
 
 # =============================================================================
 # Module-level planner (analogous to _GlobalFlashInferPlanner)
@@ -587,7 +603,58 @@ def trtllm_mha_with_cache(
     k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
 
-    qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
+    qkv_fused = None
+    if _AD_ATTN_FUSED_QKV_ROPE:
+        # Storage-continuity fast path: when fuse_gemms collapses the three
+        # q_proj/k_proj/v_proj into one fused linear AND the modeling code
+        # used in-place RoPE (so post-rotation Q,K stay as views of the
+        # fused buffer), Q|K|V are storage-adjacent and we can view the
+        # underlying buffer directly without a cat kernel.
+        try:
+            q_st = q_flat.untyped_storage()
+            k_st = k_flat.untyped_storage()
+            v_st = v_flat.untyped_storage()
+            same_storage = q_st.data_ptr() == k_st.data_ptr() == v_st.data_ptr()
+            # row stride in elements (must match for all three so a single
+            # stride works across the full [num_tokens, total_qkv] view).
+            q_row = num_heads * head_dim
+            k_row = num_kv_heads * head_dim
+            v_row = num_kv_heads * head_dim
+            total_qkv = q_row + k_row + v_row
+            if same_storage:
+                q_off = q_flat.storage_offset()
+                k_off = k_flat.storage_offset()
+                v_off = v_flat.storage_offset()
+                # Storage-adjacent in Q|K|V order: q_off + num_tokens * row_q
+                # lands exactly at k_off (in elements), and so on.
+                adj_qk = (q_off + num_tokens * q_row) == k_off
+                adj_kv = (k_off + num_tokens * k_row) == v_off
+                # Each individual tensor must itself be row-contiguous on the
+                # fused buffer with stride == total_qkv (so the next row of
+                # Q starts after the K and V columns of the current row).
+                # This is the layout fuse_gemms produces from a single
+                # nn.Linear with combined out_features.
+                row_stride_ok = (
+                    q_flat.stride(0) == total_qkv
+                    and k_flat.stride(0) == total_qkv
+                    and v_flat.stride(0) == total_qkv
+                    and q_flat.stride(1) == 1
+                    and k_flat.stride(1) == 1
+                    and v_flat.stride(1) == 1
+                )
+                if adj_qk and adj_kv and row_stride_ok:
+                    qkv_fused = torch.empty(0, dtype=q_flat.dtype, device=q_flat.device)
+                    qkv_fused.set_(
+                        q_st,
+                        storage_offset=q_off,
+                        size=(num_tokens, total_qkv),
+                        stride=(total_qkv, 1),
+                    )
+        except Exception:
+            qkv_fused = None
+
+    if qkv_fused is None:
+        qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
     # The thop.attention C++ kernel expects attention_sinks in float32 (see
     # attentionOp.cpp:365). Models typically hold sinks at the same dtype as

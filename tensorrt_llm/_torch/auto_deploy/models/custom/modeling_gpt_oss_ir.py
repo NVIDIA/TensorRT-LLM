@@ -41,6 +41,7 @@ Shardable custom ops used:
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -52,6 +53,30 @@ from transformers.utils import ModelOutput
 
 from ... import custom_ops  # noqa: F401 -- ensure all custom ops are registered
 from ..hf import AutoModelForCausalLMFactory
+
+# Env-var toggle (POC, default OFF): keep `self.sinks` (per-head learnable
+# scalar used by attention) in fp32 across all `.to(dtype)` calls. When
+# enabled, the per-call `attention_sinks.to(torch.float32)` cast inside
+# `trtllm_attention_mha_with_cache` becomes a no-op (its branch sees fp32
+# already), removing the tiny elementwise from the captured cudagraph.
+#
+# Naive V25 attempt (2026-05-11) failed because HF's `model.to(bf16)` call
+# after `__init__` re-cast the Parameter to bf16. The fix here overrides
+# `_apply()` on GptOssAttention so post-`.to()` walks the module tree but
+# the sinks tensor is recast back to fp32 at the end of each `_apply`.
+#
+# OFF by default — safe for other runs sharing this codebase.
+_AD_ATTN_SINKS_FP32 = os.environ.get("AD_ATTN_SINKS_FP32", "0") == "1"
+
+# Env-var toggle (POC, default OFF): use in-place RoPE on Q,K so the fused
+# QKV buffer (created by fuse_gemms at IR level from the three q_proj/k_proj/
+# v_proj linears) remains a single contiguous storage after rotation. The
+# attention wrapper (`trtllm_attention_mha_with_cache`) then detects storage
+# continuity and skips its `torch.cat([q,k,v])` reconstruction (one
+# CatArrayBatched kernel × num_layers per iter, ~40 µs/iter at TP=1).
+# Without this toggle the existing out-of-place RoPE allocates fresh
+# q_embed/k_embed tensors, breaking continuity, so the wrapper must cat.
+_AD_ATTN_FUSED_QKV_ROPE = os.environ.get("AD_ATTN_FUSED_QKV_ROPE", "0") == "1"
 
 # GPT-OSS hard-codes these in the HF reference (see modeling_gpt_oss.GptOssExperts).
 _GPTOSS_GLU_ALPHA = 1.702
@@ -332,6 +357,20 @@ class GptOssAttention(nn.Module):
         sliding_window = getattr(config, "sliding_window", None)
         self.sliding_window = int(sliding_window) if (is_sliding and sliding_window) else None
 
+    def _apply(self, fn, recurse=True):
+        # Env-var-gated POC: hold `self.sinks` in fp32 regardless of the
+        # surrounding `model.to(dtype)` walk. Without this override, HF's
+        # `.to(torch_dtype=bf16)` after construction casts the Parameter to
+        # bf16 and the per-call `attention_sinks.to(torch.float32)` branch
+        # inside `trtllm_attention_mha_with_cache` fires every layer every
+        # iter, adding a small but cudagraph-captured elementwise kernel.
+        # Toggle via `AD_ATTN_SINKS_FP32=1`. Default OFF: original semantics
+        # (Parameter follows surrounding dtype).
+        out = super()._apply(fn, recurse=recurse)
+        if _AD_ATTN_SINKS_FP32 and self.sinks.dtype != torch.float32:
+            self.sinks.data = self.sinks.data.to(torch.float32)
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -384,6 +423,14 @@ class GptOssAttention(nn.Module):
         )
 
         cos, sin = position_embeddings
+        # Keep canonical out-of-place op so O12
+        # (`fuse_rope_into_trtllm_attention`) can match and fuse it into
+        # the C++ side. With O12 active the python-side RoPE disappears
+        # from the graph and Q/K/V reach the wrapper as views of
+        # fuse_gemms' single linear output, where the wrapper-side
+        # `AD_ATTN_FUSED_QKV_ROPE` storage-continuity check eliminates
+        # the cat. The in-place op in custom_ops/rope/torch_rope.py is
+        # reserved for future non-O12 or fused-Triton-kernel work.
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
 
         attn_output = torch.ops.auto_deploy.torch_attention(
