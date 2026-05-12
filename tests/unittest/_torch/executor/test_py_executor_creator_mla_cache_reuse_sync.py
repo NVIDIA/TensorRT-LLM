@@ -21,26 +21,52 @@ from tensorrt_llm.quantization import QuantAlgo
 
 
 class _DummyCalibrator:
+    """Mock calibrator for testing that bypasses actual calibration logic."""
 
     def init(self, *args, **kwargs):
+        """Initialize calibrator (no-op)."""
         return None
 
     def maybe_wrap_model(self, model):
+        """Wrap model (no-op, returns model unchanged)."""
         return model
 
 
 class _DummyResourceManager:
+    """Mock resource manager that stores and retrieves resource instances by type."""
 
     def __init__(self, resources):
+        """Initialize with resource dictionary.
+        
+        Args:
+            resources: Dict mapping ResourceManagerType to resource instances.
+        """
         self._resources = resources
 
     def get_resource_manager(self, resource_type):
+        """Retrieve resource by type.
+        
+        Args:
+            resource_type: ResourceManagerType enum value.
+            
+        Returns:
+            Resource instance or None if not found.
+        """
         return self._resources.get(resource_type)
 
 
 class _DummyPyExecutor:
+    """Mock PyExecutor that stores resource manager and model engine references."""
 
     def __init__(self, resources, model_engine, peft_cache_config, execution_stream):
+        """Initialize mock executor.
+        
+        Args:
+            resources: Dict of resource managers.
+            model_engine: Model engine instance.
+            peft_cache_config: PEFT cache configuration.
+            execution_stream: CUDA stream for execution.
+        """
         self.resource_manager = _DummyResourceManager(resources)
         self.model_engine = model_engine
         self.peft_cache_config = peft_cache_config
@@ -48,20 +74,34 @@ class _DummyPyExecutor:
         self.started = False
 
     def start_worker(self):
+        """Mark executor as started."""
         self.started = True
 
 
 class _DummyKvCacheCreator:
+    """Mock KV cache creator that builds a dummy KV cache manager with reuse settings."""
 
     def __init__(self, **kwargs):
+        """Initialize with KV cache configuration.
+        
+        Args:
+            **kwargs: Keyword args including max_seq_len, kv_cache_config, execution_stream.
+        """
         self._max_seq_len = kwargs["max_seq_len"]
         self._kv_cache_config = kwargs["kv_cache_config"]
         self._execution_stream = kwargs["execution_stream"]
 
     def try_prepare_estimation(self):
+        """Skip estimation phase (no-op)."""
         return False
 
     def build_managers(self, resources, estimating_kv_cache):
+        """Build KV cache manager with reuse configuration.
+        
+        Args:
+            resources: Dict to store created managers.
+            estimating_kv_cache: Whether in estimation mode (unused).
+        """
         del estimating_kv_cache
         resources[ResourceManagerType.KV_CACHE_MANAGER] = SimpleNamespace(
             enable_block_reuse=self._kv_cache_config.enable_block_reuse,
@@ -70,8 +110,15 @@ class _DummyKvCacheCreator:
 
 
 class _DummyModelEngine:
+    """Mock model engine that exposes attention runtime features and model configuration."""
 
     def __init__(self, *, attn_runtime_features, kv_cache_quant_algo):
+        """Initialize with runtime features and quantization algorithm.
+        
+        Args:
+            attn_runtime_features: AttentionRuntimeFeatures instance.
+            kv_cache_quant_algo: Quantization algorithm for KV cache.
+        """
         self.attn_runtime_features = attn_runtime_features
         self.max_seq_len = 128
         self.max_num_tokens = 128
@@ -90,6 +137,11 @@ class _DummyModelEngine:
 
 
 def _make_llm_args():
+    """Create minimal LLM arguments for executor initialization.
+    
+    Returns:
+        SimpleNamespace with all required LLM configuration fields.
+    """
     kv_cache_config = SimpleNamespace(
         enable_block_reuse=True,
         enable_partial_reuse=False,
@@ -135,6 +187,20 @@ def _make_llm_args():
 
 
 def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
+    """Execute create_py_executor with mocked dependencies and return cache reuse flags.
+    
+    Mocks all external dependencies (model engine, resource managers, etc.) to isolate
+    executor creation logic and verify that KV cache reuse configuration is synchronized
+    with attention runtime metadata across fallback paths.
+    
+    Args:
+        monkeypatch: pytest fixture for mocking.
+        sm_version: CUDA SM version to simulate (e.g., 89, 90).
+        kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        
+    Returns:
+        Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag) from created executor.
+    """
     llm_args = _make_llm_args()
     fake_mapping = SimpleNamespace(
         rank=0,
@@ -209,6 +275,14 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):
+    """Verify MLA unsupported SM fallback disables cache reuse in both config and runtime.
+    
+    When MLA is enabled but SM version (89) is unsupported, the fallback should:
+    - Set kv_cache_config.enable_block_reuse to False
+    - Also set model_engine.attn_runtime_features.cache_reuse to False
+    
+    This test ensures invariant synchronization is maintained across the fallback.
+    """
     kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
         monkeypatch,
         sm_version=89,
@@ -220,6 +294,15 @@ def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):
 
 
 def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
+    """Verify MLA unsupported KV quant fallback disables cache reuse in both config and runtime.
+    
+    When MLA is enabled, SM version (90) is supported, but KV quantization (INT8) is unsupported,
+    the fallback should:
+    - Set kv_cache_config.enable_block_reuse to False
+    - Also set model_engine.attn_runtime_features.cache_reuse to False
+    
+    This test ensures invariant synchronization is maintained across the fallback.
+    """
     kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
         monkeypatch,
         sm_version=90,
@@ -231,6 +314,15 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
 
 
 def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch):
+    """Verify MLA supported configuration preserves cache reuse in both config and runtime.
+    
+    When both SM version (90) and KV quantization (NO_QUANT) are supported for MLA,
+    no fallback occurs and:
+    - kv_cache_config.enable_block_reuse remains True
+    - model_engine.attn_runtime_features.cache_reuse remains True
+    
+    This positive test ensures the default path does not regress.
+    """
     kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
         monkeypatch,
         sm_version=90,
