@@ -48,7 +48,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention_backend.interface import (PositionalEmbeddingParams,
+                                            RopeParams,
+                                            trtllm_dsv4_mem_opts_enabled)
 from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..distributed import (
     AllReduce,
@@ -154,6 +156,22 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
 def _deepseek_v4_pos_embd_params(
     config: PretrainedConfig, model_config: ModelConfig, layer_idx: Optional[int]
 ) -> PositionalEmbeddingParams:
+    # When TRTLLM_DSV4_MEM_OPTS=1, surface the runtime max_seq_len (set by
+    # llm_args) onto the HF config so RopeParams.from_config sees it and
+    # can auto-cap max_positions. HF DeepSeek configs lack a max_seq_len
+    # attribute by default, so without this plumb the auto-cap path is a
+    # no-op for DSv4. The mutation is gated on the env so OFF behavior
+    # stays byte-identical to upstream (where rope_params.max_seq_len
+    # would be None for DSv4 since the HF config has no such attr).
+    if (trtllm_dsv4_mem_opts_enabled()
+            and getattr(config, 'max_seq_len', None) is None
+            and model_config is not None
+            and getattr(model_config, 'max_seq_len', None) is not None):
+        try:
+            config.max_seq_len = model_config.max_seq_len
+        except (AttributeError, TypeError):
+            # PretrainedConfig is usually mutable; ignore if frozen.
+            pass
     rope_params = RopeParams.from_config(config)
 
     compress_ratios = None

@@ -1,4 +1,5 @@
 import copy
+import os
 import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
@@ -140,6 +141,12 @@ class AttentionMetadata:
     # are enabled.
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
+
+    # Optional reference to the model config. Used by backends that pre-size
+    # shape-dependent buffers up front (e.g. the attention workspace
+    # pre-allocation under TRTLLM_DSV4_MEM_OPTS). Backends that don't need
+    # it can ignore the field.
+    model_config: Optional[Any] = None
 
     # The number of tokens in each rank.
     all_rank_num_tokens: Optional[List[int]] = None
@@ -457,6 +464,22 @@ class PositionalEmbedder(Protocol):
         ...
 
 
+def trtllm_dsv4_mem_opts_enabled() -> bool:
+    """Master switch for DSv4-style memory optimizations.
+
+    When TRTLLM_DSV4_MEM_OPTS is truthy, three memory optimizations are
+    activated together with values auto-derived from the runtime config:
+      1. Rope cos/sin table capped at runtime max_seq_len.
+      2. Attention workspace pre-allocated to a worst-case size estimated
+         from max_num_tokens and the model's per-head dims, so the
+         allocation happens in a memory-rich phase rather than mid-warmup.
+      3. MHC fused-HC scratch tensors routed through the global Buffers pool.
+    There is no per-feature env knob; the switch is single-on / single-off.
+    """
+    return os.environ.get("TRTLLM_DSV4_MEM_OPTS", "").lower() not in (
+        "", "0", "false", "off", "no")
+
+
 @dataclass(kw_only=True, unsafe_hash=True)
 class RopeParams:
     dim: int = 0
@@ -555,6 +578,19 @@ class RopeParams:
             rope_params.scale_type = RotaryScalingType.yarn
         # Other metdadata for RoPE.
         rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
+
+        # Auto-cap the precomputed cos/sin table size when TRTLLM_DSV4_MEM_OPTS
+        # is on. Yarn cos/sin for position p depends only on p and the yarn
+        # scaling constants (which use original_max_position_embeddings, not
+        # the table size), so truncating to max_seq_len yields identical
+        # values for indices < cap. The cap is applied via field mutation so
+        # it participates in the cache key (preserving dedup semantics) and
+        # downstream kernel-facing fields stay consistent.
+        if (trtllm_dsv4_mem_opts_enabled()
+                and rope_params.max_seq_len is not None
+                and rope_params.max_seq_len > 0
+                and rope_params.max_seq_len < rope_params.max_positions):
+            rope_params.max_positions = rope_params.max_seq_len
 
         return rope_params
 

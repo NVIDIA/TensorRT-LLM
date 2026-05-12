@@ -745,6 +745,19 @@ class PyTorchModelEngine(ModelEngine):
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
+        # Synchronize the max-shape across TP ranks. Each rank's
+        # `get_num_available_tokens` answer is a function of that rank's
+        # available KV-cache memory, which can differ between ranks (allocator
+        # fragmentation, system reservations, workspace pre-alloc rounding,
+        # etc.). The subsequent `_general_warmup_impl` runs a forward at
+        # `(curr_max_num_tokens, 0)` which issues collective MoE ops; if
+        # ranks disagree on the shape, some ranks silently `continue`
+        # ("Not enough KV cache space") while others enter the collective,
+        # producing a CUDA 719 cascade in MoE routing. Taking the minimum
+        # across the TP group makes every rank use the same shape.
+        if self.mapping.tp_size > 1:
+            curr_max_num_tokens = min(
+                self.dist.tp_allgather(curr_max_num_tokens))
         max_batch_size = min(
             self.batch_size, curr_max_num_tokens //
             (1 + self.max_total_draft_tokens) // self.max_beam_width)
@@ -831,7 +844,29 @@ class PyTorchModelEngine(ModelEngine):
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
+            # Pre-autotuner TP-group barrier. Ensures every rank has
+            # finished the previous `_general_warmup` collectives before
+            # any rank enters `_run_autotuner_warmup`, so collectives
+            # the autotuner issues internally find all peers.
+            #
+            # Without this and the post-autotuner barrier below, a rank
+            # that exits the autotuner instantly (e.g. when `Cache size
+            # after warmup is 0`) races ahead into the next
+            # collective-issuing `_general_warmup` step while a peer
+            # is still inside its own autotuner — the two collectives
+            # then mismatch and the slower rank's autotuner spins
+            # forever waiting for peers that have moved on, producing
+            # a silent hang with no error message. See
+            # bench-mewtwo/claude_opt/dsv4_autotuner_hang_fix_20260513.md.
+            if self.mapping.tp_size > 1:
+                self.dist.tp_barrier()
             self._run_autotuner_warmup(resource_manager)
+            # Post-autotuner TP-group barrier. Pair to the pre-autotuner
+            # barrier above; holds fast ranks until every rank has
+            # exited the autotuner before any issues the post-autotuner
+            # `_general_warmup` MoE all-to-all collective.
+            if self.mapping.tp_size > 1:
+                self.dist.tp_barrier()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
@@ -1483,6 +1518,7 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=cache_indirection,
             sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
+            model_config=self.model.model_config,
         )
 
         return self.attn_metadata

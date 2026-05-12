@@ -31,12 +31,100 @@ from .interface import (
     PredefinedAttentionMask,
     RopeParams,
     merge_attention_forward_args,
+    trtllm_dsv4_mem_opts_enabled,
 )
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
+
+
+def _estimate_attn_workspace_bytes(model_config, max_num_tokens, mapping) -> int:
+    """Mirror AttentionOp::getWorkspaceSizeForContext (attentionOp.cpp:725).
+
+    The C++ side sums ~26 buffer slots (`workspaces[0..25]`) with 256-byte
+    alignment per slot (`calculateTotalWorkspaceSize` in workspace.h:76).
+    For the DSv4-Pro / sparse-MLA / FP8 paged-context FMHA path, the
+    non-zero contributions empirically reduce to:
+
+        CUBLAS_WORKSPACE_SIZE (32 MiB)
+      + 3 * max_num_tokens * num_heads * head_size * bytes_per_elt
+      + small slots (tokens_info, cu_seqlens x 3, rotary_inv_freq, scheduler
+        counter, FMHA scales -- < 1 MiB combined)
+
+    The factor-of-3 reflects three head-size-scaled staging buffers that
+    the C++ side bills for: `q_buf_2` (slot 6), `fp8_q_buf` (slot 13), and
+    one additional same-size buffer that fires in the DSv4 path (either
+    layer-specific scratch for the indexer, or worst-case sizing for the
+    non-sparse-MLA fall-through). This was empirically derived from runtime
+    `workspace_.value().resize_(...)` requests on DSv4-Pro GB300 TP=4:
+
+        batch=1, max_num_tokens=8208:  runtime asks 1,644,233,984 B
+                                       formula computes 1,644,231,360 B (-2.6 KB)
+        batch=2, max_num_tokens=16416: runtime asks 3,254,912,256 B
+                                       formula computes 3,254,910,720 B (-1.5 KB)
+
+    Pre-allocating at this size avoids the lazy `0 -> ~1.6 GiB` (batch=1)
+    or `0 -> ~3.0 GiB` (batch=2) resize that fires mid-warmup, fails under
+    tight memory, and leaves CUDA state degraded so the MoE kernel hits
+    CUDA_ERROR_LAUNCH_FAILED on a later real forward.
+
+    Returns 0 when inputs are insufficient; caller falls back to lazy
+    workspace growth.
+    """
+    if model_config is None or max_num_tokens is None or max_num_tokens <= 0:
+        return 0
+    cfg = getattr(model_config, "pretrained_config", None) or model_config
+    num_heads = getattr(cfg, "num_attention_heads", None)
+    if not num_heads:
+        return 0
+
+    has_mla = hasattr(cfg, "kv_lora_rank") and getattr(
+        cfg, "kv_lora_rank", 0) > 0
+
+    use_attention_dp = bool(
+        getattr(model_config, "enable_attention_dp", False))
+    tp_size = max(1, getattr(mapping, "tp_size", 1)) \
+        if mapping is not None else 1
+    if not use_attention_dp and not has_mla and tp_size > 1:
+        num_heads = max(1, num_heads // tp_size)
+
+    # head_size for the FMHA wrapper. For sparse-MLA absorption this is
+    # `kv_lora_rank + qk_rope_head_dim` (see MLA.mqa create_attention in
+    # modules/attention.py); for non-MLA models it's the HF `head_dim`.
+    if has_mla:
+        head_size = (getattr(cfg, "kv_lora_rank", 0)
+                     + getattr(cfg, "qk_rope_head_dim", 0))
+    else:
+        head_size = getattr(cfg, "head_dim", 0)
+        if not head_size:
+            hidden = getattr(cfg, "hidden_size", 0)
+            head_size = hidden // num_heads if num_heads else 0
+    if head_size <= 0:
+        return 0
+
+    # FP8 KV cache => FP8 staging (1 byte per elt); else bf16/fp16 (2 bytes).
+    quant_cfg = getattr(model_config, "quant_config", None)
+    is_fp8 = False
+    if quant_cfg is not None:
+        for attr in ("kv_cache_quant_algo", "kv_cache_dtype", "quant_algo"):
+            val = getattr(quant_cfg, attr, None)
+            if val and "fp8" in str(val).lower():
+                is_fp8 = True
+                break
+    bytes_per_elt = 1 if is_fp8 else 2
+
+    CUBLAS_WORKSPACE_SIZE = 33554432  # cpp/include/.../cudaUtils.h:59
+
+    def aligned(nbytes: int, alignment: int = 256) -> int:
+        # Mirrors workspace.h:76 calculateTotalWorkspaceSize rounding.
+        return nbytes + ((alignment - nbytes % alignment) % alignment)
+
+    dominant = 3 * max_num_tokens * num_heads * head_size * bytes_per_elt
+    tokens_info = 8 * max_num_tokens  # sizeof(int2) per token (slot 18)
+    return aligned(CUBLAS_WORKSPACE_SIZE) + aligned(dominant) + aligned(
+        tokens_info)
 
 
 @functools.cache
@@ -213,9 +301,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
+        _initial_workspace_bytes = 0
+        if trtllm_dsv4_mem_opts_enabled():
+            _initial_workspace_bytes = _estimate_attn_workspace_bytes(
+                getattr(self, "model_config", None),
+                self.max_num_tokens,
+                self.mapping,
+            )
+
         if self.workspace is None:
             self.workspace = torch.empty(
-                (0, ),
+                (_initial_workspace_bytes, ),
                 device='cuda',
                 dtype=torch.int8,
             )
