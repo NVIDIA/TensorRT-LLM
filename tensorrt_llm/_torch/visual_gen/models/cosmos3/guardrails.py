@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import os
@@ -119,8 +134,8 @@ def build_text_guardrail(guardrail_ckpt_dir: str) -> TextGuardrailFn:
 
         checkers.append(_blocklist_check)
         logger.info("Blocklist guardrail loaded (%d keywords)", len(blocklist_words))
-    except ImportError:
-        logger.warning("better-profanity or nltk not installed; skipping blocklist guardrail")
+    except (ImportError, OSError, RuntimeError, ValueError) as e:
+        logger.warning("Could not load blocklist guardrail: %s", e)
 
     # 2. Qwen3Guard
     try:
@@ -158,8 +173,8 @@ def build_text_guardrail(guardrail_ckpt_dir: str) -> TextGuardrailFn:
 
         checkers.append(_qwen_check)
         logger.info("Qwen3Guard guardrail loaded")
-    except ImportError:
-        logger.warning("transformers not installed; skipping Qwen3Guard")
+    except (ImportError, OSError, RuntimeError, ValueError) as e:
+        logger.warning("Could not load Qwen3Guard guardrail: %s", e)
 
     def text_guardrail(prompt: str) -> None:
         for checker in checkers:
@@ -203,8 +218,6 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
         classifier = classifier.to("cuda", dtype=torch.float32).eval()
 
         def _safety_check(frames: np.ndarray) -> tuple[bool, str]:
-            nonlocal siglip_model, classifier
-
             unsafe_count = 0
             total = len(frames)
             for frame in frames:
@@ -228,7 +241,7 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
 
         safety_checker = _safety_check
         logger.info("Video content safety filter loaded (SigLIP so400m + classifier)")
-    except (ImportError, FileNotFoundError) as e:
+    except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError) as e:
         logger.warning("Could not load video safety filter: %s", e)
 
     # 2. Face blur: RetinaFace + pixelation
@@ -280,8 +293,6 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
             return boxes
 
         def _face_blur(frames: np.ndarray) -> np.ndarray:
-            nonlocal retinaface_net
-
             prior_data = None
             scale = None
             result_frames = []
@@ -338,7 +349,7 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
 
         face_blurrer = _face_blur
         logger.info("Face blur filter loaded (RetinaFace Resnet50)")
-    except (ImportError, FileNotFoundError) as e:
+    except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError) as e:
         logger.warning("Could not load face blur filter: %s", e)
 
     def video_guardrail(frames: np.ndarray) -> np.ndarray | None:
@@ -358,7 +369,8 @@ def check_video_safety(
     video_tensor: torch.Tensor, video_guardrail: VideoGuardrailFn
 ) -> torch.Tensor | None:
     v = video_tensor.detach().cpu()
-    if v.dim() == 5:
+    was_batched = v.dim() == 5
+    if was_batched:
         v = v[0]
     frames_np = v.numpy()
     frames_np = video_guardrail(frames_np)
@@ -366,6 +378,6 @@ def check_video_safety(
         return None
 
     result = torch.from_numpy(frames_np)
-    if video_tensor.dim() == 4:
+    if was_batched:
         result = result.unsqueeze(0)
     return result.to(video_tensor.device)

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 import os
 import time
@@ -59,7 +74,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.transformer.eval()
 
     def load_standard_components(
-        self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = None
+        self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
@@ -87,11 +102,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder=PipelineComponent.SCHEDULER,
             )
 
-        # load guardrails by default
-        if (
-            not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
-            and PipelineComponent.TEXT_GUARDRAIL not in skip_components
-            and PipelineComponent.VIDEO_GUARDRAIL not in skip_components
+        self.text_guardrail = None
+        self.video_guardrail = None
+        if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS and (
+            PipelineComponent.TEXT_GUARDRAIL not in skip_components
+            or PipelineComponent.VIDEO_GUARDRAIL not in skip_components
         ):
             if self.model_config.extra_attrs.get("guardrail_checkpoint_dir", None) is not None:
                 logger.info(
@@ -100,8 +115,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 guardrail_ckpt_dir = self.model_config.extra_attrs["guardrail_checkpoint_dir"]
             else:
                 guardrail_ckpt_dir = download_guardrail_checkpoint()
-            self.text_guardrail = build_text_guardrail(guardrail_ckpt_dir)
-            self.video_guardrail = build_video_guardrail(guardrail_ckpt_dir)
+            if PipelineComponent.TEXT_GUARDRAIL not in skip_components:
+                self.text_guardrail = build_text_guardrail(guardrail_ckpt_dir)
+            if PipelineComponent.VIDEO_GUARDRAIL not in skip_components:
+                self.video_guardrail = build_video_guardrail(guardrail_ckpt_dir)
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
@@ -218,7 +235,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             add_generation_prompt=True,
             return_dict=False,
         )
-        token_ids = token_ids[:max_sequence_length]
+        reserved_tokens = 2
+        if max_sequence_length < reserved_tokens:
+            raise ValueError(
+                f"max_sequence_length must be at least {reserved_tokens}, got {max_sequence_length}"
+            )
+        token_ids = token_ids[: max_sequence_length - reserved_tokens]
         token_ids.append(self.tokenizer.eos_token_id)  # 151645
         token_ids.append(self.tokenizer.convert_tokens_to_ids("<|vision_start|>"))  # 151652
         seq_len = len(token_ids)
@@ -436,13 +458,22 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 f"use a single image with multiple prompts instead."
             )
 
-        if self.rank == 0 and use_guardrails:
+        # Text guardrail
+        text_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
+        if self.rank == 0 and use_guardrails and self.text_guardrail is not None:
             for p in prompt:
                 is_safe, msg = self.text_guardrail(p)
                 if not is_safe:
                     logger.warning(f"Text guardrail blocked prompt: {msg}")
-                    timer.mark_end()
-                    return timer.fill(PipelineOutput())
+                    text_blocked.fill_(1)
+                    break
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(text_blocked, src=0)
+
+        if text_blocked.item():
+            timer.mark_end()
+            return timer.fill(PipelineOutput())
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -568,16 +599,24 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         video = self.decode_latents(latents, self._decode_latents)
 
+        # Video guardrail
+        video_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
         if self.rank == 0:
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-            if use_guardrails:
+            if use_guardrails and self.video_guardrail is not None:
                 video = check_video_safety(video, self.video_guardrail)
                 if video is None:
                     logger.warning("Video guardrail blocked video generation")
-                    timer.mark_end()
-                    return timer.fill(PipelineOutput())
+                    video_blocked.fill_(1)
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(video_blocked, src=0)
+
+        if video_blocked.item():
+            timer.mark_end()
+            return timer.fill(PipelineOutput())
 
         timer.mark_end()
         return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))

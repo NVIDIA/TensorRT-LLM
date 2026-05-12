@@ -12,10 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-model default generation parameters for Wan pipelines.
+"""Per-model default generation parameters for Cosmos3 pipelines.
 
-Deduction cascade: model version (2.1/2.2) → model size → model name.
-Shared by WanPipeline (T2V) and WanImageToVideoPipeline (I2V).
+Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 """
 
 from typing import Dict

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from typing import Tuple
 
@@ -82,7 +97,7 @@ def compute_mrope_position_ids_vision(
     Returns:
         (position_ids [3, grid_t * grid_h * grid_w], next_temporal_offset)
     """
-    if enable_fps_modulation:
+    if enable_fps_modulation and fps is not None:
         tps = fps / temporal_compression_factor
         base_tps = base_fps / temporal_compression_factor
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
@@ -659,10 +674,8 @@ class Cosmos3VFMTransformer(nn.Module):
                 f"Cosmos3 does not support tensor parallelism. Got tp_size={vgm.tp_size}"
             )
 
-        if (
-            use_ulysses
-            and self.num_attention_heads % ulysses_size != 0
-            and self.num_kv_heads % ulysses_size != 0
+        if use_ulysses and (
+            self.num_attention_heads % ulysses_size != 0 or self.num_kv_heads % ulysses_size != 0
         ):
             raise ValueError(
                 f"num_attention_heads ({self.num_attention_heads}) and "

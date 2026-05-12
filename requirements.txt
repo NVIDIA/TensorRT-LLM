@@ -91,4 +91,4 @@ smg-grpc-proto>=0.4.2
 cache-dit>=1.3.5
 nltk==3.9.4
 better_profanity==0.7.0
-retinaface @ git+https://github.com/NVShreyas/retinaface.git@main
+retinaface @ git+https://github.com/NVShreyas/retinaface.git@1bb2e4589b5f1cf4e1d01a56b7b0a7259ac563de
