@@ -294,7 +294,6 @@ def parse_args():
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
     )
-
     return parser.parse_args()
 
 
@@ -338,10 +337,12 @@ def _build_diffusion_args(args) -> VisualGenArgs:
     else:
         cache_kwargs = {}
 
+    attention_cfg: dict = {"backend": args.attention_backend}
+
     kwargs = dict(
         text_encoder_path=args.text_encoder_path,
         **cache_kwargs,
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
