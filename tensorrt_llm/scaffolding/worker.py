@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import copy
 import json
@@ -5,7 +8,7 @@ import os
 import types
 from abc import ABC
 from enum import Enum
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlencode
 
 import httpx
@@ -95,6 +98,7 @@ class OpenaiWorker(Worker):
         async_client: openai.AsyncOpenAI,
         model: str,
         kv_cache_hint_enabled: bool = False,
+        extra_body: Optional[Dict[str, Any]] = None,
     ):
         # Dynamic patch to support KV cache hint
         async def send_kv_cache_hint(self, task: DropKVCacheTask, params: dict):
@@ -135,11 +139,13 @@ class OpenaiWorker(Worker):
         self.model = model
         self.async_client = async_client
         self.kv_cache_hint_enabled = kv_cache_hint_enabled
+        self.extra_body = copy.deepcopy(
+            extra_body) if extra_body is not None else {}
 
     def convert_task_params(self, task: GenerationTask | ChatTask):
         params = {
             "model": self.model,
-            "extra_body": {},
+            "extra_body": copy.deepcopy(self.extra_body),
         }
 
         if hasattr(task, "sub_request_markers") and os.environ.get(
@@ -204,6 +210,21 @@ class OpenaiWorker(Worker):
             if key not in ("messages", "tools", "prompt")
         }
 
+    @staticmethod
+    def _get_response_field(obj: Any, field: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(field)
+        return getattr(obj, field, None)
+
+    @classmethod
+    def _reasoning_content_from_thinking_blocks(cls,
+                                                message: Any) -> Optional[str]:
+        thinking_blocks = cls._get_response_field(message, "thinking_blocks")
+        if not thinking_blocks:
+            return None
+        thinking = cls._get_response_field(thinking_blocks[0], "thinking")
+        return thinking if isinstance(thinking, str) else None
+
     def fill_generation_task_with_response(self, task: GenerationTask,
                                            response: openai.Completion):
         task.output_str = response.choices[0].text
@@ -239,21 +260,30 @@ class OpenaiWorker(Worker):
             response = await self.async_client.chat.completions.create(**params)
             finish_reason = response.choices[0].finish_reason
             task.finish_reason = finish_reason
-            content = response.choices[0].message.content
-            reasoning = getattr(response.choices[0].message, 'reasoning', None)
-            reasoning_content = getattr(response.choices[0].message,
-                                        'reasoning_content', None)
-            tool_calls = response.choices[0].message.tool_calls
+            message = response.choices[0].message
+            content = self._get_response_field(message, "content")
+            reasoning = self._get_response_field(message, "reasoning")
+            reasoning_content = self._get_response_field(
+                message, "reasoning_content")
+            if reasoning_content is None:
+                reasoning_content = self._reasoning_content_from_thinking_blocks(
+                    message)
+            tool_calls = self._get_response_field(message, "tool_calls")
             task.messages.append(
                 AssistantMessage(content, reasoning, reasoning_content,
                                  tool_calls, finish_reason))
             if task.enable_token_counting:
-                task.prompt_tokens_num = response.usage.prompt_tokens
-                task.completion_tokens_num = response.usage.completion_tokens
-                if hasattr(
-                        response.usage, "completion_tokens_details"
-                ) and response.usage.completion_tokens_details is not None:
-                    task.reasoning_tokens_num = response.usage.completion_tokens_details.reasoning_tokens
+                usage = self._get_response_field(response, "usage")
+                if usage is not None:
+                    task.prompt_tokens_num = self._get_response_field(
+                        usage, "prompt_tokens") or 0
+                    task.completion_tokens_num = self._get_response_field(
+                        usage, "completion_tokens") or 0
+                    details = self._get_response_field(
+                        usage, "completion_tokens_details")
+                    if details is not None:
+                        task.reasoning_tokens_num = self._get_response_field(
+                            details, "reasoning_tokens") or 0
 
             return TaskStatus.SUCCESS
 

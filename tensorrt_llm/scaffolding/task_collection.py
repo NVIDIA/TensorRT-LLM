@@ -982,8 +982,12 @@ class ExecutionTracer(TaskCollection):
             fr = getattr(message, "finish_reason", None)
             if fr is not None:
                 ev.finish_reason = fr
-        if role == "system" and message_index == 0 and llm_request_tools:
-            ev.llm_request_tools = llm_request_tools
+        if role == "system":
+            spid = getattr(content, "system_prompt_id", None)
+            if spid is not None:
+                ev.system_prompt_id = spid
+            if message_index == 0 and llm_request_tools:
+                ev.llm_request_tools = llm_request_tools
         if role == "tool":
             ts = getattr(message, "trace_stdout", None)
             te = getattr(message, "trace_stderr", None)

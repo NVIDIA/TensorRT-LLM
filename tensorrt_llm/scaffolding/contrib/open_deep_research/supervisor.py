@@ -131,20 +131,30 @@ class Supervisor(Controller):
                 break
 
             research_tasks_list = []
+            should_complete = False
 
+            # Every tool_use in the assistant message MUST get a matching
+            # tool_result in the next message — Bedrock / Anthropic enforce
+            # 1:1 pairing. So process every tool_call here; don't ``break``
+            # out of the loop early on ``complete_research`` (that used to
+            # orphan any tool_calls that came after it in the same message).
             for tool_call in research_planning_task.messages[-1].tool_calls:
                 tool_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
 
                 if tool_name == "think_tool":
                     research_planning_task.add_message(
                         ToolMessage(
-                            f"Reflection recorded: {arguments['think']}", tool_call_id=tool_call.id
+                            f"Reflection recorded: {arguments.get('think', '')}",
+                            tool_call_id=tool_call.id,
                         )
                     )
                 elif tool_name == "conduct_research":
                     research_task = ResearchTask.from_topic(
-                        arguments["research_topic"], tool_call.id
+                        arguments.get("research_topic", ""), tool_call.id
                     )
                     research_tasks_list.append([research_task])
 
@@ -152,7 +162,14 @@ class Supervisor(Controller):
                     research_planning_task.add_message(
                         ToolMessage("Research completed.", tool_call_id=tool_call.id)
                     )
-                    break
+                    should_complete = True
+                else:
+                    research_planning_task.add_message(
+                        ToolMessage(
+                            f"[supervisor] unsupported tool: {tool_name}",
+                            tool_call_id=tool_call.id,
+                        )
+                    )
 
             if len(research_tasks_list) > 0:
                 researcher_controllers = [
@@ -164,14 +181,22 @@ class Supervisor(Controller):
                 yield ParallelProcess(researcher_controllers, research_tasks_list, kwargs_list)
 
                 for research_tasks in research_tasks_list:
+                    findings = research_tasks[0].research_findings
+                    if findings is None:
+                        # Researcher / Compressor failed (e.g., upstream
+                        # exception left ``chat_task.output_str`` unset).
+                        # Emit a non-None placeholder so the ToolMessage
+                        # isn't silently dropped by messages_to_dict_content
+                        # and the corresponding tool_use stays paired.
+                        findings = "[researcher] no findings produced"
                     research_planning_task.add_message(
-                        ToolMessage(
-                            research_tasks[0].research_findings, research_tasks[0].tool_call_id
-                        )
+                        ToolMessage(findings, research_tasks[0].tool_call_id)
                     )
                     topic = research_tasks[0].research_topic
-                    findings = research_tasks[0].research_findings
                     research_findings[topic] = findings
+
+            if should_complete:
+                break
 
         # Generate final report based on interactions with the user and the research findings
         # gathered by the researchers.

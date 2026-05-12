@@ -35,6 +35,14 @@ from tensorrt_llm.scaffolding.task_collection import (
 )
 from tensorrt_llm.scaffolding.worker import Worker
 
+from .prompts import (
+    EVALUATION_INPUT_PROMPT,
+    EVALUATION_SYSTEM_PROMPT,
+    EXPANSION_INPUT_PROMPT,
+    EXPANSION_SYSTEM_PROMPT,
+    FINAL_INPUT_PROMPT,
+    FINAL_SYSTEM_PROMPT,
+)
 from .tools import TOT_RESEARCH_TOOLS
 
 
@@ -46,6 +54,7 @@ class _TOTBranch:
     branch_path: tuple[int, ...] = field(default_factory=tuple)
     tool_name: str | None = None
     tool_args: dict[str, Any] = field(default_factory=dict)
+    tool_call_id: str = ""
     observation: str = ""
     score: float = 0.0
     evaluation: str = ""
@@ -172,15 +181,7 @@ class TOTResearchController(Controller):
                 break
 
             eval_tasks = [
-                ChatTask.create_from_messages(
-                    [
-                        SystemMessage(
-                            "You score tree-of-thought research branches. "
-                            "Return a numeric score and a short rationale."
-                        ),
-                        UserMessage(self._evaluation_prompt(question, branch)),
-                    ]
-                )
+                ChatTask.create_from_messages(self._evaluation_messages(question, branch))
                 for branch in candidates
             ]
             yield ParallelProcess(
@@ -209,16 +210,7 @@ class TOTResearchController(Controller):
 
         final_candidates = frontier + completed_branches
         best_branch = max(final_candidates, key=lambda item: (item.score, len(item.path())))
-        final_task = ChatTask.create_from_messages(
-            [
-                SystemMessage(
-                    "You write final answers from a selected tree-of-thought "
-                    "research trajectory. Use observations as evidence and do "
-                    "not invent tool results."
-                ),
-                UserMessage(self._final_prompt(question, best_branch)),
-            ]
-        )
+        final_task = ChatTask.create_from_messages(self._final_messages(question, best_branch))
         yield ParallelProcess.from_generators(
             [self.generation_controller.process([final_task])],
             branch_paths=[best_branch.branch_path],
@@ -237,14 +229,7 @@ class TOTResearchController(Controller):
         for branch in frontier:
             for branch_index in range(max(1, self.num_thoughts_per_step)):
                 task = ChatTask.create_from_messages(
-                    [
-                        SystemMessage(
-                            "You are a tree-of-thought research agent. Produce "
-                            "one concise branch thought in the message content, "
-                            "then call exactly one native tool from the provided list."
-                        ),
-                        UserMessage(self._expansion_prompt(question, branch, depth)),
-                    ],
+                    self._expansion_messages(question, branch, depth),
                     tools=self.tools,
                 )
                 expansion_tasks.append((task, branch, branch.branch_path + (branch_index,)))
@@ -276,6 +261,7 @@ class TOTResearchController(Controller):
                 branch_path=branch_path,
                 tool_name="reflection",
                 tool_args={"reflection": content},
+                tool_call_id=self._branch_tool_call_id(branch_path),
             )
 
         tool_call = tool_calls[0]
@@ -288,6 +274,7 @@ class TOTResearchController(Controller):
             branch_path=branch_path,
             tool_name=tool_name,
             tool_args=tool_args,
+            tool_call_id=tool_call.id or self._branch_tool_call_id(branch_path),
         )
 
     def _run_tool(self, branch: _TOTBranch, question: str):
@@ -338,7 +325,7 @@ class TOTResearchController(Controller):
             return
 
         mcp_task = MCPCallTask.create_mcptask(
-            tool_call_id=f"tot_{id(branch)}",
+            tool_call_id=branch.tool_call_id or self._branch_tool_call_id(branch.branch_path),
             tool_name=tool_name or "",
             args=_json_dumps(tool_args),
             worker_tag=self.WorkerTag.TOOL_CALL,
@@ -350,58 +337,45 @@ class TOTResearchController(Controller):
         if mcp_task.result_stderr:
             branch.observation += f"\nstderr:\n{mcp_task.result_stderr}"
 
-    def _expansion_prompt(self, question: str, branch: _TOTBranch, depth: int) -> str:
-        return f"""Question:
-{question}
+    def _expansion_messages(self, question: str, branch: _TOTBranch, depth: int):
+        messages = [
+            SystemMessage(EXPANSION_SYSTEM_PROMPT),
+            UserMessage(
+                EXPANSION_INPUT_PROMPT.format(
+                    question=question,
+                    trajectory=self._render_path(branch),
+                    depth=depth + 1,
+                    max_depth=self.max_depth,
+                )
+            ),
+        ]
+        return messages
 
-Current selected trajectory:
-{self._render_path(branch)}
+    def _evaluation_messages(self, question: str, branch: _TOTBranch):
+        return [
+            SystemMessage(EVALUATION_SYSTEM_PROMPT),
+            UserMessage(
+                EVALUATION_INPUT_PROMPT.format(
+                    question=question,
+                    thought=branch.thought,
+                    tool_name=branch.tool_name,
+                    tool_args=_json_dumps(branch.tool_args),
+                    observation=branch.observation,
+                )
+            ),
+        ]
 
-Depth: {depth + 1} of {self.max_depth}
-
-Create one distinct next branch. Choose exactly one available native tool:
-- tavily_search for web search.
-- fetch_webpage for reading known URLs.
-- python_interpreter for computation or parsing. It has only a basic Python
-  environment by default; before importing a non-basic package, first call
-  python_interpreter with code like:
-  import subprocess, sys; subprocess.check_call([sys.executable, "-m", "pip",
-  "install", "<package>"])
-- reflection for planning when no external action is needed.
-- complete_task only when this trajectory is ready to provide the final answer.
-
-The content should be only the branch thought. The tool call must be in the
-native tool_calls field, not written as JSON or markdown text."""
-
-    def _evaluation_prompt(self, question: str, branch: _TOTBranch) -> str:
-        return f"""Question:
-{question}
-
-Candidate branch:
-Thought: {branch.thought}
-Tool: {branch.tool_name}
-Tool arguments: {_json_dumps(branch.tool_args)}
-Observation:
-{branch.observation}
-
-Score this branch from 0 to 10 for progress toward a correct, evidence-backed
-answer. Consider relevance, source quality, usefulness of the observation, and
-whether this path reduces uncertainty.
-
-Return exactly:
-Score: <number from 0 to 10>
-Reason: <one or two sentences>"""
-
-    def _final_prompt(self, question: str, branch: _TOTBranch) -> str:
-        return f"""Question:
-{question}
-
-Selected tree-of-thought trajectory:
-{self._render_path(branch)}
-
-Write the final answer in the same language as the question. Be concise when
-the answer is simple, and include source-backed caveats when the observations
-are incomplete."""
+    def _final_messages(self, question: str, branch: _TOTBranch):
+        messages = [
+            SystemMessage(FINAL_SYSTEM_PROMPT),
+            UserMessage(
+                FINAL_INPUT_PROMPT.format(
+                    question=question,
+                    trajectory=self._render_path(branch),
+                )
+            ),
+        ]
+        return messages
 
     def _render_path(self, branch: _TOTBranch) -> str:
         rows: list[str] = []
@@ -409,18 +383,23 @@ are incomplete."""
             if i == 0:
                 rows.append(node.state)
                 continue
-            rows.append(
-                "\n".join(
-                    [
-                        f"Step {i}: {node.thought}",
-                        f"Tool: {node.tool_name}({_json_dumps(node.tool_args)})",
-                        f"Observation: {node.observation}",
-                        f"Score: {node.score}",
-                        f"Complete: {node.is_complete}",
-                    ]
-                )
+            node_rows = [
+                f"Step {i}: {node.thought}",
+                f"Tool: {node.tool_name}({_json_dumps(node.tool_args)})",
+            ]
+            node_rows.append(f"Observation: {node.observation}")
+            node_rows.extend(
+                [
+                    f"Score: {node.score}",
+                    f"Complete: {node.is_complete}",
+                ]
             )
+            rows.append("\n".join(node_rows))
         return "\n\n".join(rows)
+
+    def _branch_tool_call_id(self, branch_path: tuple[int, ...]) -> str:
+        path = "_".join(str(item) for item in branch_path) or "root"
+        return f"tot_{path}"
 
     def _render_branch_state(self, parent_state: str, branch: _TOTBranch) -> str:
         return "\n\n".join(

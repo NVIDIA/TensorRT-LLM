@@ -74,12 +74,16 @@ class QueueExecutor:
         queue: asyncio.Queue,
         trace_id: str,
         worker: Worker,
-        system_token_cache: Dict[int, List[int]],
+        system_token_cache: Dict[str, List[int]],
         generation_stats: Optional[ReplayGenerationStats] = None,
     ):
         self.queue = queue
         self.trace_id = trace_id
         self.worker = worker
+        # Shared across QueueExecutors. Keyed by ``event.system_prompt_id`` for
+        # tagged templates so multiple conversations using the same template
+        # share a token-id prefix (simulating a real prefix-cache hit). Falls
+        # back to ``f"conv:{conv_id}"`` for legacy / untagged system prompts.
         self._system_token_cache = system_token_cache
         self._generation_stats = generation_stats
         self._conversation_token_ids: Dict[int, List[List[int]]] = defaultdict(list)
@@ -90,16 +94,24 @@ class QueueExecutor:
         # Always set done_event so :meth:`QueueManager.wait_all_done` cannot
         # deadlock if ``_handle_message`` / ``worker.run_task`` raises (otherwise
         # the sentinel path that sets the event is never reached).
+        #
+        # Every dequeued event — including the ``None`` sentinel — must call
+        # ``task_done`` so that :meth:`asyncio.Queue.join` (used by
+        # :meth:`QueueManager.drain_branch` at parallel_start) accurately
+        # reflects "queue currently drained".
         try:
             while True:
                 event = await self.queue.get()
-                if event is None:  # sentinel
-                    return
-                if event.event_type == "tool_call":
-                    await self._handle_tool_call(event)
-                elif event.event_type == "message":
-                    await self._handle_message(event)
-                # drop_kv_cache and others: no-op
+                try:
+                    if event is None:  # sentinel
+                        return
+                    if event.event_type == "tool_call":
+                        await self._handle_tool_call(event)
+                    elif event.event_type == "message":
+                        await self._handle_message(event)
+                    # drop_kv_cache and others: no-op
+                finally:
+                    self.queue.task_done()
         finally:
             self.done_event.set()
 
@@ -121,11 +133,25 @@ class QueueExecutor:
         message_index = event.message_index
 
         if role == "system":
-            if conv_id in self._system_token_cache:
-                token_ids = self._system_token_cache[conv_id]
-            else:
-                token_ids = _generate_random_token_ids(event.tokens or 0)
-                self._system_token_cache[conv_id] = token_ids
+            token_count = event.tokens or 0
+            # Prefer the template-level identity so that different conversations
+            # rendering the same system-prompt template share a token-id prefix.
+            # Untagged events (legacy traces) fall back to the original
+            # per-conversation key, preserving prior behavior.
+            cache_key = event.system_prompt_id or f"conv:{conv_id}"
+            cached = self._system_token_cache.get(cache_key)
+            if cached is None:
+                cached = _generate_random_token_ids(token_count)
+                self._system_token_cache[cache_key] = cached
+            elif len(cached) < token_count:
+                # Same template, longer rendered system message: grow the
+                # cached prefix in place. Subsequent shorter requests will
+                # still slice a prefix that overlaps with this longer one.
+                cached.extend(_generate_random_token_ids(token_count - len(cached)))
+            # Always hand out a fresh slice. The cache list may be extended
+            # later by a longer request; prior segments stored in
+            # ``_conversation_token_ids`` must remain stable.
+            token_ids = cached[:token_count]
             self._store_segment(conv_id, message_index, token_ids)
 
         elif role in ("user", "tool"):
@@ -182,7 +208,7 @@ class QueueManager:
     def __init__(
         self,
         worker: Worker,
-        system_token_cache: Dict[int, List[int]],
+        system_token_cache: Dict[str, List[int]],
         generation_stats: Optional[ReplayGenerationStats] = None,
     ):
         self._worker = worker
@@ -222,6 +248,20 @@ class QueueManager:
         """Send sentinel ``None`` to the queue to signal completion."""
         self._queues[queue_id].put_nowait(None)
 
+    async def drain_branch(self, branch_path: Tuple[int, ...]):
+        """Block until the executor for *branch_path* has processed every event currently queued.
+
+        Used as a synchronization barrier at ``parallel_start``: in a real
+        agent run, the controller cannot dispatch child sub-tasks until the
+        parent's pre-fork assistant generation (typically the one that
+        produced the fork tool_call) has fully completed. Without this,
+        replay would push child events into freshly-allocated child queues
+        while the parent's last ``worker.run_task`` was still in flight,
+        inflating server-side concurrency above the true agent topology.
+        """
+        queue_id = self._branch_to_queue[branch_path]
+        await self._queues[queue_id].join()
+
     async def wait_all_done(self, queue_ids: List[str]):
         """Await ``done_event`` for each executor in *queue_ids*."""
         await asyncio.gather(*(self._executors[qid].done_event.wait() for qid in queue_ids))
@@ -259,7 +299,7 @@ class ReplayEngine:
         worker: Worker,
         generation_stats: Optional[ReplayGenerationStats] = None,
     ):
-        self._system_token_cache: Dict[int, List[int]] = {}
+        self._system_token_cache: Dict[str, List[int]] = {}
         self.queue_manager = QueueManager(
             worker=worker,
             system_token_cache=self._system_token_cache,
@@ -287,8 +327,16 @@ class ReplayEngine:
 
         for event in trace.events:
             if event.event_type == "parallel_start":
-                num_branches = event.num_branches or 0
                 parent_path = tuple(event.branch_path or ())
+                # Barrier: wait for the parent branch to finish processing
+                # every event queued before this parallel_start. In a real
+                # agent run, child sub-tasks can only be dispatched after
+                # the parent's fork-producing generation has completed, so
+                # children must not start hitting the server while the
+                # parent's last ``worker.run_task`` is still in flight.
+                await self.queue_manager.drain_branch(parent_path)
+
+                num_branches = event.num_branches or 0
                 child_queue_ids = []
                 for i in range(num_branches):
                     child_qid = self.queue_manager.allocate_queue(trace_id)

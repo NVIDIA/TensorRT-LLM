@@ -29,8 +29,10 @@ from tensorrt_llm.scaffolding.worker import Worker
 from .prompts import (
     INITIAL_INPUT_PROMPT,
     INITIAL_SYSTEM_PROMPT,
-    INSTRUCTION_PROMPT,
-    LAST_INSTRUCTION_PROMPT,
+    INSTRUCTION_INPUT_PROMPT,
+    INSTRUCTION_SYSTEM_PROMPT,
+    LAST_INSTRUCTION_INPUT_PROMPT,
+    LAST_INSTRUCTION_SYSTEM_PROMPT,
     OBSERVATION_PROMPT,
 )
 from .utils import (
@@ -109,17 +111,6 @@ class IterResearchController(Controller):
             max_format_retries=self.max_format_retries,
             max_observation_length=self.max_observation_length,
         )
-
-    def _generate_llm(self, prompt_text: str):
-        """Single-user-message ChatTask through generation_controller."""
-        chat_task = ChatTask.create_from_messages(
-            [
-                UserMessage(prompt_text),
-            ],
-            tools=TOOLS,
-        )
-        yield from self.generation_controller.process([chat_task])
-        return chat_task
 
     def process(self, tasks: List[Task], **kwargs):  # noqa: C901
         assert len(tasks) >= 1, "IterResearchController requires at least one task"
@@ -233,22 +224,32 @@ class IterResearchController(Controller):
             observation = truncate_text(observation, self.max_observation_length)
 
             is_last = turn == self.max_turn - 2
-            prompt_template = LAST_INSTRUCTION_PROMPT if is_last else INSTRUCTION_PROMPT
-            formatted_observation = OBSERVATION_PROMPT.format(tool_response=observation)
+            if is_last:
+                system_prompt_template = LAST_INSTRUCTION_SYSTEM_PROMPT
+                user_prompt_template = LAST_INSTRUCTION_INPUT_PROMPT
+            else:
+                system_prompt_template = INSTRUCTION_SYSTEM_PROMPT
+                user_prompt_template = INSTRUCTION_INPUT_PROMPT
 
-            new_prompt = prompt_template.format(
-                question=question,
-                report=report,
-                action=tool_call_str,
-                observation=formatted_observation,
-                tools=tool_str,
-                date_to_use=date,
-            )
+            prompt_kwargs = {
+                "question": question,
+                "report": report,
+                "action": tool_call_str,
+                "observation": OBSERVATION_PROMPT.format(tool_response=observation),
+                "tools": tool_str,
+                "date_to_use": date,
+            }
+
+            system_prompt = system_prompt_template.format(**prompt_kwargs)
+            user_prompt = user_prompt_template.format(**prompt_kwargs)
+
+            new_messages = [
+                SystemMessage(system_prompt),
+                UserMessage(user_prompt),
+            ]
 
             chat_task = ChatTask.create_from_messages(
-                [
-                    UserMessage(new_prompt),
-                ],
+                new_messages,
                 tools=None if is_last else TOOLS,
             )
 

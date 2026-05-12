@@ -18,16 +18,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
+from tensorrt_llm.scaffolding import system_prompt
 from tensorrt_llm.scaffolding.controller import Controller
-from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, Task, UserMessage
+from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, SystemMessage, Task, UserMessage
 
-_TAVILY_COMPRESS_PROMPT = """Compress this Tavily search output for a downstream research agent.
-
-## User Goal
-{goal}
-
-## Tavily Search Output
-{search_output}
+_TAVILY_COMPRESS_SYSTEM_PROMPT = system_prompt(
+    """You compress Tavily search output for a downstream research agent.
 
 ## Requirements
 - Keep the original answer structure and result ordering.
@@ -35,6 +31,15 @@ _TAVILY_COMPRESS_PROMPT = """Compress this Tavily search output for a downstream
 - Keep core facts, numbers, names, claims, and evidence relevant to the user goal.
 - Remove secondary, repeated, boilerplate, or low-value details.
 - Do not add facts that are not in the Tavily output.
+""",
+    name="tavily_search.tavily_compress_system_prompt",
+)
+
+_TAVILY_COMPRESS_USER_PROMPT = """## User Goal
+{goal}
+
+## Tavily Search Output
+{search_output}
 """
 
 _DEFAULT_COMPRESS_THRESHOLD_CHARS = 6000
@@ -131,11 +136,16 @@ class TavilyController(Controller):
 
         LOGGER.warning("[tavily] compressing search output: raw_chars=%d", len(raw_result))
         bounded_result = _truncate_with_notice(raw_result, self.max_input_chars, "Tavily output")
-        prompt = _TAVILY_COMPRESS_PROMPT.format(
+        user_prompt = _TAVILY_COMPRESS_USER_PROMPT.format(
             goal=tavily_task.goal or "Extract relevant information for the research task.",
             search_output=bounded_result,
         )
-        chat_task = ChatTask.create_from_messages([UserMessage(prompt)])
+        chat_task = ChatTask.create_from_messages(
+            [
+                SystemMessage(content=_TAVILY_COMPRESS_SYSTEM_PROMPT),
+                UserMessage(user_prompt),
+            ]
+        )
         chat_task.max_tokens = self.max_output_tokens
         chat_task.temperature = 0.0
 

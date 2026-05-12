@@ -1,6 +1,9 @@
 # ruff: noqa: E501
 
-CODER_SYSTEM_PROMPT = """You are GPT-5.2 running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.
+from tensorrt_llm.scaffolding import system_prompt
+
+CODER_SYSTEM_PROMPT = system_prompt(
+    """You are GPT-5.2 running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.
 
 Your capabilities:
 
@@ -275,10 +278,13 @@ To create a new plan, call `update_plan` with a short list of 1‑sentence steps
 When steps have been completed, use `update_plan` to mark each finished step as `completed` and the next step you are working on as `in_progress`. There should always be exactly one `in_progress` step until everything is done. You can mark multiple items as complete in a single `update_plan` call.
 
 If all steps are complete, ensure you call `update_plan` to mark all steps as `completed`.
-"""
+""",
+    name="coder.coder_system_prompt",
+)
 
 
-SWEBENCH_SYSTEM_PROMPT = """\
+SWEBENCH_SYSTEM_PROMPT = system_prompt(
+    """\
 You are an expert software engineer interacting with a computer shell to solve programming tasks.
 
 You have access to the following tools:
@@ -339,4 +345,6 @@ The patch must contain ONLY changes to source files you modified to fix the issu
 - Use ``update_plan`` to track your progress through the workflow.
 - Each response MUST include at least one tool call.
 - After submitting via ``complete_task``, you cannot continue working.
-"""
+""",
+    name="coder.swebench_system_prompt",
+)

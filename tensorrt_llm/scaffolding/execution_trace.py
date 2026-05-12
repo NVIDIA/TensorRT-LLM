@@ -115,6 +115,12 @@ class TraceEvent:
     # -- message content (for system/user messages, used by tokenize_trace_scope) --
     content: Optional[str] = None
 
+    # -- system prompt template identity (filled when role == "system" and the
+    # message content was wrapped with `system_prompt()`). Stable UUIDv5
+    # derived from the prompt's registered name; emitted in both compact and
+    # full traces so replay/analytics can identify reused templates.
+    system_prompt_id: Optional[str] = None
+
     # -- tokenization annotation (filled by tokenize_trace_scope) --
     # tokens_source is "tokenize_endpoint" for direct counts.
     tokens: Optional[int] = None

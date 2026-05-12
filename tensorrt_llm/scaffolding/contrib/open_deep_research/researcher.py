@@ -225,9 +225,18 @@ class ResearchChatWithMCPController(ChatWithMCPController):
                             )
 
                 for i, tool_call in enumerate(tool_calls):
-                    if i not in tool_results:
-                        continue
-                    body, out, err = tool_results[i]
+                    if i in tool_results:
+                        body, out, err = tool_results[i]
+                    else:
+                        # The MCP / visit / tavily controller failed to write
+                        # ``result_str`` (e.g., upstream 504, connection reset,
+                        # JSON parse error). Bedrock / Anthropic require every
+                        # tool_use_id in the prior assistant message to have a
+                        # matching tool_result in the immediately following
+                        # message; emit a placeholder so the request payload
+                        # stays valid and the loop can keep making progress.
+                        body = f"[{tool_call.function.name}] tool produced no result"
+                        out, err = None, None
                     chat_task.add_message(
                         ToolMessage(body, tool_call.id, trace_stdout=out, trace_stderr=err)
                     )

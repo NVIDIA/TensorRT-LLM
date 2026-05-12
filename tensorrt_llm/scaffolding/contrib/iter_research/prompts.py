@@ -1,6 +1,9 @@
 # ruff: noqa: E501
 
-INITIAL_SYSTEM_PROMPT = """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
+from tensorrt_llm.scaffolding import system_prompt
+
+INITIAL_SYSTEM_PROMPT = system_prompt(
+    """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
 
 ## CRITICAL OUTPUT FORMAT REQUIREMENTS
 You MUST follow this exact format. Every response must contain:
@@ -48,7 +51,9 @@ Do not include <tool_call> tags, JSON tool-call text, function-call markdown, or
 - The message content must start with a <report></report> section.
 - The message must also include exactly one native tool call in the structured tool_calls field.
 - Never write the tool call in the text body.
-"""
+""",
+    name="iter_research.initial_system_prompt",
+)
 
 INITIAL_INPUT_PROMPT = """## Input
 - Current Date: {date_to_use}
@@ -59,7 +64,8 @@ INITIAL_INPUT_PROMPT = """## Input
 Now please begin your deep analytical work. The language of your output must be consistent with the language of the question. If the question is in Chinese, output in Chinese; if the question is in English, output in English.
 """
 
-INSTRUCTION_PROMPT = """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
+INSTRUCTION_SYSTEM_PROMPT = system_prompt(
+    """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
 
 ## CRITICAL OUTPUT FORMAT REQUIREMENTS
 You MUST follow this exact format. Every response must contain:
@@ -72,14 +78,14 @@ You MUST follow this exact format. Every response must contain:
 - **Question**: The problem posed by the user that needs to be solved
 - **Last Status Report and Deep Analysis**: A summary overview of current work progress
 - **Last Native Tool Call**: The specific structured action taken in the previous round, shown as controller-rendered JSON for context only
-- **Last Observation**: The results and feedback obtained after the previous action
+- **Last Tool Message**: The results and feedback obtained after the previous action, provided as a separate tool-role message
 
 ## Output Format
 
 <report>
 ### Status Report and Deep Analysis
 **Progress Achieved:**
-[Based on the Last Status Report and Deep Analysis and Last Tool Response provided in the input, compile a comprehensive and complete documentation of all currently collected information, conclusions, data, and findings. This section must capture ALL important information without any omissions, presented in plain text format with corresponding sources clearly annotated. You must directly record the actual information content rather than using referential markers or summaries. This includes:
+[Based on the Last Status Report and Deep Analysis and the separate Last Tool Message provided in the input, compile a comprehensive and complete documentation of all currently collected information, conclusions, data, and findings. This section must capture ALL important information without any omissions, presented in plain text format with corresponding sources clearly annotated. You must directly record the actual information content rather than using referential markers or summaries. This includes:
 1. All factual data and evidence collected
 2. All analytical conclusions and insights derived
 3. All source materials and their verification status
@@ -97,7 +103,7 @@ You MUST output this section enclosed with <report></report> tags!
 Before choosing YES, apply this **Final Answer Gate**:
 1. **Coverage**: Every major dimension in the original question is covered by evidence or explicitly marked as unavailable.
 2. **Source quality**: Key claims are supported by reliable sources. Search snippets alone are not enough for precise statistics, medical guidance, legal/financial recommendations, academic claims, or named case studies.
-3. **Failure handling**: If the last observation contains "Failed to fetch", raw PDF/binary content, an unrelated page, or insufficient evidence, you should normally perform another search or Visit rather than answer.
+3. **Failure handling**: If the last tool message contains "Failed to fetch", raw PDF/binary content, an unrelated page, or insufficient evidence, you should normally perform another search or Visit rather than answer.
 4. **Minimum depth for research tasks**: For broad research/report/literature-review questions, do not answer after only one information-gathering call unless the question is narrow and the evidence already covers all requested dimensions.
 5. **Date consistency**: Do not use sources dated after the Current Date as factual evidence unless explicitly allowed by the user.
 6. **Uncertainty discipline**: If evidence is incomplete, say so and continue gathering information when tools remain available.
@@ -153,7 +159,11 @@ Do not include <tool_call> tags, JSON tool-call text, function-call markdown, or
 - Question: {question}
 - Available Tools Summary (the actual callable tool schemas are provided separately through the native tools field)
 {tools}
-- Last Status Report and Deep Analysis:
+""",
+    name="iter_research.instruction_system_prompt",
+)
+
+INSTRUCTION_INPUT_PROMPT = """- Last Status Report and Deep Analysis:
 <report>
 {report}
 </report>
@@ -169,7 +179,8 @@ Do not include <tool_call> tags, JSON tool-call text, function-call markdown, or
 Now please begin your deep analytical work. The language of your output must be consistent with the language of the question. If the question is in Chinese, output in Chinese; if the question is in English, output in English.
 """
 
-LAST_INSTRUCTION_PROMPT = """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
+LAST_INSTRUCTION_SYSTEM_PROMPT = system_prompt(
+    """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
 
 ## CRITICAL OUTPUT FORMAT REQUIREMENTS
 You MUST follow this exact format. Every response must contain:
@@ -181,14 +192,14 @@ You MUST follow this exact format. Every response must contain:
 - **Question**: The problem posed by the user that needs to be solved
 - **Last Status Report and Deep Analysis**: A summary overview of current work progress
 - **Last Native Tool Call**: The specific structured action taken in the previous round, shown as controller-rendered JSON for context only
-- **Last Observation**: The results and feedback obtained after the previous action
+- **Last Tool Message**: The results and feedback obtained after the previous action, provided as a separate tool-role message
 
 ## Output Format
 
 <report>
 ### Status Report and Deep Analysis
 **Progress Achieved:**
-[Based on the Last Status Report and Deep Analysis and Last Tool Response provided in the input, compile a comprehensive and complete documentation of all currently collected information, conclusions, data, and findings. This section must capture ALL important information without any omissions, presented in plain text format with corresponding sources clearly annotated. You must directly record the actual information content rather than using referential markers or summaries. This includes:
+[Based on the Last Status Report and Deep Analysis and the separate Last Tool Message provided in the input, compile a comprehensive and complete documentation of all currently collected information, conclusions, data, and findings. This section must capture ALL important information without any omissions, presented in plain text format with corresponding sources clearly annotated. You must directly record the actual information content rather than using referential markers or summaries. This includes:
 1. All factual data and evidence collected
 2. All analytical conclusions and insights derived
 3. All source materials and their verification status
@@ -236,7 +247,11 @@ You MUST output this section enclosed with <answer></answer> tags!
 ## Input
 - Current Date: {date_to_use}
 - Question: {question}
-- Last Status Report and Deep Analysis:
+""",
+    name="iter_research.last_instruction_system_prompt",
+)
+
+LAST_INSTRUCTION_INPUT_PROMPT = """- Last Status Report and Deep Analysis:
 <report>
 {report}
 </report>

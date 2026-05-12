@@ -19,20 +19,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
+from tensorrt_llm.scaffolding import system_prompt
 from tensorrt_llm.scaffolding.controller import Controller
-from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, Task, UserMessage
+from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, SystemMessage, Task, UserMessage
 
 _VISIT_MAX_PROMPT_CHARS = 15000
 _VISIT_PDF_MAX_PROMPT_CHARS = 10000
 _VISIT_PDF_MAX_LINES = 200
 _VISIT_MAX_RESULT_CHARS = 2000
-_VISIT_EXTRACTOR_PROMPT = """Please process the following webpage content and user goal to extract relevant information:
-
-## **Webpage Content**
-{webpage_content}
-
-## **User Goal**
-{goal}
+_VISIT_EXTRACTOR_SYSTEM_PROMPT = system_prompt(
+    """You process webpage content and a user goal to extract relevant information.
 
 ## **Task Guidelines**
 1. **Content Scanning for Rational**:
@@ -45,6 +41,15 @@ _VISIT_EXTRACTOR_PROMPT = """Please process the following webpage content and us
     prioritizing clarity and judge the contribution of the information to the goal.
 
 **Final Output Format using JSON format has "rational", "evidence", "summary" fields**
+""",
+    name="fetch_webpage.visit_extractor_system_prompt",
+)
+
+_VISIT_EXTRACTOR_USER_PROMPT = """## **Webpage Content**
+{webpage_content}
+
+## **User Goal**
+{goal}
 """
 
 LOGGER = logging.getLogger(__name__)
@@ -223,19 +228,20 @@ class VisitController(Controller):
             visit_task.result_str = "[visit] Failed to prepare webpage content for summarization."
             return
 
-        extractor_prompt = _VISIT_EXTRACTOR_PROMPT.format(
+        user_prompt = _VISIT_EXTRACTOR_USER_PROMPT.format(
             webpage_content=prepared_content,
             goal=visit_task.goal,
         )
         LOGGER.warning(
-            "[visit] extractor prompt: chars=%d goal_chars=%d prepared_chars=%d",
-            len(extractor_prompt),
+            "[visit] extractor prompt: user_chars=%d goal_chars=%d prepared_chars=%d",
+            len(user_prompt),
             len(visit_task.goal or ""),
             len(prepared_content),
         )
         chat_task = ChatTask.create_from_messages(
             [
-                UserMessage(extractor_prompt),
+                SystemMessage(content=_VISIT_EXTRACTOR_SYSTEM_PROMPT),
+                UserMessage(user_prompt),
             ]
         )
         yield from self.generation_controller.process([chat_task])

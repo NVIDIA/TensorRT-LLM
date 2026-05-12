@@ -1,6 +1,9 @@
 # ruff: noqa: E501
 
-GENERATE_RESEARCH_BRIEF_SYSTEM_PROMPT = """You will be given a set of messages that have been exchanged so far between yourself and the user.
+from tensorrt_llm.scaffolding import system_prompt
+
+GENERATE_RESEARCH_BRIEF_SYSTEM_PROMPT = system_prompt(
+    """You will be given a set of messages that have been exchanged so far between yourself and the user.
 Your job is to translate these messages into a more detailed and concrete research question that will be used to guide the research.
 
 Today's date is {date}.
@@ -28,7 +31,9 @@ Guidelines:
 - For academic or scientific queries, prefer linking directly to the original paper or official journal publication rather than survey papers or secondary summaries.
 - For people, try linking directly to their LinkedIn profile, or their personal website if they have one.
 - If the query is in a specific language, prioritize sources published in that language.
-"""
+""",
+    name="open_deep_research.generate_research_brief_system_prompt",
+)
 
 GENERATE_RESEARCH_BRIEF_USER_PROMPT = """The messages that have been exchanged so far between yourself and the user are:
 <Messages>
@@ -37,7 +42,8 @@ GENERATE_RESEARCH_BRIEF_USER_PROMPT = """The messages that have been exchanged s
 """
 
 
-SUPERVISOR_SYSTEM_PROMPT = """You are a research supervisor. Your job is to conduct research by calling the "conduct_research" tool. For context, today's date is {date}.
+SUPERVISOR_SYSTEM_PROMPT = system_prompt(
+    """You are a research supervisor. Your job is to conduct research by calling the "conduct_research" tool. For context, today's date is {date}.
 
 <Task>
 Your focus is to call the "conduct_research" tool to conduct research against the overall research question passed in by the user.
@@ -103,10 +109,13 @@ After each conduct_research tool call, use think_tool to analyze the results:
 - A separate agent will write the final report - you just need to gather information
 - When calling conduct_research, provide complete standalone instructions - sub-agents can't see other agents' work
 - Do NOT use acronyms or abbreviations in your research questions, be very clear and specific
-</Scaling Rules>"""
+</Scaling Rules>""",
+    name="open_deep_research.supervisor_system_prompt",
+)
 
 
-RESEARCHER_SYSTEM_PROMPT = """You are a research assistant conducting research on the user's input topic. For context, today's date is {date}.
+RESEARCHER_SYSTEM_PROMPT = system_prompt(
+    """You are a research assistant conducting research on the user's input topic. For context, today's date is {date}.
 
 <Task>
 Your job is to use tools to gather information about the user's input topic.
@@ -153,10 +162,13 @@ After each wave of tavily_search / fetch_webpage / python_interpreter calls, use
 - Do I have enough to answer the question comprehensively?
 - Should I gather more or stop?
 </Show Your Thinking>
-"""
+""",
+    name="open_deep_research.researcher_system_prompt",
+)
 
 
-COMPRESSOR_SYSTEM_PROMPT = """You are a research assistant that has conducted research on a topic by calling several tools and web searches. Your job is now to clean up the findings, but preserve all of the relevant statements and information that the researcher has gathered. For context, today's date is {date}.
+COMPRESSOR_SYSTEM_PROMPT = system_prompt(
+    """You are a research assistant that has conducted research on a topic by calling several tools and web searches. Your job is now to clean up the findings, but preserve all of the relevant statements and information that the researcher has gathered. For context, today's date is {date}.
 
 <Task>
 You need to clean up information gathered from tool calls and web searches in the existing messages.
@@ -192,7 +204,9 @@ The report should be structured like this:
 </Citation Rules>
 
 Critical Reminder: It is extremely important that any information that is even remotely relevant to the user's research topic is preserved verbatim (e.g. don't rewrite it, don't summarize it, don't paraphrase it).
-"""
+""",
+    name="open_deep_research.compressor_system_prompt",
+)
 
 
 FINAL_REPORT_GENERATION_PROMPT = """Based on all the research conducted, create a comprehensive, well-structured answer to the original research brief.

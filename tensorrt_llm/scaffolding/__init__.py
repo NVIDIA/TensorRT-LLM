@@ -22,6 +22,7 @@ from .task_collection import (ChatTokenCounter, DropKVCacheWorkerTag,
                               TokenizeWorkerTag, drop_kv_cache_scope,
                               sub_request_node, tokenize_trace_scope,
                               with_execution_tracing, with_task_collection)
+from .utils import system_prompt
 from .worker import (ApiaryMCPWorker, MCPWorker, OpenaiWorker, TRTLLMWorker,
                      TRTOpenaiWorker, Worker)
 
@@ -83,4 +84,5 @@ __all__ = [
     "QueueManager",
     "ReplayEngine",
     "ReplayGenerationStats",
+    "system_prompt",
 ]
