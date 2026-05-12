@@ -473,9 +473,12 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     # answer, compensating for lm-eval's MMMU regex which fails on common
     # reasoning-model output formats (see
     # tensorrt_llm.evaluate.post_processing for cross-engine evidence).
+    # preserve_caller_max_tokens=True keeps our 16384 max_tokens instead of
+    # being overridden by lm-eval task's default 512 (too small for CoT).
     EXTRA_EVALUATOR_KWARGS = dict(
         chat_template_kwargs={"thinking": True},
         post_process_fn=strip_thinking_and_extract_mmmu_answer,
+        preserve_caller_max_tokens=True,
     )
 
     @skip_pre_blackwell
