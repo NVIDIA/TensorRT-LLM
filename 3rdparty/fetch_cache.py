@@ -72,6 +72,16 @@ def _run_git(args, **kwargs):
     return subprocess.run(["git"] + args, **kwargs)
 
 
+def _iter_dir(path: str):
+    """Yield ``os.DirEntry`` for each child of *path*; empty on OSError."""
+    try:
+        it = os.scandir(path)
+    except OSError:
+        return
+    with it:
+        yield from it
+
+
 def _apply_safety_config(bare_dir: str) -> None:
     for key, val in SAFETY_CONFIG.items():
         _run_git(["config", key, val], cwd=bare_dir)
@@ -114,36 +124,21 @@ def _walk_src_lfs_objects(src_git: str):
     per-file in :func:`_ingest_lfs_object`.
     """
     lfs_root = os.path.join(src_git, "lfs", "objects")
-    try:
-        s1_it = os.scandir(lfs_root)
-    except OSError:
-        return
-    with s1_it:
-        for s1 in s1_it:
-            if not _HEX2_RE.match(s1.name) or not s1.is_dir(follow_symlinks=False):
+    for s1 in _iter_dir(lfs_root):
+        if not _HEX2_RE.match(s1.name) or not s1.is_dir(follow_symlinks=False):
+            continue
+        for s2 in _iter_dir(s1.path):
+            if not _HEX2_RE.match(s2.name) or not s2.is_dir(follow_symlinks=False):
                 continue
-            try:
-                s2_it = os.scandir(s1.path)
-            except OSError:
-                continue
-            with s2_it:
-                for s2 in s2_it:
-                    if not _HEX2_RE.match(s2.name) or not s2.is_dir(follow_symlinks=False):
-                        continue
-                    try:
-                        f_it = os.scandir(s2.path)
-                    except OSError:
-                        continue
-                    with f_it:
-                        for f in f_it:
-                            oid = f.name
-                            if not _OID_RE.match(oid):
-                                continue
-                            if not oid.startswith(s1.name + s2.name):
-                                continue
-                            if not f.is_file(follow_symlinks=False):
-                                continue
-                            yield oid, f.path
+            for f in _iter_dir(s2.path):
+                oid = f.name
+                if not _OID_RE.match(oid):
+                    continue
+                if not oid.startswith(s1.name + s2.name):
+                    continue
+                if not f.is_file(follow_symlinks=False):
+                    continue
+                yield oid, f.path
 
 
 def _ingest_lfs_object(src_path: str, dst_path: str, oid: str) -> bool:
@@ -865,26 +860,21 @@ def _walk_submodule_dirs(modules_dir: str, cache_dir: str,
     ``third-party/fmt`` -> ``third-party/``) — recurse to find the git
     dirs inside.
     """
-    try:
-        it = os.scandir(modules_dir)
-    except OSError:
-        return
-    with it:
-        for entry in it:
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-            sub = entry.path
-            rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
-            is_git_dir = (os.path.isfile(os.path.join(sub, "HEAD"))
-                          and os.path.isdir(os.path.join(sub, "objects")))
-            if is_git_dir:
-                _ensure_cache(sub, cache_dir)
-                nested = os.path.join(sub, "modules")
-                if os.path.isdir(nested):
-                    _walk_submodule_dirs(nested, cache_dir, rel)
-            else:
-                # Intermediate path segment (submodule path with a slash).
-                _walk_submodule_dirs(sub, cache_dir, rel)
+    for entry in _iter_dir(modules_dir):
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        sub = entry.path
+        rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
+        is_git_dir = (os.path.isfile(os.path.join(sub, "HEAD"))
+                      and os.path.isdir(os.path.join(sub, "objects")))
+        if is_git_dir:
+            _ensure_cache(sub, cache_dir)
+            nested = os.path.join(sub, "modules")
+            if os.path.isdir(nested):
+                _walk_submodule_dirs(nested, cache_dir, rel)
+        else:
+            # Intermediate path segment (submodule path with a slash).
+            _walk_submodule_dirs(sub, cache_dir, rel)
 
 
 # ---------------------------------------------------------------------------

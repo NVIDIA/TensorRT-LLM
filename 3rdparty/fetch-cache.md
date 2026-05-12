@@ -575,6 +575,13 @@ the file, and (c) `TRTLLM_FETCHCONTENT_CACHE=` as a one-shot bypass.
 Silent passthrough would risk mis-parsing a new flag as a URL and
 producing confusing clone failures.
 
+**Writer invokes plain `git`, not `_TRTLLM_REAL_GIT`.** A single cache
+directory is shared across TensorRT-LLM versions and containers, so the
+writer (`fetch_cache.py`) must not pin itself to whichever git binary one
+build's `find_program` happened to discover. Only the reader-side wrapper
+(`fetch_cache_wrapper.py`), which is installed as `GIT_EXECUTABLE` and
+must `execv` the real binary, reads `_TRTLLM_REAL_GIT`.
+
 **No default clone timeout.** Network speed spans orders of magnitude
 between workstations and CI, and large repos (`cutlass`) legitimately
 take minutes on slow links. A hardcoded timeout would cause surprising

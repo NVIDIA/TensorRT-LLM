@@ -18,7 +18,10 @@ if(NOT WIN32 AND NOT "${TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
   # below, and find_package(Git) honors that cached value, so reusing the same
   # var would self-recurse on re-configure.
   find_program(_FC_REAL_GIT NAMES git REQUIRED)
-  find_program(_FC_PYTHON NAMES python3 python REQUIRED)
+  find_package(
+    Python3
+    COMPONENTS Interpreter
+    REQUIRED)
   # The wrapper still reads these two via env (it's executed by cmake as
   # GIT_EXECUTABLE and has no other channel to learn them).
   set(ENV{_TRTLLM_REAL_GIT} "${_FC_REAL_GIT}")
@@ -42,7 +45,7 @@ if(NOT WIN32 AND NOT "${TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
         CACHE INTERNAL "")
   else()
     set(_FC_WRITER_CMD
-        "${_FC_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache.py"
+        "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache.py"
         CACHE INTERNAL "")
   endif()
   message(STATUS "FetchContent cache: enabled (${_FC_CACHE_DIR})")
