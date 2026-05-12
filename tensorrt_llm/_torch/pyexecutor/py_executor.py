@@ -1460,8 +1460,8 @@ class PyExecutor:
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
-            self.stats.append((stats, req_stats, kv_iter_stats,
-                               attention_dp_rank))
+            self.stats.append(
+                (stats, req_stats, kv_iter_stats, attention_dp_rank))
 
     def _process_iter_stats(
         self,
