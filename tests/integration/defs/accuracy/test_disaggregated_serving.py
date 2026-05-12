@@ -2269,9 +2269,12 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
+        # V4-Flash 148GB weight prefetch + warmup needs >35 min, default wait timeout times out.
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
@@ -2330,8 +2333,11 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
+        # Same long-init reason as TestDeepSeekV4Flash above.
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
