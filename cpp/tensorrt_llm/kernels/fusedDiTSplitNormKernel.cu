@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -30,45 +31,89 @@ namespace kernels
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // Fused full-dim RMSNorm only (no RoPE) on a SINGLE Q or K tensor.
-// Mirror of fusedDiTSplitNormFullDimRopeKernel sans RoPE step:
-//   Phase 1: sum^2 reduce over full inner dim (num_heads * HEAD_DIM).
-//   Phase 2: scale by rsqrt(mean+eps) * weight, write back.
-// Block=256 (8 warps), grid=(num_tokens,). No cos/sin LDG; no rotation.
+// Strategy:
+//   - 2 rows per CTA (256 threads = 2 rows × 128 threads × 4 warps).
+//   - cp.async X HBM → SMEM (Phase 0a) overlaps with sync weight load → regs (Phase 0b).
+//   - Phase 1: sum^2 from SMEM, per-row reduce.
+//   - Phase 2: re-read X from SMEM, multiply by cached weight regs, write HBM.
 template <int HEAD_DIM>
 __global__ void fusedDiTSplitNormFullDimKernel(__nv_bfloat16* __restrict__ tensor, int const num_tokens,
     int const num_heads, float const eps, __nv_bfloat16 const* __restrict__ weight)
 {
     constexpr int BLOCK_SIZE = 256;
-    constexpr int N_WARPS = BLOCK_SIZE / 32;                    // 8
-    constexpr int CHUNK_ELEMS = 8;                              // 1 uint4 load = 8 bf16
-    constexpr int CHUNK_BLOCK_ELEMS = BLOCK_SIZE * CHUNK_ELEMS; // 2048
+    constexpr int ROWS_PER_BLOCK = 2;
+    constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK; // 128
+    constexpr int WARPS_PER_ROW = THREADS_PER_ROW / 32;          // 4
+    constexpr int CHUNK_ELEMS = 8;                               // uint4 = 8 bf16
+    constexpr int MAX_N = 32 * HEAD_DIM;
+    constexpr int MAX_CHUNKS_PER_ROW = (MAX_N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
 
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.wait;");
 #endif
 
     int const tid = threadIdx.x;
-    int const warpId = tid >> 5;
-    int const laneId = tid & 31;
-    int const tokenIdx = blockIdx.x;
+    int const row_in_block = tid / THREADS_PER_ROW; // 0 or 1
+    int const lane_in_row = tid % THREADS_PER_ROW;  // 0..127
+    int const row_warp = lane_in_row >> 5;          // 0..3
+    int const row_lane = lane_in_row & 31;
+
+    int const tokenIdx = blockIdx.x * ROWS_PER_BLOCK + row_in_block;
     if (tokenIdx >= num_tokens)
         return;
 
     int const N = num_heads * HEAD_DIM;
-    int const num_chunks = (N + CHUNK_BLOCK_ELEMS - 1) / CHUNK_BLOCK_ELEMS;
-
+    int const chunks_per_row = (N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
     int64_t const tokenBase = static_cast<int64_t>(tokenIdx) * N;
 
-    __shared__ float warp_sums[32];
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16* smem_input = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    float* warp_sums = reinterpret_cast<float*>(smem_raw + ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16));
 
-    // Phase 1: sum^2
-    float sum2 = 0.0f;
-    for (int chunk = 0; chunk < num_chunks; chunk++)
+    // Phase 0a: issue cp.async X HBM -> SMEM (one commit group).
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS_PER_ROW; chunk++)
     {
-        int const elemBase = chunk * CHUNK_BLOCK_ELEMS + tid * CHUNK_ELEMS;
+        if (chunk >= chunks_per_row)
+            continue;
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
         if (elemBase >= N)
             continue;
-        uint4 const v = *reinterpret_cast<uint4 const*>(&tensor[tokenBase + elemBase]);
+        __pipeline_memcpy_async(smem_input + row_in_block * N + elemBase, tensor + tokenBase + elemBase, 16);
+    }
+    __pipeline_commit();
+
+    // Phase 0b: SYNC load weight into registers (overlaps with cp.async X HBM transfer).
+    // weight_cache[chunk] holds 8 bf16 weight elements per chunk.
+    uint4 weight_cache[MAX_CHUNKS_PER_ROW];
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS_PER_ROW; chunk++)
+    {
+        if (chunk >= chunks_per_row)
+            continue;
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
+        if (elemBase >= N)
+            continue;
+        int const headIdx = elemBase / HEAD_DIM;
+        int const baseDim = elemBase - headIdx * HEAD_DIM;
+        weight_cache[chunk] = *reinterpret_cast<uint4 const*>(&weight[headIdx * HEAD_DIM + baseDim]);
+    }
+
+    // Phase 0c: wait for X cp.async + sync block.
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    // Phase 1: sum^2 from SMEM.
+    float sum2 = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS_PER_ROW; chunk++)
+    {
+        if (chunk >= chunks_per_row)
+            continue;
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
+        if (elemBase >= N)
+            continue;
+        uint4 const v = *reinterpret_cast<uint4 const*>(&smem_input[row_in_block * N + elemBase]);
         uint const* uints = reinterpret_cast<uint const*>(&v);
 #pragma unroll
         for (int i = 0; i < 4; i++)
@@ -78,53 +123,44 @@ __global__ void fusedDiTSplitNormFullDimKernel(__nv_bfloat16* __restrict__ tenso
         }
     }
 
-    // 1-sync replicated cross-warp reduce.
+    // Per-row warp reduce + cross-warp reduce.
     sum2 = tensorrt_llm::common::warpReduceSum(sum2);
-    if (laneId == 0)
-        warp_sums[warpId] = sum2;
+    if (row_lane == 0)
+        warp_sums[row_in_block * WARPS_PER_ROW + row_warp] = sum2;
     __syncthreads();
     float total = 0.0f;
 #pragma unroll
-    for (int w = 0; w < N_WARPS; w++)
-        total += warp_sums[w];
+    for (int w = 0; w < WARPS_PER_ROW; w++)
+        total += warp_sums[row_in_block * WARPS_PER_ROW + w];
     float const rms_rcp = rsqrtf(total / static_cast<float>(N) + eps);
 
-    // Phase 2: re-read input + apply scale + store (no RoPE).
-    for (int chunk = 0; chunk < num_chunks; chunk++)
+    // Phase 2: re-read X from SMEM, multiply by cached weight regs, write to HBM.
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS_PER_ROW; chunk++)
     {
-        int const elemBase = chunk * CHUNK_BLOCK_ELEMS + tid * CHUNK_ELEMS;
+        if (chunk >= chunks_per_row)
+            continue;
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
         if (elemBase >= N)
             continue;
-        int const headIdx = elemBase / HEAD_DIM;
-        int const baseDim = elemBase - headIdx * HEAD_DIM;
 
-        uint4 in_vec = *reinterpret_cast<uint4 const*>(&tensor[tokenBase + elemBase]);
-        float w_vals[CHUNK_ELEMS];
-#pragma unroll
-        for (int i = 0; i < CHUNK_ELEMS; i++)
-            w_vals[i] = __bfloat162float(weight[headIdx * HEAD_DIM + baseDim + i]);
+        uint4 const in_vec = *reinterpret_cast<uint4 const*>(&smem_input[row_in_block * N + elemBase]);
+        uint4 const w_vec = weight_cache[chunk];
 
-        float elements[CHUNK_ELEMS];
-        uint const* uints = reinterpret_cast<uint const*>(&in_vec);
-#pragma unroll
-        for (int i = 0; i < 4; i++)
-        {
-            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&uints[i]));
-            elements[2 * i] = vals.x;
-            elements[2 * i + 1] = vals.y;
-        }
-
-#pragma unroll
-        for (int i = 0; i < CHUNK_ELEMS; i++)
-            elements[i] *= rms_rcp * w_vals[i];
-
+        uint const* x_uints = reinterpret_cast<uint const*>(&in_vec);
+        uint const* w_uints = reinterpret_cast<uint const*>(&w_vec);
         uint4 out_vec;
         uint* o_uints = reinterpret_cast<uint*>(&out_vec);
 #pragma unroll
         for (int i = 0; i < 4; i++)
         {
-            __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
-            reinterpret_cast<__nv_bfloat162&>(o_uints[i]) = vals;
+            float2 x_vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&x_uints[i]));
+            float2 w_vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&w_uints[i]));
+            float2 y_vals;
+            y_vals.x = x_vals.x * rms_rcp * w_vals.x;
+            y_vals.y = x_vals.y * rms_rcp * w_vals.y;
+            __nv_bfloat162 bf = __float22bfloat162_rn(y_vals);
+            reinterpret_cast<__nv_bfloat162&>(o_uints[i]) = bf;
         }
         *reinterpret_cast<uint4*>(&tensor[tokenBase + elemBase]) = out_vec;
     }
@@ -143,16 +179,19 @@ void launchFusedDiTSplitNormFullDim(
         "fusedDiTSplitNormFullDim: num_heads (%d) must be <= 32 (block_size = num_heads*32 <= 1024)", num_heads);
     TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDim: num_heads must be >= 1, got %d", num_heads);
 
-    dim3 const gridDim(num_tokens);
-    dim3 const blockDim(256);
-    cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = gridDim;
-    cfg.blockDim = blockDim;
-    cfg.dynamicSmemBytes = 0;
-    cfg.stream = stream;
+    int const N = num_heads * head_dim;
+    constexpr int ROWS_PER_BLOCK = 2;
+
     cudaLaunchAttribute attrs[1] = {};
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((num_tokens + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    cfg.blockDim = dim3(256);
+    cfg.dynamicSmemBytes
+        = ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + ROWS_PER_BLOCK * 4 /*warps_per_row*/ * sizeof(float);
+    cfg.stream = stream;
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
 #define LAUNCH(HEAD_DIM)                                                                                               \

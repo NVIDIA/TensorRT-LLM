@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 
@@ -199,252 +200,6 @@ __global__ void fusedDiTQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, tot
         vec_T* outputPtr = reinterpret_cast<vec_T*>(&qkv[offsetThread]);
         *outputPtr = vec;
     }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// Inductor-style full-dim kernel: block=256 (8 warps), grid=(num_tokens,).
-// One block per token processes Q AND K sequentially in shared threads.
-// Chunked reduce loop holds only one chunk's data in registers at a time
-// → keeps register pressure low (~32 regs/thread vs 80 for inductor's Triton
-// version) so we can fit 8 blocks/SM at 256 threads.
-// 1 cross-warp reduce per side (Q sum², then K sum²); 1 __syncthreads each.
-// LTX-2 interleaved RoPE only — rotate_half pairs would cross warps under
-// the thread-strided layout, so the rotate_half path uses the 32-warp kernel.
-
-// PER_HEAD_COS=false: cos/sin shape [num_tokens, HEAD_DIM]; head broadcast.
-// PER_HEAD_COS=true:  cos/sin shape [num_tokens, num_heads * HEAD_DIM];
-//                     each head h reads its own slice (LTX-2 INTERLEAVED RoPE).
-// Note: when PER_HEAD_COS=true, Q and K share the same cos/sin buffer (same
-//       num_heads_q == num_heads_k for LTX-2 self-attn).
-// CosT: float (fp32 cos) or __nv_bfloat16 (kernel upcasts bf16 to fp32 in registers, lossless).
-template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
-__global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const num_heads_q, int const num_heads_k,
-    int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
-    CosT const* cos_emb, CosT const* sin_emb, int const num_tokens, int const cos_seq_per_batch)
-{
-    constexpr int BLOCK_SIZE = 256;
-    constexpr int N_WARPS = BLOCK_SIZE / 32;                    // 8
-    constexpr int CHUNK_ELEMS = 8;                              // bf16 per thread per chunk = 1 uint4
-    constexpr int CHUNK_BLOCK_ELEMS = BLOCK_SIZE * CHUNK_ELEMS; // 2048 bf16 per chunk
-
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-    // Programmatic Dependent Launch: wait for previous kernel's launch_dependents
-    // signal so we can pipeline tail-prologue overlap when the launcher sets
-    // cudaLaunchAttributeProgrammaticStreamSerialization.
-    asm volatile("griddepcontrol.wait;");
-#endif
-
-    int const tid = threadIdx.x;
-    int const warpId = tid >> 5;
-    int const laneId = tid & 31;
-    int const tokenIdx = blockIdx.x;
-    if (tokenIdx >= num_tokens)
-        return;
-
-    int const num_heads_total = num_heads_q + num_heads_k + num_heads_v;
-    int const N_q = num_heads_q * HEAD_DIM;
-    int const N_k = num_heads_k * HEAD_DIM;
-    int const num_chunks_q = (N_q + CHUNK_BLOCK_ELEMS - 1) / CHUNK_BLOCK_ELEMS;
-    int const num_chunks_k = (N_k + CHUNK_BLOCK_ELEMS - 1) / CHUNK_BLOCK_ELEMS;
-
-    int64_t const tokenBaseQ = static_cast<int64_t>(tokenIdx) * num_heads_total * HEAD_DIM;
-    int64_t const tokenBaseK = tokenBaseQ + N_q;
-    // cos/sin per-token base. PER_HEAD_COS=true: stride = num_heads * HEAD_DIM;
-    // each head reads its own slice. PER_HEAD_COS=false: stride = HEAD_DIM;
-    // all heads share the same cos.
-    // When cos_seq_per_batch > 0, cos has only one row per token-in-batch
-    // (cos shape [cos_seq_per_batch, ...]) and the kernel broadcasts it across
-    // the B grouping — saves the upstream cos.repeat(B, 1).
-    int const cos_tokenIdx = (cos_seq_per_batch > 0) ? (tokenIdx % cos_seq_per_batch) : tokenIdx;
-    int64_t const embBase = PER_HEAD_COS ? static_cast<int64_t>(cos_tokenIdx) * num_heads_q * HEAD_DIM
-                                         : static_cast<int64_t>(cos_tokenIdx) * HEAD_DIM;
-
-    __shared__ float warp_sums[32];
-
-    auto reduce_partial = [&](float partial) -> float
-    {
-        // 1-sync replicated final reduce across N_WARPS warps.
-        // No zero-init needed: final loop reads only [0, N_WARPS), all populated.
-        partial = tensorrt_llm::common::warpReduceSum(partial);
-        if (laneId == 0)
-            warp_sums[warpId] = partial;
-        __syncthreads();
-        float total = 0.0f;
-#pragma unroll
-        for (int w = 0; w < N_WARPS; w++)
-            total += warp_sums[w];
-        // Trailing barrier: this lambda is called twice (Q then K) and reuses
-        // warp_sums; without this, warp X's next-iteration lane-0 write can race
-        // warp Y's pending read of the previous iteration.
-        __syncthreads();
-        return total;
-    };
-
-    // ===== Phase 1: Q sum² =====
-    float q_sum2 = 0.0f;
-    for (int chunk = 0; chunk < num_chunks_q; chunk++)
-    {
-        int const elemBase = chunk * CHUNK_BLOCK_ELEMS + tid * CHUNK_ELEMS;
-        if (elemBase >= N_q)
-            continue;
-        uint4 const v = *reinterpret_cast<uint4 const*>(&qkv[tokenBaseQ + elemBase]);
-        uint const* uints = reinterpret_cast<uint const*>(&v);
-#pragma unroll
-        for (int i = 0; i < 4; i++)
-        {
-            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&uints[i]));
-            q_sum2 += vals.x * vals.x;
-            q_sum2 += vals.y * vals.y;
-        }
-    }
-    float const q_total = reduce_partial(q_sum2);
-    float const q_rms_rcp = rsqrtf(q_total / static_cast<float>(N_q) + eps);
-
-    // ===== Phase 2: K sum² =====
-    float k_sum2 = 0.0f;
-    for (int chunk = 0; chunk < num_chunks_k; chunk++)
-    {
-        int const elemBase = chunk * CHUNK_BLOCK_ELEMS + tid * CHUNK_ELEMS;
-        if (elemBase >= N_k)
-            continue;
-        uint4 const v = *reinterpret_cast<uint4 const*>(&qkv[tokenBaseK + elemBase]);
-        uint const* uints = reinterpret_cast<uint const*>(&v);
-#pragma unroll
-        for (int i = 0; i < 4; i++)
-        {
-            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&uints[i]));
-            k_sum2 += vals.x * vals.x;
-            k_sum2 += vals.y * vals.y;
-        }
-    }
-    float const k_total = reduce_partial(k_sum2);
-    float const k_rms_rcp = rsqrtf(k_total / static_cast<float>(N_k) + eps);
-
-    // ===== Phase 3: apply scale + RoPE for Q then K =====
-    auto apply_side = [&](int64_t tokenBase, int N, int num_chunks, __nv_bfloat16 const* weight, float rms_rcp)
-    {
-        for (int chunk = 0; chunk < num_chunks; chunk++)
-        {
-            int const elemBase = chunk * CHUNK_BLOCK_ELEMS + tid * CHUNK_ELEMS;
-            if (elemBase >= N)
-                continue;
-            int const headIdx = elemBase / HEAD_DIM;
-            int const baseDim = elemBase - headIdx * HEAD_DIM;
-
-            uint4 in_vec = *reinterpret_cast<uint4 const*>(&qkv[tokenBase + elemBase]);
-            float w_vals[CHUNK_ELEMS], cos_vals[CHUNK_ELEMS], sin_vals[CHUNK_ELEMS];
-#pragma unroll
-            for (int i = 0; i < CHUNK_ELEMS; i++)
-                w_vals[i] = __bfloat162float(weight[headIdx * HEAD_DIM + baseDim + i]);
-            int const cosHeadOff = PER_HEAD_COS ? headIdx * HEAD_DIM : 0;
-            static_assert(CHUNK_ELEMS == 8, "CHUNK_ELEMS=8 required for vectorized cos/sin load");
-            if constexpr (std::is_same_v<CosT, float>)
-            {
-                // fp32 cos: 8 scalar loads → 2 LDG.128 per array (float4 × 2).
-                float4 const* cos_v = reinterpret_cast<float4 const*>(&cos_emb[embBase + cosHeadOff + baseDim]);
-                float4 const* sin_v = reinterpret_cast<float4 const*>(&sin_emb[embBase + cosHeadOff + baseDim]);
-                float4 c0 = cos_v[0], c1 = cos_v[1];
-                float4 s0 = sin_v[0], s1 = sin_v[1];
-                cos_vals[0] = c0.x;
-                cos_vals[1] = c0.y;
-                cos_vals[2] = c0.z;
-                cos_vals[3] = c0.w;
-                cos_vals[4] = c1.x;
-                cos_vals[5] = c1.y;
-                cos_vals[6] = c1.z;
-                cos_vals[7] = c1.w;
-                sin_vals[0] = s0.x;
-                sin_vals[1] = s0.y;
-                sin_vals[2] = s0.z;
-                sin_vals[3] = s0.w;
-                sin_vals[4] = s1.x;
-                sin_vals[5] = s1.y;
-                sin_vals[6] = s1.z;
-                sin_vals[7] = s1.w;
-            }
-            else
-            {
-                // bf16 cos: 8 bf16 = 16 bytes → 1 LDG.128 (uint4) per array; upcast in registers.
-                uint4 const cos_packed = *reinterpret_cast<uint4 const*>(&cos_emb[embBase + cosHeadOff + baseDim]);
-                uint4 const sin_packed = *reinterpret_cast<uint4 const*>(&sin_emb[embBase + cosHeadOff + baseDim]);
-                uint const* cos_uints = reinterpret_cast<uint const*>(&cos_packed);
-                uint const* sin_uints = reinterpret_cast<uint const*>(&sin_packed);
-#pragma unroll
-                for (int i = 0; i < 4; i++)
-                {
-                    float2 cv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&cos_uints[i]));
-                    float2 sv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&sin_uints[i]));
-                    cos_vals[2 * i] = cv.x;
-                    cos_vals[2 * i + 1] = cv.y;
-                    sin_vals[2 * i] = sv.x;
-                    sin_vals[2 * i + 1] = sv.y;
-                }
-            }
-
-            float elements[CHUNK_ELEMS];
-            uint const* uints = reinterpret_cast<uint const*>(&in_vec);
-#pragma unroll
-            for (int i = 0; i < 4; i++)
-            {
-                float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&uints[i]));
-                elements[2 * i] = vals.x;
-                elements[2 * i + 1] = vals.y;
-            }
-
-#pragma unroll
-            for (int i = 0; i < CHUNK_ELEMS; i++)
-                elements[i] *= rms_rcp * w_vals[i];
-
-            if constexpr (INTERLEAVE)
-            {
-#pragma unroll
-                for (int i = 0; i < CHUNK_ELEMS; i += 2)
-                {
-                    float const x = elements[i], y = elements[i + 1];
-                    elements[i] = x * cos_vals[i] + (-y) * sin_vals[i];
-                    elements[i + 1] = y * cos_vals[i + 1] + x * sin_vals[i + 1];
-                }
-            }
-            else
-            {
-                // rotate-half (LTX-2 SPLIT): partner element at +HEAD_DIM/2 within head.
-                // Inline partner exchange to avoid 8-reg partner array (reg-pressure opt).
-                // Use __activemask() because the surrounding chunk loop can have
-                // `continue` early-exit on partial warps for small N.
-                constexpr int xor_mask = HEAD_DIM / 16;
-                bool const negate = ((laneId & xor_mask) == 0);
-                unsigned const activeMask = __activemask();
-#pragma unroll
-                for (int i = 0; i < CHUNK_ELEMS; i++)
-                {
-                    float p = __shfl_xor_sync(activeMask, elements[i], xor_mask);
-                    if (negate)
-                    {
-                        p = -p;
-                    }
-                    elements[i] = elements[i] * cos_vals[i] + p * sin_vals[i];
-                }
-            }
-
-            uint4 out_vec;
-            uint* o_uints = reinterpret_cast<uint*>(&out_vec);
-#pragma unroll
-            for (int i = 0; i < 4; i++)
-            {
-                __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
-                reinterpret_cast<__nv_bfloat162&>(o_uints[i]) = vals;
-            }
-            *reinterpret_cast<uint4*>(&qkv[tokenBase + elemBase]) = out_vec;
-        }
-    };
-
-    apply_side(tokenBaseQ, N_q, num_chunks_q, q_weight, q_rms_rcp);
-    apply_side(tokenBaseK, N_k, num_chunks_k, k_weight, k_rms_rcp);
-
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-    asm volatile("griddepcontrol.launch_dependents;");
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -678,6 +433,278 @@ __global__ void fusedDiTCrossHeadQKNormRopeKernel(__nv_bfloat16* qkv, // [num_to
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// V2: 2 rows per CTA + cp.async Q+K overlap with sync weight/cos/sin loads.
+// Same V3 strategy as norm-only kernel; cos/sin shared between Q and K (loaded once).
+template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
+__global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const num_heads_q, int const num_heads_k,
+    int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
+    CosT const* cos_emb, CosT const* sin_emb, int const num_tokens, int const cos_seq_per_batch)
+{
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int ROWS_PER_BLOCK = 2;
+    constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK; // 128
+    constexpr int WARPS_PER_ROW = THREADS_PER_ROW / 32;          // 4
+    constexpr int CHUNK_ELEMS = 8;                               // uint4 = 8 bf16
+    constexpr int MAX_N = 32 * HEAD_DIM;
+    constexpr int MAX_CHUNKS = (MAX_N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+    int const tid = threadIdx.x;
+    int const row_in_block = tid / THREADS_PER_ROW;
+    int const lane_in_row = tid % THREADS_PER_ROW;
+    int const row_warp = lane_in_row >> 5;
+    int const row_lane = lane_in_row & 31;
+
+    int const tokenIdx = blockIdx.x * ROWS_PER_BLOCK + row_in_block;
+    if (tokenIdx >= num_tokens)
+        return;
+
+    int const N = num_heads_q * HEAD_DIM; // num_heads_q == num_heads_k (enforced by launcher)
+    int const chunks_per_row = (N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
+    int const num_heads_total = num_heads_q + num_heads_k + num_heads_v;
+    int64_t const tokenBaseQ = static_cast<int64_t>(tokenIdx) * num_heads_total * HEAD_DIM;
+    int64_t const tokenBaseK = tokenBaseQ + N;
+    int const cos_tokenIdx = (cos_seq_per_batch > 0) ? (tokenIdx % cos_seq_per_batch) : tokenIdx;
+    int64_t const embBase = PER_HEAD_COS ? static_cast<int64_t>(cos_tokenIdx) * num_heads_q * HEAD_DIM
+                                         : static_cast<int64_t>(cos_tokenIdx) * HEAD_DIM;
+
+    // SMEM layout: [Q row0][Q row1][K row0][K row1] bf16, [cos row0..1][sin row0..1] CosT, warp_sums.
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* smem_k = smem_q + ROWS_PER_BLOCK * N;
+    CosT* smem_cos = reinterpret_cast<CosT*>(smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16));
+    CosT* smem_sin = smem_cos + ROWS_PER_BLOCK * N;
+    float* warp_sums = reinterpret_cast<float*>(
+        smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + 2 * ROWS_PER_BLOCK * N * sizeof(CosT));
+
+    // Phase 0a: cp.async Q + K + cos + sin -> SMEM (all in one commit group).
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS; chunk++)
+    {
+        if (chunk >= chunks_per_row)
+            continue;
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
+        if (elemBase >= N)
+            continue;
+        __pipeline_memcpy_async(smem_q + row_in_block * N + elemBase, qkv + tokenBaseQ + elemBase, 16);
+        __pipeline_memcpy_async(smem_k + row_in_block * N + elemBase, qkv + tokenBaseK + elemBase, 16);
+        int const headIdx = elemBase / HEAD_DIM;
+        int const baseDim = elemBase - headIdx * HEAD_DIM;
+        int const cosHeadOff = PER_HEAD_COS ? headIdx * HEAD_DIM : 0;
+        if constexpr (std::is_same_v<CosT, float>)
+        {
+            __pipeline_memcpy_async(
+                smem_cos + row_in_block * N + elemBase, cos_emb + embBase + cosHeadOff + baseDim, 16);
+            __pipeline_memcpy_async(
+                smem_cos + row_in_block * N + elemBase + 4, cos_emb + embBase + cosHeadOff + baseDim + 4, 16);
+            __pipeline_memcpy_async(
+                smem_sin + row_in_block * N + elemBase, sin_emb + embBase + cosHeadOff + baseDim, 16);
+            __pipeline_memcpy_async(
+                smem_sin + row_in_block * N + elemBase + 4, sin_emb + embBase + cosHeadOff + baseDim + 4, 16);
+        }
+        else
+        {
+            __pipeline_memcpy_async(
+                smem_cos + row_in_block * N + elemBase, cos_emb + embBase + cosHeadOff + baseDim, 16);
+            __pipeline_memcpy_async(
+                smem_sin + row_in_block * N + elemBase, sin_emb + embBase + cosHeadOff + baseDim, 16);
+        }
+    }
+    __pipeline_commit();
+
+    // Phase 0b: sync load q_weight + k_weight -> regs (overlaps cp.async transfers).
+    uint4 q_w_cache[MAX_CHUNKS], k_w_cache[MAX_CHUNKS];
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS; chunk++)
+    {
+        if (chunk >= chunks_per_row)
+            continue;
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
+        if (elemBase >= N)
+            continue;
+        int const headIdx = elemBase / HEAD_DIM;
+        int const baseDim = elemBase - headIdx * HEAD_DIM;
+        q_w_cache[chunk] = *reinterpret_cast<uint4 const*>(&q_weight[headIdx * HEAD_DIM + baseDim]);
+        k_w_cache[chunk] = *reinterpret_cast<uint4 const*>(&k_weight[headIdx * HEAD_DIM + baseDim]);
+    }
+
+    // Phase 0c: wait + sync.
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    // Phase 1: compute sum²_Q and sum²_K together from SMEM.
+    float q_sum2 = 0.0f, k_sum2 = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS; chunk++)
+    {
+        if (chunk >= chunks_per_row)
+            continue;
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
+        if (elemBase >= N)
+            continue;
+        uint4 const qv = *reinterpret_cast<uint4 const*>(&smem_q[row_in_block * N + elemBase]);
+        uint4 const kv = *reinterpret_cast<uint4 const*>(&smem_k[row_in_block * N + elemBase]);
+        uint const* qu = reinterpret_cast<uint const*>(&qv);
+        uint const* ku = reinterpret_cast<uint const*>(&kv);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            float2 qv2 = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&qu[i]));
+            float2 kv2 = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&ku[i]));
+            q_sum2 += qv2.x * qv2.x + qv2.y * qv2.y;
+            k_sum2 += kv2.x * kv2.x + kv2.y * kv2.y;
+        }
+    }
+
+    // Per-row reduce both at once: pack (q_sum, k_sum) per warp slot.
+    q_sum2 = tensorrt_llm::common::warpReduceSum(q_sum2);
+    k_sum2 = tensorrt_llm::common::warpReduceSum(k_sum2);
+    // warp_sums layout: [row_in_block][2 * warp + (0=Q, 1=K)]
+    if (row_lane == 0)
+    {
+        warp_sums[row_in_block * (2 * WARPS_PER_ROW) + 2 * row_warp + 0] = q_sum2;
+        warp_sums[row_in_block * (2 * WARPS_PER_ROW) + 2 * row_warp + 1] = k_sum2;
+    }
+    __syncthreads();
+    float q_total = 0.0f, k_total = 0.0f;
+#pragma unroll
+    for (int w = 0; w < WARPS_PER_ROW; w++)
+    {
+        q_total += warp_sums[row_in_block * (2 * WARPS_PER_ROW) + 2 * w + 0];
+        k_total += warp_sums[row_in_block * (2 * WARPS_PER_ROW) + 2 * w + 1];
+    }
+    float const q_rms_rcp = rsqrtf(q_total / static_cast<float>(N) + eps);
+    float const k_rms_rcp = rsqrtf(k_total / static_cast<float>(N) + eps);
+
+    // Phase 2: apply norm + RoPE to Q and K, writing to HBM.
+    // Cos/sin loaded from SMEM (same stage as Q+K), converted to fp32 at use.
+    auto apply_chunk
+        = [&](int chunk, __nv_bfloat16 const* smem_input, uint4 const* w_cache, int64_t tokenBaseOut, float rms_rcp)
+    {
+        int const elemBase = chunk * THREADS_PER_ROW * CHUNK_ELEMS + lane_in_row * CHUNK_ELEMS;
+        if (elemBase >= N)
+            return;
+        uint4 const in_vec = *reinterpret_cast<uint4 const*>(&smem_input[row_in_block * N + elemBase]);
+        uint4 const w_vec = w_cache[chunk];
+
+        float cos_vals[CHUNK_ELEMS];
+        float sin_vals[CHUNK_ELEMS];
+        if constexpr (std::is_same_v<CosT, float>)
+        {
+            float4 const* cs = reinterpret_cast<float4 const*>(&smem_cos[row_in_block * N + elemBase]);
+            float4 const* ss = reinterpret_cast<float4 const*>(&smem_sin[row_in_block * N + elemBase]);
+            float4 c0 = cs[0], c1 = cs[1];
+            float4 s0 = ss[0], s1 = ss[1];
+            cos_vals[0] = c0.x;
+            cos_vals[1] = c0.y;
+            cos_vals[2] = c0.z;
+            cos_vals[3] = c0.w;
+            cos_vals[4] = c1.x;
+            cos_vals[5] = c1.y;
+            cos_vals[6] = c1.z;
+            cos_vals[7] = c1.w;
+            sin_vals[0] = s0.x;
+            sin_vals[1] = s0.y;
+            sin_vals[2] = s0.z;
+            sin_vals[3] = s0.w;
+            sin_vals[4] = s1.x;
+            sin_vals[5] = s1.y;
+            sin_vals[6] = s1.z;
+            sin_vals[7] = s1.w;
+        }
+        else
+        {
+            uint4 const cp = *reinterpret_cast<uint4 const*>(&smem_cos[row_in_block * N + elemBase]);
+            uint4 const sp = *reinterpret_cast<uint4 const*>(&smem_sin[row_in_block * N + elemBase]);
+            uint const* cu = reinterpret_cast<uint const*>(&cp);
+            uint const* su = reinterpret_cast<uint const*>(&sp);
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                float2 cv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&cu[i]));
+                float2 sv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&su[i]));
+                cos_vals[2 * i] = cv.x;
+                cos_vals[2 * i + 1] = cv.y;
+                sin_vals[2 * i] = sv.x;
+                sin_vals[2 * i + 1] = sv.y;
+            }
+        }
+
+        float elements[CHUNK_ELEMS];
+        float w_vals[CHUNK_ELEMS];
+        uint const* x_uints = reinterpret_cast<uint const*>(&in_vec);
+        uint const* w_uints = reinterpret_cast<uint const*>(&w_vec);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            float2 xv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&x_uints[i]));
+            float2 wv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&w_uints[i]));
+            elements[2 * i] = xv.x;
+            elements[2 * i + 1] = xv.y;
+            w_vals[2 * i] = wv.x;
+            w_vals[2 * i + 1] = wv.y;
+        }
+
+#pragma unroll
+        for (int i = 0; i < CHUNK_ELEMS; i++)
+            elements[i] *= rms_rcp * w_vals[i];
+
+        if constexpr (INTERLEAVE)
+        {
+#pragma unroll
+            for (int i = 0; i < CHUNK_ELEMS; i += 2)
+            {
+                float const x = elements[i], y = elements[i + 1];
+                elements[i] = x * cos_vals[i] + (-y) * sin_vals[i];
+                elements[i + 1] = y * cos_vals[i + 1] + x * sin_vals[i + 1];
+            }
+        }
+        else
+        {
+            constexpr int xor_mask = HEAD_DIM / 16;
+            bool const negate = ((row_lane & xor_mask) == 0);
+            unsigned const activeMask = __activemask();
+#pragma unroll
+            for (int i = 0; i < CHUNK_ELEMS; i++)
+            {
+                float p = __shfl_xor_sync(activeMask, elements[i], xor_mask);
+                if (negate)
+                {
+                    p = -p;
+                }
+                elements[i] = elements[i] * cos_vals[i] + p * sin_vals[i];
+            }
+        }
+
+        uint4 out_vec;
+        uint* o_uints = reinterpret_cast<uint*>(&out_vec);
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
+            reinterpret_cast<__nv_bfloat162&>(o_uints[i]) = vals;
+        }
+        *reinterpret_cast<uint4*>(&qkv[tokenBaseOut + elemBase]) = out_vec;
+    };
+
+#pragma unroll
+    for (int chunk = 0; chunk < MAX_CHUNKS; chunk++)
+    {
+        if (chunk >= chunks_per_row)
+            continue;
+        apply_chunk(chunk, smem_q, q_w_cache, tokenBaseQ, q_rms_rcp);
+        apply_chunk(chunk, smem_k, k_w_cache, tokenBaseK, k_rms_rcp);
+    }
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void launchFusedDiTCrossHeadQKNormRope(void* qkv, int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
     int head_dim, float eps, void const* q_weight, void const* k_weight, float const* cos_emb, float const* sin_emb,
@@ -737,63 +764,70 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q,
         "fusedDiTQKNormRopeFullDim: requires num_heads_q == num_heads_k (got %d, %d)", num_heads_q, num_heads_k);
     TLLM_CHECK_WITH_INFO(num_heads_q <= 32, "fusedDiTQKNormRopeFullDim: num_heads must be <= 32, got %d", num_heads_q);
 
-    // Both INTERLEAVE values dispatch to fusedDiTQKNormFullDimRopeKernel
-    // (block=256, chunked, Q+K together, PDL-enabled). Templated on INTERLEAVE + PER_HEAD_COS + COS_T.
-    {
-        dim3 const gridDim(num_tokens);
-        dim3 const blockDim(256);
-        cudaLaunchConfig_t cfg = {};
-        cfg.gridDim = gridDim;
-        cfg.blockDim = blockDim;
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream = stream;
-        cudaLaunchAttribute attrs[1] = {};
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cfg.attrs = attrs;
-        cfg.numAttrs = 1;
-#define LAUNCH_FULL_DIM_INDUCTOR_LIKE(HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T)                                           \
-    cudaLaunchKernelEx(&cfg, fusedDiTQKNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T>,                   \
-        reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,                             \
-        reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),            \
-        reinterpret_cast<COS_T const*>(cos_emb), reinterpret_cast<COS_T const*>(sin_emb), num_tokens,                  \
-        cos_seq_per_batch)
-#define DISPATCH_FULL_DIM(INTERLEAVE, PER_HEAD, COS_T)                                                                 \
+    int const N = num_heads_q * head_dim;
+    constexpr int ROWS_PER_BLOCK = 2;
+
+    cudaLaunchAttribute attrs[1] = {};
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((num_tokens + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    cfg.blockDim = dim3(256);
+    // SMEM = Q+K stage (bf16) + cos+sin stage (CosT) + warp_sums.
+    size_t const cos_elem_size = cos_is_bf16 ? sizeof(__nv_bfloat16) : sizeof(float);
+    cfg.dynamicSmemBytes = 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + 2 * ROWS_PER_BLOCK * N * cos_elem_size
+        + ROWS_PER_BLOCK * 2 * 4 /*WARPS_PER_ROW*/ * sizeof(float);
+    cfg.stream = stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    // Default per-CTA dynamic SMEM cap is 48 KB; raise it per kernel specialization.
+#define LAUNCH(HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T)                                                                  \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        auto* kptr = fusedDiTQKNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T>;                           \
+        cudaFuncSetAttribute(                                                                                          \
+            reinterpret_cast<void const*>(kptr), cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.dynamicSmemBytes);   \
+        cudaLaunchKernelEx(&cfg, kptr, reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v,   \
+            eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),   \
+            reinterpret_cast<COS_T const*>(cos_emb), reinterpret_cast<COS_T const*>(sin_emb), num_tokens,              \
+            cos_seq_per_batch);                                                                                        \
+    } while (0)
+#define DISPATCH(INTERLEAVE, PER_HEAD, COS_T)                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
         switch (head_dim)                                                                                              \
         {                                                                                                              \
-        case 64: LAUNCH_FULL_DIM_INDUCTOR_LIKE(64, INTERLEAVE, PER_HEAD, COS_T); break;                                \
-        case 128: LAUNCH_FULL_DIM_INDUCTOR_LIKE(128, INTERLEAVE, PER_HEAD, COS_T); break;                              \
+        case 64: LAUNCH(64, INTERLEAVE, PER_HEAD, COS_T); break;                                                       \
+        case 128: LAUNCH(128, INTERLEAVE, PER_HEAD, COS_T); break;                                                     \
         default: TLLM_THROW("Unsupported head_dim for fusedDiTQKNormRopeFullDim: %d", head_dim);                       \
         }                                                                                                              \
     } while (0)
-#define DISPATCH_FULL_DIM_DTYPE(INTERLEAVE, PER_HEAD)                                                                  \
+#define DISPATCH_DTYPE(INTERLEAVE, PER_HEAD)                                                                           \
     do                                                                                                                 \
     {                                                                                                                  \
         if (cos_is_bf16)                                                                                               \
-            DISPATCH_FULL_DIM(INTERLEAVE, PER_HEAD, __nv_bfloat16);                                                    \
+            DISPATCH(INTERLEAVE, PER_HEAD, __nv_bfloat16);                                                             \
         else                                                                                                           \
-            DISPATCH_FULL_DIM(INTERLEAVE, PER_HEAD, float);                                                            \
+            DISPATCH(INTERLEAVE, PER_HEAD, float);                                                                     \
     } while (0)
-        if (interleave)
-        {
-            if (per_head_cos)
-                DISPATCH_FULL_DIM_DTYPE(true, true);
-            else
-                DISPATCH_FULL_DIM_DTYPE(true, false);
-        }
+    if (interleave)
+    {
+        if (per_head_cos)
+            DISPATCH_DTYPE(true, true);
         else
-        {
-            if (per_head_cos)
-                DISPATCH_FULL_DIM_DTYPE(false, true);
-            else
-                DISPATCH_FULL_DIM_DTYPE(false, false);
-        }
-#undef DISPATCH_FULL_DIM_DTYPE
-#undef DISPATCH_FULL_DIM
-#undef LAUNCH_FULL_DIM_INDUCTOR_LIKE
+            DISPATCH_DTYPE(true, false);
     }
+    else
+    {
+        if (per_head_cos)
+            DISPATCH_DTYPE(false, true);
+        else
+            DISPATCH_DTYPE(false, false);
+    }
+#undef DISPATCH_DTYPE
+#undef DISPATCH
+#undef LAUNCH
 }
 
 } // namespace kernels
