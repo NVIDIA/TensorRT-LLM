@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -3419,8 +3419,11 @@ def get_cubin_header(kernel_traits, specs_names):
                                         '').replace('ws_', '').replace(
                                             'softcapping_',
                                             '').replace('sage_', '').replace(
-                                                'skipSoftmax_',
-                                                '').replace('output_', ''))
+                                                'skipSoftmaxStat_',
+                                                '').replace(
+                                                    'skipSoftmax_',
+                                                    '').replace(
+                                                        'output_', ''))
         flash_attention = 'flash_attention' in kname
         warp_specialization = 'tma_ws' in kname
         toks = tname.split('_')
