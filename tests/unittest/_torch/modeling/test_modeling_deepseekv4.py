@@ -1,6 +1,8 @@
+import ast
 import inspect
 import json
 import struct
+import textwrap
 import weakref
 from copy import deepcopy
 
@@ -89,6 +91,14 @@ DEEPSEEK_V4_TINY_CONFIG = {
         "weight_block_size": [128, 128],
     },
 }
+
+
+def _source_calls(source):
+    return {
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+    }
 
 
 def _write_safetensors_header(path, tensor_name, dtype, shape):
@@ -326,7 +336,9 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert "kv_a_layernorm_hidden_size = (" in init_src
     assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
     assert "self.kv_a_layernorm = RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src
-    assert "self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)" in forward_src
+    assert "self.q_b_layernorm(q_proj.view(-1, self.qk_head_dim)).view_as(q_proj)" in _source_calls(
+        forward_src
+    )
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
