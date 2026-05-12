@@ -393,9 +393,7 @@ def main():
     pytest_common_vars = ""
 
     ucx_tls_cmd = (
-        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        if is_gb300
-        else "unset UCX_TLS &&"
+        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&" if is_gb300 else "unset UCX_TLS &&"
     )
     ucx_tls_server_cmd = (
         "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
@@ -419,7 +417,8 @@ def main():
             ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
             f'export pytestCommandDisaggServer="{ucx_tls_server_cmd}'
             ' $SERVER_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandDisaggServer"',
-            f'export pytestCommandBenchmark="{ucx_tls_cmd} $BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandBenchmark"',
+            f'export pytestCommandBenchmark="{ucx_tls_cmd} $BENCHMARK_ENV_VARS'
+            ' $PYTEST_COMMON_VARS $partialPytestCommandBenchmark"',
             f"export runScript={args.run_sh}",
             f"export installScript={install_script}",
             f"export configYamlPath={config_yaml}",
