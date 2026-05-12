@@ -185,6 +185,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             mapping=mapping,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache,
         )
+        if (
+            getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
+            or getattr(spec_config, "sa_config", None) is not None
+        ):
+            raise ValueError(
+                "Dynamic tree mode does not support relaxed acceptance or "
+                "suffix-automaton enhancement."
+            )
         assert self.use_dynamic_tree, (
             "Eagle3OneModelDynamicTreeWorker requires use_dynamic_tree=True"
         )

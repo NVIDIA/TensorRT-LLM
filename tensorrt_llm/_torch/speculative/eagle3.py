@@ -483,7 +483,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             else:
                 self.num_tokens -= (self.num_generations) * self.max_draft_len
 
-        if self.spec_resource_manager is not None:
+        if getattr(self.spec_resource_manager, "slot_manager",
+                   None) is not None:
             # Populate slot_ids for all requests in this batch.  Used by relaxed
             # acceptance (relaxed_delta_pool indexing), mirroring the pattern
             # in MTPSpecMetadata.prepare().

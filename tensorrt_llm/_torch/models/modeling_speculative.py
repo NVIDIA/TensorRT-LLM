@@ -413,14 +413,13 @@ class Eagle3DraftModel(DecoderModel):
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         try:
-            assert self.embed_tokens is not None
-
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError(
                     "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
                 )
 
             if inputs_embeds is None:
+                assert self.embed_tokens is not None
                 inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
             assert hidden_states is not None
@@ -645,14 +644,13 @@ class MistralLarge3DraftModel(DecoderModel):
         spec_metadata: SpecMetadata | None = None,
         hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert self.embed_tokens is not None
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
         if inputs_embeds is None:
+            assert self.embed_tokens is not None
             inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
         assert hidden_states is not None
