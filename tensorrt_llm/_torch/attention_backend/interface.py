@@ -782,6 +782,8 @@ class AttentionForwardArgs:
     attention_window_size: Optional[int] = None
     attention_mask_data: Optional[torch.Tensor] = None
     attention_sinks: Optional[torch.Tensor] = None
+    relative_attention_bias: Optional[torch.Tensor] = None
+    relative_attention_max_distance: int = 0
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None

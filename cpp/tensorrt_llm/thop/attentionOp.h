@@ -84,7 +84,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t num_contexts = 0, int64_t num_ctx_tokens = 0,
     std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt, bool const cross_attention = false,
     std::optional<torch::Tensor> cross_kv = std::nullopt,
-    std::optional<torch::Tensor> encoder_input_lengths = std::nullopt);
+    std::optional<torch::Tensor> encoder_input_lengths = std::nullopt,
+    std::optional<torch::Tensor> relative_attention_bias = std::nullopt, int64_t relative_attention_max_distance = 0);
 
 struct KvCachePoolPointers
 {

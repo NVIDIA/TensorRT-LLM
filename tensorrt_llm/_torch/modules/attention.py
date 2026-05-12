@@ -112,28 +112,35 @@ def attn_custom_op_inplace(
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
     attention_sinks: Optional[torch.Tensor],
+    relative_attention_bias: Optional[torch.Tensor],
+    relative_attention_max_distance: int,
     layer_idx: str,
     output: torch.Tensor,
     output_sf: Optional[torch.Tensor],
 ) -> None:
     metadata, attn_layer = extract_extra_attrs(layer_idx, "attn")
+    rel_attn_max_distance = relative_attention_max_distance
     mask = PredefinedAttentionMask(
         attention_mask
     ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
         attention_mask)
     # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
-    attn_layer._attn_impl(q,
-                          k,
-                          v,
-                          metadata,
-                          mask,
-                          mrope_rotary_cos_sin,
-                          mrope_position_deltas,
-                          attention_window_size,
-                          attention_mask_data,
-                          output=output,
-                          output_sf=output_sf,
-                          attention_sinks=attention_sinks)
+    attn_layer._attn_impl(
+        q,
+        k,
+        v,
+        metadata,
+        mask,
+        mrope_rotary_cos_sin,
+        mrope_position_deltas,
+        attention_window_size,
+        attention_mask_data,
+        output=output,
+        output_sf=output_sf,
+        attention_sinks=attention_sinks,
+        relative_attention_bias=relative_attention_bias,
+        relative_attention_max_distance=rel_attn_max_distance,
+    )
 
 
 def _helix_post_process(
@@ -708,9 +715,12 @@ class Attention(nn.Module):
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
     ):
         num_tokens = attn_metadata.num_tokens
+        rel_attn_max_distance = relative_attention_max_distance
 
         q = q[:num_tokens, :]
         if k is not None:
@@ -752,6 +762,8 @@ class Attention(nn.Module):
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
+                    relative_attention_bias=relative_attention_bias,
+                    relative_attention_max_distance=rel_attn_max_distance,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -791,6 +803,8 @@ class Attention(nn.Module):
                 output=output[:num_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=rel_attn_max_distance,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -810,10 +824,13 @@ class Attention(nn.Module):
         attention_mask_data: Optional[torch.Tensor],
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
+        rel_attn_max_distance = relative_attention_max_distance
         if mrope_config is not None:
             if "mrope_rotary_cos_sin" in mrope_config:
                 mrope_rotary_cos_sin = mrope_config["mrope_rotary_cos_sin"]
@@ -842,22 +859,28 @@ class Attention(nn.Module):
                 attention_window_size,
                 attention_mask_data,
                 attention_sinks,
+                relative_attention_bias,
+                relative_attention_max_distance,
                 self.layer_idx_str,
                 output,
                 output_sf,
             )
         else:
-            output, output_sf = self._attn_impl(q,
-                                                k,
-                                                v,
-                                                attn_metadata,
-                                                attention_mask,
-                                                mrope_rotary_cos_sin,
-                                                mrope_position_deltas,
-                                                attention_window_size,
-                                                attention_mask_data,
-                                                attention_sinks=attention_sinks,
-                                                has_lora=has_lora)
+            output, output_sf = self._attn_impl(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                attention_window_size,
+                attention_mask_data,
+                attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=rel_attn_max_distance,
+                has_lora=has_lora,
+            )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
 
@@ -875,6 +898,8 @@ class Attention(nn.Module):
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -939,17 +964,24 @@ class Attention(nn.Module):
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
+        if relative_attention_bias is not None:
+            assert self.attn_backend == "TRTLLM", "Relative attention bias is only supported for TRTLLM backend."
 
-        attn_output = self.forward_impl(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        attention_mask,
-                                        attention_window_size,
-                                        attention_mask_data,
-                                        mrope_config=mrope_config,
-                                        attention_sinks=attention_sinks,
-                                        has_lora=bool(lora_params))
+        rel_attn_max_distance = relative_attention_max_distance
+        attn_output = self.forward_impl(
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_mask,
+            attention_window_size,
+            attention_mask_data,
+            mrope_config=mrope_config,
+            attention_sinks=attention_sinks,
+            relative_attention_bias=relative_attention_bias,
+            relative_attention_max_distance=rel_attn_max_distance,
+            has_lora=bool(lora_params),
+        )
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

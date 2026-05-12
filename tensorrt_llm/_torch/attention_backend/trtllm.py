@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -30,8 +30,6 @@ from .trtllm_gen import trtllm_gen_attention
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
-
-
 
 
 @functools.cache
@@ -1347,6 +1345,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                  or metadata.max_seq_len)
         max_context_length = min(metadata.max_seq_len - 1,
                                  metadata.max_num_tokens)
+        relative_attention_bias = forward_args.relative_attention_bias
+        relative_attention_max_distance = forward_args.relative_attention_max_distance
+        has_relative_attention_bias = relative_attention_bias is not None
+        position_embedding_type = (int(PositionEmbeddingType.relative)
+                                   if has_relative_attention_bias else
+                                   self.position_embedding_type)
 
         helix_active = metadata.helix_position_offsets is not None
         encoder_seq_lens_arg = (metadata.kv_lens_cuda_runtime
@@ -1358,7 +1362,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
-        if prefer_trtllm_gen and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
+        can_use_trtllm_gen = (
+            prefer_trtllm_gen and not helix_active and not use_sage_attn
+            and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -1376,6 +1382,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sink_token_length=0,
                 cross_attention=metadata.is_cross,
                 is_spec_decoding=metadata.is_spec_decoding_enabled,
+                has_relative_attention_bias=has_relative_attention_bias,
                 is_mla_enable=self.is_mla_enable,
                 is_fused_qkv=is_fused_qkv,
                 update_kv_cache=update_kv_cache,
@@ -1386,7 +1393,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_prefill,
                 skip_softmax_threshold_scale_factor_decode=
                 skip_softmax_threshold_scale_factor_decode,
-        )[0]:
+            )[0])
+        if can_use_trtllm_gen:
             trtllm_gen_attention(
                 q,
                 k,
@@ -1429,7 +1437,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 int(mask_type),
                 self.quant_mode,
                 self.q_scaling,
-                self.position_embedding_type,
+                position_embedding_type,
                 rotary_embedding_dim,
                 rotary_embedding_base,
                 rotary_embedding_scale_type,
@@ -1473,14 +1481,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 global_layer_idx=self.layer_idx,
                 is_cross=metadata.is_cross,
                 encoder_seq_lens=encoder_seq_lens_arg,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
             )
         else:
             cross_kv_input = None
             if metadata.is_cross and k is not None and v is not None:
                 k_flat = k.contiguous().view(k.shape[0], -1)
                 v_flat = v.contiguous().view(v.shape[0], -1)
-                cross_kv_input = torch.cat([k_flat, v_flat],
-                                           dim=1).contiguous()
+                cross_kv_input = torch.cat([k_flat, v_flat], dim=1).contiguous()
             k_arg = None if metadata.is_cross else k
             v_arg = None if metadata.is_cross else v
             q_arg = q
@@ -1540,7 +1549,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 int(mask_type),
                 self.quant_mode,
                 self.q_scaling,
-                self.position_embedding_type,
+                position_embedding_type,
                 rotary_embedding_dim,
                 rotary_embedding_base,
                 rotary_embedding_scale_type,
@@ -1588,6 +1597,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
                 **legacy_attention_kwargs,
             )
 

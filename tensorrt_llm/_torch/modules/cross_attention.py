@@ -64,6 +64,7 @@ class CrossAttention(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         q_scaling: float = 1.0,
+        head_dim: Optional[int] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -71,9 +72,12 @@ class CrossAttention(nn.Module):
         self.hidden_size = hidden_size
         self.encoder_hidden_size = encoder_hidden_size or hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = getattr(config.pretrained_config, "head_dim", None)
-        if not isinstance(self.head_dim, int):
-            self.head_dim = self.hidden_size // self.num_heads
+        if head_dim is not None:
+            self.head_dim = head_dim
+        else:
+            self.head_dim = getattr(config.pretrained_config, "head_dim", None)
+            if not isinstance(self.head_dim, int):
+                self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.q_scaling = q_scaling
 
