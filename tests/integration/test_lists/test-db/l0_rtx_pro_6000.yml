@@ -15,6 +15,7 @@ l0_rtx_pro_6000:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_out_of_tree"
+  - unittest/_torch/modules/moe/test_flashinfer_nvfp4_sm12x_moe_backend.py
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
   # SM120 W4A16 / W4A8 mixed-dtype GEMM coverage (paired with FinegrainedMixedDtypeGemm
