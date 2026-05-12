@@ -22,7 +22,7 @@ import math
 import random
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from dataclasses import MISSING, astuple, dataclass, field, fields
+from dataclasses import MISSING, astuple, dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
 from tensorrt_llm.logger import logger
@@ -93,7 +93,7 @@ class RankState:
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
         if iter_stats_payload is None:
             return
-        self.iter_stats = RankIterStatsPayload.deserialize(iter_stats_payload.serialize())
+        self.iter_stats = replace(iter_stats_payload)
 
     def serialize(self) -> list[int]:
         """Serialize to a flat list for allgather transport."""

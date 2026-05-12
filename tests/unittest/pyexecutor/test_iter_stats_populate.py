@@ -41,7 +41,11 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock, patch
 
-from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
+    _ITERATION_STATS_OPTIONAL_FIELDS,
+    _ITERATION_STATS_SCALAR_FIELDS,
+    ADPIterStatsBuffer,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 
@@ -577,7 +581,7 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
     buffer.queue(
         pending_stats,
         ["req-stats"] if is_rank0 else None,
-        kv_iter_stats="pending-kv" if is_rank0 else None,
+        kv_iter_stats={0: "pending-kv"} if is_rank0 else None,
         is_rank0=is_rank0,
     )
     return buffer
@@ -642,7 +646,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_ifb.num_queued_gen_requests == 8
     assert rank0_ifb.num_queued_gen_kv_tokens == 800
     assert rank0_record.req_stats == ["req-stats"]
-    assert rank0_record.kv_iter_stats == "pending-kv"
+    assert rank0_record.kv_iter_stats == {0: "pending-kv"}
 
     rank1_record = records[1]
     rank1_row = rank1_record.stats
@@ -667,6 +671,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank1_record.kv_iter_stats is None
 
     assert buffer._payloads == {}
+    assert buffer.next_payload() is None
 
 
 def test_attention_dp_fanout_waits_for_complete_matching_payloads():
@@ -705,7 +710,7 @@ def test_attention_dp_fanout_buffers_multiple_pending_payloads():
     buffer.queue(
         rank0_stats_10,
         ["req-stats-10"],
-        kv_iter_stats="pending-kv-10",
+        kv_iter_stats={0: "pending-kv-10"},
         is_rank0=True,
     )
 
@@ -732,6 +737,7 @@ def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
 
     assert records == []
     assert buffer._payloads == {}
+    assert buffer.next_payload() is None
     assert buffer._rank0_req_stats == {}
     assert buffer._rank0_kv_iter_stats == {}
 
@@ -758,6 +764,22 @@ def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     assert next_payload.num_context_requests == 0
     assert 9 in buffer._synthetic_iters
     assert 10 in buffer._payloads
+
+
+def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
+    """Guard the hardcoded field lists used when cloning rank-0 stats."""
+    actual_fields = {
+        field
+        for field in dir(IterationStats())
+        if not field.startswith("_") and field != "to_json_str"
+    }
+    copied_fields = (
+        set(_ITERATION_STATS_SCALAR_FIELDS)
+        | set(_ITERATION_STATS_OPTIONAL_FIELDS)
+        | {"inflight_batching_stats"}
+    )
+
+    assert copied_fields == actual_fields
 
 
 # ---------------------------------------------------------------------------

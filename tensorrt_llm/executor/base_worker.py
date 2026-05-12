@@ -674,13 +674,14 @@ class BaseWorker(GenerationExecutor):
 
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
-        attention_dp_rank = stats[3] if len(stats) > 3 else 0
+        attention_dp_rank = stats[3] if len(stats) > 3 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
         # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
         # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
-        stats_dict["attentionDpRank"] = attention_dp_rank
+        stats_dict["attentionDpRank"] = (
+            0 if attention_dp_rank is None else attention_dp_rank)
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []

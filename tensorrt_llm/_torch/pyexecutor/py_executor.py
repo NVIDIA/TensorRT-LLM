@@ -1188,11 +1188,7 @@ class PyExecutor:
                 self._latest_kv_iter_stats = None
 
         def is_stats_dummy_request(req) -> bool:
-            return bool(
-                getattr(req, "is_dummy", False)
-                or getattr(req, "is_attention_dp_dummy", False)
-                or getattr(req, "is_cuda_graph_dummy", False)
-                or getattr(req, "is_dummy_request", False))
+            return bool(getattr(req, "is_dummy", False))
 
         # Attention-DP may add dummy requests to keep ranks aligned during
         # distributed scheduling. CUDA graph padding can add dummies too.
@@ -1382,7 +1378,7 @@ class PyExecutor:
     def _append_iter_stats(self,
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None,
-                           kv_iter_stats=None,
+                           kv_iter_stats: Optional[Dict[int, object]] = None,
                            attention_dp_rank: Optional[int] = None):
         """Append one iteration's finalized stats to the export buffer.
 
@@ -1464,10 +1460,8 @@ class PyExecutor:
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
-            entry = (stats, req_stats, kv_iter_stats)
-            if attention_dp_rank is not None:
-                entry = (stats, req_stats, kv_iter_stats, attention_dp_rank)
-            self.stats.append(entry)
+            self.stats.append((stats, req_stats, kv_iter_stats,
+                               attention_dp_rank))
 
     def _process_iter_stats(
         self,

@@ -12,6 +12,28 @@ from tensorrt_llm.logger import logger
 
 from .scheduler.adp_router import RankIterStatsPayload, RankState
 
+_ITERATION_STATS_SCALAR_FIELDS = (
+    "timestamp",
+    "iter",
+    "iter_latency_ms",
+    "new_active_requests_queue_latency_ms",
+    "num_new_active_requests",
+    "num_active_requests",
+    "num_queued_requests",
+    "num_completed_requests",
+    "max_num_active_requests",
+    "gpu_mem_usage",
+    "cpu_mem_usage",
+    "pinned_mem_usage",
+)
+
+_ITERATION_STATS_OPTIONAL_FIELDS = (
+    "kv_cache_stats",
+    "cross_kv_cache_stats",
+    "static_batching_stats",
+    "specdec_stats",
+)
+
 
 @dataclass
 class ADPIterStatsRecord:
@@ -19,7 +41,7 @@ class ADPIterStatsRecord:
 
     stats: IterationStats
     req_stats: Optional[List[RequestStats]]
-    kv_iter_stats: object
+    kv_iter_stats: Optional[Dict[int, object]]
     attention_dp_rank: int
 
 
@@ -43,7 +65,8 @@ class ADPIterStatsBuffer:
         # RequestStats remain rank-0-owned under Attention-DP.
         self._rank0_req_stats: Dict[int, Optional[List[RequestStats]]] = {}
         # Rank 0 only: KV iteration stats captured with pending IterationStats.
-        self._rank0_kv_iter_stats: Dict[int, object] = {}
+        self._rank0_kv_iter_stats: Dict[int, Optional[Dict[int, object]]] = {}
+        self._oldest_iter: Optional[int] = None
 
     @staticmethod
     def make_payload(stats: IterationStats) -> RankIterStatsPayload:
@@ -66,7 +89,7 @@ class ADPIterStatsBuffer:
         stats: IterationStats,
         req_stats: Optional[List[RequestStats]] = None,
         *,
-        kv_iter_stats=None,
+        kv_iter_stats: Optional[Dict[int, object]] = None,
         is_rank0: bool,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
@@ -80,6 +103,7 @@ class ADPIterStatsBuffer:
 
         self._payloads[iter_id] = payload
         self._synthetic_iters.discard(iter_id)
+        self._note_payload_insert(iter_id)
 
         if is_rank0:
             self._rank0_iter_stats[iter_id] = stats
@@ -88,10 +112,16 @@ class ADPIterStatsBuffer:
 
     def next_payload(self) -> Optional[RankIterStatsPayload]:
         """Return the oldest pending stats payload to piggyback."""
-        if not self._payloads:
+        if self._oldest_iter is None:
             return None
-        iter_id = min(self._payloads)
-        return self._payloads[iter_id]
+        return self._payloads[self._oldest_iter]
+
+    def _note_payload_insert(self, iter_id: int) -> None:
+        if self._oldest_iter is None or iter_id < self._oldest_iter:
+            self._oldest_iter = iter_id
+
+    def _recompute_oldest_iter(self) -> None:
+        self._oldest_iter = min(self._payloads) if self._payloads else None
 
     def _ensure_zero_payload(self, iter_id: int) -> None:
         """Add a zero payload when this rank had no work for an iteration."""
@@ -102,25 +132,36 @@ class ADPIterStatsBuffer:
             iter_stats_iter=iter_id,
         )
         self._synthetic_iters.add(iter_id)
+        self._note_payload_insert(iter_id)
 
-    def _discard(self, iter_id: int) -> None:
+    def _discard(self, iter_id: int, *, recompute_oldest: bool = True) -> None:
         self._payloads.pop(iter_id, None)
         self._synthetic_iters.discard(iter_id)
         self._rank0_iter_stats.pop(iter_id, None)
         self._rank0_req_stats.pop(iter_id, None)
         self._rank0_kv_iter_stats.pop(iter_id, None)
+        if recompute_oldest and iter_id == self._oldest_iter:
+            self._recompute_oldest_iter()
 
     def _drop_before(self, iter_id: int) -> None:
+        changed = False
         for pending_iter in list(self._payloads):
             if pending_iter >= iter_id:
                 continue
-            self._discard(pending_iter)
+            self._discard(pending_iter, recompute_oldest=False)
+            changed = True
+        if changed:
+            self._recompute_oldest_iter()
 
     def _clear_through(self, iter_id: int) -> None:
+        changed = False
         for pending_iter in list(self._payloads):
             if pending_iter > iter_id:
                 continue
-            self._discard(pending_iter)
+            self._discard(pending_iter, recompute_oldest=False)
+            changed = True
+        if changed:
+            self._recompute_oldest_iter()
 
     @staticmethod
     def _make_rank_iter_stats(
@@ -139,31 +180,13 @@ class ADPIterStatsBuffer:
         source_ifb = rank0_stats.inflight_batching_stats
 
         stats = IterationStats()
-        for attr in (
-            "timestamp",
-            "iter",
-            "iter_latency_ms",
-            "new_active_requests_queue_latency_ms",
-            "num_new_active_requests",
-            "num_active_requests",
-            "num_queued_requests",
-            "num_completed_requests",
-            "max_num_active_requests",
-            "gpu_mem_usage",
-            "cpu_mem_usage",
-            "pinned_mem_usage",
-        ):
+        for attr in _ITERATION_STATS_SCALAR_FIELDS:
             setattr(stats, attr, getattr(rank0_stats, attr))
 
         # Optional nested stats are copied when present. KV iteration deltas
         # are attached separately and remain rank-0-only to avoid double-logging
         # global KV-cache deltas.
-        for attr in (
-            "kv_cache_stats",
-            "cross_kv_cache_stats",
-            "static_batching_stats",
-            "specdec_stats",
-        ):
+        for attr in _ITERATION_STATS_OPTIONAL_FIELDS:
             nested_stats = getattr(rank0_stats, attr)
             if nested_stats is not None:
                 setattr(stats, attr, nested_stats)

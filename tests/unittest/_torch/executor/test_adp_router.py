@@ -142,6 +142,15 @@ class TestRankState:
         assert state.iter_stats.has_iter_stats == 0
         assert state.iter_stats.iter_stats_iter == -1
 
+    def test_copy_iter_stats_from_clones_payload(self):
+        state = RankState(rank=0)
+        payload = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=7)
+
+        state.copy_iter_stats_from(payload)
+
+        assert state.iter_stats == payload
+        assert state.iter_stats is not payload
+
 
 class TestDefaultADPRouter:
     # Router tests model strict placement, relaxed placement, and capacity
