@@ -9,7 +9,12 @@ UCX_REPO="https://github.com/openucx/ucx.git"
 
 mkdir -p /third-party-source
 
-rm -rf ${UCX_INSTALL_PATH}
+# Drop the trailing slash so this also removes a pre-existing *symlink* at
+# ${UCX_INSTALL_PATH} (the NGC PyTorch base image ships /usr/local/ucx as a
+# symlink to /opt/hpcx/ucx). Without this, `make install` writes through the
+# symlink into /opt/hpcx/ucx, and the later /opt/hpcx/ucx -> /usr/local/ucx
+# replacement creates an infinite symlink loop.
+rm -rf "${UCX_INSTALL_PATH%/}"
 git clone -b ${UCX_VERSION} ${UCX_REPO}
 cd ucx
 git checkout ${UCX_COMMIT}
