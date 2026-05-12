@@ -35,7 +35,11 @@ make install -j$(nproc)
 # in the container — PyTorch, NCCL, UCC, plus the C++/Python NIXL stack —
 # resolves the same UCX SONAMEs.
 for d in /opt/hpcx/ucx /opt/hpcx-*/ucx; do
-    if [ -e "$d" ] && [ ! -L "$d" ]; then
+    # `[ -e ]` catches real dirs/files; `[ -L ]` separately catches symlinks
+    # (including broken ones, where -e returns false). Together they replace
+    # any pre-existing UCX — real dir, stale symlink to an old UCX, or our
+    # own symlink on re-run (idempotent).
+    if [ -e "$d" ] || [ -L "$d" ]; then
         echo "Replacing pre-existing UCX at $d with symlink to ${UCX_INSTALL_PATH%/}"
         rm -rf "$d"
         ln -s "${UCX_INSTALL_PATH%/}" "$d"
