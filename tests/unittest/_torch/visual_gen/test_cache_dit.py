@@ -345,10 +345,7 @@ class TestCacheDiTRealPipelineForward:
                 if pipeline is not None:
                     self._teardown_cache_dit(pipeline)
 
-    def test_ltx2_cache_dit_skips_blocks_after_forward(self, monkeypatch):
-        from tensorrt_llm._torch.visual_gen.config import LTX2_FORCE_ONE_STAGE_ENV
-
-        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
+    def test_ltx2_cache_dit_skips_blocks_after_forward(self):
         ckpt = _resolve_ltx2_checkpoint()
         text_enc = _resolve_ltx2_text_encoder()
         if ckpt is None or text_enc is None:

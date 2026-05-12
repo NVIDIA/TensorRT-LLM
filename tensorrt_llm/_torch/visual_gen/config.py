@@ -1,5 +1,4 @@
 import json
-import os
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,9 +22,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # =============================================================================
 
 CacheBackendName = Literal["teacache", "cache_dit"]
-
-LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
-_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 # =============================================================================
 # Pipeline component identifiers
@@ -568,106 +564,6 @@ def create_attention_metadata_state() -> Dict[str, Any]:
     return {"metadata": None, "capacity": (0, 0)}
 
 
-def _get_ltx2_auxiliary_search_dir(checkpoint_path: Path) -> Optional[Path]:
-    if checkpoint_path.is_dir():
-        return checkpoint_path
-    if checkpoint_path.is_file():
-        return checkpoint_path.parent
-    return None
-
-
-def _pick_unique_file(search_dir: Path, pattern: str) -> str:
-    matches = sorted(search_dir.glob(pattern))
-    if len(matches) == 1:
-        return str(matches[0])
-    if len(matches) > 1:
-        logger.warning(
-            f"Multiple files matching {pattern!r} under {search_dir}: "
-            f"{[m.name for m in matches]}. Pass the path explicitly to disambiguate."
-        )
-    return ""
-
-
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in _TRUE_ENV_VALUES
-
-
-def discover_ltx2_two_stage_paths(
-    checkpoint_path: Path,
-    spatial_upsampler_path: str = "",
-    distilled_lora_path: str = "",
-) -> Tuple[str, str]:
-    """Resolve LTX2 two-stage auxiliary checkpoint paths.
-
-    Explicit paths take precedence. Missing paths are discovered from the
-    checkpoint directory only when a pattern has exactly one match.
-    """
-    search_dir = _get_ltx2_auxiliary_search_dir(checkpoint_path)
-    if search_dir is None:
-        return spatial_upsampler_path, distilled_lora_path
-
-    if not spatial_upsampler_path:
-        spatial_upsampler_path = _pick_unique_file(
-            search_dir, "*spatial-upscaler*.safetensors"
-        ) or _pick_unique_file(search_dir, "*upsampler*.safetensors")
-    if not distilled_lora_path:
-        distilled_lora_path = _pick_unique_file(
-            search_dir, "*distilled-lora*.safetensors"
-        ) or _pick_unique_file(search_dir, "*distilled*lora*.safetensors")
-
-    return spatial_upsampler_path, distilled_lora_path
-
-
-def resolve_ltx2_pipeline_extra_attrs(
-    checkpoint_path: Path,
-    spatial_upsampler_path: str = "",
-    distilled_lora_path: str = "",
-) -> Dict[str, Any]:
-    """Resolve LTX2 pipeline-selection attributes before variant selection."""
-    if _env_flag_enabled(LTX2_FORCE_ONE_STAGE_ENV):
-        logger.info(
-            f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled; skipping two-stage auxiliary "
-            "checkpoint discovery and promotion."
-        )
-        if spatial_upsampler_path or distilled_lora_path:
-            logger.info(
-                "Ignoring spatial_upsampler_path/distilled_lora_path because "
-                f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled."
-            )
-        return {"force_one_stage_pipeline": True}
-
-    resolved_upsampler_path, resolved_lora_path = discover_ltx2_two_stage_paths(
-        checkpoint_path,
-        spatial_upsampler_path,
-        distilled_lora_path,
-    )
-    if not resolved_upsampler_path and not resolved_lora_path:
-        return {}
-
-    if bool(resolved_upsampler_path) != bool(resolved_lora_path):
-        if spatial_upsampler_path or distilled_lora_path:
-            missing = "distilled_lora_path" if resolved_upsampler_path else "spatial_upsampler_path"
-            raise ValueError(
-                "LTX2 two-stage pipeline requires both spatial_upsampler_path "
-                f"and distilled_lora_path, but {missing} was not provided or discovered."
-            )
-        logger.warning(
-            "Found only one LTX2 two-stage auxiliary checkpoint in "
-            f"{checkpoint_path}; falling back to the one-stage pipeline. "
-            "Pass both paths explicitly to enable two-stage inference."
-        )
-        return {}
-
-    if not spatial_upsampler_path:
-        logger.info(f"Discovered LTX2 spatial upsampler: {resolved_upsampler_path}")
-    if not distilled_lora_path:
-        logger.info(f"Discovered LTX2 distilled LoRA: {resolved_lora_path}")
-    return {
-        "spatial_upsampler_path": resolved_upsampler_path,
-        "distilled_lora_path": resolved_lora_path,
-    }
-
-
 # =============================================================================
 # DiffusionModelConfig - Internal configuration (merged/parsed)
 # =============================================================================
@@ -966,13 +862,11 @@ class DiffusionModelConfig(BaseModel):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        extra_attrs.update(
-            resolve_ltx2_pipeline_extra_attrs(
-                checkpoint_path,
-                args.spatial_upsampler_path if args else "",
-                args.distilled_lora_path if args else "",
-            )
-        )
+        if args:
+            if args.spatial_upsampler_path:
+                extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
+            if args.distilled_lora_path:
+                extra_attrs["distilled_lora_path"] = args.distilled_lora_path
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
@@ -1012,6 +906,8 @@ class DiffusionModelConfig(BaseModel):
             if native_config is not None:
                 transformer_dict = native_config.get("transformer", {})
                 pretrained_config = SimpleNamespace(**transformer_dict)
+                if not getattr(pretrained_config, "_name_or_path", None):
+                    pretrained_config._name_or_path = str(checkpoint_path)
                 extra_attrs["monolithic_safetensors_config"] = native_config
 
                 # quantization_config lives as a separate safetensors metadata

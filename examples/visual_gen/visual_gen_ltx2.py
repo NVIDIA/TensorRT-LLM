@@ -5,12 +5,10 @@
 """LTX2 Text/Image-to-Video generation using TensorRT-LLM Visual Generation."""
 
 import argparse
-import os
 import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
-from tensorrt_llm._torch.visual_gen.config import LTX2_FORCE_ONE_STAGE_ENV, CacheDiTConfig
-from tensorrt_llm.serve.media_storage import MediaStorage
+from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig
 
 logger.set_level("info")
 
@@ -341,8 +339,7 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
 def _build_diffusion_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
     if args.enable_cache_dit:
-        os.environ[LTX2_FORCE_ONE_STAGE_ENV] = "1"
-        logger.info(f"{LTX2_FORCE_ONE_STAGE_ENV}=1 because Cache DiT requires one-stage LTX2.")
+        logger.info("Cache DiT enabled; LTX2 will run as a one-stage pipeline.")
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
     else:
         cache_kwargs = {}
