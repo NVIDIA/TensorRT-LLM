@@ -71,8 +71,8 @@ pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_ll
 > **Note:** The TensorRT LLM wheel on PyPI is built with PyTorch 2.10.0. This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a more recent PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
 >
 > ```bash
-> # Example: install TensorRT LLM 1.3.0rc11 inside the pytorch:26.02 NGC container
-> pip3 install tensorrt_llm==1.3.0rc11+ngcpytorch2602
+> # Example: install TensorRT LLM 1.3.0rc16 inside the pytorch:26.02 NGC container
+> pip3 install tensorrt_llm==1.3.0rc16+ngcpytorch2602
 > ```
 >
 > If the NGC PyTorch container-specific wheel is not available, you can instead install the pre-built wheel located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
