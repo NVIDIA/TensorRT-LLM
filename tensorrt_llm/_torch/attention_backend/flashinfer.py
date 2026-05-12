@@ -15,8 +15,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionForwardArgs,
-                        AttentionMetadata, CustomAttentionMask,
-                        PredefinedAttentionMask, merge_attention_forward_args, MLAParams)
+                        AttentionMetadata, CustomAttentionMask, MLAParams,
+                        PredefinedAttentionMask, merge_attention_forward_args)
 
 try:
     check_cuda_arch()
@@ -1418,6 +1418,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
 
         attention_mask_data = forward_args.attention_mask_data
+        latent_cache = forward_args.latent_cache
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
             assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
             attention_mask_type = int(AttentionMaskType.custom_mask)
