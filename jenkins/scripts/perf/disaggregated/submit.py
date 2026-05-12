@@ -393,7 +393,9 @@ def main():
     pytest_common_vars = ""
 
     ucx_tls_cmd = (
-        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&" if is_gb300 else "unset UCX_TLS &&"
+        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
+        if is_gb300
+        else "unset UCX_TLS UCX_NET_DEVICES &&"
     )
     ucx_tls_server_cmd = (
         "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
