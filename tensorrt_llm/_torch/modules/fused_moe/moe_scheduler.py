@@ -191,6 +191,21 @@ class ExternalCommMoEScheduler(MoEScheduler):
     # ------------------------------------------------------------------
     # DeepGemm workspace allocation
     # ------------------------------------------------------------------
+    def _dispatched_rows(self, max_tokens_per_rank: int) -> int:
+        """Row count of the dispatch output when communication is active.
+
+        DeepEPLowLatency emits ``num_slots * max_tokens_per_rank`` (expert-
+        major, one shard per slot). AllGatherReduceScatter (selected when
+        ``moe_tp_size != 1``) gathers ``dp_size * max_tokens_per_rank`` even
+        though ``moe_ep_size`` may be 1, while alltoall-family comms produce
+        ``ep_size * max_tokens_per_rank``; ``max(ep_size, dp_size)`` covers
+        both non-low-latency paths.
+        """
+        moe = self.moe
+        if isinstance(moe.comm, DeepEPLowLatency):
+            return moe.num_slots * max_tokens_per_rank
+        return max(moe.mapping.moe_ep_size, moe.mapping.dp_size) * max_tokens_per_rank
+
     def _prepare_workspace_deepgemm(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -206,13 +221,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         num_rows = x.shape[0]
         if moe.use_dp and moe.comm is not None:
-            # Communication path padding: dispatch outputs are
-            # ``[ep_size * max_tokens_per_rank, ...]`` (or expert-major for
-            # DeepEPLowLatency). Workspace must cover that footprint.
-            if isinstance(moe.comm, DeepEPLowLatency):
-                num_rows = moe.num_slots * max(all_rank_num_tokens)
-            else:
-                num_rows = moe.mapping.moe_ep_size * max(all_rank_num_tokens)
+            num_rows = self._dispatched_rows(max(all_rank_num_tokens))
 
         workspaces = moe.backend.get_workspaces([num_rows])
         return workspaces[0]
@@ -236,18 +245,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # Always need at least workspace_0; reuse chunk_0 size for workspace_1
         # since chunk 0 is always >= subsequent chunks under split_chunk.
-        # Mirror ``_prepare_workspace_deepgemm``: DeepEPLowLatency dispatches
-        # expert-major outputs sized ``num_slots * max_tokens_per_rank`` per
-        # rank (one shard per slot), while other comms produce
-        # ``ep_size * max_tokens_per_rank``. Using the wrong formula
-        # under-allocates the workspace for DeepEPLowLatency multi-chunk
-        # runs and is caught by ``DeepGemmFusedMoE.run_moe``.
+        # Under-allocation is caught by ``DeepGemmFusedMoE.run_moe``.
         if moe.use_dp and all_rank_num_tokens_list[0] is not None:
-            max_tokens = max(all_rank_num_tokens_list[0])
-            if isinstance(moe.comm, DeepEPLowLatency):
-                chunk_size_0 = moe.num_slots * max_tokens
-            else:
-                chunk_size_0 = moe.mapping.moe_ep_size * max_tokens
+            chunk_size_0 = self._dispatched_rows(max(all_rank_num_tokens_list[0]))
         else:
             chunk_size_0 = chunk_size_list[0]
         workspace_chunk_sizes = [chunk_size_0]

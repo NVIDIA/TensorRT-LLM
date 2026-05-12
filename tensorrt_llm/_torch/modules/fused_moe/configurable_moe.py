@@ -392,13 +392,17 @@ class ConfigurableMoE(MoE):
         """
         Calculate how many chunks are needed.
 
-        Uses ep_size * max(all_rank_num_tokens) when A2A communication is active,
-        because the A2A recv buffer is shaped [ep_size, max_tokens_per_rank, hidden]
-        regardless of how tokens are distributed across ranks. This matches the
-        actual memory footprint of the MoE GEMM workspace.
+        Uses ``max(ep_size, dp_size) * max(all_rank_num_tokens)`` when
+        communication is active. AllGatherReduceScatter (selected when
+        ``moe_tp_size != 1``) gathers ``dp_size * max_tokens_per_rank`` even
+        though ``moe_ep_size`` may be 1, while alltoall-family comms produce
+        ``ep_size * max_tokens_per_rank``. Using the max matches the
+        workspace sizing in the MoE scheduler.
         """
         if self.use_dp and self.comm is not None:
-            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+            num_rows = max(self.mapping.moe_ep_size, self.mapping.dp_size) * max(
+                all_rank_num_tokens
+            )
         else:
             num_rows = sum(all_rank_num_tokens)
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
