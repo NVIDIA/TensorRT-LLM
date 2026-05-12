@@ -489,7 +489,6 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_qwen_next-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_topk_4-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py::test_build_ad[deepseek-ai/DeepSeek-V3-llm_extra_args10] SKIP (https://nvbugs/5888827)
-unittest/auto_deploy/singlegpu/transformations SKIP (https://nvbugs/6160629)
 unittest/auto_deploy/singlegpu/transformations/library/test_gemm_fusion_trtllm.py::test_fuse_qkv_passthrough_with_rope SKIP (https://nvbugs/6160248)
 unittest/auto_deploy/singlegpu/transformations/library/test_mrope_delta_cache.py::test_qwen_registry_configs_explicitly_enable_mrope_delta_cache SKIP (https://nvbugs/6078421)
 unittest/auto_deploy/standalone SKIP (https://nvbugs/6160629)

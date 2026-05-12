@@ -167,6 +167,13 @@ EXCLUDE_TEST_FILES = {
     "test_triton_mla_op.py",
     # Require TRT-LLM ops (noaux_tc_op) — split from test_export.py
     "test_export_glm4_moe_lite.py",
+    # fuse_fp8_linear / fuse_nvfp4_linear / fuse_finegrained_fp8_linear transforms
+    # live in fuse_quant.py which imports tensorrt_llm.quantization.utils.fp8_utils;
+    # the module is silently skipped in standalone so the transforms aren't registered.
+    "test_quant_fusion.py",
+    # Imports utils.util.skip_pre_blackwell (not shipped in standalone) and exercises
+    # fuse_finegrained_fp8_swiglu which depends on TRT-LLM runtime.
+    "test_finegrained_fp8_swiglu.py",
 }
 
 # Import path rewrite: old -> new (applied to test files only).
