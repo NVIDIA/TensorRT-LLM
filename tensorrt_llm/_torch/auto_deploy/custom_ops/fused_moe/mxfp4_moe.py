@@ -53,7 +53,6 @@ TensorCacheKey = tuple[
 ]
 WeightCacheKey = tuple[object, ...]
 
-_MXFP4_WEIGHT_CACHE_MAX_ENTRIES = 256
 # ``convert_layout`` swizzles the packed expert weights. Cache the result by
 # underlying storage/view metadata so decode steps do not repeat that work.
 _MXFP4_WEIGHT_CACHE: OrderedDict[WeightCacheKey, tuple[PreparedWeights, list[weakref.finalize]]] = (
@@ -127,7 +126,8 @@ def _evict_mxfp4_weight_cache_entry(key: WeightCacheKey) -> None:
 
 
 def _trim_mxfp4_weight_cache() -> None:
-    while len(_MXFP4_WEIGHT_CACHE) > _MXFP4_WEIGHT_CACHE_MAX_ENTRIES:
+    max_entries = 256
+    while len(_MXFP4_WEIGHT_CACHE) > max_entries:
         _, (_, finalizers) = _MXFP4_WEIGHT_CACHE.popitem(last=False)
         _detach_finalizers(finalizers)
 
