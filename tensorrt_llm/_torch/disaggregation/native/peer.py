@@ -162,6 +162,7 @@ class PeerRegistrar:
                 )
                 self_layer_set = set(pv_global_ids)
                 matched_peer_pi = None
+                best_overlap = 0
                 for peer_pi, peer_pv in enumerate(peer_lg.pool_views):
                     peer_is_indexer = len(peer_pv.buffer_entries) == 0
                     peer_pool_role = (
@@ -175,9 +176,16 @@ class PeerRegistrar:
                         # INDEXER pools match by role alone
                         matched_peer_pi = peer_pi
                         break
-                    if set(get_pool_view_global_layer_ids(peer_pv, peer_lg)) & self_layer_set:
+                    peer_layer_set = set(get_pool_view_global_layer_ids(peer_pv, peer_lg))
+                    overlap = len(peer_layer_set & self_layer_set)
+                    if overlap == 0:
+                        continue
+                    if peer_layer_set == self_layer_set:
                         matched_peer_pi = peer_pi
                         break
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        matched_peer_pi = peer_pi
 
                 if matched_peer_pi is not None:
                     mapping[(self_lg_idx, self_pi)] = (peer_lg_idx, matched_peer_pi)

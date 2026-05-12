@@ -241,6 +241,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 PageIndexMode.SHARED,
             )
 
+    def get_disagg_data_role(self, role: DataRole):
+        from tensorrt_llm._torch.disaggregation.base.region import DataRole as DisaggDataRole
+
+        valid_roles = [attention_type.role for attention_type in DeepseekV4AttentionType]
+        if role in valid_roles:
+            return DisaggDataRole.KEY
+        raise ValueError(f"Invalid DeepSeek-V4 data role: '{role}'. Valid roles: {valid_roles}")
+
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         layer_semantics = self._manager_layer_id_to_layer_attn.get((layer_id, role))
         if layer_semantics is None:
@@ -747,29 +755,29 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return int(self.impl.get_quota(GPU_LEVEL))
 
     def _is_context_request(self, request: llm_request.LlmRequest) -> bool:
-        if getattr(request, "is_context_init_state", False):
+        if request.is_context_init_state:
             return True
-        return getattr(request, "state", None) == llm_request.LlmRequestState.CONTEXT_INIT
+        return request.state == llm_request.LlmRequestState.CONTEXT_INIT
 
     def _is_generation_request(self, request: llm_request.LlmRequest) -> bool:
         if (
-            getattr(request, "is_generation_in_progress_state", False)
-            or getattr(request, "is_generation_to_complete_state", False)
-            or getattr(request, "is_disagg_generation_init_state", False)
+            request.is_generation_in_progress_state
+            or request.is_generation_to_complete_state
+            or request.is_disagg_generation_init_state
         ):
             return True
-        return getattr(request, "state", None) in (
+        return request.state in (
             llm_request.LlmRequestState.GENERATION_IN_PROGRESS,
             llm_request.LlmRequestState.GENERATION_TO_COMPLETE,
         )
 
     def _get_context_bytes(self, request: llm_request.LlmRequest) -> int:
-        prompt_len = max(0, getattr(request, "prompt_len", request.orig_prompt_len))
+        prompt_len = max(0, request.prompt_len)
         total_tokens = prompt_len + self.num_extra_kv_tokens
         return total_tokens * self.get_cache_bytes_per_token()
 
     def _get_generation_bytes(self, request: llm_request.LlmRequest) -> int:
-        prompt_len = max(0, getattr(request, "prompt_len", request.orig_prompt_len))
+        prompt_len = max(0, request.prompt_len)
         max_new_tokens = max(0, request.max_new_tokens)
         total_tokens = prompt_len + max_new_tokens + self.num_extra_kv_tokens
         has_fp8_kv_cache = self.dtype == DataType.FP8
