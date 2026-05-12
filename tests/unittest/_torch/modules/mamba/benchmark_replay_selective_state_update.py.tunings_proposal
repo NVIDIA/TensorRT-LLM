@@ -137,12 +137,12 @@ def _import_mamba_kernels_fast():
     """Load kernel modules directly (~40s faster than a full tensorrt_llm init).
     Use --full-import as the fallback if module dependencies change.
 
-    Strategy: stub the parent packages (tensorrt_llm, tensorrt_llm._torch,
-    tensorrt_llm._torch.modules) in sys.modules with __path__ set, but do
-    NOT execute their __init__.py.  Then load the leaf kernel modules.
-    When a kernel body imports e.g. tensorrt_llm._utils.get_sm_version,
-    Python's machinery resolves it against our stub's __path__ and loads
-    only _utils.py — skipping the heavy tensorrt_llm package init.
+    Stub the parent packages (tensorrt_llm, tensorrt_llm._torch,
+    tensorrt_llm._torch.modules) in sys.modules with __path__ set, but do NOT
+    execute their __init__.py.  Then load the leaf kernel modules.  When a
+    kernel body imports e.g. tensorrt_llm._utils.get_sm_version, Python's
+    machinery resolves it against our stub's __path__ and loads only _utils.py
+    — skipping the heavy tensorrt_llm package init.
     """
     import types
 
@@ -152,17 +152,12 @@ def _import_mamba_kernels_fast():
     mamba_dir = trtllm_dir / "_torch" / "modules" / "mamba"
 
     def _stub_pkg(fqn: str, pkg_dir: Path):
-        """Register a stub package in sys.modules without running its
-        __init__.py.  Sets __path__ so Python can resolve submodule imports
-        against the real directory on disk."""
         if fqn in sys.modules:
             return
         stub = types.ModuleType(fqn)
         stub.__path__ = [str(pkg_dir)]
         sys.modules[fqn] = stub
 
-    # Stub the parent chain so `from tensorrt_llm._utils import ...` (and
-    # similar) work without triggering tensorrt_llm/__init__.py.
     _stub_pkg("tensorrt_llm", trtllm_dir)
     _stub_pkg("tensorrt_llm._torch", trtllm_dir / "_torch")
     _stub_pkg("tensorrt_llm._torch.modules", trtllm_dir / "_torch" / "modules")
@@ -1583,8 +1578,6 @@ def _bench_config(
                     json_results=getattr(args, "_json_results", None),
                     tp_size=args.tp_size,
                     json_detailed=getattr(args, "json_detailed", False),
-                    jsonl_path=getattr(args, "_jsonl_path", None),
-                    jsonl_host=getattr(args, "_jsonl_host", None),
                 )
 
     # --- Sweep parameter parsing (invariant across prev_k) ---
@@ -2139,21 +2132,6 @@ def _bench_config(
             retry_set = getattr(args, "_retry_cells_set", None)
             if retry_set and sweep_tag not in retry_set:
                 continue
-            # Resume from JSONL: skip cells already recorded.  Built the same
-            # way _print_row builds JSON keys; must stay in sync.
-            done_keys = getattr(args, "_done_keys", None)
-            if done_keys:
-                # One key per scenario (k=6, k=11, mix) — skip the whole cell
-                # only if ALL of its scenarios are already done.  We don't
-                # know which scenarios will be emitted here without
-                # re-evaluating the inner scenario loop; conservatively skip
-                # only when the prev_k_for_print's specific key is done.
-                _resume_key = _build_json_key(
-                    args.variant, batch, mtp_len, prev_k_for_print,
-                    state_dtype_name, sweep_suffix, args.tp_size,
-                )
-                if _resume_key in done_keys:
-                    continue
             if warmup_only:
                 reset_fn()
                 if scenario_pre_iter is not None:
@@ -2223,8 +2201,6 @@ def _bench_config(
                         json_results=getattr(args, "_json_results", None),
                         tp_size=args.tp_size,
                         json_detailed=getattr(args, "json_detailed", False),
-                        jsonl_path=getattr(args, "_jsonl_path", None),
-                        jsonl_host=getattr(args, "_jsonl_host", None),
                     )
 
 
@@ -2282,8 +2258,6 @@ def _print_row(
     json_results=None,
     tp_size=None,
     json_detailed=False,
-    jsonl_path=None,
-    jsonl_host=None,
 ):
     """Print one summary row and optionally accumulate stats for JSON output.
 
@@ -2291,12 +2265,6 @@ def _print_row(
     [per_kernel]}.  The summary table only shows the headline percentiles.
     JSON output captures median/p95/p99/n by default; with json_detailed=True
     it also captures the per-iter and per-kernel data.
-
-    When `jsonl_path` is provided, also appends one JSON line per row to the
-    JSONL sidecar (crash-safe incremental persistence; lets a killed sweep
-    resume from the last completed cell on rerun).  Open-per-write because
-    `args` is pickled to ProcessPoolExecutor workers and file handles aren't
-    picklable.
     """
     kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
     print(
@@ -2311,25 +2279,12 @@ def _print_row(
             sweep_suffix, tp_size,
         )
         if json_detailed:
-            row_stats = stats
+            json_results[key] = stats
         else:
-            row_stats = {
+            json_results[key] = {
                 k: stats[k] for k in ("median", "p95", "p99", "n")
                 if k in stats
             }
-        json_results[key] = row_stats
-        # Append to JSONL sidecar if a path is set (incremental persistence).
-        # Open per-write because args is pickled to ProcessPoolExecutor
-        # workers, and file handles aren't picklable.  A clean SIGTERM or
-        # Python exception will leave the file consistent up to the last
-        # newline; catastrophic kills can leave a partial last line, which
-        # the resume reader tolerates via json.JSONDecodeError pass.
-        if jsonl_path is not None:
-            rec = {"key": key, "stats": row_stats}
-            if jsonl_host is not None:
-                rec["host"] = jsonl_host
-            with open(jsonl_path, "a") as f:
-                f.write(json.dumps(rec) + "\n")
 
 
 # Main benchmark loop
@@ -2339,70 +2294,6 @@ def _run_benchmark(args) -> None:
     # JSON accumulator — populated by _print_row when --json-output is set.
     # Stash on args so we don't need to thread a dict through every helper.
     args._json_results = {} if getattr(args, "json_output", None) else None
-
-    # JSONL incremental sidecar.  Path = `<json_output>.jsonl`.  Each completed
-    # cell appends one line `{"key": <json_key>, "stats": {...}}` to this file
-    # as it finishes timing.  On startup we read this sidecar (if present) and
-    # populate _json_results + _done_keys so a killed bench can resume without
-    # redoing already-timed cells.  Crash-safe by construction: append-only
-    # writes survive SIGTERM/SIGKILL/reboot mid-sweep.
-    # Note: we store only paths/strings on `args` because args is pickled to
-    # ProcessPoolExecutor workers during compile-warmup, and file handles
-    # (TextIOWrapper) aren't picklable.  _print_row open-appends per cell.
-    args._jsonl_path = None
-    args._done_keys: set[str] = set()
-    args._jsonl_host = None  # hostname stamp for the current run
-    if getattr(args, "json_output", None):
-        import socket
-        args._jsonl_host = socket.gethostname()
-        args._jsonl_path = args.json_output + ".jsonl"
-        # Read existing JSONL if present; build skip set IFF hostname matches.
-        # Cross-node timings aren't directly comparable (CPU/GPU clock/topology
-        # differ), so resuming on a new host would mix incompatible numbers.
-        # If the JSONL was recorded on a different host, log + skip resume so
-        # the user can decide (rename / archive the old file).
-        if os.path.exists(args._jsonl_path):
-            n_loaded = 0
-            n_skipped_host = 0
-            recorded_hosts = set()
-            with open(args._jsonl_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        # Tolerate partial last line from a crash mid-write.
-                        continue
-                    rec_host = rec.get("host")
-                    if rec_host is not None:
-                        recorded_hosts.add(rec_host)
-                    if rec_host is not None and rec_host != args._jsonl_host:
-                        n_skipped_host += 1
-                        continue
-                    k = rec.get("key")
-                    if k is None:
-                        continue
-                    args._json_results[k] = rec.get("stats", {})
-                    args._done_keys.add(k)
-                    n_loaded += 1
-            if n_loaded:
-                print(
-                    f"[resume] {args._jsonl_path}: loaded {n_loaded} prior "
-                    f"cell results from host={args._jsonl_host}; sweep will "
-                    f"skip them.",
-                    file=sys.stderr,
-                )
-            if n_skipped_host:
-                print(
-                    f"[resume] WARNING: {args._jsonl_path} also contains "
-                    f"{n_skipped_host} records from other hosts "
-                    f"{sorted(recorded_hosts - {args._jsonl_host})!r}; ignoring "
-                    f"them.  If you want a clean run, remove or archive the "
-                    f"jsonl file first.",
-                    file=sys.stderr,
-                )
 
     # Skipped cells accumulator — populated by _bench_config when CUPTI capture
     # mismatch causes a cell to be skipped.  Written to args.skipped_output
