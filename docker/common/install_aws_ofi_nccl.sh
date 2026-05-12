@@ -7,6 +7,9 @@ set -ex
 # unconditionally from Dockerfile.multi.
 
 AWS_OFI_NCCL_VERSION="${AWS_OFI_NCCL_VERSION:-v1.16.2}"
+# Upstream tags are prefixed with "v" (e.g. v1.17.0). Accept either form so
+# callers passing "1.17.0" still resolve to a valid tag.
+[[ "${AWS_OFI_NCCL_VERSION}" =~ ^[0-9] ]] && AWS_OFI_NCCL_VERSION="v${AWS_OFI_NCCL_VERSION}"
 AWS_OFI_NCCL_REPO="https://github.com/aws/aws-ofi-nccl.git"
 AWS_OFI_NCCL_PREFIX="/opt/aws-ofi-nccl"
 EFA_PREFIX="/opt/amazon/efa"
