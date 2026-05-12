@@ -401,6 +401,8 @@ class SquaredReLU(nn.Module):
 
 # Source codes are from NemotronH_Nano_VL_V2 modeling.py.
 class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
+    _supports_flash_attn = True
+
     def __init__(self, model_config: ModelConfig[transformers.PretrainedConfig]):
         config = model_config.pretrained_config
         super().__init__(config)

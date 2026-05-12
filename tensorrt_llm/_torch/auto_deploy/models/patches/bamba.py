@@ -4,29 +4,32 @@ from typing import Optional
 
 import torch
 from torch import nn
+from transformers.cache_utils import Cache
+from transformers.models.bamba.modeling_bamba import (
+    ALL_ATTENTION_FUNCTIONS,
+    BambaAttention,
+    BambaMixer,
+    BambaModel,
+    BambaPreTrainedModel,
+    apply_mask_to_padding_states,
+    apply_rotary_pos_emb,
+    eager_attention_forward,
+)
 
 from ...custom_ops.attention_interface import BatchInfo
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
+# transformers>=5.5 removed ``HybridMambaAttentionDynamicCache`` (replaced by the
+# generic ``Cache`` base class with per-layer ``layers[i].conv_states`` /
+# ``layers[i].recurrent_states`` fields). Importing it lazily keeps the patch
+# resilient if a future release drops the old name entirely but reintroduces a
+# bool quirk on the unified cache class.
 try:
     from transformers.models.bamba.modeling_bamba import (
-        BambaMixer,
-        BambaModel,
-        BambaPreTrainedModel,
-        HybridMambaAttentionDynamicCache,
-        apply_mask_to_padding_states,
+        HybridMambaAttentionDynamicCache as _HybridMambaAttentionDynamicCache,
     )
-
-    _BAMBA_AVAILABLE = True
 except ImportError:
-    # transformers>=5.5 removed HybridMambaAttentionDynamicCache and
-    # apply_mask_to_padding_states from modeling_bamba. Skip patch registration
-    # in that case; bamba models won't be exportable under newer transformers
-    # until this patch is updated.
-    BambaMixer = BambaModel = BambaPreTrainedModel = None
-    HybridMambaAttentionDynamicCache = None
-    apply_mask_to_padding_states = None
-    _BAMBA_AVAILABLE = False
+    _HybridMambaAttentionDynamicCache = None
 
 
 # Original implementation:
@@ -36,7 +39,7 @@ except ImportError:
 def _bamba_mixer_torch_forward(
     self,
     input_states,
-    cache_params: Optional[HybridMambaAttentionDynamicCache] = None,
+    cache_params: Optional[Cache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
 ):
@@ -83,7 +86,7 @@ def _bamba_mixer_torch_forward(
                 slot_idx_t,
                 use_initial_states_t,
                 # CACHES
-                cache_params.conv_states[self.layer_idx],
+                cache_params.layers[self.layer_idx].conv_states,
                 # CONSTANTS
                 self.conv1d.stride[0],
                 self.conv1d.padding[0],
@@ -138,7 +141,7 @@ def _bamba_mixer_torch_forward(
             slot_idx=slot_idx_t,
             use_initial_states=use_initial_states_t,
             # CACHES
-            ssm_state_cache=cache_params.ssm_states[self.layer_idx],
+            ssm_state_cache=cache_params.layers[self.layer_idx].recurrent_states,
             # CONSTANTS
             time_step_limit=list(self.time_step_limit),
             chunk_size=self.chunk_size,
@@ -168,10 +171,55 @@ def _bamba_mixer_torch_forward(
     return contextualized_states
 
 
-# The original implementation looks at `cache_position[0]` to decide what to do which does not
-# play well with export. Plus, we do not want it to be updated anyway.
-def _bamba_model_update_mamba_mask(self, attention_mask, cache_position):
+# Original 5.3.x signature was ``(self, attention_mask, cache_position)``; transformers>=5.5
+# renamed the second argument to ``past_key_values`` (mask handling unified under the new cache).
+# Accept the new name and ignore both — we just want to disable the mask for export.
+def _bamba_model_update_mamba_mask(self, attention_mask, past_key_values):
     return None
+
+
+# transformers>=5.5 rewrote `DynamicLayer.update` to lazily allocate the cache by calling
+# `torch.tensor([], device=...)`, which torch.export's fake-tensor tracer rejects on the
+# `meta` device. The original 5.3.x flow exposed a typed `HybridMambaAttentionDynamicCache`
+# whose attention layers carried pre-allocated key/value tensors so this didn't trigger.
+# During export we don't actually need to maintain the KV cache — the AutoDeploy runtime
+# substitutes its own cached attention kernel later — so just skip the cache.update call.
+def _bamba_attention_forward(
+    self,
+    hidden_states,
+    position_embeddings=None,
+    attention_mask=None,
+    past_key_values=None,
+    **kwargs,
+):
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
 
 
 def _bamba_model_update_causal_mask(
@@ -211,22 +259,14 @@ def _cache_bool(self) -> bool:
     return True
 
 
-def _register_if_available(name):
-    def _decorate(cls):
-        if _BAMBA_AVAILABLE:
-            return ExportPatchRegistry.register(name)(cls)
-        return cls
-
-    return _decorate
-
-
-@_register_if_available("bamba")
+@ExportPatchRegistry.register("bamba")
 class BambaModelPatch(BaseExportPatch):
     """Patch for `BambaMixer`."""
 
     def _apply_patch(self):
         self.original_values["BambaMixer.torch_forward"] = BambaMixer.torch_forward
         self.original_values["BambaModel._update_mamba_mask"] = BambaModel._update_mamba_mask
+        self.original_values["BambaAttention.forward"] = BambaAttention.forward
         # Older transformers expose both; newer releases dropped `_update_causal_mask` on `BambaModel`
         # (mask handling consolidated under `_update_mamba_mask`).
         if hasattr(BambaModel, "_update_causal_mask"):
@@ -236,22 +276,26 @@ class BambaModelPatch(BaseExportPatch):
 
         BambaMixer.torch_forward = _bamba_mixer_torch_forward
         BambaModel._update_mamba_mask = _bamba_model_update_mamba_mask
+        BambaAttention.forward = _bamba_attention_forward
         if hasattr(BambaModel, "_update_causal_mask"):
             BambaModel._update_causal_mask = _bamba_model_update_causal_mask
-        HybridMambaAttentionDynamicCache.__bool__ = _cache_bool
-        # BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
+        if _HybridMambaAttentionDynamicCache is not None:
+            self.original_values["HybridMambaAttentionDynamicCache.__bool__"] = (
+                _HybridMambaAttentionDynamicCache.__bool__
+            )
+            _HybridMambaAttentionDynamicCache.__bool__ = _cache_bool
 
     def _revert_patch(self):
         BambaMixer.torch_forward = self.original_values["BambaMixer.torch_forward"]
         BambaModel._update_mamba_mask = self.original_values["BambaModel._update_mamba_mask"]
+        BambaAttention.forward = self.original_values["BambaAttention.forward"]
         if "BambaModel._update_causal_mask" in self.original_values:
             BambaModel._update_causal_mask = self.original_values["BambaModel._update_causal_mask"]
-        del HybridMambaAttentionDynamicCache.__bool__
-        # BambaPreTrainedModel._init_weights = self.original_values[
-        #     "BambaPreTrainedModel._init_weights"
-        # ]
+        if "HybridMambaAttentionDynamicCache.__bool__" in self.original_values:
+            _HybridMambaAttentionDynamicCache.__bool__ = self.original_values[
+                "HybridMambaAttentionDynamicCache.__bool__"
+            ]
 
 
 # NOTE: patch that is used during build model time
-if _BAMBA_AVAILABLE:
-    BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
+BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
