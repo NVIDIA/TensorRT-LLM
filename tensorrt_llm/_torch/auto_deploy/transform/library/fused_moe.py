@@ -2876,7 +2876,7 @@ class FuseNVFP4MoeConfig(TransformConfig):
     enable_trtllm_gen_internal_routing: bool = Field(
         default=True,
         description=(
-            "If True and backend='trtllm_gen', pass DeepSeekV3 router logits and routing bias "
+            "If True and backend='trtllm_gen', pass router logits and routing bias "
             "directly to TRTLLM-Gen MoE when the routing tensors come from trtllm.noaux_tc_op."
         ),
     )
