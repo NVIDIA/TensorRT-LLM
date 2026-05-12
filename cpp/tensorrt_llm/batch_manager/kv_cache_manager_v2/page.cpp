@@ -108,10 +108,13 @@ CommittedPage::~CommittedPage()
 {
     if (block != nullptr)
     {
-        block->unlinkPage(lifeCycle);
+        // unlinkPage nulls storage[lc]->block (i.e. our member), so capture
+        // the block pointer via the returned previous-page identity check.
+        Block* blk = block;
+        [[maybe_unused]] auto* prev = blk->unlinkPage(lifeCycle);
+        assert(prev == this && "unlinkPage returned unexpected page");
         LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
-        auto detachedBlocks = Block::clearStaleBlocksAfterPageUnlink(*block, lifeCycle, lc);
-        (void) detachedBlocks;
+        Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
     }
     // Delegate slot release to Page::~Page().
 }
@@ -440,6 +443,84 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
         locks.emplace_back(t.page->lock(kvCache, t.beamIndex, t.ordinal, t.lifeCycle,
             /*skipWait=*/true));
     return locks;
+}
+
+// ---------------------------------------------------------------------------
+// ScratchSlotLock
+// ---------------------------------------------------------------------------
+
+ScratchSlotLock::ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, bool skipWait)
+    : mOwner(&owner)
+    , mLifeCycle(lifeCycle)
+{
+    if (!skipWait)
+    {
+        slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(owner.cudaStream()));
+    }
+    mSlot.setSlot(slot);
+}
+
+ScratchSlotLock::~ScratchSlotLock()
+{
+    if (mSlot.hasValidSlot())
+    {
+        try
+        {
+            unlock();
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+ScratchSlotLock::ScratchSlotLock(ScratchSlotLock&& other) noexcept
+    : mSlot(std::move(other.mSlot))
+    , mOwner(other.mOwner)
+    , mLifeCycle(other.mLifeCycle)
+{
+    // Invalidate moved-from: mSlot move only transfers readyEvent, not slotId (trivially-copyable).
+    other.mSlot.resetSlot();
+    other.mOwner = nullptr;
+}
+
+ScratchSlotLock& ScratchSlotLock::operator=(ScratchSlotLock&& other) noexcept
+{
+    if (this != &other)
+    {
+        if (mSlot.hasValidSlot())
+        {
+            try
+            {
+                unlock();
+            }
+            catch (...)
+            {
+            }
+        }
+        mSlot = std::move(other.mSlot);
+        other.mSlot.resetSlot(); // Invalidate moved-from slotId.
+        mOwner = other.mOwner;
+        mLifeCycle = other.mLifeCycle;
+        other.mOwner = nullptr;
+    }
+    return *this;
+}
+
+Slot ScratchSlotLock::detachSlot()
+{
+    assert(mSlot.hasValidSlot());
+    Slot result;
+    result.setSlot(mSlot);
+    return result;
+}
+
+void ScratchSlotLock::unlock()
+{
+    assert(mSlot.hasValidSlot());
+    mSlot.readyEvent = mOwner->finishEvent();
+    mOwner->storageManager()->releaseSlot(mLifeCycle, kGpuLevel, std::move(mSlot));
+    assert(!mSlot.hasValidSlot());
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

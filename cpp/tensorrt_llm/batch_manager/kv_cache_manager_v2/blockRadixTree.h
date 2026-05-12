@@ -189,7 +189,8 @@ struct Block : NodeBase, std::enable_shared_from_this<Block>
     int partialMatchThisNode(TokenIdExt const* otherTokens, size_t count) const;
 
     // Break the bidirectional link to the cached page for a lifecycle.
-    void unlinkPage(LifeCycleId lcIdx);
+    // Returns the previously-stored CommittedPage* (nullptr if already unlinked).
+    CommittedPage* unlinkPage(LifeCycleId lcIdx);
 
     // Clear stale tree nodes after a lifecycle page has been unlinked.
     // Returns detached blocks that must stay alive until cleanup completes.

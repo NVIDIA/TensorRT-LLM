@@ -37,6 +37,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations.
 class KvCacheManager;
 class StorageManager;
+struct ScratchDesc;
 
 // ---------------------------------------------------------------------------
 // BlockPage — what a SeqBlock holds per (beamIndex, lifeCycleId):
@@ -352,6 +353,23 @@ public:
     // Returns kBadPageIndex if no SSM blocks are allocated.
     int getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx = 0) const;
 
+    // ---- SWA scratch slot management ------------------------------------------
+
+    // Return scratch metadata for a layer group, or nullopt if no scratch blocks.
+    std::optional<ScratchDesc> getScratchDesc(LayerGroupId lgId) const;
+
+    // True if any lifecycle has scratch slots allocated.
+    bool hasScratchSlots() const;
+
+    // Whether SWA scratch reuse is enabled for this KvCache.
+    bool isSwaScratchReuseEnabled() const noexcept;
+
+    // Enable or disable SWA scratch reuse. Throws if the transition is invalid.
+    void setEnableSwaScratchReuse(bool enable);
+
+    // Whether the given page index mode is supported (SHARED requires no scratch slots).
+    bool supportsIndexMode(PageIndexMode mode) const;
+
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);
@@ -437,8 +455,35 @@ private:
     // Mirrors Python's _check_sanity(). Returns true on success (asserts internally).
     bool _checkSanity() const;
 
+    // ---- SWA scratch private helpers ------------------------------------------
+
+    // Compute the scratch block range for a lifecycle.
+    HalfOpenRange _getScratchRange(LifeCycle const& lc, std::optional<int> hlOverride = std::nullopt,
+        std::optional<int> capOverride = std::nullopt) const;
+
+    // Result of _takeExcessScratchSlots: excess locks, per-lc delta counts, and scratch ranges.
+    struct DeltaScratchSlots
+    {
+        std::vector<std::vector<ScratchSlotLock>> excess;
+        std::vector<int> deltaCnt;
+        std::vector<HalfOpenRange> scratchRanges;
+    };
+
+    // Compute and remove excess scratch slots for a new capacity/historyLength.
+    DeltaScratchSlots _takeExcessScratchSlots(int capacity, int historyLength);
+
+    // Recover previously taken excess scratch slots back into mScratchSlots.
+    void _recoverExcessScratchSlots(std::vector<std::vector<ScratchSlotLock>>& excess);
+
+    // Release all scratch slots back to storage.
+    void _freeScratchSlots();
+
+    // Whether any lifecycle would require scratch blocks at the current state.
+    bool _wouldUseSwaScratchBlocks() const;
+
     // Page index table management.
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
+    void _checkPageIndexBufferCapacity(int newNumBlocks) const;
     void _resizePageIndexBuffers(int newNumBlocks);
 
     std::shared_ptr<KvCacheManager> mManager;
@@ -468,6 +513,10 @@ private:
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     std::vector<std::vector<BlockPage>> mSsmBlocks;
     bool mNeverResumed = true;
+
+    // SWA scratch slot support.
+    bool mEnableSwaScratchReuse = false;
+    std::vector<std::vector<ScratchSlotLock>> mScratchSlots; // [LifeCycleId][]
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

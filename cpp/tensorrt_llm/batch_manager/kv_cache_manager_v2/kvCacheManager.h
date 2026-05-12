@@ -68,14 +68,39 @@ struct AggregatedPageDesc
 };
 
 // ---------------------------------------------------------------------------
+// ScratchDesc — scratch metadata for one layer group of one sequence.
+// Scratch blocks store ephemeral KV data using shared coalesced slots.
+// Mirrors _kv_cache_manager.py::ScratchDesc.
+// ---------------------------------------------------------------------------
+struct ScratchDesc
+{
+    HalfOpenRange range;      // block ordinal range [beg, end)
+    std::vector<int> slotIds; // scratch slot IDs, length = ceil(numScratchBlocks / scale)
+
+    explicit operator bool() const noexcept
+    {
+        return static_cast<bool>(range);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // PageIndexConverter — convert base page index → kernel page indices.
 // ---------------------------------------------------------------------------
 struct PageIndexConverter
 {
     int scale;
     int expansion;
+    int layerOffset = 0;          // sub-page offset within coalesced slot
+    int scratchPagesPerBlock = 1; // sub-pages per block for scratch allocation
 
-    // Convert one base index to `expansion` kernel indices.
+    // Convert a sequence of base page indices to per-layer page indices.
+    // indexMode: SHARED (default) or PER_LAYER. When scratch is active, must be PER_LAYER.
+    // scratch: optional scratch descriptor from KvCache::getScratchDesc().
+    // Mirrors _kv_cache_manager.py::PageIndexConverter.__call__.
+    std::vector<int> operator()(std::vector<int> const& baseIndices,
+        std::optional<PageIndexMode> indexMode = std::nullopt, ScratchDesc const* scratch = nullptr) const;
+
+    // Backward-compatible single-index overload.
     std::vector<int> operator()(int baseIndex) const;
 };
 
@@ -110,7 +135,11 @@ public:
 
     // ---- Memory pool queries -----------------------------------------------
 
-    MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;
+    // Base address of the memory pool. When indexMode is PER_LAYER, returns pool group base
+    // (without per-layer offset). When SHARED, returns per-layer base (with offset baked in).
+    MemAddress getMemPoolBaseAddress(
+        LayerId layerId, DataRole role, std::optional<PageIndexMode> indexMode = std::nullopt) const;
+
     int getPageStride(LayerId layerId, DataRole role) const;
     int getPageIndexUpperBound(LayerId layerId, DataRole role) const;
 
@@ -133,6 +162,15 @@ public:
     {
         return mConfig.ssmReuseInterval;
     }
+
+    bool isSwaScratchReuseEnabled() const noexcept
+    {
+        return mConfig.enableSwaScratchReuse;
+    }
+
+    // Whether managed KV caches support the given page index mode.
+    // Returns true/false for a definitive answer, nullopt for per-instance check.
+    std::optional<bool> supportsIndexMode(PageIndexMode mode) const;
 
     bool allowSeqRebasing() const noexcept
     {

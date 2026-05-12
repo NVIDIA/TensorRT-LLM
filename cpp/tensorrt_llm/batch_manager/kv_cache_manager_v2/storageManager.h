@@ -91,7 +91,8 @@ class StorageManager : public std::enable_shared_from_this<StorageManager>
 {
 public:
     StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
-        std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {});
+        bool enableSwaScratchReuse = false, std::optional<BatchDesc> const& typicalBatch = std::nullopt,
+        std::vector<BatchDesc> const& constraints = {});
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -186,13 +187,20 @@ public:
     std::vector<float> ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const;
 
     // Compute ratio from a BatchDesc.
-    std::vector<float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock, int granularity) const;
+    std::vector<float> ratioFromBatch(
+        BatchDesc const& batch, int tokensPerBlock, bool enableScratch, int granularity) const;
 
     // Apply stored min_slots constraint to a ratio list for GPU level.
     std::vector<float> constrainRatio(std::vector<float> const& ratio) const;
 
-    // Byte address of a slot's buffer in GPU memory.
+    // Byte address of a slot's buffer in GPU memory (per-layer, with offset).
     MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;
+
+    // Pool group base address without per-layer offset.
+    MemAddress getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
+    // Per-layer storage attributes.
+    LayerAttr const& getLayerAttr(LayerId layerId) const;
 
     // Address of a slot's buffer in a specific pool at a cache level.
     Address slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, int poolIdx) const;
@@ -216,13 +224,19 @@ public:
         return mLayerToLifeCycleIds;
     }
 
+    // Per-lifecycle max slot utilization fraction (for scratch slot computation).
+    Rational const& slotUtilFracMax(LifeCycleId lcId) const
+    {
+        return mSlotUtilFracMax.at(static_cast<size_t>(lcId));
+    }
+
     friend class KvCacheManager;
 
 private:
     // Constraint-based partitioning helpers.
     std::vector<int> computeMinSlotsFromConstraints(
-        std::vector<BatchDesc> const& constraints, int tokensPerBlock) const;
-    std::vector<int> computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock) const;
+        std::vector<BatchDesc> const& constraints, int tokensPerBlock, bool enableScratch) const;
+    std::vector<int> computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock, bool enableScratch) const;
     std::vector<size_t> slotsToBytes(std::vector<int> const& numSlots, int granularity) const;
     std::vector<int> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         std::vector<std::vector<int>> const& slotSizeLists, std::vector<float> const& ratio) const;
@@ -247,6 +261,15 @@ private:
 
     // slot-to-page-index scale factors: [lcId][poolIdx]
     std::vector<std::vector<int>> mSlotToPageIndices;
+
+    // Per-layer storage attributes for scratch slot management.
+    std::map<LayerId, LayerAttr> mLayerAttributes;
+
+    // Max slot utilization fraction per lifecycle (across all layers in that lifecycle).
+    std::vector<Rational> mSlotUtilFracMax;
+
+    // Whether SWA scratch reuse is enabled.
+    bool mEnableSwaScratchReuse = false;
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().

@@ -254,6 +254,13 @@ struct KVCacheManagerConfig
     // Must be a positive multiple of tokensPerBlock. Only takes effect when SSM layers are present.
     int ssmReuseInterval = 512;
 
+    // When true, SWA layers reuse physical pages for out-of-window blocks during prefill.
+    // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing
+    // layer, reducing peak memory. Trade-off: KV cache reuse is degraded because scratch blocks
+    // have no preserved data after the step.
+    // Mirrors _config.py::KVCacheManagerConfig.enable_swa_scratch_reuse.
+    bool enableSwaScratchReuse = false;
+
     std::optional<HelixConfig> helixConfig; // unsupported yet
 
     void validate() const;

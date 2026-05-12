@@ -233,4 +233,39 @@ struct BatchedLockTarget
 // ---------------------------------------------------------------------------
 std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
+// ---------------------------------------------------------------------------
+// ScratchSlotLock — manages a scratch slot for SWA prefill memory reuse.
+// Wraps a Slot with owner (KvCache) and lifecycle references.
+// On destruction, releases the slot back to the StorageManager.
+// Mirrors _page.py::ScratchSlotLock.
+// ---------------------------------------------------------------------------
+class ScratchSlotLock
+{
+public:
+    ScratchSlotLock(Slot slot, KvCache& owner, LifeCycleId lifeCycle, bool skipWait = false);
+    ~ScratchSlotLock();
+
+    ScratchSlotLock(ScratchSlotLock&& other) noexcept;
+    ScratchSlotLock& operator=(ScratchSlotLock&& other) noexcept;
+
+    ScratchSlotLock(ScratchSlotLock const&) = delete;
+    ScratchSlotLock& operator=(ScratchSlotLock const&) = delete;
+
+    // Detach and return the slot (transfers ownership to caller).
+    Slot detachSlot();
+
+    // Release the slot back to storage manager.
+    void unlock();
+
+    Slot const& slot() const noexcept
+    {
+        return mSlot;
+    }
+
+private:
+    Slot mSlot;
+    KvCache* mOwner;
+    LifeCycleId mLifeCycle;
+};
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

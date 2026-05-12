@@ -108,15 +108,28 @@ std::vector<std::vector<int>> computeSlotToPageIndices(StorageConfig const& conf
 // ---------------------------------------------------------------------------
 
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
-    std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints)
+    bool enableSwaScratchReuse, std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints)
     : mLifeCycles(lifeCycles)
     , mStorageConfig(config)
+    , mEnableSwaScratchReuse(enableSwaScratchReuse)
 {
     mLifeCycleGrouping = config.lifeCycleGrouping();
     mLayerToLifeCycleIds = config.layerToLifeCycleIds();
     mSlotToPageIndices = computeSlotToPageIndices(config);
     mBufferAttr = config.bufferAttributes();
     mSlotDescList = config.slotDescList;
+
+    // Compute layer attributes and slot utilization fractions for scratch support.
+    mLayerAttributes = config.layerAttributes();
+    mSlotUtilFracMax.resize(static_cast<size_t>(lifeCycles.size()), Rational{0, 1});
+    for (auto const& [layerId, layerAttr] : mLayerAttributes)
+    {
+        auto lcIdx = static_cast<size_t>(layerAttr.lifeCycleId);
+        if (layerAttr.slotUtilFracMax > mSlotUtilFracMax[lcIdx])
+        {
+            mSlotUtilFracMax[lcIdx] = layerAttr.slotUtilFracMax;
+        }
+    }
 
     assert(std::all_of(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end(),
         [this](PoolGroupIndex pg) { return pg < numPoolGroups(); }));
@@ -140,13 +153,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     int gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
     // Compute min_slots from constraints.
-    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock);
+    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, enableSwaScratchReuse);
 
     // Compute init_ratio from typical_batch, constraints, or fallback.
     std::vector<float> initRatio;
     if (typicalBatch.has_value())
     {
-        initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, gpuGranularity);
+        initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, enableSwaScratchReuse, gpuGranularity);
     }
     else if (!constraints.empty())
     {
@@ -159,7 +172,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         // Fallback: average history length 2048.
         BatchDesc fallback;
         fallback.kvCaches.push_back(KVCacheDesc{2049, 2048});
-        initRatio = ratioFromBatch(fallback, tokensPerBlock, gpuGranularity);
+        initRatio = ratioFromBatch(fallback, tokensPerBlock, enableSwaScratchReuse, gpuGranularity);
     }
 
     int numLevels = static_cast<int>(config.cacheTiers.size());
@@ -693,6 +706,19 @@ MemAddress StorageManager::getMemPoolBaseAddress(LayerId layerId, DataRole role)
     return mLevels[0].storage->getBaseAddress(pgIdx, attr.poolIndex, SlotId(0)) + attr.offset;
 }
 
+MemAddress StorageManager::getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    return mLevels[0].storage->getBaseAddress(pgIdx, poolIdx, SlotId(0));
+}
+
+LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const
+{
+    auto it = mLayerAttributes.find(layerId);
+    if (it == mLayerAttributes.end())
+        throw std::out_of_range("Unknown LayerId for LayerAttr");
+    return it->second;
+}
+
 int StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const
 {
     return mLevels.at(static_cast<size_t>(level)).storage->numSlots(pgIdx);
@@ -938,9 +964,10 @@ std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int histo
 // ratioFromBatch
 // ---------------------------------------------------------------------------
 
-std::vector<float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock, int granularity) const
+std::vector<float> StorageManager::ratioFromBatch(
+    BatchDesc const& batch, int tokensPerBlock, bool enableScratch, int granularity) const
 {
-    auto numSlots = computeSlotsForBatch(batch, tokensPerBlock);
+    auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, enableScratch);
     auto numBytes = slotsToBytes(numSlots, granularity);
     return normalizeToRatio(numBytes);
 }
@@ -950,7 +977,7 @@ std::vector<float> StorageManager::ratioFromBatch(BatchDesc const& batch, int to
 // ---------------------------------------------------------------------------
 
 std::vector<int> StorageManager::computeMinSlotsFromConstraints(
-    std::vector<BatchDesc> const& constraints, int tokensPerBlock) const
+    std::vector<BatchDesc> const& constraints, int tokensPerBlock, bool enableScratch) const
 {
     // Default floor: 1 slot per life cycle in each pool group.
     std::vector<int> maxSlots(static_cast<size_t>(numPoolGroups()), 0);
@@ -958,7 +985,7 @@ std::vector<int> StorageManager::computeMinSlotsFromConstraints(
         maxSlots[static_cast<size_t>(pgIdx)] += 1;
     for (auto const& batch : constraints)
     {
-        auto slots = computeSlotsForBatch(batch, tokensPerBlock);
+        auto slots = computeSlotsForBatch(batch, tokensPerBlock, enableScratch);
         for (int pg = 0; pg < numPoolGroups(); ++pg)
             maxSlots[pg] = std::max(maxSlots[pg], slots[pg]);
     }
@@ -969,7 +996,8 @@ std::vector<int> StorageManager::computeMinSlotsFromConstraints(
 // computeSlotsForBatch
 // ---------------------------------------------------------------------------
 
-std::vector<int> StorageManager::computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock) const
+std::vector<int> StorageManager::computeSlotsForBatch(
+    BatchDesc const& batch, int tokensPerBlock, bool enableScratch) const
 {
     std::vector<int> numSlots(static_cast<size_t>(numPoolGroups()), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
@@ -1001,7 +1029,19 @@ std::vector<int> StorageManager::computeSlotsForBatch(BatchDesc const& batch, in
             auto stale = getStaleRange(lc, kv.historyLength, tokensPerBlock);
             int nonStale = totalBlocks - stale.length();
             int nonStaleSys = sysBlocks - intersect(stale, sysRange).length();
-            numSlots[static_cast<size_t>(pgIdx)] += std::max(0, nonStale - nonStaleSys);
+            int uniqueNonStale = std::max(0, nonStale - nonStaleSys);
+            if (enableScratch)
+            {
+                auto scratch = computeScratchRange(lc, kv.historyLength, kv.capacity, tokensPerBlock);
+                int numScratch = scratch.length();
+                // Scratch blocks share coalesced slots: actual slots = ceil(numScratch * fracMax).
+                numSlots[static_cast<size_t>(pgIdx)]
+                    += (uniqueNonStale - numScratch) + mSlotUtilFracMax[static_cast<size_t>(lcIdx)].ceilMul(numScratch);
+            }
+            else
+            {
+                numSlots[static_cast<size_t>(pgIdx)] += uniqueNonStale;
+            }
         }
     }
     return numSlots;

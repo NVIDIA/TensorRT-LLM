@@ -139,6 +139,49 @@ struct BufferAttr
 };
 
 // ---------------------------------------------------------------------------
+// Rational — exact fraction for slot utilization computations.
+// Mirrors Python's fractions.Fraction used in _storage/_config.py::LayerAttr.
+// ---------------------------------------------------------------------------
+struct Rational
+{
+    int num = 0;
+    int den = 1;
+
+    // ceil(n * num / den). Uses int64_t intermediates to avoid overflow.
+    [[nodiscard]] int ceilMul(int value) const noexcept
+    {
+        auto n = static_cast<int64_t>(value) * num;
+        return static_cast<int>((n + den - 1) / den);
+    }
+
+    bool operator>(Rational const& other) const noexcept
+    {
+        return static_cast<int64_t>(num) * other.den > static_cast<int64_t>(other.num) * den;
+    }
+
+    bool operator==(Rational const& other) const noexcept
+    {
+        return static_cast<int64_t>(num) * other.den == static_cast<int64_t>(other.num) * den;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// LayerAttr — per-layer storage attributes for scratch slot management.
+// Mirrors _storage/_config.py::LayerAttr.
+// ---------------------------------------------------------------------------
+struct LayerAttr
+{
+    LifeCycleId lifeCycleId = 0;
+
+    // Number of sub-pages within a single coalesced slot that belong to this layer,
+    // per pool within the pool group.
+    std::vector<int> slotUtil;
+
+    // Fraction of slot_util to total number of buffers in the slot, max over all pools.
+    Rational slotUtilFracMax;
+};
+
+// ---------------------------------------------------------------------------
 // StorageConfig — complete storage layout for the KV cache.
 // Mirrors _storage/_config.py::StorageConfig.
 // ---------------------------------------------------------------------------
@@ -158,6 +201,10 @@ struct StorageConfig
 
     // Map LayerId → LifeCycleId.
     std::unordered_map<LayerId, LifeCycleId> layerToLifeCycleIds() const;
+
+    // Per-layer storage attributes (slot utilization within coalesced slots).
+    // Mirrors _storage/_config.py::StorageConfig.layer_attributes().
+    std::map<LayerId, LayerAttr> layerAttributes() const;
 
     int numLifeCycles() const;
 };

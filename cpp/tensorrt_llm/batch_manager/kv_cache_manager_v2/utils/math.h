@@ -174,6 +174,13 @@ struct HalfOpenRange
     {
         return !(*this == o);
     }
+
+    // Membership test: is value in [beg, end)?
+    // Mirrors Python's HalfOpenRange.__contains__.
+    [[nodiscard]] bool contains(int value) const noexcept
+    {
+        return beg <= value && value < end;
+    }
 };
 
 // Returns the intersection of two half-open ranges.
