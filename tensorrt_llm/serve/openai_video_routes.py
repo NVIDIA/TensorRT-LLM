@@ -51,7 +51,7 @@ class _VideoRoutesMixin:
             request = await self._parse_video_generation_request(raw_request)
 
             # Resolve the video encode format (mp4/avi/auto)
-            resolved_fmt, resolved_ext = resolve_video_format(request.output_format)
+            resolved_fmt, _ = resolve_video_format(request.output_format)
 
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(
@@ -70,8 +70,11 @@ class _VideoRoutesMixin:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            actual_output_path = output.save(
-                self.media_storage_path / f"{video_id}{resolved_ext}",
+            # Save all generated videos (batch-aware).
+            batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
+            paths_in = [self.media_storage_path / f"{video_id}_{i}" for i in range(batch_size)]
+            saved_paths = output.save(
+                paths_in,
                 format=resolved_fmt,
                 frame_rate=output.frame_rate or request.fps or params.frame_rate,
             )
@@ -82,8 +85,11 @@ class _VideoRoutesMixin:
                 f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s"
             )
 
-            # Determine media type based on actual output file extension
-            actual_path = Path(actual_output_path)
+            # TODO(TRTLLM-11579): the OpenAI Videos API does not yet define a
+            # multi-file response, so we return only the first video as a file
+            # download while persisting all of them to disk.
+            actual_path = saved_paths[0]
+            actual_output_path = str(actual_path)
             media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
 
             return FileResponse(
@@ -240,7 +246,7 @@ class _VideoRoutesMixin:
         """Background task to generate video and save to storage."""
         try:
             # Resolve the video encode format (mp4/avi/auto)
-            resolved_fmt, resolved_ext = resolve_video_format(request.output_format)
+            resolved_fmt, _ = resolve_video_format(request.output_format)
 
             background_start = time.perf_counter()
             future = self.generator.generate_async(inputs=request.prompt, params=params)
@@ -256,8 +262,11 @@ class _VideoRoutesMixin:
                     await VIDEO_STORE.upsert(video_id, job)
                 return
 
-            actual_output_path = output.save(
-                self.media_storage_path / f"{video_id}{resolved_ext}",
+            # Save all generated videos (batch-aware).
+            batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
+            paths_in = [self.media_storage_path / f"{video_id}_{i}" for i in range(batch_size)]
+            saved_paths = output.save(
+                paths_in,
                 format=resolved_fmt,
                 frame_rate=output.frame_rate or request.fps or params.frame_rate,
             )
@@ -271,8 +280,10 @@ class _VideoRoutesMixin:
             if job:
                 job.status = "completed"
                 job.completed_at = int(time.time())
-                # Store actual file extension in case it differs from requested (.mp4 vs .avi)
-                job.output_path = str(actual_output_path)
+                # Store the first path on output_path for single-video
+                # compatibility, and the full list on output_paths.
+                job.output_path = str(saved_paths[0])
+                job.output_paths = [str(p) for p in saved_paths]
                 await VIDEO_STORE.upsert(video_id, job)
 
         except Exception as e:
@@ -442,20 +453,27 @@ class _VideoRoutesMixin:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-            # Delete the video file(s) - check for both .mp4 and .avi
-            video_path = None
-            if job.output_path and os.path.exists(job.output_path):
-                video_path = job.output_path
+            # Delete all generated video files (batch-aware).
+            paths_to_delete: list[str] = []
+            if job.output_paths:
+                paths_to_delete.extend(job.output_paths)
+            elif job.output_path:
+                paths_to_delete.append(job.output_path)
             else:
-                # Fall back to checking common extensions
+                # Fall back to checking common extensions for either the
+                # single-file name or the batch-indexed name.
                 for ext in [".mp4", ".avi"]:
-                    candidate = self.media_storage_path / f"{video_id}{ext}"
-                    if os.path.exists(candidate):
-                        video_path = candidate
+                    for name in (f"{video_id}{ext}", f"{video_id}_0{ext}"):
+                        candidate = self.media_storage_path / name
+                        if os.path.exists(candidate):
+                            paths_to_delete.append(str(candidate))
+                            break
+                    if paths_to_delete:
                         break
 
-            if video_path and os.path.exists(video_path):
-                os.remove(video_path)
+            for video_path in paths_to_delete:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
 
             # Delete from store
             success = await VIDEO_STORE.pop(video_id)

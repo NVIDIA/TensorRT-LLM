@@ -1064,14 +1064,13 @@ def test_transfer_with_gen_prefix_offset(use_v2):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
-    gen only provides suffix block IDs with start_token_idx > 0.
-    _align_kv_blocks should align correctly so only the suffix data is written.
+    gen only provides the suffix block list. The receiver-side prefix is
+    implicit in the block count; the sender derives dst_start from it.
     """
     tensorrt_llm.logger.set_level("info")
     tokens_per_block = 8
     request_len = 32  # 4 blocks
     prefix_blocks = 2  # gen has 2 blocks already cached
-    prefix_tokens = prefix_blocks * tokens_per_block
 
     setup = create_transfer_worker_setup(
         ctx_tp=1,
@@ -1158,12 +1157,12 @@ def test_transfer_with_gen_prefix_offset(use_v2):
             token_range=TokenRange(start=0, end=request_len),
         )
 
-        # Gen receives only suffix blocks with start_token_idx offset
+        # Gen receives only the suffix list; dst_start is derived from block count.
         rx = gen_tw.create_rx_session(gen_request)
         recv_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=gen_suffix_block_ids,
-            token_range=TokenRange(start=prefix_tokens, end=request_len),
+            token_range=TokenRange(start=0, end=request_len),
         )
         rx.receive(recv_slice)
         tx.send(send_slice)
