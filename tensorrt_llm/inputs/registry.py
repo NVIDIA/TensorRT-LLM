@@ -20,6 +20,7 @@ from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+                         _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
@@ -1116,6 +1117,7 @@ def create_input_processor_with_hash(
         if input_ids_tensor.numel() == 0:
             start_positions, start_special_token_positions = [], []
             item_run_cu_offsets, run_positions, run_lengths = [0], [], []
+            multimodal_embedding_lengths = []
         else:
             mm_mask, embed_mask, special_mask = _compute_mm_masks(
                 input_ids_tensor,
@@ -1131,6 +1133,11 @@ def create_input_processor_with_hash(
                                                     num_mm_tokens))
             item_run_cu_offsets, run_positions, run_lengths = (
                 _find_mm_token_runs_from_mask(mm_mask, num_mm_tokens))
+            multimodal_embedding_lengths = (
+                _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
+                                                      num_mm_tokens))
+        extra_processed_inputs["multimodal_data"].setdefault(
+            "multimodal_embedding_lengths", multimodal_embedding_lengths)
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:

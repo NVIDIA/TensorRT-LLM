@@ -755,12 +755,13 @@ def register_vision_encoder(
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
+        registered = False
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
             if registered_cls.__name__ == model_cls.__name__:
                 MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
                     vision_encoder_cls, vlm_base_model)
-                break
-        else:
+                registered = True
+        if not registered:
             raise ValueError(
                 f"register_vision_encoder: model class {model_cls.__name__} is not registered "
                 f"via register_auto_model; decorator order must ensure registration occurs first."

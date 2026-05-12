@@ -160,14 +160,30 @@ def _ensure_int64_cpu_tensor(
 
 
 def _create_kv_cache_manager_cpp(kwargs: dict) -> Any:
+    candidates = []
+    if "temp_attention_window_inputs" in kwargs:
+        candidate = dict(kwargs)
+        candidate.pop("temp_attention_window_inputs")
+        candidates.append(candidate)
+    if "chunk_size" in kwargs:
+        candidate = dict(kwargs)
+        candidate.pop("chunk_size")
+        candidates.append(candidate)
+    if ("temp_attention_window_inputs" in kwargs and "chunk_size" in kwargs):
+        candidate = dict(kwargs)
+        candidate.pop("temp_attention_window_inputs")
+        candidate.pop("chunk_size")
+        candidates.append(candidate)
+
     try:
         return KVCacheManagerCpp(**kwargs)
-    except TypeError as exc:
-        if "chunk_size" not in str(exc):
-            raise
-        legacy_kwargs = dict(kwargs)
-        legacy_kwargs.pop("chunk_size", None)
-        return KVCacheManagerCpp(**legacy_kwargs)
+    except TypeError as original_exc:
+        for candidate in candidates:
+            try:
+                return KVCacheManagerCpp(**candidate)
+            except TypeError:
+                pass
+        raise original_exc
 
 
 def _resolve_multimodal_run_metadata(

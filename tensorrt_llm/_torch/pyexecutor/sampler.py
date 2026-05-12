@@ -305,6 +305,17 @@ class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors
     data: MultimodalResult
 
 
+def _get_multimodal_embedding_lengths_for_request(
+    request: LlmRequest, extra_data: Dict[str, Any], request_index: int
+) -> Optional[List[int]]:
+    batch_lengths = extra_data.get("multimodal_embedding_lengths")
+    if batch_lengths is not None:
+        if request_index >= len(batch_lengths):
+            raise ValueError("multimodal_embedding_lengths batch size does not match mm_embeddings")
+        return [int(length) for length in batch_lengths[request_index]]
+    return get_multimodal_embedding_lengths(request)
+
+
 @dataclass(kw_only=True, frozen=True, slots=True)
 class RequestGroupKey(Generic[GenericStrategyKeyType]):
     strategy_key: GenericStrategyKeyType
@@ -365,7 +376,9 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            multimodal_embedding_lengths = get_multimodal_embedding_lengths(request)
+            multimodal_embedding_lengths = _get_multimodal_embedding_lengths_for_request(
+                request, extra_data, i
+            )
             assert multimodal_embedding_lengths is not None
             if len(mm_embedding) != sum(multimodal_embedding_lengths):
                 raise ValueError(

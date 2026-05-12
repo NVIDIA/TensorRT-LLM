@@ -4699,13 +4699,17 @@ class PyTorchModelEngine(ModelEngine):
         if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
                    None) is None:
             multimodal_chunks = None
+            multimodal_embedding_lengths_list = None
         else:
             multimodal_chunks = []
+            multimodal_embedding_lengths_list = []
             for request in scheduled_requests.context_requests:
                 multimodal_embedding_lengths = (
                     get_multimodal_embedding_lengths(request))
                 if multimodal_embedding_lengths is not None:
                     multimodal_chunks.append(sum(multimodal_embedding_lengths))
+                    multimodal_embedding_lengths_list.append(
+                        multimodal_embedding_lengths)
         # For mm_encoder_only mode, we only run the vision encoder part
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
         mm_embeddings = self.model.forward(multimodal_params)
@@ -4737,6 +4741,10 @@ class PyTorchModelEngine(ModelEngine):
                 mrope_position_deltas_list.append(mrope_position_deltas)
 
         result = {'mm_embeddings': mm_embeddings, 'logits': None}
+        if (multimodal_embedding_lengths_list is not None and
+                len(multimodal_embedding_lengths_list) == len(mm_embeddings)):
+            result[
+                'multimodal_embedding_lengths'] = multimodal_embedding_lengths_list
         if mrope_position_ids_list:
             result['mrope_position_ids'] = mrope_position_ids_list
         if mrope_position_deltas_list:

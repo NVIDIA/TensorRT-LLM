@@ -3,6 +3,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -14,13 +15,16 @@ from test_modeling_multimodal import llm_models_root
 from test_modeling_nemotron_h import extract_decode_logprobs
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.models import modeling_nemotron_nano as nemotron_nano
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLInputProcessor,
+    NanoV2VLMultimodalEncoder,
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm.inputs import (
     AudioData,
     create_input_processor,
@@ -34,6 +38,143 @@ from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 MODEL_PATH = str(os.path.join(llm_models_root(), "NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
+
+
+def _make_minimal_nano_model_config():
+    llm_config = SimpleNamespace(vocab_size=128)
+    pretrained_config = SimpleNamespace(
+        llm_config=llm_config,
+        torch_dtype=torch.bfloat16,
+        img_context_token_id=20,
+        video_context_token_id=21,
+        sound_context_token_id=None,
+        sound_config=None,
+    )
+    return SimpleNamespace(
+        pretrained_config=pretrained_config,
+        quant_config=SimpleNamespace(exclude_modules=None),
+        quant_config_dict=None,
+        video_pruning_rate=None,
+    )
+
+
+def test_nemotron_nano_registers_native_multimodal_epd_components():
+    for arch in ("NemotronH_Nano_VL_V2", "NemotronH_Nano_Omni_Reasoning_V3"):
+        vision_encoder_cls, vlm_base_model = MODEL_CLASS_VISION_ENCODER_MAPPING[arch]
+        assert vision_encoder_cls is NanoV2VLMultimodalEncoder
+        assert vlm_base_model is None
+    assert getattr(NanoV2VLInputProcessor, "support_mm_disagg") is True
+    assert getattr(NemotronH_Nano_VL_V2, "support_mm_disagg") is True
+
+
+def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypatch):
+    processor = object.__new__(NanoV2VLInputProcessor)
+    processor._config = SimpleNamespace(
+        llm_config=SimpleNamespace(vocab_size=1000, hidden_size=16),
+    )
+    processor._tokenizer = SimpleNamespace(
+        encode=MagicMock(return_value=[101, 98, 102]),
+    )
+    processor.img_context_token_id = 20
+    processor._img_start_token_ids = [30]
+    processor._img_end_token_ids = [31]
+    processor._sound_context_token_id = None
+    processor._sound_start_token_id = None
+    processor._sound_end_token_id = None
+
+    monkeypatch.setattr(
+        processor,
+        "get_num_tokens_per_video",
+        MagicMock(return_value=8),
+    )
+    monkeypatch.setattr(
+        processor,
+        "expand_prompt_token_ids_for_mm",
+        MagicMock(return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None)),
+    )
+
+    video = SimpleNamespace(frames=[object()], metadata={}, audio=None)
+    expanded_ids, mm_lengths, mm_offsets, layout = processor.get_prompt_token_ids(
+        {
+            "prompt": "Question <video> answer",
+            "multi_modal_data": {"video": [video]},
+        },
+        [{"tensor_size": (4, 16)}],
+    )
+
+    assert expanded_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert mm_lengths == [8]
+    assert mm_offsets == [1]
+    assert layout["multimodal_embedding_lengths"] == [4]
+    assert layout["multimodal_item_run_cu_offsets"] == [0, 2]
+    assert layout["multimodal_run_positions"] == [1, 6]
+    assert layout["multimodal_run_lengths"] == [4, 4]
+    assert layout["special_token_offsets"] == [0, 3, 4, 7]
+
+
+def test_nemotron_nano_vl_init_allows_disaggregated_context_role(monkeypatch):
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+
+    fake_llm = SimpleNamespace(config=SimpleNamespace())
+
+    def init_pretrained_model(self, config):
+        torch.nn.Module.__init__(self)
+        self.config = config
+
+    monkeypatch.setattr(
+        nemotron_nano.transformers.PreTrainedModel,
+        "__init__",
+        init_pretrained_model,
+    )
+    monkeypatch.setattr(
+        nemotron_nano.NemotronH_Nano_VL_V2,
+        "_update_config_for_quantization",
+        staticmethod(lambda llm_model_config: None),
+    )
+    monkeypatch.setattr(
+        nemotron_nano.AutoModelForCausalLM,
+        "from_config",
+        lambda llm_model_config: fake_llm,
+    )
+
+    model = NemotronH_Nano_VL_V2(_make_minimal_nano_model_config())
+
+    assert model.vision_encoder is None
+
+
+def test_nemotron_nano_loads_multimodal_encoder_on_disagg_context_role(monkeypatch):
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+
+    fake_encoder = MagicMock()
+    fake_encoder.eval.return_value = fake_encoder
+    fake_encoder.to.return_value = fake_encoder
+    vision_encoder_cls = MagicMock(return_value=fake_encoder)
+    monkeypatch.setattr(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls)
+
+    fake_mapper = MagicMock()
+    monkeypatch.setattr(
+        nemotron_nano, "NemotronHHfWeightMapper", MagicMock(return_value=fake_mapper)
+    )
+
+    model = SimpleNamespace(
+        _mm_model_config=_make_minimal_nano_model_config(),
+        vision_encoder=None,
+        sound_encoder=None,
+        llm=MagicMock(),
+        model_config=SimpleNamespace(),
+    )
+    weights = {
+        "vision_model.weight": torch.empty(0),
+        "mlp1.weight": torch.empty(0),
+        "language_model.weight": torch.empty(0),
+    }
+
+    NemotronH_Nano_VL_V2.load_weights(model, weights)
+
+    vision_encoder_cls.assert_called_once_with(model._mm_model_config)
+    fake_encoder.load_weights.assert_called_once_with(weights)
 
 
 @pytest.fixture(scope="function")

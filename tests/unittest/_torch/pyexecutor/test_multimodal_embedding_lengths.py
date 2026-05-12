@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
+from tensorrt_llm._torch.pyexecutor.sampler import _get_multimodal_embedding_lengths_for_request
 
 
 def test_multimodal_embedding_lengths_legacy_without_metadata():
@@ -60,3 +61,10 @@ def test_multimodal_embedding_lengths_rejects_lengths_larger_than_prompt_span():
 
     with pytest.raises(ValueError, match="exceeds"):
         get_multimodal_embedding_lengths(request)
+
+
+def test_sampler_prefers_encoder_output_embedding_lengths():
+    request = SimpleNamespace(multimodal_lengths=[6])
+    extra_data = {"multimodal_embedding_lengths": [[4]]}
+
+    assert _get_multimodal_embedding_lengths_for_request(request, extra_data, 0) == [4]

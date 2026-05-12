@@ -1271,6 +1271,32 @@ def _find_mm_token_runs_from_mask(
     return item_run_cu_offsets, run_positions, run_lengths
 
 
+def _find_mm_embedding_lengths_from_masks(
+    mm_mask: torch.Tensor,
+    embed_mask: torch.Tensor,
+    num_mm_tokens: List[int],
+) -> List[int]:
+    """Compute embedding-slot counts per logical multimodal item."""
+    if not torch.any(mm_mask):
+        return []
+
+    mm_positions = torch.where(mm_mask)[0]
+    lengths_t = torch.tensor(num_mm_tokens)
+    assert mm_positions.numel() == lengths_t.sum().item(), (
+        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+        f"num_mm_tokens={num_mm_tokens}")
+
+    embedding_lengths: List[int] = []
+    offset = 0
+    for item_length in num_mm_tokens:
+        item_positions = mm_positions[offset:offset + item_length]
+        offset += item_length
+        embedding_lengths.append(int(embed_mask[item_positions].sum().item()))
+
+    return embedding_lengths
+
+
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
                                                np.ndarray],
                        mm_hashes: List[List[int]], start_positions: List[int],
