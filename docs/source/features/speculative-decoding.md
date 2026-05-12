@@ -142,6 +142,26 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 
 PARD can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
+### DFlash
+
+DFlash is a target-dependent speculative decoding method that uses hidden states from specific target model layers as cross-attention context in the draft model to predict multiple draft tokens in parallel.
+
+Reference: [DFlash: Distilled Flash Speculative Decoding](https://arxiv.org/pdf/2602.06036)
+
+* `max_draft_len`: Maximum draft candidate length.
+* `speculative_model`: Path or HuggingFace model ID for the DFlash draft model.
+* `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
+* `target_layer_ids`: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.
+
+```python
+from tensorrt_llm.llmapi import DFlashDecodingConfig
+
+speculative_config = DFlashDecodingConfig(
+    max_draft_len=4, speculative_model="/path/to/dflash_model")
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.
@@ -206,6 +226,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `NGram`
 * `DraftTarget`
 * `PARD`
+* `DFlash`
 * `SA`
 
 > Note: The PyTorch backend supports only `Eagle3`. `decoding_type: Eagle` is accepted as a backward-compatible alias for `Eagle3`, but EAGLE (v1/v2) draft checkpoints are incompatible.

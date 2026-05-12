@@ -279,7 +279,6 @@ class _KVCache:
         self._avg_history_length = Average()
         self._avg_capacity = Average()
         self._avg_history_length.update(self.history_length)
-        self._avg_capacity.update(self.capacity)
         manager._living_kv_caches.add(rawref.ref(self))
         manager._avg_reused_length.update(self.history_length)
         manager._num_created_kv_caches += 1
@@ -342,14 +341,16 @@ class _KVCache:
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
         manager = self.manager
-        manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
-        manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
-        manager._try_update_target_ratios()
+        if self.capacity > 0:
+            self._avg_capacity.update(self.capacity)
+            manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
+            manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
+            manager._num_sampled_kv_caches += 1
+            manager._try_update_target_ratios()
         with self._record_event():
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
-        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
@@ -677,8 +678,6 @@ class _KVCache:
     @history_length.setter
     def history_length(self, history_length: int) -> None:
         "History length cannot be decreased. Increase may trigger out-of-window block eviction/dropping for SWA layers."
-        if self._shortcut_set_history_length(history_length):
-            return
         success = self.resize(None, history_length)
         assert success
 

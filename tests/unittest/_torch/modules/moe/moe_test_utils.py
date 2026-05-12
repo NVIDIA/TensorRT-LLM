@@ -47,6 +47,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -64,6 +65,7 @@ class MoeBackendType(str, Enum):
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
+    MEGAMOE = "MEGAMOE_DEEPGEMM"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -74,6 +76,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
+        MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
     }
     return backend_class_map[backend_type]
 
@@ -614,6 +617,54 @@ def should_skip_densegemm(
     return None
 
 
+def should_skip_megamoe(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    dtype: Optional[torch.dtype] = None,
+    model_config: "MoeModelConfig" = None,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+    swiglu_gptoss_style: bool = False,
+) -> Optional[str]:
+    """Check MegaMoE-specific constraints for the generic MoE test matrix."""
+    if backend_type != MoeBackendType.MEGAMOE:
+        return None
+
+    if not torch.cuda.is_available():
+        return "MegaMoEDeepGemm requires CUDA"
+
+    if comm_method is not None or parallel_mode is not None:
+        return (
+            "MegaMoEDeepGemm generic multi-GPU coverage requires a torch.distributed "
+            "EP ProcessGroup-aware launcher; keep it out of this MPIPool-based matrix."
+        )
+
+    if quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8:
+        return f"MegaMoEDeepGemm only supports W4A8_MXFP4_MXFP8 (got quant_algo={quant_algo})"
+
+    if dtype is not None and dtype != torch.bfloat16:
+        return f"MegaMoEDeepGemm only supports bfloat16 activations (got dtype={dtype})"
+
+    if swiglu_gptoss_style:
+        return "MegaMoEDeepGemm does not support swiglu_gptoss_style"
+
+    if moe_tp_size != 1:
+        return f"MegaMoEDeepGemm Phase 1 is EP-only (got moe_tp_size={moe_tp_size})"
+
+    if model_config is not None:
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+        if hidden_size % 512 != 0 or intermediate_size % 512 != 0:
+            return (
+                f"MegaMoEDeepGemm requires 512-aligned hidden/intermediate sizes "
+                f"for DeepGEMM TMA-packed SF rows "
+                f"(got h={hidden_size}, i={intermediate_size})"
+            )
+
+    return None
+
+
 def should_skip_multi_gpu(
     parallel_mode: str,
     model_config: "MoeModelConfig",
@@ -720,8 +771,8 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM does not support autotuner capture
-    if backend_type == MoeBackendType.DEEPGEMM:
+    # DEEPGEMM and MEGAMOE do not support autotuner capture
+    if backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.MEGAMOE):
         return False
 
     if use_flashinfer:
@@ -763,6 +814,9 @@ def get_quick_skip_reason(
         can_impl_kwargs = {"dtype_activation": dtype}
         if swiglu_gptoss_style:
             can_impl_kwargs["swiglu_gptoss_style"] = swiglu_gptoss_style
+        if backend_type == MoeBackendType.MEGAMOE and model_config is not None:
+            can_impl_kwargs["hidden_size"] = model_config.hidden_size
+            can_impl_kwargs["intermediate_size"] = model_config.intermediate_size
         can_impl, skip_reason = backend_cls.can_implement(quant_algo, **can_impl_kwargs)
         if not can_impl:
             return skip_reason
@@ -786,6 +840,13 @@ def get_quick_skip_reason(
             ),
             lambda: should_skip_densegemm(
                 backend_type, quant_algo=quant_algo, model_config=model_config
+            ),
+            lambda: should_skip_megamoe(
+                backend_type,
+                quant_algo=quant_algo,
+                dtype=dtype,
+                model_config=model_config,
+                swiglu_gptoss_style=swiglu_gptoss_style,
             ),
         ]
         for check in skip_checks:

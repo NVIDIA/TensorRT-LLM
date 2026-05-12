@@ -41,15 +41,20 @@ class LayerRange:
 
 @dataclass
 class KVSlice:
-    """
-    Specifies which portion of KV cache to transfer.
+    """A KV cache slice covering token_range = [start, end) of one request.
 
-    token_range is the half-open token interval [start, end) representing
-    the logical portion of the prompt being transferred.  For non-windowed
-    layers every block in block_ids_per_layer_groups covers exactly this
-    range.  For sliding-window layers the actual blocks may cover only a
-    suffix of the interval; the sender derives the exact per-group token
-    offset from its own page-table metadata when building write metadata.
+    Single-slice transfer uses [0, prompt_len) with is_last_slice=True;
+    multi-slice transfers split token_range and mark the last slice.
+
+    Per-layer token starts are NOT encoded in token_range — they are derived
+    from block count by the sender:
+        total_blocks    = ceil(token_range.end / tpb)
+        token_start_i   = (total_blocks - len(block_ids_per_layer_groups[i])) * tpb
+    Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
+    block list.
+
+    SWA stale_end uses the request prompt_len (on the session), not
+    token_range.end — they differ for non-final slices.
     """
 
     token_range: Optional[TokenRange] = None
@@ -97,6 +102,8 @@ class SessionArgsBase:
     """Base arguments for transfer sessions."""
 
     params: DisaggregatedParams
+    # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
+    prompt_len: Optional[int] = None
 
 
 def get_unique_rid(request: LlmRequest) -> Optional[int]:

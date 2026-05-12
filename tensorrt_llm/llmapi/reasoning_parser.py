@@ -197,7 +197,10 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
     "nemotron_h": "nano-v3",
+    "nemotron_h_puzzle": "nano-v3",
     "gemma4": "gemma4",
+    "kimi_k2": "kimi_k2",
+    "kimi_k25": "kimi_k25",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({
@@ -523,6 +526,7 @@ class Gemma4ReasoningParser(BaseReasoningParser):
 
 
 @register_reasoning_parser("kimi_k2")
+@register_reasoning_parser("kimi_k25", reasoning_at_start=True)
 class KimiK2ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for Kimi-K2-Thinking model.
 

@@ -115,9 +115,14 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
+
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
 
     def _configure_affinity(self, device_id):
         '''Probe and configure the CPU affinity of the worker based on NUMA topology.
@@ -215,6 +220,9 @@ class BaseWorker(GenerationExecutor):
                 args["tokenizer"] = self._tokenizer
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
+
+            if self._resource_governor_queue is not None:
+                args["resource_governor_queue"] = self._resource_governor_queue
 
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
@@ -396,15 +404,28 @@ class BaseWorker(GenerationExecutor):
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
-            adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
-                request.lora_request.adapter_id)
-            self._load_lora_adapter(request.lora_request)
-            uid = str(request.lora_request.adapter_id)
-            lora_config = tllm.LoraConfig(
-                task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid]
-                if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid])
+            if self._is_pytorch_backend:
+                # PyTorch backend: don't embed weights in the request.
+                # Each rank loads independently from disk via py_lora_path
+                # in PeftCacheManager.add_request_peft().
+                # Pre-load on rank 0 to warm the LoRA manager cache so that
+                # add_request_peft finds the adapter already loaded.
+                self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
+                lora_config = tllm.LoraConfig(
+                    task_id=request.lora_request.adapter_id,
+                    weights=None,
+                    config=self._lora_manager.cpp_lora_config[uid])
+            else:
+                adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                    request.lora_request.adapter_id)
+                self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
+                lora_config = tllm.LoraConfig(
+                    task_id=request.lora_request.adapter_id,
+                    weights=self._lora_manager.cpp_lora_weights[uid]
+                    if not adapter_in_cache else None,
+                    config=self._lora_manager.cpp_lora_config[uid])
             py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None

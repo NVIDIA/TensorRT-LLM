@@ -30,6 +30,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "glm4_moe_lite": "glm47",
     "glm_moe_dsa": "glm47",
     "gemma4": "gemma4",
+    "gemma4_text": "gemma4",
 }
 
 
@@ -54,10 +55,10 @@ class ToolParserFactory:
         "deepseek_v3": DeepSeekV3Parser,
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
+        "gemma4": Gemma4ToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,
         "minimax_m2": MiniMaxM2ToolParser,
-        "gemma4": Gemma4ToolParser,
     }
 
     @staticmethod

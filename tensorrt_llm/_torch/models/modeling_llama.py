@@ -51,6 +51,26 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import load_sharded_checkpoint
+except ImportError:
+    # Removed in transformers>=5; provide a minimal shim
+    def load_sharded_checkpoint(model, folder, strict=True):
+        import json
+
+        from safetensors.torch import load_file
+        index_file = os.path.join(folder, "model.safetensors.index.json")
+        if os.path.exists(index_file):
+            with open(index_file) as f:
+                shard_files = set(json.load(f)["weight_map"].values())
+            state_dict = {}
+            for sf in shard_files:
+                state_dict.update(load_file(os.path.join(folder, sf)))
+        else:
+            state_dict = load_file(os.path.join(folder, "model.safetensors"))
+        model.load_state_dict(state_dict, strict=strict)
+
 
 class Llama4Attention(Attention):
 

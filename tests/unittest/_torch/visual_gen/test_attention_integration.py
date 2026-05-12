@@ -22,6 +22,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
     DiffusionModelConfig,
+    SageAttentionConfig,
     create_attention_metadata_state,
 )
 
@@ -117,6 +118,7 @@ def create_model_config(
     head_dim: int,
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
+    sage_attention_config: "SageAttentionConfig | None" = None,
 ):
     """Create a mock DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(
@@ -129,7 +131,10 @@ def create_model_config(
     # Create a minimal config without quantization
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
-        attention=AttentionConfig(backend=attn_backend),
+        attention=AttentionConfig(
+            backend=attn_backend,
+            sage_attention_config=sage_attention_config,
+        ),
         skip_create_weights_in_init=False,
     )
     config.attention_metadata_state = (
@@ -279,6 +284,107 @@ def test_self_attention_equivalence(attn_backend: str):
         f"Self-attention outputs differ: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}"
     )
     return is_close
+
+
+# seq_len: pow2 baselines + real WAN latent token counts (VAE 8x spatial, 4x temporal, patch [1,2,2])
+# batch_size: B=1 (cfg_size=2, split across GPUs) / B=2 (cfg_size=1, single GPU)
+@pytest.mark.parametrize("seq_len", [256, 512, 1560, 3600, 4096, 16384, 32760])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("qk_int8", [False, True])
+def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: int):
+    """Test SageAttention (TRTLLM + sage_attention_config) self-attention.
+
+    SageAttention quantizes Q/K/V with per-block scaling factors, so outputs
+    are expected to differ from the naive SDPA reference. We verify:
+    1. Forward pass completes without error
+    2. Output shape matches naive
+    3. Outputs are finite (no NaN/Inf)
+    4. Approximate agreement with naive (cosine similarity > 0.99)
+    """
+    print("\n" + "=" * 60)
+    print(f"Testing SageAttention (qk_int8={qk_int8}, B={batch_size}, S={seq_len})")
+    print("=" * 60)
+
+    # The sm100 sage kernel only has cubins for head_dim=128,
+    # so match the WAN model dimensions (12 heads, head_dim=128).
+    num_heads = 12
+    head_dim = 128
+    hidden_size = num_heads * head_dim  # 1536
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16
+
+    print(f"Config: B={batch_size}, S={seq_len}, H={hidden_size}, heads={num_heads}, D={head_dim}")
+    print(f"Device: {device}, dtype: {dtype}")
+
+    sage_cfg = SageAttentionConfig(
+        num_elts_per_blk_q=1,
+        num_elts_per_blk_k=16 if qk_int8 else 1,
+        num_elts_per_blk_v=1,
+        qk_int8=qk_int8,
+    )
+
+    # Create models
+    naive = NaiveWanSelfAttention(hidden_size, num_heads, head_dim, dtype=dtype).to(device)
+
+    model_config = create_model_config(
+        hidden_size,
+        num_heads,
+        head_dim,
+        attn_backend="TRTLLM",
+        sage_attention_config=sage_cfg,
+    )
+    integrated = Attention(
+        hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=model_config
+    ).to(device)
+
+    # Copy weights
+    copy_weights_self_attention(naive, integrated)
+
+    naive.eval()
+    integrated.eval()
+
+    # Create inputs
+    torch.manual_seed(42)
+    hidden_states = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype)
+    freqs_cos_HSD, freqs_sin_HSD = generate_rope_embeddings(seq_len, head_dim, device, is_HSD=True)
+    freqs_cos_SHD, freqs_sin_SHD = generate_rope_embeddings(seq_len, head_dim, device, is_HSD=False)
+
+    # Forward pass
+    with torch.no_grad():
+        out_naive = naive(hidden_states, freqs_cos_HSD, freqs_sin_HSD)
+        out_sage = integrated(hidden_states, freqs=(freqs_cos_SHD, freqs_sin_SHD))
+
+    # --- Assertions ---
+
+    # 1. Shape match
+    assert out_sage.shape == out_naive.shape, (
+        f"Shape mismatch: sage={out_sage.shape}, naive={out_naive.shape}"
+    )
+
+    # 2. All values finite (no NaN / Inf)
+    assert torch.isfinite(out_sage).all(), (
+        f"SageAttention output contains NaN or Inf (B={batch_size}, S={seq_len})"
+    )
+
+    # 3. Cosine similarity — sage quantization (FP8 per-block) introduces larger
+    #    error than bf16 rounding, so elementwise allclose is too strict.
+    #    Cosine similarity captures directional agreement robustly.
+    max_diff = (out_naive - out_sage).abs().max().item()
+    mean_diff = (out_naive - out_sage).abs().mean().item()
+    cos_sim = F.cosine_similarity(
+        out_naive.reshape(-1).float(), out_sage.reshape(-1).float(), dim=0
+    ).item()
+
+    print(f"\n  Output shape: {out_sage.shape}")
+    print(f"  Max absolute diff:  {max_diff:.2e}")
+    print(f"  Mean absolute diff: {mean_diff:.2e}")
+    print(f"  Cosine similarity:  {cos_sim:.6f}")
+
+    assert cos_sim > 0.99, (
+        f"SageAttention cosine similarity too low: {cos_sim:.4f} < 0.99 "
+        f"(B={batch_size}, S={seq_len}, qk_int8={qk_int8})"
+    )
+    return cos_sim > 0.99
 
 
 @pytest.mark.parametrize("attn_backend", ["VANILLA", "FA4"])
@@ -583,6 +689,15 @@ def run_all_tests():
     # Run self-attention tests with different backends
     for backend in ["VANILLA", "TRTLLM"] + (["FA4"] if _flash_attn4_available else []):
         results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend)
+
+    # Run SageAttention self-attention tests (subset for manual runner)
+    for batch_size in [1, 2]:
+        for seq_len in [4096, 32760]:
+            for qk_int8 in [False, True]:
+                label = f"sage_B{batch_size}_S{seq_len}_QkInt8{qk_int8}"
+                results[label] = test_sage_attention_self_attention(
+                    qk_int8=qk_int8, batch_size=batch_size, seq_len=seq_len
+                )
 
     # Run cross-attention tests
     results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA")

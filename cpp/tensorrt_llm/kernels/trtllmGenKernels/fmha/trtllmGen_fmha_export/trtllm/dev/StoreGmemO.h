@@ -184,8 +184,12 @@ inline __device__ void copyFromSmemToDstMem(char* smemPtr,
       (smemRowIdx / NumRows) * NumBytesPerSmemRow + (baseOffset % NumBytesPerSmemRow);
   }
 
-  // Whether the row is valid.
+  // Whether the destination row/column fall within the compact output bounds. For non-power-of-2
+  // headDimV (for example 80), the swizzled SMEM tile is still padded to a wider NumCols, so we
+  // must suppress stores whose 16B vector starts past the real row width.
   bool isValidRow = dstMemRowIdx < numValidRows;
+  bool isValidCol = dstMemColOffset < dstMemRowStrideInBytes;
+  bool isValidStore = isValidRow && isValidCol;
 
   // Copy from shared memory to global memory.
   if constexpr (CastToE2m1) {
@@ -267,7 +271,7 @@ inline __device__ void copyFromSmemToDstMem(char* smemPtr,
         remoteSmemRowIdx * static_cast<int64_t>(dstMemRowStrideInBytes) + dstMemColOffset;
     }
 
-    if (isValidRow) {
+    if (isValidStore) {
       // The destination in GMEM/Remote SMEM.
       dstMemPtr += dstMemOffset;
       // The source in SMEM.
