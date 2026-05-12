@@ -58,8 +58,8 @@ service_discovery:
   cluster_name: ""  # Optional namespace to isolate clusters in etcd
 
 # KVBM Configuration (Dynamo KV Block Manager)
-# Orthogonal to service discovery.  When enabled, injects kv_connector_config
-# into worker configs and installs the kvbm pip package.
+# When enabled, injects kv_connector_config into worker configs
+# and installs the kvbm pip package.
 kvbm:
   enabled: false   # Set to true to enable kvbm
   package: "kvbm"  # pip package name or path (e.g. "kvbm" or "/path/to/kvbm.whl")

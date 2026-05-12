@@ -55,6 +55,22 @@ DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
 
+DEFAULT_DISAGGREGATED_SERVER_CONFIG = {
+    "hostname": "localhost",
+    "backend": "pytorch",
+    "context_servers": {
+        "num_instances": 1
+    },
+    "generation_servers": {
+        "num_instances": 1
+    }
+}
+
+DEFAULT_CUDA_GRAPH_CONFIG = {
+    "enable_padding": True,
+    "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+}
+
 
 @functools.lru_cache(maxsize=1)
 def has_nvlink():
@@ -617,16 +633,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "backend": "DEFAULT",
             "max_tokens_in_buffer": 4096
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
@@ -707,16 +714,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "max_tokens_in_buffer": 4096
             }
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
@@ -765,16 +763,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             },
             "cuda_graph_config": None,
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
@@ -1163,16 +1152,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "enable_attention_dp": enable_attention_dp,
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
@@ -1215,16 +1195,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "decoding_type": "MTP",
                 "max_draft_len": mtp_nextn
             }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
@@ -1312,16 +1283,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             "enable_block_reuse": block_reuse,
             "enable_partial_reuse": block_reuse,
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
@@ -1418,16 +1380,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "enable_partial_reuse": block_reuse,
             "free_gpu_memory_fraction": 0.5,
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
@@ -1490,16 +1443,7 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
             "enable_attention_dp": True,
             "enable_autotuner": False,
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config=ctx_server_config,
                                       gen_server_config=gen_server_config,
@@ -1628,28 +1572,20 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "max_tokens_in_buffer": 4096
             }
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
-    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device(2)
     @skip_pre_blackwell
     def test_kvbm_connector(self):
         ctx_server_config = {
-            "tensor_parallel_size": 2,
-            "disable_overlap_scheduler": True,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
             "cuda_graph_config": None,
+            "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
@@ -1665,9 +1601,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             },
         }
         gen_server_config = {
-            "tensor_parallel_size": 2,
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": False,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
@@ -1676,20 +1612,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "enable_block_reuse": True,
                 "enable_partial_reuse": False,
             },
+            "cuda_graph_config": DEFAULT_CUDA_GRAPH_CONFIG,
         }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         extra_env = {
             "DYN_KVBM_CPU_CACHE_GB": "32",
-            "DYN_KVBM_TRTLLM_ZMQ_PORT": "20081",
+            "DYN_KVBM_TRTLLM_ZMQ_PORT": str(get_free_port()),
+            "DYN_KVBM_METRICS_PORT": str(get_free_port()),
             "DYN_KVBM_LEADER_ZMQ_HOST": "0.0.0.0",
             "DYN_KVBM_NCCL_MLA_MODE": "true",
             "DYN_KVBM_NCCL_MAX_CTAS": "1",
@@ -1702,18 +1631,21 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       extra_env=extra_env) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
-    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device(2)
     @skip_pre_blackwell
     def test_kvbm_disk_cache(self):
         disk_cache_dir = tempfile.mkdtemp(prefix="kvbm_disk_cache_")
-        ctx_server_config = {
-            "tensor_parallel_size": 2,
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
+        base_config = {
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 1,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
             },
+        }
+        ctx_server_config = {**base_config}
+        ctx_server_config.update({
+            "disable_overlap_scheduler": True,
             "kv_cache_config": {
                 "enable_block_reuse": True,
                 "enable_partial_reuse": False,
@@ -1723,43 +1655,31 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "connector_scheduler_class": "DynamoKVBMConnectorLeader",
                 "connector_worker_class": "DynamoKVBMConnectorWorker",
             },
-        }
-        gen_server_config = {
-            "tensor_parallel_size": 2,
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
-            },
+        })
+        gen_server_config = {**base_config}
+        gen_server_config.update({
+            "disable_overlap_scheduler": False,
             "kv_cache_config": {
                 "enable_block_reuse": True,
                 "enable_partial_reuse": False,
             },
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
+            "cuda_graph_config": DEFAULT_CUDA_GRAPH_CONFIG,
+        })
         extra_env = {
-            "DYN_KVBM_CPU_CACHE_GB": "8",
-            "DYN_KVBM_DISK_CACHE_GB": "16",
+            "DYN_KVBM_CPU_CACHE_GB": "32",
+            "DYN_KVBM_DISK_CACHE_GB": "48",
             "DYN_KVBM_DISK_CACHE_DIR": disk_cache_dir,
             "DYN_KVBM_DISK_ZEROFILL_FALLBACK": "false",
             "DYN_KVBM_DISK_DISABLE_O_DIRECT": "true",
             "DYN_KVBM_DISK_ALLOCATOR_TYPE": "default",
             "DYN_KVBM_NCCL_MLA_MODE": "true",
             "DYN_KVBM_NCCL_MAX_CTAS": "1",
-            "DYN_KVBM_TRTLLM_ZMQ_PORT": "20082",
+            "DYN_KVBM_TRTLLM_ZMQ_PORT": str(get_free_port()),
+            "DYN_KVBM_METRICS_PORT": str(get_free_port()),
             "DYN_KVBM_LEADER_ZMQ_HOST": "0.0.0.0",
             "RUST_LOG": "warn,dynamo_llm::block_manager=warn",
         }
+        disaggregated_server_config = DEFAULT_DISAGGREGATED_SERVER_CONFIG
         try:
             with launch_disaggregated_llm(disaggregated_server_config,
                                           ctx_server_config,
