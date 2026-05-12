@@ -35,12 +35,6 @@ if TYPE_CHECKING:
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
-_DEEPSEEK_V4_ATTENTION_WEIGHTS = (
-    "layers.0.attn.wq_a.weight",
-    "layers.0.attn.wkv.weight",
-    "model.layers.0.self_attn.q_a_proj.weight",
-    "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-)
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
 
@@ -509,52 +503,32 @@ class ModelConfig(Generic[TConfig]):
         return None
 
     @staticmethod
-    def _detect_deepseek_v4_attention_layout(
-            checkpoint_dir: str) -> Optional[str]:
-        tensor_info = None
-        for tensor_name in _DEEPSEEK_V4_ATTENTION_WEIGHTS:
-            tensor_info = ModelConfig._get_safetensors_header_for_tensor(
-                checkpoint_dir, tensor_name)
-            if tensor_info is not None:
-                break
-        if tensor_info is None:
-            return None
+    def _has_deepseek_v4_layer_only_modelopt_quant_config(
+            quant_config_file: str) -> bool:
+        with open(quant_config_file) as f:
+            quant_config_dict = json.load(f)
 
-        dtype = tensor_info.get("dtype")
-        if dtype is not None and dtype.startswith("F8_"):
-            return "fp8_block_scales"
-        return None
-
-    @staticmethod
-    def _set_deepseek_v4_attention_quant_config(quant_config,
-                                                checkpoint_dir: str):
-        layout = ModelConfig._detect_deepseek_v4_attention_layout(
-            checkpoint_dir)
-        if layout != "fp8_block_scales":
-            return quant_config
-
-        attention_quant_config = QuantConfig()
-        attention_quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-        attention_quant_config.kv_cache_quant_algo = quant_config.kv_cache_quant_algo
-        attention_quant_config.group_size = 128
-        attention_quant_config.exclude_modules = [
-            "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
-        ]
-        logger.info(
-            "Detected DeepSeek-V4 FP8 block-scale attention checkpoint "
-            "layout; using %s as global quantization.",
-            attention_quant_config.quant_algo)
-        return attention_quant_config
+        quantization_config = quant_config_dict.get('quantization', {})
+        return (quantization_config.get('quant_algo', None) is None and
+                quantization_config.get('quantized_layers', None) is not None)
 
     @staticmethod
     def _set_deepseek_v4_routed_moe_quant_config(pretrained_config,
                                                  checkpoint_dir: str,
                                                  moe_backend: str,
                                                  layer_quant_config,
-                                                 spec_config=None):
+                                                 spec_config=None,
+                                                 require_layout: bool = False):
         layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
             checkpoint_dir)
         if layout not in ("mxfp4", "nvfp4"):
+            if require_layout:
+                raise ValueError(
+                    "DeepSeek-V4 checkpoint has layer-specific quantized_layers "
+                    "in hf_quant_config.json, but the routed MoE layout could "
+                    "not be detected from safetensors metadata. Expected "
+                    f"{_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT} to use dtype I8 "
+                    "for MXFP4 or U8 for NVFP4.")
             return layer_quant_config
 
         experts_quant_config = QuantConfig()
@@ -837,6 +811,7 @@ class ModelConfig(Generic[TConfig]):
 
         quant_config = QuantConfig()
         layer_quant_config = None
+        require_deepseek_v4_routed_moe_layout = False
         moe_backend = kwargs.get('moe_backend', 'AUTO')
         # Resolve AUTO to specific backend based on model architecture
         architecture = pretrained_config.architectures[
@@ -847,6 +822,10 @@ class ModelConfig(Generic[TConfig]):
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,
                                             'hf_quant_config.json'):
+            if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+                require_deepseek_v4_routed_moe_layout = (
+                    cls._has_deepseek_v4_layer_only_modelopt_quant_config(
+                        quant_config_file))
             quant_config, layer_quant_config = cls.load_modelopt_quant_config(
                 quant_config_file, checkpoint_dir, moe_backend)
             hf_quant_config = getattr(pretrained_config, "quantization_config",
@@ -878,11 +857,13 @@ class ModelConfig(Generic[TConfig]):
                 quant_config_file, moe_backend)
 
         if architecture in _DEEPSEEK_V4_ARCHITECTURES:
-            quant_config = cls._set_deepseek_v4_attention_quant_config(
-                quant_config, checkpoint_dir)
             layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
-                pretrained_config, checkpoint_dir, moe_backend,
-                layer_quant_config, kwargs.get('spec_config', None))
+                pretrained_config,
+                checkpoint_dir,
+                moe_backend,
+                layer_quant_config,
+                kwargs.get('spec_config', None),
+                require_layout=require_deepseek_v4_routed_moe_layout)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
