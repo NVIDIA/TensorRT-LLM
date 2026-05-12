@@ -20,7 +20,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^6]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
-| `GraniteForCausalLM` [^14]           | Granite 3.x                        | `ibm-granite/granite-3.3-8b-instruct`        |
+| `GraniteForCausalLM` [^14] [^19]     | Granite 3.x, Granite Guardian 3.x  | `ibm-granite/granite-3.1-8b-instruct`, `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-guardian-3.2-5b` |
 | `GraniteMoeHybridForCausalLM` [^15]  | Granite 4.0 Hybrid MoE             | `ibm-granite/granite-4.0-h-small`            |
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
 | `HunYuanDenseForCausalLM` [^14]      | Hunyuan Dense                      | `tencent/Hunyuan-7B-Instruct`                |
@@ -86,6 +86,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^15]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample AD configs for [micro](../../../examples/auto_deploy/model_registry/configs/granite_4.0_micro.yaml), [h-small](../../../examples/auto_deploy/model_registry/configs/granite_4.0_h_small.yaml), and [tiny-preview](../../../examples/auto_deploy/model_registry/configs/granite_4.0_tiny_preview.yaml).
 [^17]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/hunyuan_a13b_ep.yaml).
 [^18]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See sample [AD config](../../../examples/auto_deploy/model_registry/configs/openelm.yaml).
+[^19]: See the [AutoDeploy model registry](../../../examples/auto_deploy/model_registry/models.yaml); these Granite variants use the default dashboard config with `world_size_1.yaml`.
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
