@@ -24,5 +24,6 @@ l0_b200_ds:
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py TIMEOUT (90)
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_module.py TIMEOUT (90)
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
+  - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
   # Tokenizer chat-template tests.
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
