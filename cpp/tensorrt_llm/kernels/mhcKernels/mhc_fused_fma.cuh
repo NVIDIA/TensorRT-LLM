@@ -382,14 +382,17 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
 // Caller MUST zero y_acc[M, FULL_N], r_acc[M], done_counter[ceil(M / TM)]
 // before launch.  FULL_N must equal HC_MULT * (2 + HC_MULT) = 24.
 // ===================================================================
-template <int TN, int KS, int TM = 1, int FULL_N = 24, int BF16_VEC_OVERRIDE = 0>
+template <int TN, int KS, int TM = 1, int FULL_N = 24, int BF16_VEC_OVERRIDE = 0, bool kFuseNorm = false>
 __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat16 const* __restrict__ residual_in,
     __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix_prev,
     float const* __restrict__ comb_mix_prev, float const* __restrict__ W_T, float const* __restrict__ hc_scale,
     float const* __restrict__ hc_base, __nv_bfloat16* __restrict__ residual_out, float* __restrict__ post_mix_out,
     float* __restrict__ comb_mix_out, __nv_bfloat16* __restrict__ layer_input_out, float* __restrict__ y_acc,
     float* __restrict__ r_acc, int* __restrict__ done_counter, int M, int K, int hidden_size, float rms_eps,
-    float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat)
+    float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat,
+    // When kFuseNorm: apply next-layer RMSNorm on layer_input inline:
+    //   layer_input[t,h] = bf16(li * rsqrt(mean(li²)+norm_eps) * norm_weight[h]).
+    __nv_bfloat16 const* __restrict__ norm_weight = nullptr, float norm_eps = 0.f)
 {
     constexpr int HC_MULT = 4;
     constexpr int HC_MULT2 = HC_MULT * HC_MULT;
@@ -818,31 +821,32 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
                 cm_vals[k] = expf(cm_vals[k] - rowMax);
-            float rs = cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3];
+            // Reciprocal-multiply: 1 fdiv + 4 fmul vs 4 fdivs (faster on B200).
+            float inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3]);
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
-                cm_vals[k] = cm_vals[k] / rs + hc_sinkhorn_eps;
+                cm_vals[k] = cm_vals[k] * inv_rs + hc_sinkhorn_eps;
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
             {
                 float cs = cm_vals[k];
                 cs += __shfl_xor_sync(LANE_MASK, cs, 1);
                 cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                cm_vals[k] /= (cs + hc_sinkhorn_eps);
+                cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
             }
             for (int it = 1; it < sinkhorn_repeat; it++)
             {
-                rs = cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps;
+                inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps);
 #pragma unroll
                 for (int k = 0; k < HC_MULT; k++)
-                    cm_vals[k] /= rs;
+                    cm_vals[k] *= inv_rs;
 #pragma unroll
                 for (int k = 0; k < HC_MULT; k++)
                 {
                     float cs = cm_vals[k];
                     cs += __shfl_xor_sync(LANE_MASK, cs, 1);
                     cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                    cm_vals[k] /= (cs + hc_sinkhorn_eps);
+                    cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
                 }
             }
             float* cm_out_ptr = comb_mix_out + tok * HC_MULT2;
@@ -853,6 +857,17 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
         __syncthreads();
 
         // layer_input: warp>0 threads process hidden in parallel.
+        //
+        // When kFuseNorm is true, accumulate per-thread sum_sq while writing
+        // un-normalized layer_input bf16; after a __syncthreads, all threads
+        // run pass 2: re-LDG from L2 (hot from pass 1's STGs), multiply by
+        // rsqrt * norm_weight, STG normalized bf16. Saves one HBM read+write
+        // pair vs the separate flashinfer.rmsnorm kernel.
+        constexpr int kFmaBigFuseWarps = BLOCK_SIZE / WARP_SIZE - 1;
+        __shared__ float s_sumsq_li[kFmaBigFuseWarps];
+        __shared__ float s_rsqrt_li;
+        constexpr int BF16_VEC_LI = 8;
+        __nv_bfloat16* obase = layer_input_out + static_cast<long long>(tok) * hidden_size;
         if (warp_id > 0)
         {
             float pm[HC_MULT];
@@ -861,10 +876,9 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                 pm[j] = s_pre_mix[t][j];
 
             __nv_bfloat16 const* rbase = residual_out + static_cast<long long>(tok) * HC_MULT * hidden_size;
-            __nv_bfloat16* obase = layer_input_out + static_cast<long long>(tok) * hidden_size;
             int const p2_tid = tid - WARP_SIZE;
             constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
-            constexpr int BF16_VEC_LI = 8;
+            float sum_sq_local = 0.f;
 
             for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
             {
@@ -888,6 +902,63 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                 for (int v = 0; v < BF16_VEC_LI / 2; v++)
                     opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
                 *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+                if constexpr (kFuseNorm)
+                {
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC_LI / 2; v++)
+                    {
+                        float2 b = __bfloat1622float2(opairs[v]);
+                        sum_sq_local += b.x * b.x + b.y * b.y;
+                    }
+                }
+            }
+
+            if constexpr (kFuseNorm)
+            {
+                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 16);
+                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 8);
+                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 4);
+                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 2);
+                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 1);
+                if ((tid & 31) == 0)
+                    s_sumsq_li[warp_id - 1] = sum_sq_local;
+            }
+        }
+        if constexpr (kFuseNorm)
+        {
+            __syncthreads();
+            if (warp_id == 0 && (tid & 31) == 0)
+            {
+                float total = 0.f;
+#pragma unroll
+                for (int w = 0; w < kFmaBigFuseWarps; w++)
+                    total += s_sumsq_li[w];
+                s_rsqrt_li = rsqrtf(total / static_cast<float>(hidden_size) + norm_eps);
+            }
+            __syncthreads();
+            if (warp_id > 0)
+            {
+                int const p2_tid = tid - WARP_SIZE;
+                constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
+                float const rsqrt_val = s_rsqrt_li;
+                for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
+                {
+                    uint4 li_raw = *reinterpret_cast<uint4 const*>(&obase[h]);
+                    uint4 nw_raw = *reinterpret_cast<uint4 const*>(&norm_weight[h]);
+                    __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
+                    __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
+                    uint4 out_raw;
+                    __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC_LI / 2; v++)
+                    {
+                        float2 lif = __bfloat1622float2(li_pairs[v]);
+                        float2 nwf = __bfloat1622float2(nw_pairs[v]);
+                        opairs[v]
+                            = __float22bfloat162_rn(make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
+                    }
+                    *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+                }
             }
         }
         __syncthreads();
