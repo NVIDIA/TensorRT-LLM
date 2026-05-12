@@ -39,9 +39,10 @@ lower in this file for the timer source.
 Three modes:
 
   --cupti --cuda-graph (default)
-      Capture one CUDA graph per cell (warmup + timed iters inlined),
-      replay once, read kernel start/end from CUPTI.  ~20× faster than
-      nsys-wrapped capture and matches it to within ~1% / noise floor.
+      Capture a small CUDA graph for the cell, replay it for warmup + timed
+      iterations, and read kernel start/end from CUPTI.  Raw CUPTI buffers are
+      parsed out-of-process on the timed path, with a cached ordinal plan used
+      to keep only the kernels we care about.
 
   --cupti --no-cuda-graph
       Eager loop with CUPTI.  Per-kernel timestamps are still accurate, but
@@ -118,14 +119,20 @@ Example usage:
 """
 
 import argparse
+import atexit
+import ctypes
 import importlib
 import itertools
 import json
+import multiprocessing as mp
 import os
+import queue
 import statistics
 import sys
+import threading
 import time
 from datetime import datetime
+from multiprocessing import shared_memory
 from pathlib import Path
 
 import numpy as np
@@ -558,7 +565,7 @@ def _build_tensors(
 # CUPTI in-process kernel timing
 #
 # Self-contained module-in-a-file.  Reads kernel start/end timestamps directly
-# from the GPU profiling fabric via NVIDIA's cupti-python bindings (1 ns
+# from the GPU profiling fabric via CUPTI's Activity API (1 ns
 # resolution), avoiding two pitfalls of the cuda-events path:
 #
 #   1. cudaEvent.elapsed_time() resolution (~0.5 us) is too coarse for the
@@ -568,9 +575,8 @@ def _build_tensors(
 #      profile-export-sqlite-parse pipeline is heavy and out-of-process.
 #
 # This is functionally equivalent to wrapping each cell in nsys, except it
-# runs in the same Python process with no serialization.  When this proves
-# out, lift `CuptiKernelTimer` and `_time_kernel_cuda_graph_cupti` into a
-# proper TRT-LLM utility module — there is no benchmark-specific code below.
+# runs in the same benchmark process and sends raw activity buffers to a
+# parser process instead of materializing Python objects in the CUPTI callback.
 # =============================================================================
 
 
@@ -643,35 +649,247 @@ def _kernels_per_iter_baseline(with_conv1d: bool) -> int:
     return 2 if with_conv1d else 1
 
 
+_LIBCUPTI_CANDIDATES = (
+    os.environ.get("CUPTI_LIBRARY_PATH"),
+    "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcupti.so.13",
+    "libcupti.so.13",
+    "libcupti.so",
+)
+_CUPTI_SUCCESS = 0
+_CUPTI_ERROR_MAX_LIMIT_REACHED = 12
+_CUPTI_ERROR_INVALID_KIND = 21
+_CUPTI_ACTIVITY_KIND_KERNEL = 3
+_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL = 10
+_CUPTI_ACTIVITY_ATTR_ZEROED_OUT_ACTIVITY_BUFFER = 5
+_CUPTI_HOST_BUFFER_BYTES = 1024 * 1024
+_CUPTI_HOST_BUFFER_COUNT = 16
+_CUDA_GRAPH_GROUP_ITERS = 4
+
+
+def _load_libcupti() -> ctypes.CDLL:
+    errors = []
+    for candidate in _LIBCUPTI_CANDIDATES:
+        if not candidate:
+            continue
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError as exc:
+            errors.append(f"{candidate}: {exc}")
+    raise ImportError("Unable to load libcupti: " + "; ".join(errors))
+
+
+class _CuptiActivityKernel11Prefix(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("kind", ctypes.c_int),
+        ("cache_config", ctypes.c_uint8),
+        ("shared_memory_config", ctypes.c_uint8),
+        ("registers_per_thread", ctypes.c_uint16),
+        ("partitioned_global_cache_requested", ctypes.c_int),
+        ("partitioned_global_cache_executed", ctypes.c_int),
+        ("start", ctypes.c_uint64),
+        ("end", ctypes.c_uint64),
+        ("completed", ctypes.c_uint64),
+        ("device_id", ctypes.c_uint32),
+        ("context_id", ctypes.c_uint32),
+        ("stream_id", ctypes.c_uint32),
+        ("grid_x", ctypes.c_int32),
+        ("grid_y", ctypes.c_int32),
+        ("grid_z", ctypes.c_int32),
+        ("block_x", ctypes.c_int32),
+        ("block_y", ctypes.c_int32),
+        ("block_z", ctypes.c_int32),
+        ("static_shared_memory", ctypes.c_int32),
+        ("dynamic_shared_memory", ctypes.c_int32),
+        ("local_memory_per_thread", ctypes.c_uint32),
+        ("local_memory_total", ctypes.c_uint32),
+        ("correlation_id", ctypes.c_uint32),
+        ("grid_id", ctypes.c_int64),
+        ("name", ctypes.c_void_p),
+        ("reserved0", ctypes.c_void_p),
+        ("queued", ctypes.c_uint64),
+        ("submitted", ctypes.c_uint64),
+        ("launch_type", ctypes.c_uint8),
+        ("is_shared_memory_carveout_requested", ctypes.c_uint8),
+        ("shared_memory_carveout_requested", ctypes.c_uint8),
+        ("padding", ctypes.c_uint8),
+        ("shared_memory_executed", ctypes.c_uint32),
+        ("graph_node_id", ctypes.c_uint64),
+    ]
+
+
+def _configure_cupti_get_next_record(libcupti) -> None:
+    libcupti.cuptiActivityGetNextRecord.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    libcupti.cuptiActivityGetNextRecord.restype = ctypes.c_int
+
+
+def _parse_cupti_buffer_ptr(libcupti, buffer_ptr: int, valid_size: int, *, include_names: bool):
+    records = []
+    zero_ts_count = 0
+    zero_ts_names: dict[str, int] = {}
+    record_ptr = ctypes.c_void_p(None)
+    while True:
+        result = libcupti.cuptiActivityGetNextRecord(
+            ctypes.c_void_p(buffer_ptr),
+            valid_size,
+            ctypes.byref(record_ptr),
+        )
+        if result == _CUPTI_SUCCESS:
+            kind = ctypes.cast(record_ptr, ctypes.POINTER(ctypes.c_int)).contents.value
+            if kind not in (_CUPTI_ACTIVITY_KIND_KERNEL, _CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL):
+                continue
+            kernel = ctypes.cast(record_ptr, ctypes.POINTER(_CuptiActivityKernel11Prefix)).contents
+            name = None
+            if include_names:
+                if kernel.name:
+                    name = ctypes.string_at(kernel.name).decode("utf-8", errors="replace")
+                else:
+                    name = "?"
+            if kernel.start == 0 or kernel.end == 0:
+                zero_ts_count += 1
+                if name is not None:
+                    zero_ts_names[name] = zero_ts_names.get(name, 0) + 1
+                continue
+            if include_names:
+                records.append((
+                    name,
+                    int(kernel.start),
+                    int(kernel.end),
+                    int(kernel.correlation_id),
+                    0,
+                    int(kernel.graph_node_id),
+                    int(kernel.stream_id),
+                ))
+            else:
+                records.append((
+                    int(kernel.start),
+                    int(kernel.end),
+                    int(kernel.correlation_id),
+                    int(kernel.graph_node_id),
+                    int(kernel.stream_id),
+                ))
+        elif result == _CUPTI_ERROR_MAX_LIMIT_REACHED:
+            break
+        elif result == _CUPTI_ERROR_INVALID_KIND:
+            break
+        else:
+            raise RuntimeError(f"cuptiActivityGetNextRecord failed with CUptiResult={result}")
+    return records, zero_ts_count, zero_ts_names
+
+
+def _apply_cupti_filter_plan(numeric_records, filter_plan):
+    if not filter_plan:
+        return [
+            (None, start, end, corr, 0, graph_node_id, stream_id)
+            for start, end, corr, graph_node_id, stream_id in sorted(numeric_records)
+        ]
+
+    filtered = []
+    replay_idx = 0
+    record_idx = 0
+    for start, end, corr, graph_node_id, stream_id in sorted(numeric_records):
+        if replay_idx >= len(filter_plan):
+            break
+        records_per_replay, ordinal_names = filter_plan[replay_idx]
+        if record_idx < len(ordinal_names):
+            name = ordinal_names[record_idx]
+            if name is not None:
+                filtered.append((name, start, end, corr, 0, graph_node_id, stream_id))
+        record_idx += 1
+        if record_idx >= records_per_replay:
+            replay_idx += 1
+            record_idx = 0
+    return filtered
+
+
+def _cupti_parser_worker(input_queue, output_queue, ready_event) -> None:
+    libcupti = _load_libcupti()
+    _configure_cupti_get_next_record(libcupti)
+    shared_blocks: dict[str, shared_memory.SharedMemory] = {}
+    records_by_generation: dict[int, list[tuple[int, int, int, int, int]]] = {}
+    zero_ts_by_generation: dict[int, int] = {}
+    ready_event.set()
+    while True:
+        item = input_queue.get()
+        if item is None:
+            break
+        kind = item[0]
+        if kind == "buffer":
+            _, generation, buffer_id, name, valid_size = item
+            shm = shared_blocks.get(name)
+            if shm is None:
+                shm = shared_memory.SharedMemory(name=name)
+                shared_blocks[name] = shm
+            shared_char = ctypes.c_char.from_buffer(shm.buf)
+            try:
+                parser_ptr = ctypes.addressof(shared_char)
+                records, zero_ts_count, _ = _parse_cupti_buffer_ptr(
+                    libcupti,
+                    parser_ptr,
+                    valid_size,
+                    include_names=False,
+                )
+                records_by_generation.setdefault(generation, []).extend(records)
+                zero_ts_by_generation[generation] = zero_ts_by_generation.get(generation, 0) + zero_ts_count
+                ctypes.memset(parser_ptr, 0, len(shm.buf))
+            except Exception as exc:  # pragma: no cover - diagnostic worker path
+                output_queue.put({"kind": "error", "generation": generation, "error": repr(exc)})
+            finally:
+                del shared_char
+            output_queue.put({"kind": "buffer_done", "generation": generation, "buffer_id": buffer_id})
+        elif kind == "finish":
+            _, generation, filter_plan = item
+            try:
+                raw_records = records_by_generation.pop(generation, [])
+                zero_ts_count = zero_ts_by_generation.pop(generation, 0)
+                filtered_records = _apply_cupti_filter_plan(raw_records, filter_plan)
+                output_queue.put({
+                    "kind": "finish_done",
+                    "generation": generation,
+                    "records": filtered_records,
+                    "zero_ts_count": zero_ts_count,
+                    "zero_ts_names": {},
+                    "raw_record_count": len(raw_records),
+                })
+            except Exception as exc:  # pragma: no cover - diagnostic worker path
+                output_queue.put({"kind": "error", "generation": generation, "error": repr(exc)})
+        else:
+            output_queue.put({"kind": "error", "generation": -1, "error": f"unknown parser message {kind!r}"})
+    for shm in shared_blocks.values():
+        shm.close()
+
+
 class CuptiKernelTimer:
-    """Process-singleton wrapper around CUPTI's CONCURRENT_KERNEL activity.
+    """Raw CUPTI Activity timer with out-of-process parsing for timed runs.
 
-    CUPTI's callbacks are global (one subscriber per process), so the timer
-    is constructed lazily once via `CuptiKernelTimer.get()`.  cupti-python
-    parses the activity buffer for us — `buffer_completed` receives a Python
-    list of typed activity objects, not a raw byte buffer — so no FFI is
-    needed.
-
-    Usage:
-        timer = CuptiKernelTimer.get()
-        timer.start()                     # arms; drops any stale records
-        <run cuda graph and synchronize>
-        records, zero_ts_count, zero_ts_names = timer.stop()
-                                          # records: list of tuples per kernel
-                                          # (name, start_ns, end_ns, corr,
-                                          #  graph_id, graph_node_id, stream)
-                                          # zero_ts_count: kernel records CUPTI
-                                          # delivered with start=0 or end=0
-                                          # (couldn't timestamp); zero_ts_names:
-                                          # name → count breakdown.
-
-    The callback fires from a CUPTI worker thread, so a lock guards the
-    record buffer.  Records are kept tiny (tuple of ints + str) to minimize
-    Python overhead in the hot path of the callback.
+    CUPTI's callback gives us raw activity buffers.  The callback only hands
+    shared-memory buffer metadata to a parser process, so the main process
+    avoids the cupti-python per-record object creation cost during the timed
+    path.  A single local calibration replay may parse names in-process to
+    build an ordinal filter plan for a just-captured CUDA graph.
     """
 
     _instance = None
     _import_error = None
+
+    _request_callback_type = ctypes.CFUNCTYPE(
+        None,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    _complete_callback_type = ctypes.CFUNCTYPE(
+        None,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    )
 
     @classmethod
     def get(cls) -> "CuptiKernelTimer":
@@ -680,93 +898,241 @@ class CuptiKernelTimer:
         if cls._import_error is not None:
             raise cls._import_error
         try:
-            from cupti import cupti as _c
-        except ImportError as e:  # pragma: no cover — env-dependent
-            cls._import_error = e
+            cls._instance = cls()
+            return cls._instance
+        except ImportError as exc:  # pragma: no cover - env-dependent
+            cls._import_error = exc
             raise
-        cls._instance = cls._init(_c)
-        return cls._instance
 
-    @classmethod
-    def _init(cls, _c) -> "CuptiKernelTimer":
-        import threading
-
-        self = object.__new__(cls)
-        self._c = _c
-        self._records: list[tuple] = []
-        self._zero_ts_count = 0  # how many kernel records were dropped due to start/end==0
-        self._zero_ts_names: dict = {}  # name -> count of zero-ts drops (for diagnostics)
+    def __init__(self) -> None:
+        self._libcupti = _load_libcupti()
+        self._configure_functions()
         self._lock = threading.Lock()
+        self._shared_buffers: dict[int, shared_memory.SharedMemory] = {}
+        self._buffer_id_by_ptr: dict[int, int] = {}
+        self._free_buffer_ids: list[int] = []
+        self._local_completed: list[tuple[int, int]] = []
+        self._mode = "drop"
+        self._generation = 0
+        self._finish_results: dict[int, dict] = {}
+        self._parser_errors: list[str] = []
+        self._filter_plan = ()
+        self._mp_ctx = mp.get_context("spawn")
+        self._parse_input_queue = self._mp_ctx.Queue()
+        self._parse_output_queue = self._mp_ctx.Queue()
+        ready_event = self._mp_ctx.Event()
+        self._parse_process = self._mp_ctx.Process(
+            target=_cupti_parser_worker,
+            args=(self._parse_input_queue, self._parse_output_queue, ready_event),
+        )
+        self._parse_process.start()
+        if not ready_event.wait(timeout=10.0):
+            raise RuntimeError("CUPTI parser process did not initialize")
 
-        # CUPTI callback contract (from cupti-python-samples/cupti_common.py):
-        #   buffer_requested() -> (buffer_size, max_num_records)
-        #   buffer_completed(activities: list)
-        # Setting max_num_records=0 (unbounded) avoids spurious buffer
-        # requests.  8 MiB matches the sample defaults.
-        def _buf_req():
-            return (8 * 1024 * 1024, 0)
+        self._set_zeroed_host_buffer_attr()
+        for _ in range(_CUPTI_HOST_BUFFER_COUNT):
+            self._free_buffer_ids.append(self._allocate_shared_buffer())
 
-        kernel_kinds = (_c.ActivityKind.CONCURRENT_KERNEL, _c.ActivityKind.KERNEL)
+        self._request_callback = self._request_callback_type(self._request_buffer)
+        self._complete_callback = self._complete_callback_type(self._complete_buffer)
+        self._check(self._libcupti.cuptiActivityRegisterCallbacks(
+            self._request_callback,
+            self._complete_callback,
+        ))
+        self._check(self._libcupti.cuptiActivityEnable(_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL))
+        atexit.register(self.close)
 
-        def _buf_done(activities):
-            recs = []
-            zero_drops_local = 0
-            zero_names_local: dict = {}
-            for a in activities:
-                if a.kind not in kernel_kinds:
-                    continue
-                # start/end == 0 means CUPTI couldn't time this kernel.
-                # Track these instead of silently dropping — they're a sign
-                # CUPTI is failing to record kernels we DID launch.
-                if a.start == 0 or a.end == 0:
-                    zero_drops_local += 1
-                    name = getattr(a, "name", "?")
-                    zero_names_local[name] = zero_names_local.get(name, 0) + 1
-                    continue
-                recs.append((
-                    a.name,
-                    int(a.start),
-                    int(a.end),
-                    int(a.correlation_id),
-                    int(a.graph_id),
-                    int(a.graph_node_id),
-                    int(a.stream_id),
-                ))
-            if recs or zero_drops_local:
+    def _configure_functions(self) -> None:
+        self._libcupti.cuptiActivityRegisterCallbacks.argtypes = [
+            self._request_callback_type,
+            self._complete_callback_type,
+        ]
+        self._libcupti.cuptiActivityRegisterCallbacks.restype = ctypes.c_int
+        self._libcupti.cuptiActivityEnable.argtypes = [ctypes.c_int]
+        self._libcupti.cuptiActivityEnable.restype = ctypes.c_int
+        self._libcupti.cuptiActivityFlushAll.argtypes = [ctypes.c_uint32]
+        self._libcupti.cuptiActivityFlushAll.restype = ctypes.c_int
+        self._libcupti.cuptiActivitySetAttribute.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+        ]
+        self._libcupti.cuptiActivitySetAttribute.restype = ctypes.c_int
+        _configure_cupti_get_next_record(self._libcupti)
+
+    def _set_zeroed_host_buffer_attr(self) -> None:
+        value_obj = ctypes.c_uint8(1)
+        size_obj = ctypes.c_size_t(ctypes.sizeof(value_obj))
+        result = self._libcupti.cuptiActivitySetAttribute(
+            _CUPTI_ACTIVITY_ATTR_ZEROED_OUT_ACTIVITY_BUFFER,
+            ctypes.byref(size_obj),
+            ctypes.byref(value_obj),
+        )
+        if result != _CUPTI_SUCCESS:
+            print(
+                "[WARN] CUPTI zeroed host-buffer attribute failed; "
+                f"continuing with default CUPTI buffer handling (CUptiResult={result}).",
+                file=sys.stderr,
+            )
+
+    def _check(self, result: int) -> None:
+        if result != _CUPTI_SUCCESS:
+            raise RuntimeError(f"CUPTI call failed with CUptiResult={result}")
+
+    def _allocate_shared_buffer(self) -> int:
+        buffer_id = len(self._shared_buffers)
+        shm = shared_memory.SharedMemory(create=True, size=_CUPTI_HOST_BUFFER_BYTES)
+        shared_char = ctypes.c_char.from_buffer(shm.buf)
+        try:
+            ptr = ctypes.addressof(shared_char)
+        finally:
+            del shared_char
+        if ptr % 8 != 0:
+            shm.close()
+            shm.unlink()
+            raise RuntimeError("CUPTI shared-memory activity buffer was not 8-byte aligned")
+        self._shared_buffers[buffer_id] = shm
+        self._buffer_id_by_ptr[ptr] = buffer_id
+        return buffer_id
+
+    def _buffer_ptr(self, buffer_id: int) -> int:
+        shm = self._shared_buffers[buffer_id]
+        shared_char = ctypes.c_char.from_buffer(shm.buf)
+        try:
+            return ctypes.addressof(shared_char)
+        finally:
+            del shared_char
+
+    def _request_buffer(self, buffer, size, max_num_records) -> None:
+        with self._lock:
+            if self._free_buffer_ids:
+                buffer_id = self._free_buffer_ids.pop()
+            else:
+                buffer_id = self._allocate_shared_buffer()
+            ptr = self._buffer_ptr(buffer_id)
+        buffer[0] = ptr
+        size[0] = _CUPTI_HOST_BUFFER_BYTES
+        max_num_records[0] = 0
+
+    def _complete_buffer(self, context, stream_id, buffer, size, valid_size) -> None:
+        del context, stream_id, size
+        buffer_ptr = int(buffer)
+        valid_size_int = int(valid_size)
+        with self._lock:
+            mode = self._mode
+            generation = self._generation
+            buffer_id = self._buffer_id_by_ptr[buffer_ptr]
+            if valid_size_int == 0 or mode == "drop":
+                self._free_buffer_ids.append(buffer_id)
+                return
+            if mode == "local":
+                self._local_completed.append((buffer_id, valid_size_int))
+                return
+            shm = self._shared_buffers[buffer_id]
+        self._parse_input_queue.put(("buffer", generation, buffer_id, shm.name, valid_size_int))
+
+    def _drain_parser_results(self) -> None:
+        while True:
+            try:
+                result = self._parse_output_queue.get_nowait()
+            except queue.Empty:
+                break
+            kind = result.get("kind")
+            if kind == "buffer_done":
                 with self._lock:
-                    if recs:
-                        self._records.extend(recs)
-                    if zero_drops_local:
-                        self._zero_ts_count += zero_drops_local
-                        for k, v in zero_names_local.items():
-                            self._zero_ts_names[k] = self._zero_ts_names.get(k, 0) + v
+                    self._free_buffer_ids.append(int(result["buffer_id"]))
+            elif kind == "finish_done":
+                self._finish_results[int(result["generation"])] = result
+            elif kind == "error":
+                self._parser_errors.append(str(result.get("error")))
 
-        # Hold strong refs so the C side never sees GC'd Python callables.
-        self._buf_req = _buf_req
-        self._buf_done = _buf_done
+    def _flush(self, flag: int) -> None:
+        self._check(self._libcupti.cuptiActivityFlushAll(flag))
 
-        _c.activity_register_callbacks(_buf_req, _buf_done)
-        _c.activity_enable(_c.ActivityKind.CONCURRENT_KERNEL)
-        return self
-
-    def start(self) -> None:
-        """Arm capture: flush any stale records, then clear the buffer."""
-        self._c.activity_flush_all(1)
+    def _begin(self, mode: str, filter_plan=()) -> int:
         with self._lock:
-            self._records.clear()
-            self._zero_ts_count = 0
-            self._zero_ts_names = {}
-
-    def stop(self) -> tuple[list[tuple], int, dict]:
-        """Flush and return all kernel records + count of zero-timestamp drops.
-
-        Returns (records, zero_ts_count, zero_ts_names_dict).  The latter two
-        are diagnostic: nonzero values mean CUPTI delivered records with
-        start=0 or end=0, indicating it failed to timestamp the kernel.
-        """
-        self._c.activity_flush_all(1)
+            self._mode = "drop"
+        self._flush(1)
+        self._drain_parser_results()
         with self._lock:
-            return (list(self._records), self._zero_ts_count, dict(self._zero_ts_names))
+            self._generation += 1
+            generation = self._generation
+            self._mode = mode
+            self._local_completed = []
+            self._filter_plan = filter_plan
+        return generation
+
+    def capture_names(self, replay_fn) -> tuple[list[tuple], int, dict]:
+        """Run a small calibration replay and parse kernel names locally."""
+        self._begin("local")
+        replay_fn()
+        torch.cuda.synchronize()
+        self._flush(0)
+        records: list[tuple] = []
+        zero_ts_count = 0
+        zero_ts_names: dict[str, int] = {}
+        with self._lock:
+            completed = list(self._local_completed)
+            self._local_completed = []
+            self._mode = "drop"
+        for buffer_id, valid_size in completed:
+            ptr = self._buffer_ptr(buffer_id)
+            recs, zeros, zero_names = _parse_cupti_buffer_ptr(
+                self._libcupti,
+                ptr,
+                valid_size,
+                include_names=True,
+            )
+            records.extend(recs)
+            zero_ts_count += zeros
+            for name, count in zero_names.items():
+                zero_ts_names[name] = zero_ts_names.get(name, 0) + count
+            ctypes.memset(ptr, 0, _CUPTI_HOST_BUFFER_BYTES)
+            with self._lock:
+                self._free_buffer_ids.append(buffer_id)
+        records.sort(key=lambda r: r[1])
+        return records, zero_ts_count, zero_ts_names
+
+    def start(self, filter_plan=()) -> None:
+        self._begin("parser", filter_plan)
+
+    def stop(self) -> tuple[list[tuple], int, dict, int]:
+        generation = self._generation
+        self._flush(0)
+        with self._lock:
+            self._mode = "drop"
+            filter_plan = self._filter_plan
+        self._parse_input_queue.put(("finish", generation, filter_plan))
+        deadline = time.perf_counter() + 10.0
+        while time.perf_counter() < deadline:
+            self._drain_parser_results()
+            if self._parser_errors:
+                raise RuntimeError("CUPTI parser process failed: " + "; ".join(self._parser_errors))
+            result = self._finish_results.pop(generation, None)
+            if result is not None:
+                return (
+                    list(result["records"]),
+                    int(result["zero_ts_count"]),
+                    dict(result["zero_ts_names"]),
+                    int(result["raw_record_count"]),
+                )
+            time.sleep(0.001)
+        raise TimeoutError("Timed out waiting for CUPTI parser process")
+
+    def close(self) -> None:
+        parse_process = getattr(self, "_parse_process", None)
+        if parse_process is not None and parse_process.is_alive():
+            self._parse_input_queue.put(None)
+            parse_process.join(timeout=5.0)
+            if parse_process.is_alive():
+                parse_process.terminate()
+                parse_process.join(timeout=1.0)
+        for shm in getattr(self, "_shared_buffers", {}).values():
+            try:
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
 
 
 # =============================================================================
@@ -801,7 +1167,7 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
     """
     records = [
         r for r in records
-        if any(s in r[0] for s in _CUPTI_KEEP_KERNEL_SUBSTRINGS)
+        if r[0] is not None and any(s in r[0] for s in _CUPTI_KEEP_KERNEL_SUBSTRINGS)
     ]
     records.sort(key=lambda r: r[1])  # by start_ns
 
@@ -871,6 +1237,61 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
 
 
 _PRE_GRAPH_WARMUP_ITERS = 3  # standard practice; see commit msg / design doc
+_CUPTI_FILTER_PLAN_CACHE: dict[tuple, tuple[int, tuple[str | None, ...]]] = {}
+
+
+def _target_name_or_none(name: str | None) -> str | None:
+    if name is None:
+        return None
+    if any(s in name for s in _CUPTI_KEEP_KERNEL_SUBSTRINGS):
+        return name
+    return None
+
+
+def _capture_group_graph(args, run_fn, reset_fn, group_iters: int) -> torch.cuda.CUDAGraph:
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(group_iters):
+            reset_fn()
+            if args.l2_flush:
+                _l2_flush.fill_(0.0)
+            run_fn()
+    torch.cuda.synchronize()
+    return graph
+
+
+def _graph_group_iters(total_iters: int, pre_iter_fn) -> int:
+    if pre_iter_fn is not None:
+        return 1
+    for group_iters in (_CUDA_GRAPH_GROUP_ITERS, 2):
+        if total_iters % group_iters == 0:
+            return group_iters
+    return 1
+
+
+def _get_cupti_filter_plan(timer: CuptiKernelTimer, graph, cache_key: tuple | None,
+                           group_iters: int) -> tuple[int, tuple[str | None, ...]]:
+    full_cache_key = None if cache_key is None else (cache_key, group_iters)
+    if full_cache_key is not None:
+        cached = _CUPTI_FILTER_PLAN_CACHE.get(full_cache_key)
+        if cached is not None:
+            return cached
+
+    records, zero_ts_count, zero_ts_names = timer.capture_names(graph.replay)
+    if zero_ts_count:
+        print(
+            f"[WARN] CUPTI calibration saw {zero_ts_count} zero-timestamp records "
+            f"(breakdown {zero_ts_names}); continuing with nonzero records.",
+            file=sys.stderr,
+        )
+    ordinal_names = tuple(_target_name_or_none(r[0]) for r in records)
+    target_count = sum(name is not None for name in ordinal_names)
+    if target_count == 0:
+        raise RuntimeError("CUPTI calibration did not find any target kernel records")
+    plan = (len(records), ordinal_names)
+    if full_cache_key is not None:
+        _CUPTI_FILTER_PLAN_CACHE[full_cache_key] = plan
+    return plan
 
 
 def _time_kernel_cuda_graph(
@@ -882,6 +1303,7 @@ def _time_kernel_cuda_graph(
     expected_K: int,
     pre_iter_fn=None,
     iters_override: int | None = None,
+    cupti_plan_key: tuple | None = None,
 ) -> dict:
     """CUDA-graph CUPTI timer (graph-per-iter design).
 
@@ -926,32 +1348,59 @@ def _time_kernel_cuda_graph(
         run_fn()
     torch.cuda.synchronize()
 
+    total_iters = warmup + iters
+    group_iters = _graph_group_iters(total_iters, pre_iter_fn)
+
     # Reset just before capture so warmup state changes don't bleed in.
     reset_fn()
     torch.cuda.synchronize()
 
-    # Capture ONE iter.  pre_iter_fn deliberately not in here.
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        reset_fn()
-        if args.l2_flush:
-            _l2_flush.fill_(0.0)
-        run_fn()
+    # Capture a small group of identical logical iterations.  Mix/pre_iter
+    # cells stay at one iter per replay because their per-iter input update
+    # still runs outside the graph.
+    g = _capture_group_graph(args, run_fn, reset_fn, group_iters)
     torch.cuda.synchronize()
+
+    records_per_replay, ordinal_names = _get_cupti_filter_plan(
+        timer,
+        g,
+        cupti_plan_key,
+        group_iters,
+    )
+    target_count = sum(name is not None for name in ordinal_names)
+    expected_targets_per_replay = expected_K * group_iters
+    if target_count != expected_targets_per_replay:
+        print(
+            f"[WARN] CUPTI calibration mismatch for {tag!r}: expected "
+            f"{expected_targets_per_replay} target records in a {group_iters}-iter graph replay, "
+            f"got {target_count} target records out of {records_per_replay} total records.",
+            file=sys.stderr,
+        )
 
     # Time: replay the per-iter graph `warmup + iters` times, with
     # pre_iter_fn called between replays on the same stream.  CUPTI
     # records every kernel launch; _stats_from_cupti_records validates
     # against expected_K and slices warmup off the front.
-    timer.start()
+    graph_replays = total_iters // group_iters
+    filter_plan = ((records_per_replay, ordinal_names),) * graph_replays
+    timer.start(filter_plan)
     torch.cuda.nvtx.range_push(tag)
-    for i in range(warmup + iters):
+    for i in range(graph_replays):
         if pre_iter_fn is not None:
             pre_iter_fn(i)
         g.replay()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
-    records, zero_ts_count, zero_ts_names = timer.stop()
+    records, zero_ts_count, zero_ts_names, raw_record_count = timer.stop()
+    expected_raw_record_count = records_per_replay * graph_replays
+    if raw_record_count != expected_raw_record_count:
+        print(
+            f"[WARN] CUPTI raw-record mismatch for {tag!r}: expected "
+            f"{records_per_replay} total records/replay × {graph_replays} replays "
+            f"= {expected_raw_record_count}, got {raw_record_count}. SKIPPING cell.",
+            file=sys.stderr,
+        )
+        return None
 
     return _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
                                      zero_ts_count=zero_ts_count,
@@ -967,6 +1416,7 @@ def _time_kernel_eager(
     expected_K: int,
     pre_iter_fn=None,
     iters_override: int | None = None,
+    cupti_plan_key: tuple | None = None,
 ) -> dict:
     """Non-graph CUPTI timer (for ncu wrapping, debugging, etc.).
 
@@ -978,19 +1428,22 @@ def _time_kernel_eager(
     warmup = args.warmup
     iters = iters_override if iters_override is not None else args.iters
 
-    timer.start()
-    torch.cuda.nvtx.range_push(tag)
-    # Unified warmup+iters loop; CUPTI filters by warmup count internally.
-    for i in range(warmup + iters):
-        reset_fn()
-        if args.l2_flush:
-            _flush_l2()  # includes synchronize
-        if pre_iter_fn is not None:
-            pre_iter_fn(i)
-        run_fn()
-    torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
-    records, zero_ts_count, zero_ts_names = timer.stop()
+    del cupti_plan_key
+
+    def _run_eager_loop():
+        torch.cuda.nvtx.range_push(tag)
+        # Unified warmup+iters loop; CUPTI filters by warmup count internally.
+        for i in range(warmup + iters):
+            reset_fn()
+            if args.l2_flush:
+                _flush_l2()  # includes synchronize
+            if pre_iter_fn is not None:
+                pre_iter_fn(i)
+            run_fn()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
+    records, zero_ts_count, zero_ts_names = timer.capture_names(_run_eager_loop)
 
     return _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
                                      zero_ts_count=zero_ts_count,
@@ -1047,6 +1500,7 @@ def _time_kernel(
     expected_K: int,
     pre_iter_fn=None,
     iters_override: int | None = None,
+    cupti_plan_key: tuple | None = None,
 ) -> dict:
     """Dispatch to graph-CUPTI / eager-CUPTI / no-timer path.
 
@@ -1072,12 +1526,14 @@ def _time_kernel(
             expected_K=expected_K,
             pre_iter_fn=pre_iter_fn,
             iters_override=iters_override,
+            cupti_plan_key=cupti_plan_key,
         )
     return _time_kernel_eager(
         args, run_fn, reset_fn, tag,
         expected_K=expected_K,
         pre_iter_fn=pre_iter_fn,
         iters_override=iters_override,
+        cupti_plan_key=cupti_plan_key,
     )
 
 
@@ -1568,6 +2024,19 @@ def _bench_config(
             stats = _time_kernel(
                 args, _run_baseline, reset_fn, tag,
                 expected_K=_kernels_per_iter_baseline(with_conv1d),
+                cupti_plan_key=(
+                    "baseline",
+                    args.baseline,
+                    batch,
+                    mtp_len,
+                    state_dtype_name,
+                    act_dtype_name,
+                    with_conv1d,
+                    bool(args.l2_flush),
+                    bool(args.external_pdl),
+                    bool(use_philox),
+                    _kernels_per_iter_baseline(with_conv1d),
+                ),
             )
 
             if stats is not None:
@@ -2168,15 +2637,38 @@ def _bench_config(
                 # the skipped list for an external rerun in a fresh process.
                 retry_budget = max(0, getattr(args, "cupti_retry", 1))
                 stats = None
+                expected_K = _kernels_per_iter_incremental(
+                    mode, with_conv1d=with_conv1d,
+                    persistent_skip_empty=scenario_skip_empty,
+                )
+                plan_key = (
+                    "incremental",
+                    args.variant,
+                    mode,
+                    batch,
+                    mtp_len,
+                    state_dtype_name,
+                    act_dtype_name,
+                    with_conv1d,
+                    bool(args.l2_flush),
+                    bool(args.external_pdl),
+                    bool(args.internal_pdl),
+                    bool(use_philox),
+                    bool(rectangle_for_nowrite),
+                    bool(write_checkpoint),
+                    bool(sort_slots),
+                    bool(reverse_nowrite),
+                    bool(hardcode_sort),
+                    scenario_pre_iter is not None,
+                    expected_K,
+                )
                 for attempt in range(retry_budget + 1):
                     stats = _time_kernel(
                         args, _run_incr, reset_fn, sweep_tag,
-                        expected_K=_kernels_per_iter_incremental(
-                            mode, with_conv1d=with_conv1d,
-                            persistent_skip_empty=scenario_skip_empty,
-                        ),
+                        expected_K=expected_K,
                         pre_iter_fn=scenario_pre_iter,
                         iters_override=scenario_iters,
+                        cupti_plan_key=plan_key,
                     )
                     if stats is not None:
                         break
