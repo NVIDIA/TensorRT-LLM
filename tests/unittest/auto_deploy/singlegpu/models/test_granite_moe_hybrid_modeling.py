@@ -128,6 +128,10 @@ def set_seed():
     torch.manual_seed(42)
 
 
+def _hidden_states(output):
+    return output[0] if isinstance(output, tuple) else output
+
+
 # =============================================================================
 # Config factories
 # =============================================================================
@@ -425,7 +429,7 @@ def test_granite_moe_hybrid_moe_equivalence(B, S, dtype):
 
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
 
-    hf_out, _ = hf_moe(x)
+    hf_out = _hidden_states(hf_moe(x))
     custom_out = custom_moe(x)
 
     # Guard against degenerate all-zero outputs (0/0 RMSE ratio → NaN)
@@ -482,7 +486,7 @@ def test_granite_moe_hybrid_decoder_layer_equivalence(B, S, dtype):
         attention_mask=causal_mask,
         position_embeddings=(cos_sliced, sin_sliced),
     )
-    hf_hidden = hf_out[0]
+    hf_hidden = _hidden_states(hf_out)
 
     assert_rmse_close(custom_out, hf_hidden, rmse_ratio_tol=0.05)
 
@@ -521,7 +525,7 @@ def test_granite_moe_hybrid_mamba_decoder_layer_equivalence(B, S, dtype):
 
     # HF: mamba layers don't use position_embeddings or causal mask
     hf_out = hf_layer(hidden_states=x)
-    hf_hidden = hf_out[0]
+    hf_hidden = _hidden_states(hf_out)
 
     # Custom: mamba layers ignore position_ids and position_embeddings
     custom_out = custom_layer(x)
@@ -564,7 +568,7 @@ def test_granite_moe_hybrid_attention_decoder_layer_nope_equivalence(B, S, dtype
         attention_mask=causal_mask,
         position_embeddings=None,
     )
-    hf_hidden = hf_out[0]
+    hf_hidden = _hidden_states(hf_out)
 
     # Custom: position_embeddings=None means no RoPE
     custom_out = custom_layer(x, position_ids, position_embeddings=None)

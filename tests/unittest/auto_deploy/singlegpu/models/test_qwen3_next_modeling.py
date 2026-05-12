@@ -184,16 +184,24 @@ def _get_hf_moe_class():
 def _convert_hf_full_model_state_dict(hf_state_dict: dict, config) -> dict:
     """Convert full HF model state dict to custom format.
 
-    HF MoE uses per-expert format (same as ours), so no expert weight conversion needed.
-    The weight names match directly between HF and custom for:
-      - experts.{i}.gate_proj.weight, experts.{i}.up_proj.weight, experts.{i}.down_proj.weight
-      - shared_expert.gate_proj.weight, etc.
-      - gate.weight, shared_expert_gate.weight
-
-    No GDN conversion is needed either since both use fused projections
-    (in_proj_qkvz, in_proj_ba).
+    The custom model accepts transformers' packed expert tensors through a
+    load-state-dict pre-hook. GDN weights already use the same fused projection
+    names (in_proj_qkvz, in_proj_ba).
     """
     return dict(hf_state_dict)
+
+
+def _init_standalone_hf_packed_experts(module):
+    """Initialize packed HF expert tensors when testing standalone submodules."""
+    for submodule in module.modules():
+        experts = getattr(submodule, "experts", None)
+        if experts is None:
+            continue
+        gate_up_proj = getattr(experts, "gate_up_proj", None)
+        down_proj = getattr(experts, "down_proj", None)
+        if gate_up_proj is not None and down_proj is not None:
+            torch.nn.init.normal_(gate_up_proj, mean=0.0, std=0.02)
+            torch.nn.init.normal_(down_proj, mean=0.0, std=0.02)
 
 
 @lru_cache(maxsize=1)
@@ -499,6 +507,7 @@ def test_qwen3_next_moe_numerical_equivalence(B, S, dtype):
 
     # Create HF MoE
     hf_moe = HFMoE(config)
+    _init_standalone_hf_packed_experts(hf_moe)
     hf_moe.to(device=device, dtype=dtype)
     hf_moe.eval()
 
@@ -641,6 +650,7 @@ def test_qwen3_next_linear_decoder_layer_equivalence(B, S, dtype):
 
     # Create HF decoder layer (linear_attention, layer 0)
     hf_layer = HFDecoderLayer(config, layer_idx=0)
+    _init_standalone_hf_packed_experts(hf_layer)
     hf_layer.to(device=device, dtype=dtype)
     hf_layer.eval()
 
@@ -692,6 +702,7 @@ def test_qwen3_next_full_attention_decoder_layer_equivalence(B, S, dtype):
 
     # Create HF decoder layer (full_attention)
     hf_layer = HFDecoderLayer(config, layer_idx=_FULL_ATTN_LAYER_IDX)
+    _init_standalone_hf_packed_experts(hf_layer)
     hf_layer.to(device=device, dtype=dtype)
     hf_layer.eval()
 

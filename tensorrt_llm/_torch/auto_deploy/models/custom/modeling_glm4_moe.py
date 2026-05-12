@@ -45,6 +45,8 @@ from transformers.utils import ModelOutput
 
 from ..._compat import ActivationType
 from ..hf import AutoModelForCausalLMFactory
+from ._moe_utils import unpack_packed_expert_weights
+from ._rope_utils import get_rope_theta
 
 
 class Glm4MoeRMSNorm(nn.Module):
@@ -177,10 +179,14 @@ class Glm4MoeMoE(nn.Module):
                 for _ in range(config.n_routed_experts)
             ]
         )
+        self._register_load_state_dict_pre_hook(self._unpack_packed_expert_weights)
         self.gate = Glm4MoeMoEGate(config)
         self.shared_experts = Glm4MoeMLP(
             config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
+
+    def _unpack_packed_expert_weights(self, state_dict, prefix, *args):
+        unpack_packed_expert_weights(state_dict, prefix, self.config.n_routed_experts)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
@@ -364,6 +370,11 @@ class Glm4MoePreTrainedModel(PreTrainedModel):
     _no_split_modules = ["Glm4MoeDecoderLayer"]
     supports_gradient_checkpointing = False
 
+    @classmethod
+    def _can_set_experts_implementation(cls) -> bool:
+        # Packed HF expert checkpoints are unpacked by the MoE load-state-dict pre-hook.
+        return True
+
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
@@ -402,7 +413,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         self.rotary_emb = Glm4MoeRotaryEmbedding(
             rotary_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=get_rope_theta(config),
         )
 
         self.post_init()
@@ -449,7 +460,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
 class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
     """GLM4 MoE model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     # Ignore next-n prediction layers that exist in the checkpoint
     _keys_to_ignore_on_load_unexpected = [r"model\.layers\.92.*", r"model\.layers\.46.*"]
 

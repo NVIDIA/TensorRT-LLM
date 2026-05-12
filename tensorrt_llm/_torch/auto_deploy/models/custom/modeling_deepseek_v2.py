@@ -47,6 +47,7 @@ from transformers.utils import ModelOutput
 from ..._compat import ActivationType
 from ..hf import AutoModelForCausalLMFactory
 from . import mla_rope_utils
+from ._moe_utils import unpack_packed_expert_weights
 
 
 class DeepSeekV2RMSNorm(nn.Module):
@@ -289,6 +290,7 @@ class DeepSeekV2MoE(nn.Module):
                 for _ in range(config.n_routed_experts)
             ]
         )
+        self._register_load_state_dict_pre_hook(self._unpack_packed_expert_weights)
 
         # Gate
         self.gate = DeepSeekV2MoEGate(config)
@@ -299,6 +301,9 @@ class DeepSeekV2MoE(nn.Module):
             self.shared_experts = DeepSeekV2MLP(config, intermediate_size=intermediate_size)
         else:
             self.shared_experts = None
+
+    def _unpack_packed_expert_weights(self, state_dict, prefix, *args):
+        unpack_packed_expert_weights(state_dict, prefix, self.config.n_routed_experts)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
@@ -562,6 +567,11 @@ class DeepSeekV2PreTrainedModel(PreTrainedModel):
     _no_split_modules = ["DeepSeekV2DecoderLayer"]
     supports_gradient_checkpointing = False
 
+    @classmethod
+    def _can_set_experts_implementation(cls) -> bool:
+        # Packed HF expert checkpoints are unpacked by the MoE load-state-dict pre-hook.
+        return True
+
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
@@ -662,7 +672,7 @@ def _q_proj_deinterleave_hook(
 class DeepSeekV2ForCausalLM(DeepSeekV2PreTrainedModel, GenerationMixin):
     """DeepSeekV2 model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config):
         super().__init__(config)

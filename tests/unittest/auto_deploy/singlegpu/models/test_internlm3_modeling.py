@@ -37,9 +37,9 @@ from torch import nn
 from torch.export import Dim
 from transformers import AutoConfig
 from transformers.activations import ACT2FN
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import init_rope_inv_freq
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_internlm3 import (
     InternLM3Attention,
     InternLM3DecoderLayer,
@@ -89,6 +89,7 @@ def _create_small_config():
         attention_dropout=0.0,
         bias=False,
         tie_word_embeddings=False,
+        pad_token_id=0,
     )
 
 
@@ -139,18 +140,11 @@ def _hf_repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class _HFInternLM3RotaryEmbedding(nn.Module):
-    """HF reference RotaryEmbedding using ROPE_INIT_FUNCTIONS."""
+    """HF reference RotaryEmbedding using the same RoPE parameters as HF."""
 
     def __init__(self, config):
         super().__init__()
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type", "default")
-            )
-        else:
-            rope_type = "default"
-
-        inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
+        inv_freq, self.attention_scaling = init_rope_inv_freq(config)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x, position_ids):

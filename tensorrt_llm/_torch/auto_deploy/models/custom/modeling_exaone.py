@@ -39,11 +39,11 @@ from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import init_rope_inv_freq
 
 
 class ExaoneConfig(PretrainedConfig):
@@ -149,17 +149,7 @@ class ExaoneRotaryEmbedding(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        # Get rope type from config (handle both rope_scaling and rope_parameters)
-        rope_config = getattr(config, "rope_scaling", None)
-        if rope_config is None:
-            rope_config = getattr(config, "rope_parameters", None)
-        if isinstance(rope_config, dict):
-            rope_type = rope_config.get("rope_type", rope_config.get("type", "default"))
-        else:
-            rope_type = "default"
-
-        # Use HF's ROPE_INIT_FUNCTIONS to compute inv_freq with proper scaling
-        inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
+        inv_freq, self.attention_scaling = init_rope_inv_freq(config)
 
         # Build cos/sin cache with AD-specific naming
         max_pos = config.max_position_embeddings
@@ -401,7 +391,7 @@ class ExaoneModel(ExaonePreTrainedModel):
 class ExaoneForCausalLM(ExaonePreTrainedModel, GenerationMixin):
     """EXAONE model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

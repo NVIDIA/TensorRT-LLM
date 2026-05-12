@@ -28,6 +28,7 @@ from torch.export import Dim
 from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import get_rope_theta
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_seed_oss import (
     SeedOssAttention,
     SeedOssDecoderLayer,
@@ -209,7 +210,7 @@ def test_seed_oss_attention_equivalence(B, S, dtype):
     custom_rotary = SeedOssRotaryEmbedding(
         config.head_dim,
         max_position_embeddings=config.max_position_embeddings,
-        base=config.rope_theta,
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
@@ -279,7 +280,7 @@ def test_seed_oss_decoder_layer_equivalence(B, S, dtype):
     custom_rotary = SeedOssRotaryEmbedding(
         config.head_dim,
         max_position_embeddings=config.max_position_embeddings,
-        base=config.rope_theta,
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)

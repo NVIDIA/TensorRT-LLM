@@ -41,6 +41,7 @@ from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import get_rope_theta
 
 
 class SeedOssRMSNorm(nn.Module):
@@ -281,7 +282,7 @@ class SeedOssModel(SeedOssPreTrainedModel):
         self.rotary_emb = SeedOssRotaryEmbedding(
             config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=get_rope_theta(config),
         )
 
         self.post_init()
@@ -329,7 +330,7 @@ class SeedOssModel(SeedOssPreTrainedModel):
 class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
     """Seed-OSS model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

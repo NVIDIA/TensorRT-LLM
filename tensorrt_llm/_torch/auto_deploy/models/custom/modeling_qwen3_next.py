@@ -35,6 +35,7 @@ from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextCon
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._moe_utils import unpack_packed_expert_weights
 
 # =============================================================================
 # Normalization
@@ -423,19 +424,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         # Gate
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
 
-        # Routed experts as ModuleList (matches checkpoint structure)
+        # Routed experts as ModuleList; a load hook accepts packed HF checkpoint tensors.
         self.experts = nn.ModuleList(
             [
                 Qwen3NextMLP(config, intermediate_size=config.moe_intermediate_size)
                 for _ in range(self.num_experts)
             ]
         )
+        self._register_load_state_dict_pre_hook(self._unpack_packed_expert_weights)
 
         # Shared expert
         self.shared_expert = Qwen3NextMLP(
             config, intermediate_size=config.shared_expert_intermediate_size
         )
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
+
+    def _unpack_packed_expert_weights(self, state_dict, prefix, *args):
+        unpack_packed_expert_weights(state_dict, prefix, self.num_experts)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -548,6 +553,11 @@ class Qwen3NextPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = False
     _is_stateful = True
 
+    @classmethod
+    def _can_set_experts_implementation(cls) -> bool:
+        # Packed HF expert checkpoints are unpacked by the MoE load-state-dict pre-hook.
+        return True
+
     def _init_weights(self, module):
         super()._init_weights(module)
         if isinstance(module, Qwen3NextRMSNorm):
@@ -632,7 +642,7 @@ class Qwen3NextModel(Qwen3NextPreTrainedModel):
 class Qwen3NextForCausalLM(Qwen3NextPreTrainedModel, GenerationMixin):
     """Qwen3Next causal language model (text model + lm_head)."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3NextConfig, **kwargs):
         super().__init__(config)

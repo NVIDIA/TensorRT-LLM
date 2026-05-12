@@ -56,6 +56,7 @@ from transformers.models.cohere.configuration_cohere import CohereConfig
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import get_rope_theta
 
 
 class CohereLayerNorm(nn.Module):
@@ -337,7 +338,7 @@ class CohereModel(CoherePreTrainedModel):
         self.rotary_emb = CohereRotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=get_rope_theta(config),
         )
 
         self.post_init()
@@ -385,7 +386,7 @@ class CohereForCausalLM(CoherePreTrainedModel, GenerationMixin):
     architectures. The config object determines per-layer behavior.
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

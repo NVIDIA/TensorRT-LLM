@@ -44,6 +44,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import get_rope_theta
 
 try:
     from transformers.models.granitemoehybrid.configuration_granitemoehybrid import (
@@ -202,7 +203,7 @@ class GraniteMoeHybridRotaryEmbedding(nn.Module):
         super().__init__()
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = get_rope_theta(config)
 
         inv_freq = 1.0 / (
             self.rope_theta
@@ -673,7 +674,7 @@ class GraniteMoeHybridModel(GraniteMoeHybridPreTrainedModel):
 
 
 class GraniteMoeHybridForCausalLM(GraniteMoeHybridPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config):
         super().__init__(config)

@@ -32,6 +32,7 @@ from transformers.models.cohere.configuration_cohere import CohereConfig
 from transformers.models.cohere2.configuration_cohere2 import Cohere2Config
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import get_rope_theta
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_cohere import (
     CohereAttention,
     CohereDecoderLayer,
@@ -282,7 +283,9 @@ def test_cohere_attention_equivalence(B, S, dtype):
     # Custom position embeddings (NeoX format, full cached tables)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = CohereRotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x)  # Full cached tables (no position_ids)
@@ -344,7 +347,9 @@ def test_cohere_decoder_layer_equivalence(B, S, dtype):
 
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = CohereRotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x)  # Full cached tables
@@ -408,7 +413,9 @@ def test_cohere2_decoder_layer_equivalence(B, S, dtype, layer_idx):
 
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = CohereRotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device_str, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x)

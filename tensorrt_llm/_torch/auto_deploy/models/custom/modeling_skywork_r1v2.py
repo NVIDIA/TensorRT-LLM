@@ -49,6 +49,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import get_rope_theta
 
 # ---------------------------------------------------------------------------
 # Defaults from HuggingFace source (configuration_skywork_chat.py /
@@ -459,7 +460,7 @@ class SkyworkR1V2TransformerModel(nn.Module):
         self.rotary_emb = SkyworkR1V2RotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=get_rope_theta(config),
         )
 
     def forward(

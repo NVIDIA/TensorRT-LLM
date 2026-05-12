@@ -38,6 +38,7 @@ from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import get_rope_theta
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_hunyuan_moe import (
     HunYuanMoEAttention,
     HunYuanMoEDecoderLayer,
@@ -182,18 +183,19 @@ class _HFAttention(nn.Module):
             self.key_layernorm = _HFRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # Init RoPE
-        if config.rope_scaling is not None and config.rope_scaling.get("alpha"):
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None and rope_scaling.get("alpha"):
             self.rotary_emb = _HFDynamicNTKAlphaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=config.max_position_embeddings,
-                scaling_alpha=config.rope_scaling["alpha"],
-                base=config.rope_theta,
+                scaling_alpha=rope_scaling["alpha"],
+                base=get_rope_theta(config),
             )
         else:
             self.rotary_emb = _HFRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=config.max_position_embeddings,
-                base=config.rope_theta,
+                base=get_rope_theta(config),
             )
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, **kwargs):
@@ -433,6 +435,8 @@ def _hf_config_from_custom(cfg: PretrainedConfig):
     for k, v in vars(cfg).items():
         setattr(c, k, v)
     c._attn_implementation = "eager"
+    c.rope_scaling = getattr(cfg, "rope_scaling", None)
+    c.rope_theta = get_rope_theta(cfg)
     # Flatten per-layer lists into scalar for small config (all same value)
     return c
 
@@ -550,8 +554,8 @@ def test_attention_equivalence(B, S, dtype):
     custom_rope = HunYuanMoERotaryEmbedding(
         dim=cfg.attention_head_dim,
         max_position_embeddings=cfg.max_position_embeddings,
-        base=cfg.rope_theta,
-        rope_scaling=cfg.rope_scaling,
+        base=get_rope_theta(cfg),
+        rope_scaling=getattr(cfg, "rope_scaling", None),
     ).to(dtype=dtype)
     pos_emb = custom_rope(x)
     custom_out = custom_attn(x, position_ids, pos_emb)
@@ -613,8 +617,8 @@ def test_decoder_layer_equivalence(B, S, dtype):
     custom_rope = HunYuanMoERotaryEmbedding(
         dim=cfg.attention_head_dim,
         max_position_embeddings=cfg.max_position_embeddings,
-        base=cfg.rope_theta,
-        rope_scaling=cfg.rope_scaling,
+        base=get_rope_theta(cfg),
+        rope_scaling=getattr(cfg, "rope_scaling", None),
     ).to(dtype=dtype)
     pos_emb = custom_rope(x)
     custom_out = custom_layer(x, position_ids, pos_emb)

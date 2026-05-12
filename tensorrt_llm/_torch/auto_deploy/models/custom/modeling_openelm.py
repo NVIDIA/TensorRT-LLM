@@ -334,7 +334,7 @@ class OpenELMModel(OpenELMPreTrainedModel):
 class OpenELMForCausalLM(OpenELMPreTrainedModel, GenerationMixin):
     """OpenELM model with language modeling head (shared embeddings)."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

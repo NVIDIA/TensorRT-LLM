@@ -47,6 +47,7 @@ from transformers.utils import ModelOutput
 
 from ..._compat import ActivationType
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import get_rope_theta
 
 # ---------------------------------------------------------------------------
 # Helper: extract per-layer value from list-or-scalar config field
@@ -453,7 +454,7 @@ class HunYuanMoEModel(HunYuanMoEPreTrainedModel):
         self.rotary_emb = HunYuanMoERotaryEmbedding(
             dim=config.attention_head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=get_rope_theta(config),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
 
@@ -505,7 +506,7 @@ class HunYuanMoEForCausalLM(HunYuanMoEPreTrainedModel, GenerationMixin):
     (the dynamically loaded custom config from tencent/Hunyuan-A13B-Instruct).
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

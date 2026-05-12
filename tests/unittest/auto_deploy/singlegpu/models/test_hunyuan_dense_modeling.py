@@ -29,6 +29,7 @@ from torch.export import Dim
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import get_rope_theta
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_hunyuan_dense import (
     HunYuanDenseAttention,
     HunYuanDenseDecoderLayer,
@@ -331,8 +332,8 @@ def test_attention_equivalence(B, S, dtype):
     custom_rope = HunYuanDenseRotaryEmbedding(
         dim=hf_config.head_dim,
         max_position_embeddings=hf_config.max_position_embeddings,
-        base=hf_config.rope_theta,
-        rope_scaling=hf_config.rope_scaling,
+        base=get_rope_theta(hf_config),
+        rope_scaling=getattr(hf_config, "rope_scaling", None),
     ).to(dtype=dtype)
     custom_position_embeddings = custom_rope(x)
     custom_out = custom_attn(x, position_ids, custom_position_embeddings)
@@ -391,8 +392,8 @@ def test_decoder_layer_equivalence(B, S, dtype):
     custom_rope = HunYuanDenseRotaryEmbedding(
         dim=custom_config.head_dim,
         max_position_embeddings=custom_config.max_position_embeddings,
-        base=custom_config.rope_theta,
-        rope_scaling=custom_config.rope_scaling,
+        base=get_rope_theta(custom_config),
+        rope_scaling=getattr(custom_config, "rope_scaling", None),
     ).to(dtype=dtype)
     custom_position_embeddings = custom_rope(x)
     custom_out = custom_layer(x, position_ids, custom_position_embeddings)

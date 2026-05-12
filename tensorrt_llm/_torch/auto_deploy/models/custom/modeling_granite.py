@@ -40,12 +40,12 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.granite.configuration_granite import GraniteConfig
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import init_rope_inv_freq
 
 
 class GraniteRMSNorm(nn.Module):
@@ -74,14 +74,7 @@ class GraniteRotaryEmbedding(nn.Module):
 
     def __init__(self, config: GraniteConfig):
         super().__init__()
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type", "default")
-            )
-        else:
-            rope_type = "default"
-
-        inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
+        inv_freq, self.attention_scaling = init_rope_inv_freq(config)
 
         max_pos = config.max_position_embeddings
         t = torch.arange(max_pos, dtype=inv_freq.dtype)
@@ -329,7 +322,7 @@ class GraniteModel(GranitePreTrainedModel):
 class GraniteForCausalLM(GranitePreTrainedModel, GenerationMixin):
     """Granite model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

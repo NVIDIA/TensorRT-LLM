@@ -49,6 +49,7 @@ from transformers.models.gemma2.configuration_gemma2 import Gemma2Config
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import get_rope_theta
 
 
 class Gemma2RMSNorm(nn.Module):
@@ -302,7 +303,7 @@ class Gemma2Model(Gemma2PreTrainedModel):
         self.rotary_emb = Gemma2RotaryEmbedding(
             config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=get_rope_theta(config),
         )
 
         # Normalizer for embedding: Gemma 2 scales embeddings by sqrt(hidden_size)
@@ -352,7 +353,7 @@ class Gemma2Model(Gemma2PreTrainedModel):
 class Gemma2ForCausalLM(Gemma2PreTrainedModel, GenerationMixin):
     """Gemma 2 model with language modeling head and logit softcapping."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

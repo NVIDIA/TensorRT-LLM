@@ -28,7 +28,7 @@ This implementation differs from the original HuggingFace version in the followi
 OLMo-3 architecture features:
 * Post-norm residual pattern (RMSNorm after attention/MLP, not before)
 * QK normalization on full projection (not per-head)
-* Two separate RoPE embeddings: "default" for sliding_attention, "yarn" for full_attention
+* RoPE configured through config.rope_parameters
 * Mixed attention types per layer via config.layer_types (sliding_attention vs full_attention)
 * GQA support (7B uses MHA, 32B uses GQA)
 """
@@ -190,6 +190,35 @@ class Olmo3YarnRotaryEmbedding(nn.Module):
         cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
         sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
         return cos[position_ids], sin[position_ids]
+
+
+def _init_olmo3_rope(config: Olmo3Config, head_dim: int) -> nn.Module:
+    rope_parameters = config.rope_parameters
+    rope_type = rope_parameters.get("rope_type", "default")
+    rope_theta = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0))
+
+    if rope_type == "default":
+        return Olmo3RotaryEmbedding(
+            head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
+        )
+
+    if rope_type == "yarn":
+        return Olmo3YarnRotaryEmbedding(
+            head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
+            scaling_factor=rope_parameters["factor"],
+            original_max_position_embeddings=rope_parameters.get(
+                "original_max_position_embeddings", 8192
+            ),
+            beta_fast=rope_parameters.get("beta_fast", 32.0),
+            beta_slow=rope_parameters.get("beta_slow", 1.0),
+            attention_factor=rope_parameters.get("attention_factor", 1.0),
+        )
+
+    raise ValueError(f"Unsupported OLMo-3 RoPE type: {rope_type}")
 
 
 class Olmo3MLP(nn.Module):
@@ -392,43 +421,10 @@ class Olmo3Model(Olmo3PreTrainedModel):
         )
         self.norm = Olmo3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Two separate RoPE embeddings: "default" for sliding, "yarn" for full attention
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.rotary_emb_sliding = Olmo3RotaryEmbedding(
-            head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
-        self.rotary_emb_full = self._init_yarn_rope(config, head_dim)
-
-        # Pre-compute layer type list for static dispatch in forward
-        assert config.layer_types is not None
-        self._layer_is_sliding = [lt == "sliding_attention" for lt in config.layer_types]
+        self.rotary_emb = _init_olmo3_rope(config, head_dim)
 
         self.post_init()
-
-    def _init_yarn_rope(self, config: Olmo3Config, head_dim: int) -> nn.Module:
-        """Initialize YaRN RoPE for full_attention layers."""
-        rope_scaling = config.rope_scaling
-        if rope_scaling is not None and isinstance(rope_scaling, dict) and "factor" in rope_scaling:
-            return Olmo3YarnRotaryEmbedding(
-                head_dim,
-                max_position_embeddings=config.max_position_embeddings,
-                base=config.rope_theta,
-                scaling_factor=rope_scaling["factor"],
-                original_max_position_embeddings=rope_scaling.get(
-                    "original_max_position_embeddings", 8192
-                ),
-                beta_fast=rope_scaling.get("beta_fast", 32.0),
-                beta_slow=rope_scaling.get("beta_slow", 1.0),
-                attention_factor=rope_scaling.get("attention_factor", 1.0),
-            )
-        # Fallback to default RoPE if no yarn scaling configured
-        return Olmo3RotaryEmbedding(
-            head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -449,19 +445,13 @@ class Olmo3Model(Olmo3PreTrainedModel):
         # Cast to compute dtype for FP8 models
         inputs_embeds = inputs_embeds.to(self.norm.weight.dtype)
 
-        # Compute both sets of position embeddings once (pre-sliced by position_ids)
-        sliding_pos_embeddings = self.rotary_emb_sliding(inputs_embeds, position_ids)
-        full_pos_embeddings = self.rotary_emb_full(inputs_embeds, position_ids)
+        # Compute position embeddings once (pre-sliced by position_ids)
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
 
-        for idx, decoder_layer in enumerate(self.layers):
-            # Static dispatch: select RoPE based on layer type (resolved at trace time)
-            if self._layer_is_sliding[idx]:
-                pos_emb = sliding_pos_embeddings
-            else:
-                pos_emb = full_pos_embeddings
-            hidden_states = decoder_layer(hidden_states, pos_emb)
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(hidden_states, position_embeddings)
 
         hidden_states = self.norm(hidden_states)
 
@@ -471,7 +461,7 @@ class Olmo3Model(Olmo3PreTrainedModel):
 class Olmo3ForCausalLM(Olmo3PreTrainedModel, GenerationMixin):
     """OLMo-3 model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

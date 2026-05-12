@@ -37,12 +37,12 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from ._rope_utils import init_rope_inv_freq
 
 
 class Llama3RMSNorm(nn.Module):
@@ -71,16 +71,7 @@ class Llama3RotaryEmbedding(nn.Module):
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
-        # Determine rope type from config
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type", "default")
-            )
-        else:
-            rope_type = "default"
-
-        # Use HF's ROPE_INIT_FUNCTIONS to compute inv_freq with proper scaling
-        inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
+        inv_freq, self.attention_scaling = init_rope_inv_freq(config)
 
         # Build cos/sin cache with AD-specific naming
         max_pos = config.max_position_embeddings
@@ -325,7 +316,7 @@ class Llama3Model(Llama3PreTrainedModel):
 class Llama3ForCausalLM(Llama3PreTrainedModel, GenerationMixin):
     """Llama 3 model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

@@ -28,6 +28,7 @@ from torch.export import Dim
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import get_rope_theta
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_glm4_moe import (
     Glm4MoeAttention,
     Glm4MoeDecoderLayer,
@@ -233,7 +234,9 @@ def test_glm4_moe_attention_equivalence(B, S, dtype):
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     rotary_dim = int(head_dim * config.partial_rotary_factor)
     custom_rotary = Glm4MoeRotaryEmbedding(
-        rotary_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        rotary_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
@@ -337,7 +340,9 @@ def test_glm4_moe_decoder_layer_equivalence(B, S, dtype, layer_idx):
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     rotary_dim = int(head_dim * config.partial_rotary_factor)
     custom_rotary = Glm4MoeRotaryEmbedding(
-        rotary_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        rotary_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)

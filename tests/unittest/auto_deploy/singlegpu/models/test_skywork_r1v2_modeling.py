@@ -27,8 +27,7 @@ import pytest
 import torch
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
-from transformers import Qwen2Config, Qwen2ForCausalLM
-from transformers.modeling_utils import PretrainedConfig
+from transformers import PretrainedConfig, Qwen2Config, Qwen2ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2DecoderLayer,
@@ -38,6 +37,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import get_rope_theta
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import (
     SkyworkR1V2Attention,
     SkyworkR1V2DecoderLayer,
@@ -245,7 +245,9 @@ def test_skywork_r1v2_attention_equivalence(B, S, dtype):
 
     head_dim = config.hidden_size // config.num_attention_heads
     custom_rotary = SkyworkR1V2RotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=get_rope_theta(config),
     ).to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
@@ -290,7 +292,9 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
 
     head_dim = config.hidden_size // config.num_attention_heads
     custom_rotary = SkyworkR1V2RotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=get_rope_theta(config),
     ).to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 

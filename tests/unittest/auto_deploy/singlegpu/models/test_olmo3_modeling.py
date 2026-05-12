@@ -22,7 +22,7 @@ torch_rmsnorm) for export compatibility.
 OLMo-3 key features:
 * Post-norm residual pattern (RMSNorm after attention/MLP, not before)
 * QK normalization on full projection (not per-head)
-* Two separate RoPE embeddings: "default" for sliding_attention, "yarn" for full_attention
+* RoPE configured through config.rope_parameters
 * Mixed attention types per layer via config.layer_types
 """
 
@@ -58,12 +58,30 @@ def set_seed():
     torch.manual_seed(42)
 
 
-def _create_small_config() -> Olmo3Config:
+def _create_small_config(rope_type: str = "yarn") -> Olmo3Config:
     """Create a small OLMo-3 config for testing.
 
     Uses a minimal layer_types pattern with both sliding and full attention
     to cover both code paths. Includes GQA (4 Q heads, 2 KV heads).
     """
+    if rope_type == "default":
+        rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+        }
+    elif rope_type == "yarn":
+        rope_parameters = {
+            "rope_type": "yarn",
+            "rope_theta": 10000.0,
+            "factor": 8.0,
+            "original_max_position_embeddings": 64,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "attention_factor": 1.2,
+        }
+    else:
+        raise ValueError(f"Unsupported test RoPE type: {rope_type}")
+
     return Olmo3Config(
         vocab_size=1000,
         hidden_size=64,
@@ -74,15 +92,7 @@ def _create_small_config() -> Olmo3Config:
         hidden_act="silu",
         max_position_embeddings=512,
         rms_norm_eps=1e-6,
-        rope_theta=10000.0,
-        rope_scaling={
-            "rope_type": "yarn",
-            "factor": 8.0,
-            "original_max_position_embeddings": 64,
-            "beta_fast": 32.0,
-            "beta_slow": 1.0,
-            "attention_factor": 1.2,
-        },
+        rope_parameters=rope_parameters,
         attention_bias=False,
         attention_dropout=0.0,
         sliding_window=4096,
@@ -155,6 +165,35 @@ def _get_hf_rotary_class():
         return None
 
 
+def _create_custom_rotary(config: Olmo3Config, head_dim: int) -> torch.nn.Module:
+    rope_parameters = config.rope_parameters
+    rope_type = rope_parameters.get("rope_type", "default")
+    rope_theta = rope_parameters["rope_theta"]
+
+    if rope_type == "default":
+        return Olmo3RotaryEmbedding(
+            head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
+        )
+
+    if rope_type == "yarn":
+        return Olmo3YarnRotaryEmbedding(
+            head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
+            scaling_factor=rope_parameters["factor"],
+            original_max_position_embeddings=rope_parameters.get(
+                "original_max_position_embeddings", 64
+            ),
+            beta_fast=rope_parameters.get("beta_fast", 32.0),
+            beta_slow=rope_parameters.get("beta_slow", 1.0),
+            attention_factor=rope_parameters.get("attention_factor", 1.0),
+        )
+
+    raise ValueError(f"Unsupported OLMo-3 RoPE type: {rope_type}")
+
+
 # =========================================================================
 # Block equivalence tests (Level 1)
 # =========================================================================
@@ -192,12 +231,13 @@ def test_olmo3_mlp_equivalence(B, S, dtype):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
 @pytest.mark.parametrize("layer_idx", [0, 3])  # sliding (idx=0) and full (idx=3)
 @torch.no_grad()
-def test_olmo3_attention_equivalence(B, S, dtype, layer_idx):
+def test_olmo3_attention_equivalence(B, S, dtype, layer_idx, rope_type):
     """Test Attention layer produces numerically equivalent output to HF implementation.
 
-    Tests both sliding_attention (layer_idx=0) and full_attention (layer_idx=3) types.
+    Tests both sliding_attention and full_attention with default and YaRN RoPE.
     """
     HFAttention = _get_hf_attention_class()
     HFRotary = _get_hf_rotary_class()
@@ -205,7 +245,7 @@ def test_olmo3_attention_equivalence(B, S, dtype, layer_idx):
         pytest.skip("transformers doesn't have Olmo3Attention or Olmo3RotaryEmbedding")
 
     device = "cuda"
-    config = _create_small_config()
+    config = _create_small_config(rope_type=rope_type)
     config._attn_implementation = "eager"
 
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -225,34 +265,12 @@ def test_olmo3_attention_equivalence(B, S, dtype, layer_idx):
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    # Compute HF position embeddings (creates the right type based on attention_type)
-    if attention_type == "sliding_attention":
-        hf_rotary = HFRotary(config=config, device=device, rope_type="default")
-    else:
-        hf_rotary = HFRotary(config=config, device=device)
+    # Compute HF position embeddings
+    hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
     # Compute custom position embeddings
-    if attention_type == "sliding_attention":
-        custom_rotary = Olmo3RotaryEmbedding(
-            head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
-    else:
-        rope_scaling = config.rope_scaling
-        custom_rotary = Olmo3YarnRotaryEmbedding(
-            head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-            scaling_factor=rope_scaling["factor"],
-            original_max_position_embeddings=rope_scaling.get(
-                "original_max_position_embeddings", 64
-            ),
-            beta_fast=rope_scaling.get("beta_fast", 32.0),
-            beta_slow=rope_scaling.get("beta_slow", 1.0),
-            attention_factor=rope_scaling.get("attention_factor", 1.0),
-        )
+    custom_rotary = _create_custom_rotary(config, head_dim)
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
@@ -285,12 +303,13 @@ def test_olmo3_attention_equivalence(B, S, dtype, layer_idx):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
 @pytest.mark.parametrize("layer_idx", [0, 3])  # sliding and full
 @torch.no_grad()
-def test_olmo3_decoder_layer_equivalence(B, S, dtype, layer_idx):
+def test_olmo3_decoder_layer_equivalence(B, S, dtype, layer_idx, rope_type):
     """Test decoder layer produces numerically equivalent output to HF implementation.
 
-    Tests both sliding_attention and full_attention decoder layers.
+    Tests both sliding_attention and full_attention with default and YaRN RoPE.
     """
     HFDecoderLayer = _get_hf_decoder_layer_class()
     HFRotary = _get_hf_rotary_class()
@@ -298,7 +317,7 @@ def test_olmo3_decoder_layer_equivalence(B, S, dtype, layer_idx):
         pytest.skip("transformers doesn't have Olmo3DecoderLayer or Olmo3RotaryEmbedding")
 
     device = "cuda"
-    config = _create_small_config()
+    config = _create_small_config(rope_type=rope_type)
     config._attn_implementation = "eager"
 
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -319,33 +338,11 @@ def test_olmo3_decoder_layer_equivalence(B, S, dtype, layer_idx):
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
     # Compute HF position embeddings
-    if attention_type == "sliding_attention":
-        hf_rotary = HFRotary(config=config, device=device, rope_type="default")
-    else:
-        hf_rotary = HFRotary(config=config, device=device)
+    hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
     # Compute custom position embeddings
-    if attention_type == "sliding_attention":
-        custom_rotary = Olmo3RotaryEmbedding(
-            head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
-    else:
-        rope_scaling = config.rope_scaling
-        custom_rotary = Olmo3YarnRotaryEmbedding(
-            head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-            scaling_factor=rope_scaling["factor"],
-            original_max_position_embeddings=rope_scaling.get(
-                "original_max_position_embeddings", 64
-            ),
-            beta_fast=rope_scaling.get("beta_fast", 32.0),
-            beta_slow=rope_scaling.get("beta_slow", 1.0),
-            attention_factor=rope_scaling.get("attention_factor", 1.0),
-        )
+    custom_rotary = _create_custom_rotary(config, head_dim)
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
@@ -381,8 +378,9 @@ def test_olmo3_decoder_layer_equivalence(B, S, dtype, layer_idx):
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
 @torch.no_grad()
-def test_olmo3_full_model_equivalence(B, S, dtype, device):
+def test_olmo3_full_model_equivalence(B, S, dtype, device, rope_type):
     """Test full model produces numerically equivalent output to HF implementation."""
     HFModel = _get_hf_model_class()
     if HFModel is None:
@@ -391,7 +389,7 @@ def test_olmo3_full_model_equivalence(B, S, dtype, device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    config = _create_small_config()
+    config = _create_small_config(rope_type=rope_type)
     config._attn_implementation = "eager"
 
     # Create HF model
@@ -424,8 +422,9 @@ def test_olmo3_full_model_equivalence(B, S, dtype, device):
 # =========================================================================
 
 
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
 @torch.no_grad()
-def test_olmo3_model_can_be_exported():
+def test_olmo3_model_can_be_exported(rope_type):
     """Test that the custom model can be exported with torch_export_to_gm.
 
     Verifies:
@@ -435,7 +434,7 @@ def test_olmo3_model_can_be_exported():
     """
     device = "cuda"
     dtype = torch.bfloat16
-    config = _create_small_config()
+    config = _create_small_config(rope_type=rope_type)
 
     model = Olmo3ForCausalLM(config)
     model.to(device=device, dtype=dtype)
