@@ -15,8 +15,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionForwardArgs,
-                        AttentionMetadata, CustomAttentionMask, MLAParams,
-                        PredefinedAttentionMask, merge_attention_forward_args)
+                        AttentionInputType, AttentionMetadata,
+                        CustomAttentionMask, MLAParams, PredefinedAttentionMask,
+                        merge_attention_forward_args)
 
 try:
     check_cuda_arch()
@@ -118,6 +119,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     # Cached plan params + is-planned flag let prepare() refresh the plan
     # outside stream capture (flashinfer plan() does device->host syncs).
     _mla_decode_wrapper: Optional[object] = field(init=False, default=None)
+    _mla_context_wrapper: Optional[object] = field(init=False, default=None)
     _mla_decode_plan_params: Optional[MLADecodePlanParams] = field(init=False,
                                                                    default=None)
     _mla_decode_planned: bool = field(init=False, default=False)
@@ -220,6 +222,52 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._do_plan_mla_decode(plan_params)
         self._mla_decode_planned = True
         return self._mla_decode_wrapper
+
+    def plan_mla_context(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        plan_params: MLADecodePlanParams,
+    ) -> object:
+        """Plan MLA context with cached KV using BatchMLAPagedAttentionWrapper."""
+        if self._mla_context_wrapper is None:
+            self._mla_context_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=False,
+                backend="auto",
+            )
+
+        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Cannot plan() flashinfer MLA context while the stream is "
+                "capturing. Chunked MLA prefill with FlashInfer does not "
+                "support CUDA graph capture.")
+
+        num_pages_per_seq = kv_indptr[1:] - kv_indptr[:-1]
+        kv_len_arr = (num_pages_per_seq -
+                      1) * plan_params.page_size + kv_last_page_len
+
+        # Must sync after append_paged_mla_kv_cache and before plan().
+        torch.cuda.current_stream().synchronize()
+
+        self._mla_context_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            plan_params.num_heads,
+            plan_params.kv_lora_rank,
+            plan_params.qk_rope_head_dim,
+            plan_params.page_size,
+            causal=True,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            sm_scale=plan_params.sm_scale,
+        )
+
+        return self._mla_context_wrapper
 
     def _do_plan_mla_decode(self, plan_params: MLADecodePlanParams) -> None:
         """Compute MLA decode plan inputs and call wrapper.plan().
@@ -455,6 +503,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         )
         # Rebind the wrapper to the freshly allocated buffers.
         self._mla_decode_wrapper = None
+        self._mla_context_wrapper = None
         self._mla_decode_planned = False
 
     def create_cuda_graph_metadata(self,
@@ -1217,6 +1266,76 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     out=output[:num_tokens].view(-1, self.num_heads,
                                                  self.kv_lora_rank))
 
+    def _mla_forward_cached_context(
+        self,
+        q: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: torch.Tensor,
+    ) -> None:
+        """MLA context phase with cached KV: append latent and run paged MLA."""
+        num_ctx_tokens = metadata.num_ctx_tokens
+        kv_dtype = q.dtype
+        if self.has_fp8_kv_cache:
+            kv_dtype = torch.float8_e4m3fn
+
+        ckv_cache, kpe_cache = self._get_mla_caches(metadata, kv_dtype)
+
+        append_ckv = latent_cache[:, :self.kv_lora_rank]
+        append_kpe = latent_cache[:, self.kv_lora_rank:]
+        if self.has_fp8_kv_cache:
+            append_ckv = append_ckv.to(kv_dtype)
+            append_kpe = append_kpe.to(kv_dtype)
+
+        flashinfer.page.append_paged_mla_kv_cache(
+            append_ckv,
+            append_kpe,
+            metadata.batch_indices[:num_ctx_tokens],
+            metadata.positions[:num_ctx_tokens],
+            ckv_cache,
+            kpe_cache,
+            metadata.paged_kv_indices,
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_last_page_len,
+        )
+
+        num_tokens = q.shape[0]
+        q_3d = q.view(num_tokens, self.num_heads, self.head_dim)
+        q_nope = q_3d[..., :self.kv_lora_rank]
+        q_pe = q_3d[..., self.kv_lora_rank:]
+
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if self.q_scaling is not None:
+            sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
+        else:
+            sm_scale = 1.0 / math.sqrt(qk_head_dim)
+
+        plan_params = MLADecodePlanParams(
+            num_heads=self.num_heads,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            page_size=metadata.page_size,
+            q_dtype=q.dtype,
+            kv_dtype=kv_dtype,
+            sm_scale=sm_scale,
+        )
+
+        num_contexts = metadata.num_contexts
+        wrapper = metadata.plan_mla_context(
+            qo_indptr=metadata.qo_indptr[:num_contexts + 1],
+            kv_indptr=metadata.paged_kv_indptr_prefill[:num_contexts + 1],
+            kv_indices=metadata.paged_kv_indices[:metadata.num_context_blocks],
+            kv_last_page_len=metadata.paged_kv_last_page_len[:num_contexts],
+            plan_params=plan_params,
+        )
+
+        wrapper.run(q_nope,
+                    q_pe,
+                    ckv_cache,
+                    kpe_cache,
+                    out=output[:num_tokens].view(-1, self.num_heads,
+                                                 self.kv_lora_rank))
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -1228,6 +1347,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_window_size: Optional[int] = None,
         latent_cache: Optional[torch.Tensor] = None,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
     ) -> None:
         # MLA dispatch
         if self.is_mla_enable:
@@ -1237,8 +1357,15 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                                           latent_cache)
                 return
             elif k is None and v is None:
-                # MLA generation phase: paged decode + slice
-                self._mla_forward_generation(q, metadata, output, latent_cache)
+                if attention_input_type == AttentionInputType.context_only:
+                    assert latent_cache is not None, (
+                        "FlashInfer MLA cached context requires latent_cache.")
+                    self._mla_forward_cached_context(q, metadata, output,
+                                                     latent_cache)
+                else:
+                    # MLA generation phase: paged decode + slice
+                    self._mla_forward_generation(q, metadata, output,
+                                                 latent_cache)
                 return
 
         # Query
@@ -1452,13 +1579,15 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 
-        self.forward_impl(q=q,
-                          k=k,
-                          v=v,
-                          metadata=metadata,
-                          attention_mask_type=attention_mask_type,
-                          attention_mask_data=attention_mask_data,
-                          attention_window_size=attention_window_size,
-                          output=output,
-                          latent_cache=latent_cache)
+        self.forward_impl(
+            q=q,
+            k=k,
+            v=v,
+            metadata=metadata,
+            attention_mask_type=attention_mask_type,
+            attention_mask_data=attention_mask_data,
+            attention_window_size=attention_window_size,
+            output=output,
+            latent_cache=latent_cache,
+            attention_input_type=forward_args.attention_input_type)
         return output

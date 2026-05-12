@@ -2418,6 +2418,18 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (isinstance(attn_metadata, FlashInferAttentionMetadata)
+                and attn_metadata.kv_cache_manager is not None and any(
+                    attn_metadata.kv_cache_params.
+                    num_cached_tokens_per_seq[:attn_metadata.num_contexts])):
+            return self.forward_absorption_context(q,
+                                                   compressed_kv,
+                                                   k_pe,
+                                                   attn_metadata,
+                                                   output,
+                                                   position_ids=position_ids,
+                                                   latent_cache=latent_cache)
+
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
