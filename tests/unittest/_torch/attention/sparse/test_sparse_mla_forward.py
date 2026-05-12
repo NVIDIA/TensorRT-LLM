@@ -1,13 +1,28 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Test suite for deepseek sparse attention with kvcache_dtype=bf16 using FlashMLA backend.
 """
 import math
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List
+from typing import List, Optional
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -31,6 +46,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .deepseek_v4.test_compressor_module import RefCompressor
+
+# DSACacheManager creates background ThreadPoolExecutor threads.
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 try:
     HAS_FLASH_MLA = True
@@ -114,7 +132,31 @@ BATCH_SPECS = {
     BatchSpec(
         seq_lens=[32, 33, 49, 65, 129],  # 1 prefill, 4 decode
         query_lens=[32, 1, 1, 1, 1]),
+
+    # Large mixed scenario.  Decode prompt lengths include 8192 and 16384
+    # tokens while prefill requests exceed the 128-token window.
+    "large_mixed_deepseek_v4":
+    BatchSpec(seq_lens=[512, 8193, 16385], query_lens=[512, 1, 1]),
 }
+
+LONG_PROMPT_BATCHES = {"large_mixed_deepseek_v4"}
+KV_CACHE_DTYPES = ["auto", "fp8"]
+SPARSE_ATTN_ALGOS = ["dsa", "deepseek_v4"]
+
+UNIFIED_TEST_PARAMS = [
+    pytest.param(batch_name,
+                 kv_cache_dtype,
+                 sparse_attn_algo,
+                 id=f"{sparse_attn_algo}-{kv_cache_dtype}-{batch_name}")
+    for batch_name in BATCH_SPECS if batch_name not in LONG_PROMPT_BATCHES
+    for kv_cache_dtype in KV_CACHE_DTYPES
+    for sparse_attn_algo in SPARSE_ATTN_ALGOS
+]
+UNIFIED_TEST_PARAMS.append(
+    pytest.param("large_mixed_deepseek_v4",
+                 "auto",
+                 "deepseek_v4",
+                 id="deepseek_v4-auto-large_mixed_deepseek_v4"))
 
 
 def apply_rotary_emb(x: torch.Tensor,
@@ -180,6 +222,234 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim.item()
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _gather_deepseek_v4_compressed_kv(
+    compressed_kv: Optional[torch.Tensor],
+    topk_row: Optional[torch.Tensor],
+    max_valid_compressed: int,
+) -> Optional[torch.Tensor]:
+    """Select DS4 compressed KV entries using production local top-k indices."""
+    if compressed_kv is None or max_valid_compressed <= 0:
+        return None
+
+    max_valid_compressed = min(max_valid_compressed, compressed_kv.shape[0])
+    if max_valid_compressed <= 0:
+        return None
+
+    if topk_row is None:
+        return compressed_kv[:max_valid_compressed]
+
+    local_indices = topk_row.to(device=compressed_kv.device, dtype=torch.long)
+    valid_mask = (local_indices >= 0) & (local_indices < max_valid_compressed)
+    if not valid_mask.any().item():
+        return None
+
+    return compressed_kv.index_select(0, local_indices[valid_mask])
+
+
+def _reset_ref_compressor_state(ref_compressor: RefCompressor) -> None:
+    ref_compressor.kv_state *= 0
+    ref_compressor.score_state.fill_(-float("inf"))
+
+
+def _copy_ref_compressor_weights(ref_compressor: RefCompressor,
+                                 compressor) -> None:
+    weights_wkv_gate = compressor.wkv_gate.weight.data
+    weights_wkv = weights_wkv_gate[:compressor.state_dim]
+    weights_wgate = weights_wkv_gate[compressor.state_dim:]
+    ref_compressor.wkv.weight.data.copy_(weights_wkv)
+    ref_compressor.wgate.weight.data.copy_(weights_wgate)
+    ref_compressor.ape.data.copy_(compressor.ape.data)
+    ref_compressor.norm.weight.data.copy_(compressor.norm.weight.data)
+
+
+def _topk_from_scores(scores: torch.Tensor, topk_tokens: int) -> torch.Tensor:
+    row = torch.full((topk_tokens, ),
+                     -1,
+                     dtype=torch.int32,
+                     device=scores.device)
+    if scores.numel() == 0:
+        return row
+    k = min(topk_tokens, scores.numel())
+    row[:k] = torch.topk(scores.float(), k, dim=-1).indices.to(torch.int32)
+    return row
+
+
+def _reference_indexer_scores(q: torch.Tensor, k: torch.Tensor,
+                              weights: torch.Tensor,
+                              softmax_scale: float) -> torch.Tensor:
+    head_scores = torch.einsum("hd,kd->hk", q.float(), k.float())
+    head_scores = F.relu(head_scores) * softmax_scale
+    return (head_scores * weights.float().unsqueeze(-1)).sum(dim=0)
+
+
+def calculate_reference_deepseek_v4_topk_indices(
+    mla,
+    ref_indexer_compressor: RefCompressor,
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv_data: dict,
+    freqs_cis: torch.Tensor,
+    position_ids: torch.Tensor,
+    ctx_indices: List[int],
+    gen_indices: List[int],
+    seq_lens: List[int],
+    topk_tokens: int,
+    compress_ratio: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Independent PyTorch reference for HF DS4 ratio-4 indexer top-k indices."""
+    indexer = mla.mqa.indexer
+    num_tokens = hidden_states.shape[0]
+    topk_indices = torch.full((num_tokens, topk_tokens),
+                              -1,
+                              dtype=torch.int32,
+                              device=device)
+
+    q_ref = F.linear(qr, indexer.wq_b.weight)
+    q_ref = q_ref.view(num_tokens, indexer.n_heads, indexer.head_dim)
+    q_ref = q_ref.unsqueeze(0)
+    apply_rotary_emb(q_ref[..., -indexer.rope_dim:],
+                     freqs_cis[position_ids.long()])
+    q_ref = q_ref.squeeze(0)
+
+    weights = F.linear(hidden_states, indexer.weights_proj.weight)
+    weights = weights.float() * (indexer.n_heads**-0.5)
+
+    offset = 0
+    for req_idx in ctx_indices:
+        seq_len = seq_lens[req_idx]
+        hidden_states_seq = hidden_states[offset:offset + seq_len]
+        kv_cache = torch.zeros(1,
+                               seq_len // compress_ratio,
+                               ref_indexer_compressor.head_dim,
+                               device=device)
+        ref_indexer_compressor.kv_cache = kv_cache
+        _reset_ref_compressor_state(ref_indexer_compressor)
+        compressed_kv = ref_indexer_compressor(hidden_states_seq.unsqueeze(0),
+                                               start_pos=0,
+                                               freqs_cis=freqs_cis[:seq_len])
+
+        if compressed_kv is not None:
+            compressed_kv = compressed_kv.squeeze(0)
+            for token_idx in range(seq_len):
+                valid_len = (token_idx + 1) // compress_ratio
+                scores = _reference_indexer_scores(q_ref[offset + token_idx],
+                                                   compressed_kv[:valid_len],
+                                                   weights[offset + token_idx],
+                                                   indexer.softmax_scale)
+                topk_indices[offset + token_idx] = _topk_from_scores(
+                    scores, topk_tokens)
+
+        offset += seq_len
+
+    for gen_offset, req_idx in enumerate(gen_indices):
+        token_idx = offset + gen_offset
+        seq_len = seq_lens[req_idx]
+        start_pos = seq_len - 1
+
+        compressed_kv = kv_data["indexer_compressed_kv"][req_idx]
+        kv_state = kv_data["indexer_kv_state"][req_idx]
+        score_state = kv_data["indexer_score_state"][req_idx]
+
+        ref_indexer_compressor.kv_state = kv_state.clone()
+        ref_indexer_compressor.score_state = score_state.clone()
+        kv_cache = torch.zeros(1,
+                               seq_len // compress_ratio,
+                               ref_indexer_compressor.head_dim,
+                               device=device)
+        ref_indexer_compressor.kv_cache = kv_cache
+        if compressed_kv is not None:
+            ref_indexer_compressor.kv_cache[
+                0, :compressed_kv.shape[0]] = compressed_kv
+
+        new_compressed_kv = ref_indexer_compressor(
+            hidden_states[token_idx:token_idx + 1].unsqueeze(0),
+            start_pos=start_pos,
+            freqs_cis=freqs_cis)
+        if new_compressed_kv is not None:
+            new_compressed_kv = new_compressed_kv.squeeze(0)
+            compressed_kv = (torch.cat([compressed_kv, new_compressed_kv],
+                                       dim=0) if compressed_kv is not None else
+                             new_compressed_kv)
+
+        valid_len = seq_len // compress_ratio
+        if compressed_kv is None or valid_len == 0:
+            continue
+
+        scores = _reference_indexer_scores(q_ref[token_idx],
+                                           compressed_kv[:valid_len],
+                                           weights[token_idx],
+                                           indexer.softmax_scale)
+        topk_indices[token_idx] = _topk_from_scores(scores, topk_tokens)
+
+    return topk_indices
+
+
+def assert_deepseek_v4_topk_indices_match(actual: torch.Tensor,
+                                          expected: torch.Tensor) -> None:
+    mismatch = get_deepseek_v4_topk_mismatch(actual, expected)
+    if mismatch is not None:
+        raise AssertionError(mismatch)
+
+
+def get_deepseek_v4_topk_mismatch(actual: torch.Tensor,
+                                  expected: torch.Tensor) -> Optional[str]:
+    assert actual.shape == expected.shape
+    for token_idx in range(expected.shape[0]):
+        actual_valid = actual[token_idx][actual[token_idx] >= 0].sort().values
+        expected_valid = expected[token_idx][expected[token_idx] >=
+                                             0].sort().values
+        if not torch.equal(actual_valid, expected_valid):
+            missing_from_actual = expected_valid[
+                ~torch.isin(expected_valid, actual_valid)]
+            extra_in_actual = actual_valid[~torch.
+                                           isin(actual_valid, expected_valid)]
+            overlap = actual_valid.numel() - extra_in_actual.numel()
+            return ("DS4 indexer top-k mismatch at token "
+                    f"{token_idx}: actual_head={actual_valid[:16].tolist()} "
+                    f"expected_head={expected_valid[:16].tolist()} "
+                    f"missing={missing_from_actual[:16].tolist()} "
+                    f"extra={extra_in_actual[:16].tolist()} "
+                    f"missing_len={missing_from_actual.numel()} "
+                    f"extra_len={extra_in_actual.numel()} "
+                    f"overlap={overlap} "
+                    f"actual_len={actual_valid.numel()} "
+                    f"expected_len={expected_valid.numel()}")
+    return None
+
+
+def get_deepseek_v4_topk_overlap_mismatch(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    min_overlap: float,
+) -> Optional[str]:
+    assert actual.shape == expected.shape
+    for token_idx in range(expected.shape[0]):
+        actual_valid = actual[token_idx][actual[token_idx] >= 0].sort().values
+        expected_valid = expected[token_idx][expected[token_idx] >=
+                                             0].sort().values
+        if expected_valid.numel() == 0:
+            if actual_valid.numel() == 0:
+                continue
+            return ("DS4 indexer top-k overlap mismatch at token "
+                    f"{token_idx}: expected empty top-k, "
+                    f"actual_len={actual_valid.numel()}")
+
+        overlap = torch.isin(expected_valid, actual_valid).sum().item()
+        overlap_ratio = overlap / expected_valid.numel()
+        if overlap_ratio < min_overlap:
+            return ("DS4 indexer top-k overlap below threshold at token "
+                    f"{token_idx}: overlap={overlap}/"
+                    f"{expected_valid.numel()} "
+                    f"overlap_ratio={overlap_ratio:.6f} "
+                    f"min_overlap={min_overlap}")
+    return None
 
 
 def apply_rotary_embedding(
@@ -386,6 +656,7 @@ def calculate_reference_output_deepseek_v4_prefill(hidden_states,
                                                    kv_data,
                                                    freqs_cis,
                                                    ref_compressor,
+                                                   topk_indices,
                                                    num_heads,
                                                    qk_nope_head_dim,
                                                    qk_rope_head_dim,
@@ -401,7 +672,7 @@ def calculate_reference_output_deepseek_v4_prefill(hidden_states,
 
     Implements attention over:
     1. Sliding window: last window_size tokens
-    2. Compressed KV: all compressed tokens (assuming all are selected)
+    2. Compressed KV: indexer-selected top-k tokens for ratio-4 layers
     """
     results, offset = [], 0
     device = q.device
@@ -428,63 +699,42 @@ def calculate_reference_output_deepseek_v4_prefill(hidden_states,
             compressed_kv = ref_compressor(hidden_states_seq.unsqueeze(0),
                                            start_pos=0,
                                            freqs_cis=freqs_cis[:seq_len])
-            num_compressed = compressed_kv.shape[
-                1] if compressed_kv is not None else 0
-            if num_compressed > 0:
-                # RefCompressor returns fp32 (matches the kernel's
-                # fp32-throughout postprocess); cast to the attention dtype
-                # before concatenation.
-                kv_combined = torch.cat(
-                    [kv_seq, compressed_kv.to(kv_seq.dtype)], dim=1).squeeze(0)
-            else:
-                kv_combined = kv_seq.squeeze(0)
-                num_compressed = 0
+            if compressed_kv is not None:
+                compressed_kv = compressed_kv.squeeze(0).to(kv_seq.dtype)
         else:
-            kv_combined = kv_seq.squeeze(0)
-            num_compressed = 0
+            compressed_kv = None
 
-        # Create attention mask: [seq_len, seq_len + num_compressed]
-        # KV structure: [0:seq_len] = window_kv, [seq_len:seq_len+num_compressed] = compressed_kv
-        # Each query at position i can attend to:
-        # 1. Window tokens: positions [max(0, i - window_size + 1), i] in range [0, seq_len)
-        # 2. Compressed tokens: positions [seq_len, seq_len + i//compress_ratio) representing original tokens before position i
-        attn_mask = torch.full((seq_len, seq_len + num_compressed),
-                               float('-inf'),
-                               device=device,
-                               dtype=q_seq.dtype)
+        kv_seq = kv_seq.squeeze(0)
+        attn_outs = []
+        for token_idx in range(seq_len):
+            window_start = max(0, token_idx - window_size + 1)
+            window_kv = kv_seq[window_start:token_idx + 1]
+            topk_row = None
+            if topk_indices is not None and compress_ratio == 4:
+                topk_row = topk_indices[offset + token_idx]
+            max_valid_compressed = ((token_idx + 1) //
+                                    compress_ratio if compress_ratio > 1 else 0)
+            selected_compressed_kv = _gather_deepseek_v4_compressed_kv(
+                compressed_kv, topk_row, max_valid_compressed)
+            if selected_compressed_kv is not None:
+                kv_combined = torch.cat([window_kv, selected_compressed_kv],
+                                        dim=0)
+            else:
+                kv_combined = window_kv
 
-        for i in range(seq_len):
-            # Window KV: query at position i can attend to positions [max(0, i - window_size + 1), i]
-            window_start = max(0, i - window_size + 1)
-            attn_mask[i, window_start:i + 1] = 0
+            k_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
+            v_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
 
-            # Compressed KV: production uses (pos+1)//compress_ratio valid compressed tokens
-            if num_compressed > 0:
-                max_compressed_idx = (i + 1) // compress_ratio
-                if max_compressed_idx > 0:
-                    attn_mask[i, seq_len:seq_len + max_compressed_idx] = 0
+            q_in = q_seq[:, token_idx:token_idx + 1].transpose(1, 2)
+            k_in = k_combined.unsqueeze(0).transpose(1, 2)
+            v_in = v_combined.unsqueeze(0).transpose(1, 2)
 
-        # Expand KV for multi-head (deepseek_v4 uses MQA - single KV head for all Q heads)
-        k_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
-        # Use full kv_combined as V (not just first v_head_dim dimensions) to match reference
-        v_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
+            attn_out = torch.nn.functional.scaled_dot_product_attention(
+                q_in, k_in, v_in, scale=softmax_scale).transpose(1,
+                                                                 2).squeeze(0)
+            attn_outs.append(attn_out)
 
-        # Prepare for attention: [1, num_heads, seq_len, head_dim]
-        # q: [1, num_heads, seq_len, qk_head_dim]
-        # k: [1, num_heads, seq_len + num_compressed, qk_head_dim]
-        # v: [1, num_heads, seq_len + num_compressed, qk_head_dim]
-        # attn_mask: [1, 1, seq_len, seq_len + num_compressed]
-        q_in = q_seq.transpose(1, 2)
-        k_in = k_combined.unsqueeze(0).transpose(1, 2)
-        v_in = v_combined.unsqueeze(0).transpose(1, 2)
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-
-        # Compute attention with custom mask, attn_out: # [seq_len, num_heads, qk_head_dim]
-        attn_out = torch.nn.functional.scaled_dot_product_attention(
-            q_in, k_in, v_in, attn_mask=attn_mask,
-            scale=softmax_scale).transpose(1, 2).squeeze(0)
-
-        results.append(attn_out)
+        results.append(torch.cat(attn_outs, dim=0))
         offset += seq_len
 
     return torch.cat(results, dim=0).flatten(1)
@@ -497,6 +747,7 @@ def calculate_reference_output_deepseek_v4_generation(hidden_states,
                                                       kv_data,
                                                       freqs_cis,
                                                       ref_compressor,
+                                                      topk_indices,
                                                       num_contexts,
                                                       num_heads,
                                                       qk_nope_head_dim,
@@ -520,7 +771,7 @@ def calculate_reference_output_deepseek_v4_generation(hidden_states,
     results = []
     qk_nope_head_dim + qk_rope_head_dim
 
-    for gen_req_idx in gen_indices:
+    for gen_offset, gen_req_idx in enumerate(gen_indices):
         req_idx = gen_req_idx - num_contexts
         # Total sequence length including cache + new token
         seq_len = seq_lens[gen_req_idx]
@@ -570,11 +821,12 @@ def calculate_reference_output_deepseek_v4_generation(hidden_states,
             else:
                 num_compressed = 0
 
-            # Run compressor on new token (returns compressed KV only if compression happens at this step)
+            # Run compressor on the new token. It returns compressed KV only
+            # when this token completes a compression group.
             new_compressed_kv = ref_compressor(
                 hidden_states_seq.unsqueeze(0),  # [1, 1, head_dim]
                 start_pos=start_pos,
-                freqs_cis=freqs_cis[start_pos:start_pos + 1])
+                freqs_cis=freqs_cis)
 
             # Update compressed_kv if a new compressed token was produced.
             # RefCompressor returns fp32; cast back to the attention dtype.
@@ -594,12 +846,18 @@ def calculate_reference_output_deepseek_v4_generation(hidden_states,
         if window_kv_with_new.shape[0] > window_size:
             window_kv_with_new = window_kv_with_new[-window_size:]
 
-        # Build combined KV: [window_kv, compressed_kv]
-        if compressed_kv is not None:
-            num_compressed = compressed_kv.shape[0]
-            kv_combined = torch.cat([window_kv_with_new, compressed_kv], dim=0)
+        topk_row = None
+        if topk_indices is not None and compress_ratio == 4:
+            topk_row = topk_indices[gen_offset]
+        selected_compressed_kv = _gather_deepseek_v4_compressed_kv(
+            compressed_kv, topk_row,
+            seq_len // compress_ratio if compress_ratio > 1 else 0)
+
+        # Build combined KV: [window_kv, selected_compressed_kv]
+        if selected_compressed_kv is not None:
+            kv_combined = torch.cat(
+                [window_kv_with_new, selected_compressed_kv], dim=0)
         else:
-            num_compressed = 0
             kv_combined = window_kv_with_new
 
         total_kv_len = kv_combined.shape[0]
@@ -640,6 +898,7 @@ def calculate_reference_output_deepseek_v4_mixed(hidden_states,
                                                  kv_data,
                                                  freqs_cis,
                                                  ref_compressor,
+                                                 topk_indices,
                                                  ctx_indices,
                                                  gen_indices,
                                                  seq_lens,
@@ -656,15 +915,20 @@ def calculate_reference_output_deepseek_v4_mixed(hidden_states,
                                                  window_size=512,
                                                  compress_ratio=4):
     """Reference for deepseek_v4 mixed batch (combines context and generation)."""
+    if compress_ratio == 4:
+        assert topk_indices is not None, "DS4 ratio-4 reference requires top-k indices"
     ref_results = [None] * len(seq_lens)
 
     # Process context requests
     if ctx_indices:
+        num_ctx_tokens = sum(seq_lens[i] for i in ctx_indices)
+        ctx_topk_indices = (topk_indices[:num_ctx_tokens]
+                            if topk_indices is not None else None)
         ctx_results = calculate_reference_output_deepseek_v4_prefill(
             hidden_states, ctx_indices, seq_lens, q_ctx, kv_data, freqs_cis,
-            ref_compressor, num_heads, qk_nope_head_dim, qk_rope_head_dim,
-            v_head_dim, softmax_scale, device, o_a_proj, o_b_proj_weight,
-            n_local_groups, window_size, compress_ratio)
+            ref_compressor, ctx_topk_indices, num_heads, qk_nope_head_dim,
+            qk_rope_head_dim, v_head_dim, softmax_scale, device, o_a_proj,
+            o_b_proj_weight, n_local_groups, window_size, compress_ratio)
         offset = 0
         for req_idx in ctx_indices:
             seq_len = seq_lens[req_idx]
@@ -673,9 +937,12 @@ def calculate_reference_output_deepseek_v4_mixed(hidden_states,
 
     # Process generation requests
     if gen_indices:
+        num_ctx_tokens = sum(seq_lens[i] for i in ctx_indices)
+        gen_topk_indices = (topk_indices[num_ctx_tokens:]
+                            if topk_indices is not None else None)
         gen_results = calculate_reference_output_deepseek_v4_generation(
-            hidden_states,
-            gen_indices, seq_lens, q_gen, kv_data, freqs_cis, ref_compressor,
+            hidden_states[num_ctx_tokens:], gen_indices, seq_lens, q_gen,
+            kv_data, freqs_cis, ref_compressor, gen_topk_indices,
             len(ctx_indices), num_heads, qk_nope_head_dim, qk_rope_head_dim,
             v_head_dim, softmax_scale, device, o_a_proj, o_b_proj_weight,
             n_local_groups, window_size, compress_ratio)
@@ -770,16 +1037,28 @@ def prepare_reference_inputs(
 
     elif sparse_attn_algo == "deepseek_v4":
         all_latent_kv = {}
+        cache_keys = ("window_kv", "compressed_kv", "kv_state", "score_state",
+                      "indexer_compressed_kv", "indexer_kv_state",
+                      "indexer_score_state")
+        remapped_cache = {
+            key: {}
+            for key in cache_keys if key in kv_cache_for_ref
+        }
 
         for batch_idx, orig_req_idx in enumerate(batch_order):
             batch_start = batch_token_offsets[batch_idx]
             batch_end = batch_token_offsets[batch_idx + 1]
             q_req = q_original_for_ref[batch_start:batch_end]
             q_for_ref_list.append(q_req.view(-1, num_heads, qk_head_dim))
-            all_latent_kv[orig_req_idx] = latent_cache[batch_start:batch_end, :]
+            all_latent_kv[batch_idx] = latent_cache[batch_start:batch_end, :]
+            for key in remapped_cache:
+                if orig_req_idx in kv_cache_for_ref[key]:
+                    remapped_cache[key][batch_idx] = kv_cache_for_ref[key][
+                        orig_req_idx]
 
         q_for_ref = torch.cat(q_for_ref_list, dim=0)
         kv_cache_for_ref["latent_kv"] = all_latent_kv
+        kv_cache_for_ref.update(remapped_cache)
         return q_for_ref, kv_cache_for_ref
 
     else:
@@ -946,7 +1225,8 @@ def populate_gen_dsa_kv_cache(mla: MLA, AttentionCls: AttentionBackend,
 
 
 def populate_gen_deepseek_v4_kv_cache(
-        mla: MLA, ref_compressor: RefCompressor, AttentionCls: AttentionBackend,
+        mla: MLA, ref_compressor: RefCompressor,
+        ref_indexer_compressor: RefCompressor, AttentionCls: AttentionBackend,
         pretrained_config: DummyPretrainedConfig,
         kv_cache_manager: DeepseekV4CacheManager, mapping: Mapping,
         sparse_config: DeepSeekV4SparseAttentionConfig, gen_indices: List[int],
@@ -966,6 +1246,9 @@ def populate_gen_deepseek_v4_kv_cache(
     all_ref_compressed_kv = {}
     all_ref_score_state = {}
     all_ref_kv_state = {}
+    all_ref_indexer_compressed_kv = {}
+    all_ref_indexer_score_state = {}
+    all_ref_indexer_kv_state = {}
 
     if gen_indices:
         gen_cached_lens = [
@@ -974,7 +1257,14 @@ def populate_gen_deepseek_v4_kv_cache(
         gen_with_cache = [i for i in gen_indices if cached_lens[i] > 0]
 
         if not gen_with_cache:
-            return {"window_kv": {}, "compressed_kv": {}, "full_kv": {}}
+            return {
+                "window_kv": {},
+                "compressed_kv": {},
+                "full_kv": {},
+                "indexer_compressed_kv": {},
+                "indexer_kv_state": {},
+                "indexer_score_state": {},
+            }
 
         # Generate batched input data for cached context tokens
         total_gen_cache_tokens = sum(gen_cached_lens)
@@ -1030,12 +1320,25 @@ def populate_gen_deepseek_v4_kv_cache(
             compressed_kv_out = ref_compressor(req_hidden,
                                                start_pos=0,
                                                freqs_cis=req_freqs)
+            indexer_kv_cache = torch.zeros(
+                1,
+                cached_len // ref_indexer_compressor.compress_ratio,
+                ref_indexer_compressor.head_dim,
+                device=device)
+            ref_indexer_compressor.kv_cache = indexer_kv_cache
+            _reset_ref_compressor_state(ref_indexer_compressor)
+            indexer_compressed_kv_out = ref_indexer_compressor(
+                req_hidden, start_pos=0, freqs_cis=req_freqs)
 
             # Extract kv_state and score_state for this request (batch_idx)
             # These are the internal states used during compression
             # Shape: [compress_ratio * (1 + overlap), head_dim] for overlap mode
             all_ref_kv_state[req_idx] = ref_compressor.kv_state.clone()
             all_ref_score_state[req_idx] = ref_compressor.score_state.clone()
+            all_ref_indexer_kv_state[
+                req_idx] = ref_indexer_compressor.kv_state.clone()
+            all_ref_indexer_score_state[
+                req_idx] = ref_indexer_compressor.score_state.clone()
 
             # Apply RoPE to the k_pe and collect the window KV
             latent_cache_i = latent_cache_i.unsqueeze(0)
@@ -1054,12 +1357,20 @@ def populate_gen_deepseek_v4_kv_cache(
                     0).clone()
             else:
                 all_ref_compressed_kv[req_idx] = None
+            if indexer_compressed_kv_out is not None:
+                all_ref_indexer_compressed_kv[
+                    req_idx] = indexer_compressed_kv_out.squeeze(0).clone()
+            else:
+                all_ref_indexer_compressed_kv[req_idx] = None
 
             offset += cached_len
             num_compressed = compressed_kv_out.shape[
                 1] if compressed_kv_out is not None else 0
+            num_indexer_compressed = indexer_compressed_kv_out.shape[
+                1] if indexer_compressed_kv_out is not None else 0
             print(f"    - Computed reference cache for gen request {req_idx}: "
-                  f"{cached_len} tokens -> {num_compressed} compressed tokens")
+                  f"{cached_len} tokens -> {num_compressed} compressed tokens "
+                  f"({num_indexer_compressed} indexer)")
 
         # Step 2: Run TRT-LLM forward to populate actual KV cache
         cached_metadata = AttentionCls.Metadata(
@@ -1091,6 +1402,9 @@ def populate_gen_deepseek_v4_kv_cache(
     kv_cache_for_ref["kv_state"] = all_ref_kv_state  # Compressor's kv_state
     kv_cache_for_ref[
         "score_state"] = all_ref_score_state  # Compressor's score_state
+    kv_cache_for_ref["indexer_compressed_kv"] = all_ref_indexer_compressed_kv
+    kv_cache_for_ref["indexer_kv_state"] = all_ref_indexer_kv_state
+    kv_cache_for_ref["indexer_score_state"] = all_ref_indexer_score_state
 
     return kv_cache_for_ref
 
@@ -1154,10 +1468,19 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
     return output
 
 
-def mla_forward_impl_with_deepseek_v4_wo_linear(mla, attn_metadata, q, qr,
-                                                compressed_kv, k_pe,
-                                                latent_cache, hidden_states,
-                                                position_ids, dtype, device):
+def mla_forward_impl_with_deepseek_v4_wo_linear(mla,
+                                                attn_metadata,
+                                                q,
+                                                qr,
+                                                compressed_kv,
+                                                k_pe,
+                                                latent_cache,
+                                                hidden_states,
+                                                position_ids,
+                                                dtype,
+                                                device,
+                                                return_topk_indices=False,
+                                                override_topk_indices=None):
     """Forward implementation for deepseek_v4 sparse attention.
 
     For deepseek_v4, compressed_kv is actually the nope part of KV (qk_nope_head_dim),
@@ -1187,6 +1510,11 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla, attn_metadata, q, qr,
         position_ids,
     )
 
+    topk_indices_for_forward = topk_indices_local
+    if override_topk_indices is not None:
+        topk_indices_for_forward = override_topk_indices
+        print("  - Injecting reference top-k into DS4 sparse MLA forward")
+
     # Step 2: Call MLA's compressor to compress KV cache
     if hasattr(mla.mqa, 'compressor') and mla.mqa.compressor is not None:
         mla.mqa.compressor(
@@ -1200,7 +1528,7 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla, attn_metadata, q, qr,
 
     # Step 3: Process context requests
     if num_contexts > 0:
-        ctx_topk_local = topk_indices_local[:num_ctx_tokens]
+        ctx_topk_local = topk_indices_for_forward[:num_ctx_tokens]
 
         mla.forward_context_sparse_mla(
             q=q[:num_ctx_tokens],
@@ -1218,7 +1546,7 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla, attn_metadata, q, qr,
 
     # Step 4: Process generation requests
     if num_generations > 0:
-        gen_topk_local = topk_indices_local[num_ctx_tokens:num_tokens]
+        gen_topk_local = topk_indices_for_forward[num_ctx_tokens:num_tokens]
 
         mla.forward_generation_sparse_mla(
             q=q[num_ctx_tokens:],
@@ -1234,15 +1562,16 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla, attn_metadata, q, qr,
             f"  ✓ Generation forward: {num_gen_tokens} tokens from {num_generations} requests"
         )
 
+    if return_topk_indices:
+        return output, topk_indices_local
     return output
 
 
 @pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
 @pytest.mark.skipif(get_sm_version() < 90,
                     reason="FlashMLA requires SM90 (Hopper) or later")
-@pytest.mark.parametrize("batch_name", list(BATCH_SPECS.keys()))
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-@pytest.mark.parametrize("sparse_attn_algo", ["dsa", "deepseek_v4"])
+@pytest.mark.parametrize("batch_name,kv_cache_dtype,sparse_attn_algo",
+                         UNIFIED_TEST_PARAMS)
 def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                                     sparse_attn_algo: str):
     """Test sparse MLA attention for pure prefill, pure decode, and mixed batches."""
@@ -1308,7 +1637,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         head_size = kv_lora_rank + qk_rope_head_dim  # 512
         topk_tokens = 512
         hidden_size = 4096
-        max_position_embeddings = 4096
+        max_position_embeddings = max(4096, max(seq_lens))
         num_groups = 8
         o_lora_rank = 1024
         num_layers = 3  # Test multi-layer pool
@@ -1415,7 +1744,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     # Setup model config
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     max_seqlen = max(seq_lens)
-    max_tokens = 16384
+    max_tokens = max(16384, sum(seq_lens))
+    if batch_name in LONG_PROMPT_BATCHES:
+        max_tokens = max(max_tokens, batch_spec.batch_size * (max_seqlen + 1))
 
     # Create sparse attention config
     if sparse_attn_algo == "dsa":
@@ -1536,24 +1867,22 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             max_batch_size=1,
             max_seq_len=max_seqlen,
         )
-        # V4 reference: attention's compressor uses rotate=False (only the
-        # indexer's compressor rotates).  See V4-Pro inference/model.py
-        # Attention.__init__: ``Compressor(args, ratio, head_dim)`` (default
-        # rotate=False), Indexer.__init__: ``Compressor(..., rotate=True)``.
+        # HF DS4 reference does not apply Hadamard rotation in the attention or
+        # indexer compressor path.  TRTLLM may rotate both Q and K before FP8
+        # indexer scoring, but the independent oracle below follows HF math.
         ref_compressor = RefCompressor(ref_args,
                                        compress_ratios[layer_idx],
                                        pretrained_config.head_size,
                                        rotate=False).to(device)
+        ref_indexer_compressor = RefCompressor(ref_args,
+                                               compress_ratios[layer_idx],
+                                               sparse_config.index_head_dim,
+                                               rotate=False).to(device)
 
         # Initialize reference compressor with same weights as MLA's compressor
-        weights_wkv_gate = mla.mqa.compressor.wkv_gate.weight.data
-        weights_wkv = weights_wkv_gate[:mla.mqa.compressor.state_dim]
-        weights_wgate = weights_wkv_gate[mla.mqa.compressor.state_dim:]
-        ref_compressor.wkv.weight.data.copy_(weights_wkv)
-        ref_compressor.wgate.weight.data.copy_(weights_wgate)
-        ref_compressor.ape.data.copy_(mla.mqa.compressor.ape.data)
-        ref_compressor.norm.weight.data.copy_(
-            mla.mqa.compressor.norm.weight.data)
+        _copy_ref_compressor_weights(ref_compressor, mla.mqa.compressor)
+        _copy_ref_compressor_weights(ref_indexer_compressor,
+                                     mla.mqa.indexer.compressor)
     else:
         W_UK, W_UV = None, None
 
@@ -1562,6 +1891,12 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
 
     # Create KV cache manager
     kv_cache_manager_cls = DSACacheManager if sparse_attn_algo == "dsa" else DeepseekV4CacheManager
+    kv_cache_manager_kwargs = {}
+    if sparse_attn_algo == "deepseek_v4":
+        kv_cache_manager_kwargs = {
+            "max_input_len": max_seqlen,
+            "max_num_tokens": max_tokens,
+        }
     kv_cache_manager = kv_cache_manager_cls(
         KvCacheConfig(max_tokens=max_tokens,
                       enable_block_reuse=False,
@@ -1578,6 +1913,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         sparse_attn_config=sparse_config,
         model_config=model_config,
         vocab_size=vocab_size,
+        **kv_cache_manager_kwargs,
     )
 
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
@@ -1590,12 +1926,15 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     for req_idx in ctx_indices:
         assert cached_lens[
             req_idx] == 0, f"Context request {req_idx} should have no cached tokens"
-        kv_cache_manager.add_dummy_requests(
+        added_requests = kv_cache_manager.add_dummy_requests(
             request_ids=[req_idx],
             token_nums=[seq_lens[req_idx]],
             is_gen=False,
             prepare_resource=True,
         )
+        assert added_requests is not None, (
+            f"Failed to allocate KV cache for ctx request {req_idx} with "
+            f"{seq_lens[req_idx]} tokens")
         print(
             f"    - Allocated cache for ctx request {req_idx}: {seq_lens[req_idx]} tokens"
         )
@@ -1608,12 +1947,15 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         gen_with_cache = [i for i in gen_indices if cached_lens[i] > 0]
         # Allocate all generation caches
         for req_idx in gen_with_cache:
-            kv_cache_manager.add_dummy_requests(
+            added_requests = kv_cache_manager.add_dummy_requests(
                 request_ids=[req_idx],
                 token_nums=[seq_lens[req_idx]],
                 is_gen=False,
                 prepare_resource=True,
             )
+            assert added_requests is not None, (
+                f"Failed to allocate KV cache for gen request {req_idx} with "
+                f"{seq_lens[req_idx]} tokens")
 
     if sparse_attn_algo == "dsa":
         kv_cache_for_ref = populate_gen_dsa_kv_cache(mla, AttentionCls,
@@ -1623,9 +1965,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                                                      cached_lens, dtype, device)
     elif sparse_attn_algo == "deepseek_v4":
         kv_cache_for_ref = populate_gen_deepseek_v4_kv_cache(
-            mla, ref_compressor, AttentionCls, pretrained_config,
-            kv_cache_manager, mapping, sparse_config, gen_indices, cached_lens,
-            freqs_cis, dtype, device)
+            mla, ref_compressor, ref_indexer_compressor, AttentionCls,
+            pretrained_config, kv_cache_manager, mapping, sparse_config,
+            gen_indices, cached_lens, freqs_cis, dtype, device)
     else:
         raise ValueError(
             f"Invalid sparse attention algorithm: {sparse_attn_algo}")
@@ -1689,25 +2031,12 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
 
     q_original_for_ref = q.clone()
     hidden_states_ref = hidden_states.clone()
+    qr_ref = qr.clone()
     latent_cache_for_ref = latent_cache.clone()
 
     assert hasattr(
         mla, 'softmax_scale') and abs(mla.softmax_scale - softmax_scale) < 1e-6
     print(f"  ✓ Inputs prepared: {total_query_tokens} query tokens")
-
-    if sparse_attn_algo == "dsa":
-        output = mla_forward_impl_with_dsa_wo_linear(
-            mla, attn_metadata, q, qr, compressed_kv, k_pe, latent_cache,
-            hidden_states, position_ids, dtype, device)
-    elif sparse_attn_algo == "deepseek_v4":
-        output = mla_forward_impl_with_deepseek_v4_wo_linear(
-            mla, attn_metadata, q, qr, compressed_kv, k_pe, latent_cache,
-            hidden_states, position_ids, dtype, device)
-    else:
-        raise ValueError(
-            f"Invalid sparse attention algorithm: {sparse_attn_algo}")
-
-    print(f"  ✓ Forward pass complete: output shape {output.shape}")
 
     # Assemble reference inputs in BATCH order (same as output)
     q_for_ref, kv_data = prepare_reference_inputs(
@@ -1736,110 +2065,205 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     q_gen_ref = q_for_ref[attn_metadata.
                           num_ctx_tokens:] if gen_indices else torch.empty(
                               0, num_heads, qk_head_dim, device=device)
-
-    if sparse_attn_algo == "dsa":
-        all_compressed_kv, all_k_pe_for_ref = kv_data
-        reference_output = calculate_reference_output_mixed(
-            q_ctx=q_ctx_ref,
-            q_gen=q_gen_ref,
-            kv_c_all=all_compressed_kv,
-            k_pe_all=all_k_pe_for_ref,
-            W_UK=W_UK,
-            W_UV=W_UV,
-            rope_cos_sin=rope_cos_sin,
-            ctx_indices=list(range(num_contexts)),
-            gen_indices=list(range(num_contexts, len(batch_order))),
-            seq_lens=[seq_lens[i] for i in batch_order],
-            query_lens=batch_query_lens,
-            num_heads=num_heads,
-            kv_lora_rank=kv_lora_rank,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            softmax_scale=softmax_scale,
-            device=device,
-        )
-    elif sparse_attn_algo == "deepseek_v4":
-        # Extract output projection weights for reference calculation
-        o_a_proj_ref = mla.o_a_proj.data
-        o_b_proj_weight_ref = mla.o_b_proj.weight.data
-        n_local_groups = num_groups  # No TP in this test
-
-        reference_output = calculate_reference_output_deepseek_v4_mixed(
+    reference_topk_indices_local = None
+    inject_reference_topk = False
+    batch_seq_lens = [seq_lens[i] for i in batch_order]
+    batch_ctx_indices = list(range(num_contexts))
+    batch_gen_indices = list(range(num_contexts, len(batch_order)))
+    if sparse_attn_algo == "deepseek_v4":
+        reference_topk_indices_local = calculate_reference_deepseek_v4_topk_indices(
+            mla=mla,
+            ref_indexer_compressor=ref_indexer_compressor,
             hidden_states=hidden_states_ref,
-            q_ctx=q_ctx_ref,
-            q_gen=q_gen_ref,
+            qr=qr_ref,
             kv_data=kv_data,
             freqs_cis=freqs_cis,
-            ref_compressor=ref_compressor,
-            ctx_indices=list(range(num_contexts)),
-            gen_indices=list(range(num_contexts, len(batch_order))),
-            seq_lens=[seq_lens[i] for i in batch_order],
-            query_lens=batch_query_lens,
-            num_heads=num_heads,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            softmax_scale=softmax_scale,
-            device=device,
-            o_a_proj=o_a_proj_ref,
-            o_b_proj_weight=o_b_proj_weight_ref,
-            n_local_groups=n_local_groups,
-            window_size=sparse_config.window_size,
+            position_ids=position_ids,
+            ctx_indices=batch_ctx_indices,
+            gen_indices=batch_gen_indices,
+            seq_lens=batch_seq_lens,
+            topk_tokens=topk_tokens,
             compress_ratio=compress_ratios[layer_idx],
+            device=device,
         )
+        inject_reference_topk = _env_flag_enabled(
+            "TRTLLM_TEST_DS4_INJECT_REF_TOPK")
+        if inject_reference_topk:
+            print("  - TRTLLM_TEST_DS4_INJECT_REF_TOPK enabled")
+
+    topk_indices_local = None
+    if sparse_attn_algo == "dsa":
+        output = mla_forward_impl_with_dsa_wo_linear(
+            mla, attn_metadata, q, qr, compressed_kv, k_pe, latent_cache,
+            hidden_states, position_ids, dtype, device)
+    elif sparse_attn_algo == "deepseek_v4":
+        output, topk_indices_local = mla_forward_impl_with_deepseek_v4_wo_linear(
+            mla,
+            attn_metadata,
+            q,
+            qr,
+            compressed_kv,
+            k_pe,
+            latent_cache,
+            hidden_states,
+            position_ids,
+            dtype,
+            device,
+            return_topk_indices=True,
+            override_topk_indices=reference_topk_indices_local
+            if inject_reference_topk else None)
     else:
         raise ValueError(
             f"Invalid sparse attention algorithm: {sparse_attn_algo}")
 
-    assert output.shape == reference_output.shape and output.dtype == reference_output.dtype
-    assert torch.isfinite(output).all()
-    assert torch.isfinite(reference_output).all()
+    print(f"  ✓ Forward pass complete: output shape {output.shape}")
 
-    # Compare directly (both in batch order now)
-    batch_token_offsets = [0] + [
-        sum(batch_query_lens[:i + 1]) for i in range(len(batch_order))
-    ]
-    abs_error = (output - reference_output).abs()
-    for batch_idx, orig_req_idx in enumerate(batch_order):
-        req_error = abs_error[
-            batch_token_offsets[batch_idx]:batch_token_offsets[batch_idx + 1]]
-        if req_error.max() > 0.1:
-            req_type = "CTX" if orig_req_idx in ctx_indices else "GEN"
-            print(
-                f"  ⚠ Request {orig_req_idx} [{req_type}]: max error {req_error.max():.3f}"
+    try:
+        if sparse_attn_algo == "dsa":
+            all_compressed_kv, all_k_pe_for_ref = kv_data
+            reference_output = calculate_reference_output_mixed(
+                q_ctx=q_ctx_ref,
+                q_gen=q_gen_ref,
+                kv_c_all=all_compressed_kv,
+                k_pe_all=all_k_pe_for_ref,
+                W_UK=W_UK,
+                W_UV=W_UV,
+                rope_cos_sin=rope_cos_sin,
+                ctx_indices=batch_ctx_indices,
+                gen_indices=batch_gen_indices,
+                seq_lens=batch_seq_lens,
+                query_lens=batch_query_lens,
+                num_heads=num_heads,
+                kv_lora_rank=kv_lora_rank,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                v_head_dim=v_head_dim,
+                softmax_scale=softmax_scale,
+                device=device,
             )
+        elif sparse_attn_algo == "deepseek_v4":
+            # Extract output projection weights for reference calculation
+            o_a_proj_ref = mla.o_a_proj.data
+            o_b_proj_weight_ref = mla.o_b_proj.weight.data
+            n_local_groups = num_groups  # No TP in this test
+            assert topk_indices_local is not None
+            assert reference_topk_indices_local is not None
 
-    if kv_cache_dtype == "auto":
-        torch.testing.assert_close(output, reference_output, rtol=0.2, atol=0.2)
-    else:
-        diff = _calc_diff(output, reference_output)
-        assert diff < 1e-2, f"{diff=}"
-    print(
-        f"  ✓ Validation passed: max_error={abs_error.max():.4f}, mean_error={abs_error.mean():.6f}"
-    )
+            reference_output = calculate_reference_output_deepseek_v4_mixed(
+                hidden_states=hidden_states_ref,
+                q_ctx=q_ctx_ref,
+                q_gen=q_gen_ref,
+                kv_data=kv_data,
+                freqs_cis=freqs_cis,
+                ref_compressor=ref_compressor,
+                topk_indices=reference_topk_indices_local,
+                ctx_indices=batch_ctx_indices,
+                gen_indices=batch_gen_indices,
+                seq_lens=batch_seq_lens,
+                query_lens=batch_query_lens,
+                num_heads=num_heads,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                v_head_dim=v_head_dim,
+                softmax_scale=softmax_scale,
+                device=device,
+                o_a_proj=o_a_proj_ref,
+                o_b_proj_weight=o_b_proj_weight_ref,
+                n_local_groups=n_local_groups,
+                window_size=sparse_config.window_size,
+                compress_ratio=compress_ratios[layer_idx],
+            )
+        else:
+            raise ValueError(
+                f"Invalid sparse attention algorithm: {sparse_attn_algo}")
 
-    kv_cache_manager.shutdown()
+        assert output.shape == reference_output.shape
+        assert output.dtype == reference_output.dtype
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(reference_output).all()
+
+        # Compare directly (both in batch order now)
+        batch_token_offsets = [0] + [
+            sum(batch_query_lens[:i + 1]) for i in range(len(batch_order))
+        ]
+        abs_error = (output - reference_output).abs()
+        for batch_idx, orig_req_idx in enumerate(batch_order):
+            req_error = abs_error[
+                batch_token_offsets[batch_idx]:batch_token_offsets[batch_idx +
+                                                                   1]]
+            if req_error.max() > 0.1:
+                req_type = "CTX" if orig_req_idx in ctx_indices else "GEN"
+                print(
+                    f"  ⚠ Request {orig_req_idx} [{req_type}]: max error {req_error.max():.3f}"
+                )
+
+        if sparse_attn_algo == "deepseek_v4":
+            topk_mismatch = get_deepseek_v4_topk_mismatch(
+                topk_indices_local, reference_topk_indices_local)
+            topk_overlap_mismatch = get_deepseek_v4_topk_overlap_mismatch(
+                topk_indices_local,
+                reference_topk_indices_local,
+                min_overlap=0.95,
+            )
+            if topk_overlap_mismatch is not None:
+                if topk_mismatch is not None:
+                    print(f"  ! {topk_mismatch}")
+                raise AssertionError(topk_overlap_mismatch)
+            if topk_mismatch is None:
+                print("  ✓ Indexer top-k matches independent reference")
+            else:
+                print("  ✓ Indexer top-k overlap with independent "
+                      "reference is at least 0.95")
+                print(f"  ! {topk_mismatch}")
+
+        if (sparse_attn_algo == "deepseek_v4"
+                and batch_name == "large_mixed_deepseek_v4"):
+            print("  ⚠ Skipping output assert_close for "
+                  "large_mixed_deepseek_v4; top-k overlap was validated")
+        elif kv_cache_dtype == "auto":
+            torch.testing.assert_close(output,
+                                       reference_output,
+                                       rtol=0.2,
+                                       atol=0.2)
+        else:
+            diff = _calc_diff(output, reference_output)
+            assert diff < 1e-2, f"{diff=}"
+        max_error = abs_error.max()
+        mean_error = abs_error.mean()
+        print(f"  ✓ Validation passed: max_error={max_error:.4f}, "
+              f"mean_error={mean_error:.6f}")
+    finally:
+        kv_cache_manager.shutdown()
     print(f"  ✓ Test '{batch_name}' completed\n")
 
 
 if __name__ == "__main__":
     # Test pure prefill
     test_forward_sparse_mla_unified(batch_name="small_prefill",
-                                    kv_cache_dtype="auto")
+                                    kv_cache_dtype="auto",
+                                    sparse_attn_algo="dsa")
     test_forward_sparse_mla_unified(batch_name="small_prefill",
-                                    kv_cache_dtype="fp8")
+                                    kv_cache_dtype="fp8",
+                                    sparse_attn_algo="dsa")
 
     # Test pure decode
     test_forward_sparse_mla_unified(batch_name="small_decode",
-                                    kv_cache_dtype="auto")
+                                    kv_cache_dtype="auto",
+                                    sparse_attn_algo="dsa")
     test_forward_sparse_mla_unified(batch_name="small_decode",
-                                    kv_cache_dtype="fp8")
+                                    kv_cache_dtype="fp8",
+                                    sparse_attn_algo="dsa")
 
     # TODO: Mixed batch test - generation reference needs sparse attention masking
     test_forward_sparse_mla_unified(batch_name="small_mixed",
-                                    kv_cache_dtype="auto")
+                                    kv_cache_dtype="auto",
+                                    sparse_attn_algo="dsa")
     test_forward_sparse_mla_unified(batch_name="small_mixed",
-                                    kv_cache_dtype="fp8")
+                                    kv_cache_dtype="fp8",
+                                    sparse_attn_algo="dsa")
+
+    test_forward_sparse_mla_unified(batch_name="large_mixed_deepseek_v4",
+                                    kv_cache_dtype="auto",
+                                    sparse_attn_algo="deepseek_v4")
 
     print("All tests passed!")

@@ -906,6 +906,9 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         return true
     }
 
+    pipeline.echo("Default run multi-GPU testing.")
+    return true
+
     def relatedFileList = [
         "cpp/include/tensorrt_llm/batch_manager/",
         "cpp/include/tensorrt_llm/executor/",
