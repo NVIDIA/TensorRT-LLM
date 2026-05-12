@@ -28,10 +28,12 @@ Design Goals:
 
 import itertools
 import logging
+import os
 from typing import List, Optional
 
 import pytest
 import torch
+import torch.distributed as dist
 from _torch.modules.moe.moe_test_utils import (
     IS_CI_MODE,
     MoeBackendType,
@@ -52,12 +54,31 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
+    """MegaMoE resolves an EP ProcessGroup at construction time."""
+    if backend_type != MoeBackendType.MEGAMOE:
+        return
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for MegaMoE tests")
+    if dist.is_initialized():
+        return
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29561")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", str(rank))
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=0, world_size=1)
 
 
 def should_skip_gptoss(
@@ -144,6 +165,52 @@ def create_test_backend(
     )
 
 
+def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
+    routing_method = RenormalizeMoeRoutingMethod(top_k=1)
+    model_config = ModelConfig(
+        mapping=Mapping(
+            world_size=4,
+            rank=0,
+            tp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=4,
+        ),
+        moe_backend=MoeBackendType.MEGAMOE.value,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"MegaMoEDeepGemm requires num_slots \(10\) divisible by ep_size \(4\)",
+    ):
+        MegaMoEDeepGemm(
+            routing_method=routing_method,
+            num_experts=10,
+            hidden_size=512,
+            intermediate_size=512,
+            dtype=torch.bfloat16,
+            model_config=model_config,
+            init_load_balancer=False,
+        )
+
+
+def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch):
+    import tensorrt_llm._torch.modules.fused_moe.quantization as quantization_module
+
+    class DummyModule:
+        _weights_loaded = True
+        num_slots = 10
+        ep_size = 4
+
+    monkeypatch.setattr(quantization_module, "_import_deep_gemm", lambda: object())
+    method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
+
+    with pytest.raises(
+        ValueError,
+        match=r"MegaMoEDeepGemm requires num_slots \(10\) divisible by ep_size \(4\)",
+    ):
+        method.post_load_weights(DummyModule())
+
+
 def run_backend_moe(
     backend: MoE,
     backend_type: MoeBackendType,
@@ -163,6 +230,7 @@ def run_backend_moe(
     - TRTLLM: token_final_scales=bfloat16, optionally router_logits
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
+    - MEGAMOE_DEEPGEMM: token_selected_experts=int64, output_dtype
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -193,6 +261,9 @@ def run_backend_moe(
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
         args["workspace"] = backend.get_workspace(m_max, 128)
+    elif backend_type == MoeBackendType.MEGAMOE:
+        args["token_selected_experts"] = token_selected_experts.to(torch.int64)
+        args["output_dtype"] = dtype
 
     return backend.run_moe(**args)
 
@@ -221,6 +292,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
+    MoeBackendType.MEGAMOE,
 ]
 
 # Data types to test
@@ -247,6 +319,7 @@ CI_MOE_MODEL_CONFIGS = [
 
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
+    MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
     MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
     MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
@@ -504,6 +577,7 @@ def test_moe_backend(
     # Create mapping
     mapping = Mapping()
     mapping.rank = mpi_rank()
+    _ensure_single_proc_dist_for_megamoe(backend_type, mapping.rank)
 
     with torch.device(f"cuda:{mapping.rank}"):
         torch.manual_seed(0)
@@ -574,8 +648,8 @@ def test_moe_backend(
             activation_type=activation_type,
         )
 
-        # W4A8_MXFP4_MXFP8 requires different weights for backend and reference
-        # due to different padding/alignment requirements
+        # W4A8_MXFP4_MXFP8 requires backend-layout-aware weights. CUTLASS and
+        # MegaMoE use 128 hidden alignment; TRTLLMGen pads FC1 input to 512.
         ref_cls = quant_kwargs.pop("ref_cls", None)
         ref_module_kwargs = {}
         if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:

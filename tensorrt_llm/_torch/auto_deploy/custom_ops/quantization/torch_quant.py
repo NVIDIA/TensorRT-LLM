@@ -19,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ...utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
 from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     unpack_uint8_to_int4_weight_2d,
@@ -514,13 +513,6 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
     return y, s
 
 
-def _dequant_block_fp8_weight(weight_fp8, weight_scale, block_n, block_k, dtype=torch.bfloat16):
-    """Dequantize block-scaled FP8 weight to BF16 for tiny projections."""
-    return dequant_fp8_weight_two_dim_block_grid(
-        weight_fp8, weight_scale, block_n, block_k, dtype=dtype
-    )
-
-
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
 def torch_fake_quant_finegrained_fp8_linear(
     input: torch.Tensor,  # [..., K]
@@ -584,96 +576,4 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
-    return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
-
-
-@torch.library.custom_op("auto_deploy::trtllm_finegrained_fp8_linear", mutates_args=())
-def trtllm_finegrained_fp8_linear(
-    input: torch.Tensor,  # [..., K] bfloat16
-    weight: torch.Tensor,  # [N, K] float8_e4m3fn
-    bias: Optional[torch.Tensor],  # [N] or None
-    weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
-    tp_mode: str = "none",
-    output_sizes: Optional[List[int]] = None,
-    tp_min_local_shape: int = 1,
-    layer_type: str = "unknown",
-) -> torch.Tensor:
-    """TRT-LLM optimized FineGrainedFP8 linear operation.
-
-    Uses TRT-LLM's optimized fp8_block_scaling_gemm kernel instead of HF's triton kernel.
-    - weight_scale: per-block weight scale with shape [ceil(N/128), ceil(K/128)]
-    - Input is dynamically quantized using fp8_quantize_1x128
-    - Assumes 128x128 block size (standard for DeepSeek/MiniMax style FP8)
-    """
-    from ..._compat import get_sm_version
-
-    # Ensure input is bfloat16 for the optimized kernel
-    if input.dtype == torch.float8_e4m3fn:
-        raise ValueError("trtllm_finegrained_fp8_linear expects bfloat16 input, not FP8")
-
-    # TRT-LLM fp8_block_scaling_gemm requires float32 scales; HF checkpoints may
-    # store weight_scale_inv in bfloat16 to save space, so cast here.
-    if weight_scale.dtype != torch.float32:
-        weight_scale = weight_scale.float()
-
-    # Derive effective block size from weight and scale shapes.
-    input_shape = input.shape
-    N, K = weight.shape
-    scale_n, scale_k = weight_scale.shape
-    if scale_n == 0 or scale_k == 0:
-        raise ValueError(
-            f"trtllm_finegrained_fp8_linear: weight_scale has zero dimension "
-            f"(shape={weight_scale.shape}), weight shape={weight.shape}. "
-            f"This usually means scale tensor sharding produced an empty tensor."
-        )
-    # Ceiling division is required because the weight dimension may not be
-    # evenly divisible by the number of scale blocks (e.g. after TP sharding).
-    block_n = triton.cdiv(N, scale_n)
-    block_k = triton.cdiv(K, scale_k)
-
-    # TRT-LLM fp8_block_scaling_gemm requires exact 128x128 blocks.
-    # For small layers where a dimension < 128 (e.g. N=64), the derived block
-    # size will be < 128.  Fall back to BF16 dequant + cuBLAS.
-    if block_n != 128 or block_k != 128:
-        # BF16 fallback: the Triton FP8 kernel launches Grid=1x1x1 for tiny N,
-        # wasting 99% of SM capacity. Dequantize weight + cuBLAS is faster.
-        weight_dequant = _dequant_block_fp8_weight(
-            weight, weight_scale, block_n, block_k, dtype=input.dtype
-        )
-        output = torch.nn.functional.linear(input, weight_dequant, bias)
-        return output.reshape(*input_shape[:-1], N) if len(input_shape) > 2 else output
-
-    # Flatten input for GEMM: [..., K] -> [M, K]
-    input_2d = input.reshape(-1, input_shape[-1])
-
-    # SM version-specific activation quantization
-    if get_sm_version() == 120:
-        from tensorrt_llm._torch.modules.linear import per_token_quant_and_transform
-
-        act_fp8, act_sf = per_token_quant_and_transform(input_2d)
-    else:
-        # Hopper (SM90) and Blackwell (SM100+) share the same path
-        act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
-    output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
-
-    if bias is not None:
-        output = output + bias
-
-    # Reshape back to original batch dimensions: [M, N] -> [..., N]
-    return output.reshape(*input_shape[:-1], weight.shape[0])
-
-
-@trtllm_finegrained_fp8_linear.register_fake
-def _trtllm_finegrained_fp8_linear_fake(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    weight_scale: torch.Tensor,
-    tp_mode: str = "none",
-    output_sizes: Optional[List[int]] = None,
-    tp_min_local_shape: int = 1,
-    layer_type: str = "unknown",
-) -> torch.Tensor:
-    """Fake implementation for torch.export tracing."""
-    out_features = weight.shape[0]
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)

@@ -135,6 +135,11 @@ public:
         NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
     }
 
+    void truncateBlocks(tb::LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override
+    {
+        NB_OVERRIDE_PURE(truncateBlocks, targetTokens, numTokensToKeep);
+    }
+
     std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest, bool pinBlocks) override
     {
@@ -445,6 +450,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("request_infos"), nb::arg("llm_requests"))
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("truncate_blocks", &BaseKVCacheManager::truncateBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -616,7 +622,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  std::vector<SizeType32> const&, nvinfer1::DataType, SizeType32, int64_t, SizeType32, SizeType32, bool,
                  tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
                  std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>,
-                 bool, SizeType32, SizeType32, std::optional<tbk::LinearAttentionMetadata>>(),
+                 bool, SizeType32, SizeType32, bool, std::optional<tbk::LinearAttentionMetadata>>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("dtype"), nb::arg("sink_token_length"), nb::arg("stream"),
@@ -625,8 +631,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
-            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("linear_attention_metadata").none() = std::nullopt,
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("indexer_k_cache_use_fp4") = false,
+            nb::arg("linear_attention_metadata").none() = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "scheduling_has_free_blocks",
             [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)

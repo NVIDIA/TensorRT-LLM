@@ -50,6 +50,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=nvfp4-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_dummy_load_format
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-v2_kv_cache=True]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-triton-auto]
@@ -72,6 +73,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1_block_reuse-cutlass]
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4]
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] # nvbugs 5300551
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
@@ -123,13 +125,17 @@ l0_b200:
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
   - unittest/_torch/sampler
-  - unittest/_torch/speculative
+  - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
@@ -193,6 +199,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
@@ -284,6 +291,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

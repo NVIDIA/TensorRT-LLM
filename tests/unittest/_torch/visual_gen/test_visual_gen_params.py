@@ -668,49 +668,12 @@ class TestPipelineMetadataBridging:
 
 
 # =============================================================================
-# VisualGenParamsError — error class
-# =============================================================================
-
-
-class TestVisualGenParamsError:
-    """VisualGenParamsError is importable and is a subclass of ValueError."""
-
-    def test_import_from_top_level(self):
-        from tensorrt_llm import VisualGenParamsError
-
-        assert issubclass(VisualGenParamsError, ValueError)
-
-    def test_import_from_visual_gen(self):
-        from tensorrt_llm.visual_gen import VisualGenParamsError
-
-        assert VisualGenParamsError is not None
-
-    def test_is_subclass_of_value_error(self):
-        from tensorrt_llm.visual_gen import VisualGenParamsError
-
-        assert issubclass(VisualGenParamsError, ValueError)
-        assert not issubclass(VisualGenParamsError, RuntimeError)
-
-    def test_raise_and_catch_as_value_error(self):
-        from tensorrt_llm.visual_gen import VisualGenParamsError
-
-        with pytest.raises(ValueError):
-            raise VisualGenParamsError("bad param")
-
-    def test_message_preserved(self):
-        from tensorrt_llm.visual_gen import VisualGenParamsError
-
-        with pytest.raises(VisualGenParamsError, match="height.*out of range"):
-            raise VisualGenParamsError("height is out of range")
-
-
-# =============================================================================
 # Request validation — _validate_request
 # =============================================================================
 
 
 class TestRequestValidation:
-    """DiffusionExecutor._validate_request raises VisualGenParamsError on bad params."""
+    """DiffusionExecutor._validate_request raises ValueError on bad params."""
 
     def _make_mock_executor(self, pipeline_cls, mock_self=None):
         executor = MagicMock()
@@ -743,20 +706,18 @@ class TestRequestValidation:
 
     def test_unknown_extra_params_raises(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(FluxPipeline)
         req = self._make_request(extra_params={"nonexistent_key": 42})
-        with pytest.raises(VisualGenParamsError, match="Unknown extra_params"):
+        with pytest.raises(ValueError, match="Unknown extra_params"):
             self._validate(executor, req)
 
     def test_unknown_extra_params_lists_supported_keys(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(LTX2Pipeline)
         req = self._make_request(extra_params={"bad_key": 1})
-        with pytest.raises(VisualGenParamsError, match="Supported"):
+        with pytest.raises(ValueError, match="Supported"):
             self._validate(executor, req)
 
     def test_valid_extra_params_accepted(self):
@@ -771,20 +732,18 @@ class TestRequestValidation:
     def test_num_frames_on_image_pipeline_raises(self):
         """num_frames=81 to FLUX (image-only) should raise."""
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(FluxPipeline)
         req = self._make_request(num_frames=81)
-        with pytest.raises(VisualGenParamsError, match="num_frames.*not use it"):
+        with pytest.raises(ValueError, match="num_frames.*not use it"):
             self._validate(executor, req)
 
     def test_frame_rate_on_image_pipeline_raises(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(FluxPipeline)
         req = self._make_request(frame_rate=24.0)
-        with pytest.raises(VisualGenParamsError, match="frame_rate.*not use it"):
+        with pytest.raises(ValueError, match="frame_rate.*not use it"):
             self._validate(executor, req)
 
     def test_image_not_checked_by_validator(self):
@@ -842,11 +801,10 @@ class TestRequestValidation:
 
     def test_wrong_type_extra_param_raises(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(LTX2Pipeline)
         req = self._make_request(extra_params={"stg_scale": "not_a_number"})
-        with pytest.raises(VisualGenParamsError, match="expected type 'float'"):
+        with pytest.raises(ValueError, match="expected type 'float'"):
             self._merge_and_validate(executor, req)
 
     def test_int_accepted_for_float_spec(self):
@@ -872,39 +830,36 @@ class TestRequestValidation:
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
             WanImageToVideoPipeline,
         )
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
         req = self._make_request(
             image="/img.png",
             extra_params={"last_image": 123},
         )
-        with pytest.raises(VisualGenParamsError, match="expected type 'str'"):
+        with pytest.raises(ValueError, match="expected type 'str'"):
             self._merge_and_validate(executor, req)
 
     # --- range validation on extra_params ---
 
     def test_out_of_range_extra_param_raises(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(
             WanPipeline, _wan_mock(is_wan22_14b=True, is_wan22_5b=False)
         )
         # boundary_ratio has range (0.0, 1.0)
         req = self._make_request(extra_params={"boundary_ratio": 2.0})
-        with pytest.raises(VisualGenParamsError, match="out of range"):
+        with pytest.raises(ValueError, match="out of range"):
             self._merge_and_validate(executor, req)
 
     def test_negative_boundary_ratio_raises(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(
             WanPipeline, _wan_mock(is_wan22_14b=True, is_wan22_5b=False)
         )
         req = self._make_request(extra_params={"boundary_ratio": -0.5})
-        with pytest.raises(VisualGenParamsError, match="out of range"):
+        with pytest.raises(ValueError, match="out of range"):
             self._merge_and_validate(executor, req)
 
     def test_boundary_value_at_range_edge_ok(self):
@@ -930,7 +885,6 @@ class TestRequestValidation:
     def test_multiple_errors_in_single_message(self):
         """Multiple validation failures should be collected into one error."""
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
-        from tensorrt_llm.visual_gen import VisualGenParamsError
 
         executor = self._make_mock_executor(FluxPipeline)
         req = self._make_request(
@@ -938,7 +892,7 @@ class TestRequestValidation:
             frame_rate=24.0,
             extra_params={"bogus": 1},
         )
-        with pytest.raises(VisualGenParamsError) as exc_info:
+        with pytest.raises(ValueError) as exc_info:
             self._validate(executor, req)
         msg = str(exc_info.value)
         assert "num_frames" in msg

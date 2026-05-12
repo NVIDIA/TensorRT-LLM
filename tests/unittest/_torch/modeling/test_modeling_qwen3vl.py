@@ -10,7 +10,7 @@ from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditio
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModel
+from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase, Qwen3VLModel
 
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -268,6 +268,27 @@ class TestQwen3VL(TestModelingMultimodal):
             ),
         ]
         return scenarios
+
+    def get_hf_inputs(self, modality: str, prompt, media):
+        processor_inputs = super().get_hf_inputs(modality, prompt, media)
+
+        # For video: the parent class already deleted mm_token_type_ids, which
+        # causes HF to fall back to 1D position IDs (no MRope). Qwen3VL encodes
+        # video frames as separate timestamp-separated vision segments, so the
+        # correct approach is to compute 3D MRope position IDs via TRT-LLM's
+        # get_rope_index (which expands video_grid_thw per-frame) and pass them
+        # explicitly to HF's forward(), bypassing compute_3d_position_ids.
+        if modality == "video" and "video_grid_thw" in processor_inputs:
+            position_ids, _ = Qwen3VLInputProcessorBase.get_rope_index(
+                self.hf_config,
+                processor_inputs["input_ids"],
+                image_grid_thw=processor_inputs.get("image_grid_thw"),
+                video_grid_thw=processor_inputs["video_grid_thw"],
+                attention_mask=processor_inputs.get("attention_mask"),
+            )
+            processor_inputs["position_ids"] = position_ids.to(processor_inputs["input_ids"].device)
+
+        return processor_inputs
 
     def setup_scenario(self, scenario: TestQwen3VLScenario):
         super().setup_scenario(scenario)

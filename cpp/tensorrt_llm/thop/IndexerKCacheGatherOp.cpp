@@ -29,17 +29,24 @@ namespace torch_ext
 {
 
 std::tuple<th::Tensor, th::Tensor> indexer_k_cache_gather_op(th::Tensor const& k_cache,
-    th::Tensor const& slot_mapping_fp8, th::Tensor const& slot_mapping_scale, int64_t k_token_start, int64_t num_tokens)
+    th::Tensor const& slot_mapping_fp8, th::Tensor const& slot_mapping_scale, int64_t k_token_start, int64_t num_tokens,
+    int64_t head_dim)
 {
-    constexpr int32_t HEAD_DIM = 128;
+    // head_dim is the number of payload bytes per token: 128 for FP8 (one byte
+    // per float8 value) or 64 for FP4 (two packed E2M1 codes per byte).
     constexpr int32_t SCALE_SIZE = 4;
+    TORCH_CHECK(head_dim == 128 || head_dim == 64,
+        "indexer_k_cache_gather_op head_dim must be 128 (FP8) or 64 (FP4 packed), got %d", static_cast<int>(head_dim));
+    auto head_dim_i32 = static_cast<int32_t>(head_dim);
 
     auto device = k_cache.device();
 
-    // Early return for empty gather
+    // Early return for empty gather. Keep the FP8 dtype on the output to stay
+    // compatible with the legacy caller contract; the FP4 call site reinterprets
+    // the bytes before handing them to DeepGEMM.
     if (num_tokens == 0)
     {
-        auto k_fp8 = th::empty({0, HEAD_DIM}, th::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(device));
+        auto k_fp8 = th::empty({0, head_dim_i32}, th::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(device));
         auto k_scale = th::empty({0, 1}, th::TensorOptions().dtype(torch::kFloat32).device(device));
         return std::make_tuple(std::move(k_fp8), std::move(k_scale));
     }
@@ -87,17 +94,19 @@ std::tuple<th::Tensor, th::Tensor> indexer_k_cache_gather_op(th::Tensor const& k
 
     // Allocate output buffers
     auto num_tokens_i32 = static_cast<int32_t>(num_tokens);
-    auto out_fp8 = th::empty({num_tokens, HEAD_DIM}, th::TensorOptions().dtype(torch::kUInt8).device(device));
+    auto out_fp8 = th::empty({num_tokens, head_dim_i32}, th::TensorOptions().dtype(torch::kUInt8).device(device));
     auto out_scale = th::empty({num_tokens, SCALE_SIZE}, th::TensorOptions().dtype(torch::kUInt8).device(device));
 
     auto stream = at::cuda::getCurrentCUDAStream(k_cache.get_device());
 
     tk::invokeIndexerKCacheGather(k_cache.data_ptr<uint8_t>(), slot_mapping_fp8.data_ptr<int64_t>(),
         slot_mapping_scale.data_ptr<int64_t>(), out_fp8.data_ptr<uint8_t>(), out_scale.data_ptr<uint8_t>(),
-        static_cast<int32_t>(k_token_start), num_tokens_i32, HEAD_DIM, SCALE_SIZE, cache_dim_0, cache_dim_1,
+        static_cast<int32_t>(k_token_start), num_tokens_i32, head_dim_i32, SCALE_SIZE, cache_dim_0, cache_dim_1,
         cache_dim_2, cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3, stream);
 
-    // View-cast to final dtypes (no copy)
+    // View-cast to final dtypes (no copy). The FP8 call site keeps its existing
+    // float8_e4m3fn semantics; the FP4 call site reshapes the raw bytes into
+    // int8-packed nibbles after this op returns.
     auto k_fp8 = out_fp8.view(torch::kFloat8_e4m3fn);
     auto k_scale = out_scale.view(torch::kFloat32).view({num_tokens, 1});
 
@@ -112,7 +121,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_k_cache_gather_op(Tensor k_cache, Tensor slot_mapping_fp8, "
-        "Tensor slot_mapping_scale, int k_token_start, int num_tokens) -> (Tensor, Tensor)");
+        "Tensor slot_mapping_scale, int k_token_start, int num_tokens, int head_dim) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

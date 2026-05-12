@@ -320,7 +320,7 @@ class MyTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, **kwargs)
+        return self.tokenizer(texts, **kwargs)
 
 
 @pytest.mark.part0

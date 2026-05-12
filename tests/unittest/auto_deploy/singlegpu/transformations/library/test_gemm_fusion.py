@@ -14,6 +14,7 @@ from _torch_test_utils import all_close, fp8_compatible, reset_parameters
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 (registers torch_attention op)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, TransformRegistry
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
@@ -554,67 +555,23 @@ def test_fuse_gemms_mixed_children_qwen35_like(dtype: str):
     assert not all_close(y_model, y_random)
 
 
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@torch.inference_mode()
-def test_fuse_gemms_mixed_children(dtype: str):
-    torch_dtype = getattr(torch, dtype)
-    model = GdnLikeFusableModel().to(device="cuda", dtype=torch_dtype)
-    x = model.get_input(device="cuda", dtype=torch_dtype)
-
-    y_model = model(x)
-
-    gm = torch_export_to_gm(model, args=(x,), clone=True)
-
-    # Verify fuse_gemms does NOT fuse (shape user blocks it)
-    num_linears_before = sum(is_linear_op(n) for n in gm.graph.nodes)
-    assert num_linears_before == 4, f"Expected 4 linears before fusion, got {num_linears_before}"
-
-    gm_transformed = InferenceOptimizer(
-        None,
-        {
-            "fuse_gemms_mixed_children": {
-                "stage": "post_load_fusion",
-            },
-        },
-    )(None, gm)
-
-    run_test_transformed_gm(
-        model,
-        x,
-        gm_transformed,
-        lambda gm: sum(is_linear_op(n) for n in gm.graph.nodes) == model.num_gemms_after_fusion,
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=1e-3,
-        test_load_hook=False,
-    )
-
-    # Verify split output views exist (contiguous splitting)
-    split_view_count = _count_split_output_views(gm_transformed)
-    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
-
-    reset_parameters(gm_transformed)
-    y_random = gm_transformed(x)
-    assert not all_close(y_model, y_random)
-
-
 # ===========================================================================
-# Tests for QKV fusion (with torch_attention)
+# Tests for FX graph visibility after GEMM fusion (meta["val"] propagation)
 # ===========================================================================
 
 
-def _count_split_output_nodes(gm):
-    """Count getitem nodes that extract slices from a split_output/split_with_sizes."""
-    import operator
+def _check_all_nodes_have_meta_val(gm) -> bool:
+    """Verify that every computation node has meta['val'] after fusion."""
+    for node in gm.graph.nodes:
+        if node.op in ("placeholder", "output", "get_attr"):
+            continue
+        if "val" not in node.meta or node.meta["val"] is None:
+            return False
+    return True
 
-    count = 0
-    for n in gm.graph.nodes:
-        if n.op == "call_function" and n.target is operator.getitem:
-            source = n.args[0]
-            if isinstance(source, torch.fx.Node) and source.op == "call_function":
-                # split_output or split_with_sizes produces a tuple
-                count += 1
-    return count
+
+def _count_contiguous_nodes(gm) -> int:
+    return sum(1 for n in gm.graph.nodes if n.op == "call_method" and n.target == "contiguous")
 
 
 def _get_narrow_nodes(gm):
@@ -625,13 +582,39 @@ def _get_linear_nodes(gm):
     return [n for n in gm.graph.nodes if is_linear_op(n)]
 
 
-class QKVAttentionModel(TestModel):
-    """Model with separate Q, K, V projections feeding into torch_attention.
+class QKVLikeModel(TestModel):
+    """Three linears (QKV-like) sharing the same input with a non-linear user."""
 
-    Mimics the attention pattern in transformer models where Q, K, V are
-    projected from the same input. fuse_gemms_mixed_children should fuse the
-    3 projections into one GEMM with 3 narrow views.
-    """
+    def __init__(self, batch_size=2, seq_len=8, in_features=64, out_q=32, out_k=32, out_v=48):
+        super().__init__()
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.in_features = in_features
+        self.q_proj = nn.Linear(in_features, out_q, bias=False)
+        self.k_proj = nn.Linear(in_features, out_k, bias=False)
+        self.v_proj = nn.Linear(in_features, out_v, bias=False)
+
+    def get_input(self, **kwargs):
+        return torch.randn(self.batch_size, self.seq_len, self.in_features, **kwargs)
+
+    @property
+    def keys_to_pop(self):
+        return ("q_proj.weight", "k_proj.weight", "v_proj.weight")
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 1
+
+    def forward(self, x):
+        _batch_size, _seq_len, _ = x.shape  # non-linear user forces mixed_children path
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        return q.sum(-1, keepdim=True) + k.sum(-1, keepdim=True) + v.sum(-1, keepdim=True)
+
+
+class QKVAttentionModel(TestModel):
+    """Model with separate Q, K, V projections feeding into torch_attention."""
 
     def __init__(
         self,
@@ -695,11 +678,7 @@ class QKVAttentionModel(TestModel):
 
 
 class SwiGLUModel(TestModel):
-    """MLP with gate + up projections sharing the same input (SwiGLU pattern).
-
-    fuse_gemms_mixed_children should fuse gate+up into one GEMM with 2 narrow
-    views.
-    """
+    """MLP with gate + up projections sharing the same input (SwiGLU pattern)."""
 
     def __init__(self, batch_size=2, seq_len=8, hidden_size=64, intermediate_size=128):
         super().__init__()
@@ -733,6 +712,83 @@ class SwiGLUModel(TestModel):
         return self.down_proj(gate * up)
 
 
+@pytest.mark.parametrize(
+    "model_cls,expected_narrows,expected_linears_before",
+    [
+        (GdnLikeFusableModel, 4, 4),
+        (QKVLikeModel, 3, 3),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_fuse_gemms_mixed_children(model_cls, expected_narrows, expected_linears_before, dtype):
+    """FuseGemmsMixedChildren fuses linears and all narrow+contiguous nodes have meta['val'].
+
+    Validates both basic fusion correctness (linear count, narrow/contiguous structure,
+    numerical accuracy, parameter sensitivity) and FX graph visibility (meta['val']
+    propagation on all nodes).
+
+    Before the fix, the allow_not_contigous=False path used an opaque split_output
+    closure that produced nodes without meta['val'], breaking downstream transforms
+    (fuse_rmsnorm, piecewise CUDA graph splitting).
+    """
+    torch_dtype = getattr(torch, dtype)
+    model = model_cls().to(device="cuda", dtype=torch_dtype)
+    x = model.get_input(device="cuda", dtype=torch_dtype)
+    y_ref = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Verify linear count before fusion
+    num_linears_before = sum(is_linear_op(n) for n in gm.graph.nodes)
+    assert num_linears_before == expected_linears_before, (
+        f"Expected {expected_linears_before} linears before fusion, got {num_linears_before}"
+    )
+
+    gm_fused = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    # Should produce 1 fused linear
+    num_linears = sum(is_linear_op(n) for n in gm_fused.graph.nodes)
+    assert num_linears == 1, f"Expected 1 fused linear, got {num_linears}"
+
+    # Should have narrow nodes for each original linear
+    num_narrows = _count_split_output_views(gm_fused)
+    assert num_narrows == expected_narrows, (
+        f"Expected {expected_narrows} narrow nodes, got {num_narrows}"
+    )
+
+    # allow_not_contigous=False → each narrow should have a .contiguous() call
+    num_contigs = _count_contiguous_nodes(gm_fused)
+    assert num_contigs == expected_narrows, (
+        f"Expected {expected_narrows} contiguous nodes, got {num_contigs}"
+    )
+
+    # Core assertion: all nodes must have meta["val"]
+    assert _check_all_nodes_have_meta_val(gm_fused), (
+        "Some nodes are missing meta['val'] after GEMM fusion. "
+        "This breaks downstream transforms (fuse_rmsnorm, piecewise CUDA graph)."
+    )
+
+    # Verify narrow node meta["val"] shapes are consistent
+    for node in gm_fused.graph.nodes:
+        if node.op == "call_function" and node.target is torch.narrow:
+            val = node.meta["val"]
+            assert len(val.shape) == 3, f"Expected 3D shape, got {val.shape}"
+
+    # Numerical correctness
+    gm_fused = gm_fused.to("cuda")
+    y_fused = gm_fused(x)
+    torch.testing.assert_close(y_ref, y_fused, atol=1e-3, rtol=1e-3)
+
+    # Verify output changes with different parameters (fusion didn't hardcode values)
+    reset_parameters(gm_fused)
+    y_random = gm_fused(x)
+    assert not all_close(y_ref, y_random)
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize(
     "model_cls,model_kwargs",
@@ -763,11 +819,9 @@ def test_fuse_qkv_and_mlp_projections(model_cls, model_kwargs, dtype: str):
         f"Expected {model.num_gemms_after_fusion} linears after fusion, got {num_linears}"
     )
 
-    # FuseGemmsMixedChildren uses split_output (not narrow) to split the fused GEMM output.
-    # Count split getitem nodes to verify the expected number of output slices.
-    split_count = _count_split_output_nodes(gm_transformed)
-    assert split_count == model.expected_narrow_count, (
-        f"Expected {model.expected_narrow_count} split output nodes, got {split_count}"
+    narrow_count = _count_split_output_views(gm_transformed)
+    assert narrow_count == model.expected_narrow_count, (
+        f"Expected {model.expected_narrow_count} narrow nodes, got {narrow_count}"
     )
 
     y_transformed = gm_transformed(x)
@@ -776,6 +830,31 @@ def test_fuse_qkv_and_mlp_projections(model_cls, model_kwargs, dtype: str):
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)
     assert not all_close(y_model, y_random)
+
+
+@torch.inference_mode()
+def test_fuse_gemms_mixed_children_has_valid_shapes():
+    """FuseGemmsMixedChildren must report has_valid_shapes=True after fusion.
+
+    Before the fix, it reported has_valid_shapes=(num_matches == 0), forcing
+    an expensive run_shape_prop re-run after every fusion.
+    """
+    model = GdnLikeFusableModel().to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    shared_config = SharedConfig(local_rank=0, world_size=1)
+    config_cls = TransformRegistry.get_config_class("fuse_gemms_mixed_children")
+    config = config_cls(stage="post_load_fusion")
+    transform = TransformRegistry.get("fuse_gemms_mixed_children")(config)
+    gm, info = transform._apply(gm, cm=None, factory=None, shared_config=shared_config)
+
+    assert info.num_matches > 0, "Expected at least one fusion match"
+    assert info.has_valid_shapes is True, (
+        "FuseGemmsMixedChildren should report has_valid_shapes=True "
+        "since all nodes now have proper meta['val']"
+    )
 
 
 @pytest.mark.parametrize(
@@ -789,11 +868,7 @@ def test_fuse_qkv_and_mlp_projections(model_cls, model_kwargs, dtype: str):
 )
 @torch.inference_mode()
 def test_fuse_meta_val_propagation(model_cls, model_kwargs):
-    """Verify meta['val'] shapes are correct on fused linear and narrow nodes.
-
-    Without meta['val'] propagation, downstream transforms like sharding that
-    read node.meta['val'].shape would see None and crash.
-    """
+    """Verify meta['val'] shapes are correct on fused linear and narrow nodes."""
     model = model_cls(**model_kwargs).to(device="cuda", dtype=torch.float16)
     x = model.get_input(device="cuda", dtype=torch.float16)
 
@@ -834,3 +909,53 @@ def test_fuse_meta_val_propagation(model_cls, model_kwargs):
             f"Fused linear output dim {fused_val.shape[-1]} != "
             f"sum of narrow sizes {total_narrow_size}"
         )
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires FP8 support (Hopper+)")
+@torch.inference_mode()
+def test_fuse_gemms_mixed_children_fp8_meta_val():
+    """FP8 quantized GEMM fusion should also preserve meta['val'] on all nodes."""
+
+    class FP8MixedChildrenModel(TestModel):
+        def __init__(self, batch_size=2, seq_len=8, in_features=2048, out1=128, out2=128):
+            super().__init__()
+            self.batch_size = batch_size
+            self.seq_len = seq_len
+            self.in_features = in_features
+            self.fc1 = FakeFP8Linear(in_features, out1, bias=False)
+            self.fc2 = FakeFP8Linear(in_features, out2, bias=False)
+
+        def get_input(self, **kwargs):
+            return torch.randn(self.batch_size, self.seq_len, self.in_features, **kwargs)
+
+        @property
+        def keys_to_pop(self):
+            return ("fc1.weight", "fc2.weight")
+
+        @property
+        def num_gemms_after_fusion(self) -> int:
+            return 1
+
+        def forward(self, x):
+            _batch_size, _seq_len, _ = x.shape  # non-linear user
+            y1 = self.fc1(x)
+            y2 = self.fc2(x)
+            return y1.sum(-1, keepdim=True) + y2.sum(-1, keepdim=True)
+
+    model = FP8MixedChildrenModel().to(device="cuda")
+    x = model.get_input(device="cuda", dtype=torch.half)
+    y_ref = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_fused = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    assert _check_all_nodes_have_meta_val(gm_fused), (
+        "Some nodes missing meta['val'] after FP8 GEMM fusion"
+    )
+
+    gm_fused = gm_fused.to("cuda")
+    y_fused = gm_fused(x)
+    torch.testing.assert_close(y_ref, y_fused, atol=5e-3, rtol=5e-3)

@@ -2,14 +2,14 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
-import tensorrt_llm._torch.auto_deploy  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.mla import flashinfer_trtllm_mla as trtllm_mla_mod
-from tests.unittest.auto_deploy.singlegpu.custom_ops.mla.test_flashinfer_mla_op import (
+from auto_deploy.singlegpu.custom_ops.mla.test_flashinfer_mla_op import (
     _create_mla_inputs,
     _create_paged_cache_and_metadata,
     _create_unpaged_cache_and_metadata,
 )
+
+import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.mla import flashinfer_trtllm_mla as trtllm_mla_mod
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),

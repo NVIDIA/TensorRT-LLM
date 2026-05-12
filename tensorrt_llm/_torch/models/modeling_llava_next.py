@@ -418,8 +418,8 @@ class LlavaNextVisionModel(nn.Module):
         clip_model_config = copy.deepcopy(self.model_config)
         clip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
         self.dtype = (
-            self.model_config.pretrained_config.text_config.torch_dtype
-            or self.model_config.pretrained_config.torch_dtype)
+            self.model_config.pretrained_config.torch_dtype
+            or self.model_config.pretrained_config.text_config.torch_dtype)
         self.vision_model = CLIPVisionModel(clip_model_config).to(self.dtype)
         self.mm_projector = LlavaNextMultiModalProjector(
             self.pretrained_config).to(self.dtype)
@@ -626,10 +626,12 @@ class LlavaNextModel(PreTrainedModel):
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
 
-        # Ensure torch_dtype is set on text_config (HF may omit it from
-        # sub-configs, e.g. llava-hf/llava-v1.6-mistral-7b-hf commit 2424fdd)
-        if llm_model_config.pretrained_config.torch_dtype is None:
-            llm_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+        # Use the outer config's torch_dtype for the LLM, matching HF behavior
+        # where `.to(outer_dtype)` overrides text sub-config dtypes. Falls back
+        # to the text_config dtype if the outer config has none set.
+        llm_model_config.pretrained_config.torch_dtype = (
+            model_config.pretrained_config.torch_dtype
+            or llm_model_config.pretrained_config.torch_dtype)
 
         # TODO Remove these when MistralConfig is natively supported
         llm_model_config.pretrained_config.attention_bias = False

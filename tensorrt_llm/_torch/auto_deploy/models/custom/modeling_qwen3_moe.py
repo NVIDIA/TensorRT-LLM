@@ -145,6 +145,55 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 for _ in range(self.num_experts)
             ]
         )
+        self._register_load_state_dict_pre_hook(self._load_experts_from_fused_checkpoint)
+
+    def _owned_expert_ids(self) -> list[int]:
+        """Derive expert ids from params/buffers that currently exist on this module.
+
+        Stays shard-agnostic: on an unsharded module the state dict contains all
+        experts; after AD sharding it contains only the surviving local experts.
+        """
+        expert_ids = set()
+        for key in self.state_dict().keys():
+            if not key.startswith("experts."):
+                continue
+            parts = key.split(".", 3)
+            if len(parts) < 4:
+                continue
+            try:
+                expert_ids.add(int(parts[1]))
+            except ValueError:
+                continue
+        return sorted(expert_ids)
+
+    def _load_experts_from_fused_checkpoint(self, state_dict, prefix, *args):
+        """Convert HF Qwen3MoeExperts fused tensors into per-expert split form.
+
+        HF stores fused 3D tensors:
+            experts.gate_up_proj  -> [num_experts, 2 * intermediate, hidden]
+            experts.down_proj     -> [num_experts, hidden, intermediate]
+        AutoDeploy's Qwen3MoeMLP expects per-expert ``Linear`` weights:
+            experts.{i}.gate_proj.weight -> [intermediate, hidden]
+            experts.{i}.up_proj.weight   -> [intermediate, hidden]
+            experts.{i}.down_proj.weight -> [hidden, intermediate]
+        """
+        gate_up_key = prefix + "experts.gate_up_proj"
+        down_key = prefix + "experts.down_proj"
+        local_expert_ids = self._owned_expert_ids()
+
+        if gate_up_key in state_dict:
+            fused = state_dict.pop(gate_up_key)
+            intermediate_dim = fused.shape[1] // 2
+            gate_weights = fused[:, :intermediate_dim, :]
+            up_weights = fused[:, intermediate_dim:, :]
+            for idx in local_expert_ids:
+                state_dict[f"{prefix}experts.{idx}.gate_proj.weight"] = gate_weights[idx]
+                state_dict[f"{prefix}experts.{idx}.up_proj.weight"] = up_weights[idx]
+
+        if down_key in state_dict:
+            fused = state_dict.pop(down_key)
+            for idx in local_expert_ids:
+                state_dict[f"{prefix}experts.{idx}.down_proj.weight"] = fused[idx]
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -333,6 +382,18 @@ class Qwen3MoePreTrainedModel(PreTrainedModel):
     _no_split_modules = ["Qwen3MoeDecoderLayer"]
     supports_gradient_checkpointing = False
 
+    def _check_and_adjust_experts_implementation(self, *args, **kwargs):
+        """No-op override.
+
+        ``transformers >= 5.x``'s ``PreTrainedModel.__init__`` calls this method
+        which dispatches to ``_grouped_mm_can_dispatch`` and raises
+        ``ValueError`` for any class that hasn't opted into the new MoE
+        ``experts_implementation`` contract. AutoDeploy uses its own
+        ``torch_moe`` canonical op for routing, so no dispatch decision is
+        needed here.
+        """
+        return None
+
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
@@ -365,7 +426,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         self.rotary_emb = Qwen3MoeRotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=config.rope_parameters["rope_theta"],
         )
 
         self.post_init()
