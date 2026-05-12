@@ -1197,6 +1197,14 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
+    # Match the PyTorch backend's allocator init (py_executor_creator.py:230 and
+    # _util.py:1740-1744). Setting memory fraction to 1.0 activates PyTorch's
+    # garbage_collection_threshold logic in the native caching allocator;
+    # without it, the allocator falls back to cudaFree on each large alloc,
+    # which under heavy MoE expert-weight churn triggers HBM region eviction
+    # and UVM page-fault ping-pong (HTOD/DTOH cycle visible in nsys + PCIe TX).
+    ad_logger.info("Setting PyTorch memory fraction to 1.0 (AD parity with PT path)")
+    torch.cuda.set_per_process_memory_fraction(1.0)
     port = dist.broadcast(get_free_port())  # use MPI broadcast to pick a free port
     initialize_or_skip(rank, world_size, port)
 
