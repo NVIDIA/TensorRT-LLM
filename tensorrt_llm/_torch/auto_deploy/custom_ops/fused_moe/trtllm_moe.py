@@ -59,17 +59,24 @@ def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
 # eliminates the redundant Python ctor and JSON deserialization.
 
 
-class _MoeA2ACache:
-    """Cache for `MoeAlltoAll` instances and parsed `DistConfig` mappings.
+class _MoeAll2AllCache:
+    """Per-process singleton cache for `MoeAlltoAll` instances and parsed `DistConfig` mappings.
 
-    Note: EPLB (`num_experts != None`) is not used by auto-deploy today —
-    `eplb_num_experts` is always `None` from the call sites — but the cache
-    keys it explicitly so the helper composes correctly if EPLB is wired
-    later.
+    A separate cache instance lives in each MPI worker process — there is no
+    cross-rank shared state here (that lives in `MoeAlltoAll._WORKSPACE`, which is
+    initialized via the C++ `moe_a2a_initialize` collective). Within a rank, all
+    fused-MoE layers share this cache so the Python `MoeAlltoAll` ctor and
+    `DistConfig` JSON deserialization run at most once per (workspace) configuration
+    per process, regardless of how many MoE-DP layers the model has.
+
+    Note: EPLB (Expert Parallelism Load Balancing — `MoeAlltoAll(num_experts=…)`
+    selects an EPLB-aware codepath) is not used by auto-deploy today;
+    `eplb_num_experts` is always `None` from the call sites. The cache still keys
+    on it explicitly so the helper composes correctly if EPLB is wired later.
     """
 
     def __init__(self) -> None:
-        self._a2a: dict[tuple, MoeAlltoAll] = {}
+        self._all2all: dict[tuple, MoeAlltoAll] = {}
         self._mapping: dict[str, Tuple[Optional[Mapping], bool]] = {}
 
     def get_mapping(self, mapping_config: str) -> Tuple[Optional[Mapping], bool]:
@@ -123,7 +130,7 @@ class _MoeA2ACache:
             workspace_size,
             eplb_num_experts,
         )
-        inst = self._a2a.get(key)
+        inst = self._all2all.get(key)
         if inst is None:
             inst = MoeAlltoAll(
                 mapping=mapping,
@@ -133,11 +140,13 @@ class _MoeA2ACache:
                 workspace_size_per_rank=workspace_size,
                 num_experts=eplb_num_experts,
             )
-            self._a2a[key] = inst
+            self._all2all[key] = inst
         return inst
 
 
-_GlobalMoeA2ACache = _MoeA2ACache()
+# Per-process singleton: instantiated once at module import; each MPI rank
+# has its own instance because each rank is a separate Python process.
+_GlobalMoeAll2AllCache = _MoeAll2AllCache()
 
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
@@ -148,7 +157,7 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     Returns:
         (mapping, enable_alltoall) — mapping is None when mapping_config is empty.
     """
-    mapping, enable_alltoall = _GlobalMoeA2ACache.get_mapping(mapping_config)
+    mapping, enable_alltoall = _GlobalMoeAll2AllCache.get_mapping(mapping_config)
     if enable_alltoall and max_num_tokens <= 0:
         raise ValueError("max_num_tokens must be > 0 when enable_alltoall is True")
     return mapping, enable_alltoall
@@ -246,9 +255,9 @@ def _run_moe_with_alltoall(
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
     # The input x may be quantized (fp8/fp4), but combine outputs in the model dtype
     # (bf16/fp16). We always pass the model dtype so the combine buffer is large enough.
-    # The instance is cached across calls (see `_MoeA2ACache`), so the Python ctor and
+    # The instance is cached across calls (see `_MoeAll2AllCache`), so the Python ctor and
     # workspace-size computation happen once per (workspace) configuration per process.
-    moe_a2a = _GlobalMoeA2ACache.get_alltoall(
+    moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
@@ -419,7 +428,7 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     else:
         runtime_max_tokens_per_rank = max_num_tokens
 
-    moe_a2a = _GlobalMoeA2ACache.get_alltoall(
+    moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
