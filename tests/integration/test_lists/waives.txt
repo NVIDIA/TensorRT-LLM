@@ -416,3 +416,4 @@ unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP
 unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1] SKIP (https://nvbugs/6153575)
 verl/test_verl_cases.py::test_trtllm_abort SKIP (https://nvbugs/6272653)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] SKIP (worker init CUDA error masked by kv_cache_manager_v2/_exceptions.py:49 cuGetErrorString type bug; real failure unreadable until that wrapper is fixed)
+accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype SKIP (https://nvbugs/6166283)
