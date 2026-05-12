@@ -300,6 +300,23 @@ def _resolve_prev_ks(args, mtp_len: int) -> list[int]:
 
 # Tensor construction helpers
 
+# Module-level cache for tensor buffers shared across cells.  Keyed by all
+# the "fixed" dimensions (state_dtype, act_dtype, max_window, mtp_len,
+# nheads, head_dim, d_state, ngroups).  Within a key, the batch dim grows
+# in place: if a new cell requests a batch <= cached max_batch, we return
+# views (slices) of the existing tensors; if batch > cached max_batch, we
+# realloc at the new batch (which becomes the new max).  Tensors never shrink.
+#
+# Rationale: torch.randn/zeros for these tensor shapes at b=512 takes
+# ~10-30ms per call.  At ~895 cells/min with 5 different batch sizes,
+# we were re-allocating every cell.  Caching saves the bulk of that per-cell
+# overhead, raising GPU util in the timing phase.
+#
+# Reset state lives in caller (state_work = state0.copy_), so cached state0
+# is purely a reference whose contents stay fixed once allocated.  This is
+# fine: it's only read by the reset path.
+_TENSOR_CACHE: dict = {}
+
 
 def _build_tensors(
     batch: int,
@@ -327,6 +344,49 @@ def _build_tensors(
       intermediate_states_buffer: for baseline kernel (batch, mtp_len, nheads, head_dim, d_state)
     """
     device = "cuda"
+
+    # Cache lookup — grow batch in place if needed; else return views.
+    cache_key = (state_dtype, act_dtype, max_window, mtp_len,
+                 nheads, head_dim, d_state, ngroups)
+    cached = _TENSOR_CACHE.get(cache_key)
+    if cached is not None and cached["max_batch"] >= batch:
+        # Hit — return slices for current batch.
+        b = batch
+        return (
+            cached["state0"][:b],
+            cached["state_scales0"][:b] if cached["state_scales0"] is not None else None,
+            cached["old_x"][:b],
+            cached["old_B"][:b],
+            cached["old_dt"][:b],
+            cached["old_dA_cumsum"][:b],
+            cached["cache_buf_idx"][:b],
+            cached["x"][:b],
+            cached["dt"][:b],
+            cached["B"][:b],
+            cached["C"][:b],
+            cached["A"],
+            cached["dt_bias"],
+            cached["D"],
+            cached["prev_tokens"][:b],
+            cached["slot_perm_buf"][:b],
+            cached["out_incr"][:b],
+            cached["out_base"][:b],
+            cached["intermediate_states_buffer"][:b],
+            cached["xbc_input"][:b],
+            cached["conv_state"][:b],
+            cached["conv_weight"],
+            cached["conv_bias"],
+            cached["d_inner"],
+            cached["conv_dim"],
+        )
+
+    # Miss or grow.  Allocate at new max_batch (existing data, if any, is
+    # released — caller code re-fills via reset paths anyway).  Rebind
+    # `batch` locally to alloc_batch so the existing allocation code below
+    # uses the larger size; keep request_batch for the final slice.
+    request_batch = batch
+    alloc_batch = batch if cached is None else max(batch, cached["max_batch"])
+    batch = alloc_batch
 
     torch.manual_seed(42)
 
@@ -434,28 +494,58 @@ def _build_tensors(
     # conv_bias: (conv_dim,) — parameter
     conv_bias = torch.randn(conv_dim, device=device, dtype=act_dtype)
 
+    # Store full-batch buffers in cache and return slices at request_batch.
+    _TENSOR_CACHE[cache_key] = {
+        "max_batch": alloc_batch,
+        "state0": state0,
+        "state_scales0": state_scales0,
+        "old_x": old_x,
+        "old_B": old_B,
+        "old_dt": old_dt,
+        "old_dA_cumsum": old_dA_cumsum,
+        "cache_buf_idx": cache_buf_idx,
+        "x": x,
+        "dt": dt,
+        "B": B,
+        "C": C,
+        "A": A,
+        "dt_bias": dt_bias,
+        "D": D,
+        "prev_tokens": prev_tokens,
+        "slot_perm_buf": slot_perm_buf,
+        "out_incr": out_incr,
+        "out_base": out_base,
+        "intermediate_states_buffer": intermediate_states_buffer,
+        "xbc_input": xbc_input,
+        "conv_state": conv_state,
+        "conv_weight": conv_weight,
+        "conv_bias": conv_bias,
+        "d_inner": d_inner,
+        "conv_dim": conv_dim,
+    }
+    rb = request_batch
     return (
-        state0,
-        state_scales0,
-        old_x,
-        old_B,
-        old_dt,
-        old_dA_cumsum,
-        cache_buf_idx,
-        x,
-        dt,
-        B,
-        C,
+        state0[:rb],
+        state_scales0[:rb] if state_scales0 is not None else None,
+        old_x[:rb],
+        old_B[:rb],
+        old_dt[:rb],
+        old_dA_cumsum[:rb],
+        cache_buf_idx[:rb],
+        x[:rb],
+        dt[:rb],
+        B[:rb],
+        C[:rb],
         A,
         dt_bias,
         D,
-        prev_tokens,
-        slot_perm_buf,
-        out_incr,
-        out_base,
-        intermediate_states_buffer,
-        xbc_input,
-        conv_state,
+        prev_tokens[:rb],
+        slot_perm_buf[:rb],
+        out_incr[:rb],
+        out_base[:rb],
+        intermediate_states_buffer[:rb],
+        xbc_input[:rb],
+        conv_state[:rb],
         conv_weight,
         conv_bias,
         d_inner,
@@ -2036,6 +2126,22 @@ def _run_benchmark(args) -> None:
             args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
             baseline_fn, max_workers=args.compile_threads,
         )
+
+    # Pre-warm the per-(state_dtype, act_dtype, mtp_len, ...) tensor cache at
+    # the largest requested batch size.  Without this, the timing loop would
+    # progressively grow the cache as it encounters larger batches (e.g.,
+    # iterate 1 -> 16 -> 64 -> 128 -> 512 = 5 separate growth allocations,
+    # each freeing the previous buffers).  Pre-warming at max-batch up front
+    # makes every subsequent timing cell a view-slice (zero alloc cost).
+    _max_batch = max(batch_sizes)
+    for state_dtype in state_dtypes:
+        for act_dtype in act_dtypes:
+            for mtp_len in mtp_lengths:
+                _build_tensors(
+                    _max_batch, mtp_len, state_dtype, act_dtype,
+                    args.tp_nheads, args.head_dim, args.d_state, args.tp_ngroups,
+                    max_window=getattr(args, "max_window", None) or None,
+                )
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStart()
