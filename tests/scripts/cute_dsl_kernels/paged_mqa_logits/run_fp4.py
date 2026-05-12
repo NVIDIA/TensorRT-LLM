@@ -18,16 +18,19 @@ Example:
 """
 
 import argparse
+import functools
 import sys
 from pathlib import Path
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass.utils.smem_allocator import SmemAllocator
 
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.paged_mqa_logits import FP4MQALogitsKernel
-except (ModuleNotFoundError, ImportError):
+except ImportError:
     sys.path.insert(0, str(Path(__file__).parents[4] / "tensorrt_llm/_torch/cute_dsl_kernels"))
     from blackwell.paged_mqa_logits import FP4MQALogitsKernel
 
@@ -129,9 +132,7 @@ def _kv_cache_cast_to_fp4(x: torch.Tensor):
     )
 
 
-# ---- Pure-Python schedule metadata (replaces deep_gemm.get_paged_mqa_logits_metadata)
-
-
+# ---- Pure-Python schedule metadata on CPU
 def _compute_schedule_metadata(
     context_lens_cpu: torch.Tensor, block_kv: int, num_ctas: int
 ) -> torch.Tensor:
@@ -170,6 +171,171 @@ def _compute_schedule_metadata(
         else:
             local = target - cum + seq_offset
             schedule[i] = torch.tensor([seq_idx, local], dtype=torch.int32)
+    return schedule
+
+
+# Single-CTA single-warp kernel: register-array num_segs → warp inclusive scan
+# with carry → SMEM prefix_sum → per-SM linear scan emitting (q_idx, kv_split).
+class PagedMQALogitsMetadataKernel:
+    """Compile-time params: aligned_batch_size (multiple of 32), split_kv, num_sms.
+
+    Runtime: context_lens [B] int32 (cuda), schedule_meta [num_sms+1, 2] int32 (cuda),
+    batch_size (Int32).
+    """
+
+    def __init__(self, aligned_batch_size: int, split_kv: int, num_sms: int):
+        assert aligned_batch_size > 0 and aligned_batch_size % 32 == 0
+        self.aligned_batch_size = aligned_batch_size
+        self.split_kv = split_kv
+        self.num_sms = num_sms
+
+    @cute.jit
+    def __call__(
+        self,
+        context_lens: cute.Tensor,
+        schedule_meta: cute.Tensor,
+        batch_size: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(context_lens, schedule_meta, batch_size).launch(
+            grid=(1, 1, 1), block=(32, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        context_lens: cute.Tensor,
+        schedule_meta: cute.Tensor,
+        batch_size: cutlass.Int32,
+    ):
+        kAligned = cutlass.const_expr(self.aligned_batch_size)
+        SPLIT_KV = cutlass.const_expr(self.split_kv)
+        kNumSMs = cutlass.const_expr(self.num_sms)
+        kNumChunks = cutlass.const_expr(kAligned // 32)
+        # Cover sm_idx ∈ [0, kNumSMs] (inclusive) in 32-lane strips.
+        kMaxSmChunks = cutlass.const_expr((kNumSMs + 32) // 32)
+
+        lane_idx = cute.arch.lane_idx()
+
+        smem = SmemAllocator()
+        prefix_sum = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((kAligned,), order=(0,)),
+            byte_alignment=128,
+        )
+
+        # Phase 1: per-lane register array of ceil_div(ctx, SPLIT_KV).
+        # Out-of-range lanes contribute 0 (matches CUDA's q_idx<batch_size guard).
+        num_segs = [cutlass.Int32(0)] * kNumChunks
+        for k in cutlass.range_constexpr(kNumChunks):
+            q_idx = cutlass.Int32(k * 32) + lane_idx
+            ctx_len = cutlass.Int32(0)
+            if q_idx < batch_size:
+                ctx_len = context_lens[q_idx]
+            num_segs[k] = (ctx_len + (SPLIT_KV - 1)) // SPLIT_KV
+
+        # Phase 2: warp-level inclusive scan, with carry across chunks, → SMEM.
+        sum_carry = cutlass.Int32(0)
+        for k in cutlass.range_constexpr(kNumChunks):
+            x = num_segs[k]
+            for i in cutlass.range_constexpr(5):  # log2(32) = 5
+                offset = 1 << i
+                y = cute.arch.shuffle_sync_up(x, offset, mask=0xFFFFFFFF, mask_and_clamp=0)
+                if lane_idx >= offset:
+                    x = x + y
+            x = x + sum_carry
+            prefix_sum[k * 32 + lane_idx] = x
+            # Broadcast lane-31's value to all lanes for the next chunk.
+            sum_carry = cute.arch.shuffle_sync(x, 31)
+
+        # Phase 3: distribute `total` segments across kNumSMs CTAs.
+        # Each lane handles sm_idx = lane, lane+32, ... up to kNumSMs inclusive.
+        total = sum_carry
+        q_div = total // kNumSMs
+        r_mod = total % kNumSMs
+
+        for s in cutlass.range_constexpr(kMaxSmChunks):
+            sm_idx_local = cutlass.Int32(s * 32) + lane_idx
+            if sm_idx_local <= kNumSMs:
+                # seg_starts = sm * q + min(sm, r). Pre-declare so it survives
+                # the dynamic if/else (DSL rule: no first-assignment inside
+                # dynamic control flow).
+                seg_starts = sm_idx_local * q_div
+                if sm_idx_local <= r_mod:
+                    seg_starts = seg_starts + sm_idx_local
+                else:
+                    seg_starts = seg_starts + r_mod
+
+                # Linear scan: q_idx_out = number of j ∈ [0, batch_size) with
+                # prefix_sum[j] <= seg_starts. prefix_sum is non-decreasing, so
+                # the predicate is monotone — we can replace the CUDA `while`
+                # with a constexpr-bounded for-scan.
+                q_idx_out = cutlass.Int32(0)
+                for j in cutlass.range_constexpr(kAligned):
+                    in_range = cutlass.Int32(j) < batch_size
+                    advance = cutlass.Boolean(False)
+                    if in_range:
+                        if prefix_sum[j] <= seg_starts:
+                            advance = cutlass.Boolean(True)
+                    if advance:
+                        q_idx_out = cutlass.Int32(j + 1)
+
+                kv_split_idx = seg_starts
+                if q_idx_out > 0:
+                    kv_split_idx = seg_starts - prefix_sum[q_idx_out - 1]
+
+                schedule_meta[sm_idx_local, 0] = q_idx_out
+                schedule_meta[sm_idx_local, 1] = kv_split_idx
+
+
+@functools.cache
+def compile_paged_mqa_logits_metadata_kernel(aligned_b: int, split_kv: int, num_ctas: int):
+    """Compile (and cache) the metadata kernel using fake tensors + TVM FFI.
+
+    Mirrors `_compile_fp4_kernel` in this file: explicit fake-tensor signature
+    so runtime calls can pass raw torch tensors directly.
+    """
+    sym_B = cute.sym_int()
+    cl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (sym_B,), stride_order=(0,))
+    sm_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_ctas + 1, 2), stride_order=(1, 0)
+    )
+    fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    kern = PagedMQALogitsMetadataKernel(aligned_b, split_kv, num_ctas)
+    compiled = cute.compile(
+        kern,
+        cl_fake,
+        sm_fake,
+        cutlass.Int32(1),
+        fake_stream,
+        options="--enable-tvm-ffi",
+    )
+    print(f"[compile] schedule_meta aligned_b={aligned_b} split_kv={split_kv} num_sms={num_ctas}")
+    return compiled
+
+
+def get_paged_mqa_logits_metadata_cute_dsl(
+    context_lens: torch.Tensor,
+    compute_block_kv_per_wg: int,
+    num_ctas: int,
+    num_math_wg: int = 2,
+) -> torch.Tensor:
+    """CuTe DSL replacement for `_compute_schedule_metadata` (kernel runs on GPU).
+
+    Equivalent contract to the pure-Python version, but expects `context_lens`
+    on CUDA (int32, 1D) and returns the output on the same device. SPLIT_KV is
+    compute_block_kv_per_wg * num_math_wg.
+    """
+    assert context_lens.is_cuda and context_lens.dtype == torch.int32 and context_lens.dim() == 1
+    batch_size = int(context_lens.shape[0])
+    aligned_b = max(((batch_size + 31) // 32) * 32, 32)
+    # one cta handles tile_m is block_kv
+    split_kv = compute_block_kv_per_wg * num_math_wg
+
+    schedule = torch.empty((num_ctas + 1, 2), dtype=torch.int32, device=context_lens.device)
+    compiled = compile_paged_mqa_logits_metadata_kernel(aligned_b, split_kv, num_ctas)
+    compiled(context_lens, schedule, batch_size)
     return schedule
 
 
@@ -416,6 +582,20 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     return float(1 - 2 * (x * y).sum() / denom)
 
 
+def verify_schedule_meta(kernel_ctx_lens: torch.Tensor, num_sms: int) -> None:
+    """Bit-exact equivalence check: CuTe DSL kernel vs. pure-Python reference."""
+    ref = _compute_schedule_metadata(kernel_ctx_lens.cpu(), 128, num_sms).to(kernel_ctx_lens.device)
+    dsl = get_paged_mqa_logits_metadata_cute_dsl(kernel_ctx_lens, 128, num_sms)
+    if not torch.equal(ref, dsl):
+        diff = (ref != dsl).nonzero(as_tuple=False)
+        raise AssertionError(
+            f"[verify_meta] FAIL: {diff.shape[0]} mismatched entries "
+            f"(B={kernel_ctx_lens.shape[0]} num_sms={num_sms}); "
+            f"first diff at {diff[0].tolist()}: ref={ref[tuple(diff[0])]}, dsl={dsl[tuple(diff[0])]}"
+        )
+    print(f"[verify_meta] PASS (B={kernel_ctx_lens.shape[0]} num_sms={num_sms})")
+
+
 def run(
     batch_size: int,
     next_n: int,
@@ -430,6 +610,7 @@ def run(
     tol: float = 0.02,
     seed: int = 42,
     num_sms: int = 148,
+    verify_meta: bool = False,
 ) -> float:
     """Generate random inputs, run kernel, compare to reference, print result.
 
@@ -512,6 +693,9 @@ def run(
         kernel_sf_q = sf_q
         kernel_ctx_lens = context_lens
         kernel_block_table = block_table
+
+    if verify_meta:
+        verify_schedule_meta(kernel_ctx_lens, num_sms)
 
     schedule_meta = _compute_schedule_metadata(kernel_ctx_lens.cpu(), 128, num_sms).to(device)
 
@@ -607,6 +791,11 @@ if __name__ == "__main__":
         "--tol", type=float, default=0.02, help="cosine-diff PASS threshold (default 0.02)"
     )
     parser.add_argument("--num_sms", type=int, default=148)
+    parser.add_argument(
+        "--verify_meta",
+        action="store_true",
+        help="verify CuTe DSL schedule_meta kernel against the pure-Python reference",
+    )
     args = parser.parse_args()
 
     print("=== FP4 paged MQA logits standalone test ===")
@@ -623,4 +812,5 @@ if __name__ == "__main__":
         fix_length=not args.varlen,
         tol=args.tol,
         num_sms=args.num_sms,
+        verify_meta=args.verify_meta,
     )
