@@ -13,6 +13,7 @@ pandas = ">=2.3.2,<3.0.0"
 psutil = "^7.1.0"
 pyyaml = "^6.0.3"
 scipy = ">=1.11.0,<2.0.0"
+pygments = ">=2.20.0"
 
 [tool.pytest.ini_options]
 # Set the root directory to current directory to avoid loading parent conftest.py
