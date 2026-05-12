@@ -533,8 +533,7 @@ class TestLTX2LPIPSRegression:
     def test_ltx2_lpips_against_golden(self, ltx2_bf16_checkpoint_exists):
         if not os.path.isdir(TEXT_ENCODER_PATH):
             pytest.skip(
-                f"LTX2 text encoder not found at {TEXT_ENCODER_PATH}. "
-                "Set LTX2_TEXT_ENCODER_PATH."
+                f"LTX2 text encoder not found at {TEXT_ENCODER_PATH}. Set LTX2_TEXT_ENCODER_PATH."
             )
         if not os.path.exists(SPATIAL_UPSAMPLER_PATH):
             pytest.skip(
