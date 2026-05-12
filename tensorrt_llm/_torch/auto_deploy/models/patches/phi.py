@@ -170,6 +170,14 @@ def _clear_default_rope_scaling_for_custom_models(config):
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
         if rope_type == "default":
             config.rope_scaling = None
+            # transformers>=5.5 also exposes ``rope_parameters`` which aliases
+            # ``rope_scaling``; clear both so the model's ``_init_rope`` takes
+            # the non-scaling branch.
+            if hasattr(config, "rope_parameters"):
+                try:
+                    config.rope_parameters = None
+                except (AttributeError, TypeError):
+                    pass
 
 
 def get_model_from_config_patched(config, **kwargs):

@@ -4,16 +4,29 @@ from typing import Optional
 
 import torch
 from torch import nn
-from transformers.models.bamba.modeling_bamba import (
-    BambaMixer,
-    BambaModel,
-    BambaPreTrainedModel,
-    HybridMambaAttentionDynamicCache,
-    apply_mask_to_padding_states,
-)
 
 from ...custom_ops.attention_interface import BatchInfo
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
+
+try:
+    from transformers.models.bamba.modeling_bamba import (
+        BambaMixer,
+        BambaModel,
+        BambaPreTrainedModel,
+        HybridMambaAttentionDynamicCache,
+        apply_mask_to_padding_states,
+    )
+
+    _BAMBA_AVAILABLE = True
+except ImportError:
+    # transformers>=5.5 removed HybridMambaAttentionDynamicCache and
+    # apply_mask_to_padding_states from modeling_bamba. Skip patch registration
+    # in that case; bamba models won't be exportable under newer transformers
+    # until this patch is updated.
+    BambaMixer = BambaModel = BambaPreTrainedModel = None
+    HybridMambaAttentionDynamicCache = None
+    apply_mask_to_padding_states = None
+    _BAMBA_AVAILABLE = False
 
 
 # Original implementation:
@@ -198,7 +211,16 @@ def _cache_bool(self) -> bool:
     return True
 
 
-@ExportPatchRegistry.register("bamba")
+def _register_if_available(name):
+    def _decorate(cls):
+        if _BAMBA_AVAILABLE:
+            return ExportPatchRegistry.register(name)(cls)
+        return cls
+
+    return _decorate
+
+
+@_register_if_available("bamba")
 class BambaModelPatch(BaseExportPatch):
     """Patch for `BambaMixer`."""
 
@@ -231,4 +253,5 @@ class BambaModelPatch(BaseExportPatch):
 
 
 # NOTE: patch that is used during build model time
-BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
+if _BAMBA_AVAILABLE:
+    BambaPreTrainedModel._init_weights = _bamba_pretrained_model_init_weights
