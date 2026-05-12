@@ -2,13 +2,11 @@ import copy
 import datetime
 import enum
 import json
-import os
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 
 from tensorrt_llm.logger import logger
@@ -21,7 +19,7 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
+from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -127,54 +125,10 @@ class BaseWorker(GenerationExecutor):
     def _configure_affinity(self, device_id):
         '''Probe and configure the CPU affinity of the worker based on NUMA topology.
 
-        Args:
-            device_id: The CUDA device ID to determine optimal CPU affinity.
-
-        Note:
-            If the process already has constrained affinity, a warning is logged.
-            Configuration is handled as follows:
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
-                    -> Affinity is automatically configured if it is unconstrained,
-                       and deleted if it is constrained externally by the user.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
-                    -> Affinity is unconditionally auto-configured.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
-                    -> Affinity is unconditionally _not_ auto-configured.
+        Delegates to :func:`tensorrt_llm.llmapi.utils.configure_cpu_affinity`;
+        see that helper for the full env-var semantics.
         '''
-
-        # Get the current affinity setting
-        pid = os.getpid()
-        process = psutil.Process(pid)
-        cpu_affinity = process.cpu_affinity()
-
-        all_cpus = list(range(psutil.cpu_count()))
-
-        constrained_affinity = (cpu_affinity != all_cpus)
-        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
-
-        # If affinity is constrained but the user hasn't explicitly
-        # requested NUMA-aware affinity, remove the constraints.
-        if constrained_affinity:
-            logger.warning(
-                f"Worker process {pid} is affined to run on the following CPUs: "
-                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
-                f"performance if set incorrectly.")
-            if numa_aware_affinity is None:
-                logger.warning(
-                    f"Worker process {pid} has constrained CPU affinity "
-                    f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
-                    f"Removing CPU affinity constraints.")
-                process.cpu_affinity(all_cpus)
-
-        # If affinity is unconstrained and the user hasn't explicitly
-        # prohibited it or the user has explicitly requested it, choose the
-        # optimal affinity based upon the NUMA topology
-        if ((numa_aware_affinity is None and not constrained_affinity)
-                or (numa_aware_affinity == "1")):
-            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
-            logger.info(
-                f"Worker process {pid} CPU affinity set to "
-                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
+        configure_cpu_affinity(device_id)
 
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()

@@ -385,6 +385,12 @@ def run_diffusion_worker(
         device_id = _local_rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
+            try:
+                from tensorrt_llm.llmapi.utils import configure_cpu_affinity
+
+                configure_cpu_affinity(device_id)
+            except Exception as e:
+                logger.warning(f"[rank {rank}] NUMA-aware CPU affinity setup failed: {e}")
 
         dist.init_process_group(
             backend="nccl" if torch.cuda.is_available() else "gloo",
