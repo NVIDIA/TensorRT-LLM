@@ -13,7 +13,6 @@ from ..logger import logger
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
-    "glm_moe_dsa": "tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(

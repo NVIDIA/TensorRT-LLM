@@ -7326,7 +7326,6 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend="DEEPGEMM"),
             speculative_config=MTPDecodingConfig(),
             enable_chunked_prefill=True,
-            custom_tokenizer="glm_moe_dsa",
         )
 
         with LLM(self.MODEL_PATH,
