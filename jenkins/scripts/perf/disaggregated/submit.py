@@ -368,10 +368,15 @@ def main():
         benchmark_pytest_command,
     ) = get_pytest_commands(script_prefix_lines)
 
-    # Build worker env vars (split into ctx and gen for role-specific settings)
+    # Build worker env vars (split into ctx and gen for role-specific settings).
+    # NCCL_DEBUG_SUBSYS=INIT,NET,ENV makes NCCL print the chosen network plugin
+    # ("Using network AWS Libfabric" vs "Using network Socket") at startup, which
+    # is the cheapest way to confirm the aws-ofi-nccl plugin is actually loaded
+    # on EFA clusters. NCCL_DEBUG=INFO is already set by env_config.
     base_worker_env_vars = (
         f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
         f"HF_HOME=/tmp/hf_home "
+        f"NCCL_DEBUG_SUBSYS=INIT,NET,ENV "
         f"{env_config['worker_env_var']}"
     )
     ctx_worker_env_vars = base_worker_env_vars
