@@ -60,6 +60,19 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Whether the experimental cascade attention kernel is enabled (replaces
+// masked_multihead_attention_kernel for beam-search decoding).
+// Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
+bool getEnvEnableCascadeMmha();
+
+// Minimum beam_width required to dispatch the cascade kernel.
+// Controlled by TRTLLM_CASCADE_MMHA_MIN_BEAM (default: 2).
+int getEnvCascadeMmhaMinBeam();
+
+// Minimum shared prefix length required to dispatch the cascade kernel.
+// Controlled by TRTLLM_CASCADE_MMHA_MIN_PREFIX (default: 256).
+int getEnvCascadeMmhaMinPrefix();
+
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
     cudaStream_t stream, Args&&... args)

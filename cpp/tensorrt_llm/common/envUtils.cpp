@@ -274,6 +274,60 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvEnableCascadeMmha()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
+    return enable;
+}
+
+int getEnvCascadeMmhaMinBeam()
+{
+    static std::once_flag flag;
+    static int minBeam = 2;
+    std::call_once(flag,
+        [&]()
+        {
+            char const* env = std::getenv("TRTLLM_CASCADE_MMHA_MIN_BEAM");
+            if (env)
+            {
+                int v = std::atoi(env);
+                if (v >= 1)
+                {
+                    minBeam = v;
+                }
+                else
+                {
+                    TLLM_LOG_WARNING("Invalid TRTLLM_CASCADE_MMHA_MIN_BEAM, using default %d", minBeam);
+                }
+            }
+        });
+    return minBeam;
+}
+
+int getEnvCascadeMmhaMinPrefix()
+{
+    static std::once_flag flag;
+    static int minPrefix = 256;
+    std::call_once(flag,
+        [&]()
+        {
+            char const* env = std::getenv("TRTLLM_CASCADE_MMHA_MIN_PREFIX");
+            if (env)
+            {
+                int v = std::atoi(env);
+                if (v >= 0)
+                {
+                    minPrefix = v;
+                }
+                else
+                {
+                    TLLM_LOG_WARNING("Invalid TRTLLM_CASCADE_MMHA_MIN_PREFIX, using default %d", minPrefix);
+                }
+            }
+        });
+    return minPrefix;
+}
+
 bool getEnvUseUCXKvCache()
 {
     static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
