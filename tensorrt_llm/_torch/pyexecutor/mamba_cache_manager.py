@@ -1007,8 +1007,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # 1) Mamba layers (mamba_layer_mask is True)
         # 2) Full attention layers (full_attention_layer_mask is True)
         # 3) Not managed layers (both masks are False)
-        full_attention_layer_mask = layer_mask.copy()
         total_layers = len(mamba_layer_mask)
+        if layer_mask is None:
+            full_attention_layer_mask = [False] * total_layers
+        elif len(layer_mask) != total_layers:
+            raise ValueError(
+                f"layer_mask length ({len(layer_mask)}) must match "
+                f"mamba_layer_mask length ({total_layers})")
+        else:
+            full_attention_layer_mask = list(layer_mask)
         layer_mask = [
             mamba_layer_mask[i] or full_attention_layer_mask[i]
             for i in range(total_layers)
@@ -1028,6 +1035,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
         self.requests = []
+        # Seed externally visible mamba fields before any early return so that
+        # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
+        # on ranks with no local mamba layers.
+        self._use_replay_state_update = use_replay_state_update
+        self.ssm_state_dtype = mamba_ssm_cache_dtype
 
         if self.local_num_mamba_layers == 0:
             logger.info(
@@ -1050,7 +1062,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             return
 
-        self._use_replay_state_update = use_replay_state_update
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
@@ -1066,7 +1077,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         nheads = nheads // tp_size
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
-        self.ssm_state_dtype = mamba_ssm_cache_dtype
         self.conv_state_dtype = mamba_cache_dtype
         self.ssm_count = math.prod(self.ssm_state_shape)
         self.conv_count = math.prod(self.conv_state_shape)
