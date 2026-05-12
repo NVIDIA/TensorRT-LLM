@@ -427,8 +427,19 @@ class FlashinferOpBackend(MoEOpBackend):
         import flashinfer.fused_moe as _flashinfer_fused_moe
         from flashinfer.fp4_quantization import fp4_quantize as _flashinfer_fp4_quantize
         from flashinfer.fp8_quantization import mxfp8_quantize as _flashinfer_mxfp8_quantize
-        from flashinfer.fused_moe import RoutingMethodType as _flashinfer_routing_method_type
-        from flashinfer.fused_moe.core import ActivationType as _flashinfer_activation_type
+
+        # Flashinfer reorganised these enums across releases:
+        #   - 0.6.9 release (main):    RoutingMethodType in flashinfer.fused_moe,
+        #                              ActivationType    in flashinfer.fused_moe.core
+        #   - nightly 9f7adfb8+:       both moved to flashinfer.tllm_enums
+        # Try the upstream-main path first for forward compatibility, then
+        # fall back to tllm_enums for the nightly pin this branch uses.
+        try:
+            from flashinfer.fused_moe import RoutingMethodType as _flashinfer_routing_method_type
+            from flashinfer.fused_moe.core import ActivationType as _flashinfer_activation_type
+        except ImportError:
+            from flashinfer.tllm_enums import ActivationType as _flashinfer_activation_type
+            from flashinfer.tllm_enums import RoutingMethodType as _flashinfer_routing_method_type
 
         from ..fused_moe.routing import RoutingMethodType as _trtllmgen_routing_method_type
 

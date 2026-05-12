@@ -17,6 +17,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     CudaGraphConfig,
     ParallelConfig,
     PipelineConfig,
+    SageAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
@@ -72,6 +73,40 @@ class TestVisualGenArgsStrictValidation:
                 checkpoint_path="/tmp/model",
                 linear={"type": "default"},
             )
+
+
+class TestAttentionConfigSageFallback:
+    """Unsupported SageAttention options are logged and disabled."""
+
+    def test_sage_config_fallback_on_non_trtllm_backend(self):
+        with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
+            attention = AttentionConfig(
+                backend="VANILLA",
+                sage_attention_config=SageAttentionConfig(),
+            )
+
+        assert attention.sage_attention_config is None
+        critical.assert_called_once()
+        assert "requires backend='TRTLLM'" in critical.call_args.args[0]
+
+    def test_sage_config_fallback_when_unsupported(self):
+        with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                sage_attention_config=SageAttentionConfig(num_elts_per_blk_q=127),
+            )
+
+        assert attention.sage_attention_config is None
+        critical.assert_called_once()
+        assert "Unsupported self.sage_attention_config" in critical.call_args.args[0]
+
+    def test_supported_sage_configs(self):
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            sage_attention_config=SageAttentionConfig(),
+        )
+
+        assert attention.sage_attention_config is not None
 
 
 class TestVisualGenArgsCacheBackend:

@@ -423,3 +423,98 @@ def split_qkv_contiguous(
         k_flat.view(1, seq_len, num_q_heads, head_k_dim),
         v_flat.view(1, seq_len, num_v_heads, head_v_dim),
     )
+
+
+@triton.jit
+def _ssd_output_transpose_kernel(
+    src_ptr,
+    dst_ptr,
+    num_prefill_tokens,
+    H,
+    D,
+    NC,
+    CS,
+    stride_h,
+    stride_d,
+    stride_nc,
+    HD,
+    BLOCK_L: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    # (1, H, D, NC, CS) → (L, H*D); BLOCK_L | CS keeps each tile in one chunk.
+    pid_l = tl.program_id(0)
+    pid_hd = tl.program_id(1)
+
+    l_offs = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    hd_offs = pid_hd * BLOCK_HD + tl.arange(0, BLOCK_HD)
+
+    l_mask = l_offs < num_prefill_tokens
+    hd_mask = hd_offs < HD
+
+    nc = l_offs // CS
+    cs = l_offs % CS
+    h = hd_offs // D
+    d = hd_offs % D
+
+    # int64 offsets: H*D*NC*CS can exceed INT32_MAX for long seqlens.
+    src_off = (
+        h.to(tl.int64)[None, :] * stride_h
+        + d.to(tl.int64)[None, :] * stride_d
+        + nc.to(tl.int64)[:, None] * stride_nc
+        + cs.to(tl.int64)[:, None]
+    )
+    mask = l_mask[:, None] & hd_mask[None, :]
+    data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+
+    dst_off = l_offs.to(tl.int64)[:, None] * HD + hd_offs[None, :]
+    tl.store(dst_ptr + dst_off, data, mask=mask)
+
+
+def ssd_output_transpose(
+    out_contig: torch.Tensor,
+    dst: torch.Tensor,
+    num_prefill_tokens: int,
+) -> None:
+    """Transpose (1, H, D, NC, CS) bf16 to (num_prefill_tokens, H*D) bf16 in dst."""
+    # Tuned on B200; bandwidth-bound, so a wider tile (two heads, num_warps=2)
+    # beats more warps. BLOCK_L must divide CS so each tile stays in one chunk.
+    BLOCK_L = 128
+    BLOCK_HD = 128
+    NUM_WARPS = 2
+
+    assert out_contig.is_contiguous(), "out_contig must be contiguous in (B, H, D, NC, CS)"
+    assert out_contig.ndim == 5 and out_contig.shape[0] == 1, (
+        f"expected (1, H, D, NC, CS), got {tuple(out_contig.shape)}"
+    )
+    _, H, D, NC, CS = out_contig.shape
+    HD = H * D
+    assert dst.is_contiguous()
+    assert dst.numel() == num_prefill_tokens * HD, (
+        f"dst numel {dst.numel()} != L_p*H*D = {num_prefill_tokens}*{HD}"
+    )
+    assert NC * CS >= num_prefill_tokens, (
+        f"padded seqlen {NC * CS} < num_prefill_tokens {num_prefill_tokens}"
+    )
+    assert CS % BLOCK_L == 0, f"chunk_size {CS} must be a multiple of BLOCK_L={BLOCK_L}"
+
+    stride_h = D * NC * CS
+    stride_d = NC * CS
+    stride_nc = CS
+
+    grid = (triton.cdiv(num_prefill_tokens, BLOCK_L), triton.cdiv(HD, BLOCK_HD))
+    _ssd_output_transpose_kernel[grid](
+        out_contig,
+        dst,
+        num_prefill_tokens,
+        H,
+        D,
+        NC,
+        CS,
+        stride_h,
+        stride_d,
+        stride_nc,
+        HD,
+        BLOCK_L=BLOCK_L,
+        BLOCK_HD=BLOCK_HD,
+        num_warps=NUM_WARPS,
+    )

@@ -74,7 +74,13 @@ def _run_async(coro):
 
 
 class MockVisualGen:
-    """Lightweight stand-in for VisualGen that avoids GPU / model loading."""
+    """Lightweight stand-in for VisualGen that avoids GPU / model loading.
+
+    When *batch_aware* is True (default), ``generate()`` and
+    ``generate_async()`` inspect ``params.num_images_per_prompt`` and expand
+    the stored single-item tensors into batched tensors ``(N, ...)`` so
+    callers can test batch handling end-to-end.
+    """
 
     def __init__(
         self,
@@ -82,17 +88,25 @@ class MockVisualGen:
         video_output: Optional[torch.Tensor] = None,
         audio_output: Optional[torch.Tensor] = None,
         should_fail: bool = False,
+        batch_aware: bool = True,
     ):
         self._image = image_output
         self._video = video_output
         self._audio = audio_output
         self._should_fail = should_fail
+        self._batch_aware = batch_aware
         self._healthy = True
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
+
+    def _maybe_batch(self, tensor, n):
+        """Replicate a single tensor along a new leading batch dimension."""
+        if tensor is None or n <= 1 or not self._batch_aware:
+            return tensor
+        return tensor.unsqueeze(0).expand(n, *tensor.shape).contiguous()
 
     # --- VisualGen interface ---
 
@@ -101,10 +115,11 @@ class MockVisualGen:
         self.last_params = params
         if self._should_fail:
             raise RuntimeError("Generation intentionally failed")
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return VisualGenOutput(
             request_id=self._next_request_id(),
-            image=self._image,
-            video=self._video,
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
             audio=self._audio,
             metrics=VisualGenMetrics(),
         )
@@ -112,10 +127,11 @@ class MockVisualGen:
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
         self.last_params = params
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MockVisualGenResult(
             request_id=self._next_request_id(),
-            image=self._image,
-            video=self._video,
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
             audio=self._audio,
             should_fail=self._should_fail,
         )
@@ -725,6 +741,22 @@ class TestVideoGenerationSync:
         )
         assert resp.status_code == 400
 
+    def test_sync_video_batch_n2(self, video_client):
+        """Sync video with n=2 should succeed and return the first video."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "Batch rockets",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
 
 # =========================================================================
 # POST /v1/videos  (asynchronous)
@@ -850,6 +882,24 @@ class TestVideoGenerationAsync:
         assert params.negative_prompt == "noise"
         assert params.frame_rate == 10
         assert params.num_frames == int(2.0 * 10)
+
+    def test_async_video_batch_n2(self, video_client):
+        """Async video with n=2 should accept the request and return 202."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Batch fireworks",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["id"].startswith("video_")
 
 
 # =========================================================================
@@ -997,8 +1047,8 @@ class TestDeleteVideo:
         )
         video_id = create_resp.json()["id"]
 
-        # Write a dummy video file
-        (tmp_path / f"{video_id}.mp4").write_bytes(b"\x00" * 32)
+        # Write a dummy video file matching the batch naming convention.
+        (tmp_path / f"{video_id}_0.mp4").write_bytes(b"\x00" * 32)
 
         resp = client.delete(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
@@ -1010,7 +1060,7 @@ class TestDeleteVideo:
         assert resp.status_code == 404
 
         # Verify file is deleted
-        assert not (tmp_path / f"{video_id}.mp4").exists()
+        assert not (tmp_path / f"{video_id}_0.mp4").exists()
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
     def test_delete_video_not_found(self, video_client):

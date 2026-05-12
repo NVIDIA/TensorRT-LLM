@@ -39,7 +39,10 @@ import torch.nn.functional as F
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
-    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+    from tensorrt_llm._torch.visual_gen.config import (
+        SageAttentionConfig,
+        create_attention_metadata_state,
+    )
     from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True
@@ -133,10 +136,12 @@ def _logic_sage_ulysses_forward(rank, world_size, *, sage_attn_qk_int8: bool):
         layer_idx=0,
         num_heads=num_heads // world_size,
         head_dim=head_dim,
-        sage_attn_num_elts_per_blk_q=1,
-        sage_attn_num_elts_per_blk_k=blk_k,
-        sage_attn_num_elts_per_blk_v=1,
-        sage_attn_qk_int8=sage_attn_qk_int8,
+        sage_attention_config=SageAttentionConfig(
+            num_elts_per_blk_q=1,
+            num_elts_per_blk_k=blk_k,
+            num_elts_per_blk_v=1,
+            qk_int8=sage_attn_qk_int8,
+        ),
         attention_metadata_state=ATTENTION_META_DICT.metadata,
     )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
@@ -190,10 +195,12 @@ def _logic_sage_ulysses_vs_reference(
         layer_idx=0,
         num_heads=num_heads // world_size,
         head_dim=head_dim,
-        sage_attn_num_elts_per_blk_q=1,
-        sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
-        sage_attn_num_elts_per_blk_v=1,
-        sage_attn_qk_int8=sage_attn_qk_int8,
+        sage_attention_config=SageAttentionConfig(
+            num_elts_per_blk_q=1,
+            num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
+            num_elts_per_blk_v=1,
+            qk_int8=sage_attn_qk_int8,
+        ),
         attention_metadata_state=ATTENTION_META_DICT.metadata,
     )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
