@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -383,7 +383,9 @@ struct Compute
             // Update threshold of Skip-Softmax
             if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
             {
-                softmax.skip_softmax_threshold = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+                float const skip_softmax_threshold
+                    = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+                softmax.skip_softmax_log_threshold = logf(skip_softmax_threshold);
             }
 
             // Calculate the alibi head_scaling_factor.
@@ -566,6 +568,7 @@ struct Compute
             // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before voting.
             *skip_softmax_vote = 1;
         }
+
 // load the scales of K/V from global memory
 #define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                                                        \
     if constexpr (block_size > 0)                                                                                      \

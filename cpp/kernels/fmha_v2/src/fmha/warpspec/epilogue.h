@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,11 +30,44 @@ namespace ws
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <bool ENABLE>
+struct Skip_softmax_stat_counters
+{
+    inline __device__ void increment_total() {}
+    inline __device__ void increment_skipped() {}
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+struct Skip_softmax_stat_counters<true>
+{
+    inline __device__ Skip_softmax_stat_counters()
+        : total_blocks(0)
+        , skipped_blocks(0)
+    {
+    }
+
+    inline __device__ void increment_total()
+    {
+        total_blocks++;
+    }
+
+    inline __device__ void increment_skipped()
+    {
+        skipped_blocks++;
+    }
+
+    uint32_t total_blocks;
+    uint32_t skipped_blocks;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Special Softmax struct to handle optimization tricks on Hopper Warp-Specialized Kernels.
 template <template <int, int, int, bool, bool> class Traits, typename Kernel_traits>
-struct Softmax_base
+struct Softmax_base : public Skip_softmax_stat_counters<Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT>
 {
-
     // The instruction traits for BMM1.
     using Traits_p = typename Kernel_traits::Traits_p;
     // The instruction traits for BMM2.
@@ -128,9 +161,7 @@ struct Softmax_base
         , log2_chunked_attention_size_(params.log2_chunked_attention_size)
         , packed_mask_ptr_{reinterpret_cast<uint32_t*>(params.packed_mask_ptr)}
         , params_packed_mask_stride_in_bytes_{params.packed_mask_stride_in_bytes}
-        , total_blocks(0)
-        , skipped_blocks(0)
-        , skip_softmax_threshold(0)
+        , skip_softmax_log_threshold(0)
     {
 
         int warp = tidx / 32;
@@ -395,11 +426,12 @@ struct Softmax_base
                 // the CORES_M(=2) rows
                 if constexpr (!EXP2F_OPTIMIZATION)
                 {
-                    skip &= expf(local_max_[mi] - global_max[mi]) < skip_softmax_threshold;
+                    skip &= local_max_[mi] - global_max[mi] < skip_softmax_log_threshold;
                 }
                 else
                 {
-                    skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < skip_softmax_threshold;
+                    skip &= (local_max_[mi] - global_max[mi]) * scale
+                        < skip_softmax_log_threshold * float(M_LOG2E);
                 }
             }
 
@@ -413,7 +445,7 @@ struct Softmax_base
         {
             if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
             {
-                total_blocks++;
+                this->increment_total();
             }
             if constexpr (may_skip)
             {
@@ -435,7 +467,7 @@ struct Softmax_base
                 {
                     if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
                     {
-                        skipped_blocks++;
+                        this->increment_skipped();
                     }
                     return false;
                 }
@@ -599,13 +631,8 @@ struct Softmax_base
     float correction_[Mma_tile_p::CORES_M];
     // The packed mask.
     uint4 packed_mask_;
-    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold.
-    float skip_softmax_threshold;
-    // Per-thread accumulators for skip-softmax block statistics.
-    // Always declared so the struct layout is independent of compile flags;
-    // only written when Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT is true.
-    uint32_t total_blocks;
-    uint32_t skipped_blocks;
+    // Skip softmax when local_max - global_max < log(skip_softmax_threshold).
+    float skip_softmax_log_threshold;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -988,19 +1015,18 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
             }
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
-            // AND(&) the CORES_M results, then `skip` means whether to skip
-            // the CORES_M(=2) rows
             if constexpr (may_skip)
             {
                 // AND(&) the CORES_M results, then `skip` means whether to skip
                 // the CORES_M(=2) rows
                 if constexpr (!EXP2F_OPTIMIZATION)
                 {
-                    skip &= expf(local_max_[mi] - global_max[mi]) < this->skip_softmax_threshold;
+                    skip &= local_max_[mi] - global_max[mi] < this->skip_softmax_log_threshold;
                 }
                 else
                 {
-                    skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < this->skip_softmax_threshold;
+                    skip &= (local_max_[mi] - global_max[mi]) * scale
+                        < this->skip_softmax_log_threshold * float(M_LOG2E);
                 }
             }
             if (!IS_FIRST_COL)
@@ -1013,7 +1039,7 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
         {
             if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
             {
-                this->total_blocks++;
+                this->increment_total();
             }
 
             if constexpr (may_skip)
@@ -1035,7 +1061,7 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
                 {
                     if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
                     {
-                        this->skipped_blocks++;
+                        this->increment_skipped();
                     }
                     return false;
                 }
