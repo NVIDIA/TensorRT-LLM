@@ -957,16 +957,12 @@ def preprocess_weights_for_mixed_gemm(
         sm_: int = -1,
         do_weight_interleave: bool = True) -> torch.Tensor:
     sm_ = sm_ if sm_ > 0 else get_sm_version()
+    # 3-D inputs (MoE) on Hopper+ and any input on SM120/SM121 reuse the SM80
+    # interleaved layout. Check the original rank before unsqueeze.
+    if (len(tensor.shape) == 3 and sm_ >= 90) or sm_ >= 120:
+        sm_ = 80
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
-    elif sm_ >= 90:
-        # 3-D inputs (MoE) fall back to SM80 interleaved layout, mirroring the
-        # `force_interleave && arch >= 90` clause in the C++ preprocessor.
-        sm_ = 80
-    if sm_ >= 120:
-        # SM120/SM121 dispatch through cutlass::arch::Sm80; reuse SM80 layout
-        # for both 2-D and 3-D inputs.
-        sm_ = 80
     if sm_ == 100 or sm_ == 103:
         do_weight_interleave = False
 

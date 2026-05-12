@@ -587,13 +587,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         return get_candidate_configs_sm100(config_type_param, sm);
     }
-    // Take the SM120/121 path for FP4-mixed GEMMs (FP4xFP4, FP8xFP4 /
-    // W4A8_MXFP4_*). Pure integer weight-only (W4A16 / W8A16) falls through
-    // to the Ampere candidate list. The WEIGHT_ONLY flag is set whenever
-    // T != WeightType (true for FP8xFP4 too), so guard with the FP4 flags.
+    // Use the Blackwell (SM120+) specialized candidate list only for these cases:
+    //   - FP4 dense GEMM (FP4_ONLY)
+    //   - Mixed FP8/FP4 (FP8FP4_MIXED, e.g., W4A8_MXFP4_*)
+    // If neither applies, fall through (e.g. pure int W4A16/W8A16 handled elsewhere).
     if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)
-        && (!(config_type_param & CutlassGemmConfig::WEIGHT_ONLY)
-            || (config_type_param & (CutlassGemmConfig::FP4_ONLY | CutlassGemmConfig::FP8FP4_MIXED))))
+        && ((config_type_param & CutlassGemmConfig::FP4_ONLY) || (config_type_param & CutlassGemmConfig::FP8FP4_MIXED)))
     {
         return get_candidate_configs_sm120(config_type_param);
     }

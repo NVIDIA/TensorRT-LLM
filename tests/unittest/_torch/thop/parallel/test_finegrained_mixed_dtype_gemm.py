@@ -51,12 +51,13 @@ def test_matmul_activation_int4_input(m, n, k, group_size, activation_dtype,
     torch.manual_seed(0)
     device = "cuda"
 
-    max_sm = (FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A8
-              if use_w4a8_awq else
-              FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A16)
-    if get_sm_version() > max_sm:
-        pytest.skip(
-            f"W4A16/W4A8 not supported for SM version {get_sm_version()}")
+    sm = get_sm_version()
+    if (use_w4a8_awq
+            and sm > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A8):
+        pytest.skip(f"W4A8 not supported for SM version {sm}")
+    if (not use_w4a8_awq
+            and sm > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A16):
+        pytest.skip(f"W4A16 not supported for SM version {sm}")
 
     total_groups = (k + group_size - 1) // group_size
     scale_zero_dtype = torch.float16 if use_w4a8_awq else activation_dtype
