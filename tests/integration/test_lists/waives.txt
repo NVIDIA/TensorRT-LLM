@@ -430,3 +430,4 @@ disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutlass-auto] SKIP (https://nvbugs/5596343)
 unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3_dynamic_tree[True-False] SKIP (https://nvbugs/6113021)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] SKIP (worker init CUDA error masked by kv_cache_manager_v2/_exceptions.py:49 cuGetErrorString type bug; real failure unreadable until that wrapper is fixed)
+accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype SKIP (https://nvbugs/6166283)
