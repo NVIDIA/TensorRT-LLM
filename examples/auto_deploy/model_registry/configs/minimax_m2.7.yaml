@@ -14,8 +14,6 @@ kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
 transforms:
-  fuse_trtllm_attn_quant_fp8:
-    enabled: false
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: true
