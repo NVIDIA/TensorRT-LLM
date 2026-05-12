@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 from enum import Enum
 from pathlib import Path
@@ -51,12 +65,81 @@ class PipelineComponent(str, Enum):
 # =============================================================================
 
 
+class SageAttentionConfig(StrictBaseModel):
+    """Configuration for SageAttention quantization (TRTLLM backend only).
+
+    SageAttention quantizes Q/K/V into FP8 (or INT8 for Q/K) with per-block
+    scaling factors, enabling faster attention kernels. Providing this config
+    to AttentionConfig enables SageAttention; omitting it (None) disables it.
+
+    Similar to ``sparse_attention_config`` for the base TRTLLM attention
+    backend — the presence of the config object signals enablement.
+
+    Currently these (num_elts_per_blk_q, num_elts_per_blk_k, num_elts_per_blk_v)
+    combinations are enabled:
+    - (1, 1, 1)
+    - (1, 4, 1)
+    - (1, 16, 1) [for qk_int8 == True only]
+    """
+
+    num_elts_per_blk_q: int = PydanticField(
+        1, ge=0, description="Elements per quantization block for Q (0 disables)"
+    )
+    num_elts_per_blk_k: int = PydanticField(
+        4, ge=0, description="Elements per quantization block for K (0 disables)"
+    )
+    num_elts_per_blk_v: int = PydanticField(
+        1, ge=0, description="Elements per quantization block for V (0 disables)"
+    )
+    qk_int8: bool = PydanticField(True, description="Use INT8 (vs E4M3) for Q/K quantization")
+
+
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
     backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
     )
+    sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
+        None,
+        description=(
+            "SageAttention config (TRTLLM backend only). "
+            "Set to a SageAttentionConfig instance to enable SageAttention; "
+            "leave as None to disable."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_sage_attn_config(self) -> "AttentionConfig":
+        SUPPORTED_SAGE_CONFIGS = {
+            (1, 1, 1, False),
+            (1, 4, 1, False),
+            (1, 1, 1, True),
+            (1, 4, 1, True),
+            (1, 16, 1, True),
+        }
+
+        if self.sage_attention_config is not None:
+            if self.backend != "TRTLLM":
+                logger.critical(
+                    f"sage_attention_config requires backend='TRTLLM', "
+                    f"got backend='{self.backend}'. Either set backend='TRTLLM' "
+                    f"or remove sage_attention_config. Disabling SageAttention."
+                )
+                self.sage_attention_config = None
+                return self
+
+            if (
+                self.sage_attention_config.num_elts_per_blk_q,
+                self.sage_attention_config.num_elts_per_blk_k,
+                self.sage_attention_config.num_elts_per_blk_v,
+                self.sage_attention_config.qk_int8,
+            ) not in SUPPORTED_SAGE_CONFIGS:
+                logger.critical(
+                    f"Unsupported {self.sage_attention_config=}. Disabling SageAttention."
+                )
+                self.sage_attention_config = None
+        return self
 
 
 class ParallelConfig(StrictBaseModel):

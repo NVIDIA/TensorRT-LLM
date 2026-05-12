@@ -15,11 +15,11 @@
 """MegaMoE — DeepGEMM ``fp8_fp4_mega_moe`` as a first-class MoE backend.
 
 Targets the W4A8_MXFP4_MXFP8 quant configuration already supported by
-``TRTLLMGenFusedMoE``. Shares the ``{expert_id}.w*.weight`` /
-``{expert_id}.w*.weight_scale`` loader keys so that identical MXFP4 bytes
-fed to both backends produce numerically-aligned outputs.
+``TRTLLMGenFusedMoE``. ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the
+DG-native weight tensors, scale conversion, and DeepGEMM weight transform.
 """
 
-from .backend import MegaMoEDeepGemmFusedMoE
+from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
+from .mega_moe_deepgemm import MegaMoEDeepGemm
 
-__all__ = ["MegaMoEDeepGemmFusedMoE"]
+__all__ = ["MegaMoEDeepGemm", "W4A8MXFP4MXFP8MegaMoEDeepGemmMethod"]
