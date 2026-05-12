@@ -4240,6 +4240,23 @@ def checkpointing_state_update(
     _heads_per_block: int | None = None,
     _maxnreg: int | None = None,
     _num_ctas: int | None = None,
+    # Per-main knobs (override shared values for one half of the dl-family /
+    # persistent_main launches).  Default None = tied to the shared value
+    # (backward compat).  The two main kernels (write vs nowrite) have
+    # different per-slot work — write does a state shift + store, nowrite
+    # just appends — so the optimum (M, W, S, H) can differ.  Precompute
+    # knobs are intentionally NOT split: shared precompute wins (cheaper
+    # launch, hotter precompute outputs in L2).  Persistent CPS / LS knobs
+    # are also split per-main since the two persistent_main launches have
+    # different grid sizes.
+    _block_size_m_write: int | None = None,
+    _block_size_m_nowrite: int | None = None,
+    _num_warps_write: int | None = None,
+    _num_warps_nowrite: int | None = None,
+    _num_stages_write: int | None = None,
+    _num_stages_nowrite: int | None = None,
+    # Note: heads_per_block / precompute_num_warps are NOT split — they only
+    # affect the precompute kernel, which is shared across write/nowrite.
     # TMA state-tensor toggles — 4 independent paths (see CHECKPOINTING_DESIGN.md
     # item #17 for measured perf profiles).  Each is False=raw load/store, True=
     # use a host-built TMA tensor_descriptor for that path.
@@ -4279,6 +4296,14 @@ def checkpointing_state_update(
     _num_loop_stages: int | None = None,
     _flatten: bool | None = None,
     _warp_specialize: bool | None = None,
+    # Per-main persistent-specific knobs.  Same rationale as the BLOCK_SIZE_M
+    # split above: the two persistent_main launches (write half vs nowrite
+    # half) have different grid sizes and per-work-item costs, so they may
+    # want different cta_per_sm / num_loop_stages.
+    _cta_per_sm_write: int | None = None,
+    _cta_per_sm_nowrite: int | None = None,
+    _num_loop_stages_write: int | None = None,
+    _num_loop_stages_nowrite: int | None = None,
 ):
     """
     Replay SSM state update with precomputed CB and tl.dot fast-forward.
@@ -4633,6 +4658,21 @@ def checkpointing_state_update(
     if _precompute_num_warps is not None:
         precompute_num_warps = _precompute_num_warps
 
+    # Per-main knob resolution: each _*_{write,nowrite} arg, if not None,
+    # overrides the corresponding shared value for ONE main launch only.
+    # Default (None) = tied to shared value (current behavior).
+    BLOCK_SIZE_M_WRITE = _block_size_m_write if _block_size_m_write is not None else BLOCK_SIZE_M
+    BLOCK_SIZE_M_NOWRITE = _block_size_m_nowrite if _block_size_m_nowrite is not None else BLOCK_SIZE_M
+    NUM_WARPS_WRITE = _num_warps_write if _num_warps_write is not None else num_warps
+    NUM_WARPS_NOWRITE = _num_warps_nowrite if _num_warps_nowrite is not None else num_warps
+    NUM_STAGES_WRITE = _num_stages_write if _num_stages_write is not None else _num_stages
+    NUM_STAGES_NOWRITE = _num_stages_nowrite if _num_stages_nowrite is not None else _num_stages
+    # Persistent-only per-main:
+    CTA_PER_SM_WRITE = _cta_per_sm_write if _cta_per_sm_write is not None else _cta_per_sm
+    CTA_PER_SM_NOWRITE = _cta_per_sm_nowrite if _cta_per_sm_nowrite is not None else _cta_per_sm
+    NUM_LOOP_STAGES_WRITE = _num_loop_stages_write if _num_loop_stages_write is not None else _num_loop_stages
+    NUM_LOOP_STAGES_NOWRITE = _num_loop_stages_nowrite if _num_loop_stages_nowrite is not None else _num_loop_stages
+
     HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
 
     assert nheads % heads_per_block == 0, (
@@ -4815,7 +4855,15 @@ def checkpointing_state_update(
     def launch_replay_main(write_checkpoint: bool, early_out: bool,
                            launch_dependent_kernels: bool = False,
                            reverse_perm: bool = False):
-        _checkpointing_main_kernel[main_grid](
+        # Per-main knob selection: write vs nowrite branches use independent
+        # M / num_warps / num_stages / heads_per_block values.  Grid is
+        # M-dependent so it must be a closure over the selected M.
+        _bsm = BLOCK_SIZE_M_WRITE if write_checkpoint else BLOCK_SIZE_M_NOWRITE
+        _nw = NUM_WARPS_WRITE if write_checkpoint else NUM_WARPS_NOWRITE
+        _ns = NUM_STAGES_WRITE if write_checkpoint else NUM_STAGES_NOWRITE
+        def _main_grid_local(META, _bsm=_bsm):
+            return (triton.cdiv(dim, _bsm), batch, nheads)
+        _checkpointing_main_kernel[_main_grid_local](
             state, state_tma_descriptor, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
             prev_num_accepted_tokens, cache_buf_idx,
@@ -4840,7 +4888,7 @@ def checkpointing_state_update(
             cb_scaled.stride(0), cb_scaled.stride(1),
             cb_scaled.stride(2), cb_scaled.stride(3),
             decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
-            BLOCK_SIZE_M,
+            _bsm,
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             QUANT_MAX=quant_max,
@@ -4854,8 +4902,8 @@ def checkpointing_state_update(
             USE_TMA_LOAD_WRITE=bool(_use_tma_replay_write_load and write_checkpoint),
             USE_TMA_LOAD_NOWRITE=bool(_use_tma_replay_nowrite_load and not write_checkpoint),
             USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint),
-            num_warps=num_warps,
-            **({"num_stages": _num_stages} if _num_stages else {}),
+            num_warps=_nw,
+            **({"num_stages": _ns} if _ns else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
             **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
@@ -4864,7 +4912,13 @@ def checkpointing_state_update(
     def launch_rectangle_main(early_out: bool,
                               launch_dependent_kernels: bool = False,
                               reverse_perm: bool = False):
-        _rectangle_main_kernel[main_grid](
+        # Rectangle is the nowrite-side path; use the nowrite-main knobs.
+        _bsm = BLOCK_SIZE_M_NOWRITE
+        _nw = NUM_WARPS_NOWRITE
+        _ns = NUM_STAGES_NOWRITE
+        def _main_grid_local(META, _bsm=_bsm):
+            return (triton.cdiv(dim, _bsm), batch, nheads)
+        _rectangle_main_kernel[_main_grid_local](
             state, state_tma_descriptor, state_scales_arg, old_x,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
@@ -4882,7 +4936,7 @@ def checkpointing_state_update(
             cb_scaled.stride(0), cb_scaled.stride(1),
             cb_scaled.stride(2), cb_scaled.stride(3),
             decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
-            BLOCK_SIZE_M,
+            _bsm,
             LAUNCH_WITH_PDL=use_internal_pdl,
             QUANT_MAX=quant_max,
             EARLY_OUT=early_out,
@@ -4890,8 +4944,8 @@ def checkpointing_state_update(
             USE_PERM=use_perm,
             REVERSE_PERM=reverse_perm,
             USE_TMA_LOAD=bool(_use_tma_rect_load),
-            num_warps=num_warps,
-            **({"num_stages": _num_stages} if _num_stages else {}),
+            num_warps=_nw,
+            **({"num_stages": _ns} if _ns else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
             **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
@@ -4990,6 +5044,19 @@ def checkpointing_state_update(
             n_slots_for_kernel = host_n_writes if write_checkpoint else (batch - host_n_writes)
             if n_slots_for_kernel <= 0:
                 return
+        # Per-main knob selection.  The two persistent_main launches (write
+        # half vs nowrite half) get independent BLOCK_SIZE_M / num_warps /
+        # num_stages / cta_per_sm / num_loop_stages.  See the per-main args
+        # block in the wrapper signature.
+        _bsm = BLOCK_SIZE_M_WRITE if write_checkpoint else BLOCK_SIZE_M_NOWRITE
+        _nw = NUM_WARPS_WRITE if write_checkpoint else NUM_WARPS_NOWRITE
+        _ns = NUM_STAGES_WRITE if write_checkpoint else NUM_STAGES_NOWRITE
+        _cps = CTA_PER_SM_WRITE if write_checkpoint else CTA_PER_SM_NOWRITE
+        _cps = _cps if _cps else 1
+        _nls = NUM_LOOP_STAGES_WRITE if write_checkpoint else NUM_LOOP_STAGES_NOWRITE
+        _nls = _nls if _nls else 2
+        _num_persistent = _cps * _num_sms
+        _num_pid_m_local = (dim + _bsm - 1) // _bsm
         # Grid sizing: cap at min(full persistent grid, actual total_work).
         # `n_slots` for this launch is `host_n_writes` (write half) / `batch -
         # host_n_writes` (nowrite half) when host knows it (pure); else upper
@@ -5001,8 +5068,8 @@ def checkpointing_state_update(
             _n_slots_for_launch = host_n_writes if write_checkpoint else (batch - host_n_writes)
         else:
             _n_slots_for_launch = batch
-        _total_work_launch = max(1, _n_slots_for_launch * _num_pid_m * nheads)
-        grid = (min(num_persistent_arg, _total_work_launch),)
+        _total_work_launch = max(1, _n_slots_for_launch * _num_pid_m_local * nheads)
+        grid = (min(_num_persistent, _total_work_launch),)
         _persistent_main_kernel[grid](
             state, state_tma_descriptor, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
@@ -5029,15 +5096,15 @@ def checkpointing_state_update(
             cb_scaled.stride(0), cb_scaled.stride(1),
             cb_scaled.stride(2), cb_scaled.stride(3),
             decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
-            BLOCK_SIZE_M,
+            _bsm,
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             QUANT_MAX=quant_max,
             WRITE_CHECKPOINT=write_checkpoint,
             LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
             USE_PERM=use_perm,
-            NUM_PERSISTENT=num_persistent_arg,
-            NUM_LOOP_STAGES=num_loop_stages_arg,
+            NUM_PERSISTENT=_num_persistent,
+            NUM_LOOP_STAGES=_nls,
             FLATTEN=flatten_arg,
             WARP_SPECIALIZE=warp_specialize_arg,
             IS_DYNAMIC=False,
@@ -5053,8 +5120,8 @@ def checkpointing_state_update(
                 and not write_checkpoint
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint),
-            num_warps=num_warps,
-            **({"num_stages": _num_stages} if _num_stages else {}),
+            num_warps=_nw,
+            **({"num_stages": _ns} if _ns else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
             **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
