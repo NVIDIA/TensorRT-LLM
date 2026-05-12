@@ -531,11 +531,12 @@ class TestEncodeMultimodalAudioOrder:
         v2_emb = torch.randn(v2_len, hidden)
         a2_emb = torch.randn(a2_len, hidden)
 
-        # vision_encoder is called once per param; return the right tensor.
-        vision_returns = [
-            ([v1_emb], [list(range(v1_len))]),
-            ([v2_emb], [list(range(v2_len))]),
-        ]
+        # All video params are encoded in a single batched call; the encoder
+        # returns one embedding per param, in input order.
+        vision_return = (
+            [v1_emb, v2_emb],
+            [list(range(v1_len)), list(range(v2_len))],
+        )
 
         # All audio (across both videos) is encoded in a single batched call;
         # the helper returns one (emb, per_clip_counts) per input in order.
@@ -549,7 +550,7 @@ class TestEncodeMultimodalAudioOrder:
         # Build a minimal mock of NemotronH_Nano_VL_V2 with only the attributes `_encode_multimodal`
         # touches.
         model = MagicMock()
-        model.vision_encoder = MagicMock(side_effect=vision_returns)
+        model.vision_encoder = MagicMock(return_value=vision_return)
         model.sound_encoder = MagicMock()  # not None -> audio path taken
         model._encode_audio = MagicMock(return_value=audio_returns)
         # Mock the interleaver to simply concatenate vision + audio, since this test only verifies

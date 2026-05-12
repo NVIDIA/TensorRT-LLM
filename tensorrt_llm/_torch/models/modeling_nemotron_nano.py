@@ -2907,32 +2907,37 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         Per-request `num_tokens_in_video` (needed by EVS) is stashed in
         each param's `multimodal_data` dict as a side-channel.
 
-        Image params are batched into a single ``vision_encoder`` call;
-        all audio inputs (standalone audio params and audio extracted
+        Image and video params are batched into single ``vision_encoder``
+        calls; all audio inputs (standalone audio params and audio extracted
         from video) are batched into a single ``sound_encoder`` call.
-        Videos still run per-request because per-video audio
-        interleaving and EVS token-count stashing are tied to one
-        request's data layout.
+        Per-video audio interleaving and EVS token-count stashing happen in
+        the second pass that walks params in input order.
         """
-        # Collect all image params and all audio inputs (standalone +
-        # video-extracted) in a single pass, then run each encoder once
-        # over its bucket.
+        # Collect all image, video, and audio inputs in a single pass, then
+        # run each encoder once over its bucket.
         image_params: List[MultimodalParams] = []
+        video_params: List[MultimodalParams] = []
         audio_data_list: List[dict] = []
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
             if modality_type == "image":
                 image_params.append(param)
+            elif modality_type == "video":
+                video_params.append(param)
+                if self.sound_encoder is not None:
+                    audio_data = param.multimodal_data["video"].get("audio")
+                    if audio_data is not None:
+                        audio_data_list.append(audio_data)
             elif modality_type == "audio":
                 audio_data_list.append(param.multimodal_data["audio"])
-            elif modality_type == "video" and self.sound_encoder is not None:
-                audio_data = param.multimodal_data["video"].get("audio")
-                if audio_data is not None:
-                    audio_data_list.append(audio_data)
 
         image_embeds: List[torch.Tensor] = []
         if image_params:
             image_embeds, _ = self.vision_encoder(image_params)
+        video_embeds: List[torch.Tensor] = []
+        video_num_tokens: Optional[List[List[int] | None]] = None
+        if video_params:
+            video_embeds, video_num_tokens = self.vision_encoder(video_params)
         audio_outputs: List[Tuple[torch.Tensor, List[int]]] = (
             self._encode_audio(audio_data_list) if audio_data_list else []
         )
@@ -2941,6 +2946,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # incrementing per-modality cursors.
         mm_embeddings: List[torch.Tensor] = []
         image_idx = 0
+        video_idx = 0
         audio_idx = 0
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
@@ -2948,10 +2954,11 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 mm_embeddings.append(image_embeds[image_idx])
                 image_idx += 1
             elif modality_type == "video":
-                embs, num_tokens = self.vision_encoder([param])
-                vision_emb = embs[0]
+                vision_emb = video_embeds[video_idx]
+                num_tokens = video_num_tokens[video_idx] if video_num_tokens is not None else None
+                video_idx += 1
                 if num_tokens is not None:
-                    param.multimodal_data["num_tokens_in_video"] = num_tokens[0]
+                    param.multimodal_data["num_tokens_in_video"] = num_tokens
                 # If audio was extracted from video, interleave it per-video so
                 # the combined tensor matches input_ids order
                 # (v1_img_context, v1_sound_context, v2_img_context, ...).
@@ -2966,7 +2973,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                         has_audio=audio_data["has_audio"],
                         audio_num_clips=audio_data["audio_num_clips"],
                         video_sizes=param.multimodal_data["video"].get("video_size", []),
-                        evs_num_tokens=(num_tokens[0] if num_tokens is not None else None),
+                        evs_num_tokens=num_tokens,
                     )
                 mm_embeddings.append(vision_emb)
             elif modality_type == "audio":
