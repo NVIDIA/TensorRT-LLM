@@ -214,6 +214,11 @@ def parse_args():
         "FA4: Flash Attention 4). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
+    )
 
     # Parallelism
     parser.add_argument(
@@ -336,9 +341,19 @@ def build_diffusion_args(args) -> VisualGenArgs:
     else:
         cache_kwargs = {}
 
+    attention_cfg: dict = {"backend": args.attention_backend}
+    if args.enable_sage_attention:
+        attention_cfg["sage_attention_config"] = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 16,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+        logger.info("SageAttention: INT8 Q/K, blocks (1, 16, 1)")
+
     kwargs = dict(
         revision=args.revision,
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         **cache_kwargs,
         parallel={
             "dit_ulysses_size": args.ulysses_size,
