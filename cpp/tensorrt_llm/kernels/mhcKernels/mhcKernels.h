@@ -25,10 +25,14 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::mhc
 {
 
+// `norm_weight` (bf16 [hidden_size], optional) enables fused next-layer RMSNorm
+// on `layer_input`: when non-null, layer_input is written normalized
+//   bf16(li * rsqrt(mean(li²)+norm_eps) * norm_weight[h]).
+// When null, layer_input is the un-normalized weighted sum.
 void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 const* residual, float const* hc_scale,
     float const* hc_base, float* post_mix, float* comb_mix, __nv_bfloat16* layer_input, int M, int K, int hidden_size,
     float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat,
-    int num_splits, int block_size, cudaStream_t stream);
+    int num_splits, int block_size, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
 
 void mhcGemmSqrsumFmaLaunch(__nv_bfloat16 const* x, float const* w_t, float* y, float* r, int M, int N, int K,
     int tile_n, int tile_m, cudaStream_t stream);
@@ -57,12 +61,14 @@ void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x,
 // FMA fused-HC paths use runtime hidden_size but still require hidden_size % 64 == 0.
 // Passing num_k_splits == 0 or bigfuse_block_size == 0 falls back to the
 // internal heuristics.
+// `norm_weight` (optional, bf16 [hidden_size]) enables fused next-layer RMSNorm
+// on layer_input_cur in the bigfuse pass; pass nullptr to leave un-normalized.
 void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
     float const* comb_mix_prev, float const* w_t, float const* hc_scale, float const* hc_base,
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
 
 // FMA-path fused hyper-connection boundary launcher.
 //
@@ -83,12 +89,14 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
 //   y_acc_workspace: fp32 [num_k_splits, M, 24]
 //   r_acc_workspace: fp32 [num_k_splits, M]
 // No pre-zeroing required (ksplit kernel writes = not +=).
+// `norm_weight` (optional, bf16 [hidden_size]) enables fused next-layer RMSNorm
+// on layer_input_cur in the bigfuse pass; pass nullptr to leave un-normalized.
 void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
     float const* comb_mix_prev, float const* w_t, float const* hc_scale, float const* hc_base,
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int tile_n, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (TF32 tcgen05 path).
 //
@@ -109,12 +117,18 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 //   hidden_size in {4096, 7168} for SM100/tcgen05 MMA fused-HC paths.
 // FMA fused-HC paths use runtime hidden_size but still require hidden_size % 64 == 0.
 // Passing num_k_splits == 0 falls back to internal heuristics.
+// `norm_weight` (optional, bf16 [hidden_size]) enables fused next-layer RMSNorm
+// on `layer_input_cur`: when non-null, the kernel writes
+//   layer_input_cur[t,h] = bf16(li[t,h] * rsqrt(mean(li²)+norm_eps) * norm_weight[h]).
+// When null, layer_input_cur receives the un-normalized weighted sum (current
+// behavior; caller must run RMSNorm separately).
 void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
     float const* post_mix_prev, float const* comb_mix_prev, float const* w_t, float const* hc_scale,
     float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int num_k_splits, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
-    float hc_post_mult_value, int sinkhorn_repeat, cudaStream_t stream);
+    float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
+    cudaStream_t stream);
 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (FMA path).
 //
@@ -133,12 +147,15 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
 //   y_acc_workspace: fp32 [M, 24]
 //   r_acc_workspace: fp32 [M]
 //   done_counter_workspace: int32 [ceil(M / tile_m)]
+// `norm_weight` (optional, bf16 [hidden_size]) enables fused next-layer RMSNorm
+// on layer_input_cur in the Phase 4 epilogue; pass nullptr to leave un-normalized.
 void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
     float const* post_mix_prev, float const* comb_mix_prev, float const* w_t, float const* hc_scale,
     float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int tile_n, int num_k_splits, int tile_m, float rms_eps, float hc_pre_eps,
-    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, cudaStream_t stream);
+    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight,
+    float norm_eps, cudaStream_t stream);
 
 } // namespace kernels::mhc
 
