@@ -2119,10 +2119,21 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                 errors.append((futures[fut], e))
 
     if errors:
-        for cfg, e in errors:
-            print(f"[compile-warmup] FAILED config {cfg}: {type(e).__name__}: {e}",
+        # Don't abort the whole bench just because some (M, W, S, TMA, ...)
+        # combinations refuse to compile.  Driver-style invocations
+        # (search loops, sparse cell-lists) often hit a few bad combos in
+        # otherwise-valid sweeps; aborting wastes the rest of the bench's
+        # work.  Log them once each and continue — the inner-loop runs
+        # below will trip their compile again per-cell, fail safely
+        # (per-cell is caught), and the cells just don't get timed.
+        print(f"[compile-warmup] {len(errors)} configs failed to compile "
+              f"(continuing; cells will be skipped):", file=sys.stderr)
+        for cfg, e in errors[:5]:
+            first_line = str(e).strip().split("\n")[0][:120]
+            print(f"  FAILED {cfg}: {type(e).__name__}: {first_line}",
                   file=sys.stderr)
-        raise errors[0][1]
+        if len(errors) > 5:
+            print(f"  ... and {len(errors) - 5} more", file=sys.stderr)
 
     print(f"[compile-warmup] done in {time.perf_counter() - t0:.1f}s")
 
@@ -2994,11 +3005,14 @@ def _bench_config(
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
             reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
-            # --retry-cells filter: only time cells whose tag is in the
-            # retry set.  Cheaper than re-enumerating cells in the orchestrator.
-            retry_set = getattr(args, "_retry_cells_set", None)
-            if retry_set and sweep_tag not in retry_set:
-                continue
+            # --cell-list filter: only time cells whose (canonical-knob-values)
+            # tuple is in the loaded set.  Robust to bench gaining new knobs
+            # (old cell-list files keep working: any keys they don't list
+            # become wildcards that retain CLI defaults).
+            if args._cell_list_keys:
+                _tup = _current_cell_tuple(args, locals())
+                if _tup is None or _tup not in args._cell_list_set:
+                    continue
             # Resume from JSONL: skip cells already recorded.  Built the same
             # way _print_row builds JSON keys; must stay in sync.
             done_keys = getattr(args, "_done_keys", None)
@@ -3168,24 +3182,26 @@ def _print_row(
     act_dtype_name,
     stats,
     sweep_suffix="",
-    json_results=None,
     tp_size=None,
     json_detailed=False,
     jsonl_path=None,
     jsonl_host=None,
 ):
-    """Print one summary row and optionally accumulate stats for JSON output.
+    """Print one summary row and append the result to the JSONL sidecar.
 
     `stats` is a dict from _time_kernel: {median, p95, p99, n, iters_us,
     [n_writes_per_iter], [per_kernel]}.  The summary table only shows the
-    headline percentiles.  JSON output captures compact per-iter spans by
-    default; with json_detailed=True it also captures per-kernel data.
+    headline percentiles.  JSONL captures the compact per-iter spans +
+    n_writes_per_iter by default; with json_detailed=True it also captures
+    per-kernel data.
 
-    When `jsonl_path` is provided, also appends one JSON line per row to the
+    When `jsonl_path` is provided, appends one JSON line per row to the
     JSONL sidecar (crash-safe incremental persistence; lets a killed sweep
-    resume from the last completed cell on rerun).  Open-per-write because
-    `args` is pickled to ProcessPoolExecutor workers and file handles aren't
-    picklable.
+    resume from the last completed cell on rerun, even across hosts).  Open
+    per-write because `args` is pickled to ProcessPoolExecutor workers and
+    file handles aren't picklable.  JSONL is the canonical artifact — the
+    bench no longer writes a final `.json` summary; use `jsonl_to_json.py`
+    if a one-shot `.json` snapshot is needed.
     """
     kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
     print(
@@ -3194,7 +3210,7 @@ def _print_row(
         f"{stats['median']:>9.2f} | {stats['p95']:>7.2f} | {stats['p99']:>7.2f} |"
         f"{sweep_suffix}"
     )
-    if json_results is not None:
+    if jsonl_path is not None:
         key = _build_json_key(
             kernel_name, batch, mtp_len, prev_k, state_dtype_name,
             sweep_suffix, tp_size,
@@ -3207,9 +3223,8 @@ def _print_row(
                 for k in ("median", "p95", "p99", "n", "iters_us", "n_writes_per_iter")
                 if k in stats
             }
-            if "host_timing" in stats:
-                row_stats["host_timing"] = stats["host_timing"]
-        json_results[key] = row_stats
+        if "host_timing" in stats:
+            row_stats["host_timing"] = stats["host_timing"]
         # Append to JSONL sidecar if a path is set (incremental persistence).
         # Open per-write because args is pickled to ProcessPoolExecutor
         # workers, and file handles aren't picklable.  A clean SIGTERM or
@@ -3217,7 +3232,13 @@ def _print_row(
         # newline; catastrophic kills can leave a partial last line, which
         # the resume reader tolerates via json.JSONDecodeError pass.
         if jsonl_path is not None:
-            rec = {"key": key, "stats": row_stats}
+            # Wall-clock timestamp (float seconds since UNIX epoch) at write
+            # time.  Lets post-hoc analysis diff consecutive rows to derive
+            # per-cell wall budget and identify startup-bound vs steady-state
+            # segments (cells/sec, downtime between bench invocations) without
+            # needing to instrument the bench's outer loops separately.
+            import time as _time
+            rec = {"key": key, "stats": row_stats, "t": _time.time()}
             if jsonl_host is not None:
                 rec["host"] = jsonl_host
             with open(jsonl_path, "a") as f:
@@ -3251,7 +3272,6 @@ def _finish_result_job(args, job: dict) -> None:
         job["act_dtype_name"],
         stats,
         job.get("sweep_suffix", ""),
-        json_results=getattr(args, "_json_results", None),
         tp_size=args.tp_size,
         json_detailed=getattr(args, "json_detailed", False),
         jsonl_path=getattr(args, "_jsonl_path", None),
@@ -3313,21 +3333,201 @@ def _submit_result_job(
         _finish_result_job(args, job)
 
 
+# Cell-list mode — canonical knob-key mapping to argparse args + local
+# loop variable.  See _load_cell_list_into_args / inner-loop filter.
+#
+# Each entry: cell-key → (args attribute name, comma-separated string flag)
+# For split (write/nowrite) knobs, we use Xw / Xnw keys.  Tied forms (M, W,
+# S, CPS, LS) accepted on load and expanded to their w/nw variants.
+_CELL_LIST_KEY_TO_ARG = {
+    "Mw":    "block_size_m_write",
+    "Mnw":   "block_size_m_nowrite",
+    "Ww":    "num_warps_write",
+    "Wnw":   "num_warps_nowrite",
+    "Sw":    "num_stages_write",
+    "Snw":   "num_stages_nowrite",
+    "CPSw":  "cta_per_sm_write",
+    "CPSnw": "cta_per_sm_nowrite",
+    "LSw":   "num_loop_stages_write",
+    "LSnw":  "num_loop_stages_nowrite",
+    "pW":    "precompute_num_warps",
+    "pS":    "precompute_num_stages",
+    "H":     "heads_per_block",
+    "R":     "maxnreg",
+    "CT":    "num_ctas",
+    "FL":    "flatten",
+    "WS":    "warp_specialize",
+    "TMARL": "use_tma_rect_load",
+    "TMAWL": "use_tma_replay_write_load",
+    "TMANL": "use_tma_replay_nowrite_load",
+    "TMAWS": "use_tma_replay_write_store",
+    "RECT":  "rectangle_for_nowrite",
+    "WC":    "write_modes",
+    "SORT":  "sort_slots",
+    "REVN":  "reverse_nowrite",
+    "HSORT": "hardcode_sort",
+    # MODE and SR get special handling (string values):
+    # MODE → args.modes (single mode name)
+    # SR → args.sr_modes ("RN" if 0, "SR" if 1)
+}
+
+# Split-knob tied form: "M" expands to both "Mw" and "Mnw".
+_CELL_LIST_TIED_EXPANSIONS = {
+    "M":   ("Mw", "Mnw"),
+    "W":   ("Ww", "Wnw"),
+    "S":   ("Sw", "Snw"),
+    "CPS": ("CPSw", "CPSnw"),
+    "LS":  ("LSw", "LSnw"),
+}
+
+
+def _normalize_cell(cell: dict) -> dict:
+    """Expand tied-form keys (M, W, S, CPS, LS) to their w/nw variants.
+    Returns a new dict with only canonical split-or-plain keys.
+    """
+    out = dict(cell)
+    for tied, (w_key, nw_key) in _CELL_LIST_TIED_EXPANSIONS.items():
+        if tied in out:
+            v = out.pop(tied)
+            out.setdefault(w_key, v)
+            out.setdefault(nw_key, v)
+    return out
+
+
+def _load_cell_list_into_args(args) -> None:
+    """Read --cell-list JSON, normalize, override args.* knob ranges, and
+    populate args._cell_list_keys + args._cell_list_set for the inner-loop
+    filter.  Errors out if cells aren't uniform (different key sets).
+    """
+    with open(args.cell_list) as f:
+        raw = json.load(f)
+    if not isinstance(raw, list):
+        sys.exit(f"--cell-list: expected JSON list, got {type(raw).__name__}")
+    cells = [_normalize_cell(c) for c in raw]
+    if not cells:
+        print("[cell-list] empty list — nothing to time", file=sys.stderr)
+        return
+    # All cells must share the same key set (uniform schema)
+    keys0 = frozenset(cells[0].keys())
+    for i, c in enumerate(cells[1:], start=1):
+        if frozenset(c.keys()) != keys0:
+            sys.exit(
+                f"--cell-list: cells must have uniform key sets; cell[0] "
+                f"has {sorted(keys0)} but cell[{i}] has {sorted(c.keys())}"
+            )
+
+    # Auto-cover: collect per-knob value set across all cells
+    cover: dict = {}
+    for c in cells:
+        for k, v in c.items():
+            cover.setdefault(k, set()).add(v)
+    # Apply overrides
+    for key, vals in cover.items():
+        if key in _CELL_LIST_KEY_TO_ARG:
+            arg_name = _CELL_LIST_KEY_TO_ARG[key]
+            vals_str = ",".join(str(v) for v in sorted(vals))
+            setattr(args, arg_name, vals_str)
+        elif key == "MODE":
+            args.modes = ",".join(sorted({str(v) for v in vals}))
+        elif key == "SR":
+            args.sr_modes = ",".join(sorted({"SR" if v else "RN" for v in vals}))
+        else:
+            print(f"[cell-list] WARNING: unknown key {key!r} in cells; "
+                  f"will not override any args.* attribute (the value will "
+                  f"still be matched in the filter if a matching local var "
+                  f"is in scope)", file=sys.stderr)
+
+    # Canonical key order (sorted) for tuple matching in the inner loop
+    args._cell_list_keys = tuple(sorted(keys0))
+    args._cell_list_set = {
+        tuple(c[k] for k in args._cell_list_keys) for c in cells
+    }
+    print(f"[cell-list] loaded {len(cells)} cells with keys "
+          f"{list(args._cell_list_keys)}; overrode args.* to auto-cover",
+          file=sys.stderr)
+
+
+# Maps cell-list key → name of the local variable in _bench_config's inner
+# loop.  Used to extract the "current cell" tuple for the filter check.
+# Keep in sync with the loop-variable names; the filter is lenient about
+# missing names (it picks them up from the inner scope at runtime).
+_CELL_LIST_KEY_TO_LOCAL = {
+    "Mw":    "block_size_m_w",
+    "Mnw":   "block_size_m_nw",
+    "Ww":    "num_warps_w",
+    "Wnw":   "num_warps_nw",
+    "Sw":    "num_stages_w",
+    "Snw":   "num_stages_nw",
+    "CPSw":  "cta_per_sm_w",
+    "CPSnw": "cta_per_sm_nw",
+    "LSw":   "num_loop_stages_w",
+    "LSnw":  "num_loop_stages_nw",
+    "pW":    "precompute_num_warps",
+    "pS":    "precompute_num_stages",
+    "H":     "heads_per_block",
+    "R":     "maxnreg",
+    "CT":    "num_ctas",
+    "FL":    "flatten",
+    "WS":    "warp_specialize",
+    "TMARL": "use_tma_rect_load",
+    "TMAWL": "use_tma_replay_write_load",
+    "TMANL": "use_tma_replay_nowrite_load",
+    "TMAWS": "use_tma_replay_write_store",
+    "RECT":  "rectangle_for_nowrite",
+    "WC":    "write_checkpoint",
+    "MODE":  "mode",
+    "SORT":  "sort_slots",
+    "REVN":  "reverse_nowrite",
+    "HSORT": "hardcode_sort",
+    "SR":    "use_philox",
+}
+
+
+def _current_cell_tuple(args, locals_dict: dict) -> tuple | None:
+    """Build the (key1=val1, key2=val2, ...) tuple for the current inner-loop
+    iteration, matching args._cell_list_keys' order.  Used by the inner-loop
+    filter to check membership in args._cell_list_set.  Returns None if any
+    expected local is missing (the bench evolved a knob name — caller skips).
+    """
+    if not args._cell_list_keys:
+        return None
+    vals = []
+    for k in args._cell_list_keys:
+        local_name = _CELL_LIST_KEY_TO_LOCAL.get(k, k)
+        if local_name not in locals_dict:
+            return None
+        v = locals_dict[local_name]
+        # Coerce bools to ints to match cell-list JSON (1/0)
+        if isinstance(v, bool):
+            v = int(v)
+        vals.append(v)
+    return tuple(vals)
+
+
 # Main benchmark loop
 
 
 def _run_benchmark(args) -> None:
-    # JSON accumulator — populated by _print_row when --json-output is set.
-    # Stash on args so we don't need to thread a dict through every helper.
-    args._json_results = {} if getattr(args, "json_output", None) else None
+    # Pending-results FIFO for srxl's deferred CUPTI parsing pipeline.  Each
+    # entry holds a _PendingCuptiStats handle; _drain_pending_results pulls
+    # ready entries and routes them to _print_row (which appends to JSONL).
     args._pending_results = []
 
     # JSONL incremental sidecar.  Path = `<json_output>.jsonl`.  Each completed
-    # cell appends one line `{"key": <json_key>, "stats": {...}}` to this file
-    # as it finishes timing.  On startup we read this sidecar (if present) and
-    # populate _json_results + _done_keys so a killed bench can resume without
+    # cell appends one line `{"key": <json_key>, "stats": {...}, "host": <h>}`
+    # to this file as it finishes timing.  On startup we read this sidecar (if
+    # present) and populate _done_keys so a killed bench can resume without
     # redoing already-timed cells.  Crash-safe by construction: append-only
     # writes survive SIGTERM/SIGKILL/reboot mid-sweep.
+    #
+    # Resume is host-blind: _done_keys includes records from any host, so a
+    # bench restarted on a different node fills in the missing cells without
+    # redoing cells already covered elsewhere.  Cross-host *timings* aren't
+    # directly comparable, but each JSONL record carries its `host` stamp so
+    # the analyzer can group/compare per host.  This bench no longer writes a
+    # final `.json` summary — the JSONL is the canonical artifact; use the
+    # `jsonl_to_json.py` helper if a one-shot `.json` snapshot is needed.
+    #
     # Note: we store only paths/strings on `args` because args is pickled to
     # ProcessPoolExecutor workers during compile-warmup, and file handles
     # (TextIOWrapper) aren't picklable.  _print_row open-appends per cell.
@@ -3338,15 +3538,11 @@ def _run_benchmark(args) -> None:
         import socket
         args._jsonl_host = socket.gethostname()
         args._jsonl_path = args.json_output + ".jsonl"
-        # Read existing JSONL if present; build skip set IFF hostname matches.
-        # Cross-node timings aren't directly comparable (CPU/GPU clock/topology
-        # differ), so resuming on a new host would mix incompatible numbers.
-        # If the JSONL was recorded on a different host, log + skip resume so
-        # the user can decide (rename / archive the old file).
+        # Read existing JSONL if present: load every record's key into the
+        # skip set regardless of host (gap-fill on a new node).
         if os.path.exists(args._jsonl_path):
             n_loaded = 0
-            n_skipped_host = 0
-            recorded_hosts = set()
+            host_counts: dict[str, int] = {}
             with open(args._jsonl_path) as f:
                 for line in f:
                     line = line.strip()
@@ -3357,58 +3553,95 @@ def _run_benchmark(args) -> None:
                     except json.JSONDecodeError:
                         # Tolerate partial last line from a crash mid-write.
                         continue
-                    rec_host = rec.get("host")
-                    if rec_host is not None:
-                        recorded_hosts.add(rec_host)
-                    if rec_host is not None and rec_host != args._jsonl_host:
-                        n_skipped_host += 1
-                        continue
                     k = rec.get("key")
                     if k is None:
                         continue
-                    args._json_results[k] = rec.get("stats", {})
                     args._done_keys.add(k)
                     n_loaded += 1
+                    rec_host = rec.get("host")
+                    if rec_host:
+                        host_counts[rec_host] = host_counts.get(rec_host, 0) + 1
             if n_loaded:
+                host_summary = ", ".join(
+                    f"{h}={n}" for h, n in sorted(host_counts.items())
+                ) if host_counts else "(no host stamps)"
                 print(
                     f"[resume] {args._jsonl_path}: loaded {n_loaded} prior "
-                    f"cell results from host={args._jsonl_host}; sweep will "
-                    f"skip them.",
+                    f"cell results across hosts [{host_summary}]; sweep will "
+                    f"skip them.  New cells stamp host={args._jsonl_host}.",
                     file=sys.stderr,
                 )
-            if n_skipped_host:
-                print(
-                    f"[resume] WARNING: {args._jsonl_path} also contains "
-                    f"{n_skipped_host} records from other hosts "
-                    f"{sorted(recorded_hosts - {args._jsonl_host})!r}; ignoring "
-                    f"them.  If you want a clean run, remove or archive the "
-                    f"jsonl file first.",
-                    file=sys.stderr,
-                )
+
+        # Sidecar metadata: cmd, host, tp_size, variant, cupti, etc.  Written
+        # once at startup; helps later analysis identify how this JSONL was
+        # produced even though there's no top-level .json wrapper anymore.
+        meta_path = args.json_output + ".meta.json"
+        meta_payload = {
+            "timestamp": datetime.now().isoformat(),
+            "host": args._jsonl_host,
+            "cmd": " ".join(sys.argv),
+            "tp_size": getattr(args, "tp_size", None),
+            "warmup": getattr(args, "warmup", None),
+            "iters": getattr(args, "iters", None),
+            "variant": getattr(args, "variant", None),
+            "cupti": getattr(args, "cupti", False),
+        }
+        # Append to a list so successive runs (gap-fill, retry) keep history.
+        existing_meta = []
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path) as f:
+                    existing_meta = json.load(f)
+                if not isinstance(existing_meta, list):
+                    existing_meta = [existing_meta]
+            except (OSError, json.JSONDecodeError):
+                existing_meta = []
+        existing_meta.append(meta_payload)
+        # Bench is sometimes invoked with --json-output pointing into a dir
+        # the caller hasn't created (subprocess driver, search loop, etc.).
+        # Ensure the dir exists before writing the meta sidecar OR the JSONL.
+        os.makedirs(os.path.dirname(os.path.abspath(meta_path)), exist_ok=True)
+        tmp = meta_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(existing_meta, f, indent=2)
+        os.replace(tmp, meta_path)
 
     # Skipped cells accumulator — populated by _bench_config when CUPTI capture
     # mismatch causes a cell to be skipped.  Written to args.skipped_output
-    # (or derived from json_output) at end of run.  Pair with --retry-cells
-    # to re-time only the skipped cells in a fresh process.
+    # (or derived from json_output) at end of run.
     args._skipped_cells = []
 
-    # Retry-cells filter set.  When non-empty, only cells whose tag is in this
-    # set will be timed; all others are silently skipped.  Cells are matched
-    # against the sweep_tag string built in _bench_config.
-    args._retry_cells_set: set[str] = set()
-    if getattr(args, "retry_cells", None):
-        with open(args.retry_cells) as f:
-            data = json.load(f)
-        # Accept either a list of tag strings, or the same shape we write
-        # (dict with "skipped" key).  Tolerant of both for hand-edited files.
-        if isinstance(data, dict) and "skipped" in data:
-            data = data["skipped"]
-        args._retry_cells_set = set(data)
-        print(
-            f"[retry] --retry-cells loaded {len(args._retry_cells_set)} tags "
-            f"from {args.retry_cells}; sweep will skip all other cells.",
-            file=sys.stderr,
-        )
+    # Cell-list filter (replaces the old --retry-cells tag-string filter).
+    # When set, the sweep iterates ONLY the cells described in the list.
+    #
+    # Each entry in the JSON file is a dict of canonical knob keys → values,
+    # using the same names that appear in the sweep_tag (Mw/Mnw, Ww/Wnw,
+    # Sw/Snw, pW, pS, H, R, CT, CPSw/CPSnw, LSw/LSnw, FL, WS, TMARL,
+    # TMAWL, TMANL, TMAWS, SR, RECT, WC, MODE, SORT, REVN, HSORT).  Each
+    # cell may also use the tied forms M / W / S / CPS / LS (single value
+    # applied to both write and nowrite halves).
+    #
+    # On load we:
+    #   - Override the bench's CLI knob args (`args.block_size_m_write`,
+    #     etc.) with the union of values present across all cells per knob,
+    #     so the cartesian iteration auto-covers the list.
+    #   - Build `args._cell_list_keys` (the canonical key order used by
+    #     every cell — must be uniform across the list) and
+    #     `args._cell_list_set` (frozen tuples for O(1) membership check
+    #     inside the inner loop).
+    #
+    # In the inner loop, we build the current iteration's tuple and skip
+    # cells not in the set.  Dict-matching is robust to bench gaining new
+    # knobs (old cell-list files keep working — newly-added knobs simply
+    # aren't matched on, so they retain CLI defaults).
+    # Cell-list state may already have been populated by main() (so that
+    # the args.*_list derivations downstream see the override).  Default to
+    # empty if not.
+    if not hasattr(args, "_cell_list_keys"):
+        args._cell_list_keys: tuple = ()
+        args._cell_list_set: set = set()
+        if getattr(args, "cell_list", None):
+            _load_cell_list_into_args(args)
 
     assert args.nheads % args.tp_size == 0, (
         f"nheads ({args.nheads}) must be divisible by tp_size ({args.tp_size})"
@@ -3650,28 +3883,16 @@ def _run_benchmark(args) -> None:
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
 
-    if args.json_output and args._json_results is not None:
-        payload = {
-            "metadata": {
-                "timestamp": datetime.now().isoformat(),
-                "cmd": " ".join(sys.argv),
-                "tp_size": args.tp_size,
-                "warmup": args.warmup,
-                "iters": args.iters,
-                "variant": args.variant,
-                "cupti": getattr(args, "cupti", False),
-            },
-            "results": args._json_results,
-        }
-        tmp = args.json_output + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp, args.json_output)
-        print(f"\nJSON results written to: {args.json_output} "
-              f"({len(args._json_results)} entries)")
+    # JSONL is the canonical artifact (written incrementally per cell with
+    # host stamps).  No clean-exit `.json` write — use `jsonl_to_json.py` to
+    # materialize a snapshot when an analyzer wants one.
+    if args.json_output and args._jsonl_path is not None:
+        print(f"\nJSONL results: {args._jsonl_path} "
+              f"(meta sidecar: {args.json_output}.meta.json)")
 
-    # Write the skipped-cells sidecar.  Pair with --retry-cells in a separate
-    # invocation to re-time the failed cells in a fresh process.
+    # Write the skipped-cells sidecar.  Caller can convert this list to a
+    # --cell-list JSON (one dict per skipped cell) to drive a retry pass in
+    # a fresh process.
     skipped_path = getattr(args, "skipped_output", None)
     if skipped_path is None and args.json_output:
         # Derive default: foo.json -> foo.skipped.json
@@ -3858,16 +4079,20 @@ def _parse_args() -> argparse.Namespace:
         help="Path to write the list of cells that failed CUPTI capture even "
         "after --cupti-retry retries (JSON list of sweep_tag strings).  "
         "Default: derived from --json-output by replacing .json with "
-        ".skipped.json.  Pair with --retry-cells in a separate invocation "
-        "(fresh process = fresh CUPTI subscriber) to re-time these cells.",
+        ".skipped.json.",
     )
     parser.add_argument(
-        "--retry-cells",
+        "--cell-list",
         default=None,
-        help="Path to a JSON list of cell tags (as written by --skipped-output "
-        "in a prior invocation).  When set, the sweep iterates as normal but "
-        "skips any cell whose tag is NOT in the listed set.  Lets collect.py "
-        "drive a retry pass over only the cells that failed the first time.",
+        help="Path to a JSON list of cell dicts (one per cell to time).  "
+        "Each dict has canonical knob keys → values: Mw, Mnw, Ww, Wnw, Sw, "
+        "Snw, pW, pS, H, R, CT, CPSw, CPSnw, LSw, LSnw, FL, WS, TMARL, "
+        "TMAWL, TMANL, TMAWS, SR, RECT, WC, MODE, SORT, REVN, HSORT (tied "
+        "forms M / W / S / CPS / LS are also accepted and auto-expanded).  "
+        "When set, bench's CLI knob ranges are auto-overridden to the "
+        "per-knob union across all cells, and the inner-loop filter skips "
+        "any iteration whose knob-value tuple isn't in the list.  All cells "
+        "must share the same key set (uniform schema).",
     )
     parser.add_argument(
         "--prev-tokens-fracs",
@@ -4263,6 +4488,15 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.mix_only and args.mix_csv is None:
         parser.error("--mix-only requires --mix-csv")
+
+    # Cell-list (if any) must be applied BEFORE the post-argparse string→list
+    # derivations below — those build args.*_list from args.* strings, so a
+    # cell-list override of e.g. args.modes='maindl' needs to land before
+    # args.modes_list is computed.  The function populates args._cell_list_keys
+    # and args._cell_list_set, plus overrides args.* knob strings to the
+    # per-knob union of values across the listed cells.
+    if getattr(args, "cell_list", None):
+        _load_cell_list_into_args(args)
 
     # Backward-compat: --philox-rounding implies --sr-modes SR if --sr-modes
     # was left at the default.  If both are set explicitly, error.
