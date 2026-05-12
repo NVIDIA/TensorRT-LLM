@@ -1,6 +1,7 @@
 """Weight loader for diffusion models."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -87,12 +88,7 @@ class WeightLoader(BaseWeightLoader):
             if not weight_files:
                 raise ValueError(f"No weight files found in {weight_dir}")
 
-            # Load all weights with progress bar
-            component_weights = {}
-            desc = f"Loading {component}" if is_pipeline else "Loading checkpoint"
-            for wf in tqdm.tqdm(weight_files, desc=desc):
-                component_weights.update(self._load_file(wf))
-
+            component_weights = self._load_weight_files(weight_files, component, is_pipeline)
             all_weights[component] = component_weights
 
         # Return flat dict for single component (backward compatibility)
@@ -101,6 +97,32 @@ class WeightLoader(BaseWeightLoader):
 
         # Return nested dict for multiple components
         return all_weights
+
+    def _load_weight_files(
+        self, weight_files: List[str], component: str, is_pipeline: bool
+    ) -> Dict[str, Any]:
+        desc = f"Loading {component}" if is_pipeline else "Loading checkpoint"
+        if len(weight_files) <= 1:
+            component_weights = {}
+            for wf in tqdm.tqdm(weight_files, desc=desc):
+                component_weights.update(self._load_file(wf))
+            return component_weights
+
+        workers = min(4, len(weight_files))
+
+        logger.info(f"Loading {len(weight_files)} {component} shard files with {workers} workers")
+        component_weights = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self._load_file, wf): wf for wf in weight_files}
+            for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc=desc):
+                wf = futures[future]
+                try:
+                    loaded = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to load weight file {wf}") from exc
+                component_weights.update(loaded)
+
+        return component_weights
 
     def _find_weight_files(self, weight_dir) -> List[str]:
         """Find safetensors or bin weight files.
