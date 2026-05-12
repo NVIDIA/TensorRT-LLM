@@ -837,15 +837,14 @@ class ConfigurableMoE(MoE):
         # Call unified run_moe interface with common parameters
         # If EPLB is enabled, token_selected_slots represents expert slots
         # Otherwise, token_selected_experts represents expert IDs
-        backend_kwargs = self._get_backend_kwargs(
-            router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
-        )
         final_hidden_states = self.backend.run_moe(
             x=x,
             token_selected_experts=token_selected_slots,
             token_final_scales=token_final_scales,
             x_sf=x_sf,
-            **backend_kwargs,
+            **self._get_backend_kwargs(
+                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
+            ),
         )
 
         # ========== Step 8: EPLB - Start CPU stage ==========

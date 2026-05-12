@@ -1161,8 +1161,7 @@ class DeepseekV4LogitsProcessor(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
         hidden_states = self._hc_head(hidden_states)
         hidden_states = self._norm(hidden_states)
-        logits = lm_head(hidden_states).float()
-        return logits
+        return lm_head(hidden_states).float()
 
 
 class DeepseekV4Linear(Linear):
@@ -1496,7 +1495,6 @@ class DeepseekV4MoE(nn.Module):
         # Store config values for perfect routing.
         self.model_config = model_config
         self.dtype = dtype
-        self.layer_idx = layer_idx
 
         # Perfect router caching - precompute common logits if enabled.
         if os.environ.get("ENABLE_PERFECT_ROUTER", "0") == "1":
