@@ -147,7 +147,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("end", &kv::HalfOpenRange::end)
         .def("__bool__", [](kv::HalfOpenRange const& self) { return static_cast<bool>(self); })
         .def("__len__", &kv::HalfOpenRange::length)
-        .def("__eq__", &kv::HalfOpenRange::operator==);
+        .def("__eq__", &kv::HalfOpenRange::operator==)
+        .def("__contains__", &kv::HalfOpenRange::contains, nb::arg("item"));
+
+    nb::enum_<kv::PageIndexMode>(m, "PageIndexMode")
+        .value("SHARED", kv::PageIndexMode::SHARED)
+        .value("PER_LAYER", kv::PageIndexMode::PER_LAYER);
+
+    nb::class_<kv::ScratchDesc>(m, "ScratchDesc")
+        .def_ro("range", &kv::ScratchDesc::range)
+        .def_ro("slot_ids", &kv::ScratchDesc::slotIds)
+        .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
         .def(nb::init<std::optional<int>, int>(), nb::arg("window_size"), nb::arg("num_sink_blocks"))
@@ -307,7 +317,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, int vocabSize,
                 std::vector<kv::CacheTierConfig> cacheTiers, nb::list layers, float maxUtilForResume,
                 bool enablePartialReuse, std::optional<kv::BatchDesc> typicalStep,
-                std::vector<kv::BatchDesc> constraints, int ssmReuseInterval,
+                std::vector<kv::BatchDesc> constraints, int ssmReuseInterval, bool enableSwaScratchReuse,
                 std::optional<kv::HelixConfig> helixConfig)
             {
                 new (cfg) kv::KVCacheManagerConfig();
@@ -327,12 +337,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
                 cfg->ssmReuseInterval = ssmReuseInterval;
+                cfg->enableSwaScratchReuse = enableSwaScratchReuse;
                 cfg->helixConfig = std::move(helixConfig);
             },
             nb::arg("tokens_per_block"), nb::arg("vocab_size"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
-            nb::arg("ssm_reuse_interval") = 512, nb::arg("helix_config").none() = std::nullopt)
+            nb::arg("ssm_reuse_interval") = 512, nb::arg("enable_swa_scratch_reuse") = false,
+            nb::arg("helix_config").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("vocab_size", &kv::KVCacheManagerConfig::vocabSize)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
@@ -342,6 +354,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
+        .def_rw("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def_prop_rw(
             "helix_config",
             [](kv::KVCacheManagerConfig const& self) -> nb::object
@@ -427,6 +440,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_group_id"), nb::arg("beam_idx") = 0)
         .def("get_ssm_block_base_index", &kv::KvCache::getSsmBlockBaseIndex, nb::arg("layer_group_id"),
             nb::arg("beam_id") = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_scratch_desc", &kv::KvCache::getScratchDesc, nb::arg("layer_group_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
+        .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
+            [](kv::KvCache& self, bool enable) { self.setEnableSwaScratchReuse(enable); })
+        .def("supports_index_mode", &kv::KvCache::supportsIndexMode, nb::arg("mode"))
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
         .def_prop_ro("finish_event",
@@ -571,7 +590,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("lora_task_id") = std::nullopt, nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none())
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
-            nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("data_role"), nb::arg("index_mode") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
@@ -586,6 +605,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
         .def_prop_ro("enable_partial_match", &kv::KvCacheManager::enablePartialMatch)
+        .def_prop_ro("enable_swa_scratch_reuse", &kv::KvCacheManager::isSwaScratchReuseEnabled)
+        .def(
+            "supports_index_mode",
+            [](kv::KvCacheManager const& self, kv::PageIndexMode mode) -> nb::object
+            {
+                auto result = self.supportsIndexMode(mode);
+                if (!result.has_value())
+                    return nb::none();
+                return nb::cast(*result);
+            },
+            nb::arg("mode"))
         .def_prop_ro("ssm_reuse_interval", &kv::KvCacheManager::ssmReuseInterval)
         .def_prop_ro("num_layers", &kv::KvCacheManager::numLayers)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
@@ -636,7 +666,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PageIndexConverter>(m, "PageIndexConverter")
         .def_ro("scale", &kv::PageIndexConverter::scale)
         .def_ro("expansion", &kv::PageIndexConverter::expansion)
-        .def("__call__", &kv::PageIndexConverter::operator(), nb::arg("base_index"));
+        .def_ro("layer_offset", &kv::PageIndexConverter::layerOffset)
+        .def_ro("scratch_pages_per_block", &kv::PageIndexConverter::scratchPagesPerBlock)
+        .def(
+            "__call__",
+            [](kv::PageIndexConverter const& self, std::vector<int> const& baseIndices,
+                std::optional<kv::PageIndexMode> indexMode, nb::object scratchObj) -> std::vector<int>
+            {
+                kv::ScratchDesc const* scratch = nullptr;
+                std::optional<kv::ScratchDesc> scratchHolder;
+                if (!scratchObj.is_none())
+                {
+                    scratchHolder = nb::cast<kv::ScratchDesc>(scratchObj);
+                    scratch = &*scratchHolder;
+                }
+                return self(baseIndices, indexMode, scratch);
+            },
+            nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch") = nb::none());
 
     // ---- Page (read-only introspection, used via block.storage) ---------------
     // status is returned as int so it compares equal with the Python IntEnum PageStatus.

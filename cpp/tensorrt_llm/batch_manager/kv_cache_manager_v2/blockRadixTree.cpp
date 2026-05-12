@@ -288,6 +288,7 @@ Block::~Block()
         auto const page = storage[i];
         if (page != nullptr)
         {
+            assert(page->block == this);
             unlinkPage(static_cast<LifeCycleId>(i));
             if (page->status() == PageStatus::DROPPABLE && page->scheduledForEviction())
             {
@@ -315,14 +316,16 @@ int Block::partialMatchThisNode(TokenIdExt const* otherTokens, size_t otherCount
     return count;
 }
 
-void Block::unlinkPage(LifeCycleId lcIdx)
+CommittedPage* Block::unlinkPage(LifeCycleId lcIdx)
 {
-    auto& page = storage.at(static_cast<size_t>(lcIdx));
+    auto& slot = storage.at(static_cast<size_t>(lcIdx));
+    CommittedPage* page = slot;
     if (page != nullptr)
     {
         page->block = nullptr;
-        page = nullptr;
+        slot = nullptr;
     }
+    return page;
 }
 
 std::vector<std::shared_ptr<Block>> Block::clearStaleBlocksAfterPageUnlink(

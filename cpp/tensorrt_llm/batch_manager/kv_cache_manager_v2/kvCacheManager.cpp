@@ -45,19 +45,56 @@ static double nowSeconds()
 // PageIndexConverter
 // ---------------------------------------------------------------------------
 
-std::vector<int> PageIndexConverter::operator()(int baseIndex) const
+std::vector<int> PageIndexConverter::operator()(
+    std::vector<int> const& baseIndices, std::optional<PageIndexMode> indexMode, ScratchDesc const* scratch) const
 {
-    constexpr int kBadPageIndex = -1;
-    bool valid = baseIndex != kBadPageIndex;
-    std::vector<int> result(static_cast<size_t>(expansion));
-    for (int i = 0; i < expansion; ++i)
+    if (!indexMode.has_value())
     {
-        if (valid)
-            result[i] = (baseIndex * scale) * expansion + i;
+        if (scratch)
+        {
+            throw std::invalid_argument("index_mode must be provided when scratch is active");
+        }
+        indexMode = PageIndexMode::SHARED;
+    }
+
+    int appliedLayerOffset = (*indexMode == PageIndexMode::PER_LAYER) ? layerOffset : 0;
+    int scratchPages = scratchPagesPerBlock;
+
+    std::vector<int> result;
+    result.reserve(baseIndices.size() * static_cast<size_t>(expansion));
+
+    for (int ordinal = 0; ordinal < static_cast<int>(baseIndices.size()); ++ordinal)
+    {
+        int index;
+        if (scratch && scratch->range.contains(ordinal))
+        {
+            // Scratch block: slot IDs come from ScratchDesc, not base_indices.
+            int blockPos = ordinal - scratch->range.beg;
+            int totalOffset = blockPos * scratchPages;
+            int slotIdx = totalOffset / scale;
+            int slotId = scratch->slotIds[static_cast<size_t>(slotIdx)];
+            int offset = totalOffset % scale;
+            index = slotId * scale + (offset + appliedLayerOffset) % scale;
+        }
+        else if (baseIndices[static_cast<size_t>(ordinal)] == kBadPageIndex)
+        {
+            index = kBadPageIndex;
+        }
         else
-            result[i] = kBadPageIndex;
+        {
+            index = baseIndices[static_cast<size_t>(ordinal)] * scale + appliedLayerOffset;
+        }
+        for (int i = 0; i < expansion; ++i)
+        {
+            result.push_back(index != kBadPageIndex ? index * expansion + i : kBadPageIndex);
+        }
     }
     return result;
+}
+
+std::vector<int> PageIndexConverter::operator()(int baseIndex) const
+{
+    return operator()(std::vector<int>{baseIndex}, std::nullopt, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -76,8 +113,8 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config)
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
-    mStorage = std::make_shared<StorageManager>(
-        mLifeCycles, storageConfig, mConfig.tokensPerBlock, mConfig.typicalStep, mConfig.constraints);
+    mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
+        mConfig.enableSwaScratchReuse, mConfig.typicalStep, mConfig.constraints);
 
     mTargetRatioListGpu = _currentGpuRatio();
     mTargetRatioListOther = _currentOtherRatios();
@@ -123,9 +160,27 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(std::optional<int64_t> lo
 
 // ---- Memory pool queries --------------------------------------------------
 
-MemAddress KvCacheManager::getMemPoolBaseAddress(LayerId layerId, DataRole role) const
+MemAddress KvCacheManager::getMemPoolBaseAddress(
+    LayerId layerId, DataRole role, std::optional<PageIndexMode> indexMode) const
 {
-    return mStorage->getMemPoolBaseAddress(layerId, role);
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+
+    if (!indexMode.has_value())
+    {
+        if (mConfig.enableSwaScratchReuse)
+        {
+            throw std::invalid_argument("index_mode must be provided when SWA scratch reuse is enabled");
+        }
+        indexMode = PageIndexMode::SHARED;
+    }
+
+    PoolGroupIndex pgIdx = mStorage->getPoolGroupIndex(attr.lifeCycleId);
+    MemAddress addr = mStorage->getMemPoolBaseAddress(pgIdx, attr.poolIndex);
+    if (*indexMode == PageIndexMode::SHARED)
+    {
+        addr = MemAddress(addr + attr.offset);
+    }
+    return addr;
 }
 
 int KvCacheManager::getPageStride(LayerId layerId, DataRole role) const
@@ -157,9 +212,22 @@ int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
+    auto const& layerAttr = mStorage->getLayerAttr(layerId);
     int scale = mStorage->mSlotToPageIndices.at(static_cast<size_t>(attr.lifeCycleId))
                     .at(static_cast<size_t>(attr.poolIndex));
-    return PageIndexConverter{scale, attr.expansion};
+    int offset = exactDiv(static_cast<int>(attr.offset), static_cast<int>(attr.size));
+    int scratchPages = layerAttr.slotUtil.at(static_cast<size_t>(attr.poolIndex));
+    return PageIndexConverter{scale, attr.expansion, offset, scratchPages};
+}
+
+std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode) const
+{
+    switch (mode)
+    {
+    case PageIndexMode::PER_LAYER: return true;
+    case PageIndexMode::SHARED: return mConfig.enableSwaScratchReuse ? std::optional<bool>(std::nullopt) : true;
+    }
+    return std::nullopt;
 }
 
 // ---- getAggregatedPages ---------------------------------------------------

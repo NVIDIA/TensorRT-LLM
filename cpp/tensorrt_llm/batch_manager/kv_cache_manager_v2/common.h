@@ -53,6 +53,18 @@ enum class CacheTier : int
     DISK = 2,
 };
 
+// PageIndexMode — how converted page indices relate to layers within a layer group.
+// Mirrors _common.py::PageIndexMode.
+enum class PageIndexMode : int
+{
+    // Converted index list is shared across layers in the same LayerGroup.
+    // Base pointer is per-layer (includes attr.offset).
+    SHARED = 0,
+    // Converted index list is per-layer.
+    // Base pointer is shared (pool group base, no attr.offset).
+    PER_LAYER = 1,
+};
+
 // ---------------------------------------------------------------------------
 // Strongly-typed integer aliases (mirroring Python NewType wrappers).
 // These are plain integer typedefs — use them for type-checked indices.

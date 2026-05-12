@@ -106,6 +106,24 @@ inline HalfOpenRange getStaleRange(LifeCycle const& lc, int historyLength, int t
     return std::visit([&](auto const& v) { return v.getStaleRange(historyLength, tokensPerBlock); }, lc);
 }
 
+// Compute the range of blocks that should use scratch (shared) slots during SWA prefill.
+// Scratch = stale_at_capacity ∩ input_blocks, where:
+//   stale_at_capacity: blocks out-of-window when all capacity tokens become history.
+//   input_blocks: [divUp(historyLength, tpb), divUp(capacity, tpb)) — new blocks
+//     for the current chunk.
+// Mirrors _life_cycle_registry.py::compute_scratch_range().
+inline HalfOpenRange computeScratchRange(LifeCycle const& lc, int historyLength, int capacity, int tokensPerBlock)
+{
+    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+    if (!attn || !attn->windowSize.has_value())
+    {
+        return {0, 0};
+    }
+    auto capStale = attn->getStaleRange(capacity, tokensPerBlock);
+    HalfOpenRange inputRange{divUp(historyLength, tokensPerBlock), divUp(capacity, tokensPerBlock)};
+    return intersect(capStale, inputRange);
+}
+
 // Factory: create a LifeCycle from a LayerConfig variant.
 LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock);
 

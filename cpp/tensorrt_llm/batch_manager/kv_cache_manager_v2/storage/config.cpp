@@ -98,6 +98,53 @@ std::unordered_map<LayerId, LifeCycleId> StorageConfig::layerToLifeCycleIds() co
     return map;
 }
 
+std::map<LayerId, LayerAttr> StorageConfig::layerAttributes() const
+{
+    std::map<LayerId, LayerAttr> ret;
+    for (auto const& pg : slotDescList)
+    {
+        for (auto const& variant : pg.variants)
+        {
+            LifeCycleId lcId = variant.lifeCycleId;
+            int numPools = static_cast<int>(variant.coalescedBuffers.size());
+
+            for (int poolIdx = 0; poolIdx < numPools; ++poolIdx)
+            {
+                auto const& cb = variant.coalescedBuffers[static_cast<size_t>(poolIdx)];
+                // Count how many buffers per layer in this coalesced buffer.
+                std::unordered_map<LayerId, int> slotUtilPerLayer;
+                for (auto const& bufId : cb.bufferIds)
+                {
+                    slotUtilPerLayer[bufId.layerId] += 1;
+                }
+                int buffersPerSlot = cb.numBuffers();
+
+                for (auto const& [layerId, count] : slotUtilPerLayer)
+                {
+                    auto it = ret.find(layerId);
+                    if (it == ret.end())
+                    {
+                        LayerAttr attr;
+                        attr.lifeCycleId = lcId;
+                        attr.slotUtil.resize(static_cast<size_t>(numPools), 0);
+                        attr.slotUtilFracMax = Rational{0, 1};
+                        it = ret.emplace(layerId, std::move(attr)).first;
+                    }
+                    auto& attr = it->second;
+                    assert(attr.lifeCycleId == lcId);
+                    attr.slotUtil[static_cast<size_t>(poolIdx)] = count;
+                    Rational frac{count, buffersPerSlot};
+                    if (frac > attr.slotUtilFracMax)
+                    {
+                        attr.slotUtilFracMax = frac;
+                    }
+                }
+            }
+        }
+    }
+    return ret;
+}
+
 // ---------------------------------------------------------------------------
 // createStorageConfig — factory function.
 // Mirrors _storage/_config.py::create_storage_config.
