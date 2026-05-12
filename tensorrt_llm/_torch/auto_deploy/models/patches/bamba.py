@@ -3,6 +3,7 @@
 from typing import Optional
 
 import torch
+import torch.utils._pytree as _pytree
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.models.bamba.modeling_bamba import (
@@ -31,6 +32,57 @@ try:
 except ImportError:
     _HybridMambaAttentionDynamicCache = None
 
+# transformers>=5.5 returns the unified ``DynamicCache`` (with per-layer
+# ``CacheLayerMixin`` subclasses) as ``past_key_values`` in ``ModelOutput``
+# subclasses. ``torch.export``'s aot_autograd ``flat_fn`` flattens the output via
+# pytree, and chokes when it encounters ``DynamicCache`` because the class is
+# not registered as a known pytree node. Registering it at module import keeps
+# the export-time flatten/unflatten contract intact (so the patched-vs-original
+# comparison in the export tests still compares like-for-like structures).
+try:
+    from transformers.cache_utils import DynamicCache as _DynamicCache
+except ImportError:
+    _DynamicCache = None
+
+_LAYER_TENSOR_ATTRS = ("keys", "values", "conv_states", "recurrent_states")
+
+
+def _flatten_dynamic_cache(cache):
+    leaves = []
+    spec = []
+    for layer in cache.layers:
+        present = []
+        for attr in _LAYER_TENSOR_ATTRS:
+            val = getattr(layer, attr, None)
+            if torch.is_tensor(val):
+                leaves.append(val)
+                present.append(attr)
+        spec.append((type(layer), tuple(present)))
+    return leaves, tuple(spec)
+
+
+def _unflatten_dynamic_cache(leaves, context):
+    cache = _DynamicCache.__new__(_DynamicCache)
+    cache.layers = []
+    idx = 0
+    for layer_cls, present in context:
+        layer = layer_cls.__new__(layer_cls)
+        for attr in _LAYER_TENSOR_ATTRS:
+            setattr(layer, attr, None)
+        for attr in present:
+            setattr(layer, attr, leaves[idx])
+            idx += 1
+        cache.layers.append(layer)
+    return cache
+
+
+if _DynamicCache is not None and _DynamicCache not in _pytree.SUPPORTED_NODES:
+    _pytree.register_pytree_node(
+        _DynamicCache,
+        _flatten_dynamic_cache,
+        _unflatten_dynamic_cache,
+    )
+
 
 # Original implementation:
 # https://github.com/huggingface/transformers/blob/06f8004e5cd9d06cfbffc3f47afb6c2b43bcb3d2/
@@ -56,6 +108,38 @@ def _bamba_mixer_torch_forward(
     )
 
     use_caching = cache_params is not None
+
+    if use_caching:
+        # transformers>=5.5 unified ``DynamicCache`` lazily allocates per-layer
+        # ``conv_states`` / ``recurrent_states`` (5.3.x ``HybridMambaAttentionDynamicCache``
+        # pre-allocated them). The cached custom ops below need real buffers, so trigger
+        # lazy_initialization with correctly-shaped zero tensors before first use.
+        _layer = cache_params.layers[self.layer_idx]
+        if getattr(_layer, "conv_states", None) is None and hasattr(_layer, "lazy_initialization"):
+            _conv_dim = self.conv1d.weight.shape[0]
+            _conv_kernel_size = self.conv1d.weight.shape[-1]
+            _layer.lazy_initialization(
+                conv_states=torch.zeros(
+                    batch_size,
+                    _conv_dim,
+                    _conv_kernel_size,
+                    device=input_states.device,
+                    dtype=hidden_states_B_C.dtype,
+                )
+            )
+        if getattr(_layer, "recurrent_states", None) is None and hasattr(
+            _layer, "lazy_initialization"
+        ):
+            _layer.lazy_initialization(
+                recurrent_states=torch.zeros(
+                    batch_size,
+                    self.num_heads,
+                    self.head_dim,
+                    self.ssm_state_size,
+                    device=input_states.device,
+                    dtype=hidden_states_B_C.dtype,
+                )
+            )
 
     # 2. Convolution sequence transformation (cached/uncached handled inside the op)
     if use_caching:

@@ -72,8 +72,13 @@ def test_bamba_patches(
     position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).repeat(
         input_ids.shape[0], 1
     )
-    batch_size_dynamic = Dim.DYNAMIC
-    seq_len_dynamic = Dim.DYNAMIC
+    # transformers>=5.5 ``LinearAttentionLayer.lazy_initialization`` reads
+    # ``conv_states.shape[0]`` as a Python int to populate ``max_batch_size``,
+    # which forces specialization of the batch dim during export. Use
+    # ``Dim.AUTO`` so the exporter accepts the specialization rather than
+    # erroring as it does with the stricter ``Dim.DYNAMIC``.
+    batch_size_dynamic = Dim.AUTO
+    seq_len_dynamic = Dim.AUTO
     dynamic_shapes = (
         {0: batch_size_dynamic, 1: seq_len_dynamic},
         {0: batch_size_dynamic, 1: seq_len_dynamic},
