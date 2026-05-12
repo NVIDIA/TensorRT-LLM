@@ -14,19 +14,25 @@ from urllib.parse import urlparse
 
 import numpy as np
 import soundfile
+import torch
 from PIL import Image
 
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.inputs.utils import (
-    VideoData,
     _get_aiohttp_session,
     _load_and_convert_image,
     _load_video_by_cv2,
     _normalize_file_uri,
     _safe_aiohttp_get,
 )
+from tensorrt_llm.logger import logger
 
 # Canonical set of supported media modalities for Pydantic field validation.
 MediaModality = Literal["image", "video", "audio"]
+
+# Output representations supported by `ImageMediaIO` and `VideoMediaIO`:
+# `"pt"` → `torch.Tensor`, `"pil"` → `PIL.Image.Image` (per frame for video).
+_SUPPORTED_IMAGE_FORMATS = ("pt", "pil")
 
 _MediaT = TypeVar("_MediaT")
 
@@ -40,9 +46,6 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     modalities.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
-        self._kwargs = kwargs
-
     @classmethod
     def create(
         cls,
@@ -51,6 +54,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     ) -> "BaseMediaIO[_MediaT]":
         """Merge per-modality kwargs and return a configured instance."""
         merged = cls.merge_kwargs(default_kwargs, runtime_kwargs)
+        logger.debug("effective %s kwargs keys: %s", cls.__name__, sorted(merged))
         return cls(**merged)
 
     @classmethod
@@ -80,8 +84,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """Load media from a local file URL or bare path.
 
         Receives the original URL string (not a parsed path) so that
-        subclasses can match the modality-specific normalization done by the
-        legacy free functions.
+        subclasses can apply their own normalization — e.g. unquoting
+        `file://` URIs, or passing the string through verbatim to a
+        decoder that handles bare paths.
         """
         ...
 
@@ -109,62 +114,37 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
-    async def load_base64_async(self, media_type: str, data: str) -> _MediaT:
-        """Async wrapper for `load_base64`.
 
-        For use when the caller already has raw base64 data rather than a URL
-        (e.g. `input_audio` parts).
-        """
-        return await asyncio.to_thread(self.load_base64, media_type, data)
-
-
-class ImageMediaIO(BaseMediaIO[Union[Image.Image, Any]]):
+class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
     """I/O for the image modality."""
 
-    def __init__(self, format: str = "pt", device: str = "cpu", **kwargs: Any) -> None:
-        assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-        super().__init__(format=format, device=device, **kwargs)
-        self.format = format
-        self.device = device
+    def __init__(self, format: str = "pt", device: str = "cpu") -> None:
+        if format not in _SUPPORTED_IMAGE_FORMATS:
+            raise ValueError(f"format must be one of {_SUPPORTED_IMAGE_FORMATS}, got {format!r}")
+        self._format = format
+        self._device = device
 
-    def _postprocess(self, image: Image.Image) -> Union[Image.Image, Any]:
-        if self.format == "pt":
+    def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor]:
+        if self._format == "pt":
             from torchvision.transforms import ToTensor
 
-            return ToTensor()(image).to(device=self.device)
+            return ToTensor()(image).to(device=self._device)
         return image
 
-    def load_bytes(self, data: bytes) -> Union[Image.Image, Any]:
+    def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor]:
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
-    def load_base64(self, media_type: str, data: str) -> Union[Image.Image, Any]:
+    def load_base64(self, media_type: str, data: str) -> Union[Image.Image, torch.Tensor]:
         return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
 
-    def load_file(self, url: str) -> Union[Image.Image, Any]:
-        # Mirrors `async_load_image` for file/empty scheme: build a Path from
-        # the parsed path (no unquoting) and hand it to PIL.
+    def load_file(self, url: str) -> Union[Image.Image, torch.Tensor]:
+        # Hand the parsed path (no unquoting) to PIL.
         parsed = urlparse(url)
         return self._postprocess(_load_and_convert_image(Path(parsed.path)))
 
 
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
     """I/O for the audio modality."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-
-    async def async_load(self, url: str) -> Tuple[np.ndarray, int]:
-        # Override to match `async_load_audio`, which does not accept `data:`
-        # URLs (raw base64 audio goes through `load_base64_async` instead).
-        parsed = urlparse(url)
-        if parsed.scheme in ("http", "https"):
-            session = await _get_aiohttp_session()
-            data = await _safe_aiohttp_get(url, session=session)
-            return await asyncio.to_thread(self.load_bytes, data)
-        elif parsed.scheme in ("", "file"):
-            return await asyncio.to_thread(self.load_file, url)
-        else:
-            raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
     def load_bytes(self, data: bytes) -> Tuple[np.ndarray, int]:
         return soundfile.read(BytesIO(data))
@@ -173,8 +153,8 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
         return soundfile.read(BytesIO(base64.b64decode(data)))
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
-        # Mirrors `async_load_audio`: strip `file://` and unquote the path for
-        # `file:` URIs; pass empty-scheme URLs through verbatim.
+        # Strip `file://` and unquote the path for `file:` URIs; pass
+        # empty-scheme URLs through verbatim.
         parsed = urlparse(url)
         path = _normalize_file_uri(url) if parsed.scheme == "file" else url
         return soundfile.read(path)
@@ -190,22 +170,14 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         format: str = "pt",
         device: str = "cpu",
         extract_audio: bool = False,
-        **kwargs: Any,
     ) -> None:
-        assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-        super().__init__(
-            num_frames=num_frames,
-            fps=fps,
-            format=format,
-            device=device,
-            extract_audio=extract_audio,
-            **kwargs,
-        )
-        self.num_frames = num_frames
-        self.fps = fps
-        self.format = format
-        self.device = device
-        self.extract_audio = extract_audio
+        if format not in _SUPPORTED_IMAGE_FORMATS:
+            raise ValueError(f"format must be one of {_SUPPORTED_IMAGE_FORMATS}, got {format!r}")
+        self._num_frames = num_frames
+        self._fps = fps
+        self._format = format
+        self._device = device
+        self._extract_audio = extract_audio
 
     @classmethod
     def merge_kwargs(
@@ -232,26 +204,26 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
             f.flush()
             return _load_video_by_cv2(
                 f.name,
-                self.num_frames,
-                self.fps,
-                self.format,
-                self.device,
-                extract_audio=self.extract_audio,
+                self._num_frames,
+                self._fps,
+                self._format,
+                self._device,
+                extract_audio=self._extract_audio,
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        # Mirrors `async_load_video`: pass the original URL/path string
-        # directly to cv2 (cv2 handles bare paths but not `file://` URIs).
+        # Pass the URL/path string straight to cv2 — it handles bare
+        # paths but not `file://` URIs.
         return _load_video_by_cv2(
             url,
-            self.num_frames,
-            self.fps,
-            self.format,
-            self.device,
-            extract_audio=self.extract_audio,
+            self._num_frames,
+            self._fps,
+            self._format,
+            self._device,
+            extract_audio=self._extract_audio,
         )
 
 

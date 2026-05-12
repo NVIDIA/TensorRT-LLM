@@ -97,11 +97,13 @@ def _make_media_io(
     request_kwargs: Optional[Dict[str, Dict[str, Any]]],
 ) -> BaseMediaIO:
     """Construct a configured MediaIO instance for one modality on one request."""
-    server_kwargs = server_config.media_io_kwargs if server_config else None
+    server_kwargs = (server_config.media_io_kwargs
+                     if server_config else None) or {}
+    request_kwargs = request_kwargs or {}
     media_io_cls = MEDIA_IO_REGISTRY.get(modality, BaseMediaIO)
     return media_io_cls.create(
-        (server_kwargs or {}).get(modality),
-        (request_kwargs or {}).get(modality),
+        server_kwargs.get(modality),
+        request_kwargs.get(modality),
     )
 
 
@@ -145,8 +147,6 @@ def parse_chat_message_content_part(
         image_io = _make_media_io("image",
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
-        logger.debug("effective image_kwargs keys: %s",
-                     sorted(image_io._kwargs))
         return MultimodalData(modality="image",
                               data=image_io.async_load(str_content),
                               is_embedding=False)
@@ -166,8 +166,6 @@ def parse_chat_message_content_part(
         video_io = _make_media_io("video",
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
-        logger.debug("effective video_kwargs keys: %s",
-                     sorted(video_io._kwargs))
         return MultimodalData(modality="video",
                               data=video_io.async_load(str_content),
                               is_embedding=False)
@@ -177,8 +175,6 @@ def parse_chat_message_content_part(
         audio_io = _make_media_io("audio",
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
-        logger.debug("effective audio_kwargs keys: %s",
-                     sorted(audio_io._kwargs))
         return MultimodalData(modality="audio",
                               data=audio_io.async_load(str_content),
                               is_embedding=False)
@@ -190,12 +186,15 @@ def parse_chat_message_content_part(
             raise ValueError(
                 "input_audio part is missing a non-empty 'data' field with "
                 "base64-encoded audio content.")
+        # Rebuild the OpenAI `input_audio` shape as a `data:` URL so it
+        # routes through the same loader path as `audio_url` parts.
+        audio_format = dict_content.get("format", "")
+        audio_url = f"data:audio/{audio_format};base64,{audio_data}"
         audio_io = _make_media_io("audio",
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="audio",
-                              data=audio_io.load_base64_async(
-                                  "audio/raw", audio_data),
+                              data=audio_io.async_load(audio_url),
                               is_embedding=False)
 
     raise NotImplementedError(f"Unknown part type: {part_type}")
@@ -331,8 +330,7 @@ def parse_chat_messages_coroutines(
         multimodal_server_config: Server-level multimodal config
             (e.g. `--media_io_kwargs`); defaults to empty.
         request_media_io_kwargs: Per-request override merged per
-            modality with the server default via
-            `resolve_media_io_kwargs`.
+            modality with the server default via `BaseMediaIO.create`.
 
     Returns:
         `(conversation, mm_coroutine, mm_placeholder_counts)` where
