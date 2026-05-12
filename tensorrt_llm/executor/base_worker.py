@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import datetime
 import enum
@@ -704,18 +718,14 @@ class BaseWorker(GenerationExecutor):
 
         from tensorrt_llm._torch.virtual_memory import release_with_tag
 
-        try:
-            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
-            logger.info(f"Sleep: {tags}")
-            with self.engine.control_action():
-                torch.cuda.synchronize()
-                release_with_tag(*tags)
-                torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Encountered an error in sleep: {e}")
-            raise
+        tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        logger.info(f"Sleep: {tags}")
+        with self.engine.control_action():
+            torch.cuda.synchronize()
+            release_with_tag(*tags)
+            torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def wakeup(self, wakeup_tags: List[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
@@ -748,16 +758,12 @@ class BaseWorker(GenerationExecutor):
 
         from tensorrt_llm._torch.virtual_memory import materialize_with_tag
 
-        try:
-            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
-            logger.info(f"Wakeup: {tags}")
-            with self.engine.control_action():
-                torch.cuda.synchronize()
-                materialize_with_tag(*tags)
-                torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Encountered an error in wakeup: {e}")
-            raise
+        tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        logger.info(f"Wakeup: {tags}")
+        with self.engine.control_action():
+            torch.cuda.synchronize()
+            materialize_with_tag(*tags)
+            torch.cuda.synchronize()
 
     def shutdown(self):
         if self.doing_shutdown:

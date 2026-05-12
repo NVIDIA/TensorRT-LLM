@@ -23,13 +23,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# Sentinel used as the default sleep_config value in _make_worker so that
+# callers who omit sleep_config get a truthy non-None object (simulating a
+# configured SleepConfig), while callers who pass sleep_config=None test the
+# "feature not enabled" guard.  Module-level placement avoids Ruff B008.
+_SLEEP_CONFIG_DEFAULT = object()
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_worker(backend="pytorch", world_size=1, sleep_config=object()):
+def _make_worker(backend="pytorch",
+                 world_size=1,
+                 sleep_config=_SLEEP_CONFIG_DEFAULT):
     from tensorrt_llm.executor.base_worker import BaseWorker
 
     w = object.__new__(BaseWorker)

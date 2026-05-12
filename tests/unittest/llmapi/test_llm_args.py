@@ -393,7 +393,7 @@ def test_SleepConfig_is_picklable():
 
     # Default construction
     cfg_default = SleepConfig()
-    rt = pickle.loads(pickle.dumps(cfg_default))
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
     assert rt.restore_modes == cfg_default.restore_modes
     # Verify the default_factory still works after round-trip (i.e. missing
     # keys return a RestoreMode, not raise KeyError).
@@ -406,7 +406,7 @@ def test_SleepConfig_is_picklable():
             ExecutorMemoryType.KV_CACHE.value: "NONE",
             ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
         })
-    rt_custom = pickle.loads(pickle.dumps(cfg_custom))
+    rt_custom = pickle.loads(pickle.dumps(cfg_custom))  # noqa: S301
     assert rt_custom.restore_modes[
         ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
     assert rt_custom.restore_modes[
