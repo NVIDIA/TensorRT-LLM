@@ -26,11 +26,13 @@ from pathlib import Path
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
+import lpips
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
+from lpips_video_utils import average_video_lpips_score
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
@@ -82,6 +84,18 @@ NEGATIVE_PROMPT = ""
 NUM_STEPS = 4
 SEED = 42
 COS_SIM_THRESHOLD = 0.99
+WAN_LPIPS_PROMPT = "A cat sitting on a windowsill"
+WAN_LPIPS_NEGATIVE_PROMPT = None
+WAN_LPIPS_HEIGHT = 256
+WAN_LPIPS_WIDTH = 256
+WAN_LPIPS_NUM_FRAMES = 5
+WAN_LPIPS_NUM_INFERENCE_STEPS = 1
+WAN_LPIPS_GUIDANCE_SCALE = 5.0
+WAN_LPIPS_SEED = 42
+WAN_LPIPS_IMAGE_SIZE = (256, 256)
+WAN_LPIPS_MAX_FRAMES = 8
+WAN_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "wan21_t2v_lpips_golden_video.mp4"
+WAN_LPIPS_THRESHOLD = 0.05
 
 
 # ============================================================================
@@ -175,6 +189,13 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a_flat = a.float().cpu().reshape(-1)
     b_flat = b.float().cpu().reshape(-1)
     return F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0)).clamp(-1.0, 1.0).item()
+
+
+def _load_lpips_model(device: str):
+    try:
+        return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    except Exception as exc:
+        pytest.fail(f"LPIPS model could not be loaded: {exc}")
 
 
 def _assert_pipeline_matches_hf(
@@ -271,6 +292,62 @@ class TestWan21_14B_PipelineCorrectness:
             guidance_scale=5.0,
             model_label="Wan2.1-T2V-14B",
         )
+
+
+# ============================================================================
+# LPIPS Regression Tests
+# ============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.wan_t2v
+class TestWan21T2VLPIPSRegression:
+    """End-to-end Wan 2.1 T2V video-frame regression against a TRT-LLM golden frame."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_wan21_1_3b_lpips_against_golden(self):
+        if not os.path.exists(WAN21_1_3B_PATH):
+            pytest.skip(f"Checkpoint not found: {WAN21_1_3B_PATH}")
+        if not WAN_LPIPS_GOLDEN_PATH.exists():
+            pytest.fail(f"Missing Wan 2.1 LPIPS golden video: {WAN_LPIPS_GOLDEN_PATH}")
+
+        pipeline = _load_trtllm_pipeline(WAN21_1_3B_PATH)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt=WAN_LPIPS_PROMPT,
+                    negative_prompt=WAN_LPIPS_NEGATIVE_PROMPT,
+                    height=WAN_LPIPS_HEIGHT,
+                    width=WAN_LPIPS_WIDTH,
+                    num_frames=WAN_LPIPS_NUM_FRAMES,
+                    num_inference_steps=WAN_LPIPS_NUM_INFERENCE_STEPS,
+                    guidance_scale=WAN_LPIPS_GUIDANCE_SCALE,
+                    seed=WAN_LPIPS_SEED,
+                )
+            generated_video = result.video
+        finally:
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        lpips_model = _load_lpips_model("cuda")
+        lpips_score = average_video_lpips_score(
+            generated_video,
+            WAN_LPIPS_GOLDEN_PATH,
+            lpips_model,
+            "cuda",
+            image_size=WAN_LPIPS_IMAGE_SIZE,
+            max_frames=WAN_LPIPS_MAX_FRAMES,
+        )
+
+        print(f"\n[E2E Wan 2.1 T2V video LPIPS] mean score: {lpips_score:.6f}")
+        assert lpips_score < WAN_LPIPS_THRESHOLD, (
+            f"Mean LPIPS too high: {lpips_score:.6f} (expected < {WAN_LPIPS_THRESHOLD:.6f})"
+        )
+
+        del lpips_model
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # =============================================================================

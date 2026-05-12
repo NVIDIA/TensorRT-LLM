@@ -1,0 +1,21 @@
+{
+  "video": "wan21_t2v_lpips_golden_video.mp4",
+  "model": "Wan2.1-T2V-1.3B-Diffusers",
+  "source": "TensorRT-LLM VisualGen",
+  "source_video": "/home/scratch.yibinl_sw_1/wan_flux_load_experiments_20260508/outputs/wan21_13b_baseline_probe.mp4",
+  "prompt": "A cat sitting on a windowsill",
+  "negative_prompt": null,
+  "height": 256,
+  "width": 256,
+  "num_frames": 5,
+  "lpips_image_size": [
+    256,
+    256
+  ],
+  "lpips_max_frames": 8,
+  "num_inference_steps": 1,
+  "guidance_scale": 5.0,
+  "seed": 42,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05
+}

@@ -13,27 +13,71 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 import gc
 import json
 import os
+from pathlib import Path
 
+import lpips
 import pytest
 import torch
 import torch.nn.functional as F
+from lpips_video_utils import average_video_lpips_score
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
+    (
     AttentionConfig,
     CacheDiTConfig,
     DiffusionModelConfig,
     PipelineComponent,
+    TorchCompileConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
+from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 
 _LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
+
+
+def _ltx2_text_encoder_path() -> str:
+    if "LTX2_TEXT_ENCODER_PATH" in os.environ:
+        return os.environ["LTX2_TEXT_ENCODER_PATH"]
+
+    root = str(llm_models_root(check=True))
+    candidates = [
+        os.path.join(root, "gemma-3-12b-it"),
+        os.path.join(root, "gemma", "gemma-3-12b-it"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _ltx2_spatial_upsampler_path() -> str:
+    if "LTX2_SPATIAL_UPSAMPLER_PATH" in os.environ:
+        return os.environ["LTX2_SPATIAL_UPSAMPLER_PATH"]
+
+    return os.path.join(
+        str(llm_models_root(check=True)),
+        "LTX-2",
+        "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+    )
+
+
+def _ltx2_distilled_lora_path() -> str:
+    if "LTX2_DISTILLED_LORA_PATH" in os.environ:
+        return os.environ["LTX2_DISTILLED_LORA_PATH"]
+
+    return os.path.join(
+        str(llm_models_root(check=True)),
+        "LTX-2",
+        "ltx-2-19b-distilled-lora-384.safetensors",
+    )
+
 
 CHECKPOINT_PATH_BF16 = os.environ.get(
     "LTX2_MODEL_PATH",
@@ -43,6 +87,9 @@ CHECKPOINT_PATH_FP8 = os.environ.get(
     "LTX2_MODEL_PATH_FP8",
     os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors"),
 )
+TEXT_ENCODER_PATH = _ltx2_text_encoder_path()
+SPATIAL_UPSAMPLER_PATH = _ltx2_spatial_upsampler_path()
+DISTILLED_LORA_PATH = _ltx2_distilled_lora_path()
 
 # Skip non-transformer components.  VisualGenArgs.skip_components is a
 # List[PipelineComponent] validated by Pydantic; LTX2-native components
@@ -65,6 +112,30 @@ def _write_minimal_ltx2_diffusers_checkpoint(tmp_path):
     )
     (transformer_path / "config.json").write_text(json.dumps({"_class_name": "LTX2"}))
     return checkpoint_path
+
+LTX2_LPIPS_PROMPT = (
+    "A woman with long brown hair and light skin smiles at the camera while standing in a "
+    "sunlit park, her hair gently blowing in the breeze as she tilts her head slightly to "
+    "the side."
+)
+LTX2_LPIPS_NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
+LTX2_LPIPS_HEIGHT = 512
+LTX2_LPIPS_WIDTH = 768
+LTX2_LPIPS_NUM_FRAMES = 49
+LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
+LTX2_LPIPS_GUIDANCE_SCALE = 4.0
+LTX2_LPIPS_SEED = 42
+LTX2_LPIPS_IMAGE_SIZE = (256, 256)
+LTX2_LPIPS_MAX_FRAMES = 8
+LTX2_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "ltx2_lpips_golden_video.mp4"
+LTX2_LPIPS_THRESHOLD = 0.05
+
+
+def _load_lpips_model(device: str):
+    try:
+        return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    except Exception as exc:
+        pytest.fail(f"LPIPS model could not be loaded: {exc}")
 
 
 def _get_ltx2_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -445,6 +516,84 @@ class TestLTX2AttentionBackend:
             print(f"\n[PASS] TRTLLM backend matches VANILLA: cos_sim={cos_sim:.6f} (>0.99)")
 
         del pipeline_trtllm, transformer_trtllm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+# ============================================================================
+# LPIPS Regression Tests
+# ============================================================================
+
+
+@pytest.mark.integration
+class TestLTX2LPIPSRegression:
+    """End-to-end LTX-2 video-frame regression against a TRT-LLM golden frame."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_ltx2_lpips_against_golden(self, ltx2_bf16_checkpoint_exists):
+        if not os.path.isdir(TEXT_ENCODER_PATH):
+            pytest.skip(
+                f"LTX2 text encoder not found at {TEXT_ENCODER_PATH}. "
+                "Set LTX2_TEXT_ENCODER_PATH."
+            )
+        if not os.path.exists(SPATIAL_UPSAMPLER_PATH):
+            pytest.skip(
+                f"LTX2 spatial upsampler not found at {SPATIAL_UPSAMPLER_PATH}. "
+                "Set LTX2_SPATIAL_UPSAMPLER_PATH."
+            )
+        if not os.path.exists(DISTILLED_LORA_PATH):
+            pytest.skip(
+                f"LTX2 distilled LoRA not found at {DISTILLED_LORA_PATH}. "
+                "Set LTX2_DISTILLED_LORA_PATH."
+            )
+        if not LTX2_LPIPS_GOLDEN_PATH.exists():
+            pytest.fail(f"Missing LTX-2 LPIPS golden video: {LTX2_LPIPS_GOLDEN_PATH}")
+
+        args = VisualGenArgs(
+            checkpoint_path=CHECKPOINT_PATH_BF16,
+            text_encoder_path=TEXT_ENCODER_PATH,
+            spatial_upsampler_path=SPATIAL_UPSAMPLER_PATH,
+            distilled_lora_path=DISTILLED_LORA_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt=LTX2_LPIPS_PROMPT,
+                    negative_prompt=LTX2_LPIPS_NEGATIVE_PROMPT,
+                    height=LTX2_LPIPS_HEIGHT,
+                    width=LTX2_LPIPS_WIDTH,
+                    num_frames=LTX2_LPIPS_NUM_FRAMES,
+                    num_inference_steps=LTX2_LPIPS_NUM_INFERENCE_STEPS,
+                    guidance_scale=LTX2_LPIPS_GUIDANCE_SCALE,
+                    seed=LTX2_LPIPS_SEED,
+                )
+            generated_video = result.video
+        finally:
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        lpips_model = _load_lpips_model("cuda")
+        lpips_score = average_video_lpips_score(
+            generated_video,
+            LTX2_LPIPS_GOLDEN_PATH,
+            lpips_model,
+            "cuda",
+            image_size=LTX2_LPIPS_IMAGE_SIZE,
+            max_frames=LTX2_LPIPS_MAX_FRAMES,
+        )
+
+        print(f"\n[E2E LTX-2 video LPIPS] mean score: {lpips_score:.6f}")
+        assert lpips_score < LTX2_LPIPS_THRESHOLD, (
+            f"Mean LPIPS too high: {lpips_score:.6f} (expected < {LTX2_LPIPS_THRESHOLD:.6f})"
+        )
+
+        del lpips_model
         gc.collect()
         torch.cuda.empty_cache()
 

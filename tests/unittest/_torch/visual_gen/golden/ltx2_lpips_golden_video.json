@@ -1,0 +1,21 @@
+{
+  "video": "ltx2_lpips_golden_video.mp4",
+  "model": "LTX-2 BF16 two-stage",
+  "source": "TensorRT-LLM VisualGen",
+  "source_video": "/home/scratch.yibinl_sw_1/ltx2_teacache_sanity_20260511_231345/videos/bf16_off.mp4",
+  "prompt": "A woman with long brown hair and light skin smiles at the camera while standing in a sunlit park, her hair gently blowing in the breeze as she tilts her head slightly to the side.",
+  "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
+  "height": 512,
+  "width": 768,
+  "num_frames": 49,
+  "lpips_image_size": [
+    256,
+    256
+  ],
+  "lpips_max_frames": 8,
+  "num_inference_steps": 8,
+  "guidance_scale": 4.0,
+  "seed": 42,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05
+}
