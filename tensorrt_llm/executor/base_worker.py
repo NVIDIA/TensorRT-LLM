@@ -1,6 +1,7 @@
 import copy
 import datetime
 import enum
+import gc
 import json
 import os
 import weakref
@@ -18,7 +19,7 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
@@ -646,6 +647,96 @@ class BaseWorker(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def sleep(self, sleep_tags: List[str]) -> None:
+        """Release GPU virtual memory for the specified memory type tags.
+
+        Single-rank (``world_size == 1``) only.  Uses
+        ``PyExecutor.control_action()`` to drain in-flight requests and pause
+        the event loop before calling ``release_with_tag()``, matching the
+        ``@control_action_decorator`` behaviour used in Ray.
+
+        Args:
+            sleep_tags: List of
+                :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                value strings (e.g. ``["kv_cache"]``).
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+            NotImplementedError: If ``parallel_config.world_size > 1``.
+        """
+        if self._backend != "pytorch":
+            raise ValueError(
+                "sleep() is only available for the PyTorch (TorchLLM) backend."
+            )
+        if self.llm_args is None or self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in "
+                "the LLM arguments.")
+        # Non-rank-0 processes block on their local control_action_done
+        # threading.Event with no Python caller to release it — deadlock.
+        if self.llm_args.parallel_config.world_size > 1:
+            raise NotImplementedError(
+                "sleep() requires model_world_size == 1; "
+                "use the Ray executor for multi-rank deployments.")
+
+        from tensorrt_llm._torch.virtual_memory import release_with_tag
+
+        try:
+            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+            logger.info(f"Sleep: {tags}")
+            with self.engine.control_action():
+                torch.cuda.synchronize()
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"Encountered an error in sleep: {e}")
+            raise
+
+    def wakeup(self, wakeup_tags: List[str]) -> None:
+        """Materialize GPU virtual memory for the specified memory type tags.
+
+        Single-rank (``world_size == 1``) only.  See :meth:`sleep` for
+        details.
+
+        Args:
+            wakeup_tags: List of
+                :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                value strings (e.g. ``["kv_cache"]``).
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+            NotImplementedError: If ``parallel_config.world_size > 1``.
+        """
+        if self._backend != "pytorch":
+            raise ValueError(
+                "wakeup() is only available for the PyTorch (TorchLLM) backend."
+            )
+        if self.llm_args is None or self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in "
+                "the LLM arguments.")
+        if self.llm_args.parallel_config.world_size > 1:
+            raise NotImplementedError(
+                "wakeup() requires model_world_size == 1; "
+                "use the Ray executor for multi-rank deployments.")
+
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+        try:
+            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+            logger.info(f"Wakeup: {tags}")
+            with self.engine.control_action():
+                torch.cuda.synchronize()
+                materialize_with_tag(*tags)
+                torch.cuda.synchronize()
+        except Exception as e:
+            logger.error(f"Encountered an error in wakeup: {e}")
+            raise
 
     def shutdown(self):
         if self.doing_shutdown:

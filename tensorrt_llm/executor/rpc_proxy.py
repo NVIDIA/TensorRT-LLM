@@ -1,6 +1,6 @@
 import json
 import threading
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.utils import logger_debug, print_colored
@@ -48,6 +48,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             is_llm_executor=is_llm_executor,
         )
 
+        self.model_world_size = model_world_size
         self._create_mpi_session(model_world_size, mpi_session)
 
         # Inject the generated HMAC key into worker_kwargs for workers
@@ -175,6 +176,54 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
         self._iter_kv_events_result.set_timeout(timeout)
         return self._iter_kv_events_result
+
+    def collective_rpc(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: Optional[Union[int, List[int]]] = None,
+    ) -> List:
+        """Execute a method call on the rank-0 RpcWorker via the RPC client.
+
+        Rank-0-only shim; only ``model_world_size == 1`` is supported.
+        See :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
+        for details.
+
+        Args:
+            method: Name of the
+                :class:`~tensorrt_llm.executor.rpc_worker.RpcWorker` method
+                to invoke.
+            args: Positional arguments forwarded to the worker method.
+            kwargs: Keyword arguments forwarded to the worker method.
+            non_block: If ``True``, return a ``Future`` without waiting.
+            unique_reply_rank: Must be ``None``.
+            target_ranks: Must be ``None``.
+
+        Returns:
+            A list containing the single return value (blocking) or a list
+            containing the pending :class:`~concurrent.futures.Future`
+            (non-blocking).
+
+        Raises:
+            NotImplementedError: If ``model_world_size > 1``, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
+        """
+        if self.model_world_size > 1:
+            raise NotImplementedError(
+                "MPI collective_rpc only supports model_world_size == 1; "
+                "use the Ray executor for multi-rank deployments.")
+        if unique_reply_rank is not None or target_ranks is not None:
+            raise NotImplementedError(
+                "unique_reply_rank and target_ranks are not supported; "
+                "this shim only reaches rank-0.")
+        kwargs = kwargs or {}
+        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        if non_block:
+            return [remote_call.remote_future()]
+        return [remote_call.remote()]
 
     def setup_engine_remote(self):
         return self.rpc_client.setup_engine().remote(need_response=True)

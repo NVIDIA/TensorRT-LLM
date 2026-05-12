@@ -5,7 +5,7 @@ import os
 import threading
 import weakref
 from queue import Empty
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import zmq
@@ -503,6 +503,58 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def collective_rpc(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: Optional[Union[int, List[int]]] = None,
+    ) -> List:
+        """Execute a method call on the rank-0 GPU worker via the RPC client.
+
+        Rank-0-only shim; only ``model_world_size == 1`` is supported.
+        Shares the :meth:`RayExecutor.collective_rpc` signature for uniform
+        dispatch from :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`,
+        but does not broadcast to all workers.
+
+        Args:
+            method: Name of the worker method to invoke.
+            args: Positional arguments forwarded to the worker method.
+            kwargs: Keyword arguments forwarded to the worker method.
+            non_block: If ``True``, return a ``Future`` without waiting.
+            unique_reply_rank: Must be ``None``.
+            target_ranks: Must be ``None``.
+
+        Returns:
+            A list containing the single return value when ``non_block=False``,
+            or a list containing the pending
+            :class:`~concurrent.futures.Future` when ``non_block=True``.
+
+        Raises:
+            RuntimeError: If the RPC client has not been initialised yet.
+            NotImplementedError: If ``model_world_size > 1``, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
+        """
+        if self.rpc_client is None:
+            raise RuntimeError(
+                "RPC client is not initialised — collective_rpc() cannot be "
+                "called before the executor workers have started.")
+        if self.model_world_size > 1:
+            raise NotImplementedError(
+                "MPI collective_rpc only supports model_world_size == 1; "
+                "use the Ray executor for multi-rank deployments.")
+        if unique_reply_rank is not None or target_ranks is not None:
+            raise NotImplementedError(
+                "unique_reply_rank and target_ranks are not supported; "
+                "this shim only reaches rank-0.")
+        kwargs = kwargs or {}
+        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        if non_block:
+            return [remote_call.remote_future()]
+        return [remote_call.remote()]
 
     def get_stats(self, timeout: float) -> List[dict]:
         """Get iteration statistics from the runtime via RPC.
