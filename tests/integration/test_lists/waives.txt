@@ -111,7 +111,6 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=False] SKIP (https://nvbugs/6141653)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[llguidance] SKIP (https://nvbugs/6141653)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[xgrammar] SKIP (https://nvbugs/6141653)
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False] SKIP (https://nvbugs/6141653)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False] SKIP (https://nvbugs/6162114)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True] SKIP (https://nvbugs/6162114)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa SKIP (https://nvbugs/6162114)
