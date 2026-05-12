@@ -132,8 +132,9 @@ def _require_fp4_metadata(
         return tensor
 
     sm = get_sm_version_from_torch()
+    sm_str = f"SM{sm}" if sm is not None else "unknown GPU"
     raise ValueError(
-        f"Missing FP4 metadata: {metadata_name} for {quant_mode} on SM{sm}.")
+        f"Missing FP4 metadata: {metadata_name} for {quant_mode} on {sm_str}.")
 
 
 def load_weight_shard(

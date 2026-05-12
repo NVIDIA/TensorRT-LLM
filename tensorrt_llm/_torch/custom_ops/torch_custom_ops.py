@@ -58,7 +58,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
 
-def _validate_fp4_runtime_support(quant_mode: Union[QuantAlgo, str]) -> None:
+def _validate_fp4_runtime_support(
+        quant_mode: Union[QuantAlgo, QuantMode, str]) -> None:
     sm = get_sm_version_from_torch()
     if not is_mxfp4_supported(sm, quant_mode):
         raise RuntimeError(get_mxfp4_support_error_message(sm, quant_mode))
