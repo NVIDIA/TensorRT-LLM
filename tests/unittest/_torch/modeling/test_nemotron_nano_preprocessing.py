@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Preprocessing unit tests for modeling_nemotron_nano.py."""
 
 import functools
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
 )
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
+    MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
@@ -519,6 +521,21 @@ class TestAudioInputProcessor:
             "audio_num_clips",
         } <= audio_inputs.keys()
 
+    def test_call_audio_stashes_evs_ids_when_evs_enabled(self):
+        proc = _make_audio_processor()
+        proc.video_pruning_rate = 0.5
+        audio = np.random.randn(16000).astype(np.float32)
+        inputs = {
+            "prompt": f"Listen: {AUDIO_PLACEHOLDER}",
+            "multi_modal_data": {"audio": [(audio, 16000)]},
+        }
+
+        input_ids, extra_inputs = proc(inputs, None)
+
+        evs_ids = extra_inputs["multimodal_data"]["audio"]["evs_ids"]
+        assert evs_ids.dtype == torch.int32
+        assert evs_ids.tolist() == input_ids
+
     def test_process_audio_raises_without_sound_config(self):
         proc = _make_audio_processor()
         proc._audio_extractor = None
@@ -798,31 +815,60 @@ class TestGetNumTokensPerVideoTemporal:
 # Arbitrary token IDs used across the merge_evs tests.
 _IMG_CTX_ID = 20
 _VIDEO_CTX_ID = 21
+_SOUND_CTX_ID = 30
+_SOUND_START = 200
+_SOUND_END = 201
 _TEXT_TOKEN = 99  # stand-in for any non-special token
 _IMG_START = 50
 _IMG_END = 51
 
 
 def _make_merge_model():
-    """Create a minimal mock with the two token-ID attrs that `merge_evs_mm_embeds` reads."""
+    """Create a minimal mock with the attrs/helpers that `merge_evs_mm_embeds` reads."""
     model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
     model.img_context_token_id = _IMG_CTX_ID
     model.video_context_token_id = _VIDEO_CTX_ID
+    model.sound_context_token_id = _SOUND_CTX_ID
+    model._build_evs_adjusted_context_ids = functools.partial(
+        NemotronH_Nano_VL_V2._build_evs_adjusted_context_ids, model
+    )
+    model._refresh_evs_runtime_and_slice_context_ids = functools.partial(
+        NemotronH_Nano_VL_V2._refresh_evs_runtime_and_slice_context_ids, model
+    )
     return model
 
 
-def _make_mm_param(modality: str, evs_ids):
+def _make_runtime(past_seen_token_num: int, chunk_end_pos: int, prompt_len: int):
+    return MultimodalRuntimeData(
+        past_seen_token_num=past_seen_token_num,
+        chunk_end_pos=chunk_end_pos,
+        embed_mask_cumsum=torch.zeros(prompt_len, dtype=torch.int64),
+    )
+
+
+def _make_mm_param(modality: str, evs_ids, runtime=None):
     """Build a MultimodalParams for merge_evs_mm_embeds."""
     return MultimodalParams(
         multimodal_data={
             "modality_type": modality,
             modality: {"evs_ids": evs_ids},
-        }
+        },
+        multimodal_runtime=runtime,
     )
 
 
 class TestMergeEvsMMEmbeds:
     """Tests for `NemotronH_Nano_VL_V2.merge_evs_mm_embeds`."""
+
+    def test_evs_video_with_text_only_context_raises(self):
+        """Reject batches where text-only context chunks would shift EVS writes."""
+        params = [_make_mm_param("video", torch.tensor([_VIDEO_CTX_ID], dtype=torch.long))]
+
+        with pytest.raises(ValueError, match="text-only context requests"):
+            NemotronH_Nano_VL_V2._validate_evs_context_batch(
+                params,
+                num_context_requests=2,
+            )
 
     def test_single_video_two_tubelets(self):
         """Each video_context_token_id placeholder is replaced with the right count."""
@@ -902,6 +948,43 @@ class TestMergeEvsMMEmbeds:
         assert result.shape == input_ids.shape
         assert (result[: len(expected)] == expected).all()
 
+    def test_mixed_audio_video_batch(self):
+        """Audio entry passes through; video entry gets placeholders replaced."""
+        model = _make_merge_model()
+        video_evs = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+            ],
+            dtype=torch.long,
+        )
+        audio_evs = torch.tensor(
+            [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],
+            dtype=torch.long,
+        )
+        params = [
+            _make_mm_param("video", video_evs),
+            _make_mm_param("audio", audio_evs),
+        ]
+        num_tokens_in_videos = [torch.tensor([2]), None]
+        input_ids = torch.zeros(20, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, params, input_ids
+        )
+
+        expected = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 2
+            + [_IMG_END]
+            + [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],
+            dtype=torch.long,
+        )
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected)] == expected).all()
+
     def test_trailing_tokens_preserved(self):
         """Tokens after the last placeholder are not dropped."""
         model = _make_merge_model()
@@ -923,6 +1006,96 @@ class TestMergeEvsMMEmbeds:
         )
         assert result.shape == input_ids.shape
         assert (result[: len(expected)] == expected).all()
+
+    def test_chunked_prefill_uses_current_context_slice(self):
+        """Chunked prefill should write only the active context window."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                88,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                77,
+            ],
+            dtype=torch.long,
+        )
+        full_context = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 3
+            + [_IMG_END, 88, _IMG_START]
+            + [_IMG_CTX_ID] * 2
+            + [_IMG_END, 77],
+            dtype=torch.long,
+        )
+        runtime = _make_runtime(
+            past_seen_token_num=4,
+            chunk_end_pos=9,
+            prompt_len=len(full_context),
+        )
+        param = _make_mm_param("video", evs_ids, runtime=runtime)
+        num_tokens_in_videos = [torch.tensor([3, 2])]
+        generation_tail = torch.tensor([700, 701], dtype=torch.long)
+        input_ids = torch.cat([torch.zeros(5, dtype=torch.long), generation_tail.clone()])
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        expected_context_chunk = full_context[4:9]
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected_context_chunk)] == expected_context_chunk).all()
+        assert (result[len(expected_context_chunk) :] == generation_tail).all()
+        assert runtime.num_cached_mm_tokens == 2
+        assert runtime.num_mm_tokens_in_chunk == 2
+        assert runtime.total_embeds_in_request == 5
+
+    def test_chunked_prefill_first_chunk_can_be_shorter_than_full_context(self):
+        """A full EVS context longer than input_ids must not be assigned wholesale."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _TEXT_TOKEN,
+            ],
+            dtype=torch.long,
+        )
+        full_context = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 5
+            + [_IMG_END, _IMG_START]
+            + [_IMG_CTX_ID] * 4
+            + [_IMG_END, _TEXT_TOKEN],
+            dtype=torch.long,
+        )
+        runtime = _make_runtime(
+            past_seen_token_num=0,
+            chunk_end_pos=4,
+            prompt_len=len(full_context),
+        )
+        param = _make_mm_param("video", evs_ids, runtime=runtime)
+        num_tokens_in_videos = [torch.tensor([5, 4])]
+        input_ids = torch.zeros(4, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        assert result.shape == input_ids.shape
+        assert (result == full_context[:4]).all()
+        assert runtime.num_cached_mm_tokens == 0
+        assert runtime.num_mm_tokens_in_chunk == 2
+        assert runtime.total_embeds_in_request == 9
 
 
 class TestProcessVideoPromptsEvs:
@@ -1500,6 +1673,42 @@ class TestExpandPromptTokenIdsForMM:
         assert mm_data_updates is None
         assert 200 in result  # sound_start_token_id
         assert 201 in result  # sound_end_token_id
+
+    def test_evs_dispatch_returns_image_evs_ids_in_mm_data_updates(self):
+        proc = _make_fast_path_processor()
+        proc.video_pruning_rate = 0.5
+        img_ctx = proc.img_context_token_id
+        prompt = [1, img_ctx, 2]
+
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+            prompt,
+            [5],
+            mm_data={"image": [object()]},
+        )
+
+        assert mm_data_updates is not None
+        evs_ids = mm_data_updates["image"]["evs_ids"]
+        assert isinstance(evs_ids, torch.Tensor)
+        assert evs_ids.dtype == torch.long
+        assert evs_ids.tolist() == result
+
+    def test_evs_dispatch_returns_audio_evs_ids_in_mm_data_updates(self):
+        proc = _make_fast_path_audio_processor()
+        proc.video_pruning_rate = 0.5
+        snd_ctx = proc._sound_context_token_id
+        prompt = [1, snd_ctx, 2]
+
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+            prompt,
+            [5],
+            mm_data={"audio": [object()]},
+        )
+
+        assert mm_data_updates is not None
+        evs_ids = mm_data_updates["audio"]["evs_ids"]
+        assert isinstance(evs_ids, torch.Tensor)
+        assert evs_ids.dtype == torch.long
+        assert evs_ids.tolist() == result
 
     def test_no_placeholders_returns_unchanged(self):
         proc = _make_fast_path_processor()

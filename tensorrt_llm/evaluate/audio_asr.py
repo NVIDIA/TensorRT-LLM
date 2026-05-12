@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
-import json
 import re
 import unicodedata
 from io import BytesIO
@@ -37,7 +36,7 @@ from tensorrt_llm.llmapi import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .interface import Evaluator, get_chat_template_kwargs
+from .interface import Evaluator, get_chat_template_kwargs, get_model_context
 
 
 class MultimodalASRSample(NamedTuple):
@@ -239,7 +238,7 @@ class AudioASREvaluator(Evaluator):
 
     def _make_input_context(self, llm: Any) -> _ASRInputContext:
         """Resolve the model type, processor, and chat-template settings once per run."""
-        _, model_type = _get_model_context(llm)
+        _, model_type = get_model_context(llm)
         processor = getattr(getattr(llm, "input_processor", None), "processor", None)
         hf_chat_template = resolve_hf_chat_template(llm.tokenizer, processor, None, None)
         return _ASRInputContext(
@@ -302,11 +301,11 @@ class AudioASREvaluator(Evaluator):
             chat_template_kwargs=input_context.chat_template_kwargs,
         )
 
-        input = {"prompt": prompt}
+        request_input = {"prompt": prompt}
         multi_modal_data, _ = mm_data_tracker.retrieve_all_sync()
         if multi_modal_data:
-            input["multi_modal_data"] = multi_modal_data
-        return input
+            request_input["multi_modal_data"] = multi_modal_data
+        return request_input
 
 
 def _resolve_media_path(dataset_path: str, media_path: str) -> str:
@@ -449,7 +448,7 @@ def _compute_wer(
     sample_results = []
     total_edits = 0
     total_words = 0
-    for sample_id, prediction, reference in zip(sample_ids, predictions, references):
+    for sample_id, prediction, reference in zip(sample_ids, predictions, references, strict=True):
         normalized_prediction = _normalize_asr_text(prediction)
         normalized_reference = _normalize_asr_text(reference)
         prediction_words = normalized_prediction.split()
@@ -498,18 +497,3 @@ def _format_worst_sample_report(sample_results: list[ASRWERSampleResult], limit:
             f"  ref ={_truncate_text(result.normalized_reference)!r}"
         )
     return "\n".join(lines)
-
-
-def _get_model_context(llm: Any) -> tuple[str, str]:
-    model_dir = getattr(llm, "_hf_model_dir", None) or getattr(llm, "model", None)
-    if model_dir is None:
-        raise ValueError("The LLM object does not expose a model directory.")
-
-    config_path = Path(model_dir) / "config.json"
-    with open(config_path, "r", encoding="utf-8") as config_file:
-        config = json.load(config_file)
-
-    model_type = config.get("model_type")
-    if model_type is None:
-        raise KeyError(f"'model_type' is missing from {config_path}.")
-    return str(model_dir), model_type

@@ -19,7 +19,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, Sampl
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_pre_blackwell, skip_pre_hopper
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VoxPopuli
+from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
 
 
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
@@ -509,7 +509,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         temperature=0.0,
         top_k=1,
     )
-    voxpopuli_extra_evaluator_kwargs = {
+    no_thinking_evaluator_kwargs = {
         # We explicitly disable thinking, because otherwise the thinking traces could
         # be absurdly long (20k+ tokens), which is not helpful for test-runtime, nor
         # for reproducibility (the more tokens there are, the higher likelihood of the
@@ -521,7 +521,19 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     VOXPOPULI_TASK_SPEC = (
         VoxPopuli,
         voxpopuli_sampling_params,
-        voxpopuli_extra_evaluator_kwargs,
+        no_thinking_evaluator_kwargs,
+    )
+
+    videomme_sampling_params = SamplingParams(
+        max_tokens=VideoMME.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=VideoMME.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    VIDEOMME_TASK_SPEC = (
+        VideoMME,
+        videomme_sampling_params,
+        no_thinking_evaluator_kwargs,
     )
 
     @pytest.mark.skip_less_device_memory(80000)
@@ -552,7 +564,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 64,
                 QuantAlgo.FP8,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
                 marks=skip_pre_hopper,
                 id="fp8",
             ),
@@ -567,7 +579,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 128,
                 QuantAlgo.MIXED_PRECISION,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
                 marks=skip_pre_blackwell,
                 id="nvfp4",
             ),
