@@ -504,8 +504,6 @@ class ModelConfig(Generic[TConfig]):
         shape = tensor_info.get("shape", [])
         if dtype == "I8" and len(shape) == 2:
             return "mxfp4"
-        if dtype is not None and dtype.startswith("F8_"):
-            return "fp8_block_scales"
         if dtype == "U8":
             return "nvfp4"
         return None
@@ -525,8 +523,6 @@ class ModelConfig(Generic[TConfig]):
         dtype = tensor_info.get("dtype")
         if dtype is not None and dtype.startswith("F8_"):
             return "fp8_block_scales"
-        if dtype == "U8":
-            return "nvfp4"
         return None
 
     @staticmethod

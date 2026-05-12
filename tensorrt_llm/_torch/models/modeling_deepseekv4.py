@@ -1412,9 +1412,7 @@ class DeepseekV4MoE(nn.Module):
                 WideEPMoE,
                 DeepGemmFusedMoE,
             )
-            # The TRTLLM-Gen fp4-block-scale fused-MoE kernel
-            # (`run_fp4_block_scale_moe` in fused_moe_trtllm_gen.py:760, covers
-            # NVFP4 / W4A16-MXFP4 / W4A8-MXFP4-MXFP8) only implements the
+            # The TRTLLM-Gen fp4-block-scale fused-MoE kernel only implements the
             # GPT-OSS-style SwiGLU clamping path, which expects bias /
             # swiglu_alpha / swiglu_beta to be set alongside swiglu_limit.
             # DeepSeek-V4 has no expert bias (config.attention_bias == False
