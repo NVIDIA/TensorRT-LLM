@@ -48,13 +48,22 @@ class CacheReuseAdapter(ABC):
     ) -> List[int]:
         """Per-layer-group cached prefix in tokens (block-aligned).
 
-        Returns the reuse-hit prefix only; SWA stale-region handling lives at
-        the transfer call site (it is a transport concern, not a cache one).
+        Returns the per-group reusable prefix. SWA groups also count already
+        evicted stale blocks as skipped so transfer offsets stay block-aligned.
         """
         if not self.enable_block_reuse:
             return [0] * len(layer_groups)
         scalar = max(0, self._global_cached_token_count(req))
-        return [scalar] * len(layer_groups)
+        tpb = self.tokens_per_block
+        out: List[int] = []
+        for lg in layer_groups:
+            window = lg.sliding_window_size
+            if window is None:
+                out.append(scalar)
+            else:
+                stale_end = max(0, (req.prompt_len + 1 - window) // tpb)
+                out.append(max(scalar, stale_end * tpb))
+        return out
 
     @abstractmethod
     def get_block_ids(

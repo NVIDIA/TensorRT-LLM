@@ -583,8 +583,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         No-op for V1 managers and for V2 caches with only full-context
         life cycles.
         """
-        if not self._is_v2_manager:
-            return
         trim = getattr(self._kv_cache_manager, "trim_to_history", None)
         if trim is None:
             return

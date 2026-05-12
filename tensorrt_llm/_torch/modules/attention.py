@@ -8,47 +8,29 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
+                                 nvtx_range_debug)
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    AttentionMetadata,
-    FlashInferAttentionMetadata,
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
-)
-from ..attention_backend.interface import (
-    AttentionBackend,
-    AttentionMask,
-    CustomAttentionMask,
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-)
+from ..attention_backend import (AttentionForwardArgs, AttentionInputType,
+                                 AttentionMetadata, FlashInferAttentionMetadata,
+                                 TrtllmAttention, TrtllmAttentionMetadata)
+from ..attention_backend.interface import (AttentionBackend, AttentionMask,
+                                           CustomAttentionMask,
+                                           PositionalEmbeddingParams,
+                                           PredefinedAttentionMask)
 from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata,
-    transform_local_topk_and_prepare_pool_view,
-)
+    DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import (
-    AllReduceParams,
-    HelixAllToAllNative,
-    alltoall_helix,
-    cp_allgather,
-    reducescatter,
-)
+from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
+                           cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import (
-    Fp4QuantizedTensor,
-    get_model_extra_attrs,
-    is_torch_compiling,
-    maybe_compiled_cat,
-    maybe_compiled_copy_,
-)
+from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+                     is_torch_compiling, maybe_compiled_cat,
+                     maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm

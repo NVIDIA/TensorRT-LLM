@@ -775,8 +775,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         config = model_config.pretrained_config
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         index_head_dim = model_config.sparse_attention_config.index_head_dim
-        is_disagg = kwargs.get("is_disagg", False)
-        pp_layers = mapping.pp_layers(model_config.get_num_attention_layers(is_disagg=is_disagg))
+        pp_layers = mapping.pp_layers(model_config.get_num_attention_layers())
         compress_ratios = [
             model_config.sparse_attention_config.compress_ratios[layer] for layer in pp_layers
         ]

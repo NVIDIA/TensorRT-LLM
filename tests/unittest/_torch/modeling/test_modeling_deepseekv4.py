@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -37,7 +38,11 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfi
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekV4SparseAttentionConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -355,6 +360,13 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     assert DeepseekV4TrtllmAttention.forward(attn, "q") == "ok"
     assert captured["attention_sinks"].data_ptr() == sink.data_ptr()
 
+    captured.clear()
+    forward_args = AttentionForwardArgs()
+
+    assert DeepseekV4TrtllmAttention.forward(attn, "q", forward_args=forward_args) == "ok"
+    assert "attention_sinks" not in captured
+    assert captured["forward_args"].attention_sinks.data_ptr() == sink.data_ptr()
+
 
 def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
     monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
@@ -605,6 +617,32 @@ def test_deepseek_v4_sparse_ratios_keep_explicit_override(tmp_path, monkeypatch)
     )
 
     assert model_config.sparse_attention_config.compress_ratios == explicit_ratios
+
+
+def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(
+    tmp_path, monkeypatch
+):
+    checkpoint_ratios = [128, 128]
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=len(checkpoint_ratios),
+        num_nextn_predict_layers=1,
+        compress_ratios=checkpoint_ratios,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+
+    spec_config = MTPDecodingConfig(max_draft_len=1)
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+        spec_config=spec_config,
+    )
+
+    assert spec_config.num_nextn_predict_layers == 1
+    assert model_config.sparse_attention_config.compress_ratios == [128, 128, 1]
 
 
 def test_deepseek_v4_sanity():

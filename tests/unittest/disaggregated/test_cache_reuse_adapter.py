@@ -164,12 +164,11 @@ class TestAdapterPerLayerGroup:
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
         assert out == [0, 0]
 
-    def test_zero_scalar(self):
-        # No reuse hit: every group reports 0 — SWA stale handling is the
-        # transfer call site's concern, not the adapter's.
+    def test_zero_scalar_clamps_swa_stale_prefix(self):
         ad = _StubAdapter(scalar=0, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
-        assert out == [0, 0]
+        # full-attn has no cached prefix; SWA treats evicted stale blocks as already skipped.
+        assert out == [0, 192]
 
     def test_full_attn_passthrough(self):
         ad = _StubAdapter(scalar=64, tpb=self.TPB)

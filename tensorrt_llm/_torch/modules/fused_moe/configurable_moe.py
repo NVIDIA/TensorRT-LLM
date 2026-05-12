@@ -545,6 +545,7 @@ class ConfigurableMoE(MoE):
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
+        input_ids: Optional[torch.IntTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -581,6 +582,7 @@ class ConfigurableMoE(MoE):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             lora_params=lora_params,
+            input_ids=input_ids,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

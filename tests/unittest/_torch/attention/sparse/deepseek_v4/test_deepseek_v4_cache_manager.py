@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -21,6 +22,30 @@ _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
     Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
 ]
+
+
+def test_cache_size_estimation_uses_model_attention_layer_count():
+    class FakeModelConfig:
+        sparse_attention_config = SimpleNamespace(
+            index_head_dim=128,
+            compress_ratios=[1, 4, 1, 128],
+        )
+        pretrained_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        quant_config = None
+
+        def get_num_attention_layers(self) -> int:
+            return len(self.sparse_attention_config.compress_ratios)
+
+    size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
+        FakeModelConfig(),
+        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        is_disagg=True,
+    )
+
+    assert size_per_token > 0
 
 
 def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:

@@ -20,12 +20,9 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import (
-    DeepSeekSparseAttentionConfig,
-    DeepSeekV4SparseAttentionConfig,
-    KvCacheConfig,
-    MoeLoadBalancerConfig,
-)
+from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+                                          DeepSeekV4SparseAttentionConfig,
+                                          KvCacheConfig, MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -38,12 +35,9 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-    from tensorrt_llm.llmapi.llm_args import (
-        DecodingBaseConfig,
-        LoraConfig,
-        SparseAttentionConfig,
-        SpeculativeConfig,
-    )
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
+                                              SparseAttentionConfig,
+                                              SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
@@ -595,9 +589,8 @@ class ModelConfig(Generic[TConfig]):
             layer_quant_config = dict(layer_quant_config)
 
         num_moe_layers = pretrained_config.num_hidden_layers
-        if (spec_config is not None
-                and spec_config.spec_dec_mode.is_mtp_one_model()):
-            num_moe_layers += spec_config.num_nextn_predict_layers
+        num_moe_layers += ModelConfig._get_mtp_num_layers(
+            pretrained_config, spec_config)
 
         for layer_idx in range(num_moe_layers):
             layer_quant_config[
@@ -607,6 +600,22 @@ class ModelConfig(Generic[TConfig]):
             "Detected DeepSeek-V4 routed MoE MXFP4 checkpoint layout; using "
             "%s for routed experts.", experts_quant_config.quant_algo)
         return layer_quant_config
+
+    @staticmethod
+    def _get_mtp_num_layers(pretrained_config, spec_config) -> int:
+        if (spec_config is None
+                or not spec_config.spec_dec_mode.is_mtp_one_model()):
+            return 0
+
+        mtp_num_layers = spec_config.num_nextn_predict_layers
+        if mtp_num_layers is None:
+            mtp_num_layers = getattr(pretrained_config,
+                                     "num_nextn_predict_layers", None)
+            if mtp_num_layers is not None:
+                spec_config.num_nextn_predict_layers = mtp_num_layers
+        if mtp_num_layers is None:
+            mtp_num_layers = 1
+        return mtp_num_layers
 
     @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
@@ -756,8 +765,8 @@ class ModelConfig(Generic[TConfig]):
                                    spec_config.spec_dec_mode.is_mtp_one_model())
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
-                    checkpoint_window_size = getattr(
-                        pretrained_config, 'window_size', None)
+                    checkpoint_window_size = getattr(pretrained_config,
+                                                     'window_size', None)
                     if checkpoint_window_size is None:
                         checkpoint_window_size = getattr(
                             pretrained_config, 'sliding_window', None)
@@ -793,7 +802,8 @@ class ModelConfig(Generic[TConfig]):
                     # explicit user override; padding a short default list for
                     # non-MTP changes sparse attention semantics.
                     if mtp_enabled:
-                        mtp_num_layers = spec_config.num_nextn_predict_layers
+                        mtp_num_layers = cls._get_mtp_num_layers(
+                            pretrained_config, spec_config)
                         total_layers = num_base_layers + mtp_num_layers
                         if len(compress_ratios) < total_layers:
                             compress_ratios = list(compress_ratios) + [1] * (
@@ -1080,7 +1090,8 @@ class ModelConfig(Generic[TConfig]):
             for x in self.pretrained_config.block_configs
         ])
 
-        from tensorrt_llm._torch.models.modeling_nemotron_nas import _ffn_mult_to_intermediate_size
+        from tensorrt_llm._torch.models.modeling_nemotron_nas import \
+            _ffn_mult_to_intermediate_size
         mlp_hidden_size = _ffn_mult_to_intermediate_size(
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 

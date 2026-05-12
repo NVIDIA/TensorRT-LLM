@@ -439,8 +439,8 @@ class PyExecutor:
         # freed by suspend) or _pause_requests (V2's prepare_context
         # handles resume internally, so resetting to CONTEXT_INIT is
         # unnecessary).  Several revert/skip paths gate on this flag.
-        self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
-                                            KVCacheManagerV2)
+        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
+                                                        KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
@@ -2540,7 +2540,7 @@ class PyExecutor:
         can_queue check.  V1 allocates in prepare_resources() after the
         can_queue check, so no revert is needed.
         """
-        if self._is_kv_manager_v2:
+        if self._scheduler_manages_kv_suspend:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
@@ -2931,7 +2931,7 @@ class PyExecutor:
                     self._revert_gen_alloc(scheduled_batch)
                     continue
 
-                if not self._is_kv_manager_v2:
+                if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
 
@@ -3321,7 +3321,7 @@ class PyExecutor:
                     self._revert_gen_alloc(scheduled_batch)
                     continue
 
-                if not self._is_kv_manager_v2:
+                if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
@@ -3467,7 +3467,7 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                if not self._is_kv_manager_v2:
+                if not self._scheduler_manages_kv_suspend:
                     self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
@@ -4097,8 +4097,8 @@ class PyExecutor:
         # the wait window does not hold pool capacity hostage.  V1
         # allocates after delay batching, so skip the dropped-set
         # computation entirely on V1.
-        if (self._is_kv_manager_v2 and len(scheduled_context_requests)
-                < len(original_ctx_requests)):
+        if (self._scheduler_manages_kv_suspend and
+                len(scheduled_context_requests) < len(original_ctx_requests)):
             kept = {r.py_request_id for r in scheduled_context_requests}
             dropped = [
                 r for r in original_ctx_requests if r.py_request_id not in kept

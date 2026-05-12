@@ -9,6 +9,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 import pytest
@@ -47,6 +48,27 @@ MAX_SEQ_LEN = 256
 MAX_BATCH_SIZE = 4
 VOCAB_SIZE = 32000
 REQUEST_LENGTHS = [30, 60, 80]
+
+
+def test_trim_kv_to_prompt_history_uses_cache_manager_capability():
+    calls = []
+    req = SimpleNamespace(prompt_len=17)
+    cache_manager = SimpleNamespace(trim_to_history=lambda r, n: calls.append((r, n)))
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    assert not hasattr(transceiver, "_is_v2_manager")
+    transceiver._trim_kv_to_prompt_history(req)
+
+    assert calls == [(req, 17)]
+
+
+def test_trim_kv_to_prompt_history_noops_without_trim_capability():
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = object()
+
+    assert not hasattr(transceiver, "_is_v2_manager")
+    transceiver._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=17))
 
 
 # ---------------------------------------------------------------------------

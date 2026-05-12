@@ -1106,8 +1106,13 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
     def forward(self, *args, **kwargs):
         attn_sink = getattr(self, "attn_sink", None)
-        if attn_sink is not None and kwargs.get("attention_sinks") is None:
-            kwargs["attention_sinks"] = attn_sink.data
+        if attn_sink is not None:
+            forward_args = kwargs.get("forward_args")
+            if isinstance(forward_args, AttentionForwardArgs):
+                if forward_args.attention_sinks is None:
+                    forward_args.attention_sinks = attn_sink.data
+            elif kwargs.get("attention_sinks") is None:
+                kwargs["attention_sinks"] = attn_sink.data
         return super().forward(*args, **kwargs)
 
     def sparse_attn_predict(
