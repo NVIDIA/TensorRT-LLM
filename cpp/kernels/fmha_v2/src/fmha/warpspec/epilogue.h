@@ -430,8 +430,7 @@ struct Softmax_base : public Skip_softmax_stat_counters<Kernel_traits::ENABLE_SK
                 }
                 else
                 {
-                    skip &= (local_max_[mi] - global_max[mi]) * scale
-                        < skip_softmax_log_threshold * float(M_LOG2E);
+                    skip &= (local_max_[mi] - global_max[mi]) * scale < skip_softmax_log_threshold;
                 }
             }
 
@@ -631,7 +630,7 @@ struct Softmax_base : public Skip_softmax_stat_counters<Kernel_traits::ENABLE_SK
     float correction_[Mma_tile_p::CORES_M];
     // The packed mask.
     uint4 packed_mask_;
-    // Skip softmax when local_max - global_max < log(skip_softmax_threshold).
+    // Skip softmax threshold in the same logarithm base as the softmax exponent path.
     float skip_softmax_log_threshold;
 };
 
@@ -1025,8 +1024,7 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
                 }
                 else
                 {
-                    skip &= (local_max_[mi] - global_max[mi]) * scale
-                        < this->skip_softmax_log_threshold * float(M_LOG2E);
+                    skip &= (local_max_[mi] - global_max[mi]) * scale < this->skip_softmax_log_threshold;
                 }
             }
             if (!IS_FIRST_COL)
