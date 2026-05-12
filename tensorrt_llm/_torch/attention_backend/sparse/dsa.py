@@ -85,11 +85,10 @@ def _pick_fp4_dsl_expand(next_n: int) -> Tuple[int, int]:
         next_n=6 -> (2, 3): two atoms of next_n=3 (prefer eff=3 over eff=2)
         next_n=9 -> (3, 3): three atoms of next_n=3
     """
-    for eff in (3, 2, 1):
+    for eff in (3, 2):
         if next_n % eff == 0:
             return next_n // eff, eff
-    raise AssertionError(
-        f"unreachable: every positive next_n is divisible by 1 (got {next_n})")
+    return next_n, 1
 
 
 def _compute_slot_mappings(

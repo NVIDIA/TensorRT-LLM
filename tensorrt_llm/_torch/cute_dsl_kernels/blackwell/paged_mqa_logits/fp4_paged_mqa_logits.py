@@ -32,7 +32,7 @@ Fused KV layout (same shape as FP8, half the data bytes):
   Per block: [KV data (phys_block_kv * head_dim/2 bytes)] [SF (phys_block_kv * 4 bytes)]
 
 Epilogue dtype flows:
-  acc=fp32 (硬件锁死, FP4 MXF4 SS only emits fp32 acc).
+  acc=fp32 (FP4 MXF4 SS only emits fp32 acc).
   epi ∈ {fp32, bf16, fp16}, output ∈ {fp32, bf16, fp16}.
 
   fp32 path: tmem_load fp32 → ReLU → scalar FMA → cvt output_dtype → store
@@ -502,7 +502,7 @@ class FP4MQALogitsKernel:
 
         # TMEM SF layouts (single region, NOT staged — see plan U1).
         # Build a virtual 1-stage chunk SMEM layout to feed the TMEM helpers
-        # (D5 决议: smem_layout param is only used for shape inference, doesn't
+        # (smem_layout param is only used for shape inference, doesn't
         # bind a runtime alloc; our actual SF SMEM is flat, see Step 4 plan).
         sfa_chunk_smem_for_inference = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma, self.mma_tiler, self.sf_vec_size, 1
@@ -687,7 +687,7 @@ class FP4MQALogitsKernel:
         # TMA for SF KV — [phys_block_kv, num_phys_blocks] int32, tile [phys_block_kv]
         # SMEM holds compute_block_kv int32 SF per stage (= block_kv tokens);
         # filled by num_blocks_per_mma sub-block TMAs at consecutive offsets.
-        # FLAT M-row-major (plan 方案 Z); UMMA warp does an in-place SMEM
+        # FLAT M-row-major; UMMA warp does an in-place SMEM
         # transpose to chunk byte layout before issuing UTCCP (Step 4).
         self.sf_kv_smem_layout_staged = cute.make_layout((self.block_kv, self.num_kv_stages))
         sf_kv_smem_per_subblock = cute.make_layout((phys_block_kv,))

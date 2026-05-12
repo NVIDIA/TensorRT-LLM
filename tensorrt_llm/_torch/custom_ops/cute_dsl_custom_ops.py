@@ -5931,33 +5931,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.paged_mqa_logits import (
         FP4MQALogitsKernel, FP8MQALogitsKernel)
 
-    def _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
-                                           block_table, schedule_meta,
-                                           epi_dtype, acc_dtype, output_dtype):
-        errs = []
-        if q.dtype != torch.float8_e4m3fn:
-            errs.append(f"q must be float8_e4m3fn, got {q.dtype}")
-        if kv_fused.dtype != torch.uint8:
-            errs.append(f"kv_fused must be uint8, got {kv_fused.dtype}")
-        # TODO: update to (torch.float32, torch.float16) once fp16 weights
-        # are validated end-to-end and the in-kernel .half() conversion is removed.
-        if weights.dtype != torch.float32:
-            errs.append(f"weights must be float32, got {weights.dtype}")
-        if context_lens.dtype != torch.int32:
-            errs.append(f"context_lens must be int32, got {context_lens.dtype}")
-        if block_table.dtype != torch.int32:
-            errs.append(f"block_table must be int32, got {block_table.dtype}")
-        if schedule_meta.dtype != torch.int32:
-            errs.append(
-                f"schedule_meta must be int32, got {schedule_meta.dtype}")
-        for name, dt in [("epi_dtype", epi_dtype), ("acc_dtype", acc_dtype),
-                         ("output_dtype", output_dtype)]:
-            if dt not in (torch.float16, torch.float32):
-                errs.append(f"{name} must be float16 or float32, got {dt}")
-        if errs:
-            raise ValueError("FP8 Paged MQA Logits dtype errors:\n  " +
-                             "\n  ".join(errs))
-
     class CuteDSLPagedMQALogitsRunner:
         """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
 
@@ -6153,9 +6126,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL: SM version {get_sm_version()} is not supported. "
                 f"CuteDSL FP8 Paged MQA Logits only supports SM 100 family.")
-        _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
-                                           block_table, schedule_meta,
-                                           epi_dtype, acc_dtype, output_dtype)
+        # Caller (dsa.py) prepares all tensors with metadata-guaranteed
+        # dtype/shape; skip per-call validation to keep decode-hot-path
+        # latency low. Log inputs once for debugging.
+        logger.info_once(
+            f"cute_dsl_fp8_paged_mqa_logits inputs: "
+            f"q dtype={q.dtype} shape={tuple(q.shape)} stride={q.stride()}; "
+            f"kv_fused dtype={kv_fused.dtype} shape={tuple(kv_fused.shape)} stride={kv_fused.stride()}; "
+            f"weights dtype={weights.dtype} shape={tuple(weights.shape)} stride={weights.stride()}; "
+            f"context_lens dtype={context_lens.dtype} shape={tuple(context_lens.shape)}; "
+            f"block_table dtype={block_table.dtype} shape={tuple(block_table.shape)} stride={block_table.stride()}; "
+            f"schedule_meta dtype={schedule_meta.dtype} shape={tuple(schedule_meta.shape)}; "
+            f"max_context_len={max_context_len} num_epi_subtiles={num_epi_subtiles} "
+            f"epi_dtype={epi_dtype} acc_dtype={acc_dtype} output_dtype={output_dtype}",
+            key="cute_dsl_fp8_paged_mqa_logits_inputs",
+        )
         return CuteDSLPagedMQALogitsRunner.forward(
             q,
             kv_fused,
@@ -6748,66 +6733,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     #  CuTE DSL FP4 Paged MQA Logits (Blackwell SM100)                   #
     # ------------------------------------------------------------------ #
 
-    def _check_fp4_paged_mqa_logits_dtypes(q, sf_q, kv_fused, weights,
-                                           context_lens, block_table,
-                                           schedule_meta, epi_dtype,
-                                           output_dtype):
-        errs = []
-        if q.dtype != torch.uint8:
-            errs.append(f"q must be uint8 (FP4 packed), got {q.dtype}")
-        if sf_q.dtype != torch.int32:
-            errs.append(f"sf_q must be int32, got {sf_q.dtype}")
-        if kv_fused.dtype != torch.uint8:
-            errs.append(f"kv_fused must be uint8, got {kv_fused.dtype}")
-        if weights.dtype != torch.float32:
-            errs.append(f"weights must be float32, got {weights.dtype}")
-        if context_lens.dim() != 1:
-            errs.append(f"context_lens must be 1D, got {context_lens.dim()}D")
-        if context_lens.dtype != torch.int32:
-            errs.append(f"context_lens must be int32, got {context_lens.dtype}")
-        if block_table.dtype != torch.int32:
-            errs.append(f"block_table must be int32, got {block_table.dtype}")
-        if schedule_meta.dtype != torch.int32:
-            errs.append(
-                f"schedule_meta must be int32, got {schedule_meta.dtype}")
-        for name, dt in [("epi_dtype", epi_dtype),
-                         ("output_dtype", output_dtype)]:
-            if dt not in (torch.float16, torch.bfloat16, torch.float32):
-                errs.append(
-                    f"{name} must be float16, bfloat16, or float32, got {dt}")
-        # Shape checks: forward() reinterprets q/sf_q/weights via reshape(),
-        # so a same-numel but differently ordered tensor would silently
-        # scramble the token/head mapping. Validate ranks and cross-tensor
-        # shapes here to fail fast.
-        if q.dim() != 4:
-            errs.append(f"q must be 4D [B, next_n, H, D//2], got {q.dim()}D")
-        else:
-            B, next_n, H, half_D = q.shape
-            if tuple(sf_q.shape) != (B, next_n, H):
-                errs.append(
-                    f"sf_q must have shape {(B, next_n, H)}, got {tuple(sf_q.shape)}"
-                )
-            if tuple(weights.shape) != (B * next_n, H):
-                errs.append(
-                    f"weights must have shape {(B * next_n, H)}, got {tuple(weights.shape)}"
-                )
-            if tuple(context_lens.shape) != (B, ):
-                errs.append(
-                    f"context_lens must have shape {(B,)}, got {tuple(context_lens.shape)}"
-                )
-            if block_table.dim() != 2 or block_table.shape[0] != B:
-                errs.append(
-                    f"block_table must be 2D with batch dim {B}, got {tuple(block_table.shape)}"
-                )
-            if (kv_fused.dim() != 4 or kv_fused.shape[2] != 1
-                    or kv_fused.shape[3] != half_D + 4):
-                errs.append(
-                    f"kv_fused must be 4D [num_blocks, phys_block_kv, 1, D//2 + 4={half_D + 4}], "
-                    f"got {tuple(kv_fused.shape)}")
-        if errs:
-            raise ValueError("FP4 Paged MQA Logits dtype errors:\n  " +
-                             "\n  ".join(errs))
-
     class CuteDSLFP4PagedMQALogitsRunner:
         """Runner for CuTe DSL FP4 Paged MQA Logits kernel (Blackwell SM100).
 
@@ -7031,10 +6956,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"num_epi_subtiles must be one of (1, 2, 4), got {num_epi_subtiles}"
             )
-        _check_fp4_paged_mqa_logits_dtypes(q, sf_q, kv_fused, weights,
-                                           context_lens, block_table,
-                                           schedule_meta, epi_dtype,
-                                           output_dtype)
+        # Caller (dsa.py) prepares all tensors with metadata-guaranteed
+        # dtype/shape; skip per-call validation to keep decode-hot-path
+        # latency low. Log inputs once for debugging.
+        logger.info_once(
+            f"cute_dsl_fp4_paged_mqa_logits inputs: "
+            f"q dtype={q.dtype} shape={tuple(q.shape)} stride={q.stride()}; "
+            f"sf_q dtype={sf_q.dtype} shape={tuple(sf_q.shape)} stride={sf_q.stride()}; "
+            f"kv_fused dtype={kv_fused.dtype} shape={tuple(kv_fused.shape)} stride={kv_fused.stride()}; "
+            f"weights dtype={weights.dtype} shape={tuple(weights.shape)} stride={weights.stride()}; "
+            f"context_lens dtype={context_lens.dtype} shape={tuple(context_lens.shape)}; "
+            f"block_table dtype={block_table.dtype} shape={tuple(block_table.shape)} stride={block_table.stride()}; "
+            f"schedule_meta dtype={schedule_meta.dtype} shape={tuple(schedule_meta.shape)}; "
+            f"max_context_len={max_context_len} num_epi_subtiles={num_epi_subtiles} "
+            f"epi_dtype={epi_dtype} output_dtype={output_dtype}",
+            key="cute_dsl_fp4_paged_mqa_logits_inputs",
+        )
         return CuteDSLFP4PagedMQALogitsRunner.forward(
             q,
             sf_q,
