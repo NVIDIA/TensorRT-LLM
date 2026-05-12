@@ -1320,6 +1320,14 @@ class DualModeCapturedGraph(nn.Module):
         """
         batch_info = kwargs.get(self.batch_info_kwarg_name)
         if batch_info is not None and isinstance(batch_info, torch.Tensor):
+            # Under AD_BATCH_INFO_DEVICE=1 the kwarg is the device shadow; read
+            # from the registered host buffer instead to avoid a CUDA sync.
+            if batch_info.device.type == "cuda":
+                from ...custom_ops.attention_interface import _get_current_batch_info_host
+
+                host = _get_current_batch_info_host()
+                if host is not None:
+                    batch_info = host
             # batch_info_host[0] = num_prefill
             num_prefill = batch_info[0].item()
             return num_prefill == 0
@@ -1338,6 +1346,12 @@ class DualModeCapturedGraph(nn.Module):
         """Extract total num_tokens from batch_info_host or batched inputs."""
         batch_info = kwargs.get(self.batch_info_kwarg_name)
         if batch_info is not None and isinstance(batch_info, torch.Tensor):
+            if batch_info.device.type == "cuda":
+                from ...custom_ops.attention_interface import _get_current_batch_info_host
+
+                host = _get_current_batch_info_host()
+                if host is not None:
+                    batch_info = host
             # batch_info_host layout: [0]=num_prefill, [1]=num_prefill_tokens,
             # [2]=num_extend, [3]=num_extend_tokens, [4]=num_decode, [5]=num_decode_tokens
             return int((batch_info[1] + batch_info[3] + batch_info[5]).item())

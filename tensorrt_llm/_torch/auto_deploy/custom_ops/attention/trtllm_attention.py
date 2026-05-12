@@ -247,6 +247,14 @@ class _TrtllmPlanner:
         """
         key = kv_cache.data_ptr()
         if key not in self._layer_cache:
+            # Keep pool_ptrs on pinned host (original behavior). An earlier
+            # attempt to relocate this to kv_cache.device failed at runtime
+            # with cudaErrorStreamCaptureUnsupported because this lazy
+            # allocation is FIRST exercised inside CUDA-graph capture warmup
+            # (cudaMalloc is not capturable). The dominant UVM source is the
+            # per-iter batch_info_host (36 layer-arg events/iter); host_kv_
+            # cache_pool_pointers is only 1 event/iter and not worth the
+            # graph-capture friction without a pre-warm hook.
             pool_ptrs = torch.zeros(
                 1, 2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
             )
