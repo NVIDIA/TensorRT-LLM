@@ -229,6 +229,8 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
+    void const* slidingWindowKvPoolBasePtr = nullptr;
     // Packed KV scaling factor buffer
     void const* kvSfPtr;
     // Packed QKV buffer
@@ -243,6 +245,8 @@ struct TllmGenFmhaRunnerParams
     int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
     int32_t* firstSparseMaskOffsetsKvPtr;
+    // The variable sparse MLA topK lengths with shape [numTokensQ].
+    int32_t const* ptrSparseMlaTopKLens = nullptr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.

@@ -308,6 +308,7 @@ class LinearShardableNode(ShardableNode):
 @ShardableNode.register(
     torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
     torch.ops.auto_deploy.trtllm_finegrained_fp8_linear,
+    torch.ops.auto_deploy.trtllm_fp8_deepgemm,
 )
 class FineGrainedFP8LinearShardableNode(LinearShardableNode):
     """FineGrained FP8 linear: shards per-block ``weight_scale_inv`` buffers."""
@@ -898,19 +899,18 @@ class IRShardingConfig(TransformConfig):
         return validate_allreduce_strategy(v)
 
     def _init_dist_config(self, rank: int, world_size: int):
-        """Initialize DistConfig from dist_mapping config (fallback path).
+        """Initialize ``self.dist_config`` from ``dist_mapping`` (test-only fallback).
 
-        Called when ``shared_config.dist_config`` is None (e.g. test suites
-        that construct ``InferenceOptimizer`` without a ``Mapping``).
+        Production path builds ``DistConfig`` in ``LlmArgs.init_dist_config``
+        and passes it through ``SharedConfig.dist_config``.  This fallback is
+        only entered when ``shared_config.dist_config is None`` (tests that
+        construct ``InferenceOptimizer`` without a ``dist_config`` kwarg).
         ``rank`` and ``world_size`` come from ``shared_config``.
         """
-        self.dist_config = DistConfig(
-            world_size=world_size,
+        self.dist_config = DistConfig.from_sharding_params(
             rank=rank,
-            tp_size=self.dist_mapping.get("tp", world_size),
-            moe_tp_size=self.dist_mapping.get("moe_tp", 1),
-            moe_ep_size=self.dist_mapping.get("moe_ep", world_size),
-            moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+            world_size=world_size,
+            dist_mapping=self.dist_mapping,
             enable_attention_dp=self.enable_attention_dp,
             allreduce_strategy=self.allreduce_strategy.name,
         )
@@ -983,6 +983,9 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
             enable_sharding._shard_scales(
                 gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None
             )
+        # torch_dist_all_gather is the demollm backend op; signature is
+        # (tensor, dim=0, sizes=None) — plain torch.distributed all_gather,
+        # no strategy or symm_mem support (use the trtllm backend for those).
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
@@ -1066,14 +1069,14 @@ class ApplyShardingHints(BaseTransform):
         invalidate_weight_node_cache(gm)
 
         if shared_config.dist_config is not None:
-            # Intentional alias: single shared DistConfig across all transforms
-            # so mutations (e.g., allreduce_strategy) propagate to downstream fusions.
+            # Alias the shared DistConfig (already populated with allreduce_strategy
+            # from YAML by LlmArgs.init_dist_config) so any later mutations stay
+            # visible to downstream fusions.
             self.config.dist_config = shared_config.dist_config
         else:
             self.config._init_dist_config(shared_config.local_rank, shared_config.world_size)
 
         dc = self.config.dist_config
-        dc.allreduce_strategy = self.config.allreduce_strategy.name
         _log_sharding_prelude(dc)
 
         if shared_config.world_size < 2:

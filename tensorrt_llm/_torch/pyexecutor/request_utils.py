@@ -500,6 +500,7 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
             filter(
@@ -510,6 +511,7 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_lora_path,
                 ],
             )
         )

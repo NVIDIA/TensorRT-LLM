@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,7 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -55,7 +55,9 @@ class NVLinkOneSided(Communication):
     MAX_TOP_K = 8
     MAX_PAYLOADS = 8
 
-    # Single shared workspace/memory across the process
+    # Shared workspaces/memory across the process, keyed by payload layout.
+    _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
+    _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
     _WORKSPACE: dict | None = None
 
     # MetaInfo indices - initialized from C++ constants
@@ -221,10 +223,27 @@ class NVLinkOneSided(Communication):
             )
             self.workspace_size_per_rank = 2048 * 1024 * 1024
 
-        # Initialize or reuse workspace
+        # Initialize or reuse workspace.  The C++ op computes payload offsets
+        # from the current tensors at dispatch time, while the Python singleton
+        # owns the symmetric memory backing those offsets.  Keep separate
+        # workspaces for different payload layouts so one test/layer cannot
+        # reuse stale one-sided state from another shape.
         MnnvlMemory.initialize()
+        self._workspace_key = (
+            self.workspace_size_per_rank,
+            self.max_num_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.eplb_stats_num_experts,
+            self.num_experts,
+            self.top_k,
+            hidden_size,
+            dtype,
+            self.use_low_precision_combine,
+        )
 
-        if self._WORKSPACE is None:
+        workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
+        if workspace_state is None:
             tllm_logger.info(
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
@@ -238,37 +257,49 @@ class NVLinkOneSided(Communication):
                 self.max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
             )
-            NVLinkOneSided._WORKSPACE = {
+            workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
                 "ep_rank": self.ep_rank,
                 "ep_size": self.ep_size,
                 "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                "num_experts": self.num_experts,
+                "top_k": self.top_k,
+                "hidden_size": hidden_size,
+                "dtype": dtype,
+                "use_low_precision_combine": self.use_low_precision_combine,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
             }
+            NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         else:
-            assert self._WORKSPACE["workspace_size_per_rank"] == self.workspace_size_per_rank, (
-                "reuse workspace with different workspace_size_per_rank"
-            )
-            assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, (
-                "reuse workspace with different max_num_tokens_per_rank"
-            )
-            assert self._WORKSPACE["ep_rank"] == self.ep_rank, (
-                "reuse workspace with different ep_rank"
-            )
-            assert self._WORKSPACE["ep_size"] == self.ep_size, (
-                "reuse workspace with different ep_size"
-            )
-            assert self._WORKSPACE["eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
-                "reuse workspace with different eplb_stats_num_experts"
-            )
+            expected_workspace_state = {
+                "workspace_size_per_rank": self.workspace_size_per_rank,
+                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                "ep_rank": self.ep_rank,
+                "ep_size": self.ep_size,
+                "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                "num_experts": self.num_experts,
+                "top_k": self.top_k,
+                "hidden_size": hidden_size,
+                "dtype": dtype,
+                "use_low_precision_combine": self.use_low_precision_combine,
+            }
+            for key, expected_value in expected_workspace_state.items():
+                assert workspace_state[key] == expected_value, (
+                    f"reuse workspace with different {key}"
+                )
 
-        self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
-        self.workspace = self._WORKSPACE["workspace"]
-        self.moe_a2a_metainfo = self._WORKSPACE["metainfo"]
-        self.max_num_tokens_per_rank = self._WORKSPACE["max_num_tokens_per_rank"]
+        NVLinkOneSided._WORKSPACE = workspace_state
+        NVLinkOneSided._WORKSPACE_REFCOUNTS[self._workspace_key] = (
+            NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
+        )
+        self._destroyed = False
+        self.mnnvl_mem = workspace_state["mnnvl_mem"]
+        self.workspace = workspace_state["workspace"]
+        self.moe_a2a_metainfo = workspace_state["metainfo"]
+        self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
 
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
@@ -288,6 +319,35 @@ class NVLinkOneSided(Communication):
         NVLINK one-sided comm supports post-quant dispatch.
         """
         return True
+
+    def destroy(self):
+        """Release this instance's reference to the shared symmetric workspace."""
+        if getattr(self, "_destroyed", False):
+            return
+
+        self._destroyed = True
+        workspace_key = getattr(self, "_workspace_key", None)
+        if workspace_key is None:
+            return
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
+        if refcount > 0:
+            NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
+        else:
+            NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
+            workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
+            if NVLinkOneSided._WORKSPACE is workspace_state:
+                NVLinkOneSided._WORKSPACE = None
+            if workspace_state is not None:
+                workspace_state.clear()
+
+        self.mnnvl_mem = None
+        self.workspace = None
+        self.moe_a2a_metainfo = None
+        self._dispatch_state = {"phase": "destroyed"}
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """

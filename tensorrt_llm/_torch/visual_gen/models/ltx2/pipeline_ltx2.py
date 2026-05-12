@@ -18,7 +18,7 @@ from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
@@ -586,6 +586,10 @@ class LTX2Pipeline(BasePipeline):
         the reference ``LTXModelConfigurator.from_config()``.  Missing keys
         fall back to the same defaults the reference uses.
         """
+        attn_cfg = getattr(self.model_config, "attention", None)
+        if attn_cfg is not None and getattr(attn_cfg, "sage_attention_config", None) is not None:
+            raise NotImplementedError("SageAttention is not yet supported for the LTX-2 pipeline.")
+
         cfg = self.model_config.pretrained_config
 
         rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
@@ -1273,6 +1277,8 @@ class LTX2Pipeline(BasePipeline):
         if image is not None:
             _assert_resolution(height, width, is_two_stage=False)
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Build guider params
@@ -1779,6 +1785,7 @@ class LTX2Pipeline(BasePipeline):
         # forward_fn, so tell BasePipeline not to apply its own CFG.
         effective_guidance = 1.0 if use_multi_modal_guidance else guidance_scale
 
+        timer.mark_denoise_start()
         result = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -1803,6 +1810,8 @@ class LTX2Pipeline(BasePipeline):
 
         latents, extra_stream_latents = result
         audio_latents = extra_stream_latents["audio"]
+
+        timer.mark_post_start()
 
         # ---- 8. Decode --------------------------------------------------
         logger.info("Decoding video and audio...")
@@ -1846,4 +1855,16 @@ class LTX2Pipeline(BasePipeline):
             logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(video=video, audio=audio)
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                audio=audio,
+                frame_rate=float(frame_rate),
+                audio_sample_rate=(
+                    int(self.audio_sampling_rate)
+                    if getattr(self, "audio_sampling_rate", None) is not None and audio is not None
+                    else None
+                ),
+            )
+        )

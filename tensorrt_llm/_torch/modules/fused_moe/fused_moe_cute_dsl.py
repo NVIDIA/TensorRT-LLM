@@ -27,13 +27,14 @@ from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
 from ...custom_ops.cute_dsl_custom_ops import (
     GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -327,8 +328,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 (Sm100BlockScaledContiguousGroupedGemmRunner,
                  Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
                  Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner
-                 )):
+                 Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False
@@ -430,6 +430,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -445,6 +446,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
 
         if self.aux_stream_dict is None:
@@ -625,7 +627,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             moe_output.record_stream(
                 self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+        # Fused gather + GEMM + activation + quantize for FC1.
+        # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
+        # For non-gated (Relu2): weights are plain, output is N.
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=weight_view.w3_w1_weight[0].view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
@@ -641,6 +646,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
+            activation_type=self.activation_type,
         )
 
         if self.use_fused_finalize:
@@ -744,7 +750,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         moe_output.record_stream(
             self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=[
                 w.view(torch.float4_e2m1fn_x2) for w in weight_view.w3_w1_weight
@@ -764,6 +770,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
+            activation_type=self.activation_type,
         )
 
         with torch.cuda.stream(
@@ -818,6 +825,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
+        assert self.activation_type == ActivationType.Swiglu, (
+            "FP8 block-scales MoE path hardcodes SwiGLU (see swiglu_fused_moe "
+            f"below); got activation_type={ActivationType(self.activation_type).name}"
+        )
         weight_dtype = self.w3_w1_weight.dtype
 
         (

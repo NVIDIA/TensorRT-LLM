@@ -84,23 +84,14 @@ def test_qwen3_next_moe_patch():
     hidden_size = 16
     inputs = torch.randn(2, 6, hidden_size, dtype=torch.bfloat16)
 
-    # Reference: original HF forward returns (hidden_states, router_logits)
+    # Reference: original HF forward returns a single tensor in transformers 5.x
     with torch.no_grad():
-        ref_output, ref_router_logits = type(module).forward(module, inputs)
+        ref_output = type(module).forward(module, inputs)
 
-    # Patched: our _forward_moe also returns (hidden_states, router_logits)
+    # Patched: our _forward_moe also returns a single tensor
     module.forward = types.MethodType(_forward_moe, module)
     with torch.no_grad():
-        test_output, test_router_logits = module(inputs)
-
-    # Router logits should be identical (same computation path)
-    torch.testing.assert_close(
-        ref_router_logits,
-        test_router_logits,
-        atol=1e-5,
-        rtol=1e-5,
-        msg="Router logits mismatch between original and patched Qwen3Next MoE",
-    )
+        test_output = module(inputs)
 
     # Final hidden states should be very close
     # (small tolerance for different computation order in torch_moe)
