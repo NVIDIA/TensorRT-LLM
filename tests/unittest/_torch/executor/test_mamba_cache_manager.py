@@ -19,8 +19,8 @@ skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="require
 
 
 def _make_mgr(max_batch_size=4, max_draft_len=2):
-    # Pool size mirrors MambaHybridCacheManager's +max_draft_len+1 headroom.
-    pool = max_batch_size + max_draft_len + 1
+    # +1 headroom matches MixedMambaHybridCacheManager.pool_size.
+    pool = max_batch_size + 1
     return PythonMambaCacheManager(
         d_state=8,
         d_conv=4,
@@ -39,50 +39,73 @@ def _make_mgr(max_batch_size=4, max_draft_len=2):
 
 @skip_no_cuda
 def test_padding_slot_not_held_by_parked_real():
-    """get_state_indices must not hand the padding position a slot
-    owned by a live request outside the current batch. Padding entries
-    all reuse the pre-allocated slot of their dummy request (added via
-    add_dummy_requests), which is distinct from every real request's
-    slot."""
+    """Padding must not resolve to a slot owned by a parked real
+    request outside the current batch."""
     mgr = _make_mgr(max_batch_size=4, max_draft_len=2)
-    # Four real requests claim slots; pool has max_batch_size+max_draft_len+1 = 7 slots.
     mgr._prepare_mamba_cache_blocks([100, 101, 102, 103])
-    # Pre-allocate the padding dummy's slot (what _get_padded_batch does
-    # via kv_cache_manager.add_dummy_requests before get_state_indices).
     mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
-    # Current batch has only two reals; 102 and 103 are "parked".
+    # 102 and 103 are parked outside the current batch.
     request_ids = [100, 101, CUDA_GRAPH_DUMMY_REQUEST_ID]
     indices = mgr.get_state_indices(request_ids, [False, False, True])
     real_slots = {mgr.mamba_cache_index[r] for r in [100, 101, 102, 103]}
-    assert indices[2] not in real_slots, (
-        f"padding slot {indices[2]} overlaps a real request's slot (real slots: {real_slots})"
-    )
-    # Padding should reuse the dummy's reserved slot, not allocate a new one.
+    assert indices[2] not in real_slots
     assert indices[2] == mgr.mamba_cache_index[CUDA_GRAPH_DUMMY_REQUEST_ID]
 
 
 @skip_no_cuda
 def test_padding_survives_overlap_scheduler_pressure():
-    """Regression for the overlap-scheduler + attention-dp + CUDA-graph
-    padding combo: prior-iter completions linger in mamba_cache_index
-    until _process_previous_batch runs, so get_state_indices must not
-    require N unused pool slots to serve N padding entries."""
+    """Under the overlap scheduler, prior-iter completions linger in
+    mamba_cache_index, so N padding entries must not need N free
+    slots."""
     mgr = _make_mgr(max_batch_size=4, max_draft_len=0)
-    # Fill the pool with "live" real requests (simulates completed
-    # requests from prior iter that haven't been freed yet).
     mgr._prepare_mamba_cache_blocks([100, 101, 102, 103])
-    # Pre-allocate the padding dummy's slot.
     mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
-    # Current batch: 1 real request + 3 padding entries (attention-dp
-    # pushed padded_batch_size to 4 on this rank even though only 1 real
-    # gen request is scheduled here).
+    # 1 real + 3 padding (attention-dp padded_batch_size=4 on this rank).
     request_ids = [100] + [CUDA_GRAPH_DUMMY_REQUEST_ID] * 3
     is_padding = [False] + [True] * 3
     indices = mgr.get_state_indices(request_ids, is_padding)
-    # All padding entries share the dummy's slot.
     dummy_slot = mgr.mamba_cache_index[CUDA_GRAPH_DUMMY_REQUEST_ID]
     assert indices[0] == mgr.mamba_cache_index[100]
     assert indices[1:] == [dummy_slot] * 3
+
+
+@skip_no_cuda
+def test_all_draft_len_sentinels_share_one_slot():
+    """All per-draft-len sentinels must collapse to a single slot, so
+    the pool needs only +1 headroom regardless of max_draft_len."""
+    max_batch_size, max_draft_len = 4, 3
+    mgr = _make_mgr(max_batch_size=max_batch_size, max_draft_len=max_draft_len)
+    mgr._prepare_mamba_cache_blocks([100, 101, 102, 103])
+
+    sentinels = [CUDA_GRAPH_DUMMY_REQUEST_ID - k for k in range(max_draft_len + 1)]
+    mgr.add_dummy_requests(sentinels)
+
+    shared = mgr.mamba_cache_index[sentinels[0]]
+    real_slots = {mgr.mamba_cache_index[r] for r in [100, 101, 102, 103]}
+    assert shared not in real_slots
+    for s in sentinels:
+        assert mgr.mamba_cache_index[s] == shared
+    assert mgr.mamba_cache_free_blocks == []
+
+
+@skip_no_cuda
+def test_padding_slot_is_permanent():
+    """free_resources drops a sentinel's index entry but the shared
+    slot stays reserved for the next batch."""
+    mgr = _make_mgr(max_batch_size=4, max_draft_len=2)
+    sentinels = [CUDA_GRAPH_DUMMY_REQUEST_ID - k for k in range(3)]
+    mgr.add_dummy_requests(sentinels)
+    shared = mgr.mamba_cache_index[sentinels[0]]
+
+    def _fake(rid):
+        return SimpleNamespace(py_request_id=rid)
+
+    for s in sentinels:
+        mgr.free_resources(_fake(s))
+        assert s not in mgr.mamba_cache_index
+        assert shared not in mgr.mamba_cache_free_blocks
+
+    assert mgr._padding_slot == shared
 
 
 @skip_no_cuda
@@ -126,7 +149,6 @@ def test_update_mamba_states_mtp_path():
 
 @skip_no_cuda
 def test_update_mamba_states_autodeploy_path():
-    """Test update_mamba_states in AutoDeploy path."""
     mgr = _make_mgr()
     mgr._prepare_mamba_cache_blocks([200, 201, 202])
 
@@ -165,7 +187,6 @@ def test_update_mamba_states_autodeploy_path():
 
 @skip_no_cuda
 def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
-    """Test non-MTP PyTorch backend prepare and get_state_indices flow."""
     mgr = _make_mgr(max_batch_size=4, max_draft_len=0)
     # Simulate a non-MTP step: mix of context + generation requests,
     # plus a CUDA-graph padding dummy.

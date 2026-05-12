@@ -416,12 +416,21 @@ class BatchInfo:
         # Use the tensor view directly so fake tensors can flow through
         # torch.compile metadata tracing without requiring a real .numpy() view.
         self._batch_info = batch_info_host
+        # Cached zero-copy numpy view for fast scalar/list writes on the host path.
+        # `.numpy()` raises RuntimeError on fake tensors, so guard the call.
+        try:
+            self._batch_info_np = batch_info_host.numpy()
+        except RuntimeError:
+            self._batch_info_np = None
 
     def serialize(self) -> torch.Tensor:
         return self._batch_info_host
 
     def update(self, batch_info: List[int]) -> None:
-        self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
+        if self._batch_info_np is not None:
+            self._batch_info_np[:6] = batch_info
+        else:
+            self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
 
     def is_generate_only(self) -> bool:
         return self._batch_info[:4].sum().item() == 0

@@ -37,9 +37,9 @@ def initialize_tokenizer(model_name: str,
         model_name (str): The name of the HuggingFace model to pull a
         tokenizer from.
         custom_tokenizer (str, optional): A built-in alias (e.g.,
-        'deepseek_v32', 'glm_moe_dsa') or a fully-qualified
-        'module.path.ClassName' for models whose HF tokenizer_config.json
-        is incompatible with AutoTokenizer.
+        'deepseek_v32') or a fully-qualified 'module.path.ClassName' for
+        models whose HF tokenizer_config.json is incompatible with
+        AutoTokenizer.
 
     Returns:
         PreTrainedTokenizer: An initialized HuggingFace tokenizer.

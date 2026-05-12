@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import math
 import os
@@ -17,6 +17,7 @@ from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...inputs import (
+    AudioData,
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
     ExtraProcessedInputs,
@@ -1140,12 +1141,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             return feature_size
         return self.num_image_token
 
+    # TODO(TRTLLM-12465): Accept a VideoData container here instead of passing
+    # frames, metadata, and audio as separate arguments.
     def get_num_tokens_per_video(
         self,
         *,
         video: List[Union[Image.Image, torch.Tensor]],
         video_pruning_rate: Optional[float] = None,
         video_metadata: Optional[dict] = None,
+        video_audio: Optional[AudioData] = None,
         **kwargs,
     ):
         # Use VIDEO_PRUNING_RATIO if not explicitly provided
@@ -1189,16 +1193,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # _extract_audio_from_video). Account for those tokens so
         # total_mm_tokens_in_request matches the actual mm-token count in the
         # tokenized prompt and len(mm_embed) at forward time.
-        if (
-            isinstance(video_metadata, dict)
-            and "audio_samples" in video_metadata
-            and self._audio_extractor is not None
-        ):
+        if video_audio is not None and self._audio_extractor is not None:
             num_total_tokens += self.get_num_tokens_per_audio(
-                audio=(
-                    video_metadata["audio_samples"],
-                    video_metadata["audio_sample_rate"],
-                )
+                audio=(video_audio.samples, video_audio.sample_rate)
             )
 
         return num_total_tokens
@@ -1251,8 +1248,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 video).
                 `mm_data_updates` (Optional[Dict]) — additional fields to
                 merge into `extra_processed_inputs["multimodal_data"]`.
-                Currently only non-None for EVS-enabled video, in which case
-                it is `{"video": {"evs_ids": evs_ids_tensor}}`.
+                Currently non-None for EVS-enabled image/audio/video requests,
+                in which case it carries a modality-specific `evs_ids` tensor.
         """
         # Detect modality primarily from `mm_data`, which is authoritative and
         # independent of tokenizer quirks. The token-scanning fallback is only
@@ -1286,12 +1283,26 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             expanded = self._expand_image_placeholders_in_token_ids(
                 prompt_token_ids, num_mm_tokens_per_placeholder
             )
-            return expanded, None
+            mm_data_updates = None
+            if self.video_pruning_rate > 0:
+                mm_data_updates = {
+                    "image": {
+                        "evs_ids": torch.tensor(expanded, dtype=torch.long),
+                    },
+                }
+            return expanded, mm_data_updates
         if has_audio:
             expanded = self._expand_audio_placeholders_in_token_ids(
                 prompt_token_ids, num_mm_tokens_per_placeholder
             )
-            return expanded, None
+            mm_data_updates = None
+            if self.video_pruning_rate > 0:
+                mm_data_updates = {
+                    "audio": {
+                        "evs_ids": torch.tensor(expanded, dtype=torch.long),
+                    },
+                }
+            return expanded, mm_data_updates
         # has_video -- reuse `mm_data` already extracted above for detection.
         expanded_ids, evs_ids_tensor = self._expand_video_placeholders_in_token_ids(
             prompt_token_ids, num_mm_tokens_per_placeholder, mm_data or None
@@ -1544,16 +1555,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         video_evs_expansions: Optional[List[List[int]]] = [] if evs_enabled else None
         for video_data in videos:
             # `video_data` comes in two shapes:
-            #   - A `VideoData`-like object (with `.frames` / `.metadata`
-            #     attributes) — the production case (openai_server wraps
-            #     video inputs this way) and the unit-test case (tests use
-            #     `SimpleNamespace(frames=..., metadata=...)`).
+            #   - A `VideoData`-like object (with `.frames` / `.metadata` /
+            #     `.audio` attributes) — the production case (openai_server
+            #     wraps video inputs this way).
             #   - A plain list of frames (no metadata) — the defensive
             #     fallback when callers pass raw frames directly, matching
             #     the pattern in `find_mm_token_lengths` in multimodal.py.
             # `getattr` with a default handles both uniformly.
             frames = getattr(video_data, "frames", video_data)
             metadata = getattr(video_data, "metadata", None)
+            audio = getattr(video_data, "audio", None)
 
             video_size = self._compute_video_shape_descriptor(frames)
             # When EVS is enabled, `_compute_token_numbers_per_video`
@@ -1590,19 +1601,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             # an unnecessary librosa.resample (we only need the resampled length, not
             # the resampled samples themselves).
             # Audio is NOT pruned by EVS, so both streams need identical audio slots.
-            if (
-                isinstance(metadata, dict)
-                and "audio_samples" in metadata
-                and self._audio_extractor is not None
-            ):
+            if audio is not None and self._audio_extractor is not None:
                 num_audio_context = (
-                    self.get_num_tokens_per_audio(
-                        audio=(
-                            metadata["audio_samples"],
-                            metadata["audio_sample_rate"],
-                        )
-                    )
-                    - 2
+                    self.get_num_tokens_per_audio(audio=(audio.samples, audio.sample_rate)) - 2
                 )
                 audio_ids = (
                     [self._sound_start_token_id]
@@ -2106,9 +2107,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             )
         elif videos is not None:
             modality_type = "video"
-            video_frames, video_metadatas = (
+            video_frames, video_metadatas, video_audios = (
                 [video_data.frames for video_data in videos],
                 [video_data.metadata for video_data in videos],
+                [getattr(video_data, "audio", None) for video_data in videos],
             )
             num_videos = len(video_frames)
             processed_images = self._process_videos_frames(video_frames)
@@ -2122,7 +2124,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 processed_images["video_size"], video_metadatas
             )
 
-            text_prompt, audio_data = self._extract_audio_from_video(text_prompt, video_metadatas)
+            text_prompt, audio_data = self._extract_audio_from_video(text_prompt, video_audios)
 
             split_text_prompt = text_prompt.split(self.video_context_token)
             if len(split_text_prompt) - 1 != num_videos:
@@ -2145,6 +2147,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         elif audios is not None:
             modality_type = "audio"
             input_ids, modality_data = self._process_audio(text_prompt, audios)
+            modality_data["evs_ids"] = (
+                input_ids[0].to(torch.int32) if self.video_pruning_rate > 0 else None
+            )
 
         # Will package inputs for language model forward in AGGREGATE mode.
         multimodal_data = {}
@@ -2204,9 +2209,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _extract_audio_from_video(
         self,
         text_prompt: str,
-        video_metadatas: List[dict],
+        video_audios: List[Optional[AudioData]],
     ) -> Tuple[str, Optional[dict]]:
-        """Extract audio streams from video metadata and prepare audio features.
+        """Extract structured video audio streams and prepare audio features.
 
         Injects audio placeholder tokens after each video that carries an audio stream, resamples
         audio to the extractor's target sample rate, expands placeholder tokens, and computes
@@ -2215,11 +2220,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         Returns the (possibly modified) text prompt and an audio data dict (or
         `None` when no audio is present).
         """
-        has_audio = [meta is not None and "audio_samples" in meta for meta in video_metadatas]
+        has_audio = [audio is not None for audio in video_audios]
         audio_from_video = [
-            (meta["audio_samples"], meta["audio_sample_rate"])
-            for meta in video_metadatas
-            if meta is not None and "audio_samples" in meta
+            (audio.samples, audio.sample_rate) for audio in video_audios if audio is not None
         ]
 
         if not audio_from_video or self._audio_extractor is None:
@@ -2229,10 +2232,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Split on <video> and rebuild so each placeholder lands after the
         # correct video, not all after the first one.
         parts = text_prompt.split(self.video_context_token)
-        if len(parts) - 1 != len(video_metadatas):
+        if len(parts) - 1 != len(video_audios):
             raise ValueError(
                 f"Number of {self.video_context_token} tokens ({len(parts) - 1}) "
-                f"doesn't match the number of videos ({len(video_metadatas)})"
+                f"doesn't match the number of videos ({len(video_audios)})"
             )
         rebuilt = [parts[0]]
         for i, part in enumerate(parts[1:]):
@@ -2489,6 +2492,136 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
+    def _build_evs_adjusted_context_ids(
+        self,
+        evs_ids: torch.Tensor,
+        modality: str,
+        num_tokens_in_video: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Build full per-request token IDs after EVS placeholder expansion.
+
+        Args:
+            evs_ids: Full per-request token IDs from preprocessing. For video,
+                this contains one video placeholder per tubelet before final EVS
+                expansion. For image/audio, this is already the final token ID layout.
+            modality: Request modality, one of "image", "video", or "audio".
+            num_tokens_in_video: Per-tubelet retained image-token counts after
+                EVS for video requests. Unused for image/audio requests.
+
+        Returns:
+            Full per-request token IDs with video placeholders replaced by the
+            post-EVS number of image context tokens.
+        """
+        if modality in ("image", "audio"):
+            return evs_ids
+        if modality != "video":
+            raise ValueError(f"Unsupported modality for EVS merge: {modality}")
+
+        # evs_ids is a flat 1-D tensor built at token-ID level. Replace each
+        # video placeholder with the post-EVS count for the corresponding tubelet.
+        request_context_parts = []
+        placeholder_mask = evs_ids == self.video_context_token_id
+        placeholder_positions = placeholder_mask.nonzero(as_tuple=True)[0]
+        image_idx = 0
+        prev_end = 0
+        for pos in placeholder_positions:
+            pos = pos.item()
+            if pos > prev_end:
+                request_context_parts.append(evs_ids[prev_end:pos])
+            request_context_parts.append(
+                torch.full(
+                    (int(num_tokens_in_video[image_idx]),),
+                    fill_value=self.img_context_token_id,
+                    dtype=evs_ids.dtype,
+                    device=evs_ids.device,
+                )
+            )
+            image_idx += 1
+            prev_end = pos + 1
+        if prev_end < len(evs_ids):
+            request_context_parts.append(evs_ids[prev_end:])
+        return torch.cat(request_context_parts, dim=0)
+
+    def _refresh_evs_runtime_and_slice_context_ids(
+        self,
+        context_ids: torch.Tensor,
+        multimodal_param: MultimodalParams,
+    ) -> torch.Tensor:
+        """Refresh runtime MM counters and slice to the current context chunk.
+
+        Args:
+            context_ids: Full per-request token IDs after EVS adjustment.
+            multimodal_param: Per-request multimodal parameters. When
+                `multimodal_runtime` is present, its MM-token counters are
+                updated from `context_ids`.
+
+        Returns:
+            `context_ids` narrowed to the current context chunk when runtime
+            metadata is present; otherwise the original `context_ids`.
+        """
+        runtime = multimodal_param.multimodal_runtime
+        if runtime is None:
+            return context_ids
+        if runtime.chunk_end_pos > context_ids.shape[0]:
+            raise ValueError(
+                "EVS context chunk end position "
+                f"({runtime.chunk_end_pos}) exceeds full context "
+                f"length ({context_ids.shape[0]})."
+            )
+
+        embed_mask = context_ids == self.img_context_token_id
+        sound_context_token_id = getattr(self, "sound_context_token_id", None)
+        if sound_context_token_id is not None:
+            embed_mask = torch.logical_or(embed_mask, context_ids == sound_context_token_id)
+        embed_mask_cumsum = embed_mask.cumsum(0, dtype=torch.int64)
+        runtime.num_cached_mm_tokens = (
+            int(embed_mask_cumsum[runtime.past_seen_token_num - 1])
+            if runtime.past_seen_token_num > 0
+            else 0
+        )
+        runtime.num_mm_tokens_in_chunk = (
+            int(embed_mask_cumsum[runtime.chunk_end_pos - 1]) - runtime.num_cached_mm_tokens
+            if runtime.chunk_end_pos > 0
+            else 0
+        )
+        runtime.total_embeds_in_request = int(embed_mask_cumsum[-1])
+        return context_ids[runtime.past_seen_token_num : runtime.chunk_end_pos]
+
+    @staticmethod
+    def _validate_evs_context_batch(
+        ctx_params: List[MultimodalParams],
+        num_context_requests: int,
+    ) -> None:
+        """Reject EVS video mixed with text-only context requests.
+
+        Args:
+            ctx_params: Multimodal params associated with current context
+                requests. Today this list contains only context requests with
+                multimodal content.
+            num_context_requests: Total number of current context requests in
+                the flattened forward batch, including text-only requests.
+
+        Raises:
+            ValueError: If an EVS video context is batched together with a
+                text-only context request.
+        """
+        has_video = any(
+            param.has_content() and param.multimodal_data.get("modality_type") == "video"
+            for param in ctx_params
+        )
+        has_text_only_context = len(ctx_params) < num_context_requests or any(
+            not param.has_content() for param in ctx_params
+        )
+        if has_video and has_text_only_context:
+            # TODO(TRTLLM-12534): Remove this guard once merge_evs_mm_embeds writes each
+            # multimodal context chunk using its flattened input_ids offset
+            # instead of assuming a contiguous multimodal prefix.
+            raise ValueError(
+                "EVS video requests cannot be inflight-batched with text-only "
+                "context requests yet. merge_evs_mm_embeds currently assumes "
+                "multimodal context chunks form a contiguous input_ids prefix."
+            )
+
     def merge_evs_mm_embeds(
         self,
         num_tokens_in_videos: List[int],
@@ -2514,52 +2647,50 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if "video" not in modalities:
             return input_ids
 
-        evs_ids_lst = [
-            multimodal_data[modality]["evs_ids"]
-            for modality, multimodal_data in zip(modalities, multimodal_data_lst)
-        ]
+        evs_ids_lst = []
+        for modality, multimodal_data in zip(modalities, multimodal_data_lst, strict=True):
+            if modality not in ("image", "video", "audio"):
+                raise ValueError(f"Unsupported modality for EVS merge: {modality}")
+            evs_ids = multimodal_data[modality].get("evs_ids")
+            if evs_ids is None:
+                raise ValueError(
+                    f"Missing evs_ids for {modality} modality while merging EVS inputs."
+                )
+            evs_ids_lst.append(evs_ids)
         # Iterate over batch, replacing video_context_token_id placeholders with
         # the actual per-tubelet img_context_token counts from EVS.
         context_parts = []
-        for evs_ids, modality, num_tokens_in_video in zip(
-            evs_ids_lst, modalities, num_tokens_in_videos
+        for multimodal_param, evs_ids, modality, num_tokens_in_video in zip(
+            multimodal_params, evs_ids_lst, modalities, num_tokens_in_videos, strict=True
         ):
-            # Image modality: keep input_ids unchanged during inflight-batching.
-            if modality == "image":
-                context_parts.append(evs_ids)
-                continue
+            context_ids = self._build_evs_adjusted_context_ids(
+                evs_ids, modality, num_tokens_in_video
+            )
+            # EVS can redistribute image tokens across tubelets, so refresh
+            # runtime counters from the post-EVS layout before slicing embeddings.
+            context_ids = self._refresh_evs_runtime_and_slice_context_ids(
+                context_ids, multimodal_param
+            )
+            context_parts.append(context_ids)
 
-            # evs_ids is a flat 1-D tensor built at token-ID level.
-            # Find placeholder positions and replace each with the EVS count.
-            placeholder_mask = evs_ids == self.video_context_token_id
-            placeholder_positions = placeholder_mask.nonzero(as_tuple=True)[0]
-            image_idx = 0
-            prev_end = 0
-            for pos in placeholder_positions:
-                pos = pos.item()
-                # Append tokens before this placeholder.
-                if pos > prev_end:
-                    context_parts.append(evs_ids[prev_end:pos])
-                # Replace placeholder with actual img_context_token count.
-                context_parts.append(
-                    torch.full(
-                        (int(num_tokens_in_video[image_idx]),),
-                        fill_value=self.img_context_token_id,
-                        dtype=evs_ids.dtype,
-                        device=evs_ids.device,
-                    )
-                )
-                image_idx += 1
-                prev_end = pos + 1
-            # Append remaining tokens after the last placeholder.
-            if prev_end < len(evs_ids):
-                context_parts.append(evs_ids[prev_end:])
-
+        if not context_parts:
+            return input_ids
         context_ids = torch.cat(context_parts, dim=0)
         # -> [num_tokens, ]
 
         # Special handling for inflight-batching.
         # Assume input ids format is [context_ids, generation_ids].
+        # Under chunked prefill, multimodal_runtime narrows context_ids to the current
+        # context chunk so decode ids after it are preserved.
+        if context_ids.shape[0] > input_ids.shape[0]:
+            raise ValueError(
+                "EVS-adjusted context length "
+                f"({context_ids.shape[0]}) exceeds input_ids length "
+                f"({input_ids.shape[0]}). This usually means a chunked "
+                "multimodal request reached merge_evs_mm_embeds without "
+                "multimodal_runtime metadata."
+            )
+        context_ids = context_ids.to(device=input_ids.device, dtype=input_ids.dtype)
         input_ids[: context_ids.shape[0]] = context_ids
         del context_ids
 
@@ -2749,10 +2880,13 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embedding = []
         if len(multimodal_params) > 0:
+            ctx_params = multimodal_params[:num_context_requests]
+            if self.video_pruning_rate > 0:
+                self._validate_evs_context_batch(ctx_params, num_context_requests)
             if not _is_disagg():
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self._encode_multimodal,
-                    multimodal_params=multimodal_params[:num_context_requests],
+                    multimodal_params=ctx_params,
                 )
             else:
                 raise NotImplementedError(
@@ -2762,7 +2896,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
                 # Retrieve per-video count stashed by `_encode_multimodal`.
-                ctx_params = multimodal_params[:num_context_requests]
                 num_tokens_in_videos = [
                     param.multimodal_data.get("num_tokens_in_video")
                     for param in ctx_params
@@ -2774,9 +2907,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     input_ids=input_ids,
                 )
 
-            mm_embedding = find_input_mm_embeds(
-                mm_embedding, multimodal_params[:num_context_requests]
-            )
+            mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)
 
         mm_token_ids_list = [self.img_context_token_id]
         if self.sound_context_token_id is not None:
