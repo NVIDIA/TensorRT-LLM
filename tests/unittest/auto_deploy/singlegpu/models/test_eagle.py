@@ -16,6 +16,7 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
+from typing import Any, ClassVar, Dict
 
 import pytest
 import torch
@@ -79,7 +80,7 @@ class MockEagleConfig(EagleConfig):
     For standalone testing, we need to load these from the checkpoint.
     """
 
-    _drafter_defaults = {
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": False,
             "load_lm_head_from_target": False,
