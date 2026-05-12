@@ -24,7 +24,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.models.quant_config_utils import \
-    update_quant_config_from_compressed_tensors
+    update_quant_config_from_compressed_tensors, is_w4a16_nvfp4_hf_quant_config
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config, read_modelopt_quant_config,
@@ -314,16 +314,16 @@ class ModelConfig(Generic[TConfig]):
 
     @staticmethod
     def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
-                                   moe_backend):
+                                   moe_backend, hf_quant_config=None):
         with open(quant_config_file) as f:
             quant_config_dict = json.load(f)
         return ModelConfig._build_modelopt_quant_config(
             read_modelopt_quant_config(quant_config_dict), checkpoint_dir,
-            moe_backend)
+            moe_backend, hf_quant_config)
 
     @staticmethod
     def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
-                                     moe_backend):
+                                     moe_backend, hf_quant_config=None):
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
 
         ``json_quant_configs`` should be a dict as produced by
@@ -347,6 +347,13 @@ class ModelConfig(Generic[TConfig]):
             quant_config.has_zero_point = json_quant_configs['has_zero_point']
         if 'pre_quant_scale' in json_quant_configs:
             quant_config.pre_quant_scale = json_quant_configs['pre_quant_scale']
+
+        if (quant_config.quant_algo in (QuantAlgo.NVFP4, "NVFP4") and
+                is_w4a16_nvfp4_hf_quant_config(hf_quant_config)):
+            quant_config.quant_algo = QuantAlgo.W4A16_NVFP4
+            quant_config.group_size = 16
+            quant_config.exclude_modules = hf_quant_config.get(
+                "ignore", quant_config.exclude_modules)
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
             json_extended_quant_configs: dict = {}
@@ -536,6 +543,7 @@ class ModelConfig(Generic[TConfig]):
         new_algo = os.environ.get("OVERRIDE_QUANT_ALGO", None)
         supported_algos = {
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
+            "W4A16_NVFP4": QuantAlgo.W4A16_NVFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,
             "W4A8_MXFP4_FP8": QuantAlgo.W4A8_MXFP4_FP8,
         }
@@ -692,6 +700,9 @@ class ModelConfig(Generic[TConfig]):
         moe_backend_hint = cls.resolve_moe_backend(requested_moe_backend,
                                                    architecture)
 
+        hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                  None)
+
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,
                                             'hf_quant_config.json'):
@@ -706,7 +717,7 @@ class ModelConfig(Generic[TConfig]):
                 source_file="hf_quant_config.json",
             )
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
-                normalized, checkpoint_dir, moe_backend_hint)
+                normalized, checkpoint_dir, moe_backend_hint, hf_quant_config=hf_quant_config)
         # quantized ckpt in other formats
         elif getattr(pretrained_config, "quantization_config",
                      None) is not None:

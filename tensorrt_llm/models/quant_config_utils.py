@@ -18,6 +18,22 @@ from typing import Any, Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+def is_w4a16_nvfp4_hf_quant_config(hf_quant_config):
+    if hf_quant_config is None:
+        return False
+    config_groups = hf_quant_config.get("config_groups")
+    if config_groups is None:
+        return False
+
+    group_config = config_groups.get("group_0")
+    if group_config is None:
+        return False
+    weights_quant_config = group_config.get("weights", {})
+    inputs_quant_config = group_config.get("input_activations")
+    return (hf_quant_config.get("format") == "nvfp4-pack-quantized"
+            and weights_quant_config.get("num_bits") == 4
+            and weights_quant_config.get("group_size") == 16
+            and inputs_quant_config is None)
 
 def update_quant_config_from_compressed_tensors(
     quant_config: QuantConfig, hf_quant_config: Mapping[str, Any]
@@ -32,7 +48,10 @@ def update_quant_config_from_compressed_tensors(
     weights_quant_strategy = weights_quant_config["strategy"]
     inputs_quant_strategy = inputs_quant_config["strategy"]
 
-    if weights_quant_config["num_bits"] == 8:
+    if is_w4a16_nvfp4_hf_quant_config(hf_quant_config):
+        quant_config.quant_algo = QuantAlgo.W4A16_NVFP4
+        quant_config.group_size = 16
+    elif weights_quant_config["num_bits"] == 8:
         if weights_quant_strategy == "channel":
             if inputs_quant_strategy != "token":
                 raise ValueError(f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}.")

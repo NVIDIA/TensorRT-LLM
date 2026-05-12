@@ -1,3 +1,4 @@
+import json
 import types
 
 import pytest
@@ -7,6 +8,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.mode import QuantMode
 
 
 def make_pretrained_config(
@@ -116,3 +118,85 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def test_quant_mode_distinguishes_w4a16_nvfp4_from_w4a4_nvfp4():
+    w4a4_mode = QuantMode.from_quant_algo(QuantAlgo.NVFP4)
+    assert w4a4_mode.has_nvfp4()
+    assert not w4a4_mode.has_w4a16_nvfp4()
+
+    w4a16_mode = QuantMode.from_quant_algo(QuantAlgo.W4A16_NVFP4)
+    assert w4a16_mode.has_w4a16_nvfp4()
+    assert not w4a16_mode.has_nvfp4()
+    assert w4a16_mode.has_any_quant(exclude_kv_cache=True)
+
+
+def test_load_hf_quant_config_detects_nvfp4_w4a16_compressed_tensors():
+    hf_quant_config = {
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "ignore": ["mtp.layers"],
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear", "lm_head"],
+                "weights": {
+                    "type": "float",
+                    "num_bits": 4,
+                    "strategy": "group",
+                    "group_size": 16,
+                },
+                "input_activations": None,
+            },
+        },
+    }
+
+    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
+        hf_quant_config, moe_backend="CUTLASS"
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert quant_config.group_size == 16
+    assert quant_config.exclude_modules == ["mtp.layers"]
+    assert layer_quant_config is None
+
+
+def test_load_modelopt_quant_config_respects_hf_w4a16_metadata(tmp_path):
+    modelopt_quant_config = {
+        "quantization": {
+            "quant_algo": "NVFP4",
+            "kv_cache_quant_algo": None,
+            "group_size": 16,
+            "exclude_modules": ["mtp*"],
+        }
+    }
+    hf_quant_config = {
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "ignore": ["mtp.layers.0.mixer.q_proj"],
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear", "lm_head"],
+                "weights": {
+                    "type": "float",
+                    "num_bits": 4,
+                    "strategy": "tensor_group",
+                    "group_size": 16,
+                },
+                "input_activations": None,
+            },
+        },
+    }
+    quant_config_file = tmp_path / "hf_quant_config.json"
+    quant_config_file.write_text(json.dumps(modelopt_quant_config), encoding="utf-8")
+
+    quant_config, layer_quant_config = ModelConfig.load_modelopt_quant_config(
+        str(quant_config_file),
+        str(tmp_path),
+        moe_backend="CUTLASS",
+        hf_quant_config=hf_quant_config,
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert quant_config.group_size == 16
+    assert quant_config.exclude_modules == ["mtp.layers.0.mixer.q_proj"]
+    assert layer_quant_config is None

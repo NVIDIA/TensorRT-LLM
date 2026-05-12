@@ -18,6 +18,7 @@ from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
 from ...models.modeling_utils import QuantConfig
+from ...quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
@@ -368,16 +369,20 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_rank = config.mapping.pp_rank
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
+        lm_head_quant_config = None
+        if (config.quant_config is not None and config.quant_config.quant_algo
+                in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4") and not config.
+                quant_config.is_module_excluded_from_quantization("lm_head")):
+            lm_head_quant_config = config.quant_config
 
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
+                quant_config=lm_head_quant_config,
             )
         else:
-            # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-            # will considering per layer QuantConfig in the future.
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
@@ -399,6 +404,7 @@ class DecoderModelForCausalLM(nn.Module,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
+                quant_config=lm_head_quant_config,
             )
 
             if self.has_custom_lm_head:

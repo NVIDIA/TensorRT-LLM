@@ -1861,6 +1861,75 @@ class NVFP4LinearMethod(LinearMethodBase):
                     module.rebuild_tensor_metadata)
 
 
+class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        module.scaling_vector_size = 16
+        assert in_features % module.scaling_vector_size == 0, (
+            f"in_features {in_features} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+        )
+
+        module.weight = Parameter(torch.empty([out_features, in_features // 2],
+                                              dtype=fp4_utils.float4_e2m1x2),
+                                  requires_grad=False)
+
+        nrows = fp4_utils.pad_up(out_features, 128)
+        ncols = fp4_utils.pad_up(in_features // module.scaling_vector_size, 4)
+        module.weight_scale = Parameter(torch.empty(
+            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype),
+                                        requires_grad=False)
+
+        module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
+                                          requires_grad=False)
+
+        module.input_scale = None
+        module.inv_input_scale = None
+        module.alpha = None
+        module.pre_quant_scale = None
+
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        original_shape = None
+        if input.dim() > 2:
+            original_shape = input.shape
+            input = input.reshape(-1, input.shape[-1])
+
+        if module.pre_quant_scale is not None:
+            assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
+            input = input * module.pre_quant_scale
+
+        output = torch.ops.trtllm.w4a16_nvfp4_gemm(
+            input,
+            module.weight,
+            module.weight_scale,
+            module.weight_scale_2,
+            module.dtype,
+            bias=None,
+        )
+
+        if output.shape[-1] > module.out_features:
+            output = output[..., :module.out_features].contiguous()
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
+        if bias is not None:
+            output = output + bias
+        return output
+
+
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
@@ -2720,6 +2789,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
             return NVFP4ARCLinearMethod()
         else:
             return NVFP4LinearMethod()
+    if quant_config.layer_quant_mode.has_w4a16_nvfp4():
+        return W4A16NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
         return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
