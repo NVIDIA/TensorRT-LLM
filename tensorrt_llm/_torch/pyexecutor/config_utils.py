@@ -458,9 +458,8 @@ def load_pretrained_config(model_name_or_path: str,
                             )):
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
-    elif (model_type == "exaone4"
-            and config_dict.get("sliding_window") is None
-            and config_dict.get("layer_types") is None):
+    elif (model_type == "exaone4" and config_dict.get("sliding_window") is None
+          and config_dict.get("layer_types") is None):
         # transformers 5.5.x Exaone4Config.__post_init__ first forces
         # `sliding_window_pattern = 0` when `sliding_window is None`, then
         # synthesizes `layer_types` via `(i + 1) % sliding_window_pattern`,
@@ -471,8 +470,9 @@ def load_pretrained_config(model_name_or_path: str,
         # filtering by going through CONFIG_MAPPING + from_dict.
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
         n_layers = config_dict.get("num_hidden_layers") or 32
-        patched_dict = {**config_dict,
-                        "layer_types": ["full_attention"] * n_layers}
+        patched_dict = {
+            **config_dict, "layer_types": ["full_attention"] * n_layers
+        }
         model_config = CONFIG_MAPPING[model_type].from_dict(patched_dict)
     else:
         model_config = transformers.AutoConfig.from_pretrained(
