@@ -727,6 +727,9 @@ class StorageManager:
     def ratio_from_length(
         self, tokens_per_block: int, history_length: int, capacity: int
     ) -> TypedIndexList[PoolGroupIndex, float]:
+        if capacity < history_length:
+            warnings.warn("Bad sampling for capacity and history_length")
+            capacity = history_length
         num_blocks = div_up(capacity, tokens_per_block)
         num_bytes = filled_list(0.0, self.num_pool_groups)
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
@@ -738,7 +741,7 @@ class StorageManager:
                 num_required_blocks = 1
             else:
                 stale = lc.get_stale_range(history_length, tokens_per_block)
-                num_required_blocks = num_blocks - len(stale)
+                num_required_blocks = max(num_blocks - len(stale), 1)
             num_bytes[pg_idx] += num_required_blocks * sum(slot_size)
         total = sum(num_bytes)
         assert total > 0

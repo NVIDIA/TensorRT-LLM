@@ -381,6 +381,8 @@ class ServerConfig:
             # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
+            # moe_config
+            "l_load_balancer_num_slots",
         ]
 
     def to_db_data(self) -> dict:
@@ -1178,7 +1180,9 @@ class PerfSanityTestConfig:
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 raise RuntimeError("Failed to get GPU type")
 
-        self.upload_to_db = "upload" in test_case_name.split("-")[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.gpu_type = get_gpu_type()
 
         # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode

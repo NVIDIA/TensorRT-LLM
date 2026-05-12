@@ -250,7 +250,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             num_tokens = len(new_tokens)
 
         accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.10
+        assert accept_rate > 0.1
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)

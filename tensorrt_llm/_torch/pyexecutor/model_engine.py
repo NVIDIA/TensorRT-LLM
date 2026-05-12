@@ -1365,6 +1365,8 @@ class PyTorchModelEngine(ModelEngine):
             "Cannot fuse drafting loop. Not enough KV cache space for all draft tokens."
         )
         token_num -= num_extra_decoding_steps
+        token_num = int(
+            token_num)  # Ensure int for range() in add_dummy_requests
 
         max_seq_len_request = kv_cache_manager.add_dummy_requests(
             request_ids=[batch_size - 1],
