@@ -247,6 +247,11 @@ public:
         mAvgSqrHistoryLength.update(v);
     }
 
+    void incrementNumSampledKvCaches()
+    {
+        ++mNumSampledKvCaches;
+    }
+
     // Try to rebalance memory pool ratios based on usage statistics.
     void tryUpdateTargetRatios();
 
@@ -277,9 +282,9 @@ private:
     std::vector<float> mTargetRatioListOther;
 
     int mNumCreatedKvCaches{0};
-    int mNumClosedKvCaches{0};
+    int mNumSampledKvCaches{0};
     double mLastAdjustmentTime{0.0};
-    int mLastUpdateNumClosedRequests{0};
+    int mLastUpdateNumSampledKvCaches{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

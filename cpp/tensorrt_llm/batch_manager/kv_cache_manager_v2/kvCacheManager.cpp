@@ -507,14 +507,13 @@ void KvCacheManager::registerKvCache(KvCache* kvc)
 void KvCacheManager::unregisterKvCache(KvCache* kvc)
 {
     mLivingKvCaches.erase(kvc);
-    ++mNumClosedKvCaches;
 }
 
 void KvCacheManager::tryUpdateTargetRatios()
 {
-    if (mNumClosedKvCaches - mLastUpdateNumClosedRequests < 100)
+    if (mNumSampledKvCaches - mLastUpdateNumSampledKvCaches < 100)
         return;
-    mLastUpdateNumClosedRequests = mNumClosedKvCaches;
+    mLastUpdateNumSampledKvCaches = mNumSampledKvCaches;
 
     int tokensPerBlock = mConfig.tokensPerBlock;
     int avgReusedLength = static_cast<int>(std::round(mAvgReusedLength.value()));
@@ -575,7 +574,7 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
 
 bool KvCacheManager::needAdjustment() const
 {
-    if (mNumClosedKvCaches < 2000)
+    if (mNumSampledKvCaches < 2000)
         return false;
     double now = nowSeconds();
     if (now - mLastAdjustmentTime < 120.0)
