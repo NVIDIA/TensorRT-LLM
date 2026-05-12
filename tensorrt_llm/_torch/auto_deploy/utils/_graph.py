@@ -18,7 +18,7 @@ from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC, TreeSpec
 
 from .logger import ad_logger
-from .node_utils import get_op_schema, get_weight_tensor, is_op
+from .node_utils import all_gather_ops, get_op_schema, get_weight_tensor, is_op
 
 # ---------------------------------------------------------------------------
 # Dynamic custom-op derivation helpers
@@ -578,7 +578,7 @@ def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Nod
     # gather_tokens *before* the sharded GEMM + all_gather, keeping both out
     # of the main CUDA graph and avoiding NVLink contention with layer
     # AllReduces.
-    if is_op(lm_head_node, torch.ops.auto_deploy.trtllm_dist_all_gather):
+    if is_op(lm_head_node, all_gather_ops()):
         lm_head_node = lm_head_node.all_input_nodes[0]
 
     return lm_head_node

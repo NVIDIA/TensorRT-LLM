@@ -125,6 +125,34 @@ class DistConfig(BaseModel):
             enable_attention_dp=mapping.enable_attention_dp,
         )
 
+    @classmethod
+    def from_sharding_params(
+        cls,
+        *,
+        rank: int,
+        world_size: int,
+        dist_mapping: dict,
+        enable_attention_dp: bool = False,
+        allreduce_strategy: str = "NCCL",
+    ) -> "DistConfig":
+        """Build ``DistConfig`` from sharding-transform YAML inputs + runtime MPI info.
+
+        Single source of truth for the three ``DistConfig`` construction sites in
+        the AutoDeploy sharding stack: ``LlmArgs.init_dist_config`` (production),
+        ``ShardingTransformConfig._init_mapping`` (legacy test fallback), and
+        ``IRShardingConfig._init_dist_config`` (IR test fallback).
+        """
+        return cls(
+            world_size=world_size,
+            rank=rank,
+            tp_size=dist_mapping.get("tp", world_size),
+            moe_tp_size=dist_mapping.get("moe_tp", 1),
+            moe_ep_size=dist_mapping.get("moe_ep", world_size),
+            moe_cluster_size=dist_mapping.get("moe_cluster", 1),
+            enable_attention_dp=enable_attention_dp,
+            allreduce_strategy=allreduce_strategy,
+        )
+
     def to_mapping(self) -> Any:
         """Convert back to a ``tensorrt_llm.mapping.Mapping`` for C++ op interop."""
         from tensorrt_llm.mapping import Mapping  # will be deprecated by DistConfig

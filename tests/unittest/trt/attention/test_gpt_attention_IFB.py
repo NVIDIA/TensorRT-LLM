@@ -26,7 +26,6 @@ import tensorrt as trt
 
 from parameterized import parameterized
 from transformers import GPT2Config, GPTBigCodeConfig, GPTJConfig, LlamaConfig
-from transformers.cache_utils import DynamicCache
 from transformers.modeling_attn_mask_utils import (AttentionMaskConverter,
                                                    _prepare_4d_attention_mask)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
@@ -51,6 +50,8 @@ from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
     MemoryPoolsAllocator
 from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
     PoolsKVCacheManager
+from tests.unittest.trt.attention.hf_dynamic_cache_compat import (
+    dynamic_cache_from_legacy, dynamic_cache_to_legacy)
 
 
 class TestFunctional(unittest.TestCase):
@@ -381,13 +382,19 @@ class TestFunctional(unittest.TestCase):
                 rope_scale_type = RotaryScalingType.none
                 rope_scale = 1.0
                 if attention_type == "llama_attention":
-                    rope_base = configuration.rope_theta
-                    if configuration.rope_scaling is not None:
+                    rope_params = getattr(configuration, 'rope_parameters',
+                                          None) or {}
+                    rope_base = rope_params.get(
+                        'rope_theta',
+                        getattr(configuration, 'rope_theta', 10000.0))
+                    rope_type = rope_params.get(
+                        'rope_type', rope_params.get('type', 'default'))
+                    if rope_type not in ('default', None):
                         rope_scale_type = {
                             "linear": RotaryScalingType.linear,
                             "dynamic": RotaryScalingType.dynamic
-                        }[configuration.rope_scaling["type"]]
-                        rope_scale = configuration.rope_scaling["factor"]
+                        }[rope_type]
+                        rope_scale = rope_params.get("factor", 1.0)
                 rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                     configuration.max_position_embeddings, rotary_embedding_dim,
                     rope_base, rope_scale)
@@ -579,8 +586,20 @@ class TestFunctional(unittest.TestCase):
                                   attn_implementation='eager')
         if attention_type == 'llama_attention':
             configuration.num_key_value_heads = num_kv_heads
-            configuration.rope_theta = rope_base
-            configuration.rope_scaling = rope_scaling
+            # In transformers 5.x, rope_theta/rope_scaling are unified into
+            # rope_parameters.  Build the dict so LlamaRotaryEmbedding works.
+            if rope_scaling is not None:
+                rope_params = {**rope_scaling, "rope_theta": rope_base}
+                # transformers 5.x expects "rope_type" key, not "type"
+                if "rope_type" not in rope_params and "type" in rope_params:
+                    rope_params["rope_type"] = rope_params["type"]
+            else:
+                rope_params = {
+                    "rope_type": "default",
+                    "rope_theta": rope_base,
+                }
+            configuration.rope_parameters = rope_params
+            configuration.rope_scaling = rope_params
             if rope_scaling is not None:
                 # scaling is typically used for supporting longer seq lens than max_position_embeddings
                 # so we set the max_position_embeddings to be smaller than total seq len
@@ -760,8 +779,7 @@ class TestFunctional(unittest.TestCase):
                 tgt_len=(in_len if step == 0 else 1))
             if attention_type == 'gpt2_attention':
                 torch_output = attention(input,
-                                         past_key_value=layer_past,
-                                         use_cache=True,
+                                         past_key_values=layer_past,
                                          attention_mask=attention_mask)[0]
                 torch_present = layer_past
             elif attention_type == 'llama_attention':
@@ -774,10 +792,9 @@ class TestFunctional(unittest.TestCase):
                                             1))
                 torch_output = attention(
                     input,
-                    past_key_value=layer_past,
+                    past_key_values=layer_past,
                     position_embeddings=position_embeddings,
-                    attention_mask=attention_mask,
-                    use_cache=True)[0]
+                    attention_mask=attention_mask)[0]
                 torch_present = layer_past
             elif attention_type == 'gptj_attention':
                 torch_output, torch_present = attention(
@@ -1010,7 +1027,7 @@ class TestFunctional(unittest.TestCase):
                         (local_beam_width, input_length, hidden_size))
 
                 # llama/gpt2 uses DynamicCache
-                past_key_values = DynamicCache.from_legacy_cache(
+                past_key_values = dynamic_cache_from_legacy(
                     torch_cache_list[req_idx])
 
                 torch_out, past_key_values = torch_exec(
@@ -1018,7 +1035,8 @@ class TestFunctional(unittest.TestCase):
                     past_key_values)
 
                 # llama/gpt2 uses DynamicCache
-                torch_cache_list[req_idx] = past_key_values.to_legacy_cache()
+                torch_cache_list[req_idx] = dynamic_cache_to_legacy(
+                    past_key_values)
                 past_key_values = torch_cache_list[req_idx][0]
 
                 if use_fp8_kv_cache or use_int8_kv_cache:

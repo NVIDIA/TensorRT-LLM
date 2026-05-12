@@ -70,7 +70,9 @@ class RecvReqInfo:
         np.ndarray
     ]  # Block IDs per layer group, each np.ndarray(dtype=np.int64)
     unique_rid: int
-    start_token_idx: Optional[int] = None
+    # Block-aligned token offset where the receiver's block list starts.
+    # None means "end-of-range suffix" — sender derives it from len(blocks).
+    dst_start_token: Optional[int] = None
     aux_slot: Optional[int] = None
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
@@ -85,7 +87,7 @@ class RecvReqInfo:
                     arr.tobytes() for arr in self.block_ids_per_layer_groups
                 ],
                 "unique_rid": self.unique_rid,
-                "start_token_idx": self.start_token_idx,
+                "dst_start_token": self.dst_start_token,
                 "aux_slot": self.aux_slot,
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
@@ -204,11 +206,13 @@ class KVSendTask(SendTaskBase):
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
+        prompt_len: Optional[int] = None,
     ):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
+        self._prompt_len = prompt_len
 
 
 class Sender(SenderBase):
@@ -648,8 +652,38 @@ class Sender(SenderBase):
                         f"{dst_block_ids.size} (expected diff <= 1)"
                     )
                 tpb = extractor.page_table.tokens_per_block
-                src_start = task._slice.token_range.start if task._slice.token_range else 0
-                dst_start = req_info.start_token_idx or 0
+                token_range = task._slice.token_range
+                lg_info = extractor.page_table.layer_groups[self_lg]
+                window_size = getattr(lg_info, "sliding_window_size", None)
+
+                # Block lists are the suffix of [..., slice_end); cached prefix
+                # is implicit in their size. token_start = (total_blocks - n) * tpb.
+                slice_end = token_range.end if token_range is not None else 0
+                total_blocks = (slice_end + tpb - 1) // tpb
+                assert src_block_ids.size <= total_blocks, (
+                    f"src block list ({src_block_ids.size}) exceeds total slice "
+                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                )
+                assert dst_block_ids.size <= total_blocks, (
+                    f"dst block list ({dst_block_ids.size}) exceeds total slice "
+                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                )
+                src_start = (total_blocks - src_block_ids.size) * tpb
+                dst_start = (total_blocks - dst_block_ids.size) * tpb
+                if req_info.dst_start_token is not None:
+                    dst_start = max(dst_start, req_info.dst_start_token)
+                if window_size is not None:
+                    # SWA stale_end uses the request prompt_len (not slice_end —
+                    # they differ for non-final slices). prompt_len must be plumbed
+                    # via the session; falling back to slice_end is wrong on
+                    # non-final slices.
+                    assert task._prompt_len is not None, (
+                        "SWA layer requires session.prompt_len; "
+                        "set TxSession(prompt_len=request.prompt_len)."
+                    )
+                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
+                    src_start = max(stale_end * tpb, src_start)
+                    dst_start = max(stale_end * tpb, dst_start)
                 src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                     src_block_ids,
                     dst_block_ids,
@@ -984,8 +1018,9 @@ class TxSession(TxSessionBase):
         sender: Sender,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
+        prompt_len: Optional[int] = None,
     ):
-        super().__init__(sender, SessionArgsBase(params))
+        super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
@@ -1035,7 +1070,7 @@ class TxSession(TxSessionBase):
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
-            task = KVSendTask(slice, params, slice_id)
+            task = KVSendTask(slice, params, slice_id, prompt_len=self._base_args.prompt_len)
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
@@ -1273,20 +1308,14 @@ class Receiver(ReceiverBase):
             f"ctx_request_id is None for task unique_rid={task._unique_rid}"
         )
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
-        # Propagate the generation-side token offset so the context server can
-        # skip blocks that are already present in generation's prefix cache.
-        # Currently this is 0 for all requests (generation does not yet filter
-        # its block list); the hook is in place for future narrowing.
-        start_token_idx = (
-            task._kv_slice.token_range.start if task._kv_slice.token_range is not None else None
-        )
+        # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
-            start_token_idx=start_token_idx,
+            dst_start_token=None,
             aux_slot=task._aux_slot,
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
@@ -1501,8 +1530,9 @@ class RxSession(RxSessionBase):
         receiver: Receiver,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
+        prompt_len: Optional[int] = None,
     ):
-        super().__init__(receiver, SessionArgsBase(params))
+        super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._receiver: Receiver  # narrow base class type for Pylance
@@ -1535,6 +1565,8 @@ class RxSession(RxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self._kv_tasks):
+            return SessionStatus.ERROR
         if self._kv_tasks:
             kv_all_transferred = all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks)
             if kv_all_transferred and self._aux_status == TaskStatus.TRANSFERRED:
@@ -1878,6 +1910,7 @@ class TransferWorker:
             sender=self._sender,
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.tx_timeout_s,
+            prompt_len=request.prompt_len,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -1889,6 +1922,7 @@ class TransferWorker:
             receiver=self._receiver,
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.rx_timeout_s,
+            prompt_len=request.prompt_len,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:

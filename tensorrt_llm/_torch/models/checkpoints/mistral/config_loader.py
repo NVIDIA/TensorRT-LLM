@@ -348,5 +348,6 @@ class MistralConfigLoader(BaseConfigLoader):
 
         model_config.pretrained_config.gate_cls = Mistral3Gate
         model_config.pretrained_config.input_processor_type = "mistral_large_3"
+        model_config.pretrained_config.model_type = "mistral_large_3"
         model_config._frozen = True
         return model_config

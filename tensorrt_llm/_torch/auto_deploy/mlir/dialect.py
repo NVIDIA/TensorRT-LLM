@@ -409,6 +409,26 @@ class AdCast(IRDLOperation):
 
 
 @irdl_op_definition
+class AdFloorDiv(IRDLOperation):
+    """Elementwise integer floor division by scalar — mirrors ``operator.floordiv``."""
+
+    name = "ad.floordiv"
+    input = operand_def(AnyAttr())
+    divisor = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdEq(IRDLOperation):
+    """Elementwise equality comparison with scalar — mirrors ``operator.eq`` / ``torch.eq``."""
+
+    name = "ad.eq"
+    input = operand_def(AnyAttr())
+    value = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
 class AdSplat(IRDLOperation):
     """Constant splat — creates a tensor filled with a scalar value."""
 
@@ -448,6 +468,8 @@ AD_OPS = [
     AdReduceSum,
     AdReduceMean,
     AdCast,
+    AdFloorDiv,
+    AdEq,
     AdSplat,
 ]
 

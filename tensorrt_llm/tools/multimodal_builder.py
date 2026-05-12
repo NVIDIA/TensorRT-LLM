@@ -14,10 +14,15 @@ from pathlib import Path
 from tensorrt_llm._utils import torch_dtype_to_str, to_json_file
 from tensorrt_llm.builder import Builder
 from tensorrt_llm.logger import logger
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    # Transformers v5+: vision-to-seq auto models use AutoModelForImageTextToText
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
-                          AutoModelForVision2Seq, AutoProcessor,
-                          Blip2ForConditionalGeneration, Blip2Processor,
-                          FuyuForCausalLM, FuyuProcessor,
+                          AutoProcessor, Blip2ForConditionalGeneration,
+                          Blip2Processor, FuyuForCausalLM, FuyuProcessor,
                           LlavaForConditionalGeneration, NougatProcessor,
                           Pix2StructForConditionalGeneration,
                           VisionEncoderDecoderModel, CLIPVisionModel)

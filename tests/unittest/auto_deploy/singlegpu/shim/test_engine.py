@@ -161,6 +161,9 @@ class _DummyKVCacheManager:
         # Return many dummy page IDs; ADEngine will truncate as needed
         return list(range(1024))
 
+    def get_batch_cache_indices(self, request_ids):
+        return [list(range(1024)) for _ in request_ids]
+
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:
             return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -182,6 +185,7 @@ class _DummyRequest:
         self.context_chunk_size = size
         self.seq_slot = seq_slot
         self.py_seq_slot = seq_slot
+        self.py_request_id = seq_slot
         self.py_batch_idx = None
         self.py_multimodal_data = None
         self.multimodal_positions = None
@@ -542,6 +546,9 @@ class _DummyHybridKVCacheManager:
             num_blocks = self.get_num_kv_blocks(num_tokens)
             return list(range(num_blocks))
         return list(range(1024))
+
+    def get_batch_cache_indices(self, request_ids):
+        return [list(range(1024)) for _ in request_ids]
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:

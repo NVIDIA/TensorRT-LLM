@@ -26,7 +26,8 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
-from .utils import ErrorResponse, RequestError, WorkerCommIpcAddrs
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    WorkerCommIpcAddrs)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -58,6 +59,10 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             tokenizer=tokenizer,
             llm_args=llm_args,
         )
+
+        if (self.llm_args is not None
+                and getattr(self.llm_args, "enable_resource_governor", False)):
+            self._resource_governor_queue = IntraProcessQueue()
 
         self.setup_engine()
 
@@ -188,6 +193,7 @@ def worker_main(
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
+    resource_governor_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
@@ -216,6 +222,11 @@ def worker_main(
             is_server=False,
             socket_type=zmq.DEALER,
             name="worker_init_status_queue")
+        resource_governor_queue = IpcQueue(
+            worker_queues.resource_governor_queue_addr,
+            is_server=False,
+            name="worker_resource_governor_queue"
+        ) if worker_queues.resource_governor_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -321,6 +332,13 @@ def worker_main(
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
+                if resource_governor_queue is not None:
+                    # Swap rank 0 to the proxy IPC queue after construction.
+                    # The resource-governor flag is already enabled on all
+                    # ranks.
+                    worker.engine.set_resource_governor_queue(
+                        resource_governor_queue)
+
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
