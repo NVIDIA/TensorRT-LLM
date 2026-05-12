@@ -9,7 +9,6 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
-from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -1147,4 +1146,3 @@ def __getattr__(name):
         from .eagle3 import MTPEagleWorker
         return MTPEagleWorker
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-

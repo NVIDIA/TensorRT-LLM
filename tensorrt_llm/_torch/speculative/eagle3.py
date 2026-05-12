@@ -759,9 +759,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
         draft_logits_list = []
-        last_tokens_idx = torch.cumsum(attn_metadata.seq_lens_cuda,
-                                       dim=0,
-                                       dtype=torch.long) - 1
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
@@ -954,8 +953,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         use ``spec_metadata.subseq_all_rank_num_tokens`` since every sequence
         contributes a single token per iteration.
         """
-        return (spec_metadata.all_rank_num_tokens if step_idx == 0 else
-                spec_metadata.subseq_all_rank_num_tokens)
+        return (spec_metadata.all_rank_num_tokens
+                if step_idx == 0 else spec_metadata.subseq_all_rank_num_tokens)
 
     def _run_draft_forward(self, draft_model, inputs, spec_metadata,
                            step_idx: int):
@@ -1156,12 +1155,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
         draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens,
-            runtime_draft_len) if num_gens > 0 else torch.empty(
-                0,
-                runtime_draft_len,
-                dtype=torch.int,
-                device=logits.device)
+            num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
+                0, runtime_draft_len, dtype=torch.int, device=logits.device)
         return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
                                          batch_size, spec_metadata)
 
