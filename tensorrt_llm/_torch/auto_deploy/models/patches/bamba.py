@@ -150,7 +150,17 @@ def _bamba_mixer_torch_forward(
         )
         slot_idx_t = torch.arange(batch_size, device=input_states.device, dtype=torch.long)
         use_initial_states_t = torch.zeros(batch_size, device=input_states.device, dtype=torch.bool)
-        _batch_info = BatchInfo()
+        # ``BatchInfo()`` default-constructs the host tensor with
+        # ``pin_memory=prefer_pinned()`` (=True) and no explicit device. Under
+        # torch.export the tracer captures the implicit default device as cuda,
+        # producing ``aten.empty.memory_format([13], device=cuda, pin_memory=True)``
+        # which is illegal at gm execution. Pre-allocate the host buffer on CPU
+        # without pinning so the captured op is well-formed.
+        _batch_info = BatchInfo(
+            batch_info_host=torch.zeros(
+                BatchInfo._NUM_ELEMENTS, dtype=torch.int, device="cpu"
+            )
+        )
         if seq_len == 1:
             _batch_info.update([0, 0, 0, 0, batch_size, batch_size])
         else:
