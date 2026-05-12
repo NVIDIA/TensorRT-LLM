@@ -55,80 +55,7 @@ from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
-from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE, _dsv4_moe_dump_tensor
-
-
-def _dsv4_configmoe_dump_tensor(
-    module: "ConfigurableMoE",
-    name: str,
-    tensor: Optional[torch.Tensor],
-) -> None:
-    _dsv4_moe_dump_tensor(
-        f"layer.{module.layer_idx}.configmoe_{name}",
-        tensor,
-        layer_idx=module.layer_idx,
-    )
-
-
-def _dsv4_configmoe_dump_value(
-    module: "ConfigurableMoE",
-    name: str,
-    value: Optional[Union[torch.Tensor, Fp4QuantizedTensor]],
-) -> None:
-    if isinstance(value, Fp4QuantizedTensor):
-        _dsv4_configmoe_dump_tensor(module, f"{name}_fp4", value.fp4_tensor)
-        _dsv4_configmoe_dump_tensor(module, f"{name}_sf", value.scaling_factor)
-        return
-    _dsv4_configmoe_dump_tensor(module, name, value)
-
-
-def _dsv4_configmoe_dump_output(
-    module: "ConfigurableMoE",
-    name: str,
-    value: Optional[Union[torch.Tensor, tuple]],
-) -> None:
-    if isinstance(value, tuple):
-        for index, tensor in enumerate(value):
-            _dsv4_configmoe_dump_tensor(module, f"{name}_{index}", tensor)
-        return
-    _dsv4_configmoe_dump_tensor(module, name, value)
-
-
-def _dsv4_configmoe_dump_backend_state(
-    module: "ConfigurableMoE",
-    reference: Optional[Union[torch.Tensor, Fp4QuantizedTensor]],
-) -> None:
-    backend = module.backend
-    _dsv4_configmoe_dump_tensor(
-        module, "fc31_input_scale", getattr(backend, "fc31_input_scale", None)
-    )
-    _dsv4_configmoe_dump_tensor(
-        module, "fc2_input_scale", getattr(backend, "fc2_input_scale", None)
-    )
-    _dsv4_configmoe_dump_tensor(module, "fc31_alpha", getattr(backend, "fc31_alpha", None))
-    _dsv4_configmoe_dump_tensor(module, "fc2_alpha", getattr(backend, "fc2_alpha", None))
-
-    if isinstance(reference, Fp4QuantizedTensor):
-        device = reference.fp4_tensor.device
-    elif isinstance(reference, torch.Tensor):
-        device = reference.device
-    else:
-        device = torch.device("cpu")
-
-    values = [
-        int(getattr(backend, "has_nvfp4", False)),
-        int(getattr(backend, "has_w4a8_nvfp4_fp8", False)),
-        int(getattr(backend, "has_w4a16_mxfp4", False)),
-        int(getattr(backend, "has_w4a8_mxfp4_mxfp8", False)),
-        int(getattr(backend, "has_deepseek_fp8_block_scales", False)),
-        int(getattr(backend, "scaling_vector_size", 0) or 0),
-        int(getattr(module, "num_slots", 0) or 0),
-        int(getattr(module, "slot_start", 0) or 0),
-        int(getattr(module, "slot_end", 0) or 0),
-        int(getattr(module, "expert_size_per_partition", 0) or 0),
-    ]
-    flags = torch.tensor(values, dtype=torch.int32, device=device)
-    _dsv4_configmoe_dump_tensor(module, "backend_flags", flags)
+from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 
 
 class ConfigurableMoE(MoE):
@@ -782,9 +709,6 @@ class ConfigurableMoE(MoE):
             token_selected_experts = None
             token_final_scales = None
 
-        _dsv4_configmoe_dump_tensor(self, "selected_experts", token_selected_experts)
-        _dsv4_configmoe_dump_tensor(self, "routing_weights", token_final_scales)
-
         # ========== Step 3: EPLB - Update statistics and route ==========
         # Only executed if backend supports routing separation AND EPLB is enabled
         if self.layer_load_balancer and token_selected_experts is not None:
@@ -813,7 +737,6 @@ class ConfigurableMoE(MoE):
         token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
             self.num_slots, token_selected_slots
         )
-        _dsv4_configmoe_dump_tensor(self, "selected_slots", token_selected_slots)
 
         # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
         # NVLINK two-sided has a prepare phase to gather EPLB statistics
@@ -851,7 +774,6 @@ class ConfigurableMoE(MoE):
 
         # ========== Step 4 & 5: Quantization and Communication Dispatch ==========
         # Order depends on whether strategy supports post-quant dispatch
-        _dsv4_configmoe_dump_value(self, "x_before_quant", x)
         if self.comm is not None:
             # Check if we should use post-quant dispatch
             # supports_post_quant_dispatch checks strategy capability for the current quant mode
@@ -870,8 +792,6 @@ class ConfigurableMoE(MoE):
 
                 # Step 4a: Quantization FIRST
                 x, x_sf = self.backend.quantize_input(x)
-                _dsv4_configmoe_dump_value(self, "x_post_quant", x)
-                _dsv4_configmoe_dump_tensor(self, "x_sf_post_quant", x_sf)
 
                 # Step 4b: Dispatch AFTER quantization
                 # Get pre_quant_scale for W4AFP8 if available (only DeepEPLowLatency needs it)
@@ -888,10 +808,6 @@ class ConfigurableMoE(MoE):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                _dsv4_configmoe_dump_value(self, "x_after_dispatch", x)
-                _dsv4_configmoe_dump_tensor(self, "x_sf_after_dispatch", x_sf)
-                _dsv4_configmoe_dump_tensor(self, "slots_after_dispatch", token_selected_slots)
-                _dsv4_configmoe_dump_tensor(self, "weights_after_dispatch", token_final_scales)
                 if should_update_eplb_after_dispatch:
                     gathered_stats = self.comm.get_eplb_gathered_statistics()
                     self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
@@ -908,21 +824,13 @@ class ConfigurableMoE(MoE):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                _dsv4_configmoe_dump_value(self, "x_after_dispatch", x)
-                _dsv4_configmoe_dump_tensor(self, "x_sf_after_dispatch", x_sf)
-                _dsv4_configmoe_dump_tensor(self, "slots_after_dispatch", token_selected_slots)
-                _dsv4_configmoe_dump_tensor(self, "weights_after_dispatch", token_final_scales)
 
                 # Step 4b: Quantization AFTER dispatch
                 x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
-                _dsv4_configmoe_dump_value(self, "x_after_dispatch_quant", x)
-                _dsv4_configmoe_dump_tensor(self, "x_sf_after_dispatch_quant", x_sf)
         else:
             # No communication, just quantize
             # (use non-post-quant-comm path for TRTLLMGenFusedMoE)
             x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
-            _dsv4_configmoe_dump_value(self, "x_no_comm_quant", x)
-            _dsv4_configmoe_dump_tensor(self, "x_sf_no_comm_quant", x_sf)
 
         # ========== Step 6: MoE Computation ==========
 
@@ -932,24 +840,12 @@ class ConfigurableMoE(MoE):
         backend_kwargs = self._get_backend_kwargs(
             router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
         )
-        _dsv4_configmoe_dump_backend_state(self, x)
-        _dsv4_configmoe_dump_value(self, "x_before_run_moe", x)
-        _dsv4_configmoe_dump_tensor(self, "x_sf_before_run_moe", x_sf)
-        _dsv4_configmoe_dump_tensor(self, "slots_before_run_moe", token_selected_slots)
-        _dsv4_configmoe_dump_tensor(self, "weights_before_run_moe", token_final_scales)
-        _dsv4_configmoe_dump_tensor(
-            self, "moe_output_workspace_before", backend_kwargs.get("moe_output")
-        )
         final_hidden_states = self.backend.run_moe(
             x=x,
             token_selected_experts=token_selected_slots,
             token_final_scales=token_final_scales,
             x_sf=x_sf,
             **backend_kwargs,
-        )
-        _dsv4_configmoe_dump_output(self, "output_after_run_moe", final_hidden_states)
-        _dsv4_configmoe_dump_tensor(
-            self, "moe_output_workspace_after", backend_kwargs.get("moe_output")
         )
 
         # ========== Step 8: EPLB - Start CPU stage ==========
@@ -965,17 +861,14 @@ class ConfigurableMoE(MoE):
                 final_hidden_states,
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
             )
-            _dsv4_configmoe_dump_tensor(self, "output_after_combine", final_hidden_states)
         else:
             # For non-comm case, It should be attention TP or single rank.
             # only check if allreduce is needed
             if self.parallel_size > 1 and self.reduce_results:
                 final_hidden_states = self.all_reduce(final_hidden_states)
-                _dsv4_configmoe_dump_tensor(self, "output_after_all_reduce", final_hidden_states)
         # ========== Step 10: EPLB - Done CPU stage ==========
         self._load_balancer_done_set_cpu_stage(is_last_call)
 
-        _dsv4_configmoe_dump_tensor(self, "output_final", final_hidden_states)
         return final_hidden_states
 
     def _prepare_workspaces_for_chunk(

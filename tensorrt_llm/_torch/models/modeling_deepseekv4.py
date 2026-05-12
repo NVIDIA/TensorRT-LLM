@@ -95,154 +95,6 @@ from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor, create_lm_head
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, filter_weights, register_auto_model
 
-_DSV4_DUMP_DIR_ENV = "TRTLLM_DSV4_DUMP_DIR"
-_DSV4_DUMP_STATE = {
-    "step": -1,
-    "active_step": None,
-    "counts": {},
-}
-
-
-def _parse_int_env(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def _parse_dsv4_dump_layers() -> Optional[set[int]]:
-    value = os.environ.get("TRTLLM_DSV4_DUMP_LAYERS")
-    if not value:
-        return None
-
-    layers = set()
-    for part in value.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start, end = part.split("-", 1)
-            layers.update(range(int(start), int(end) + 1))
-        else:
-            layers.add(int(part))
-    return layers
-
-
-def _dsv4_dump_begin_forward() -> Optional[int]:
-    if not os.environ.get(_DSV4_DUMP_DIR_ENV):
-        return None
-
-    step = _DSV4_DUMP_STATE["step"] + 1
-    _DSV4_DUMP_STATE["step"] = step
-    _DSV4_DUMP_STATE["active_step"] = step
-    _DSV4_DUMP_STATE["counts"] = {}
-
-    max_steps = _parse_int_env("TRTLLM_DSV4_DUMP_MAX_STEPS", 0)
-    if max_steps > 0 and step >= max_steps:
-        return None
-    return step
-
-
-def _dsv4_dump_point_enabled(name: str) -> bool:
-    value = os.environ.get("TRTLLM_DSV4_DUMP_POINTS")
-    if not value:
-        return True
-
-    enabled = {part.strip() for part in value.split(",") if part.strip()}
-    suffix = name.rsplit(".", 1)[-1]
-    return name in enabled or suffix in enabled
-
-
-def _dsv4_dump_enabled(name: str, layer_idx: Optional[int] = None) -> bool:
-    if not os.environ.get(_DSV4_DUMP_DIR_ENV):
-        return False
-    if layer_idx is not None:
-        layers = _parse_dsv4_dump_layers()
-        if layers is not None and layer_idx not in layers:
-            return False
-    return _dsv4_dump_point_enabled(name)
-
-
-def _dsv4_dump_tensor(
-    name: str,
-    tensor: Optional[torch.Tensor],
-    *,
-    layer_idx: Optional[int] = None,
-    step: Optional[int] = None,
-) -> None:
-    dump_dir = os.environ.get(_DSV4_DUMP_DIR_ENV)
-    if dump_dir is None or tensor is None or not isinstance(tensor, torch.Tensor):
-        return
-    if step is None:
-        step = _DSV4_DUMP_STATE.get("active_step")
-    if step is None:
-        return
-
-    max_steps = _parse_int_env("TRTLLM_DSV4_DUMP_MAX_STEPS", 0)
-    if max_steps > 0 and step >= max_steps:
-        return
-
-    if layer_idx is not None:
-        layers = _parse_dsv4_dump_layers()
-        if layers is not None and layer_idx not in layers:
-            return
-    if not _dsv4_dump_point_enabled(name):
-        return
-    is_current_stream_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
-    if tensor.is_cuda and is_current_stream_capturing is not None and is_current_stream_capturing():
-        return
-
-    with torch.no_grad():
-        original_shape = tuple(tensor.shape)
-        value = tensor.detach()
-        max_tokens = _parse_int_env("TRTLLM_DSV4_DUMP_MAX_TOKENS", 8)
-        sliced_dim0 = False
-        if max_tokens > 0 and value.ndim > 0 and value.shape[0] > max_tokens:
-            value = value[-max_tokens:]
-            sliced_dim0 = True
-        value = value.cpu()
-
-    rank = (
-        os.environ.get("OMPI_COMM_WORLD_RANK")
-        or os.environ.get("RANK")
-        or os.environ.get("LOCAL_RANK")
-        or "0"
-    )
-    safe_name = name.replace(".", "_").replace("/", "_")
-    count = _DSV4_DUMP_STATE["counts"].get(safe_name, 0)
-    _DSV4_DUMP_STATE["counts"][safe_name] = count + 1
-    suffix = "" if count == 0 else f"_{count}"
-    os.makedirs(dump_dir, exist_ok=True)
-    path = os.path.join(dump_dir, f"step_{step:06d}_rank_{rank}_{safe_name}{suffix}.pt")
-    torch.save(
-        {
-            "name": name,
-            "step": step,
-            "rank": rank,
-            "dtype": str(tensor.dtype),
-            "shape": original_shape,
-            "sliced_dim0": sliced_dim0,
-            "tensor": value,
-        },
-        path,
-    )
-
-
-def _dsv4_dump_module_tensor(
-    name: str,
-    module: torch.nn.Module,
-    attr: str,
-    *,
-    layer_idx: Optional[int] = None,
-) -> None:
-    tensor = getattr(module, attr, None)
-    if isinstance(tensor, torch.nn.Parameter):
-        tensor = tensor.data
-    _dsv4_dump_tensor(name, tensor, layer_idx=layer_idx)
-
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -1264,11 +1116,9 @@ class DeepseekV4MTPHead(nn.Module):
         # Temporarily disable gather_output when not in ADP mode or (in ADP mode and LM TP is enabled)
         if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = False
-        _dsv4_dump_tensor("mtp_logits_input", hidden_states)
         logits = lm_head(
             hidden_states, mapping_lm_head_tp=self.mapping_lm_head_tp, is_spec_decoding_head=True
         )
-        _dsv4_dump_tensor("mtp_logits", logits)
         if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = True
         return logits
@@ -1311,9 +1161,7 @@ class DeepseekV4LogitsProcessor(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
         hidden_states = self._hc_head(hidden_states)
         hidden_states = self._norm(hidden_states)
-        _dsv4_dump_tensor("logits_input", hidden_states)
         logits = lm_head(hidden_states).float()
-        _dsv4_dump_tensor("logits", logits)
         return logits
 
 
@@ -1577,10 +1425,8 @@ class DeepseekV4MoE(nn.Module):
             # already apply the clamp via the standard GatedMLP linear stack
             # below.
             qm = experts_quant_config.quant_mode
-            kernel_requires_bias_for_swiglu_limit = (
-                moe_cls in (TRTLLMGenFusedMoE, WideEPMoE)
-                and (qm.has_nvfp4() or qm.has_w4a16_mxfp4()
-                     or qm.has_w4a8_mxfp4_mxfp8())
+            kernel_requires_bias_for_swiglu_limit = moe_cls in (TRTLLMGenFusedMoE, WideEPMoE) and (
+                qm.has_nvfp4() or qm.has_w4a16_mxfp4() or qm.has_w4a8_mxfp4_mxfp8()
             )
             if supports_swiglu_limit and not kernel_requires_bias_for_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
@@ -1748,11 +1594,6 @@ class DeepseekV4MoE(nn.Module):
             )
 
         router_logits = self.gate(hidden_states)
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.router_logits",
-            router_logits,
-            layer_idx=self.layer_idx,
-        )
 
         # Use ideal load balanced logits if enabled, otherwise use gate output.
         if os.environ.get("ENABLE_PERFECT_ROUTER", "0") == "1":
@@ -1764,48 +1605,6 @@ class DeepseekV4MoE(nn.Module):
                 num_tokens=num_tokens, num_experts=num_experts, device=hidden_states.device
             )
 
-        if _dsv4_dump_enabled(
-            f"layer.{self.layer_idx}.selected_experts", self.layer_idx
-        ) or _dsv4_dump_enabled(f"layer.{self.layer_idx}.routing_weights", self.layer_idx):
-            selected_experts, routing_weights = self.gate.routing_method.apply(
-                router_logits.clone(), input_ids
-            )
-            _dsv4_dump_tensor(
-                f"layer.{self.layer_idx}.selected_experts",
-                selected_experts,
-                layer_idx=self.layer_idx,
-            )
-            _dsv4_dump_tensor(
-                f"layer.{self.layer_idx}.routing_weights",
-                routing_weights,
-                layer_idx=self.layer_idx,
-            )
-
-        _dsv4_dump_module_tensor(
-            f"layer.{self.layer_idx}.experts_fc31_input_scale",
-            self.experts,
-            "fc31_input_scale",
-            layer_idx=self.layer_idx,
-        )
-        _dsv4_dump_module_tensor(
-            f"layer.{self.layer_idx}.experts_fc2_input_scale",
-            self.experts,
-            "fc2_input_scale",
-            layer_idx=self.layer_idx,
-        )
-        _dsv4_dump_module_tensor(
-            f"layer.{self.layer_idx}.experts_fc31_alpha",
-            self.experts,
-            "fc31_alpha",
-            layer_idx=self.layer_idx,
-        )
-        _dsv4_dump_module_tensor(
-            f"layer.{self.layer_idx}.experts_fc2_alpha",
-            self.experts,
-            "fc2_alpha",
-            layer_idx=self.layer_idx,
-        )
-
         routed_output = self.experts(
             hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states,
             router_logits,
@@ -1815,11 +1614,6 @@ class DeepseekV4MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             **({"alltoall_result_do_sum": False} if isinstance(self.experts, WideEPMoE) else {}),
-        )
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.routed_output",
-            routed_output if isinstance(routed_output, torch.Tensor) else None,
-            layer_idx=self.layer_idx,
         )
 
         return routed_output
@@ -1842,11 +1636,6 @@ class DeepseekV4MoE(nn.Module):
             )
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
-            _dsv4_dump_tensor(
-                f"layer.{self.layer_idx}.shared_output",
-                shared_output,
-                layer_idx=self.layer_idx,
-            )
             return shared_output
 
         def _compute_routed_output():
@@ -1882,11 +1671,6 @@ class DeepseekV4MoE(nn.Module):
                     final_hidden_states, all_reduce_params=final_all_reduce_params
                 )
 
-            _dsv4_dump_tensor(
-                f"layer.{self.layer_idx}.moe_combined_output",
-                final_hidden_states,
-                layer_idx=self.layer_idx,
-            )
             return final_hidden_states
 
 
@@ -2133,37 +1917,17 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         residual, post_mix, comb_mix, layer_input = self._entry_boundary(
             hc_state, engram_embeddings, has_engram
         )
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.entry_residual",
-            residual,
-            layer_idx=self.layer_idx,
-        )
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.entry_input",
-            layer_input,
-            layer_idx=self.layer_idx,
-        )
 
         # -------------------------------------------------------------------
         # Attention block
         # -------------------------------------------------------------------
         x_attn = self.input_layernorm(layer_input)
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.attn_norm",
-            x_attn,
-            layer_idx=self.layer_idx,
-        )
         x_attn = self.self_attn(
             position_ids=position_ids,
             hidden_states=x_attn,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
-        )
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.attn_out",
-            x_attn,
-            layer_idx=self.layer_idx,
         )
 
         # -------------------------------------------------------------------
@@ -2189,11 +1953,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 comb_res_mix=comb_mix,
             )
             post_mix, comb_mix, layer_input = self.hc_ffn.pre_mapping(residual)
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.moe_input",
-            layer_input,
-            layer_idx=self.layer_idx,
-        )
 
         # -------------------------------------------------------------------
         # MoE block — returns x_ffn (post-MoE, already normed by
@@ -2205,21 +1964,11 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             spec_metadata=spec_metadata,
             input_ids=input_ids,
         )
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.moe_out",
-            x_ffn,
-            layer_idx=self.layer_idx,
-        )
 
         # Defer this layer's hc_ffn.post_mapping only when the NEXT layer can
         # absorb it via fused_hc (see post_load_weights). Otherwise resolve it
         # here and hand the next layer a fully post-mapped residual.
         if self.defer_post_mapping:
-            _dsv4_dump_tensor(
-                f"layer.{self.layer_idx}.deferred_x_prev",
-                x_ffn,
-                layer_idx=self.layer_idx,
-            )
             return HCState.deferred(
                 residual=residual, post_mix=post_mix, comb_mix=comb_mix, x_prev=x_ffn
             )
@@ -2228,11 +1977,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             residual=residual,
             post_layer_mix=post_mix,
             comb_res_mix=comb_mix,
-        )
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.resolved_residual",
-            resolved_residual,
-            layer_idx=self.layer_idx,
         )
         return HCState.resolved(resolved_residual)
 
@@ -2307,11 +2051,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         else:
             # No fusion: just normalize.
             hidden_states = self.post_attention_layernorm(hidden_states)
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.moe_norm",
-            hidden_states,
-            layer_idx=self.layer_idx,
-        )
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -2327,12 +2066,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         hidden_states = _run_MoE(
             hidden_states, hidden_states_fp4=None, input_ids=input_ids, do_finalize=do_finalize
         )
-        if isinstance(hidden_states, torch.Tensor):
-            _dsv4_dump_tensor(
-                f"layer.{self.layer_idx}.moe_raw_out",
-                hidden_states,
-                layer_idx=self.layer_idx,
-            )
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -2370,11 +2103,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, None)
 
-        _dsv4_dump_tensor(
-            f"layer.{self.layer_idx}.moe_final_out",
-            hidden_states,
-            layer_idx=self.layer_idx,
-        )
         return hidden_states
 
 
@@ -2612,13 +2340,8 @@ class DeepseekV4Model(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        dump_step = _dsv4_dump_begin_forward()
-        _dsv4_dump_tensor("input_ids", input_ids, step=dump_step)
-        _dsv4_dump_tensor("position_ids", position_ids, step=dump_step)
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        _dsv4_dump_tensor("inputs_embeds", inputs_embeds, step=dump_step)
 
         # -----------------------------------------------------------------
         # Engram pre-computation (overlapped with main-stream layer forward)
@@ -2691,7 +2414,6 @@ class DeepseekV4Model(DecoderModel):
             )
 
         hidden_states = hc_state.residual.flatten(1)
-        _dsv4_dump_tensor("model_output", hidden_states, step=dump_step)
 
         return hidden_states
 
