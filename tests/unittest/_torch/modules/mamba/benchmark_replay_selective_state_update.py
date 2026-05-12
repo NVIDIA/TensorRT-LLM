@@ -663,7 +663,7 @@ _CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL = 10
 _CUPTI_ACTIVITY_ATTR_ZEROED_OUT_ACTIVITY_BUFFER = 5
 _CUPTI_HOST_BUFFER_BYTES = 1024 * 1024
 _CUPTI_HOST_BUFFER_COUNT = 16
-_CUDA_GRAPH_GROUP_ITERS = 4
+_DEFAULT_CUDA_GRAPH_GROUP_ITERS = 2
 
 
 def _load_libcupti() -> ctypes.CDLL:
@@ -917,6 +917,9 @@ class CuptiKernelTimer:
         self._finish_results: dict[int, dict] = {}
         self._parser_errors: list[str] = []
         self._filter_plan = ()
+        self._last_start_timing: dict[str, float] = {}
+        self._last_stop_timing: dict[str, float] = {}
+        self._current_flush_period_ms = 0
         self._mp_ctx = mp.get_context("spawn")
         self._parse_input_queue = self._mp_ctx.Queue()
         self._parse_output_queue = self._mp_ctx.Queue()
@@ -952,6 +955,8 @@ class CuptiKernelTimer:
         self._libcupti.cuptiActivityEnable.restype = ctypes.c_int
         self._libcupti.cuptiActivityFlushAll.argtypes = [ctypes.c_uint32]
         self._libcupti.cuptiActivityFlushAll.restype = ctypes.c_int
+        self._libcupti.cuptiActivityFlushPeriod.argtypes = [ctypes.c_uint32]
+        self._libcupti.cuptiActivityFlushPeriod.restype = ctypes.c_int
         self._libcupti.cuptiActivitySetAttribute.argtypes = [
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_size_t),
@@ -1031,35 +1036,65 @@ class CuptiKernelTimer:
             shm = self._shared_buffers[buffer_id]
         self._parse_input_queue.put(("buffer", generation, buffer_id, shm.name, valid_size_int))
 
+    def _handle_parser_result(self, result: dict) -> None:
+        kind = result.get("kind")
+        if kind == "buffer_done":
+            with self._lock:
+                self._free_buffer_ids.append(int(result["buffer_id"]))
+        elif kind == "finish_done":
+            self._finish_results[int(result["generation"])] = result
+        elif kind == "error":
+            self._parser_errors.append(str(result.get("error")))
+
     def _drain_parser_results(self) -> None:
         while True:
             try:
                 result = self._parse_output_queue.get_nowait()
             except queue.Empty:
                 break
-            kind = result.get("kind")
-            if kind == "buffer_done":
-                with self._lock:
-                    self._free_buffer_ids.append(int(result["buffer_id"]))
-            elif kind == "finish_done":
-                self._finish_results[int(result["generation"])] = result
-            elif kind == "error":
-                self._parser_errors.append(str(result.get("error")))
+            self._handle_parser_result(result)
 
     def _flush(self, flag: int) -> None:
         self._check(self._libcupti.cuptiActivityFlushAll(flag))
 
-    def _begin(self, mode: str, filter_plan=()) -> int:
+    def _set_flush_period_ms(self, period_ms: int) -> None:
+        if period_ms == self._current_flush_period_ms:
+            return
+        self._check(self._libcupti.cuptiActivityFlushPeriod(period_ms))
+        self._current_flush_period_ms = period_ms
+
+    def _begin(
+        self,
+        mode: str,
+        filter_plan=(),
+        flush_period_ms: int = 0,
+        collect_timing: bool = False,
+    ) -> int:
+        start_timing: dict[str, float] = {}
         with self._lock:
             self._mode = "drop"
+        phase_start_s = time.perf_counter() if collect_timing else 0.0
         self._flush(1)
+        if collect_timing:
+            start_timing["forced_flush_ms"] = 1000.0 * (time.perf_counter() - phase_start_s)
+        phase_start_s = time.perf_counter() if collect_timing else 0.0
         self._drain_parser_results()
+        if collect_timing:
+            start_timing["drain_ms"] = 1000.0 * (time.perf_counter() - phase_start_s)
         with self._lock:
             self._generation += 1
             generation = self._generation
             self._mode = mode
             self._local_completed = []
             self._filter_plan = filter_plan
+        if flush_period_ms > 0:
+            phase_start_s = time.perf_counter() if collect_timing else 0.0
+            self._set_flush_period_ms(flush_period_ms)
+            if collect_timing:
+                start_timing["period_enable_ms"] = 1000.0 * (
+                    time.perf_counter() - phase_start_s
+                )
+        self._last_start_timing = start_timing
         return generation
 
     def capture_names(self, replay_fn) -> tuple[list[tuple], int, dict]:
@@ -1093,23 +1128,51 @@ class CuptiKernelTimer:
         records.sort(key=lambda r: r[1])
         return records, zero_ts_count, zero_ts_names
 
-    def start(self, filter_plan=()) -> None:
-        self._begin("parser", filter_plan)
+    def start(
+        self,
+        filter_plan=(),
+        flush_period_ms: int = 0,
+        collect_timing: bool = False,
+    ) -> None:
+        self._begin("parser", filter_plan, flush_period_ms, collect_timing)
 
-    def stop(self) -> tuple[list[tuple], int, dict, int]:
+    def stop(self, collect_timing: bool = False) -> tuple[list[tuple], int, dict, int]:
+        stop_timing: dict[str, float] = {}
+        stop_start_s = time.perf_counter() if collect_timing else 0.0
         generation = self._generation
+        phase_start_s = time.perf_counter() if collect_timing else 0.0
+        self._set_flush_period_ms(0)
+        if collect_timing:
+            stop_timing["period_disable_ms"] = 1000.0 * (
+                time.perf_counter() - phase_start_s
+            )
+        phase_start_s = time.perf_counter() if collect_timing else 0.0
         self._flush(0)
+        if collect_timing:
+            stop_timing["flush_ms"] = 1000.0 * (time.perf_counter() - phase_start_s)
         with self._lock:
             self._mode = "drop"
             filter_plan = self._filter_plan
         self._parse_input_queue.put(("finish", generation, filter_plan))
+        phase_start_s = time.perf_counter() if collect_timing else 0.0
         deadline = time.perf_counter() + 10.0
         while time.perf_counter() < deadline:
-            self._drain_parser_results()
+            timeout_s = max(0.0, min(0.01, deadline - time.perf_counter()))
+            try:
+                result = self._parse_output_queue.get(timeout=timeout_s)
+            except queue.Empty:
+                continue
+            self._handle_parser_result(result)
             if self._parser_errors:
                 raise RuntimeError("CUPTI parser process failed: " + "; ".join(self._parser_errors))
             result = self._finish_results.pop(generation, None)
             if result is not None:
+                if collect_timing:
+                    stop_timing["parser_wait_ms"] = 1000.0 * (
+                        time.perf_counter() - phase_start_s
+                    )
+                    stop_timing["total_ms"] = 1000.0 * (time.perf_counter() - stop_start_s)
+                self._last_stop_timing = stop_timing
                 return (
                     list(result["records"]),
                     int(result["zero_ts_count"]),
@@ -1118,6 +1181,12 @@ class CuptiKernelTimer:
                 )
             time.sleep(0.001)
         raise TimeoutError("Timed out waiting for CUPTI parser process")
+
+    def last_start_timing(self) -> dict[str, float]:
+        return dict(self._last_start_timing)
+
+    def last_stop_timing(self) -> dict[str, float]:
+        return dict(self._last_stop_timing)
 
     def close(self) -> None:
         parse_process = getattr(self, "_parse_process", None)
@@ -1240,6 +1309,34 @@ _PRE_GRAPH_WARMUP_ITERS = 3  # standard practice; see commit msg / design doc
 _CUPTI_FILTER_PLAN_CACHE: dict[tuple, tuple[int, tuple[str | None, ...]]] = {}
 
 
+class _HostTiming:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.values: dict[str, float | int | bool] = {}
+        self._total_start_s = time.perf_counter() if enabled else 0.0
+        self._phase_start_s = 0.0
+
+    def start(self) -> None:
+        if self.enabled:
+            self._phase_start_s = time.perf_counter()
+
+    def stop(self, key: str) -> None:
+        if self.enabled:
+            self.values[key] = 1000.0 * (time.perf_counter() - self._phase_start_s)
+
+    def add(self, key: str, value: float | int | bool) -> None:
+        if self.enabled:
+            self.values[key] = value
+
+    def stop_total(self) -> None:
+        if self.enabled:
+            self.values["total_ms"] = 1000.0 * (time.perf_counter() - self._total_start_s)
+
+    def attach(self, stats: dict | None) -> None:
+        if self.enabled and stats is not None:
+            stats["host_timing"] = self.values
+
+
 def _target_name_or_none(name: str | None) -> str | None:
     if name is None:
         return None
@@ -1260,10 +1357,11 @@ def _capture_group_graph(args, run_fn, reset_fn, group_iters: int) -> torch.cuda
     return graph
 
 
-def _graph_group_iters(total_iters: int, pre_iter_fn) -> int:
+def _graph_group_iters(args, total_iters: int, pre_iter_fn) -> int:
     if pre_iter_fn is not None:
         return 1
-    for group_iters in (_CUDA_GRAPH_GROUP_ITERS, 2):
+    requested_group_iters = max(1, int(args.cuda_graph_group_iters))
+    for group_iters in (requested_group_iters, 2):
         if total_iters % group_iters == 0:
             return group_iters
     return 1
@@ -1334,6 +1432,7 @@ def _time_kernel_cuda_graph(
     call.  Used to give mix scenarios a higher iter count than pure
     (more iters = more independent mix draws averaged in).
     """
+    host_timing = _HostTiming(bool(getattr(args, "host_timing", False)))
     timer = CuptiKernelTimer.get()
     warmup = args.warmup
     iters = iters_override if iters_override is not None else args.iters
@@ -1341,32 +1440,44 @@ def _time_kernel_cuda_graph(
     # Pre-graph eager warmup: full per-iter chain × N.  Settles allocator
     # + autotune; pre_iter_fn included so any side effects it has are
     # exercised before capture.
+    host_timing.start()
     for _ in range(_PRE_GRAPH_WARMUP_ITERS):
         reset_fn()
         if pre_iter_fn is not None:
             pre_iter_fn(0)
         run_fn()
     torch.cuda.synchronize()
+    host_timing.stop("pre_graph_warmup_ms")
 
     total_iters = warmup + iters
-    group_iters = _graph_group_iters(total_iters, pre_iter_fn)
+    group_iters = _graph_group_iters(args, total_iters, pre_iter_fn)
 
     # Reset just before capture so warmup state changes don't bleed in.
+    host_timing.start()
     reset_fn()
     torch.cuda.synchronize()
+    host_timing.stop("pre_capture_reset_ms")
 
     # Capture a small group of identical logical iterations.  Mix/pre_iter
     # cells stay at one iter per replay because their per-iter input update
     # still runs outside the graph.
+    host_timing.start()
     g = _capture_group_graph(args, run_fn, reset_fn, group_iters)
     torch.cuda.synchronize()
+    host_timing.stop("graph_capture_ms")
 
+    plan_cache_key = None if cupti_plan_key is None else (cupti_plan_key, group_iters)
+    host_timing.add("cupti_plan_cached", (
+        plan_cache_key is not None and plan_cache_key in _CUPTI_FILTER_PLAN_CACHE
+    ))
+    host_timing.start()
     records_per_replay, ordinal_names = _get_cupti_filter_plan(
         timer,
         g,
         cupti_plan_key,
         group_iters,
     )
+    host_timing.stop("cupti_plan_ms")
     target_count = sum(name is not None for name in ordinal_names)
     expected_targets_per_replay = expected_K * group_iters
     if target_count != expected_targets_per_replay:
@@ -1383,15 +1494,34 @@ def _time_kernel_cuda_graph(
     # against expected_K and slices warmup off the front.
     graph_replays = total_iters // group_iters
     filter_plan = ((records_per_replay, ordinal_names),) * graph_replays
-    timer.start(filter_plan)
+    cupti_flush_period_ms = max(0, int(getattr(args, "cupti_flush_period_ms", 0)))
+    host_timing.start()
+    timer.start(
+        filter_plan,
+        flush_period_ms=cupti_flush_period_ms,
+        collect_timing=host_timing.enabled,
+    )
+    host_timing.stop("cupti_start_ms")
+    for key, value in timer.last_start_timing().items():
+        host_timing.add(f"cupti_start_{key}", value)
     torch.cuda.nvtx.range_push(tag)
+    host_timing.start()
     for i in range(graph_replays):
         if pre_iter_fn is not None:
             pre_iter_fn(i)
         g.replay()
+    host_timing.stop("graph_enqueue_ms")
+    host_timing.start()
     torch.cuda.synchronize()
+    host_timing.stop("graph_sync_ms")
     torch.cuda.nvtx.range_pop()
-    records, zero_ts_count, zero_ts_names, raw_record_count = timer.stop()
+    host_timing.start()
+    records, zero_ts_count, zero_ts_names, raw_record_count = timer.stop(
+        collect_timing=host_timing.enabled,
+    )
+    host_timing.stop("cupti_stop_ms")
+    for key, value in timer.last_stop_timing().items():
+        host_timing.add(f"cupti_stop_{key}", value)
     expected_raw_record_count = records_per_replay * graph_replays
     if raw_record_count != expected_raw_record_count:
         print(
@@ -1402,9 +1532,20 @@ def _time_kernel_cuda_graph(
         )
         return None
 
-    return _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
-                                     zero_ts_count=zero_ts_count,
-                                     zero_ts_names=zero_ts_names)
+    host_timing.start()
+    stats = _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
+                                      zero_ts_count=zero_ts_count,
+                                      zero_ts_names=zero_ts_names)
+    host_timing.stop("stats_ms")
+    host_timing.stop_total()
+    host_timing.add("graph_group_iters", group_iters)
+    host_timing.add("graph_replays", graph_replays)
+    host_timing.add("cupti_records_per_replay", records_per_replay)
+    host_timing.add("cupti_target_records_per_replay", target_count)
+    host_timing.add("cupti_raw_records", raw_record_count)
+    host_timing.add("cupti_flush_period_ms", cupti_flush_period_ms)
+    host_timing.attach(stats)
+    return stats
 
 
 def _time_kernel_eager(
@@ -1424,6 +1565,7 @@ def _time_kernel_eager(
     come from CUPTI — same accuracy as the graph path, just slower per-iter
     (extra Python + sync overhead).
     """
+    host_timing = _HostTiming(bool(getattr(args, "host_timing", False)))
     timer = CuptiKernelTimer.get()
     warmup = args.warmup
     iters = iters_override if iters_override is not None else args.iters
@@ -1443,11 +1585,18 @@ def _time_kernel_eager(
         torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
+    host_timing.start()
     records, zero_ts_count, zero_ts_names = timer.capture_names(_run_eager_loop)
+    host_timing.stop("timed_loop_and_cupti_parse_ms")
 
-    return _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
-                                     zero_ts_count=zero_ts_count,
-                                     zero_ts_names=zero_ts_names)
+    host_timing.start()
+    stats = _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
+                                      zero_ts_count=zero_ts_count,
+                                      zero_ts_names=zero_ts_names)
+    host_timing.stop("stats_ms")
+    host_timing.stop_total()
+    host_timing.attach(stats)
+    return stats
 
 
 def _run_kernel_untimed(args, run_fn, reset_fn, tag: str) -> dict:
@@ -2809,6 +2958,8 @@ def _print_row(
                 k: stats[k] for k in ("median", "p95", "p99", "n")
                 if k in stats
             }
+            if "host_timing" in stats:
+                row_stats["host_timing"] = stats["host_timing"]
         json_results[key] = row_stats
         # Append to JSONL sidecar if a path is set (incremental persistence).
         # Open per-write because args is pickled to ProcessPoolExecutor
@@ -3289,6 +3440,15 @@ def _parse_args() -> argparse.Namespace:
         "inside the graph, eliminating all host overhead.",
     )
     parser.add_argument(
+        "--cuda-graph-group-iters",
+        type=int,
+        default=_DEFAULT_CUDA_GRAPH_GROUP_ITERS,
+        help="For pure CUDA-graph cells, capture this many logical benchmark "
+        "iterations per graph replay when warmup + iters is divisible by this "
+        "value. Mix cells stay at one logical iteration per replay because "
+        "their per-iteration input update runs outside the graph.",
+    )
+    parser.add_argument(
         "--cupti",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3298,6 +3458,14 @@ def _parse_args() -> argparse.Namespace:
         "timing entirely (kernels still run, but median/p95/p99 are zero) "
         "— use when wrapping the bench in nsys/ncu, where the external "
         "profiler provides timings and our CUPTI subscriber would conflict.",
+    )
+    parser.add_argument(
+        "--cupti-flush-period-ms",
+        type=int,
+        default=0,
+        help="If >0, ask CUPTI to periodically flush activity buffers during "
+        "the timed CUDA-graph region. This can overlap raw-buffer parsing with "
+        "long timed cells; 0 leaves flushing explicit at the end of each cell.",
     )
     parser.add_argument(
         "--json-output",
@@ -3314,6 +3482,14 @@ def _parse_args() -> argparse.Namespace:
         "spans) and per_kernel (per-iter relative start/end timestamps for "
         "each kernel) — useful for PDL overlap analysis but adds ~4 KB/cell. "
         "Default off keeps records to ~40 bytes (median/p95/p99/n only).",
+    )
+    parser.add_argument(
+        "--host-timing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Attach benchmark host-side phase timings to JSON/JSONL results. "
+        "Useful for diagnosing benchmark overhead, but it adds roughly 1 KB "
+        "per compact JSONL row and several perf_counter calls per cell.",
     )
     parser.add_argument(
         "--cupti-retry",
