@@ -1054,6 +1054,10 @@ class CuptiKernelTimer:
                 break
             self._handle_parser_result(result)
 
+    def is_generation_ready(self, generation: int) -> bool:
+        self._drain_parser_results()
+        return generation in self._finish_results or bool(self._parser_errors)
+
     def _flush(self, flag: int) -> None:
         self._check(self._libcupti.cuptiActivityFlushAll(flag))
 
@@ -1136,9 +1140,8 @@ class CuptiKernelTimer:
     ) -> None:
         self._begin("parser", filter_plan, flush_period_ms, collect_timing)
 
-    def stop(self, collect_timing: bool = False) -> tuple[list[tuple], int, dict, int]:
+    def stop_async(self, collect_timing: bool = False) -> tuple[int, dict[str, float]]:
         stop_timing: dict[str, float] = {}
-        stop_start_s = time.perf_counter() if collect_timing else 0.0
         generation = self._generation
         phase_start_s = time.perf_counter() if collect_timing else 0.0
         self._set_flush_period_ms(0)
@@ -1154,24 +1157,31 @@ class CuptiKernelTimer:
             self._mode = "drop"
             filter_plan = self._filter_plan
         self._parse_input_queue.put(("finish", generation, filter_plan))
+        self._last_stop_timing = stop_timing
+        return generation, stop_timing
+
+    def wait_for_generation(
+        self,
+        generation: int,
+        stop_timing: dict[str, float] | None = None,
+        collect_timing: bool = False,
+    ) -> tuple[list[tuple], int, dict, int]:
+        if stop_timing is None:
+            stop_timing = {}
         phase_start_s = time.perf_counter() if collect_timing else 0.0
         deadline = time.perf_counter() + 10.0
         while time.perf_counter() < deadline:
-            timeout_s = max(0.0, min(0.01, deadline - time.perf_counter()))
-            try:
-                result = self._parse_output_queue.get(timeout=timeout_s)
-            except queue.Empty:
-                continue
-            self._handle_parser_result(result)
-            if self._parser_errors:
-                raise RuntimeError("CUPTI parser process failed: " + "; ".join(self._parser_errors))
             result = self._finish_results.pop(generation, None)
             if result is not None:
                 if collect_timing:
                     stop_timing["parser_wait_ms"] = 1000.0 * (
                         time.perf_counter() - phase_start_s
                     )
-                    stop_timing["total_ms"] = 1000.0 * (time.perf_counter() - stop_start_s)
+                    stop_timing["total_ms"] = (
+                        stop_timing.get("period_disable_ms", 0.0)
+                        + stop_timing.get("flush_ms", 0.0)
+                        + stop_timing["parser_wait_ms"]
+                    )
                 self._last_stop_timing = stop_timing
                 return (
                     list(result["records"]),
@@ -1179,8 +1189,19 @@ class CuptiKernelTimer:
                     dict(result["zero_ts_names"]),
                     int(result["raw_record_count"]),
                 )
-            time.sleep(0.001)
+            timeout_s = max(0.0, min(0.01, deadline - time.perf_counter()))
+            try:
+                parser_result = self._parse_output_queue.get(timeout=timeout_s)
+            except queue.Empty:
+                continue
+            self._handle_parser_result(parser_result)
+            if self._parser_errors:
+                raise RuntimeError("CUPTI parser process failed: " + "; ".join(self._parser_errors))
         raise TimeoutError("Timed out waiting for CUPTI parser process")
+
+    def stop(self, collect_timing: bool = False) -> tuple[list[tuple], int, dict, int]:
+        generation, stop_timing = self.stop_async(collect_timing)
+        return self.wait_for_generation(generation, stop_timing, collect_timing)
 
     def last_start_timing(self) -> dict[str, float]:
         return dict(self._last_start_timing)
@@ -1335,6 +1356,65 @@ class _HostTiming:
     def attach(self, stats: dict | None) -> None:
         if self.enabled and stats is not None:
             stats["host_timing"] = self.values
+
+
+class _PendingCuptiStats:
+
+    def __init__(
+        self,
+        timer: CuptiKernelTimer,
+        generation: int,
+        stop_timing: dict[str, float],
+        host_timing: _HostTiming,
+        *,
+        warmup: int,
+        iters: int,
+        tag: str,
+        expected_K: int,
+        expected_raw_record_count: int,
+    ) -> None:
+        self._timer = timer
+        self._generation = generation
+        self._stop_timing = stop_timing
+        self._host_timing = host_timing
+        self._warmup = warmup
+        self._iters = iters
+        self._tag = tag
+        self._expected_K = expected_K
+        self._expected_raw_record_count = expected_raw_record_count
+
+    def is_ready(self) -> bool:
+        return self._timer.is_generation_ready(self._generation)
+
+    def resolve(self) -> dict | None:
+        records, zero_ts_count, zero_ts_names, raw_record_count = self._timer.wait_for_generation(
+            self._generation,
+            self._stop_timing,
+            collect_timing=self._host_timing.enabled,
+        )
+        for key, value in self._timer.last_stop_timing().items():
+            self._host_timing.add(f"cupti_stop_{key}", value)
+        if raw_record_count != self._expected_raw_record_count:
+            print(
+                f"[WARN] CUPTI raw-record mismatch for {self._tag!r}: expected "
+                f"{self._expected_raw_record_count}, got {raw_record_count}. SKIPPING cell.",
+                file=sys.stderr,
+            )
+            return None
+
+        self._host_timing.start()
+        stats = _stats_from_cupti_records(
+            records,
+            self._warmup,
+            self._iters,
+            self._tag,
+            self._expected_K,
+            zero_ts_count=zero_ts_count,
+            zero_ts_names=zero_ts_names,
+        )
+        self._host_timing.stop("stats_ms")
+        self._host_timing.attach(stats)
+        return stats
 
 
 def _target_name_or_none(name: str | None) -> str | None:
@@ -1515,14 +1595,38 @@ def _time_kernel_cuda_graph(
     torch.cuda.synchronize()
     host_timing.stop("graph_sync_ms")
     torch.cuda.nvtx.range_pop()
+    expected_raw_record_count = records_per_replay * graph_replays
     host_timing.start()
+    if int(getattr(args, "cupti_defer_depth", 1)) > 1:
+        generation, stop_timing = timer.stop_async(collect_timing=host_timing.enabled)
+        host_timing.stop("cupti_stop_ms")
+        for key, value in timer.last_stop_timing().items():
+            host_timing.add(f"cupti_stop_{key}", value)
+        host_timing.stop_total()
+        host_timing.add("graph_group_iters", group_iters)
+        host_timing.add("graph_replays", graph_replays)
+        host_timing.add("cupti_records_per_replay", records_per_replay)
+        host_timing.add("cupti_target_records_per_replay", target_count)
+        host_timing.add("cupti_raw_records_expected", expected_raw_record_count)
+        host_timing.add("cupti_flush_period_ms", cupti_flush_period_ms)
+        return _PendingCuptiStats(
+            timer,
+            generation,
+            stop_timing,
+            host_timing,
+            warmup=warmup,
+            iters=iters,
+            tag=tag,
+            expected_K=expected_K,
+            expected_raw_record_count=expected_raw_record_count,
+        )
+
     records, zero_ts_count, zero_ts_names, raw_record_count = timer.stop(
         collect_timing=host_timing.enabled,
     )
     host_timing.stop("cupti_stop_ms")
     for key, value in timer.last_stop_timing().items():
         host_timing.add(f"cupti_stop_{key}", value)
-    expected_raw_record_count = records_per_replay * graph_replays
     if raw_record_count != expected_raw_record_count:
         print(
             f"[WARN] CUPTI raw-record mismatch for {tag!r}: expected "
@@ -1543,6 +1647,7 @@ def _time_kernel_cuda_graph(
     host_timing.add("cupti_records_per_replay", records_per_replay)
     host_timing.add("cupti_target_records_per_replay", target_count)
     host_timing.add("cupti_raw_records", raw_record_count)
+    host_timing.add("cupti_raw_records_expected", expected_raw_record_count)
     host_timing.add("cupti_flush_period_ms", cupti_flush_period_ms)
     host_timing.attach(stats)
     return stats
@@ -2188,22 +2293,18 @@ def _bench_config(
                 ),
             )
 
-            if stats is not None:
-                _print_row(
-                    show_kernel_col,
-                    args.baseline,
-                    batch,
-                    mtp_len,
-                    "N/A",
-                    state_dtype_name,
-                    act_dtype_name,
-                    stats,
-                    json_results=getattr(args, "_json_results", None),
-                    tp_size=args.tp_size,
-                    json_detailed=getattr(args, "json_detailed", False),
-                    jsonl_path=getattr(args, "_jsonl_path", None),
-                    jsonl_host=getattr(args, "_jsonl_host", None),
-                )
+            _submit_result_job(
+                args,
+                stats,
+                show_kernel_col=show_kernel_col,
+                kernel_name=args.baseline,
+                batch=batch,
+                mtp_len=mtp_len,
+                prev_k="N/A",
+                state_dtype_name=state_dtype_name,
+                act_dtype_name=act_dtype_name,
+                skipped_tag=tag,
+            )
 
     # --- Sweep parameter parsing (invariant across prev_k) ---
     def _parse_sweep(val):
@@ -2784,7 +2885,12 @@ def _bench_config(
                 # because the failure is transient at the kernel-launch level.
                 # Per --cupti-retry budget.  On final failure, append tag to
                 # the skipped list for an external rerun in a fresh process.
-                retry_budget = max(0, getattr(args, "cupti_retry", 1))
+                defer_results = (
+                    args.cuda_graph
+                    and getattr(args, "cupti", True)
+                    and int(getattr(args, "cupti_defer_depth", 1)) > 1
+                )
+                retry_budget = 0 if defer_results else max(0, getattr(args, "cupti_retry", 1))
                 stats = None
                 expected_K = _kernels_per_iter_incremental(
                     mode, with_conv1d=with_conv1d,
@@ -2834,6 +2940,7 @@ def _bench_config(
                 # For pure scenarios, n_writes is constant: 0 (nowrite) or
                 # batch (write), determined by scn["fill"] + mtp_len > max_window.
                 # For mix, scn carries the precomputed per-iter array.
+                per_iter_nw = None
                 if stats is not None and getattr(args, "json_detailed", False):
                     eff_iters = scenario_iters if scenario_iters is not None else args.iters
                     if scn["fill"] is not None:
@@ -2847,25 +2954,21 @@ def _bench_config(
                             per_iter_nw = nw_full[args.warmup:args.warmup + eff_iters].tolist()
                         else:
                             per_iter_nw = None
-                    if per_iter_nw is not None:
-                        stats["n_writes_per_iter"] = per_iter_nw
 
                 if stats is not None:
-                    _print_row(
-                        show_kernel_col,
-                        args.variant,
-                        batch,
-                        mtp_len,
-                        prev_k_for_print,
-                        state_dtype_name,
-                        act_dtype_name,
+                    _submit_result_job(
+                        args,
                         stats,
-                        sweep_suffix,
-                        json_results=getattr(args, "_json_results", None),
-                        tp_size=args.tp_size,
-                        json_detailed=getattr(args, "json_detailed", False),
-                        jsonl_path=getattr(args, "_jsonl_path", None),
-                        jsonl_host=getattr(args, "_jsonl_host", None),
+                        show_kernel_col=show_kernel_col,
+                        kernel_name=args.variant,
+                        batch=batch,
+                        mtp_len=mtp_len,
+                        prev_k=prev_k_for_print,
+                        state_dtype_name=state_dtype_name,
+                        act_dtype_name=act_dtype_name,
+                        sweep_suffix=sweep_suffix,
+                        per_iter_nw=per_iter_nw,
+                        skipped_tag=sweep_tag,
                     )
 
 
@@ -2975,6 +3078,95 @@ def _print_row(
                 f.write(json.dumps(rec) + "\n")
 
 
+def _finish_result_job(args, job: dict) -> None:
+    result = job["result"]
+    if isinstance(result, _PendingCuptiStats):
+        stats = result.resolve()
+    else:
+        stats = result
+
+    if stats is None:
+        skipped_tag = job.get("skipped_tag")
+        if skipped_tag is not None:
+            args._skipped_cells.append(skipped_tag)
+        return
+
+    per_iter_nw = job.get("per_iter_nw")
+    if per_iter_nw is not None and getattr(args, "json_detailed", False):
+        stats["n_writes_per_iter"] = per_iter_nw
+
+    _print_row(
+        job["show_kernel_col"],
+        job["kernel_name"],
+        job["batch"],
+        job["mtp_len"],
+        job["prev_k"],
+        job["state_dtype_name"],
+        job["act_dtype_name"],
+        stats,
+        job.get("sweep_suffix", ""),
+        json_results=getattr(args, "_json_results", None),
+        tp_size=args.tp_size,
+        json_detailed=getattr(args, "json_detailed", False),
+        jsonl_path=getattr(args, "_jsonl_path", None),
+        jsonl_host=getattr(args, "_jsonl_host", None),
+    )
+
+
+def _drain_pending_results(args, *, force: bool = False) -> None:
+    pending_results = getattr(args, "_pending_results", None)
+    if not pending_results:
+        return
+
+    max_pending = max(1, int(getattr(args, "cupti_defer_depth", 1)))
+    while pending_results:
+        first_result = pending_results[0]["result"]
+        should_block = force or len(pending_results) >= max_pending
+        if (
+            not should_block
+            and isinstance(first_result, _PendingCuptiStats)
+            and not first_result.is_ready()
+        ):
+            break
+        job = pending_results.pop(0)
+        _finish_result_job(args, job)
+
+
+def _submit_result_job(
+    args,
+    result,
+    *,
+    show_kernel_col,
+    kernel_name,
+    batch,
+    mtp_len,
+    prev_k,
+    state_dtype_name,
+    act_dtype_name,
+    sweep_suffix="",
+    per_iter_nw=None,
+    skipped_tag=None,
+) -> None:
+    job = {
+        "result": result,
+        "show_kernel_col": show_kernel_col,
+        "kernel_name": kernel_name,
+        "batch": batch,
+        "mtp_len": mtp_len,
+        "prev_k": prev_k,
+        "state_dtype_name": state_dtype_name,
+        "act_dtype_name": act_dtype_name,
+        "sweep_suffix": sweep_suffix,
+        "per_iter_nw": per_iter_nw,
+        "skipped_tag": skipped_tag,
+    }
+    if isinstance(result, _PendingCuptiStats):
+        args._pending_results.append(job)
+        _drain_pending_results(args)
+    else:
+        _finish_result_job(args, job)
+
+
 # Main benchmark loop
 
 
@@ -2982,6 +3174,7 @@ def _run_benchmark(args) -> None:
     # JSON accumulator — populated by _print_row when --json-output is set.
     # Stash on args so we don't need to thread a dict through every helper.
     args._json_results = {} if getattr(args, "json_output", None) else None
+    args._pending_results = []
 
     # JSONL incremental sidecar.  Path = `<json_output>.jsonl`.  Each completed
     # cell appends one line `{"key": <json_key>, "stats": {...}}` to this file
@@ -3306,6 +3499,8 @@ def _run_benchmark(args) -> None:
                                                     mix_samples_sorted_cpu=mix_samples_sorted_cpu,
                                                 )
 
+    _drain_pending_results(args, force=True)
+
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
 
@@ -3466,6 +3661,14 @@ def _parse_args() -> argparse.Namespace:
         help="If >0, ask CUPTI to periodically flush activity buffers during "
         "the timed CUDA-graph region. This can overlap raw-buffer parsing with "
         "long timed cells; 0 leaves flushing explicit at the end of each cell.",
+    )
+    parser.add_argument(
+        "--cupti-defer-depth",
+        type=int,
+        default=4,
+        help="Maximum number of CUDA-graph CUPTI timing results that may be "
+        "left for the parser process while the main process starts later cells. "
+        "1 preserves synchronous per-cell parsing and inline retry behavior.",
     )
     parser.add_argument(
         "--json-output",
