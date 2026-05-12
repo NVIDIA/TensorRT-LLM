@@ -117,8 +117,6 @@ class LTX2Attention(Attention):
             eps=norm_eps,
             bias=True,
             interleave=(rope_type == LTXRopeType.INTERLEAVED),
-            # LTX-2 defaults to fused norm+RoPE. Override via config.attention.fuse_qk_norm_rope=False
-            # to fall back to the naive eager rope path (rare; head_dim must still be 64/128).
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
@@ -209,78 +207,6 @@ class LTX2Attention(Attention):
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
 
-    def _apply_split_norm_rope(
-        self,
-        tensor: torch.Tensor,
-        weight: torch.Tensor,
-        num_heads: int,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> None:
-        """In-place fused RMSNorm + RoPE on a single Q or K tensor [B, T, H*D].
-
-        Calls trtllm.fused_dit_split_norm_rope. Used by the cross-attn fast path.
-        """
-        B, T, _ = tensor.shape
-        # LTX-2 full-dim per-head cos: [B, T, H, D] reshape(-1, H*D) -> [B*T, H*D]
-        # is what the kernel reads. Kernel broadcasts cos over B internally
-        # (cos_tokenIdx = tokenIdx % cos_seq_per_batch), so we pass cos as-is.
-        # bf16 cos is also accepted (kernel upcasts to fp32 in registers).
-        cos_last = num_heads * self.head_dim
-        cos_2d = cos.reshape(-1, cos_last).contiguous()
-        sin_2d = sin.reshape(-1, cos_last).contiguous()
-        tensor_2d = tensor.view(B * T, -1)
-        torch.ops.trtllm.fused_dit_split_norm_rope(
-            tensor_2d,
-            num_heads,
-            self.head_dim,
-            self.eps,
-            weight,
-            cos_2d,
-            sin_2d,
-            self.interleave,
-        )
-
-    def _apply_split_norm(
-        self,
-        tensor: torch.Tensor,
-        weight: torch.Tensor,
-        num_heads: int,
-    ) -> None:
-        """In-place fused full-dim RMSNorm only (no RoPE) on a single Q or K tensor [B, T, H*D].
-
-        Calls trtllm.fused_dit_split_norm. Used by paths that need norm but
-        no RoPE -- LTX-2 text cross-attn (Q-norm with pe=None) and the K-norm
-        side of prepare_text_cache project_kv when pe is unavailable.
-        """
-        B, T, _ = tensor.shape
-        tensor_2d = tensor.view(B * T, -1)
-        torch.ops.trtllm.fused_dit_split_norm(
-            tensor_2d,
-            num_heads,
-            self.head_dim,
-            self.eps,
-            weight,
-        )
-
-    def _apply_split_norm_or_norm_rope(
-        self,
-        tensor: torch.Tensor,
-        weight: torch.Tensor,
-        num_heads: int,
-        pe: tuple[torch.Tensor, torch.Tensor] | None,
-    ) -> None:
-        """Dispatcher: in-place norm-only when pe is None, else norm + RoPE.
-
-        Used to dispatch all SEPARATE_QKV cross-attn norm paths through the
-        split-fuse kernels regardless of whether the path needs RoPE.
-        """
-        if pe is None:
-            self._apply_split_norm(tensor, weight, num_heads)
-        else:
-            cos, sin = pe
-            self._apply_split_norm_rope(tensor, weight, num_heads, cos, sin)
-
     def project_kv(
         self,
         context: torch.Tensor,
@@ -302,7 +228,7 @@ class LTX2Attention(Attention):
         # All cross-attn K-norm paths (with or without RoPE) go through the
         # split-fuse kernels.  fallback only kicks in for unsupported head_dim.
         if self.qk_norm and self.head_dim in (64, 128):
-            self._apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
+            self.apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
         else:
             if self.qk_norm:
                 k = self.norm_k(k)
@@ -337,7 +263,7 @@ class LTX2Attention(Attention):
             # ─── self-attn → packed kernel (norm + rope on QKV in-place) ───
             qkv = self.qkv_proj(x)
             cos, sin = pe
-            self.apply_qk_norm_rope(qkv, cos, sin)
+            self.apply_packed_qk_norm_rope(qkv, cos, sin)
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
 
         elif self.qkv_mode == QKVMode.SEPARATE_QKV:
@@ -348,26 +274,23 @@ class LTX2Attention(Attention):
                 # cached tensor; we only fuse Q here.
                 k, v = pre_projected_kv
                 q = self.to_q(x)
-                self._apply_split_norm_or_norm_rope(
+                self.apply_split_norm_or_norm_rope(
                     q, self.norm_q.weight, self.num_attention_heads, pe
                 )
             else:
-                # Uncached cross-attn (LTX-2 实际不进；保留 fuse 一致性).
+                # Uncached cross-attn (not exercised by LTX-2 in practice; kept for fuse-dispatch consistency).
                 q = self.to_q(x)
                 k = self.to_k(context)
                 v = self.to_v(context)
-                self._apply_split_norm_or_norm_rope(
+                self.apply_split_norm_or_norm_rope(
                     q, self.norm_q.weight, self.num_attention_heads, pe
                 )
-                self._apply_split_norm_or_norm_rope(
+                self.apply_split_norm_or_norm_rope(
                     k,
                     self.norm_k.weight,
                     self.num_key_value_heads,
                     k_pe if k_pe is not None else pe,
                 )
-        else:
-            # Defensive: unknown QKVMode (LTX-2 always FUSE_QKV or SEPARATE_QKV).
-            return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv)
 
         out = self._attn_impl(q, k, v)
 
@@ -400,10 +323,6 @@ class LTX2Attention(Attention):
         ([B, T, H, D] for SPLIT rope, [B, T, D] for INTERLEAVED). The fused
         kernel's 2D form is not compatible with the naive ``apply_rotary_emb``.
         """
-        if pe is not None:
-            assert isinstance(pe, tuple) and pe[0].ndim >= 3, (
-                "_forward_unfused requires 4D PE (caller passed 2D — only fused kernel accepts that)"
-            )
         if pre_projected_kv is not None:
             k, v = pre_projected_kv
             q = self.to_q(x)
@@ -1331,48 +1250,36 @@ class LTXModel(nn.Module):
         is_audio: bool,
         fuse: bool,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Sharded-local PE in the form the consumer wants.
+        """Sharded-local PE for the attention consumer.
 
         Slices the source 4D PE along seq dim by Ulysses rank (one-time, in
-        ``prepare_text_cache``), then either:
-          - ``fuse=True``  → reshape to 2D ``[T_local, H*D]`` contiguous, the
-            layout the fused norm+rope kernel consumes directly.
-          - ``fuse=False`` → keep 4D ``[B, T_local, H, D]`` for the naive
-            ``apply_rotary_emb`` eager path.
+        ``prepare_text_cache``), then either reshapes to 2D ``[T_local, H*D]``
+        for the fused kernel or keeps 4D for the eager apply_rotary_emb path.
+        LTX-2 SPLIT rope produces 4D PE; INTERLEAVED is not used in prod.
 
-        Returns None for ndim != 4 SPLIT-rope inputs (e.g. INTERLEAVED rope
-        produces 3D PE) — caller can carry the original through unchanged.
+        ``_audio_is_sharded`` (set in ``configure_audio_ulysses``) already
+        encodes whether audio_seq_len is divisible by ulysses_size, so we
+        gate sharding on that flag alone — no second divisibility check.
         """
         if pe is None:
             return None
         cos, sin = pe
-        if cos.ndim != 4:
-            return None
-        # Shard along seq dim (one-time, at cache build).
         sh = self._sharder
-        shard_this = sh.is_active and (not is_audio or self._audio_is_sharded)
-        if shard_this and cos.shape[1] % sh.size == 0:
+        if sh.is_active and (not is_audio or self._audio_is_sharded):
             chunk = cos.shape[1] // sh.size
             s = sh.rank * chunk
             e = s + chunk
-            cos_local = cos[:, s:e]
-            sin_local = sin[:, s:e]
-        else:
-            cos_local = cos
-            sin_local = sin
-        cos_local = cos_local.contiguous()
-        sin_local = sin_local.contiguous()
+            cos = cos[:, s:e]
+            sin = sin[:, s:e]
+        cos = cos.contiguous()
+        sin = sin.contiguous()
         if fuse:
             # [B, T_local, H, D] -> [B*T_local, H*D]. PE source from
             # precompute_freqs_cis has B=1 so this collapses to [T_local, H*D];
             # the fused kernel broadcasts cos over B internally.
-            cos_out = cos_local.reshape(cos_local.shape[0] * cos_local.shape[1], -1)
-            sin_out = sin_local.reshape(sin_local.shape[0] * sin_local.shape[1], -1)
-        else:
-            # Keep 4D for naive apply_rotary_emb path.
-            cos_out = cos_local
-            sin_out = sin_local
-        return (cos_out, sin_out)
+            cos = cos.reshape(cos.shape[0] * cos.shape[1], -1)
+            sin = sin.reshape(sin.shape[0] * sin.shape[1], -1)
+        return (cos, sin)
 
     def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather hidden states along the sequence dim."""
@@ -1494,14 +1401,10 @@ class LTXModel(nn.Module):
         # has no reshape/contiguous/shard work on PE.
         # Inspect any LTX2Attention to learn whether fusion is on (per-modality
         # attentions are constructed with the same flag in this codepath).
-        fuse_video = (
-            self.transformer_blocks[0].attn1.fuse_qk_norm_rope
-            if video_context is not None
-            else True
-        )
+        fuse_video = self.transformer_blocks[0].attn1.fuse_qk_norm_rope
         fuse_audio = (
             self.transformer_blocks[0].audio_attn1.fuse_qk_norm_rope
-            if audio_context is not None and hasattr(self.transformer_blocks[0], "audio_attn1")
+            if hasattr(self.transformer_blocks[0], "audio_attn1")
             else True
         )
         v_pe = self._make_pe_local(v_pe, is_audio=False, fuse=fuse_video)

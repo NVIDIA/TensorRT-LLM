@@ -433,8 +433,13 @@ __global__ void fusedDiTCrossHeadQKNormRopeKernel(__nv_bfloat16* qkv, // [num_to
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// V2: 2 rows per CTA + cp.async Q+K overlap with sync weight/cos/sin loads.
-// Same V3 strategy as norm-only kernel; cos/sin shared between Q and K (loaded once).
+// Fused full-dim RMSNorm + RoPE on packed QKV; Q and K share a single cos/sin pair.
+// Strategy:
+//   - 2 rows per CTA (256 threads = 2 rows x 128 threads x 4 warps).
+//   - Phase 0a: cp.async Q + K + cos + sin (HBM -> SMEM) in one commit group.
+//   - Phase 0b: sync load q_weight + k_weight -> regs (overlaps the cp.async transfers).
+//   - Phase 1: sum^2_Q and sum^2_K together from SMEM, per-row reduce with packed (Q, K) warp slots.
+//   - Phase 2: applies norm + RoPE to Q and K via shared cos/sin SMEM stage; writes HBM in place.
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const num_heads_q, int const num_heads_k,
     int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,

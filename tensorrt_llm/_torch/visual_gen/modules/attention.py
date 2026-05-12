@@ -250,7 +250,7 @@ class Attention(nn.Module):
             k = self.norm_k(k)
         return q, k
 
-    def apply_qk_norm_rope(
+    def apply_packed_qk_norm_rope(
         self,
         qkv: torch.Tensor,
         freqs_cos: torch.Tensor,
@@ -259,7 +259,7 @@ class Attention(nn.Module):
         q_add_weight: Optional[torch.Tensor] = None,
         k_add_weight: Optional[torch.Tensor] = None,
     ) -> None:
-        """Apply fused QK Norm + RoPE in-place on packed QKV tensor.
+        """Apply fused QK Norm + RoPE in-place on packed QKV tensor (FUSE_QKV self-attn).
 
         cos/sin can be either shape (per-token total elements):
           - [..., head_dim]            : shared across heads (FLUX/Cosmos style)
@@ -312,6 +312,77 @@ class Attention(nn.Module):
             self.interleave,
             tokens_per_batch,
         )
+
+    def apply_split_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> None:
+        """In-place fused RMSNorm + RoPE on a single Q or K tensor [B, T, H*D] (SEPARATE_QKV cross-attn).
+
+        Calls trtllm.fused_dit_split_norm_rope. Full-dim per-head cos in
+        [B, T, H, D] reshape(-1, H*D) -> [B*T, H*D] is what the kernel reads;
+        the kernel broadcasts cos over B internally
+        (cos_tokenIdx = tokenIdx % cos_seq_per_batch), so we pass cos as-is.
+        bf16 cos is also accepted (kernel upcasts to fp32 in registers).
+        """
+        B, T, _ = tensor.shape
+        cos_last = num_heads * self.head_dim
+        cos_2d = cos.reshape(-1, cos_last).contiguous()
+        sin_2d = sin.reshape(-1, cos_last).contiguous()
+        tensor_2d = tensor.view(B * T, -1)
+        torch.ops.trtllm.fused_dit_split_norm_rope(
+            tensor_2d,
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+            cos_2d,
+            sin_2d,
+            self.interleave,
+        )
+
+    def apply_split_norm(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+    ) -> None:
+        """In-place fused full-dim RMSNorm only (no RoPE) on a single Q or K tensor [B, T, H*D].
+
+        Calls trtllm.fused_dit_split_norm. Used by paths that need norm but
+        no RoPE -- e.g. LTX-2 text cross-attn (Q-norm with pe=None).
+        """
+        B, T, _ = tensor.shape
+        tensor_2d = tensor.view(B * T, -1)
+        torch.ops.trtllm.fused_dit_split_norm(
+            tensor_2d,
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+        )
+
+    def apply_split_norm_or_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        """Dispatcher: in-place norm-only when pe is None, else norm + RoPE.
+
+        Used to dispatch all SEPARATE_QKV cross-attn norm paths through the
+        split-fuse kernels regardless of whether the path needs RoPE.
+        """
+        if pe is None:
+            self.apply_split_norm(tensor, weight, num_heads)
+        else:
+            cos, sin = pe
+            self.apply_split_norm_rope(tensor, weight, num_heads, cos, sin)
 
     def _attn_impl(
         self,
@@ -388,7 +459,7 @@ class Attention(nn.Module):
         ):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
-            self.apply_qk_norm_rope(qkv, freqs_cos, freqs_sin)
+            self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
             out = self._attn_impl(q, k, v)
             return self.to_out[0](out)

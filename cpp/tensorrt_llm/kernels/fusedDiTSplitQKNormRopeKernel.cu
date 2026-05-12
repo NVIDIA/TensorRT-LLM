@@ -29,11 +29,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// V2: 2 rows per CTA + cp.async X overlap with sync weight/cos/sin loads (matches flashinfer pipelining).
-// Same arithmetic as V1 above, just restructured for higher DRAM utilization:
-//   - cp.async X (HBM->SMEM)  + sync weight + sync cos/sin (HBM->REG) all run in parallel
-//   - Phase 1 sum^2 reads X from SMEM (no HBM re-read)
-//   - Phase 2 reads X from SMEM, applies cached weight/cos/sin from regs, writes HBM
+// Fused full-dim RMSNorm + RoPE on a SINGLE Q or K tensor (LTX-2 SEPARATE_QKV cross-attn).
+// Strategy:
+//   - 2 rows per CTA (256 threads = 2 rows x 128 threads x 4 warps).
+//   - Phase 0a: cp.async X + cos + sin (HBM -> SMEM) in one commit group.
+//   - Phase 0b: sync load weight -> regs (overlaps the cp.async transfers).
+//   - Phase 1: sum^2 reads X from SMEM (no HBM re-read).
+//   - Phase 2: reads X + cos + sin from SMEM, multiplies by cached weight regs, writes HBM.
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ tensor, int const num_tokens,
     int const num_heads, float const eps, __nv_bfloat16 const* __restrict__ weight, CosT const* __restrict__ cos_emb,
