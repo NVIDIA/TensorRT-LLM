@@ -946,10 +946,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 hidden_gen = F.pad(hidden_gen, (0, 0, 0, pad))
                 cos, sin = self.cached_freqs_gen
                 self.cached_freqs_gen = (
-                    F.pad(cos, (0, 0, 0, pad)),
-                    F.pad(sin, (0, 0, 0, pad)),
+                    F.pad(cos, (0, 0, 0, 0, 0, pad)),
+                    F.pad(sin, (0, 0, 0, 0, 0, pad)),
                 )
-            S_shard = S_gen // self.seq_parallel_size
+            padded_s_gen = S_gen + pad
+            S_shard = padded_s_gen // self.seq_parallel_size
             hidden_gen = hidden_gen[
                 :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
             ]
