@@ -200,19 +200,24 @@ class DFlashWorker(SpecWorkerBase):
         """
         return self.max_draft_len + 1
 
-    def _lazy_init_ctx_buffers(self, draft_model, spec_metadata):
+    def _lazy_init_ctx_buffers(self, draft_model, spec_metadata, attn_metadata):
         if self._ctx_buf_inited:
             return
 
         max_batch = spec_metadata.max_num_requests
 
+        # Prefer runtime max_seq_len over max_position_embeddings: YaRN
+        # models advertise 100k+ positions, which would OOM the ctx buffer
+        # or, if silently capped, corrupt the slot cache on long prompts.
         config_max_ctx = getattr(self.spec_config, "max_ctx_len", None)
         if config_max_ctx is not None:
             self._max_ctx = config_max_ctx
         else:
             config = getattr(draft_model, "config", None)
-            max_pos = getattr(config, "max_position_embeddings", 8192) if config else 8192
-            self._max_ctx = min(max_pos, 8192)
+            max_pos = getattr(config, "max_position_embeddings", None) if config else None
+            runtime_max = getattr(attn_metadata, "max_seq_len", None)
+            candidates = [c for c in (runtime_max, max_pos) if c is not None]
+            self._max_ctx = min(candidates) if candidates else 8192
 
         dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
 
@@ -381,7 +386,7 @@ class DFlashWorker(SpecWorkerBase):
         K = self.max_draft_len
 
         # Lazy init buffers and attach worker reference for prepare()
-        self._lazy_init_ctx_buffers(draft_model, spec_metadata)
+        self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
         spec_metadata._dflash_worker = self
 
         # Save context lengths before warmup to prevent accumulation
