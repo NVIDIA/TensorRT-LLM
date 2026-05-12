@@ -30,9 +30,11 @@ if [ ! -f "${EFA_PREFIX}/include/rdma/fabric.h" ]; then
   exit 0
 fi
 
-# hwloc is optional but lets the plugin do topology-aware NIC selection.
+# hwloc is required by recent aws-ofi-nccl for topology-aware NIC selection;
+# configure aborts without it.
 if command -v apt-get >/dev/null; then
-  apt-get install -y --no-install-recommends libhwloc-dev || true
+  apt-get update
+  apt-get install -y --no-install-recommends libhwloc-dev
 fi
 
 mkdir -p /third-party-source
