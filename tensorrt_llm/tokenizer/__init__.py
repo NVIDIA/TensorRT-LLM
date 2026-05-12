@@ -8,6 +8,7 @@ from .tokenizer import (
     _xgrammar_tokenizer_info,
     load_custom_tokenizer,
     load_hf_tokenizer,
+    maybe_fix_byte_level_tokenizer,
     tokenizer_factory,
 )
 
@@ -19,6 +20,7 @@ __all__ = [
     "TransformersTokenizer",
     "load_custom_tokenizer",
     "load_hf_tokenizer",
+    "maybe_fix_byte_level_tokenizer",
     "tokenizer_factory",
     "_xgrammar_tokenizer_info",
     "_llguidance_tokenizer_info",

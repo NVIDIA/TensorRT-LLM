@@ -28,8 +28,8 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
 
 from .. import profiler
 from .._deprecation import emit_engine_arch_deprecation
-from .._utils import (maybe_pin_memory, mpi_rank, prefer_pinned,
-                      str_dtype_to_torch, str_dtype_to_trt,
+from .._utils import (get_hf_rope_theta, maybe_pin_memory, mpi_rank,
+                      prefer_pinned, str_dtype_to_torch, str_dtype_to_trt,
                       supports_inflight_batching, torch_dtype_to_trt,
                       trt_dtype_to_torch)
 from ..functional import RopeEmbeddingUtils, RotaryScalingType
@@ -415,7 +415,7 @@ class MultimodalModelRunner:
             self.max_position_embeddings = hf_config.max_position_embeddings
             self.hidden_size = hf_config.hidden_size
             self.num_attention_heads = hf_config.num_attention_heads
-            self.rope_theta = hf_config.rope_theta
+            self.rope_theta = get_hf_rope_theta(hf_config, 10000.0)
         if self.model_type == 'llava_onevision':
             self.num_frames = self.args.video_num_frames
             if self.num_frames is None:

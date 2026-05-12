@@ -113,6 +113,7 @@ def initialize_dummy_weights(
     """
 
     def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
+        """Return safe (min, max) bounds for uniform sampling of ``dtype``."""
         # These values are not necessarily the largest possible min/max,
         # they need to be small enough to avoid NaNs.
         if dtype in (torch.float8_e4m3fn, torch.int8):
@@ -128,7 +129,24 @@ def initialize_dummy_weights(
         else:
             raise NotImplementedError(f"Unknown quantized type: {dtype}.")
 
-    for param in model.state_dict().values():
+    # Calibration scalars (input_scale / inv_input_scale / kv_scales /
+    # inv_kv_scales / alpha / scalar_alpha) must keep their create_weights
+    # default (typically 1.0). Randomizing them breaks FP8 attention output
+    # and KV cache scaling for any `load_format="dummy"` + IPC update_weights
+    # flow when the checkpoint doesn't ship calibrated values (e.g., HF
+    # FineGrainedFP8, which uses dynamic activation quantization by design).
+    _SKIP_NAME_SUFFIXES = (
+        ".input_scale",
+        ".inv_input_scale",
+        ".kv_scales",
+        ".inv_kv_scales",
+        ".alpha",
+        ".scalar_alpha",
+    )
+
+    for _name, param in model.state_dict().items():
+        if any(_name.endswith(_s) for _s in _SKIP_NAME_SUFFIXES):
+            continue
         generator = torch.Generator(device=param.data.device)
         generator.manual_seed(seed)
         dtype = param.data.dtype
