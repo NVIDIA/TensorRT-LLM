@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,7 +56,7 @@ class CommunicationFactory:
         expert_size_per_partition: int,
         payload_in_workspace: bool = False,
         alltoall_result_do_sum: bool = True,
-        use_flashinfer: bool = False,
+        use_flashinfer_comm: bool = False,
         hidden_size: Optional[int] = None,
     ) -> Optional[Communication]:
         """
@@ -124,7 +124,7 @@ class CommunicationFactory:
                 expert_size_per_partition,
                 payload_in_workspace,
                 alltoall_result_do_sum,
-                use_flashinfer,
+                use_flashinfer_comm,
                 hidden_size=hidden_size,
             )
 
@@ -150,7 +150,7 @@ class CommunicationFactory:
             logger.info(f"NVLinkOneSided not available: {e}")
 
         try:
-            if use_flashinfer:
+            if use_flashinfer_comm:
                 strategy = NVLinkTwoSidedFlashinfer(
                     mapping,
                     num_experts,
@@ -223,7 +223,7 @@ class CommunicationFactory:
         expert_size_per_partition: int,
         payload_in_workspace: bool,
         alltoall_result_do_sum: bool,
-        use_flashinfer: bool,
+        use_flashinfer_comm: bool,
         hidden_size: Optional[int] = None,
     ) -> Communication:
         """
@@ -248,7 +248,7 @@ class CommunicationFactory:
 
         # Create strategy - will raise RuntimeError if platform not supported
         if method in ["NVLINK_TWO_SIDED"]:
-            if use_flashinfer:
+            if use_flashinfer_comm:
                 return NVLinkTwoSidedFlashinfer(
                     mapping,
                     num_experts,

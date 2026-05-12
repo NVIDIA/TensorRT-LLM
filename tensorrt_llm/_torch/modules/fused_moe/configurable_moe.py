@@ -325,6 +325,8 @@ class ConfigurableMoE(MoE):
         self.validate_backend(backend)
         self.backend = backend
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
+        # Only the comm-side flag matters for selecting the communication strategy.
+        self.use_flashinfer_comm = getattr(self.backend, "use_flashinfer_comm", False)
 
         # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
         # backend code path that reads e.g. ``self.layer_load_balancer`` or
@@ -515,7 +517,7 @@ class ConfigurableMoE(MoE):
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
-            use_flashinfer=self.use_flashinfer,
+            use_flashinfer_comm=self.use_flashinfer_comm,
             hidden_size=self.hidden_size,
         )
 

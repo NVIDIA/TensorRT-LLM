@@ -33,6 +33,32 @@ from tensorrt_llm.mapping import Mapping
 from .base import Communication
 
 
+def _align_payload(tensor: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    """Pad the row width so each row is 16B aligned (a FlashInfer moe_comm requirement)."""
+    assert tensor.dim() == 2, f"_align_payload expects a 2D tensor, got {tensor.dim()}D"
+    alignment = 16 // tensor.element_size()
+    pad_width = (-tensor.shape[1]) % alignment
+    if pad_width == 0:
+        return tensor, 0
+    return torch.nn.functional.pad(tensor, (0, pad_width)), pad_width
+
+
+def _mnnvl_moe_alltoallv_packed(tensors, alltoall_info, workspace, ep_rank, ep_size):
+    results = []
+    for tensor in tensors:
+        if tensor is None:
+            results.append(None)
+            continue
+        aligned_tensor, pad_width = _align_payload(tensor)
+        result = flashinfer_MnnvlMoe.mnnvl_moe_alltoallv(
+            aligned_tensor, alltoall_info, workspace, ep_rank, ep_size
+        )
+        if pad_width != 0:
+            result = result[:, :-pad_width].contiguous()
+        results.append(result)
+    return results
+
+
 class NVLinkTwoSidedFlashinfer(Communication):
     """
     NVLINK two-sided comm AllToAll strategy.
@@ -152,19 +178,6 @@ class NVLinkTwoSidedFlashinfer(Communication):
         """
         NVLINK two-sided comm dispatch (post-quant, uses alltoall_info from prepare_dispatch).
         """
-
-        def mnnvl_moe_alltoallv_packed(x, alltoall_info, workspace, ep_rank, ep_size):
-            results = []
-            for tensor in x:
-                if tensor is not None:
-                    result = flashinfer_MnnvlMoe.mnnvl_moe_alltoallv(
-                        tensor, alltoall_info, workspace, ep_rank, ep_size
-                    )
-                    results.append(result)
-                else:
-                    results.append(None)
-            return results
-
         # Read alltoall_info from dispatch_state (set by prepare_dispatch)
         alltoall_info = self._dispatch_state.get("alltoall_info")
         if alltoall_info is None:
@@ -178,7 +191,7 @@ class NVLinkTwoSidedFlashinfer(Communication):
 
         # Dispatch quantized data using AllToAll
         hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
-            mnnvl_moe_alltoallv_packed(
+            _mnnvl_moe_alltoallv_packed(
                 [hidden_states, hidden_states_sf, token_selected_slots, token_final_scales],
                 alltoall_info,
                 self.alltoall_workspace,

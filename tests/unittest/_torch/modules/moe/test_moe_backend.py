@@ -29,6 +29,7 @@ Design Goals:
 import itertools
 import logging
 import os
+from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -79,6 +80,19 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
     os.environ.setdefault("LOCAL_RANK", str(rank))
     torch.cuda.set_device(rank)
     dist.init_process_group(backend="nccl", rank=0, world_size=1)
+
+
+@pytest.mark.parametrize(("top_k", "expected"), [(4, False), (8, True)])
+def test_trtllm_gen_flashinfer_comm_checks_bf16_scale_alignment(top_k: int, expected: bool):
+    backend = SimpleNamespace(
+        use_flashinfer=True,
+        dtype=torch.bfloat16,
+        hidden_size=128,
+        routing_method=SimpleNamespace(experts_per_token=top_k),
+    )
+    backend_cls = get_backend_class(MoeBackendType.TRTLLM)
+
+    assert backend_cls._check_flashinfer_comm_support(backend) is expected
 
 
 def should_skip_gptoss(
