@@ -59,6 +59,12 @@ input [
     optional: true
   },
   {
+    name: "early_stopping"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
     name: "prompt_ignore_length"
     data_type: TYPE_INT32
     dims: [ 1 ]
@@ -186,6 +192,10 @@ ensemble_scheduling {
       input_map {
           key: "len_penalty"
           value: "length_penalty"
+      }
+      input_map {
+          key: "early_stopping"
+          value: "early_stopping"
       }
       input_map {
           key: "prompt_ignore_length"

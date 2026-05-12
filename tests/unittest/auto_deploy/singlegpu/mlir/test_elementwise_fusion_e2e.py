@@ -39,6 +39,8 @@ from tensorrt_llm._torch.auto_deploy.mlir.codegen.triton_emitter import (  # noq
 from tensorrt_llm._torch.auto_deploy.mlir.decompose import run_decomposition  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.mlir.dialect import (  # noqa: E402
     AdAdd,
+    AdEq,
+    AdFloorDiv,
     AdGraphOutput,
     AdMul,
     AdRMSNorm,
@@ -384,3 +386,103 @@ def test_full_fx_roundtrip_with_replacement():
     assert len(result) == len(ref), f"Output count mismatch: {len(result)} vs {len(ref)}"
     torch.testing.assert_close(result[0], ref[0], atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(result[1], ref[1], atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# MoE EP sharding mask: floordiv + eq + mul  (integer + bool + bf16 mixed)
+# Pattern from DeepSeek-R1 Expert Parallelism all-reduce sharding:
+#   floordiv(expert_ids, experts_per_rank) → which rank owns each expert
+#   eq(rank_ids, ep_rank) → boolean mask for local experts
+#   mul(routing_scores, mask) → zero out non-local expert scores
+# ---------------------------------------------------------------------------
+
+
+def _build_moe_ep_mask_module(top_k: int = 8, experts_per_rank: int = 32, ep_rank: int = 0):
+    """Build MLIR module for the MoE EP sharding mask pattern.
+
+    Inputs:  (scores: bf16 [B, top_k], expert_ids: int32 [B, top_k])
+    Ops:     floordiv → eq → mul
+    Outputs: (masked_scores: bf16 [B, top_k])
+    """
+    from xdsl.dialects.builtin import IntegerAttr, IntegerType
+
+    t_bf16 = TensorType(BFloat16Type(), [8, top_k])
+    t_i32 = TensorType(IntegerType(32), [8, top_k])
+    t_bool = TensorType(IntegerType(1), [8, top_k])
+
+    block = Block()
+    scores = block.insert_arg(t_bf16, 0)
+    expert_ids = block.insert_arg(t_i32, 1)
+
+    floordiv_op = AdFloorDiv.build(
+        operands=[expert_ids],
+        attributes={"divisor": IntegerAttr(experts_per_rank, IntegerType(64))},
+        result_types=[t_i32],
+    )
+    block.add_op(floordiv_op)
+
+    eq_op = AdEq.build(
+        operands=[floordiv_op.output],
+        attributes={"value": IntegerAttr(ep_rank, IntegerType(64))},
+        result_types=[t_bool],
+    )
+    block.add_op(eq_op)
+
+    mul_op = AdMul.build(
+        operands=[scores, eq_op.output],
+        result_types=[t_bf16],
+    )
+    block.add_op(mul_op)
+
+    out_op = AdGraphOutput.build(operands=[[mul_op.output]])
+    block.add_op(out_op)
+
+    return ModuleOp(Region([block]))
+
+
+def test_moe_ep_mask_fusion_discovery():
+    """Floordiv + eq + mul should be discovered as a single fusible subgraph."""
+    mlir_mod = _build_moe_ep_mask_module()
+
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) == 1, f"Expected 1 subgraph, got {len(subgraphs)}"
+    assert len(subgraphs[0].ops) == 3, f"Expected 3 ops, got {len(subgraphs[0].ops)}"
+
+
+def test_moe_ep_mask_kernel_generation():
+    """Triton kernel can be generated for the mixed-type floordiv+eq+mul pattern."""
+    mlir_mod = _build_moe_ep_mask_module()
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    assert len(subgraphs) == 1
+
+    kernel_fn = generate_kernel_from_subgraph(subgraphs[0])
+    assert callable(kernel_fn)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_moe_ep_mask_numerical_correctness():
+    """Generated kernel matches the reference floordiv+eq+mul computation."""
+    experts_per_rank = 32
+    ep_rank = 0
+    top_k = 8
+    batch = 8
+
+    mlir_mod = _build_moe_ep_mask_module(
+        top_k=top_k,
+        experts_per_rank=experts_per_rank,
+        ep_rank=ep_rank,
+    )
+    subgraphs = discover_fusible_subgraphs(mlir_mod)
+    kernel_fn = generate_kernel_from_subgraph(subgraphs[0])
+
+    scores = torch.randn(batch, top_k, device="cuda", dtype=torch.bfloat16)
+    expert_ids = torch.randint(0, 256, (batch, top_k), device="cuda", dtype=torch.int32)
+
+    # Subgraph input order: expert_ids first (used by floordiv), scores second (used by mul)
+    result = kernel_fn(expert_ids, scores)
+
+    rank_ids = expert_ids // experts_per_rank
+    mask = rank_ids == ep_rank
+    expected = scores * mask
+
+    torch.testing.assert_close(result[0], expected, atol=0, rtol=0)

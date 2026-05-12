@@ -133,7 +133,7 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
 
     int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const sink_token_length,
     int64_t const beam_width, int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank,
-    int64_t kv_lora_rank, int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim)
+    int64_t kv_lora_rank, int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append)
 {
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
@@ -160,7 +160,7 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
 
     tk::MlaMetaParams mla_meta_params = {static_cast<int>(q_lora_rank), static_cast<int>(kv_lora_rank),
         static_cast<int>(qk_nope_head_dim), static_cast<int>(qk_rope_head_dim), static_cast<int>(v_head_dim),
-        static_cast<int>(predicted_tokens_per_seq), static_cast<int>(layer_num)};
+        static_cast<int>(predicted_tokens_per_seq), static_cast<int>(layer_num), static_cast<int>(rope_append)};
 
     int32_t const* helix_position_offsets_ptr
         = helix_position_offsets.has_value() ? helix_position_offsets->data_ptr<int32_t>() : nullptr;
@@ -303,6 +303,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int qk_nope_head_dim"
         ", int qk_rope_head_dim"
         ", int v_head_dim"
+        ", bool rope_append"
         ") -> ()");
 }
 

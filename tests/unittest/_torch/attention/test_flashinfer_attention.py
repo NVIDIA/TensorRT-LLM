@@ -28,10 +28,10 @@ class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
     def get_num_plans(self, plan_params) -> int:
         return self._num_times_planned[plan_params]
 
-    def _plan_with_params(self, plan_params):
+    def _plan_with_params(self, plan_params, flashinfer_backend: str = "fa2"):
         if self.needs_plan(plan_params):
             self._num_times_planned[plan_params] += 1
-        return super()._plan_with_params(plan_params)
+        return super()._plan_with_params(plan_params, flashinfer_backend)
 
 
 @dataclass(repr=False)
@@ -280,10 +280,13 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() defers re-planning to forward_impl only when multiple
+        # wrappers share one workspace_buffer (hybrid attention); for the
+        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertEqual(wrappers.is_planned, not defer_plan)
 
         # [context_1, gen_1]
         results_2 = []
@@ -326,10 +329,13 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() defers re-planning to forward_impl only when multiple
+        # wrappers share one workspace_buffer (hybrid attention); for the
+        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertEqual(wrappers.is_planned, not defer_plan)
 
         # [context_2, gen_2]
         results_3 = []
@@ -371,10 +377,13 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() defers re-planning to forward_impl only when multiple
+        # wrappers share one workspace_buffer (hybrid attention); for the
+        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertEqual(wrappers.is_planned, not defer_plan)
 
         # assert value
 

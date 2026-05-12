@@ -9,7 +9,6 @@ import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -53,26 +52,35 @@ def parse_args():
     )
 
     # Generation Params
-    parser.add_argument("--height", type=int, default=720, help="Video height")
-    parser.add_argument("--width", type=int, default=1280, help="Video width")
-    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
+    parser.add_argument(
+        "--height", type=int, default=None, help="Video height (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--width", type=int, default=None, help="Video width (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--num_frames",
+        type=int,
+        default=None,
+        help="Number of frames to generate (default: auto-detect)",
+    )
     parser.add_argument(
         "--steps",
         type=int,
         default=None,
-        help="Number of denoising steps (default: auto-detect, 50 for Wan2.1, 40 for Wan2.2)",
+        help="Number of denoising steps (default: auto-detect, 50 for Wan2.1 and Wan 2.2 5B, 40 for Wan2.2 A14B)",
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
         default=None,
-        help="Guidance scale (default: auto-detect, 5.0 for Wan2.1, 4.0 for Wan2.2)",
+        help="Guidance scale (default: auto-detect, 5.0 for Wan2.1 and Wan 2.2 5B, 4.0 for Wan2.2 A14B)",
     )
     parser.add_argument(
         "--guidance_scale_2",
         type=float,
         default=None,
-        help="Second-stage guidance scale for Wan2.2 two-stage denoising (default: 3.0)",
+        help="Second-stage guidance scale for Wan2.2 A14B two-stage denoising (default: 3.0)",
     )
     parser.add_argument(
         "--boundary_ratio",
@@ -189,6 +197,17 @@ def parse_args():
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
 
+    # SageAttention (requires --attention_backend TRTLLM)
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help=(
+            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
+            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.1, "
+            "(1, 16, 1) otherwise."
+        ),
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -201,7 +220,25 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses (sequence) parallel size within each CFG group.",
+        help="Ulysses (head-sharding) parallel size within each CFG group. "
+        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
@@ -273,8 +310,29 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
+def _wan_needs_fine_grained_sage(model_path: str) -> bool:
+    """Hard-coded heuristics for determining if a WAN model needs finer-grained SageAttentionConfig."""
+    lower = model_path.lower().replace(".", "_").replace("-", "_")
+    # For I2V, Wan2.1 14B is also observed to require higher granularity
+    return "_1_3b" in lower or "wan2_1_i" in lower
+
+
 def main():
     args = parse_args()
+
+    attention_cfg = {
+        "backend": args.attention_backend,
+    }
+    if args.enable_sage_attention:
+        num_elts_per_blk_k = 4 if _wan_needs_fine_grained_sage(args.model_path) else 16
+        sage_cfg = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": num_elts_per_blk_k,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+        attention_cfg["sage_attention_config"] = sage_cfg
+        logger.info(f"SageAttention: INT8 Q/K, blocks (1, {num_elts_per_blk_k}, 1)")
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
@@ -283,12 +341,30 @@ def main():
     else:
         cache_kwargs = {}
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
+
+    if args.ulysses_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size})"
+    elif attn2d_size > 1:
+        parallel_str = (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
+        )
+    else:
+        parallel_str = "None"
+
     kwargs = dict(
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         **cache_kwargs,
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
             "enable_parallel_vae": not args.disable_parallel_vae,
         },
         torch_compile={
@@ -308,7 +384,7 @@ def main():
     logger.info(
         f"Initializing VisualGen: "
         f"cfg_size={diffusion_args.parallel.dit_cfg_size}, "
-        f"ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
+        f"parallelism={parallel_str}"
     )
     visual_gen = VisualGen(
         model=args.model_path,
@@ -316,14 +392,22 @@ def main():
     )
 
     try:
+        defaults = visual_gen.default_params
+        negative_prompt_log = (
+            args.negative_prompt if args.negative_prompt is not None else "[model default]"
+        )
+        height = args.height if args.height is not None else defaults.height
+        width = args.width if args.width is not None else defaults.width
+        num_frames = args.num_frames if args.num_frames is not None else defaults.num_frames
+        steps = args.steps if args.steps is not None else defaults.num_inference_steps
+        frame_rate = defaults.frame_rate
+
         logger.info(f"Generating video for prompt: '{args.prompt}'")
-        logger.info(f"Negative prompt: '{args.negative_prompt}'")
+        logger.info(f"Negative prompt: '{negative_prompt_log}'")
         logger.info(f"Input image: {args.image_path}")
         if args.last_image_path:
             logger.info(f"Last frame image: {args.last_image_path}")
-        logger.info(
-            f"Resolution: {args.height}x{args.width}, Frames: {args.num_frames}, Steps: {args.steps}"
-        )
+        logger.info(f"Resolution: {height}x{width}, Frames: {num_frames}, Steps: {steps}")
 
         start_time = time.time()
 
@@ -344,6 +428,7 @@ def main():
                 guidance_scale=args.guidance_scale,
                 seed=args.seed,
                 num_frames=args.num_frames,
+                frame_rate=frame_rate,
                 negative_prompt=args.negative_prompt,
                 image=args.image_path,
                 extra_params=extra_params if extra_params else None,
@@ -352,7 +437,7 @@ def main():
 
         logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        MediaStorage.save_video(output.video, args.output_path, audio=output.audio, frame_rate=16.0)
+        output.save(args.output_path)
 
     finally:
         visual_gen.shutdown()
