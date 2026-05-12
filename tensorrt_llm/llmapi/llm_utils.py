@@ -338,7 +338,17 @@ class ModelLoader:
             )
             with open(hf_quant_config_path, "r") as f:
                 hf_quant_config = json.load(f)
+            # ModelOpt < 1.0 wraps fields under "quantization"; ModelOpt >= 1.0
+            # emits a flat schema and renames "exclude_modules" -> "ignore".
+            # Normalize both shapes so the rest of this method is shape-agnostic.
+            if "quantization" in hf_quant_config:
                 hf_quant_config = hf_quant_config["quantization"]
+            for _meta_key in ("producer", "quant_method", "config_groups"):
+                hf_quant_config.pop(_meta_key, None)
+            if ("ignore" in hf_quant_config
+                    and "exclude_modules" not in hf_quant_config):
+                hf_quant_config["exclude_modules"] = hf_quant_config.pop(
+                    "ignore")
 
             hf_quant_algo = hf_quant_config.pop("quant_algo", None)
             if hf_quant_algo is not None:

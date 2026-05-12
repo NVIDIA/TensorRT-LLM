@@ -301,7 +301,10 @@ class ModelConfig(Generic[TConfig]):
         with open(quant_config_file) as f:
             quant_config_dict = json.load(f)
 
-        json_quant_configs = quant_config_dict['quantization']
+        # ModelOpt < 1.0 wraps fields under "quantization"; ModelOpt >= 1.0
+        # emits a flat schema and renames "exclude_modules" -> "ignore".
+        json_quant_configs = quant_config_dict.get('quantization',
+                                                   quant_config_dict)
 
         quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
         # fp8_pb_wo from modelopt is the same as FP8_BLOCK_SCALES
@@ -311,7 +314,7 @@ class ModelConfig(Generic[TConfig]):
             'kv_cache_quant_algo', None)
         quant_config.group_size = json_quant_configs.get('group_size', None)
         quant_config.exclude_modules = json_quant_configs.get(
-            'exclude_modules', None)
+            'exclude_modules', json_quant_configs.get('ignore', None))
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
             json_extended_quant_configs: dict = {}
