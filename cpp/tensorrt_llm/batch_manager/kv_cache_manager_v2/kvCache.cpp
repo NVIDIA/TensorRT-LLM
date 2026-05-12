@@ -89,7 +89,6 @@ KvCache::KvCache(KvCacheManager& manager, std::optional<int64_t> loraTaskId, std
         _setupForReuse(inputTokens);
 
     mAvgHistoryLength.update(static_cast<double>(mHistoryLength));
-    mAvgCapacity.update(static_cast<double>(mCapacity));
 
     mManager->registerKvCache(this);
     mManager->updateAvgReusedLength(static_cast<double>(mHistoryLength));
@@ -476,9 +475,14 @@ void KvCache::close()
     stopCommitting();
     assert(gNdebug || _checkSanity());
 
-    mManager->updateAvgSqrCapacity(mAvgCapacity.value() * mAvgCapacity.value());
-    mManager->updateAvgSqrHistoryLength(mAvgHistoryLength.value() * mAvgHistoryLength.value());
-    mManager->tryUpdateTargetRatios();
+    if (mCapacity > 0)
+    {
+        mAvgCapacity.update(static_cast<double>(mCapacity));
+        mManager->updateAvgSqrCapacity(mAvgCapacity.value() * mAvgCapacity.value());
+        mManager->updateAvgSqrHistoryLength(mAvgHistoryLength.value() * mAvgHistoryLength.value());
+        mManager->incrementNumSampledKvCaches();
+        mManager->tryUpdateTargetRatios();
+    }
 
     // Record event scope — mirrors Python's `with self._record_event()`.
     // Python always enters _record_event() here; _cuda_stream is valid for both ACTIVE and SUSPENDED.

@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
 #include <cassert>
@@ -933,6 +934,11 @@ std::vector<float> StorageManager::getRatioList(CacheLevel level) const
 
 std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const
 {
+    if (capacity < historyLength)
+    {
+        TLLM_LOG_WARNING("Bad sampling for capacity and history_length");
+        capacity = historyLength;
+    }
     int numBlocks = divUp(capacity, tokensPerBlock);
     std::vector<size_t> numBytes(static_cast<size_t>(numPoolGroups()), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
@@ -952,7 +958,7 @@ std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int histo
         else
         {
             auto stale = getStaleRange(lifecycles[lcIdx], historyLength, tokensPerBlock);
-            numRequiredBlocks = numBlocks - stale.length();
+            numRequiredBlocks = std::max(numBlocks - stale.length(), 1);
         }
         numBytes[static_cast<size_t>(pgIdx)]
             += static_cast<size_t>(numRequiredBlocks) * static_cast<size_t>(slotSizeSum);
