@@ -3436,7 +3436,8 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         # routed experts are unsupported by WIDEEP (raises "Unsupported
         # quantization mode: [65536]"). is_integration_test=True keeps this
         # to a 1-sample smoke.
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
@@ -3505,7 +3506,8 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # Aggregate (non-disagg, non-EPLB) smoke test. FP8 weights ~71 GB/rank
         # at TP=4 — fits on 4x B300 (~288 GB/GPU). 1-sample smoke. CUTLASS is
         # Hopper-only on Blackwell and skipped here.
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
