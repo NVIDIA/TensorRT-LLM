@@ -842,11 +842,32 @@ def _cupti_parser_worker(input_queue, output_queue, ready_event) -> None:
                 del shared_char
             output_queue.put({"kind": "buffer_done", "generation": generation, "buffer_id": buffer_id})
         elif kind == "finish":
-            _, generation, filter_plan = item
+            if len(item) == 4:
+                _, generation, filter_plan, stats_request = item
+            else:
+                _, generation, filter_plan = item
+                stats_request = None
             try:
                 raw_records = records_by_generation.pop(generation, [])
                 zero_ts_count = zero_ts_by_generation.pop(generation, 0)
                 filtered_records = _apply_cupti_filter_plan(raw_records, filter_plan)
+                stats = None
+                parser_stats_ms = 0.0
+                stats_ready = stats_request is not None
+                if stats_request is not None:
+                    stats_start_s = time.perf_counter()
+                    stats = _stats_from_cupti_records(
+                        filtered_records,
+                        int(stats_request["warmup"]),
+                        int(stats_request["iters"]),
+                        str(stats_request["tag"]),
+                        int(stats_request["expected_K"]),
+                        zero_ts_count=zero_ts_count,
+                        zero_ts_names={},
+                        include_details=bool(stats_request.get("include_details", True)),
+                    )
+                    parser_stats_ms = 1000.0 * (time.perf_counter() - stats_start_s)
+                    filtered_records = []
                 output_queue.put({
                     "kind": "finish_done",
                     "generation": generation,
@@ -854,6 +875,9 @@ def _cupti_parser_worker(input_queue, output_queue, ready_event) -> None:
                     "zero_ts_count": zero_ts_count,
                     "zero_ts_names": {},
                     "raw_record_count": len(raw_records),
+                    "stats": stats,
+                    "stats_ready": stats_ready,
+                    "parser_stats_ms": parser_stats_ms,
                 })
             except Exception as exc:  # pragma: no cover - diagnostic worker path
                 output_queue.put({"kind": "error", "generation": generation, "error": repr(exc)})
@@ -1140,7 +1164,11 @@ class CuptiKernelTimer:
     ) -> None:
         self._begin("parser", filter_plan, flush_period_ms, collect_timing)
 
-    def stop_async(self, collect_timing: bool = False) -> tuple[int, dict[str, float]]:
+    def stop_async(
+        self,
+        collect_timing: bool = False,
+        stats_request: dict | None = None,
+    ) -> tuple[int, dict[str, float]]:
         stop_timing: dict[str, float] = {}
         generation = self._generation
         phase_start_s = time.perf_counter() if collect_timing else 0.0
@@ -1156,16 +1184,16 @@ class CuptiKernelTimer:
         with self._lock:
             self._mode = "drop"
             filter_plan = self._filter_plan
-        self._parse_input_queue.put(("finish", generation, filter_plan))
+        self._parse_input_queue.put(("finish", generation, filter_plan, stats_request))
         self._last_stop_timing = stop_timing
         return generation, stop_timing
 
-    def wait_for_generation(
+    def wait_for_generation_result(
         self,
         generation: int,
         stop_timing: dict[str, float] | None = None,
         collect_timing: bool = False,
-    ) -> tuple[list[tuple], int, dict, int]:
+    ) -> dict:
         if stop_timing is None:
             stop_timing = {}
         phase_start_s = time.perf_counter() if collect_timing else 0.0
@@ -1183,12 +1211,7 @@ class CuptiKernelTimer:
                         + stop_timing["parser_wait_ms"]
                     )
                 self._last_stop_timing = stop_timing
-                return (
-                    list(result["records"]),
-                    int(result["zero_ts_count"]),
-                    dict(result["zero_ts_names"]),
-                    int(result["raw_record_count"]),
-                )
+                return result
             timeout_s = max(0.0, min(0.01, deadline - time.perf_counter()))
             try:
                 parser_result = self._parse_output_queue.get(timeout=timeout_s)
@@ -1198,6 +1221,20 @@ class CuptiKernelTimer:
             if self._parser_errors:
                 raise RuntimeError("CUPTI parser process failed: " + "; ".join(self._parser_errors))
         raise TimeoutError("Timed out waiting for CUPTI parser process")
+
+    def wait_for_generation(
+        self,
+        generation: int,
+        stop_timing: dict[str, float] | None = None,
+        collect_timing: bool = False,
+    ) -> tuple[list[tuple], int, dict, int]:
+        result = self.wait_for_generation_result(generation, stop_timing, collect_timing)
+        return (
+            list(result["records"]),
+            int(result["zero_ts_count"]),
+            dict(result["zero_ts_names"]),
+            int(result["raw_record_count"]),
+        )
 
     def stop(self, collect_timing: bool = False) -> tuple[list[tuple], int, dict, int]:
         generation, stop_timing = self.stop_async(collect_timing)
@@ -1243,7 +1280,8 @@ def _stats_from_spans(spans_us: list[float]) -> dict:
 
 def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
                               zero_ts_count: int = 0,
-                              zero_ts_names: dict | None = None):
+                              zero_ts_names: dict | None = None,
+                              include_details: bool = True):
     """Bin a flat CUPTI kernel record stream into per-iter spans + per-kernel
     relative timestamps.  Used by both graph and eager CUPTI paths.
 
@@ -1314,15 +1352,17 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
         iter_start_ns = min(r[1] for r in chunk)
         iter_end_ns = max(r[2] for r in chunk)
         spans_us.append((iter_end_ns - iter_start_ns) / 1000.0)
-        for r in chunk:
-            name = r[0]
-            slot = per_kernel.setdefault(name, {"start_us": [], "end_us": []})
-            slot["start_us"].append((r[1] - iter_start_ns) / 1000.0)
-            slot["end_us"].append((r[2] - iter_start_ns) / 1000.0)
+        if include_details:
+            for r in chunk:
+                name = r[0]
+                slot = per_kernel.setdefault(name, {"start_us": [], "end_us": []})
+                slot["start_us"].append((r[1] - iter_start_ns) / 1000.0)
+                slot["end_us"].append((r[2] - iter_start_ns) / 1000.0)
 
     out = _stats_from_spans(spans_us)
-    out["iters_us"] = spans_us
-    out["per_kernel"] = per_kernel
+    if include_details:
+        out["iters_us"] = spans_us
+        out["per_kernel"] = per_kernel
     return out
 
 
@@ -1387,13 +1427,14 @@ class _PendingCuptiStats:
         return self._timer.is_generation_ready(self._generation)
 
     def resolve(self) -> dict | None:
-        records, zero_ts_count, zero_ts_names, raw_record_count = self._timer.wait_for_generation(
+        result = self._timer.wait_for_generation_result(
             self._generation,
             self._stop_timing,
             collect_timing=self._host_timing.enabled,
         )
         for key, value in self._timer.last_stop_timing().items():
             self._host_timing.add(f"cupti_stop_{key}", value)
+        raw_record_count = int(result["raw_record_count"])
         if raw_record_count != self._expected_raw_record_count:
             print(
                 f"[WARN] CUPTI raw-record mismatch for {self._tag!r}: expected "
@@ -1402,17 +1443,22 @@ class _PendingCuptiStats:
             )
             return None
 
-        self._host_timing.start()
-        stats = _stats_from_cupti_records(
-            records,
-            self._warmup,
-            self._iters,
-            self._tag,
-            self._expected_K,
-            zero_ts_count=zero_ts_count,
-            zero_ts_names=zero_ts_names,
-        )
-        self._host_timing.stop("stats_ms")
+        if result.get("stats_ready"):
+            stats = result.get("stats")
+            self._host_timing.add("stats_ms", 0.0)
+            self._host_timing.add("parser_stats_ms", float(result.get("parser_stats_ms", 0.0)))
+        else:
+            self._host_timing.start()
+            stats = _stats_from_cupti_records(
+                list(result["records"]),
+                self._warmup,
+                self._iters,
+                self._tag,
+                self._expected_K,
+                zero_ts_count=int(result["zero_ts_count"]),
+                zero_ts_names=dict(result["zero_ts_names"]),
+            )
+            self._host_timing.stop("stats_ms")
         self._host_timing.attach(stats)
         return stats
 
@@ -1598,7 +1644,16 @@ def _time_kernel_cuda_graph(
     expected_raw_record_count = records_per_replay * graph_replays
     host_timing.start()
     if int(getattr(args, "cupti_defer_depth", 1)) > 1:
-        generation, stop_timing = timer.stop_async(collect_timing=host_timing.enabled)
+        generation, stop_timing = timer.stop_async(
+            collect_timing=host_timing.enabled,
+            stats_request={
+                "warmup": warmup,
+                "iters": iters,
+                "tag": tag,
+                "expected_K": expected_K,
+                "include_details": bool(getattr(args, "json_detailed", False)),
+            },
+        )
         host_timing.stop("cupti_stop_ms")
         for key, value in timer.last_stop_timing().items():
             host_timing.add(f"cupti_stop_{key}", value)
@@ -1637,9 +1692,16 @@ def _time_kernel_cuda_graph(
         return None
 
     host_timing.start()
-    stats = _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
-                                      zero_ts_count=zero_ts_count,
-                                      zero_ts_names=zero_ts_names)
+    stats = _stats_from_cupti_records(
+        records,
+        warmup,
+        iters,
+        tag,
+        expected_K,
+        zero_ts_count=zero_ts_count,
+        zero_ts_names=zero_ts_names,
+        include_details=bool(getattr(args, "json_detailed", False)),
+    )
     host_timing.stop("stats_ms")
     host_timing.stop_total()
     host_timing.add("graph_group_iters", group_iters)
@@ -1695,9 +1757,16 @@ def _time_kernel_eager(
     host_timing.stop("timed_loop_and_cupti_parse_ms")
 
     host_timing.start()
-    stats = _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
-                                      zero_ts_count=zero_ts_count,
-                                      zero_ts_names=zero_ts_names)
+    stats = _stats_from_cupti_records(
+        records,
+        warmup,
+        iters,
+        tag,
+        expected_K,
+        zero_ts_count=zero_ts_count,
+        zero_ts_names=zero_ts_names,
+        include_details=bool(getattr(args, "json_detailed", False)),
+    )
     host_timing.stop("stats_ms")
     host_timing.stop_total()
     host_timing.attach(stats)
