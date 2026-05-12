@@ -872,7 +872,9 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
-    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued. Callers can use this to decide
+    //! whether a subsequent refreshBlocks()/syncTransfers() is necessary.
+    bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
@@ -1387,7 +1389,8 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
-    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued.
+    bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
@@ -2217,7 +2220,9 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called before every forward step, after adding new tokens.
-    void copyLinearAttentionBlock(LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued for this request. The caller can
+    //! aggregate this across requests and skip refreshBlocks() (which performs a stream sync) when no copies happened.
+    bool copyLinearAttentionBlock(LlmRequest const& llmRequest);
 
     void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
