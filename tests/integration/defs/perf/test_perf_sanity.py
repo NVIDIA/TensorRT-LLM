@@ -1902,16 +1902,3 @@ def test_e2e(output_dir, perf_sanity_test_case):
 
     # Upload results to database
     config.upload_test_results_to_database()
-
-
-def test_cbts_validation():
-    """CBTS perf-sanity validation entry, will revert.
-
-    Exercises the perf-sanity narrowing path:
-      - testdef sees this new function via AST scope mapping
-      - testlist sees the matching `tests:` entry in
-        `l0_dgx_h200_perf_sanity.yml`
-      - rule should set `perfsanity_required=True`
-    No real perf measurement — keeps CI cost trivial.
-    """
-    assert True

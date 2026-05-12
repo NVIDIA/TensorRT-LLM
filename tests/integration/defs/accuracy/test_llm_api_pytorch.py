@@ -160,17 +160,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm, streaming=True)
 
-    def test_cbts_validation(self):
-        """CBTS validation entry, will revert.
-
-        Exercises the full narrowing chain end-to-end:
-          - testdef sees this new method via AST scope mapping
-          - testlist sees the matching `tests:` entry added to
-            `l0_b200.yml`
-        No LLM evaluation — keeps CI cost trivial.
-        """
-        assert self.MODEL_NAME == "meta-llama/Llama-3.1-8B"
-
 
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
