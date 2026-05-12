@@ -195,6 +195,113 @@ class UlyssesAttention(AttentionBackend):
         return True
 
 
+class UlyssesCrossAttention(AttentionBackend):
+    """
+    Ulysses Sequence Parallelism wrapper for cross-attention where
+    ``S_q != S_kv`` and K/V are pre-projected.
+
+    Uses three collectives total:
+      1. Q all-to-all:           [B, S_q/U, H, D]  -> [B, S_q,  H/U, D]
+      2. Fused K|V 5D all-to-all: stack K, V on a new dim of size 2 so both
+                                  tensors travel in one collective:
+                                  [B, S_kv/U, 2, H_kv, D] -> [B, S_kv, 2, H_kv/U, D]
+      3. Output all-to-all:      [B, S_q, H/U, D]  -> [B, S_q/U, H, D]
+
+    Per-rank receive volume is ``((U-1)/U^2) * total_bytes`` per collective,
+    i.e. a factor of ``U`` less than an all-gather of the same total tensor.
+
+    The inner backend must be instantiated at sharded head counts
+    ``(H/U, H_kv/U)`` so its forward sees the post-a2a shape correctly.
+
+    Caller contract:
+    - ``q``, ``k``, ``v`` are seq-sharded, full-head NHD tensors. The Q-side
+      and KV-side seq dims are independent.
+    - ``S_q`` and ``S_kv`` must each be divisible by ``world_size``.
+    - All other kwargs (``attention_mask``, etc.) are forwarded transparently
+      to the inner backend after the a2a phase.
+    - ``world_size == 1`` is a fast path that skips all three collectives.
+    - ``support_fused_qkv() == False`` (S_q != S_kv precludes Q+KV fusion).
+    """
+
+    def __init__(
+        self,
+        inner_backend: AttentionBackend,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.inner_backend = inner_backend
+        self.process_group = process_group
+        self._preferred_layout = AttentionTensorLayout.NHD
+
+        self.head_dim = inner_backend.head_dim
+        self.sharded_num_heads = inner_backend.num_heads
+        self.sharded_num_kv_heads = getattr(inner_backend, "num_kv_heads", self.sharded_num_heads)
+
+        try:
+            self.world_size = torch.distributed.get_world_size(group=process_group)
+        except (RuntimeError, ValueError):
+            self.world_size = 1
+
+        # Exposed head counts reflect the full, unsharded model width. The
+        # inner backend is at (H/U, H_kv/U) so that on each rank, after the
+        # a2a distributes heads across ranks, the shape matches.
+        self.num_heads = self.sharded_num_heads * self.world_size
+        self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert q.dim() == 4, f"q must be 4D [B, S_q/U, H, D], got {q.dim()}D"
+        assert k.dim() == 4, f"k must be 4D [B, S_kv/U, H_kv, D], got {k.dim()}D"
+        assert v.dim() == 4, f"v must be 4D [B, S_kv/U, H_kv, D], got {v.dim()}D"
+        assert q.shape[0] == k.shape[0] == v.shape[0], (
+            f"q/k/v batch mismatch: {q.shape[0]}, {k.shape[0]}, {v.shape[0]}"
+        )
+        assert k.shape[1] == v.shape[1], f"k/v seq shard mismatch: k={k.shape[1]}, v={v.shape[1]}"
+
+        if self.world_size > 1:
+            # Q: [B, S_q/U, H, D] -> [B, S_q, H/U, D]
+            q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
+            # Fused K|V: stack on new dim=2 so both travel in one collective.
+            # [B, S_kv/U, 2, H_kv, D] -> [B, S_kv, 2, H_kv/U, D]
+            kv = torch.stack([k, v], dim=2)
+            kv = all_to_all_5d(kv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
+            k, v = kv.unbind(dim=2)
+            k = k.contiguous()
+            v = v.contiguous()
+
+        if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+        out = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
+
+        if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
+            out = out.transpose(1, 2).contiguous()
+        else:
+            out = out.contiguous()
+
+        if self.world_size > 1:
+            # Output: [B, S_q, H/U, D] -> [B, S_q/U, H, D]
+            out = all_to_all_4d(out, scatter_dim=1, gather_dim=2, process_group=self.process_group)
+
+        return out
+
+    @property
+    def preferred_layout(self) -> AttentionTensorLayout:
+        """Preferred tensor layout: [B, S, H, D]"""
+        return self._preferred_layout
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        # S_q != S_kv precludes stacking Q with K/V in a single collective.
+        return False
+
+
 class Attention2DAttention(AttentionBackend):
     """
     Attention2D Context Parallelism wrapper for video-generation inference.

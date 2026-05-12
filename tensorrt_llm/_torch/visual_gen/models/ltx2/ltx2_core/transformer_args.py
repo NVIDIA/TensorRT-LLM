@@ -32,6 +32,11 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
+    # Optional [B, S_full_padded] bool mask (True=valid, False=pad) for the
+    # audio modality when LTXModel.forward pads it on entry to satisfy
+    # T_a % ulysses_size == 0. Identical across Ulysses ranks (full-seq).
+    # None when no padding is applied.
+    audio_padding_mask: torch.Tensor | None = None
 
 
 class TransformerArgsPreprocessor:
