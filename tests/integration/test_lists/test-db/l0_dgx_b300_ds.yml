@@ -20,6 +20,9 @@ l0_dgx_b300_ds:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python
+  # ------------- Disaggregated transfer component tests (multi-process) ---------------
+  - unittest/disaggregated/test_kv_transfer_mp.py
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py
   # ------------- DeepSeek-V4 (4x B300, pre_merge) ---------------
   # B300's larger per-GPU memory (~288 GB) lets V4 EPLB and FP8 aggregate
   # smoke fit at TP=4. (Same tests at TP=8 would also fit on 8x B200, but a

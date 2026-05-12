@@ -209,7 +209,9 @@ class Sender(SenderBase):
         self._sessions_lock = threading.Lock()  # Protects _sessions access
         self._shutdown = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
+        # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
+        self._loaded_remote_agents_lock = threading.Lock()
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
@@ -388,9 +390,12 @@ class Sender(SenderBase):
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
+            status = self._agent.submit_transfer_requests(request)
+            if not status.wait():
                 agent_result = AgentResult.FAILED
-                logger.error(
+                last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
+                agent_name = getattr(self._agent, "name", "<?>")
+                detail = (
                     f"KV transfer agent failed: "
                     f"unique_rid={write_meta.unique_rid} "
                     f"slice={write_meta.slice_id} "
@@ -399,12 +404,12 @@ class Sender(SenderBase):
                     f"op={getattr(request, 'op', '?')} "
                     f"remote={getattr(request, 'remote_name', '?')} "
                     f"src_size={int(write_meta.src_ptrs.size)} "
-                    f"dst_size={int(write_meta.dst_ptrs.size)}"
+                    f"dst_size={int(write_meta.dst_ptrs.size)} "
+                    f"nixl_status={last_status} agent={agent_name}"
                 )
+                logger.error(detail)
                 if not write_meta.task_future.done():
-                    write_meta.task_future.set_exception(
-                        RuntimeError(f"KV transfer failed for request {write_meta.unique_rid}")
-                    )
+                    write_meta.task_future.set_exception(RuntimeError(detail))
                 task.status = TaskStatus.ERROR
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
@@ -694,6 +699,9 @@ class Sender(SenderBase):
         self._messenger.start_listener(handle_message)
 
     def _register_peer_rank(self, _send_id: bytes, message: list[bytes]):
+        # Skip late messages so we don't race shutdown's invalidate loop.
+        if self._shutdown:
+            return
         torch.cuda.set_device(self._device_id)
         CUASSERT(cudart.cudaSetDevice(self._device_id))
         ri: RankInfo = RankInfo.from_bytes(message[1])
@@ -706,7 +714,8 @@ class Sender(SenderBase):
             ri.instance_name + str(ri.instance_rank),
             ri.transfer_engine_info,
         )
-        self._loaded_remote_agents.add(agent_name)
+        with self._loaded_remote_agents_lock:
+            self._loaded_remote_agents.add(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
@@ -772,26 +781,32 @@ class Sender(SenderBase):
             return
         self._shutdown = True
 
+        # Quiesce listener before invalidate to avoid set/map mutation races.
+        self._messenger.stop()
+
         for q in self._send_task_queues:
             q.put(None)
         for t in self._worker_threads:
             t.join(timeout=5)
-        # Invalidate all loaded remote agents to release fabric/POSIX FD resources
-        for agent_name in self._loaded_remote_agents:
+
+        # Snapshot under lock as defense in depth.
+        with self._loaded_remote_agents_lock:
+            loaded_agents = list(self._loaded_remote_agents)
+            self._loaded_remote_agents.clear()
+        # Invalidate all loaded remote agents to release fabric/POSIX FD resources.
+        for agent_name in loaded_agents:
             try:
                 self._agent.invalidate_remote_agent(agent_name)
             except Exception as e:
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        self._loaded_remote_agents.clear()
         for dealer in self._dealers.values():
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
         self._dealers.clear()
-        self._messenger.stop()
 
     def __del__(self):
         try:
@@ -1267,12 +1282,14 @@ class RxSession(RxSessionBase):
                     ri = self._receiver._registrar.self_rank_info
                     task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
         elif status == AgentResult.FAILED:
+            detail = (
+                f"KV transfer failed for request {self.request_id} slice {slice_id} "
+                f"peer_rank={peer_rank} is_last_slice={is_last_slice} "
+                f"(reported by remote agent; see sender-side log for nixl_status)"
+            )
+            logger.error(detail)
             if not task.future.done():
-                task.future.set_exception(
-                    RuntimeError(
-                        f"KV transfer failed for request {self.request_id} slice {slice_id}"
-                    )
-                )
+                task.future.set_exception(RuntimeError(detail))
             task.status = TaskStatus.ERROR
         else:
             raise ValueError(
@@ -1617,6 +1634,13 @@ class TransferWorker:
         finalizer = getattr(self, "_finalizer", None)
         if finalizer is not None:
             finalizer()
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            try:
+                agent.shutdown()
+            except Exception as e:
+                logger.warning(f"TransferWorker.shutdown: agent.shutdown error: {e}")
+            self._agent = None
 
     def __del__(self):
         try:
