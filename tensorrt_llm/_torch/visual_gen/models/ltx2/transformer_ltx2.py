@@ -145,7 +145,7 @@ class LTX2Attention(Attention):
             )
             self._has_dual_attn = True
 
-        # Cross-attention Ulysses wrap (a2v in LTX-2). Active only when
+        # Cross-attention Ulysses wrap (v2a in LTX-2). Active only when
         # the configured parallelism is Ulysses (ulysses_size > 1).
         # Attention2D mode keeps ulysses_size == 1 (mapping enforces mutual
         # exclusion), so this branch is naturally skipped under Attention2D.
@@ -1029,9 +1029,7 @@ class LTXModel(nn.Module):
         # True so production benefits from full Ulysses scaling at any T_a.
         # Set false in YAML parallel.audio_pad_for_ulysses to fall back to the
         # naturally-divisible-only behavior (wrapper engages iff T_a % U == 0).
-        self._audio_pad_for_ulysses = (
-            model_config.parallel.audio_pad_for_ulysses if model_config is not None else True
-        )
+        self._audio_pad_for_ulysses = model_config.parallel.audio_pad_for_ulysses
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
         # Per-block text cross-attn KV lists, looked up by inner.idx in the
@@ -1392,31 +1390,24 @@ class LTXModel(nn.Module):
     def _pad_pe(
         pe: tuple[torch.Tensor, torch.Tensor] | None,
         pad: int,
-        unpadded_seq_len: int,
+        seq_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Repeat-last pad a (cos, sin) PE tuple by ``pad`` slots on its seq dim.
+        """Repeat-last pad a (cos, sin) PE tuple by ``pad`` slots on ``seq_dim``.
 
-        ``text_cache.audio_pe`` / ``audio_cross_pe`` are precomputed at the
-        unpadded ``T_a`` length; when ``forward`` pads audio for Ulysses, the
-        PE must be extended symmetrically so the rope helper sees consistent
-        shapes between input and PE. Repeat-last keeps RoPE values at pad
-        slots equal to the last valid token (no OOB position).
+        Used by ``prepare_text_cache`` to extend audio PE when audio padding
+        is active, so the rope helper sees consistent shapes between padded
+        audio input and PE. Repeat-last keeps RoPE values at pad slots equal
+        to the last valid token (no OOB positional index).
 
-        Seq dim is auto-detected by matching ``unpadded_seq_len``:
-          - SPLIT rope: cos shape ``[B, H, T, D]``  → seq dim = 2
-          - INTERLEAVED rope: cos shape ``[B, T, D]`` → seq dim = 1
+        Caller passes ``seq_dim`` explicitly (depends on rope type and PE
+        layout): SPLIT rope = ``[B, H, T, D]`` so 2; INTERLEAVED = ``[B, T, D]``
+        so 1.
         """
         if pe is None or pad <= 0:
             return pe
         cos, sin = pe
-        seq_dim = None
-        for d in range(cos.ndim):
-            if cos.shape[d] == unpadded_seq_len:
-                seq_dim = d
-                break
-        if seq_dim is None:
-            # No matching dim: don't pad (caller's data assumption may differ).
-            return pe
+        if not (0 <= seq_dim < cos.ndim):
+            raise ValueError(f"_pad_pe: seq_dim={seq_dim} out of range for cos.ndim={cos.ndim}")
 
         def _ext(t: torch.Tensor) -> torch.Tensor:
             idx = [slice(None)] * t.ndim
@@ -1491,20 +1482,15 @@ class LTXModel(nn.Module):
             return
 
         U = self._sharder.size
-        if self._audio_pad_for_ulysses:
-            self._audio_is_sharded = True
-            self._audio_pad = (U - audio_seq_len % U) % U
-        else:
-            is_divisible = (audio_seq_len % U) == 0
-            if not is_divisible and self._cp_size > 1 and self._ulysses_size == 1:
-                raise ValueError(
-                    f"audio_seq_len ({audio_seq_len}) must be divisible by seq_size "
-                    f"({U}) when CP is active without Ulysses "
-                    "(Ring/Attention2D has no plain-attention fallback). "
-                    "Set parallel.audio_pad_for_ulysses=True to enable padding."
-                )
-            self._audio_is_sharded = is_divisible
-            self._audio_pad = 0
+        self._audio_pad = ((U - audio_seq_len % U) % U) if self._audio_pad_for_ulysses else 0
+        self._audio_is_sharded = (audio_seq_len + self._audio_pad) % U == 0
+        if not self._audio_is_sharded and self._cp_size > 1 and self._ulysses_size == 1:
+            raise ValueError(
+                f"audio_seq_len ({audio_seq_len}) must be divisible by seq_size "
+                f"({U}) when CP is active without Ulysses "
+                "(Ring/Attention2D has no plain-attention fallback). "
+                "Set parallel.audio_pad_for_ulysses=True to enable padding."
+            )
 
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
@@ -1600,6 +1586,14 @@ class LTXModel(nn.Module):
                 audio_context, audio_context_mask, audio_positions, dtype
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+            # Extend audio PE to the padded length once, so per-step forward
+            # doesn't redo it. configure_audio_ulysses runs before this and
+            # has set self._audio_pad (0 when no pad). Seq dim per rope type:
+            # SPLIT cos = [B, H, T, D] → 2; INTERLEAVED cos = [B, T, D] → 1.
+            if self._audio_pad > 0:
+                pe_seq_dim = 2 if (a_pe is not None and a_pe[0].ndim == 4) else 1
+                a_pe = self._pad_pe(a_pe, self._audio_pad, seq_dim=pe_seq_dim)
+                a_cross_pe = self._pad_pe(a_cross_pe, self._audio_pad, seq_dim=pe_seq_dim)
 
         # Build sharded-local PE in the form the attention consumer expects.
         # fuse_qk_norm_rope=True (LTX-2 default) -> 2D [T_local, H*D] contiguous,
@@ -1662,14 +1656,15 @@ class LTXModel(nn.Module):
         # [B, T_a_padded] bool mask (True=valid, False=pad) that travels
         # through TransformerArgs to audio_attn1 + a2v cross-attn. Strip the
         # padded tail on output below.
+        # Audio padding for Ulysses: when self._audio_pad > 0 (set once by
+        # configure_audio_ulysses under audio_pad_for_ulysses=True), pad audio
+        # on entry to make it shardable. Build a [B, T_a_padded] bool mask
+        # (True=valid, False=pad) that travels through TransformerArgs to
+        # audio_attn1 + a2v. Strip the padded tail on output below.
+        # text_cache.audio_{pe,cross_pe} are already padded in prepare_text_cache.
         audio_padding_mask = None
         s_real_audio = None
-        if (
-            audio is not None
-            and self.use_seq_parallel
-            and self._audio_pad_for_ulysses
-            and self._audio_pad > 0
-        ):
+        if audio is not None and self._audio_pad > 0:
             s_real_audio = audio.latent.shape[1]
             audio = self._pad_modality_audio(audio, self._audio_pad)
             s_full_audio = audio.latent.shape[1]
@@ -1691,25 +1686,14 @@ class LTXModel(nn.Module):
             if video is not None
             else None
         )
-        # Pad audio PE to match the padded audio.latent. text_cache stores PE
-        # at unpadded T_a; the rope helper requires PE seq len == input seq len.
-        audio_pe_for_prepare = text_cache.audio_pe
-        audio_cross_pe_for_prepare = text_cache.audio_cross_pe
-        if s_real_audio is not None:
-            audio_pe_for_prepare = self._pad_pe(
-                text_cache.audio_pe, self._audio_pad, unpadded_seq_len=s_real_audio
-            )
-            audio_cross_pe_for_prepare = self._pad_pe(
-                text_cache.audio_cross_pe, self._audio_pad, unpadded_seq_len=s_real_audio
-            )
 
         audio_args = (
             self.audio_args_preprocessor.prepare(
                 audio,
                 text_cache.audio_context,
                 text_cache.audio_mask,
-                audio_pe_for_prepare,
-                audio_cross_pe_for_prepare,
+                text_cache.audio_pe,
+                text_cache.audio_cross_pe,
             )
             if audio is not None
             else None
