@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import base64
 import ipaddress
@@ -6,7 +9,6 @@ import os
 import socket
 import tempfile
 from collections import defaultdict
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
@@ -26,6 +28,10 @@ from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
+from tensorrt_llm.inputs.multimodal_data import AudioData as AudioData
+from tensorrt_llm.inputs.multimodal_data import \
+    BaseModalityData as BaseModalityData
+from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
@@ -46,43 +52,6 @@ async def _get_aiohttp_session() -> aiohttp.ClientSession:
     if _global_aiohttp_session is None or _global_aiohttp_session.closed:
         _global_aiohttp_session = aiohttp.ClientSession()
     return _global_aiohttp_session
-
-
-@dataclass
-class BaseModalityData:
-    """Base class for modality-specific data.
-
-    This class serves as the foundation for all modality data types (image, video, audio, etc.),
-    providing a common interface for modality-specific data structures.
-
-    Subclasses should define their own attributes based on the specific needs of each modality.
-    """
-
-
-@dataclass
-class VideoData(BaseModalityData):
-    """Data class for video loading results.
-
-    Attributes:
-        frames: List of video frames, either as PIL Images or PyTorch tensors.
-        metadata: Dictionary containing video metadata including:
-            - total_num_frames: Total number of frames in the video
-            - fps: Original frames per second of the video
-            - duration: Duration of the video in seconds
-            - frames_indices: List of indices of the sampled frames
-    """
-    frames: Union[List[Image.Image], List[torch.Tensor]]
-    """The loaded video frames, either as PIL Images or PyTorch tensors."""
-
-    metadata: Dict[str, Any]
-    """Metadata associated with the video (e.g., fps, duration, frame indices)."""
-
-    def __post_init__(self):
-        """Validate that frames list is not empty."""
-        if not self.frames:
-            raise ValueError("frames list cannot be empty")
-        if not isinstance(self.metadata, dict):
-            raise TypeError("metadata must be a dictionary")
 
 
 def rgba_to_rgb(
@@ -515,11 +484,12 @@ def _load_video_by_cv2(video: str,
         # audio extraction on Windows) and to avoid leaking descriptors.
         vidcap.release()
 
+    audio = None
     if extract_audio:
         try:
             audio_samples, audio_sample_rate = extract_audio_from_video(video)
-            metadata["audio_samples"] = audio_samples
-            metadata["audio_sample_rate"] = audio_sample_rate
+            audio = AudioData(samples=audio_samples,
+                              sample_rate=audio_sample_rate)
         except ValueError as e:
             if "No audio stream found" in str(e):
                 logger.warning(
@@ -527,7 +497,7 @@ def _load_video_by_cv2(video: str,
             else:
                 raise
 
-    return VideoData(frames=loaded_frames, metadata=metadata)
+    return VideoData(frames=loaded_frames, metadata=metadata, audio=audio)
 
 
 def load_base64_video(video: str) -> BytesIO:

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import time
 
@@ -14,7 +17,7 @@ from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
-from tensorrt_llm.inputs.utils import VideoData
+from tensorrt_llm.inputs.utils import AudioData, VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -314,7 +317,7 @@ def test_apply_mm_hashes_uuid_content_combined():
         "Different UUID + same content should produce different hashes"
 
 
-def test_apply_mm_hashes_video_audio_metadata_affects_hash():
+def test_apply_mm_hashes_video_audio_affects_hash():
     """VideoData hashes include extracted audio when it affects model inputs."""
     frames = [
         Image.new("RGB", (2, 2), (10, 20, 30)),
@@ -325,13 +328,10 @@ def test_apply_mm_hashes_video_audio_metadata_affects_hash():
     audio_b = np.array([0.0, 0.25, -0.5, -1.0], dtype=np.float32)
 
     def make_video(audio_samples=None, sample_rate=16000):
-        metadata = {}
+        audio = None
         if audio_samples is not None:
-            metadata = {
-                "audio_samples": audio_samples,
-                "audio_sample_rate": sample_rate,
-            }
-        return VideoData(frames=frames, metadata=metadata)
+            audio = AudioData(samples=audio_samples, sample_rate=sample_rate)
+        return VideoData(frames=frames, metadata={}, audio=audio)
 
     hashes_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]})
     hashes_a_copy, _ = apply_mm_hashes({"video": [make_video(audio_a_copy)]})
@@ -352,6 +352,27 @@ def test_apply_mm_hashes_video_audio_metadata_affects_hash():
     hashes_uuid_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]},
                                        mm_uuids)
     assert hashes_uuid_a["video"][0] != hashes_uuid_b["video"][0]
+
+
+def test_apply_mm_hashes_audio_data_deterministic():
+    """AudioData hashes are deterministic and include sample rate."""
+    audio_a = AudioData(samples=np.array([0.0, 0.25, -0.5], dtype=np.float32),
+                        sample_rate=16000)
+    audio_a_copy = AudioData(samples=audio_a.samples.copy(), sample_rate=16000)
+    audio_b = AudioData(samples=np.array([0.0, 0.25, -1.0], dtype=np.float32),
+                        sample_rate=16000)
+    audio_a_different_rate = AudioData(samples=audio_a.samples.copy(),
+                                       sample_rate=8000)
+
+    hashes_a, _ = apply_mm_hashes({"audio": [audio_a]})
+    hashes_a_copy, _ = apply_mm_hashes({"audio": [audio_a_copy]})
+    hashes_b, _ = apply_mm_hashes({"audio": [audio_b]})
+    hashes_a_different_rate, _ = apply_mm_hashes(
+        {"audio": [audio_a_different_rate]})
+
+    assert hashes_a["audio"][0] == hashes_a_copy["audio"][0]
+    assert hashes_a["audio"][0] != hashes_b["audio"][0]
+    assert hashes_a["audio"][0] != hashes_a_different_rate["audio"][0]
 
 
 def test_int32_hexdigest_roundtrip():
