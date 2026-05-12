@@ -1563,6 +1563,7 @@ def create_py_executor_instance(
             model_config=model_binding_config,
             world_config=world_config,
             execution_stream=execution_stream,
+            lora_target_modules=target_modules,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
