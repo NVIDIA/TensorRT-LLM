@@ -357,21 +357,16 @@ def _unwrap_contiguous(node: Node) -> Node:
     ``graph.call_method("contiguous", ...)``)."""
     current = node
     while isinstance(current, Node):
-        if current.op == "call_method" and current.target == "contiguous":
-            if not current.args or not isinstance(current.args[0], Node):
-                break
-            current = current.args[0]
-            continue
-        if current.op == "call_function":
-            is_aten_contig = is_op(current, torch.ops.aten.contiguous.default)
-            is_method_contig = getattr(current.target, "__name__", "") == "contiguous"
-            if not (is_aten_contig or is_method_contig):
-                break
-            if not current.args or not isinstance(current.args[0], Node):
-                break
-            current = current.args[0]
-            continue
-        break
+        is_method_contig = current.op == "call_method" and current.target == "contiguous"
+        is_function_contig = current.op == "call_function" and (
+            is_op(current, torch.ops.aten.contiguous.default)
+            or getattr(current.target, "__name__", "") == "contiguous"
+        )
+        if not (is_method_contig or is_function_contig):
+            break
+        if not current.args or not isinstance(current.args[0], Node):
+            break
+        current = current.args[0]
     return current
 
 
