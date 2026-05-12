@@ -872,7 +872,6 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
             use_dynamic_tree=True,
             dynamic_tree_max_topK=dynamic_tree_max_top_k,
             max_total_draft_tokens=max_total_draft_tokens,
-            max_batch_size=max_batch_size,
         )
 
     llm_spec = LLM(**llm_common_config,

@@ -208,7 +208,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 use_dynamic_tree=True,
                 dynamic_tree_max_topK=4,
                 max_total_draft_tokens=16,
-                max_batch_size=max_batch_size,
             )
 
         llm = LLM(
