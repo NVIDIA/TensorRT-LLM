@@ -146,20 +146,27 @@ class EagleConfig(PretrainedConfig):
         "nemotron_h": ("mtp_hybrid_override_pattern",),
     }
 
-    def __init__(
-        self,
+    @classmethod
+    def from_base_config(
+        cls,
         config: PretrainedConfig,
         model_type: str,
     ):
-        if model_type not in self._drafter_defaults:
+        """Build an EagleConfig by merging a base model's config with type-specific defaults.
+
+        Use this factory instead of constructing ``EagleConfig`` directly: transformers>=5.5
+        applies ``@dataclass(kw_only=True)`` to ``PretrainedConfig`` subclasses, which
+        overrides any manually defined ``__init__``.
+        """
+        if model_type not in cls._drafter_defaults:
             raise ValueError(
                 f"Unsupported model_type '{model_type}' for EagleConfig. "
-                f"Supported types: {list(self._drafter_defaults.keys())}"
+                f"Supported types: {list(cls._drafter_defaults.keys())}"
             )
 
-        defaults = self._drafter_defaults[model_type]
+        defaults = cls._drafter_defaults[model_type]
         config_dict = config.to_dict()
-        for key in self._preserved_config_attrs.get(model_type, ()):
+        for key in cls._preserved_config_attrs.get(model_type, ()):
             if key not in config_dict and hasattr(config, key):
                 config_dict[key] = getattr(config, key)
 
@@ -172,7 +179,7 @@ class EagleConfig(PretrainedConfig):
                 )
 
         merged = deep_merge_dicts(defaults, config_dict)
-        super().__init__(**merged)
+        return cls(**merged)
 
 
 class LlamaRotaryEmbedding(nn.Module):

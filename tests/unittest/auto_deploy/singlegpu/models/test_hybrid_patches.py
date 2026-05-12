@@ -7,11 +7,31 @@ from tensorrt_llm._torch.auto_deploy.export import apply_export_patches, torch_e
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
+# The bamba export patch relies on ``HybridMambaAttentionDynamicCache`` and
+# ``apply_mask_to_padding_states`` which were removed in transformers>=5.5.
+# Skip bamba-related tests when the patch is not registered.
+try:
+    from transformers.models.bamba.modeling_bamba import (  # noqa: F401
+        HybridMambaAttentionDynamicCache,
+        apply_mask_to_padding_states,
+    )
+
+    _BAMBA_PATCH_AVAILABLE = True
+except ImportError:
+    _BAMBA_PATCH_AVAILABLE = False
+
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
 EXAMPLE_INPUT2 = "Tiger is a cat with the following properties:"
 
 
+@pytest.mark.skipif(
+    not _BAMBA_PATCH_AVAILABLE,
+    reason=(
+        "Bamba export patch requires symbols removed in transformers>=5.5 "
+        "(HybridMambaAttentionDynamicCache, apply_mask_to_padding_states)."
+    ),
+)
 @pytest.mark.parametrize(
     "model_dir,run_verify_generation",
     [

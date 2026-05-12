@@ -138,8 +138,9 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
         from accelerate import init_empty_weights
 
         model_config, unused_kwargs = self._get_model_config()
-        # transformers>=5.5 marks dataclass configs as kw_only; pass kwargs.
-        model_config = MockEagleConfig(config=model_config, model_type=model_config.model_type)
+        # transformers>=5.5 applies @dataclass(kw_only=True) to PretrainedConfig
+        # subclasses, overriding EagleConfig.__init__. Use the factory classmethod.
+        model_config = MockEagleConfig.from_base_config(model_config, model_config.model_type)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = MockEagle3ModelForCausalLM._from_config(model_config, **unused_kwargs)
