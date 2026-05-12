@@ -159,54 +159,53 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     ) -> KVSlice:
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
+        assert self._page_table is not None
+        layer_groups = self._page_table.layer_groups
 
         is_gen_only = req.is_generation_only_request()
-        cached_tokens = adapter.get_cached_token_count(req) if is_gen_only else 0
-        num_cached_blocks = cached_tokens // tpb
+        cached_per_lg = (
+            adapter.get_cached_token_count_per_layer_group(req, layer_groups)
+            if is_gen_only
+            else [0] * len(layer_groups)
+        )
 
-        if token_range is None and req.prompt_len > 0 and cached_tokens < req.prompt_len:
-            token_range = TokenRange(start=cached_tokens, end=req.prompt_len)
+        if token_range is None and req.prompt_len > 0:
+            token_range = TokenRange(start=0, end=req.prompt_len)
 
         groups = []
-        assert self._page_table is not None
-        for idx, lg in enumerate(self._page_table.layer_groups):
+        for idx, lg in enumerate(layer_groups):
             if isinstance(lg, MambaLayerGroup):
-                # Mamba layer groups have no KV cache blocks; skip.
                 groups.append(np.array([], dtype=np.int64))
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
-
             window_size = lg.sliding_window_size
+
             if window_size is not None:
-                # Filter to only window-relevant blocks.
-                # Computes the expected number of non-stale blocks (using the same
-                # eviction formula as update_resources) and keeps only the tail.
-                # This works correctly regardless of whether update_resources has
-                # been called:
-                #   - Pre-eviction: all blocks present → trim to last N.
-                #   - Post-eviction (V2 valid_only=True): stale blocks already
-                #     removed → len == expected_valid, so the condition is false.
+                # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 total_blocks = (req.prompt_len + tpb - 1) // tpb
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = total_blocks - stale_end
-                if expected_valid <= 0:
-                    block_ids = np.array([], dtype=np.int64)
-                elif block_ids.size > expected_valid:
-                    block_ids = block_ids[-expected_valid:]
-
-                # For window layers, only skip blocks that fall within BOTH the
-                # cached prefix [0, num_cached_blocks) AND the valid window
-                # [stale_end, total_blocks).  Plain block_ids[num_cached_blocks:]
-                # is wrong here because the window-trimmed list starts at
-                # stale_end, not 0.
-                cached_in_window = max(0, num_cached_blocks - stale_end)
-                if cached_in_window >= block_ids.size:
-                    block_ids = np.array([], dtype=np.int64)
-                elif cached_in_window > 0:
-                    block_ids = block_ids[cached_in_window:]
+                expected_valid = max(0, total_blocks - stale_end)
+                if block_ids.size > expected_valid:
+                    block_ids = (
+                        block_ids[-expected_valid:]
+                        if expected_valid > 0
+                        else np.array([], dtype=np.int64)
+                    )
+                # Adapter contract: SWA cached_tokens >= stale_end*tpb (clamped).
+                cache_skip = cached_per_lg[idx] // tpb - stale_end
+                assert cache_skip >= 0, (
+                    f"SWA adapter must clamp cached_tokens to >= stale_end*tpb "
+                    f"(cached={cached_per_lg[idx]}, stale_end*tpb={stale_end * tpb})"
+                )
             else:
-                if num_cached_blocks > 0 and block_ids.size > num_cached_blocks:
-                    block_ids = block_ids[num_cached_blocks:]
+                cache_skip = cached_per_lg[idx] // tpb
+
+            if cache_skip > 0:
+                block_ids = (
+                    block_ids[cache_skip:]
+                    if cache_skip < block_ids.size
+                    else np.array([], dtype=np.int64)
+                )
 
             groups.append(block_ids)
 
