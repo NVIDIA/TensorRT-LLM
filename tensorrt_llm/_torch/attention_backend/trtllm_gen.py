@@ -651,7 +651,13 @@ class FlashInferTrtllmGenAttention:
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         mask_type: int,
+        active_helix: bool,
+        use_sage_attn: bool,
     ) -> Tuple[bool, str]:
+        if use_sage_attn:
+            return False, "trtllm-gen does not support sage attention."
+        if active_helix:
+            return False, "trtllm-gen does not support helix parallelism."
         # Return cached positive result after the first supported call.
         if self._support_result is not None:
             return self._support_result
