@@ -1,4 +1,5 @@
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
+accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype SKIP (https://nvbugs/6166283)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/6117811)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/6117811)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python SKIP (https://nvbugs/6117811)
