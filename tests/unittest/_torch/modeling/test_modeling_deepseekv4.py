@@ -1,6 +1,8 @@
+import ast
 import inspect
 import json
 import struct
+import textwrap
 import weakref
 from copy import deepcopy
 
@@ -10,6 +12,7 @@ from transformers import PretrainedConfig
 
 # from utils.util import default_dtype
 import tensorrt_llm
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
     DeepseekV4CacheManager,
 )
@@ -19,7 +22,6 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -94,6 +96,14 @@ DEEPSEEK_V4_TINY_CONFIG = {
         "weight_block_size": [128, 128],
     },
 }
+
+
+def _source_calls(source):
+    return {
+        ast.unparse(node)
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+    }
 
 
 def _write_safetensors_header(path, tensor_name, dtype, shape):
@@ -331,7 +341,9 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert "kv_a_layernorm_hidden_size = (" in init_src
     assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
     assert "self.kv_a_layernorm = RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src
-    assert "self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)" in forward_src
+    assert "self.q_b_layernorm(q_proj.view(-1, self.qk_head_dim)).view_as(q_proj)" in _source_calls(
+        forward_src
+    )
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
@@ -619,9 +631,7 @@ def test_deepseek_v4_sparse_ratios_keep_explicit_override(tmp_path, monkeypatch)
     assert model_config.sparse_attention_config.compress_ratios == explicit_ratios
 
 
-def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(
-    tmp_path, monkeypatch
-):
+def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, monkeypatch):
     checkpoint_ratios = [128, 128]
     config = DeepseekV4Config(
         architectures=["DeepseekV4ForCausalLM"],
