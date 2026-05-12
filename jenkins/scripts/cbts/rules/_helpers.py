@@ -21,6 +21,49 @@ from typing import Iterable, Iterator
 from blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree, block_matches_stage
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_COMMENT_BODY_RE = re.compile(r"^\s*#")
+
+
+def strip_noop_diff_lines(diff: str) -> str:
+    """Normalize a unified diff so blank- and comment-only edits don't count.
+
+    Blank or comment-only `+/-` lines carry no test-selection meaning for
+    CBTS — they can't introduce imports, decorators, test methods, or
+    YAML entries. Treating them as real changes causes anchor walk-up
+    and stage-select detection to over-fire (e.g. a trailing `+` blank
+    line in a method-only diff drops AST scope to module-level and
+    forces a file-level anchor fallback).
+
+    Normalization rules:
+      - `+` blank / comment-only line → downgrade to context (` `).
+        Cursor in `iter_diff_post_line_numbers` still advances, so
+        every subsequent line keeps its correct post-image line number.
+      - `-` blank / comment-only line → drop entirely. `-` lines never
+        advance the post-image cursor, so removal is safe.
+      - All real-content `+/-` lines, context lines, hunk headers, and
+        file headers are emitted verbatim.
+
+    Hunk header counts (`-A,B +C,D`) are left as-is — CBTS walkers
+    don't consume B or D; only `+C` (the post-image start line) is
+    read, and that remains correct because we preserve cursor steps
+    via the context-downgrade trick.
+    """
+    out: list[str] = []
+    for raw in diff.splitlines(keepends=True):
+        body = raw.rstrip("\n").rstrip("\r")
+        if not body or body.startswith(("+++", "---", "@@")):
+            out.append(raw)
+            continue
+        sign = body[0]
+        rest = body[1:]
+        if sign in ("+", "-") and (not rest.strip() or _COMMENT_BODY_RE.match(rest)):
+            if sign == "+":
+                # downgrade to context: preserves post-image cursor
+                out.append(" " + raw[1:])
+            # else: drop entirely (no cursor impact)
+            continue
+        out.append(raw)
+    return "".join(out)
 
 
 def stages_by_yaml_stem(stages: dict[str, Stage]) -> dict[str, list[tuple[str, Stage]]]:

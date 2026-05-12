@@ -46,6 +46,7 @@ from blocks import (  # noqa: E402
     parse_stages_from_groovy,
     write_filtered_test_db,
 )
+from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
 from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
 from rules.test_list_rule import TestListRule  # noqa: E402
@@ -205,9 +206,13 @@ class Selector:
 
 def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     data = json.loads(input_json_path.read_text())
+    # Pre-strip blank- and comment-only `+/-` lines once so every rule
+    # sees a "meaningful changes only" diff. Avoids spurious anchor
+    # walk-up and stage-select misfires from cosmetic edits.
+    diffs = {path: strip_noop_diff_lines(d) for path, d in data.get("diffs", {}).items()}
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
-        diffs=dict(data.get("diffs", {})),
+        diffs=diffs,
         post_merge=bool(data.get("post_merge", False)),
     )
 
