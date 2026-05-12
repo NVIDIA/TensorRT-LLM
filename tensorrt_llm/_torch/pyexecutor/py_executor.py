@@ -3620,10 +3620,15 @@ class PyExecutor:
         """Common helper to check for and handle cache transfer errors."""
         error_requests = self._get_disagg_reqs_in_error_state()
         if error_requests:
+            poisoned_transfer_buffer = (
+                self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.has_poisoned_transfer_buffer())
             self._handle_errors(
-                f"Error in kv cache transfer for {error_msg_prefix}",
+                f"Error in kv cache transfer for {error_msg_prefix}" +
+                ("; unrecoverable poisoned transfer buffer requires process restart"
+                 if poisoned_transfer_buffer else ""),
                 requests=error_requests,
-                charge_budget=False)
+                charge_budget=poisoned_transfer_buffer)
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
@@ -4241,6 +4246,12 @@ class PyExecutor:
                             f"Cancelled timed-out generation KV transfer for "
                             f"request {request.py_request_id}; waiting for "
                             "C++ transfer status to report final cleanup")
+                # Keep the request in active_requests so the deferred-cleanup
+                # contract still holds: _check_disagg_gen_cache_transfer_status
+                # will eventually transition it to DISAGG_TRANS_ERROR once C++
+                # surfaces the cancellation, and _check_cache_transfer_errors
+                # then enqueues the final error response and runs termination.
+                new_active_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:

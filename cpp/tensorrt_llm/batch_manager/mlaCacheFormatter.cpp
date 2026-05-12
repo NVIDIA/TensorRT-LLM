@@ -210,10 +210,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 
             TLLM_LOG_DEBUG("Try using zero-copy for the KV cache.");
             NVTX3_SCOPED_RANGE(sendBufferFun);
-            TLLM_CHECK_WITH_INFO(false,
-                "Zero-copy KV cache transfer sends directly from request-owned KV blocks. It is disabled for "
-                "cancellable disaggregated transfers until KV-block leases can prove the peer has stopped reading "
-                "from those blocks before the request is freed.");
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             for (size_t i = 0; i < pickUpConnections.size(); i++)

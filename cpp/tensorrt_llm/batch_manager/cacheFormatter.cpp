@@ -464,10 +464,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
             TLLM_CHECK(pickUpConnections.size() == 1);
-            TLLM_CHECK_WITH_INFO(false,
-                "Zero-copy KV cache transfer sends directly from request-owned KV blocks. It is disabled for "
-                "cancellable disaggregated transfers until KV-block leases can prove the peer has stopped reading "
-                "from those blocks before the request is freed.");
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             for (size_t i = 0; i < pickUpConnections.size(); i++)
@@ -595,6 +591,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         {
             if (agentConnection != nullptr)
             {
+                // AgentConnection::send can throw on cancel/error after the
+                // backend transfer has seen this send buffer. release() is
+                // not a quiescence proof, so do not return the slot to the
+                // pool; poison it and let Python restart the process.
                 sendHolder.poison();
             }
             throw;

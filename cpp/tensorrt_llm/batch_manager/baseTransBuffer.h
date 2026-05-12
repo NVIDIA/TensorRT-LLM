@@ -268,6 +268,12 @@ public:
         return mMaxNumTokens;
     }
 
+    [[nodiscard]] bool hasPoisonedBuffer() const noexcept
+    {
+        return mConcurrenceSendResource.mPoisoned.load(std::memory_order_relaxed)
+            || mConcurrenceRecvResource.mPoisoned.load(std::memory_order_relaxed);
+    }
+
 protected:
     /// @brief Constructor - derived classes call this after computing buffer sizes.
     /// @param transferBufferSize Size of each transfer buffer in bytes.

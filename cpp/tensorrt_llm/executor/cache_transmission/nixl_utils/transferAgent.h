@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -74,6 +75,11 @@ public:
 private:
     nixlAgent* mRawAgent{};
     nixlXferReqH* mHandle{};
+    // Serializes all access to mHandle (and the NIXL handle it points to)
+    // across wait(), isCompleted(), and release(), because multiple Python
+    // threads holding the same BindingsNixlTransferStatus wrapper can call
+    // into the C++ methods concurrently.
+    mutable std::mutex mHandleMutex;
 };
 
 class NixlTransferAgent final : public BaseTransferAgent

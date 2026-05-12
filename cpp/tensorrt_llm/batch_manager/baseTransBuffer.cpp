@@ -333,18 +333,15 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
         return resource.mPoisoned.load(std::memory_order_relaxed)
             || static_cast<size_t>(resource.mConcurrence) < bufferCount;
     };
-    if (!predicate())
+    auto const slice = std::chrono::milliseconds{waitSliceMs};
+    while (!predicate())
     {
-        auto const slice = std::chrono::milliseconds{waitSliceMs};
-        while (!predicate())
+        resource.mBuffersCV.wait_for(lk, slice);
+        if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
         {
-            resource.mBuffersCV.wait_for(lk, slice);
-            if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
-            {
-                auto const reqIdStr
-                    = requestIdForLog.has_value() ? std::to_string(requestIdForLog.value()) : std::string{"?"};
-                TLLM_THROW("assignBufferIndex cancelled via perRequestCancel (reqId=%s)", reqIdStr.c_str());
-            }
+            auto const reqIdStr
+                = requestIdForLog.has_value() ? std::to_string(requestIdForLog.value()) : std::string{"?"};
+            TLLM_THROW("assignBufferIndex cancelled via perRequestCancel (reqId=%s)", reqIdStr.c_str());
         }
     }
     TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),

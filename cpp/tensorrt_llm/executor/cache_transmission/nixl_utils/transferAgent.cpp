@@ -492,16 +492,18 @@ NixlTransferStatus::~NixlTransferStatus()
 
 TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 {
-    if (mHandle == nullptr)
-    {
-        return TransferState::kFAILURE;
-    }
-
     auto startTime = std::chrono::steady_clock::now();
-
     while (true)
     {
-        auto status = mRawAgent->getXferStatus(mHandle);
+        nixl_status_t status;
+        {
+            std::lock_guard<std::mutex> lock(mHandleMutex);
+            if (mHandle == nullptr)
+            {
+                return TransferState::kFAILURE;
+            }
+            status = mRawAgent->getXferStatus(mHandle);
+        }
         if (status == NIXL_SUCCESS)
         {
             return TransferState::kSUCCESS;
@@ -533,6 +535,7 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
+    std::lock_guard<std::mutex> lock(mHandleMutex);
     if (mHandle == nullptr)
     {
         return false;
@@ -542,6 +545,7 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 
 [[nodiscard]] bool NixlTransferStatus::release()
 {
+    std::lock_guard<std::mutex> lock(mHandleMutex);
     if (mHandle == nullptr)
     {
         return true;

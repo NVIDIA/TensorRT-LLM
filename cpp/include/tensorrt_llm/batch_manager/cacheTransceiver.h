@@ -205,10 +205,6 @@ class BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
-    // These methods take std::shared_ptr<LlmRequest> so the transceiver and
-    // its async workers can hold a strong reference for the duration of the
-    // transfer. See the comment on CacheTransceiver::mSenderFutures for the
-    // lifetime invariant (kept in one place to avoid drift).
     virtual void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
@@ -227,6 +223,11 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -274,6 +275,8 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
+    [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
+
 private:
     void initializeCommState();
 
@@ -281,24 +284,6 @@ private:
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    // Store shared_ptr rather than raw LlmRequest* so the futures map holds a
-    // strong reference for the duration of the transfer. Otherwise Python's
-    // _terminate_request can drop its pybind shared_ptr while the C++ side's
-    // raw pointer is still dereferenced by checkGenTransferStatus /
-    // checkContextTransferStatus (the UAF forensically confirmed via
-    // MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555).
-    //
-    // Eviction policy is asymmetric:
-    // - mRequesterFutures (gen side): on timeout, keep the entry tracked
-    //   via mTimedOutRequesterIds until the worker future resolves. A
-    //   timeout/cancel is not a quiescence proof on the recv side, so the
-    //   advertised receive buffers may still be written to until the worker
-    //   unwinds. See checkGenTransferStatus.
-    // - mSenderFutures (ctx side): erased immediately on completion,
-    //   exception, or timeout. Sender zombies empirically unwind on peer
-    //   teardown (decode-pod restart), and CacheSender::cancelRequest is
-    //   only required to clear bookkeeping for telemetry / re-enqueue
-    //   paths. See checkContextTransferStatus.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
