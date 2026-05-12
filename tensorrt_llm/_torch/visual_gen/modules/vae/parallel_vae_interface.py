@@ -139,6 +139,16 @@ class ParallelVAEFactory:
     }
 
     @classmethod
+    def supports(cls, vae_type: type) -> bool:
+        """Return True if a parallel wrapper is registered for ``vae_type``.
+
+        Pure capability check — deterministic and identical on every rank, so
+        callers can use it to make globally-consistent decisions (e.g. whether
+        parallel-VAE decode mode is active across the world).
+        """
+        return cls._resolve(vae_type) is not None
+
+    @classmethod
     def from_vae(
         cls,
         vae: nn.Module,

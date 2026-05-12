@@ -113,12 +113,11 @@ TeaCache caches transformer outputs when timestep embeddings change slowly betwe
 
 ### Multi-GPU Parallelism
 
-Two parallelism modes can be combined:
+Three parallelism modes can be combined:
 
 - **CFG Parallelism** (`--cfg_size 2`): Splits positive/negative guidance prompts across GPUs.
 - **Ulysses Parallelism** (`--ulysses_size N`): Splits the sequence dimension across GPUs for longer sequences.
-
-Total GPU count = `cfg_size * ulysses_size`.
+- **Parallel VAE** (`--parallel_vae_size N`): Shards the final VAE decode along a spatial axis across GPUs, useful to reduce VAE latency and improve GPU utilization (Constraint: `parallel_vae_size ≤ world_size`). Currently only supported for WAN models.
 
 ## Developer Guide
 

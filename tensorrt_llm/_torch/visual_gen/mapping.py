@@ -208,11 +208,48 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             f"VisualGenMapping._build_attn2d_groups: row_size={row_size}, col_size={col_size}"
         )
 
+    def _validate_vae_ranks_share_cfg_group(self) -> None:
+        """Ensure all ``vae_ranks`` share one cfg coordinate (or span the full world).
+
+        Today ``_vae_ranks = list(range(parallel_vae_size))`` only sits inside
+        one CFG group when ``cfg`` is the outermost axis of ``dit_dim_order``.
+        """
+        if self.parallel_vae_size <= 1 or self.cfg_size <= 1:
+            return
+        if self.parallel_vae_size == self.world_size:
+            return
+
+        # Row-major stride along the cfg axis from the mesh order.
+        stride, cfg_stride = 1, None
+        for dim in reversed(self._dim_names):
+            if dim == "cfg":
+                cfg_stride = stride
+                break
+            stride *= self._dim_sizes[dim]
+        assert cfg_stride is not None  # 'cfg' is always present in _dim_names
+
+        cfg_coords = {(r // cfg_stride) % self.cfg_size for r in self._vae_ranks}
+        if len(cfg_coords) > 1:
+            raise NotImplementedError(
+                f"vae_ranks={self._vae_ranks} straddle CFG groups "
+                f"(cfg coordinates={sorted(cfg_coords)}) under order='{self._order}'. "
+                "VAE ranks must share a single CFG group, or span the full world. "
+                "_vae_ranks is currently hardcoded to list(range(parallel_vae_size)), "
+                "which only lands in one CFG group when 'cfg' is the outermost axis "
+                "of dit_dim_order. Either pick parallel_vae_size <= ranks_per_cfg_group "
+                "or derive _vae_ranks from the mesh."
+            )
+
     def _build_vae_group(self) -> None:
         """Create the process group used by parallel VAE."""
         if self.parallel_vae_size <= 1:
             return
 
+        self._validate_vae_ranks_share_cfg_group()
+
+        # use_local_synchronization=False since new_group is world-collective, so every
+        # rank (including non-VAE ranks) must participate or the next world-wide
+        # collective deadlocks.
         pg = dist.new_group(self._vae_ranks, use_local_synchronization=False)
         if self._rank in self._vae_ranks:
             self._vae_group = pg
