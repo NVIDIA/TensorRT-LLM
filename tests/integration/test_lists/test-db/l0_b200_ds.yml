@@ -37,5 +37,6 @@ l0_b200_ds:
   - unittest/disaggregated/test_router.py
   # Disaggregated KV transfer with DeepSeek-V4 cache manager (single B200, threading-based).
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py TIMEOUT (180)
+  - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
   # Tokenizer chat-template tests.
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
