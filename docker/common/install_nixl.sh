@@ -17,6 +17,8 @@ fi
 
 if [ -n "${GITHUB_MIRROR}" ]; then
   export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export UV_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export UV_HTTP_TIMEOUT=120
 fi
 pip3 install meson ninja pybind11 setuptools
 
