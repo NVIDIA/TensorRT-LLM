@@ -1142,12 +1142,33 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         topk_ids_for_tuner,
     ]
 
-    kernel_runner, best_tactic = tuner.choose_one(
-        "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
-        [kernel_runner],
-        tuning_config_with_hook,
-        input_tensors_for_tuner,
-    )
+    # Optional env-var override of the autotuner's tactic pick for the
+    # MxE4m3 MxE2m1 MxE4m3 (W4A8 SwiGLU) MoE runner. Mirrors the Bf16
+    # pattern below. The autotuner caches the best tactic from PREFILL
+    # shape (large num_tokens) which biases towards larger tileN; at
+    # decode (num_tokens=1) a smaller tileN may be faster because the
+    # actual N dim is 1 and 15/16 (for tileN=16) of the N work is filler.
+    # Use AD_MOE_MXE4M3_TACTIC_TILEN / AD_MOE_MXE4M3_TACTIC_CONFIG to
+    # force a specific (tileN, configIndex) cubin pair, gated on
+    # num_tokens <= AD_MOE_MXE4M3_TACTIC_DECODE_MAX_TOKENS by default.
+    forced_tilen = os.environ.get("AD_MOE_MXE4M3_TACTIC_TILEN")
+    forced_config = os.environ.get("AD_MOE_MXE4M3_TACTIC_CONFIG")
+    decode_only = os.environ.get("AD_MOE_MXE4M3_TACTIC_DECODE_ONLY", "1") == "1"
+    decode_max_tokens = int(
+        os.environ.get("AD_MOE_MXE4M3_TACTIC_DECODE_MAX_TOKENS", "16"))
+    use_override = (forced_tilen is not None and forced_config is not None
+                    and (not decode_only
+                         or hidden_states.shape[0] <= decode_max_tokens))
+
+    if use_override:
+        best_tactic = [int(forced_tilen), int(forced_config)]
+    else:
+        kernel_runner, best_tactic = tuner.choose_one(
+            "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
+            [kernel_runner],
+            tuning_config_with_hook,
+            input_tensors_for_tuner,
+        )
 
     input_tensors = input_tensors_for_tuner
     input_tensors[
