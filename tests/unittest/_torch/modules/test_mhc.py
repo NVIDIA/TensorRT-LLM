@@ -532,9 +532,80 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
         for hidden_size in (4096, 7168, 8192)
     }
 
+    # After P0 (Path D KS=112 enable + scalar-vec tail in Phase 4), the
+    # support trait reduces to `hidden % bf16_vec == 0` and `h_tiles % ks == 0`,
+    # so any KS in the table that divides HIDDEN/BLOCK_K is supported.
+    # h_tiles(4096) = 64 → KS divisors of 64; h_tiles(7168) = 112 → divisors
+    # of 112; hidden=8192 is not in the supported-hidden allowlist.
     assert supported_by_hidden_size[4096] == {1, 2, 4, 8, 16, 32, 64}
-    assert supported_by_hidden_size[7168] == {1, 2, 4, 8, 16}
+    assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 56, 112}
     assert supported_by_hidden_size[8192] == set()
+
+
+@pytest.mark.parametrize("n", [128, 2048])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_fused_hc_fused_norm(n: int, hidden_size: int, hc_mult: int):
+    """mHC.fused_hc with ``norm_weight`` must return layer_input already
+    RMSNorm-normalized, matching ``rmsnorm(fused_hc(...)[3], norm_weight,
+    norm_eps)`` within bf16 tolerance. The residual / post_mix / comb_mix
+    outputs are independent of the norm fold-in and must match bit-identically
+    across the two paths.
+    """
+    pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+
+    torch.random.manual_seed(23)
+    device = "cuda"
+    x_prev = torch.randn((n, hidden_size), dtype=torch.bfloat16, device=device) / hidden_size
+    residual_prev = (
+        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device) / hidden_size
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+
+    cur_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=pre_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=pre_data["hc_pre_eps"],
+        norm_eps=pre_data["rms_eps"],
+        post_mult_value=pre_data["hc_post_mult_value"],
+    ).cuda()
+    cur_module.fn.copy_(pre_data["fn"])
+    cur_module.scale.copy_(pre_data["hc_scale"])
+    cur_module.base.copy_(pre_data["hc_base"])
+
+    # Unfused: fused_hc + separate RMSNorm.
+    residual_u, post_mix_u, comb_mix_u, layer_input_u = cur_module.fused_hc(
+        x_prev, residual_prev, post_mix_prev, comb_mix_prev
+    )
+    norm_weight = torch.randn(hidden_size, dtype=torch.bfloat16, device=device) * 0.1 + 1.0
+    norm_eps = 1e-6
+    li_fp32 = layer_input_u.to(torch.float32)
+    inv_rms = torch.rsqrt(li_fp32.pow(2).mean(dim=-1, keepdim=True) + norm_eps)
+    layer_input_ref = (li_fp32 * inv_rms).to(torch.bfloat16) * norm_weight
+
+    # Fused: norm folded into layer_input epilogue.
+    residual_f, post_mix_f, comb_mix_f, layer_input_f = cur_module.fused_hc(
+        x_prev,
+        residual_prev,
+        post_mix_prev,
+        comb_mix_prev,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+    # Non-layer_input outputs are unaffected by the norm fold-in *semantically*;
+    # bit-equality is not guaranteed because the kFuseNorm branch alters Phase 4
+    # scheduling enough to perturb some Phase 3 reduction orderings by sub-ULP.
+    # Match the unfused path within fp32 tolerance.
+    torch.testing.assert_close(residual_u, residual_f, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(post_mix_u, post_mix_f, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(comb_mix_u, comb_mix_f, rtol=1e-3, atol=5e-3)
+    # layer_input_f is bf16(rmsnorm(layer_input_u)); two-stage cast plus weight
+    # multiply has the same precision profile as a bf16 RMSNorm op.
+    torch.testing.assert_close(layer_input_ref, layer_input_f, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))

@@ -141,6 +141,8 @@ class mHC(nn.Module):
         residual_prev: torch.Tensor,
         post_mix_prev: torch.Tensor,
         comb_mix_prev: torch.Tensor,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fused post_mapping(from previous mHC) + pre_mapping(from self).
 
@@ -155,17 +157,25 @@ class mHC(nn.Module):
         but exposed as one call so the model forward can say
         ``state = mHC_next.fused_hc(...)`` at every layer boundary.
 
+        When ``norm_weight`` is provided, the next-layer RMSNorm is folded into
+        ``layer_input_cur`` (i.e. the returned ``layer_input_cur`` is already
+        ``rmsnorm(layer_input_raw, norm_weight, norm_eps)``), saving an extra
+        kernel launch on the model's pre-attention norm.
+
         Args:
             x_prev:        [..., hidden]    bf16  (attn / MoE output of prev block)
             residual_prev: [..., mult, hidden] bf16
             post_mix_prev: [..., mult] or [..., mult, 1] fp32
             comb_mix_prev: [..., mult, mult] fp32
+            norm_weight:   [hidden] bf16 / None — when set, fuse next-layer RMSNorm
+                           into ``layer_input_cur`` epilogue.
+            norm_eps:      RMSNorm epsilon (only consulted when ``norm_weight`` is set).
 
         Returns:
             residual_cur:    [..., mult, hidden] bf16 (new residual for next post_mapping)
             post_mix_cur:    [..., mult, 1] fp32
             comb_mix_cur:    [..., mult, mult] fp32
-            layer_input_cur: [..., hidden] bf16
+            layer_input_cur: [..., hidden] bf16 (RMSNorm-normalized when ``norm_weight`` is set)
         """
         if not _cuda_available:
             raise RuntimeError(
@@ -199,6 +209,8 @@ class mHC(nn.Module):
             self.sinkhorn_eps,
             self.post_mult_value,
             self.sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
 
         residual_cur = residual_cur.view(*outer_shape, n, hidden)

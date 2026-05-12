@@ -1896,18 +1896,20 @@ class DeepseekV4DecoderLayer(DecoderLayer):
 
         # -------------------------------------------------------------------
         # Entry boundary: hc_pre (layer 0) or fused_hc / unfused chain.
+        # _entry_boundary returns layer_input already normalized by
+        # input_layernorm — fused via fused_hc on the deferred path, applied
+        # as a standalone RMSNorm on the layer-0 / engram / non-deferred path.
         # -------------------------------------------------------------------
         residual, post_mix, comb_mix, layer_input = self._entry_boundary(
             hc_state, engram_embeddings, has_engram
         )
 
         # -------------------------------------------------------------------
-        # Attention block
+        # Attention block (layer_input is already input_layernorm-normed)
         # -------------------------------------------------------------------
-        x_attn = self.input_layernorm(layer_input)
         x_attn = self.self_attn(
             position_ids=position_ids,
-            hidden_states=x_attn,
+            hidden_states=layer_input,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
@@ -1979,22 +1981,28 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # hc_attn.fused_hc. By construction (post_load_weights), a deferred
         # state at entry is guaranteed fusable. Layer 0 receives the raw
         # residual tensor and has no HCState, so short-circuit on it.
+        # input_layernorm is folded into fused_hc's layer_input epilogue, so
+        # the returned layer_input is already RMSNorm-normalized.
         if not self.is_first_layer and hc_state.is_deferred:
             return self.hc_attn.fused_hc(
                 x_prev=hc_state.x_prev,
                 residual_prev=hc_state.residual,
                 post_mix_prev=hc_state.post_mix,
                 comb_mix_prev=hc_state.comb_mix,
+                norm_weight=self.input_layernorm.weight,
+                norm_eps=self.input_layernorm.variance_epsilon,
             )
 
         # Unfused entry: layer 0 hands us the initial residual tensor
         # [B, HC_MULT, hidden] directly; post-layer-0 hands us a resolved
         # HCState. Both collapse to "apply engram delta (if any) then run
-        # pre_mapping".
+        # pre_mapping". Apply input_layernorm here so the caller always sees
+        # a normed layer_input regardless of which entry path ran.
         residual = hc_state if self.is_first_layer else hc_state.residual
         if has_engram:
             residual = residual + self.engram(residual, engram_embeddings)
         post_mix, comb_mix, layer_input = self.hc_attn.pre_mapping(residual)
+        layer_input = self.input_layernorm(layer_input)
         return residual, post_mix, comb_mix, layer_input
 
     def forward_MoE(
