@@ -88,6 +88,17 @@ python visual_gen_wan_t2v.py \
     --output_path output.mp4
 ```
 
+**With SageAttention (FP8/INT8 per-block quantized attention):**
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --attention_backend TRTLLM \
+    --enable_sage_attention \
+    --output_path output.mp4
+```
+
 **With TeaCache:**
 ```bash
 python visual_gen_wan_t2v.py \
@@ -275,6 +286,7 @@ python visual_gen_ltx2.py \
 | `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
 | `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
 | `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
+| `--enable_sage_attention` | ✓ | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | ✓ | — | 1 | Ulysses parallelism |
 | `--attn2d_row_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh row size |
