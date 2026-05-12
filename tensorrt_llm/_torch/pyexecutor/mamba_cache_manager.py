@@ -997,12 +997,71 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
-        layer_mask: Optional[List[bool]] = None,
+        layer_mask: Optional[
+            List[bool]] = None,  # this is the full attention layer mask
         is_estimating_kv_cache: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
+        # 3 kinds of layers:
+        # 1) Mamba layers (mamba_layer_mask is True)
+        # 2) Full attention layers (full_attention_layer_mask is True)
+        # 3) Not managed layers (both masks are False)
+        total_layers = len(mamba_layer_mask)
+        if layer_mask is None:
+            full_attention_layer_mask = [False] * total_layers
+        elif len(layer_mask) != total_layers:
+            raise ValueError(
+                f"layer_mask length ({len(layer_mask)}) must match "
+                f"mamba_layer_mask length ({total_layers})")
+        else:
+            full_attention_layer_mask = list(layer_mask)
+        layer_mask = [
+            mamba_layer_mask[i] or full_attention_layer_mask[i]
+            for i in range(total_layers)
+        ]
+        # PP sharding is done across all layers.
+        # This is called again in the super().__init__, but we want it to run first
+        # to set up mtp states before the C++ backend is initialized.
+        self.pp_layers, _ = get_pp_layers(
+            mamba_num_layers + num_layers,
+            mapping,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+        )
+        self.mamba_pp_layers = [
+            layer_idx for layer_idx in self.pp_layers
+            if mamba_layer_mask[layer_idx]
+        ]
+        self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        self.requests = []
+        # Seed externally visible mamba fields before any early return so that
+        # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
+        # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        self.ssm_state_dtype = mamba_ssm_cache_dtype
+
+        if self.local_num_mamba_layers == 0:
+            logger.info(
+                "No local mamba layers for this rank, skipping mamba cache initialization"
+            )
+            super().__init__(
+                kv_cache_config,
+                kv_cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=mapping,
+                dtype=dtype,
+                spec_config=spec_config,
+                layer_mask=full_attention_layer_mask,
+                is_estimating_kv_cache=is_estimating_kv_cache,
+            )
+            return
+
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
@@ -1018,7 +1077,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         nheads = nheads // tp_size
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
-        self.ssm_state_dtype = mamba_ssm_cache_dtype
         self.conv_state_dtype = mamba_cache_dtype
         self.ssm_count = math.prod(self.ssm_state_shape)
         self.conv_count = math.prod(self.conv_state_shape)
@@ -1049,18 +1107,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             kv_cache_config.enable_partial_reuse = False
 
-        full_attention_layer_mask = layer_mask.copy()
-
         kv_cache_config.max_attention_window = []
-        # 3 kinds of layers:
-        # 1) Mamba layers (mamba_layer_mask is True)
-        # 2) Full attention layers (full_attention_layer_mask is True)
-        # 3) Not managed layers (both masks are False)
-        total_layers = len(mamba_layer_mask)
-        layer_mask = [
-            mamba_layer_mask[i] or full_attention_layer_mask[i]
-            for i in range(total_layers)
-        ]
         for i in range(len(layer_mask)):
             if layer_mask[i]:
                 kv_cache_config.max_attention_window.append(
@@ -1082,21 +1129,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         for i, is_mamba in enumerate(mamba_layer_mask):
             if is_mamba:
                 per_layer_kv_heads[i] = 0
-
-        # PP sharding is done across all layers.
-        # This is called again in the super().__init__, but we want it to run first
-        # to set up mtp states before the C++ backend is initialized.
-        self.pp_layers, _ = get_pp_layers(
-            mamba_num_layers + num_layers,
-            mapping,
-            spec_config=spec_config,
-            layer_mask=layer_mask,
-        )
-        self.mamba_pp_layers = [
-            layer_idx for layer_idx in self.pp_layers
-            if mamba_layer_mask[layer_idx]
-        ]
-        self.local_num_mamba_layers = len(self.mamba_pp_layers)
 
         self._setup_mtp_intermediate_states(spec_config, max_batch_size)
 
@@ -1128,7 +1160,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ],
                                               dtype=torch.int32,
                                               device="cpu")
-        self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.layer_offsets[self.mamba_pp_layers[0]]][0]
 
@@ -1287,6 +1318,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
+        if self.local_num_mamba_layers == 0:
+            return
         self._prepare_resources(scheduled_batch)
 
     def is_speculative(self) -> bool:
@@ -1296,6 +1329,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                             attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor,
                             state_indices: Optional[torch.Tensor] = None):
+        if self.local_num_mamba_layers == 0:
+            return
         # Note: cannot use @torch.compile here because all_ssm_states and
         # all_conv_states are dtype-reinterpreted views of the C++ pool
         # (uint8 -> typed), and aot_autograd does not support mutations on
@@ -1394,6 +1429,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:
+        if self.local_num_mamba_layers == 0:
+            return
         block_indices = []
         for req in self.requests:
             if req.is_context_finished:

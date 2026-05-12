@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for MambaCacheManager padding-slot behavior."""
+"""Regression tests for MambaCacheManager padding-slot behavior and
+CppMambaHybridCacheManager PP-sharding edge cases."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -15,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     PythonMambaCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -339,3 +341,108 @@ def test_cpp_hybrid_recurrent_pool_reserves_draft_len_sentinel_slots():
         f"need >= max_batch_size + 1 + max_draft_len = {expected_min} so "
         f"per-draft-len sentinels don't collide with live state"
     )
+
+
+# ---------------------------------------------------------------------------
+# CppMambaHybridCacheManager: rank with zero local mamba layers
+#
+# Regression test for the early-exit path added when a rank ends up with no
+# mamba layers (e.g. under PP sharding when all mamba layers fall on other
+# ranks). On that path, the constructor must:
+#   - call the real parent KVCacheManager with the union layer_mask and
+#     num_layers=num_layers (not mamba_num_layers + num_layers),
+#   - skip allocating any mamba-only state, and
+#   - leave self.requests = [] so the guards on prepare_resources /
+#     update_mamba_states / _setup_state_indices can no-op without touching
+#     uninitialized state.
+#
+# We exercise the same Python branch with world_size=1 (so the real C++
+# KVCacheManager init doesn't need MPI) and a layer mask that contains zero
+# mamba layers.
+# ---------------------------------------------------------------------------
+
+
+def _build_zero_mamba_hybrid():
+    """Construct a real CppMambaHybridCacheManager whose this-rank slice has
+    no mamba layers. world_size=1 / pp_size=1 keeps the real parent
+    KVCacheManager off the MPI path."""
+    # [other, other, full_attn, full_attn]
+    mamba_mask = [False, False, False, False]
+    attn_mask = [False, False, True, True]
+    mamba_num_layers = sum(mamba_mask)  # 0
+    num_layers = sum(attn_mask)  # 4
+
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    # Cap KV pool size so the real C++ allocator only takes a tiny slice of
+    # GPU memory; we don't actually use the cache.
+    kv_cache_config = KvCacheConfig(max_tokens=128)
+
+    mgr = CppMambaHybridCacheManager(
+        # mamba cache parameters — values are unused on the early-exit path
+        # but must be type-valid.
+        mamba_d_state=8,
+        mamba_d_conv=4,
+        mamba_num_heads=4,
+        mamba_n_groups=1,
+        mamba_head_dim=8,
+        mamba_num_layers=mamba_num_layers,
+        mamba_layer_mask=mamba_mask,
+        mamba_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=torch.float16,
+        # kv cache parameters
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=num_layers,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=2,
+        mapping=mapping,
+        spec_config=None,
+        layer_mask=attn_mask,
+    )
+    return mgr
+
+
+@skip_no_cuda
+def test_cpp_hybrid_zero_local_mamba_layers():
+    """End-to-end: real parent KVCacheManager + real early-exit. Verifies
+    early-exit invariants on the manager state AND that the three guarded
+    methods no-op without raising on uninitialized mamba-only state."""
+    mgr = _build_zero_mamba_hybrid()
+
+    # Early-exit indicators.
+    assert mgr.local_num_mamba_layers == 0
+    assert mgr.mamba_pp_layers == []
+    assert mgr.requests == []
+    assert mgr.pp_layers == [2, 3]
+
+    # Parent KVCacheManager was really initialized. self.impl is the C++
+    # KVCacheManagerCpp object; blocks_per_window is set up by it.
+    assert hasattr(mgr, "impl")
+    assert hasattr(mgr, "blocks_per_window")
+    # Parent saw num_layers = num_layers (4), not mamba_num_layers + num_layers.
+    # On the early-exit branch, num_layers is forwarded as-is.
+    assert mgr.num_layers == 4
+    assert mgr.num_local_layers == 2
+
+    # No mamba-only state was allocated.
+    for attr in (
+        "ssm_state_shape",
+        "conv_state_shape",
+        "mamba_layer_offsets",
+        "cuda_state_indices",
+        "host_block_offsets",
+        "recurrent_states_pool_index",
+    ):
+        assert not hasattr(mgr, attr), f"{attr} must not be set on the zero-mamba early-exit path"
+    # Parent must not have been told to treat this as linear attention.
+    assert mgr.is_linear_attention is False
+
+    # Guards on the three mamba-only methods must turn them into no-ops
+    # instead of crashing on the missing state above.
+    empty_batch = ScheduledRequests()
+    mgr.prepare_resources(empty_batch)  # super() runs, then guard returns
+    mgr.update_mamba_states(attn_metadata=None, num_accepted_tokens=None, state_indices=None)
+    mgr._setup_state_indices()
