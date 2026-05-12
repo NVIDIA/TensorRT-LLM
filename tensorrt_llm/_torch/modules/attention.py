@@ -344,6 +344,7 @@ class Attention(nn.Module):
         use_custom_cublas_mm: bool = False,
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
+        head_dim: Optional[int] = None,
     ):
         """
         Initialize the Attention module.
@@ -387,9 +388,16 @@ class Attention(nn.Module):
         config = config or ModelConfig()
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = getattr(config.pretrained_config, 'head_dim', None)
-        if not isinstance(self.head_dim, int):
-            self.head_dim = self.hidden_size // self.num_heads
+        # Prefer an explicit head_dim from the caller; fall back to the
+        # pretrained config, then to hidden_size // num_heads. The explicit
+        # override is required for sub-modules (e.g. VLM vision encoders)
+        # whose head_dim does not match the top-level config's head_dim.
+        if head_dim is not None:
+            self.head_dim = head_dim
+        else:
+            self.head_dim = getattr(config.pretrained_config, 'head_dim', None)
+            if not isinstance(self.head_dim, int):
+                self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings

@@ -9,7 +9,6 @@ import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -198,6 +197,17 @@ def parse_args():
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
 
+    # SageAttention (requires --attention_backend TRTLLM)
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help=(
+            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
+            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.1, "
+            "(1, 16, 1) otherwise."
+        ),
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -300,8 +310,29 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
+def _wan_needs_fine_grained_sage(model_path: str) -> bool:
+    """Hard-coded heuristics for determining if a WAN model needs finer-grained SageAttentionConfig."""
+    lower = model_path.lower().replace(".", "_").replace("-", "_")
+    # For I2V, Wan2.1 14B is also observed to require higher granularity
+    return "_1_3b" in lower or "wan2_1_i" in lower
+
+
 def main():
     args = parse_args()
+
+    attention_cfg = {
+        "backend": args.attention_backend,
+    }
+    if args.enable_sage_attention:
+        num_elts_per_blk_k = 4 if _wan_needs_fine_grained_sage(args.model_path) else 16
+        sage_cfg = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": num_elts_per_blk_k,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+        attention_cfg["sage_attention_config"] = sage_cfg
+        logger.info(f"SageAttention: INT8 Q/K, blocks (1, {num_elts_per_blk_k}, 1)")
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
@@ -327,7 +358,7 @@ def main():
         parallel_str = "None"
 
     kwargs = dict(
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         **cache_kwargs,
         parallel={
             "dit_cfg_size": args.cfg_size,
@@ -406,9 +437,7 @@ def main():
 
         logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        MediaStorage.save_video(
-            output.video, args.output_path, audio=output.audio, frame_rate=frame_rate
-        )
+        output.save(args.output_path)
 
     finally:
         visual_gen.shutdown()

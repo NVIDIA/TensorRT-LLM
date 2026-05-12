@@ -6,7 +6,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -51,7 +51,7 @@ class AttentionBlock(Attention):
             type=PositionEmbeddingType.yarn,
             rope=RopeParams(
                 dim=pretrained_config.head_dim,
-                theta=pretrained_config.rope_theta,
+                theta=get_hf_rope_theta(pretrained_config, 10000.0),
                 scale_type=RotaryScalingType.yarn,
                 scale=pretrained_config.rope_scaling['factor'],
                 max_positions=pretrained_config.max_position_embeddings,

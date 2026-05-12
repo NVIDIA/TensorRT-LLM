@@ -149,6 +149,35 @@ def _get_hf_rotary_class():
         return None
 
 
+def _init_hf_moe_params_in_place(module: torch.nn.Module, std: float = 0.02) -> None:
+    """Manually initialize standalone HF Qwen3MoE submodule parameters.
+
+    These would normally be filled by ``Qwen3MoePreTrainedModel._init_weights``
+    via ``post_init()``.
+
+    transformers 5.x's ``Qwen3MoeExperts`` allocates ``gate_up_proj`` /
+    ``down_proj`` with ``torch.empty(...)`` (uninitialized memory) and
+    ``Qwen3MoeTopKRouter`` allocates ``weight`` with ``torch.zeros(...)``.
+    When these are constructed standalone (not inside a ``PreTrainedModel``
+    subclass), ``post_init()`` is never run, so matmuls produce NaN.
+    Walk every submodule and apply the same ``normal_(0, std)`` that the
+    upstream ``_init_weights`` would.
+    """
+    try:
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+            Qwen3MoeExperts,
+            Qwen3MoeTopKRouter,
+        )
+    except ImportError:
+        return
+    for m in module.modules():
+        if isinstance(m, Qwen3MoeExperts):
+            torch.nn.init.normal_(m.gate_up_proj, mean=0.0, std=std)
+            torch.nn.init.normal_(m.down_proj, mean=0.0, std=std)
+        elif isinstance(m, Qwen3MoeTopKRouter):
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+
+
 # =========================================================================
 # Block equivalence tests (Level 1)
 # =========================================================================
@@ -225,7 +254,9 @@ def test_qwen3_moe_attention_equivalence(B, S, dtype):
     # Compute custom position embeddings (pre-sliced by position_ids)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = Qwen3MoeRotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=config.rope_parameters["rope_theta"],
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
@@ -268,9 +299,12 @@ def test_qwen3_moe_sparse_moe_block_equivalence(B, S, dtype):
     device = "cuda"
     config = _create_small_config()
 
-    # Create HF MoE block
+    # Create HF MoE block. Standalone construction skips PreTrainedModel.post_init(),
+    # so Qwen3MoeExperts (torch.empty) and Qwen3MoeTopKRouter (torch.zeros) need
+    # manual initialization to avoid NaN matmuls on uninitialized memory.
     hf_moe = HFMoE(config)
     hf_moe.to(device=device, dtype=dtype)
+    _init_hf_moe_params_in_place(hf_moe, std=config.initializer_range)
     hf_moe.eval()
 
     # Create custom MoE block and load same weights
@@ -282,9 +316,13 @@ def test_qwen3_moe_sparse_moe_block_equivalence(B, S, dtype):
     # Create input
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
 
-    # Run both
-    hf_out, hf_router_logits = hf_moe(x)
-    custom_out, custom_router_logits = custom_moe(x)
+    # Run both. transformers 5.x's HFMoE.forward returns a single tensor
+    # despite its ``tuple[Tensor, Tensor]`` annotation; older versions
+    # returned ``(output, router_logits)``.
+    hf_out = hf_moe(x)
+    if isinstance(hf_out, tuple):
+        hf_out = hf_out[0]
+    custom_out, _ = custom_moe(x)
 
     # MoE uses fused routing, use relaxed tolerance
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.02, msg="MoE block: ")
@@ -309,9 +347,13 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
     config = _create_small_config()
     config._attn_implementation = "eager"
 
-    # Create HF decoder layer
+    # Create HF decoder layer. Standalone construction skips
+    # PreTrainedModel.post_init(), so the inner Qwen3MoeExperts /
+    # Qwen3MoeTopKRouter parameters (torch.empty / torch.zeros) need manual
+    # initialization to avoid NaN matmuls.
     hf_layer = HFDecoderLayer(config, layer_idx=0)
     hf_layer.to(device=device, dtype=dtype)
+    _init_hf_moe_params_in_place(hf_layer, std=config.initializer_range)
     hf_layer.eval()
 
     # Create custom decoder layer and load same weights
@@ -331,7 +373,9 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
     # Compute custom position embeddings (pre-sliced by position_ids)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = Qwen3MoeRotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=config.rope_parameters["rope_theta"],
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)

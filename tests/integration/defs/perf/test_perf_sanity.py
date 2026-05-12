@@ -296,7 +296,12 @@ class ServerConfig:
         # speculative_config
         speculative_config = server_config_data.get("speculative_config", {})
         self.spec_decoding_type = speculative_config.get("decoding_type", "")
-        self.num_nextn_predict_layers = speculative_config.get("num_nextn_predict_layers", 0)
+        # MTP user config migrated from num_nextn_predict_layers to max_draft_len.
+        # Keep both DB field names populated for perf/baseline compatibility while
+        # the surrounding reporting pipeline transitions to l_max_draft_len.
+        self.max_draft_len = speculative_config.get(
+            "max_draft_len", speculative_config.get("num_nextn_predict_layers", 0)
+        )
         eagle3_value = speculative_config.get("eagle3_layers_to_capture", [])
         if isinstance(eagle3_value, int):
             self.eagle3_layers_to_capture = [eagle3_value]
@@ -304,7 +309,6 @@ class ServerConfig:
             self.eagle3_layers_to_capture = eagle3_value
         else:
             self.eagle3_layers_to_capture = []
-        self.max_draft_len = speculative_config.get("max_draft_len", 0)
         self.speculative_model = speculative_config.get("speculative_model", "")
         self.eagle3_one_model = speculative_config.get("eagle3_one_model", False)
 
@@ -372,8 +376,13 @@ class ServerConfig:
             # cache_transceiver_config
             "s_cache_transceiver_backend",
             # speculative_config
+            # Keep baseline matching on the legacy key during DB migration.
+            # l_max_draft_len is written to DB but not used for matching until
+            # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
+            # moe_config
+            "l_load_balancer_num_slots",
         ]
 
     def to_db_data(self) -> dict:
@@ -423,7 +432,7 @@ class ServerConfig:
             "l_cache_transceiver_max_tokens_in_buffer": self.cache_transceiver_max_tokens_in_buffer,
             # speculative_config
             "s_spec_decoding_type": self.spec_decoding_type,
-            "l_num_nextn_predict_layers": self.num_nextn_predict_layers,
+            "l_num_nextn_predict_layers": self.max_draft_len,
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
             "s_speculative_model_dir": self.speculative_model,
@@ -1171,7 +1180,9 @@ class PerfSanityTestConfig:
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 raise RuntimeError("Failed to get GPU type")
 
-        self.upload_to_db = "upload" in test_case_name.split("-")[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.gpu_type = get_gpu_type()
 
         # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode

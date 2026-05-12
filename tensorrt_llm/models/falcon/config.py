@@ -14,6 +14,7 @@
 # limitations under the License.
 from typing import Optional, Union
 
+from ..._utils import get_hf_rope_theta
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
@@ -109,7 +110,7 @@ class FalconConfig(PretrainedConfig):
                    max_position_embeddings=getattr(hf_config,
                                                    'max_position_embeddings',
                                                    2048),
-                   rotary_base=getattr(hf_config, 'rope_theta', 10000.0),
+                   rotary_base=get_hf_rope_theta(hf_config, 10000.0),
                    intermediate_size=getattr(hf_config, 'ffn_hidden_size',
                                              None),
                    mapping=mapping,

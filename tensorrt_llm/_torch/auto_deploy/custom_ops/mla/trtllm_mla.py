@@ -1071,6 +1071,7 @@ def _handle_prefill_thop(
         qk_nope_head_dim,  # qk_nope_head_dim
         qk_rope_head_dim,  # qk_rope_head_dim
         v_head_dim,  # v_head_dim
+        True,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
         mla_tensor_params,  # helix_tensor_params
@@ -1083,7 +1084,8 @@ def _handle_prefill_thop(
         None,  # sparse_attn_indices
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
+        0,  # num_sparse_topk
+        None,  # sparse_mla_topk_lens
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
@@ -1361,6 +1363,7 @@ def _handle_prefill_thop_cached_kv(
             qk_nope_head_dim,
             qk_rope_head_dim,
             v_head_dim,
+            True,  # rope_append
             None,  # mrope_rotary_cos_sin
             None,  # mrope_position_deltas
             mla_tensor_params,
@@ -1477,30 +1480,32 @@ def _handle_prefill_thop_cached_kv(
         qk_nope_head_dim,
         qk_rope_head_dim,
         v_head_dim,
-        None,
-        None,
+        True,  # rope_append
+        None,  # mrope_rotary_cos_sin
+        None,  # mrope_position_deltas
         mla_tensor_params,
-        None,
-        temp_softmax_stats,
+        None,  # attention_chunk_size
+        temp_softmax_stats,  # softmax_stats_tensor
         spec_decoding_bool_params,
         spec_decoding_tensor_params,
-        None,
-        None,
-        None,
-        None,
-        1,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        None,  # sparse_kv_indices
+        None,  # sparse_kv_offsets
+        None,  # sparse_attn_indices
+        None,  # sparse_attn_offsets
+        1,  # sparse_attn_indices_block_size
+        0,  # num_sparse_topk
+        None,  # sparse_mla_topk_lens
+        None,  # skip_softmax_threshold_scale_factor_prefill
+        None,  # skip_softmax_threshold_scale_factor_decode
+        None,  # skip_softmax_stat
+        None,  # cu_q_seqlens
+        None,  # cu_kv_seqlens
+        None,  # fmha_scheduler_counter
+        None,  # mla_bmm1_scale
+        None,  # mla_bmm2_scale
+        None,  # quant_q_buffer
+        None,  # flash_mla_tile_scheduler_metadata
+        None,  # flash_mla_num_splits
         num_contexts=pf,
         num_ctx_tokens=num_tokens,
     )
@@ -1662,6 +1667,7 @@ def _handle_decode_impl(
         qk_nope_head_dim,
         qk_rope_head_dim,
         kv_lora_rank,  # v_head_dim (in latent space = kv_lora_rank)
+        True,  # rope_append
     )
 
     output_latent = planner.output_latent[:num_tokens]
@@ -1732,6 +1738,7 @@ def _handle_decode_impl(
         qk_nope_head_dim,  # qk_nope_head_dim
         qk_rope_head_dim,  # qk_rope_head_dim
         kv_lora_rank,  # v_head_dim (latent space)
+        True,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
         mla_tensor_params,  # helix_tensor_params
@@ -1744,7 +1751,8 @@ def _handle_decode_impl(
         None,  # sparse_attn_indices
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
+        0,  # num_sparse_topk
+        None,  # sparse_mla_topk_lens
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat

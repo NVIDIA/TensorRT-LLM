@@ -40,7 +40,6 @@ import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -215,6 +214,11 @@ def parse_args():
         "FA4: Flash Attention 4). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
+    )
 
     # Parallelism
     parser.add_argument(
@@ -337,9 +341,19 @@ def build_diffusion_args(args) -> VisualGenArgs:
     else:
         cache_kwargs = {}
 
+    attention_cfg: dict = {"backend": args.attention_backend}
+    if args.enable_sage_attention:
+        attention_cfg["sage_attention_config"] = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 16,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+        logger.info("SageAttention: INT8 Q/K, blocks (1, 16, 1)")
+
     kwargs = dict(
         revision=args.revision,
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         **cache_kwargs,
         parallel={
             "dit_ulysses_size": args.ulysses_size,
@@ -414,7 +428,7 @@ def main():
 
                 elapsed = time.time() - start_time
                 output_path = os.path.join(args.output_dir, f"{i:02d}.png")
-                MediaStorage.save_image(output.image, output_path)
+                output.save(output_path)
                 logger.info(f"  Saved {output_path} ({elapsed:.1f}s)")
 
                 timing_records.append(
@@ -472,7 +486,7 @@ def main():
 
             logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-            MediaStorage.save_image(output.image, args.output_path)
+            output.save(args.output_path)
 
     finally:
         visual_gen.shutdown()
