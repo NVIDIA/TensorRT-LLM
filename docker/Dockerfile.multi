@@ -55,7 +55,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     # WAR: uninstall dependencies that has vulnerability or need upgrading.
-    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy || true && \
+    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy mistune || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
     pip3 install --ignore-installed -r /tmp/constraints.txt && \
