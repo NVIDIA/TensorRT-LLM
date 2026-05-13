@@ -388,6 +388,16 @@ def _make_v4_routing(top_k, n_group, topk_group, num_experts, is_hashed):
     )
 
 
+# DSv4-Pro production: num_experts_per_tok=6, n_routed_experts=384, n_group=8,
+# topk_group=4 (verified against the deployed checkpoint config). n_group and
+# topk_group are not explicitly in the HF config; they fall back to the DSv3
+# defaults that ``DeepseekV4Gate`` consumes via ``config.n_group`` /
+# ``config.topk_group``.
+_DSV4_PRO_TOP_K = 6
+_DSV4_PRO_N_GROUP = 8
+_DSV4_PRO_TOPK_GROUP = 4
+
+
 @pytest.mark.parametrize(
     "routing_cls", [DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod])
 def test_perfect_router_resolve_group_config(routing_cls):
@@ -397,16 +407,16 @@ def test_perfect_router_resolve_group_config(routing_cls):
     DeepSeekV4MoeRoutingMethod stores them directly on the outer object.
     Both shapes must resolve to the same ``(n_group, topk_group)``.
     """
-    n_group, topk_group = 8, 4
+    n_group, topk_group = _DSV4_PRO_N_GROUP, _DSV4_PRO_TOPK_GROUP
     num_experts = 64
     if routing_cls is DeepSeekV4MoeRoutingMethod:
-        routing = _make_v4_routing(top_k=8,
+        routing = _make_v4_routing(top_k=_DSV4_PRO_TOP_K,
                                    n_group=n_group,
                                    topk_group=topk_group,
                                    num_experts=num_experts,
                                    is_hashed=False)
     else:
-        routing = _make_v3_routing(top_k=8,
+        routing = _make_v3_routing(top_k=_DSV4_PRO_TOP_K,
                                    n_group=n_group,
                                    topk_group=topk_group,
                                    num_experts=num_experts)
@@ -416,26 +426,36 @@ def test_perfect_router_resolve_group_config(routing_cls):
 
 
 @pytest.mark.parametrize(
+    "shape",
+    [
+        # (num_experts, moe_ep_size) — small case for CI speed, plus the
+        # production DSv4-Pro shape (DEP=16 disagg-serving benchmark).
+        pytest.param((64, 1), id="small"),
+        pytest.param((384, 16), id="dsv4_pro_dep16"),
+    ],
+)
+@pytest.mark.parametrize(
     "routing_name",
     ["v3", "v4_dense", "v4_hashed"],
 )
-def test_perfect_router_get_cached_logits_e2e(routing_name):
+def test_perfect_router_get_cached_logits_e2e(routing_name, shape):
     """End-to-end regression: synthesize perfect-router logits on CPU.
 
-    Exercises the full pipeline through ``get_cached_perfect_router_logits``:
-      - Group-aware planner reads n_group/topk_group correctly (V3 and V4
-        layouts).
+    Exercises the full pipeline through ``get_cached_perfect_router_logits``
+    at ``top_k=6`` (DSv4-Pro ``num_experts_per_tok``):
+      - Group-aware planner reads ``n_group`` / ``topk_group`` correctly
+        (V3 nests them on ``routing_impl``, V4 stores them directly).
       - ``_force_zero_routing_bias_in_place`` handles both Tensor and
         ``None`` bias values. DSv4 hashed gates return ``None`` from their
         bias callable, which previously crashed with ``zeros_like(None)``.
-
-    The test is intentionally CPU-only so it can run in non-GPU CI.
+      - Production DSv4-Pro shape (384 experts, EP=16) is covered alongside
+        a small case so CI remains fast while still exercising the
+        DEP=16 disagg-serving topology.
     """
-    n_group, topk_group = 8, 4
-    top_k = 8
-    num_experts = 64
+    num_experts, moe_ep_size = shape
+    n_group, topk_group = _DSV4_PRO_N_GROUP, _DSV4_PRO_TOPK_GROUP
+    top_k = _DSV4_PRO_TOP_K
     num_tokens = 16
-    moe_ep_size = 1
     ep_rank = 0
     dtype = torch.float32
     device = torch.device("cpu")
@@ -473,7 +493,9 @@ def test_perfect_router_get_cached_logits_e2e(routing_name):
     assert logits.shape == (num_tokens, num_experts)
     assert logits.dtype == dtype
     assert logits.device.type == "cpu"
-    # Cache hit on the second call must not crash either.
+    # Cache hit on the second call must not crash either (covers the case
+    # where _force_zero_routing_bias_in_place runs again on an already-prepared
+    # routing method).
     logits_2 = get_cached_perfect_router_logits(num_tokens=num_tokens,
                                                 num_experts=num_experts,
                                                 experts_per_token=top_k,
