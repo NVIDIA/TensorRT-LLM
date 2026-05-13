@@ -10,13 +10,15 @@ import time
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.example_utils import (
     add_attention_backend_args,
-    add_cache_dit_args,
+    add_cache_args,
     add_optimization_args,
+    add_parallelism_args,
     add_quant_args,
-    build_cache_dit_config,
+    build_cache_config,
+    format_parallelism_str,
+    validate_parallelism_args,
 )
 from tensorrt_llm._torch.visual_gen.utils import linear_type_to_quant_config
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -141,15 +143,6 @@ def parse_args():
         help="Use Gemma3 to enhance the text prompt before encoding",
     )
 
-    # Diffusion cache acceleration
-    parser.add_argument(
-        "--enable_cache_dit",
-        action="store_true",
-        help="Enable Cache-DiT per-block acceleration.",
-    )
-    # Cache-DiT overrides (only with --enable_cache_dit; omitted fields use CacheDiTConfig defaults)
-    add_cache_dit_args(parser, residual_threshold_default=0.16)
-
     # Two-stage pipeline
     parser.add_argument(
         "--spatial_upsampler_path",
@@ -172,41 +165,10 @@ def parse_args():
         ),
     )
 
-    # Parallelism
-    parser.add_argument(
-        "--cfg_size",
-        type=int,
-        default=1,
-        choices=[1, 2],
-        help="CFG parallel size (1 or 2). Set to 2 for CFG Parallelism.",
-    )
-    parser.add_argument(
-        "--ulysses_size",
-        type=int,
-        default=1,
-        help="Ulysses (head-sharding) parallel size within each CFG group. "
-        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
-    )
-    parser.add_argument(
-        "--attn2d_row_size",
-        type=int,
-        default=1,
-        help="Attention2D row mesh size (Q all-gather dimension). "
-        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
-        "Cannot be combined with --ulysses_size (not yet implemented).",
-    )
-    parser.add_argument(
-        "--attn2d_col_size",
-        type=int,
-        default=1,
-        help="Attention2D column mesh size (K/V all-gather dimension). "
-        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Cannot be combined with --ulysses_size (not yet implemented).",
-    )
-
+    add_cache_args(parser, backends=("cache_dit",), cache_dit_residual_threshold_default=0.16)
     add_quant_args(parser)
-    add_attention_backend_args(parser)
+    add_attention_backend_args(parser, backends=("VANILLA", "TRTLLM"), expose_sage=False)
+    add_parallelism_args(parser, expose_cfg_size=True)
     add_optimization_args(parser)
 
     return parser.parse_args()
@@ -214,7 +176,7 @@ def parse_args():
 
 def _build_diffusion_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
-    cache_kwargs = {"cache": build_cache_dit_config(args)} if args.enable_cache_dit else {}
+    cache_kwargs = build_cache_config(args)
 
     attention_cfg: dict = {"backend": args.attention_backend}
 
@@ -260,23 +222,11 @@ def main():
             f"--distilled_lora_path, but {missing} was not provided."
         )
 
-    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
-    if attn2d_size > 1 and args.ulysses_size > 1:
-        raise ValueError(
-            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
-        )
+    validate_parallelism_args(args)
 
     diffusion_args = _build_diffusion_args(args)
 
-    if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
-    elif attn2d_size > 1:
-        parallel_str = (
-            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
-            f"total={attn2d_size})"
-        )
-    else:
-        parallel_str = "None"
+    parallel_str = format_parallelism_str(args)
     logger.info(
         f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, parallelism={parallel_str}"
     )

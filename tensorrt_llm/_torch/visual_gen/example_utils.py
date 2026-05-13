@@ -80,48 +80,64 @@ def add_cache_dit_args(parser, residual_threshold_default=None):
     )
 
 
-def add_cache_args(parser, teacache_thresh_default=0.2, teacache_thresh_help=None):
-    """Add the full cache-acceleration group (TeaCache + Cache-DiT, mutually exclusive).
-
-    Use for models that support both backends (e.g. Wan T2V/I2V, FLUX).
-    Callers that only support Cache-DiT (e.g. LTX2) should add --enable_cache_dit directly
-    and call add_cache_dit_args instead.
+def add_cache_args(
+    parser,
+    *,
+    backends=("teacache", "cache_dit"),
+    teacache_thresh_default=0.2,
+    teacache_thresh_help=None,
+    cache_dit_residual_threshold_default=None,
+):
+    """Add cache-acceleration args; expose only the backends the model supports.
 
     Args:
+        backends: Subset of ("teacache", "cache_dit") to expose on the CLI. Models that
+            support both (Wan T2V/I2V, FLUX) take the default; models that only support
+            one (e.g. LTX2: ("cache_dit",)) pass that subset. Multiple backends become a
+            mutually-exclusive group; a single backend is added as a plain flag.
         teacache_thresh_default: Default for --teacache_thresh. Pass None for models where
-            the threshold is auto-detected per variant (e.g. FLUX.1 vs FLUX.2).
-        teacache_thresh_help: Custom help string for --teacache_thresh. Defaults to a generic
-            description when None.
+            the threshold is auto-detected per variant (e.g. FLUX.1 vs FLUX.2). Ignored if
+            "teacache" is not in `backends`.
+        teacache_thresh_help: Custom help string for --teacache_thresh. Defaults to a
+            generic description when None. Ignored if "teacache" is not in `backends`.
+        cache_dit_residual_threshold_default: Forwarded to add_cache_dit_args as its
+            `residual_threshold_default`. Ignored if "cache_dit" is not in `backends`.
     """
-    # Diffusion cache acceleration (TeaCache vs Cache-DiT; mutually exclusive)
-    cache_group = parser.add_mutually_exclusive_group()
-    cache_group.add_argument(
-        "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
-    )
-    cache_group.add_argument(
-        "--enable_cache_dit",
-        action="store_true",
-        help=(
-            "Enable Cache-DiT per-block acceleration (requires the cache_dit package; "
-            "see https://github.com/vipshop/cache-dit). Incompatible with --enable_teacache."
-        ),
-    )
-    parser.add_argument(
-        "--teacache_thresh",
-        type=float,
-        default=teacache_thresh_default,
-        help=teacache_thresh_help
-        or "TeaCache similarity threshold (rel_l1_thresh); ignored when using --enable_cache_dit",
-    )
-    parser.add_argument(
-        "--use_ret_steps",
-        action="store_true",
-        help="Use ret_steps mode for TeaCache. "
-        "Using Retention Steps will result in faster generation speed and better generation quality. "
-        "Ignored when using --enable_cache_dit.",
-    )
-    # Cache-DiT overrides (only apply with --enable_cache_dit; omitted fields use CacheDiTConfig defaults)
-    add_cache_dit_args(parser)
+    if not backends:
+        raise ValueError("add_cache_args: `backends` must contain at least one backend")
+
+    enable_target = parser.add_mutually_exclusive_group() if len(backends) > 1 else parser
+    if "teacache" in backends:
+        enable_target.add_argument(
+            "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
+        )
+    if "cache_dit" in backends:
+        enable_target.add_argument(
+            "--enable_cache_dit",
+            action="store_true",
+            help=(
+                "Enable Cache-DiT per-block acceleration (requires the cache_dit package; "
+                "see https://github.com/vipshop/cache-dit)."
+                + (" Incompatible with --enable_teacache." if "teacache" in backends else "")
+            ),
+        )
+    if "teacache" in backends:
+        parser.add_argument(
+            "--teacache_thresh",
+            type=float,
+            default=teacache_thresh_default,
+            help=teacache_thresh_help
+            or "TeaCache similarity threshold (rel_l1_thresh); ignored when using --enable_cache_dit",
+        )
+        parser.add_argument(
+            "--use_ret_steps",
+            action="store_true",
+            help="Use ret_steps mode for TeaCache. "
+            "Using Retention Steps will result in faster generation speed and better generation quality. "
+            "Ignored when using --enable_cache_dit.",
+        )
+    if "cache_dit" in backends:
+        add_cache_dit_args(parser, residual_threshold_default=cache_dit_residual_threshold_default)
 
 
 def build_cache_dit_config(args) -> CacheDiTConfig:
@@ -160,11 +176,12 @@ def build_cache_config(args) -> dict:
     """Build the appropriate cache kwarg dict from CLI args.
 
     Returns a dict ready to unpack into VisualGenArgs (e.g. **build_cache_config(args)).
-    Handles the mutually exclusive TeaCache / Cache-DiT selection used by Wan T2V/I2V.
+    Tolerates callers that exposed only a subset of backends via add_cache_args(backends=...);
+    flags from an unexposed backend are treated as off.
     """
-    if args.enable_cache_dit:
+    if getattr(args, "enable_cache_dit", False):
         return {"cache": build_cache_dit_config(args)}
-    if args.enable_teacache:
+    if getattr(args, "enable_teacache", False):
         return {"cache": build_teacache_config(args)}
     return {}
 
@@ -183,22 +200,46 @@ def add_quant_args(parser):
     )
 
 
-def add_attention_backend_args(parser):
-    """Add --attention_backend and --enable_sage_attention arguments."""
+def add_attention_backend_args(
+    parser,
+    *,
+    backends=("VANILLA", "TRTLLM", "FA4"),
+    expose_sage=True,
+):
+    """Add --attention_backend (and optionally --enable_sage_attention).
+
+    Args:
+        backends: Allowed values for --attention_backend. Models that don't support a
+            particular backend (e.g. LTX2 doesn't yet support FA4) should pass a narrower
+            subset so it isn't surfaced on the CLI. First entry is used as the default.
+        expose_sage: When True, also expose --enable_sage_attention. Models that don't
+            wire SageAttention through to their attention config (e.g. LTX2) should pass
+            False so the flag isn't silently accepted-and-ignored.
+    """
+    if not backends:
+        raise ValueError("add_attention_backend_args: `backends` must be non-empty")
+    backend_descriptions = {
+        "VANILLA": "VANILLA: PyTorch SDPA",
+        "TRTLLM": "TRTLLM: optimized kernels",
+        "FA4": "FA4: Flash Attention 4",
+    }
+    help_choices = ", ".join(backend_descriptions.get(b, b) for b in backends)
     parser.add_argument(
         "--attention_backend",
         type=str,
-        default="VANILLA",
-        choices=["VANILLA", "TRTLLM", "FA4"],
-        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
-        "FA4: Flash Attention 4). "
-        "Note: TRTLLM falls back to VANILLA for cross-attention.",
+        default=backends[0],
+        choices=list(backends),
+        help=(
+            f"Attention backend ({help_choices}). "
+            "Note: TRTLLM falls back to VANILLA for cross-attention."
+        ),
     )
-    parser.add_argument(
-        "--enable_sage_attention",
-        action="store_true",
-        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
-    )
+    if expose_sage:
+        parser.add_argument(
+            "--enable_sage_attention",
+            action="store_true",
+            help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
+        )
 
 
 def add_optimization_args(parser):
@@ -218,3 +259,74 @@ def add_optimization_args(parser):
     parser.add_argument(
         "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise NVTX markers"
     )
+
+
+def add_parallelism_args(parser, *, expose_cfg_size=False, expose_parallel_vae=False):
+    """Add diffusion parallelism args.
+
+    Ulysses + Attention2D (row/col) are always added; every visual-gen example uses them.
+    --cfg_size and --disable_parallel_vae are gated by kwargs because not every model
+    exposes them (e.g. FLUX has no CFG parallel knob; only Wan T2V/I2V drive parallel VAE).
+
+    Args:
+        expose_cfg_size: Add --cfg_size (choices [1, 2]). Wan T2V/I2V and LTX2 use this.
+        expose_parallel_vae: Add --disable_parallel_vae. Only Wan T2V/I2V use this today.
+    """
+    parser.add_argument(
+        "--ulysses_size",
+        type=int,
+        default=1,
+        help="Ulysses (head-sharding) parallel size within each CFG group. "
+        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
+    )
+    if expose_cfg_size:
+        parser.add_argument(
+            "--cfg_size",
+            type=int,
+            default=1,
+            choices=[1, 2],
+            help="CFG parallel size (1 or 2). Set to 2 for CFG Parallelism.",
+        )
+    if expose_parallel_vae:
+        parser.add_argument(
+            "--disable_parallel_vae", action="store_true", help="Disable parallel VAE"
+        )
+
+
+def validate_parallelism_args(args) -> None:
+    """Raise if --ulysses_size and --attn2d_row/col_size are both >1 (not yet implemented)."""
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
+
+
+def format_parallelism_str(args) -> str:
+    """Format the parallelism mode for logging (e.g. 'Ulysses(size=2)', 'Attention2D(...)', 'None')."""
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if args.ulysses_size > 1:
+        return f"Ulysses(size={args.ulysses_size})"
+    if attn2d_size > 1:
+        return (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
+        )
+    return "None"

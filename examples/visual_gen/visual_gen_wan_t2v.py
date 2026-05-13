@@ -12,8 +12,11 @@ from tensorrt_llm._torch.visual_gen.example_utils import (
     add_attention_backend_args,
     add_cache_args,
     add_optimization_args,
+    add_parallelism_args,
     add_quant_args,
     build_cache_config,
+    format_parallelism_str,
+    validate_parallelism_args,
 )
 from tensorrt_llm._torch.visual_gen.utils import linear_type_to_quant_config
 
@@ -92,49 +95,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     add_cache_args(parser)
-
     add_quant_args(parser)
     add_attention_backend_args(parser)
-
-    # Parallelism
-    parser.add_argument(
-        "--cfg_size",
-        type=int,
-        default=1,
-        choices=[1, 2],
-        help="CFG parallel size (1 or 2). "
-        "Distributes positive/negative prompts across GPUs. "
-        "Example: cfg_size=2 on 4 GPUs -> 2 GPUs per prompt.",
-    )
-    parser.add_argument(
-        "--ulysses_size",
-        type=int,
-        default=1,
-        help="Ulysses (head-sharding) parallel size within each CFG group. "
-        "Requirements: num_heads (12) must be divisible by ulysses_size. "
-        "Example: ulysses_size=2 on 4 GPUs with cfg_size=2 -> "
-        "2 CFG groups x 2 Ulysses ranks = 4 GPUs total. "
-        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
-    )
-    parser.add_argument(
-        "--attn2d_row_size",
-        type=int,
-        default=1,
-        help="Attention2D row mesh size (Q all-gather dimension). "
-        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
-        "Cannot be combined with --ulysses_size (not yet implemented).",
-    )
-    parser.add_argument(
-        "--attn2d_col_size",
-        type=int,
-        default=1,
-        help="Attention2D column mesh size (K/V all-gather dimension). "
-        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Cannot be combined with --ulysses_size (not yet implemented).",
-    )
-    parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
-
+    add_parallelism_args(parser, expose_cfg_size=True, expose_parallel_vae=True)
     add_optimization_args(parser)
 
     return parser.parse_args()
@@ -149,21 +112,8 @@ def _wan_needs_fine_grained_sage(model_path: str) -> bool:
 def main():
     args = parse_args()
 
-    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
-    if attn2d_size > 1 and args.ulysses_size > 1:
-        raise ValueError(
-            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
-        )
-
-    if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
-    elif attn2d_size > 1:
-        parallel_str = (
-            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
-            f"total={attn2d_size})"
-        )
-    else:
-        parallel_str = "None"
+    validate_parallelism_args(args)
+    parallel_str = format_parallelism_str(args)
 
     attention_cfg = {
         "backend": args.attention_backend,

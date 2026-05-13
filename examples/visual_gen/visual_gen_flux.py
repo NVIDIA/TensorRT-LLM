@@ -43,8 +43,11 @@ from tensorrt_llm._torch.visual_gen.example_utils import (
     add_attention_backend_args,
     add_cache_args,
     add_optimization_args,
+    add_parallelism_args,
     add_quant_args,
     build_cache_config,
+    format_parallelism_str,
+    validate_parallelism_args,
 )
 from tensorrt_llm._torch.visual_gen.utils import linear_type_to_quant_config
 
@@ -120,38 +123,10 @@ def parse_args():
         teacache_thresh_help="TeaCache similarity threshold (default: 0.6 for FLUX.1, 0.2 for FLUX.2); "
         "ignored when using --enable_cache_dit",
     )
-
     add_quant_args(parser)
     add_attention_backend_args(parser)
-
-    # Parallelism
-    parser.add_argument(
-        "--ulysses_size",
-        type=int,
-        default=1,
-        help="Ulysses (head-sharding) parallel size within each CFG group. "
-        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
-    )
-    parser.add_argument(
-        "--attn2d_row_size",
-        type=int,
-        default=1,
-        help="Attention2D row mesh size (Q all-gather dimension). "
-        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
-        "Cannot be combined with --ulysses_size (not yet implemented).",
-    )
-    parser.add_argument(
-        "--attn2d_col_size",
-        type=int,
-        default=1,
-        help="Attention2D column mesh size (K/V all-gather dimension). "
-        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Cannot be combined with --ulysses_size (not yet implemented).",
-    )
-
+    add_parallelism_args(parser)
     add_optimization_args(parser)
-
     args = parser.parse_args()
 
     if args.prompt is None and args.prompts_file is None:
@@ -213,23 +188,11 @@ def build_diffusion_args(args) -> VisualGenArgs:
 def main():
     args = parse_args()
 
-    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
-    if attn2d_size > 1 and args.ulysses_size > 1:
-        raise ValueError(
-            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
-        )
+    validate_parallelism_args(args)
 
     diffusion_args = build_diffusion_args(args)
 
-    if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
-    elif attn2d_size > 1:
-        parallel_str = (
-            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
-            f"total={attn2d_size})"
-        )
-    else:
-        parallel_str = "None"
+    parallel_str = format_parallelism_str(args)
     logger.info(f"Initializing VisualGen: parallelism={parallel_str}")
     visual_gen = VisualGen(
         model=args.model_path,
