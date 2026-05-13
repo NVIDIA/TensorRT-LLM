@@ -1891,6 +1891,30 @@ class PyExecutor:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    @staticmethod
+    def _sync_disagg_generation_trans_complete_draft_tokens(
+            requests: Iterable[LlmRequest]) -> None:
+        for request in requests:
+            if not request.is_disagg_generation_transmission_complete:
+                continue
+
+            context_phase_params = request.context_phase_params
+            if context_phase_params is None:
+                continue
+
+            draft_tokens = context_phase_params.draft_tokens
+            request.py_draft_tokens = [] if draft_tokens is None else list(
+                draft_tokens)
+            request.draft_tokens = request.py_draft_tokens
+            request.py_draft_pages_allocated = len(request.py_draft_tokens)
+
+    @staticmethod
+    def _get_generation_num_draft_tokens(request: LlmRequest) -> int:
+        py_draft_tokens = getattr(request, 'py_draft_tokens', None)
+        if py_draft_tokens is None:
+            return request.num_draft_tokens
+        return max(len(py_draft_tokens), request.num_draft_tokens)
+
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -1900,6 +1924,8 @@ class PyExecutor:
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
+            self._sync_disagg_generation_trans_complete_draft_tokens(
+                self.active_requests)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -3010,8 +3036,9 @@ class PyExecutor:
             else:
                 compute = max(1, remaining - reusable_in_chunk)
             num_scheduled_ctx_tokens += compute
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
+        num_scheduled_gen_tokens = sum(
+            1 + PyExecutor._get_generation_num_draft_tokens(gen_req)
+            for gen_req in generation_requests)
         return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
@@ -3257,7 +3284,10 @@ class PyExecutor:
                 req.py_kv_transfer_start_time = None
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
-                req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+                req.py_draft_tokens = [] if ctx_draft_tokens is None else list(
+                    ctx_draft_tokens)
+                req.draft_tokens = req.py_draft_tokens
+                req.py_draft_pages_allocated = len(req.py_draft_tokens)
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
