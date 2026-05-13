@@ -187,20 +187,30 @@ def should_skip_trtllm(
     if backend_type != MoeBackendType.TRTLLM:
         return None
 
-    # [Bug] TRTLLMGen MoE on B300 (SM103) has tactic-selection illegal
-    # memory access during autotune. Partial mitigation in PR #13964 head
-    # commit blacklists tactic [tileN=32, configIndex=5] in
-    # cpp/.../trtllmGenKernels/blockScaleMoe/runner.h, but full coverage
-    # of other failing tactics is not yet validated end-to-end. Skip all
-    # TRTLLMGen tests on B300 until the fix is verified.
+    # [Bug] TRTLLMGen MoE on B300 (SM103) with W4A16_MXFP4 + bf16
+    # activation hits tactic-selection illegal memory access during
+    # autotune. Root cause: Python
+    # Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics passed
+    # (num_experts, num_tokens) swapped versus the C++
+    # getValidConfigIndices signature, so the returned valid-tactic list
+    # included [tileN=32, configIndex=5] which IMAs on SM103. PR #13964
+    # head commit 5629e0dff9 fixes the Python arg order AND adds
+    # isKnownInvalidBlockScaleMoeTactic in runner.h to also block this
+    # tactic from the C++ side for fp4/fp8/mxFp4 BlockScaleMoe runners.
+    # Other TRTLLMGen quant_algos on B300 are covered by that C++
+    # blacklist; only W4A16_MXFP4 was exposed via the Python bug, so
+    # restrict the skip to that specific case until the fix is
+    # verified end-to-end on B300.
     from tensorrt_llm._utils import get_sm_version
 
-    if get_sm_version() == 103:
+    if get_sm_version() == 103 and quant_algo == QuantAlgo.W4A16_MXFP4:
         return (
-            "[Bug] TRTLLMGen MoE on B300 (SM103) hits tactic-selection "
-            "illegal memory access during autotune. Partial fix blacklists "
-            "tactic [tileN=32, configIndex=5]; skipping all TRTLLMGen tests "
-            "on B300 until full coverage is verified."
+            "[Bug] TRTLLMGen MoE W4A16_MXFP4 on B300 (SM103) hits "
+            "illegal memory access during autotune: "
+            "Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics returned an "
+            "invalid tactic list that selected [tileN=32, configIndex=5]. "
+            "Partial fix in PR #13964 head commit 5629e0dff9; skipping "
+            "until the fix is verified end-to-end on B300."
         )
 
     # Routing method compatibility check (used by test_moe_module.py)
