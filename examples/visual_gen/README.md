@@ -35,7 +35,6 @@ python models/wan_t2v.py --extra_visual_gen_options configs/wan2.2-t2v-fp4-1gpu.
 ```bash
 # Install dependencies (from repository root)
 pip install -r requirements-dev.txt
-pip install "diffusers>=0.37.0"
 ```
 
 
