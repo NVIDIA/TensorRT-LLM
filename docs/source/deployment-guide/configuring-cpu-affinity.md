@@ -29,6 +29,35 @@ environment variable as follows:
 | 0 or any other value            | Affinity remains as configured by the user and/or environment                                                                |
 
 
+## Intel Priority Core Turbo
+
+Intel Granite Rapids platforms, such as the Intel Xeon 6, include the [Priority
+Core Turbo](https://cdrdv2-public.intel.com/846906/846906_PCT_Technology_Technical_Article_Rev_1_5_1.pdf)
+(PCT) feature. PCT allows designated high-priority cores to operate at elevated
+turbo frequencies, while other cores run at lower base speeds. The
+high-priority cores provide substantial benefit to CPU-intensive AI
+applications like TensorRT-LLM, where GPU work submission is on the critical
+path. However, due to the large disparity in performance between high and low-priority
+cores, precise CPU affinity configuration is imperative. For this reason,
+TensorRT-LLM automatically restricts worker CPU affinity to high-priority PCT
+cores. The per-GPU affinity is determined by intersecting the set of PCT cores
+with the NVML-reported NUMA affinity for each device, so the correct NUMA-local
+subset is selected automatically.
+
+This behavior differs from the generic NUMA-aware affinity in two ways:
+
+1. It is applied **unconditionally by default**, regardless of whether the
+   process already has constrained affinity (e.g. from OpenMPI, Slurm, or
+   numactl). A warning is logged when existing constraints are overridden.
+2. It can only be disabled by explicitly setting
+   `TLLM_NUMA_AWARE_WORKER_AFFINITY=0`.
+
+| TLLM_NUMA_AWARE_WORKER_AFFINITY | Behavior on Granite Rapids                                      |
+|---------------------------------|-----------------------------------------------------------------|
+| \<unset\>                       | PCT-aware affinity is applied (overrides any existing affinity) |
+| 1                               | PCT-aware affinity is applied (overrides any existing affinity) |
+| 0                               | Affinity remains as configured by the user and/or environment   |
+
 ## Other environmental considerations
 
 Whether or not the user chooses to manually configure CPU affinity or have
