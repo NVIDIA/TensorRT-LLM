@@ -500,6 +500,7 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
             filter(
@@ -510,6 +511,7 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_lora_path,
                 ],
             )
         )
@@ -520,6 +522,9 @@ class RequestBroadcaster:
     ) -> Tuple[List, Optional[Dict]]:
         """Broadcast requests across pipeline stages."""
         payloads = (new_requests, py_request_objects)
+
+        if self.dist.world_size == 1:
+            return payloads
 
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)

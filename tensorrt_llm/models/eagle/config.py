@@ -18,6 +18,7 @@ from typing import Optional, Union
 
 from transformers import LlamaConfig
 
+from ..._utils import get_hf_rope_theta
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..llama.config import LLaMAConfig
@@ -84,7 +85,7 @@ class EagleConfig(LLaMAConfig):
             rms_norm_eps = hf_config.rms_norm_eps
             vocab_size = hf_config.vocab_size
             rotary_scaling = hf_config.rope_scaling
-            rotary_base = hf_config.rope_theta
+            rotary_base = get_hf_rope_theta(hf_config, 10000.0)
             n_positions = hf_config.max_position_embeddings
             hidden_act = hf_config.hidden_act
             dtype = str(hf_config.torch_dtype)[6:] if dtype == 'auto' else dtype

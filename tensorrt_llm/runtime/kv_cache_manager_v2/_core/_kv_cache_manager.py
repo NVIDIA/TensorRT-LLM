@@ -31,6 +31,7 @@ from .._common import (
     CacheTier,
     LayerId,
     MemAddress,
+    PageIndexMode,
     PageStatus,
     Priority,
     TokenIdExt,
@@ -42,6 +43,7 @@ from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
 from .._utils import (
+    HalfOpenRange,
     HomoTuple,
     TypedIndexList,
     div_up,
@@ -102,19 +104,78 @@ class AggregatedPageDesc:
 
 
 @dataclass(slots=True, frozen=True)
+class ScratchDesc:
+    """Scratch metadata for one layer group of one sequence.
+
+    Scratch blocks are blocks whose KV data is ephemeral (only needed during one
+    step's attention). Their pages are stored in shared coalesced slots rather than
+    per-block slots.
+    """
+
+    range: HalfOpenRange[BlockOrdinal]  # block ordinal range [beg, end)
+    slot_ids: Sequence[int]  # scratch slot IDs, length = ceil(num_scratch_blocks / scale)
+
+    def __bool__(self) -> bool:
+        return bool(self.range)
+
+
+@dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
     expansion: int
+    layer_offset: int  # sub-page offset within coalesced slot
+    scratch_pages_per_block: int = 1
 
-    def __call__(self, base_index: int) -> Iterator[int]:
+    def __call__(
+        self,
+        base_indices: Sequence[int],
+        index_mode: PageIndexMode | None = None,
+        scratch: "ScratchDesc | None" = None,
+    ) -> list[int]:
         """
-        Convert from base page indices to page indices expected by operators/kernels.
-        This is just an reference implementation. Users are encouraged to do it with a CUDA kernel.
+        Convert from base page indices to per-layer page indices expected by operators/kernels.
+        This is a reference implementation. Users are encouraged to do it with a CUDA kernel.
+
+        When index_mode is PageIndexMode.PER_LAYER, the converted indices include the layer's
+        position within the coalesced slot. The caller should use the pool group base address.
+
+        When index_mode is PageIndexMode.SHARED, the converted indices do not include any
+        layer offset — the caller's base pointer (from get_mem_pool_base_address) already
+        incorporates it.
+
+        Args:
+            base_indices: Per-block base page indices (slot IDs), from get_base_page_indices().
+            index_mode: Page index mode. None defaults to SHARED; must be explicit when
+                scratch is active (scratch requires PER_LAYER).
+            scratch: Optional scratch metadata from _KVCache.get_scratch_desc().
         """
-        valid = base_index != BAD_PAGE_INDEX
-        index = base_index * self.scale
+        if index_mode is None:
+            assert not scratch, "index_mode must be provided when scratch is active"
+            index_mode = PageIndexMode.SHARED
+
+        scale = self.scale
         expansion = self.expansion
-        return ((index * expansion + i if valid else BAD_PAGE_INDEX) for i in range(expansion))
+        applied_layer_offset = self.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+        scratch_pages = self.scratch_pages_per_block
+        result = list[int]()
+
+        for ordinal, base_index in enumerate(base_indices):
+            index: int
+            if scratch and ordinal in scratch.range:
+                # Scratch block: slot IDs come from ScratchDesc, not base_indices
+                block_pos = ordinal - scratch.range.beg
+                total_offset = block_pos * scratch_pages
+                slot_idx = total_offset // scale
+                slot_id = scratch.slot_ids[slot_idx]
+                offset = total_offset % scale
+                index = slot_id * scale + (offset + applied_layer_offset) % scale
+            elif base_index == BAD_PAGE_INDEX:
+                index = BAD_PAGE_INDEX
+            else:
+                index = base_index * scale + applied_layer_offset
+            for i in range(expansion):
+                result.append(index * expansion + i if index != BAD_PAGE_INDEX else BAD_PAGE_INDEX)
+        return result
 
 
 class KVCacheManager:
@@ -130,9 +191,9 @@ class KVCacheManager:
         "_target_ratio_list_gpu",
         "_target_ratio_list_other",
         "_num_created_kv_caches",
-        "_num_closed_kv_caches",
+        "_num_sampled_kv_caches",
         "_last_adjustment_time",
-        "_last_update_num_closed_requests",
+        "_last_update_num_sampled_kv_caches",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -152,9 +213,9 @@ class KVCacheManager:
     _target_ratio_list_gpu: TypedIndexList[PoolGroupIndex, float]
     _target_ratio_list_other: TypedIndexList[PoolGroupIndex, float]
     _num_created_kv_caches: int
-    _num_closed_kv_caches: int
+    _num_sampled_kv_caches: int
     _last_adjustment_time: float
-    _last_update_num_closed_requests: int
+    _last_update_num_sampled_kv_caches: int
 
     def __init__(self, config: KVCacheManagerConfig) -> None:
         init_cuda_once()
@@ -167,6 +228,7 @@ class KVCacheManager:
             self._life_cycles,
             storage_config,
             config.tokens_per_block,
+            config.enable_swa_scratch_reuse,
             typical_batch=config.typical_step,
             constraints=config.constraints,
         )
@@ -178,9 +240,9 @@ class KVCacheManager:
         self._target_ratio_list_gpu = self._current_gpu_ratio
         self._target_ratio_list_other = self._current_other_ratios
         self._num_created_kv_caches = 0
-        self._num_closed_kv_caches = 0
+        self._num_sampled_kv_caches = 0
         self._last_adjustment_time = time.monotonic()
-        self._last_update_num_closed_requests = 0
+        self._last_update_num_sampled_kv_caches = 0
 
     def __del__(self) -> None:
         self.shutdown()
@@ -197,12 +259,30 @@ class KVCacheManager:
             for pg_idx in typed_range(level.storage.num_pool_groups):
                 assert level.controller.num_evictable_pages(pg_idx) == 0
 
-    def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
+    def get_mem_pool_base_address(
+        self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
+    ) -> MemAddress:
         """
         Get the base address of the memory pool holding pages for the given layer and data role.
-        It's guaranteed that for one layer, multiple buffers of the same size have the same base address.
+
+        When index_mode is PageIndexMode.PER_LAYER, returns the pool group base address
+        (without per-layer offset), since PageIndexConverter includes the layer offset in
+        the converted indices. Otherwise, returns the per-layer base address (with the
+        layer offset baked in).
         """
-        return self._storage.get_mem_pool_base_address(layer_id, data_role)
+        storage = self._storage
+        attr = storage.get_buffer_attr(layer_id, data_role)
+
+        if index_mode is None:
+            if self.enable_swa_scratch_reuse:
+                raise ValueError("index_mode must be provided when SWA scratch reuse is enabled")
+            index_mode = PageIndexMode.SHARED
+
+        pg_idx = storage.get_pool_group_index(attr.life_cycle_id)
+        addr = storage.get_mem_pool_base_address(pg_idx, attr.pool_index)
+        if index_mode == PageIndexMode.SHARED:
+            addr = MemAddress(addr + attr.offset)
+        return addr
 
     # Currently always equals to page size. In the future, that will change when kernels support page stride.
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int:
@@ -245,16 +325,19 @@ class KVCacheManager:
         self, layer_id: LayerId, data_role: DataRole
     ) -> PageIndexConverter:
         """
-        Get the converter to convert from base page indices to page indices expected by operators/kernels.
+        Get the converter to convert from base page indices to per-layer page indices
+        expected by operators/kernels.
 
-        For layers in the same layer group and with the same tokens_per_block, users are encouraged to
-        share the computed page indices between buffers of these layers, if the page index scale for these
-        buffers are the same.
+        The returned converter is constant and usable by all kv cache instances.
         """
         storage = self._storage
         attr = storage.get_buffer_attr(layer_id, data_role)
+        layer_attr = storage.get_layer_attr(layer_id)
         scale = storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
-        return PageIndexConverter(scale, attr.expansion)
+        layer_offset = exact_div(attr.offset, attr.size)
+        return PageIndexConverter(
+            scale, attr.expansion, layer_offset, layer_attr.slot_util[attr.pool_index]
+        )
 
     def create_kv_cache(
         self,
@@ -263,6 +346,7 @@ class KVCacheManager:
         id: int | None = None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
+        cache_salt_id: int | None = None,
     ) -> _KVCache:
         """
         lora_task_id: match lora_task_id before matching any tokens.
@@ -274,8 +358,17 @@ class KVCacheManager:
         This call will attempt to reuse KV cache blocks.
         It's user responsibility to remove the last token from prompts if we need to re-compute the token
         generated by prefill.
+        cache_salt_id: when set, isolates this request's reuse from requests carrying a different
+        salt (or no salt) by seeding a distinct radix-tree branch.
         """
-        return _KVCache(self, lora_task_id, input_tokens, id, custom_priority_callback)
+        return _KVCache(
+            self,
+            lora_task_id,
+            input_tokens,
+            id,
+            custom_priority_callback,
+            cache_salt_id=cache_salt_id,
+        )
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """
@@ -324,6 +417,24 @@ class KVCacheManager:
     @property
     def ssm_reuse_interval(self) -> int:
         return self._init_config.ssm_reuse_interval
+
+    @property
+    def enable_swa_scratch_reuse(self) -> bool:
+        return self._init_config.enable_swa_scratch_reuse
+
+    def supports_index_mode(self, mode: PageIndexMode) -> bool | None:
+        """Whether managed KV caches support the given page index mode.
+
+        Returns:
+            True  — the mode is supported by every KV cache.
+            False — the mode is not supported by any KV cache.
+            None  — support is per-instance; check _KVCache.supports_index_mode().
+        """
+        match mode:
+            case PageIndexMode.PER_LAYER:
+                return True
+            case PageIndexMode.SHARED:
+                return None if self.enable_swa_scratch_reuse else True
 
     @property
     def num_layers(self) -> int:
@@ -481,7 +592,7 @@ class KVCacheManager:
 
     @property
     def need_adjustment(self) -> bool:
-        if self._num_closed_kv_caches < 2000:
+        if self._num_sampled_kv_caches < 2000:
             return False
         if time.monotonic() - self._last_adjustment_time < 120:
             return False
@@ -505,9 +616,9 @@ class KVCacheManager:
         self._last_adjustment_time = time.monotonic()
 
     def _try_update_target_ratios(self) -> None:
-        if self._num_closed_kv_caches - self._last_update_num_closed_requests < 100:
+        if self._num_sampled_kv_caches - self._last_update_num_sampled_kv_caches < 100:
             return
-        self._last_update_num_closed_requests = self._num_closed_kv_caches
+        self._last_update_num_sampled_kv_caches = self._num_sampled_kv_caches
         tokens_per_block = self.tokens_per_block
         storage = self._storage
 

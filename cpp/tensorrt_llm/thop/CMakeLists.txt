@@ -89,11 +89,13 @@ add_library(
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
+  fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   ncclCommunicatorOp.cpp
+  allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp
@@ -108,6 +110,7 @@ add_library(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   specDecOp.cpp
+  dynamicTreeOp.cpp
   loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp

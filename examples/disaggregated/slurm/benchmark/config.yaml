@@ -107,7 +107,7 @@ worker_config:
     num_postprocess_workers: 4
     speculative_config: # when mtp_size is 0, remove this section.
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
@@ -130,4 +130,4 @@ worker_config:
       backend: DEFAULT
     speculative_config: # when mtp_size is 0, remove this section.
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      max_draft_len: 1

@@ -60,6 +60,22 @@ class AttentionBackend(ABC):
     @abstractmethod
     def preferred_layout(self) -> AttentionTensorLayout: ...
 
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support LSE output. "
+            "Override forward_with_lse() or check support_lse() before calling."
+        )
+
     @classmethod
     def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_lse(cls) -> bool:
         return False

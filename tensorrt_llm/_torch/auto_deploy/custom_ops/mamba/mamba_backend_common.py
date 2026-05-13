@@ -22,7 +22,7 @@ from torch.fx import Node
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import cu_seqlens_to_chunk_indices_offsets
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,

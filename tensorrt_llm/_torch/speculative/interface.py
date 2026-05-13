@@ -7,6 +7,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
+from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm.logger import logger
@@ -26,6 +27,20 @@ if IS_FLASHINFER_AVAILABLE:
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+# RNG pool configuration for the fractional (probabilistic) component of the
+# synthetic acceptance rate. Pool size MUST be a power of two so we can use
+# a bitmask (`& (pool_size - 1)`) for wrap-around — this stays cheap and
+# keeps tensor shapes static for CUDA graph capture. The fixed seed is what
+# guarantees identical random draws on every TP rank (so all ranks accept the
+# same number of tokens per iteration and downstream collectives stay in
+# lock-step). The two stride primes mix the per-call counter with the
+# per-slot index so consecutive calls / consecutive slots map to decorrelated
+# pool entries.
+_FORCE_ACCEPT_RNG_POOL_SIZE = 1 << 16  # 65536 entries (256 KiB float32)
+_FORCE_ACCEPT_RNG_SEED = 0xACCE9D
+_FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
+_FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
@@ -88,14 +103,26 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
             'slot_mapping_scale':
             m.slot_mapping_scale.clone(),
         }
-        block_ids_per_seq = draft_kv_cache_manager.get_block_ids_per_seq(
-            m.request_ids)
-        num_blocks = block_ids_per_seq.shape[1]
-        m.host_indexer_k_cache_block_offsets[:len(
-            block_ids_per_seq), :num_blocks].copy_(block_ids_per_seq)
+        # Derive pool indices from the draft manager's encoded block
+        # offsets (via _get_pool_block_indices) instead of using raw block
+        # IDs.  With host cache offload, block IDs can exceed
+        # blocks_in_primary_pool after offload swaps (the block keeps its
+        # original high ID even though its memory now lives in the primary
+        # GPU pool).  Using raw block IDs as pool indices causes OOB access
+        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
+        # decodes memPoolBlockIndex from the C++ encoded offsets.
+        # Note: kv_cache_manager was already swapped to draft above (line 67).
+        pool_indices = m._get_pool_block_indices()
+        num_blocks = pool_indices.shape[1]
+        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
+            pool_indices)
         m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
             m.host_indexer_k_cache_block_offsets[:m.num_seqs],
             non_blocking=True)
+        # Safety clamp: sanitize stale padding entries beyond num_seqs
+        # that may contain negative or out-of-range values, matching the
+        # regular DSA prepare() flow.
+        m.indexer_k_cache_block_offsets.clamp_(min=0)
         Indexer.recompute_slot_mappings(m)
     return saved
 
@@ -124,7 +151,14 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
 
 def get_force_num_accepted_tokens() -> int:
     """
-    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment variable.
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment
+    variable as an integer.
+
+    Used by speculative decoding paths that operate on Python lists/slices and
+    therefore require an integer count (e.g. the two-model path in
+    ``TorchSampler``). For the one-model path, see
+    :func:`get_force_num_accepted_tokens_float`, which supports fractional
+    synthetic acceptance rates.
 
     Returns:
         int: The forced number of accepted tokens, or 0 if not set or invalid.
@@ -137,6 +171,31 @@ def get_force_num_accepted_tokens() -> int:
             f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid integer, "
             f"got '{env_value}'. Using default value 0.")
         return 0
+
+
+def get_force_num_accepted_tokens_float() -> float:
+    """
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment
+    variable as a (possibly fractional) float.
+
+    Used by the one-model speculative decoding path to synthesize non-integer
+    acceptance rates: the integer part is the number of draft tokens accepted
+    on every iteration, and the fractional part is the probability of
+    accepting one additional draft token. For example, "2.6" means always
+    accept 2 draft tokens and accept one more with probability 0.6.
+
+    Returns:
+        float: The forced (possibly fractional) number of accepted draft
+        tokens, or 0.0 if not set or invalid.
+    """
+    env_value = os.environ.get(FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR, "0")
+    try:
+        return float(env_value)
+    except ValueError:
+        logger.warning(
+            f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid number "
+            f"(int or float), got '{env_value}'. Using default value 0.0.")
+        return 0.0
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -152,6 +211,7 @@ class SpeculativeDecodingMode(IntEnum):
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
+    DFLASH = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -180,6 +240,12 @@ class SpeculativeDecodingMode(IntEnum):
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
 
+    def is_dflash(self):
+        return self == SpeculativeDecodingMode.DFLASH
+
+    def is_parallel_draft(self):
+        return self.is_pard() or self.is_dflash()
+
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
@@ -202,7 +268,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def is_external_drafter(self):
-        return self.is_pard() or self.is_draft_target_one_model()
+        return self.is_parallel_draft() or self.is_draft_target_one_model()
 
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
@@ -497,11 +563,20 @@ class SpecWorkerBase(nn.Module, ABC):
     def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
-        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
-        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.4"
+        self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
+        )
+        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and Version(
+            flashinfer.__version__) >= Version("0.6.4")
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
+        # Lazily-initialized state for the fractional synthetic acceptance
+        # rate. The pool is a fixed-seed, rank-independent table of uniform
+        # [0, 1) values; the counter is a device-side int64 advanced in-place
+        # inside captured CUDA graphs (mirroring the existing flashinfer
+        # seed/offset pattern in `_sample_tokens_for_batch`).
+        self._force_accept_rng_pool: Optional[torch.Tensor] = None
+        self._force_accept_rng_counter: Optional[torch.Tensor] = None
 
     @property
     @abstractmethod
@@ -610,25 +685,112 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 
+    def _ensure_force_accept_rng_state(self, device: torch.device) -> None:
+        """
+        Lazily build the deterministic RNG state used by
+        :meth:`_apply_force_accepted_tokens` for fractional synthetic
+        acceptance rates.
+
+        The pool is filled from a CPU generator with a fixed seed so that
+        every tensor-parallel rank produces the bit-for-bit identical pool
+        (TP ranks must agree on the per-iteration accepted-token count, or
+        downstream collectives expecting identical shapes will hang).
+
+        First-call allocation must happen during eager warmup — never inside
+        a captured CUDA graph. The CUDA-graph runner already runs warmup
+        forwards before capture, which satisfies this in practice.
+        """
+        if self._force_accept_rng_pool is not None:
+            return
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(_FORCE_ACCEPT_RNG_SEED)
+        pool_cpu = torch.rand(_FORCE_ACCEPT_RNG_POOL_SIZE,
+                              dtype=torch.float32,
+                              generator=cpu_gen)
+        self._force_accept_rng_pool = pool_cpu.to(device=device)
+        self._force_accept_rng_counter = torch.zeros(1,
+                                                     dtype=torch.int64,
+                                                     device=device)
+
     def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
                                      runtime_draft_len: int):
         """
-        Apply forced number of accepted tokens if environment variable is set.
-        This is used for testing and debugging.
+        Apply a forced (synthetic) number of accepted draft tokens if the
+        ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` environment variable is
+        set. This is used for testing and debugging speculative decoding.
+
+        The forced value supports fractional synthetic acceptance rates: the
+        integer part is the number of draft tokens accepted on every
+        generation iteration, and the fractional part is the probability of
+        accepting one additional draft token on that iteration. For example,
+        a value of ``2.6`` means: always accept 2 draft tokens, and accept
+        one more with probability 0.6 (per generation request).
+
+        The implementation is CUDA-graph-compatible AND tensor-parallel
+        deterministic. Randomness is sourced from a fixed-seed lookup pool
+        plus a device-side counter that is advanced in place each call —
+        the same pattern as the flashinfer seed/offset state used by
+        :meth:`_sample_tokens_for_batch`. Because every rank seeds the pool
+        identically and increments the counter on the same captured ops,
+        every rank draws the same uniform values and therefore agrees on the
+        accepted-token count for every request in every iteration.
 
         Args:
-            num_accepted_tokens: Tensor of shape [batch_size] with current accepted counts
-            num_contexts: Number of context (prefill) requests
+            num_accepted_tokens: Tensor of shape [batch_size] with current
+                accepted counts (target token + accepted draft tokens).
+            num_contexts: Number of context (prefill) requests in the batch.
             runtime_draft_len: The draft length for the current iteration.
 
         Returns:
-            Modified num_accepted_tokens tensor
+            Modified num_accepted_tokens tensor.
         """
-        if self.force_num_accepted_tokens != 0:
-            # total tokens per iteration = accepted draft tokens + 1 target token
-            force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     runtime_draft_len + 1)
+        if self.force_num_accepted_tokens == 0.0:
+            return num_accepted_tokens
+
+        # Decompose into a deterministic integer part (always accepted) and a
+        # probabilistic fractional part. ``int(...)`` truncates toward zero,
+        # which matches floor for the supported non-negative range.
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+
+        # ``num_accepted_tokens`` counts the target token + accepted draft
+        # tokens, so the maximum reachable value is ``runtime_draft_len + 1``.
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+
+        if frac_part > 0.0 and base_total < max_total:
+            self._ensure_force_accept_rng_state(num_accepted_tokens.device)
+
+            # ``num_gens`` is fixed at CUDA-graph capture time (graphs are
+            # captured for a specific batch shape with ``num_contexts``
+            # typically 0), so all of the ops below have static shapes.
+            num_gens = num_accepted_tokens.shape[0] - num_contexts
+
+            # In-place counter bump is captured by the graph and replayed on
+            # every iteration, so each replay yields fresh draws from the
+            # pool. All TP ranks bump in lock-step → identical indices.
+            self._force_accept_rng_counter += 1
+
+            slot_ids = torch.arange(num_gens,
+                                    device=num_accepted_tokens.device,
+                                    dtype=torch.int64)
+            # Hash (counter, slot) → pool index. ``& (pool_size - 1)`` is a
+            # cheap power-of-two modulo. The two stride primes are coprime
+            # to ``pool_size`` so consecutive calls and consecutive slots
+            # land on decorrelated pool entries.
+            indices = (self._force_accept_rng_counter *
+                       _FORCE_ACCEPT_RNG_COUNTER_STRIDE +
+                       slot_ids * _FORCE_ACCEPT_RNG_SLOT_STRIDE) & (
+                           _FORCE_ACCEPT_RNG_POOL_SIZE - 1)
+            rand = self._force_accept_rng_pool[indices]
+            extra = (rand < frac_part).to(num_accepted_tokens.dtype)
+            # ``base_total + extra`` is at most ``int_part + 2``; clamp so we
+            # never exceed the available draft slots.
+            force_total_tokens = (base_total + extra).clamp_(max=max_total)
             num_accepted_tokens[num_contexts:] = force_total_tokens
+        else:
+            num_accepted_tokens[num_contexts:] = base_total
+
         return num_accepted_tokens
 
     def _sample_and_accept_draft_tokens_base(

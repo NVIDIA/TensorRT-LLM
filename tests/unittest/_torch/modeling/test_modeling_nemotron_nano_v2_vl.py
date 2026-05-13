@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from pathlib import Path
 from unittest import mock
@@ -19,6 +22,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
 from tensorrt_llm.inputs import (
+    AudioData,
     create_input_processor,
     create_input_processor_with_hash,
     default_multimodal_input_loader,
@@ -71,7 +75,7 @@ def nano_llm_model():
     nano_llm = LLM(
         model=MODEL_PATH,
         tensor_parallel_size=1,
-        max_batch_size=2,
+        max_batch_size=24,
         cuda_graph_config=CudaGraphConfig(),
         kv_cache_config=KvCacheConfig(enable_block_reuse=False, mamba_ssm_cache_dtype="float32"),
     )
@@ -286,7 +290,7 @@ class TestSoundPlaceholderInjection:
     VIDEO_TOKEN = "<video>"
     SOUND_TOKEN = "<so_embedding>"
 
-    def _call_extract_audio_from_video(self, text_prompt, video_metadatas):
+    def _call_extract_audio_from_video(self, text_prompt, video_audios):
         """Call the real _extract_audio_from_video with a minimal mock model.
 
         _prepare_audio_features is stubbed to pass through the text unchanged
@@ -297,19 +301,22 @@ class TestSoundPlaceholderInjection:
         model._sound_context_token = self.SOUND_TOKEN
         model._audio_extractor = MagicMock()  # not None → passes early return
         model._prepare_audio_features = MagicMock(side_effect=lambda text, _: (text, {}))
-        return NanoV2VLInputProcessor._extract_audio_from_video(model, text_prompt, video_metadatas)
+        return NanoV2VLInputProcessor._extract_audio_from_video(model, text_prompt, video_audios)
+
+    def _make_audio(self) -> AudioData:
+        return AudioData(samples=np.zeros(16000), sample_rate=16000)
 
     def test_two_videos_only_second_has_audio(self):
         """When video1 is silent and video2 has audio, the sound placeholder
         should be injected after the *second* <video>, not the first."""
         text_prompt = f"Watch {self.VIDEO_TOKEN} and {self.VIDEO_TOKEN} carefully."
 
-        video_metadatas = [
-            {},  # video 1: no audio
-            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
+        video_audios = [
+            None,  # video 1: no audio
+            self._make_audio(),
         ]
 
-        result, _ = self._call_extract_audio_from_video(text_prompt, video_metadatas)
+        result, _ = self._call_extract_audio_from_video(text_prompt, video_audios)
 
         expected = f"Watch {self.VIDEO_TOKEN} and {self.VIDEO_TOKEN}{self.SOUND_TOKEN} carefully."
         assert result == expected, (
@@ -322,13 +329,13 @@ class TestSoundPlaceholderInjection:
         """Sound placeholders should follow the first and third <video> tokens."""
         text_prompt = f"A {self.VIDEO_TOKEN} B {self.VIDEO_TOKEN} C {self.VIDEO_TOKEN} D"
 
-        video_metadatas = [
-            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
-            {},  # video 2: no audio
-            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
+        video_audios = [
+            self._make_audio(),
+            None,  # video 2: no audio
+            self._make_audio(),
         ]
 
-        result, _ = self._call_extract_audio_from_video(text_prompt, video_metadatas)
+        result, _ = self._call_extract_audio_from_video(text_prompt, video_audios)
 
         expected = (
             f"A {self.VIDEO_TOKEN}{self.SOUND_TOKEN} B "
@@ -683,12 +690,13 @@ class TestChunkedPrefillCaching:
 
     def _make_param_with_runtime(self, modality_type, num_tokens, **extra):
         """Build a real MultimodalParams with runtime data for caching."""
+        # Single contiguous mm block of `num_tokens` tokens, none cached yet:
+        # mask = all-True over the chunk, cumsum = [1, 2, ..., num_tokens].
+        embed_mask_cumsum = torch.arange(1, num_tokens + 1, dtype=torch.int64)
         runtime = MultimodalRuntimeData(
             past_seen_token_num=0,
-            mm_token_lengths=[num_tokens],
-            mm_token_positions=[0],
             chunk_end_pos=num_tokens,
-            special_token_offsets=[],
+            embed_mask_cumsum=embed_mask_cumsum,
         )
         # Mirror the nested shape produced by the input processor: a dict
         # keyed by `modality_type` holds per-modality side-channel data.

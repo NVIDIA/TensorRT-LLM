@@ -18,7 +18,7 @@ from typing import List, Optional
 import torch
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable, ResourceHandlerDict
 from .mamba_backend_common import (
     BaseBackendSSM,
@@ -125,6 +125,11 @@ def _flashinfer_cached_ssm(
         ) = decode_inputs
 
         import flashinfer
+
+        # FlashInfer needs contiguous x/B/C with 128-byte alignment.
+        x_decode = x_decode.contiguous()
+        B_decode = B_decode.contiguous()
+        C_decode = C_decode.contiguous()
 
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
         y_decode = flashinfer.mamba.selective_state_update(
