@@ -10,16 +10,14 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
-from tensorrt_llm._torch.disaggregation.base.region import DataRole as RegionDataRole
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     build_page_table_from_manager,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import PoolRole, get_pool_role
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import Role
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -967,16 +965,17 @@ class TestDeepseekV4CacheManager:
             for layer_group in page_table.layer_groups:
                 for pool_view in layer_group.pool_views:
                     saw_pool_view = True
-                    assert (
-                        get_pool_role(pool_view, kv_factor=cache_manager.kv_factor)
-                        == PoolRole.KV_CACHE
-                    )
-                    assert {int(entry["role"]) for entry in pool_view.buffer_entries} == {
-                        int(RegionDataRole.KEY)
-                    }
+                    # All DSv4 pools dispatch through the standard mapper
+                    # family; INDEXER mapper is reserved for V1's separate
+                    # indexer K cache pool.
+                    assert pool_view.mapper_kind == MapperKind.STANDARD
+                    # pool_role carries the manager-native role-name strings,
+                    # which are all DSv4 attention-type names like
+                    # "deepseek_v4_swa", "deepseek_v4_compress", etc.
+                    assert pool_view.pool_role
+                    for role_name in pool_view.pool_role:
+                        assert role_name.startswith("deepseek_v4_"), role_name
             assert saw_pool_view
-            with pytest.raises(ValueError, match="Invalid DeepSeek-V4 data role"):
-                cache_manager.get_disagg_data_role(Role.KEY)
         finally:
             cache_manager.shutdown()
 

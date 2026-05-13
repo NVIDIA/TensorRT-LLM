@@ -1,20 +1,18 @@
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.region import DataRole, MemRegionGroup, SpecRegion
+from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     build_page_table,
 )
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
-    PoolRole,
-    get_device_pointer,
     get_global_layer_ids,
     get_layer_to_layer_group,
     get_num_layer_groups,
     get_num_layers,
     get_physical_pool,
-    get_pool_role,
     get_unique_layers,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -154,26 +152,19 @@ def test_build_page_table():
     assert pool.base_address > 0
     assert pool.num_slots == 50  # 3200 tokens / 64 tokens_per_block
     assert len(pv.buffer_entries) > 0
-    assert get_pool_role(pv, kv_factor=2) == PoolRole.KV_CACHE
+    assert pv.pool_role == frozenset({"key", "value"})
+    assert pv.mapper_kind == MapperKind.STANDARD
     assert len(get_global_layer_ids(lg)) > 0
 
     local_layer_id = list(get_unique_layers(pv))[0]
-    ptr_key = get_device_pointer(
-        page_table,
-        lg_idx=0,
-        pool_view=pv,
-        slot_id=0,
-        local_layer_id=local_layer_id,
-        role=int(DataRole.KEY),
+    layer_entries = sorted(
+        (e for e in pv.buffer_entries if int(e["local_layer_id"]) == local_layer_id),
+        key=lambda e: int(e["offset"]),
     )
-    ptr_value = get_device_pointer(
-        page_table,
-        lg_idx=0,
-        pool_view=pv,
-        slot_id=0,
-        local_layer_id=local_layer_id,
-        role=int(DataRole.VALUE),
-    )
+    assert len(layer_entries) >= 2  # KV layout: K + V buffer per layer
+    pool = get_physical_pool(page_table, 0, pv.pool_idx)
+    ptr_key = int(pool.base_address) + int(layer_entries[0]["offset"])
+    ptr_value = int(pool.base_address) + int(layer_entries[1]["offset"])
     assert ptr_key > 0
     assert ptr_value > ptr_key
 
@@ -199,7 +190,6 @@ def test_build_page_table():
 def test_layer_group_meta_serialization():
     import numpy as np
 
-    from tensorrt_llm._torch.disaggregation.base.region import DataRole
     from tensorrt_llm._torch.disaggregation.resource.page import (
         BUFFER_ENTRY_DTYPE,
         AttentionLayerGroup,
@@ -211,7 +201,7 @@ def test_layer_group_meta_serialization():
     )
 
     entries = np.array(
-        [(0, int(DataRole.KEY), 0, 256), (0, int(DataRole.VALUE), 256, 256)],
+        [(0, 0, 256), (0, 256, 256)],
         dtype=BUFFER_ENTRY_DTYPE,
     )
     kv_pool = PhysicalPool(base_address=1000, slot_bytes=512, num_slots=10)
@@ -278,7 +268,6 @@ def test_mamba_layer_group_serialization():
 def test_mixed_page_table_serialization():
     import numpy as np
 
-    from tensorrt_llm._torch.disaggregation.base.region import DataRole
     from tensorrt_llm._torch.disaggregation.resource.page import (
         BUFFER_ENTRY_DTYPE,
         AttentionLayerGroup,
@@ -292,7 +281,7 @@ def test_mixed_page_table_serialization():
 
     # Attention layer group
     entries = np.array(
-        [(0, int(DataRole.KEY), 0, 256), (0, int(DataRole.VALUE), 256, 256)],
+        [(0, 0, 256), (0, 256, 256)],
         dtype=BUFFER_ENTRY_DTYPE,
     )
     attn_lg = AttentionLayerGroup(

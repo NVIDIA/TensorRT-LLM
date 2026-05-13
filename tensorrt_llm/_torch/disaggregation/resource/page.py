@@ -1,18 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from enum import IntEnum
+from typing import Dict, FrozenSet, List, Optional
 
 import numpy as np
 
 BUFFER_ENTRY_DTYPE = np.dtype(
     [
         ("local_layer_id", np.uint32),
-        ("role", np.uint32),
         ("offset", np.uint32),
         ("size", np.uint32),
     ]
 )
+
+
+class MapperKind(IntEnum):
+    """Selects the byte-mover (Mapper) family for an attention pool.
+
+    Closed set: a new value here is added together with a new Mapper class.
+    Runtime conditions like head-match or transfer_layers == num_layers are
+    *not* part of this enum — they are evaluated by ``build_kv_mapper``
+    when picking between mappers within the same kind.
+
+    Mamba state pools do not use this enum: Mamba's transfer is dispatched
+    through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
+    bypasses the attention pool-matching path entirely.
+    """
+
+    STANDARD = 0  # KV / block-scale: Identity / HeadMatch / HeadMismatch
+    INDEXER = 1  # DSv4 indexer K cache: IndexerKCacheHeadMatchMapper
 
 
 @dataclass
@@ -74,15 +91,32 @@ class LocalLayer:
 class PoolView:
     """
     Per-layer-group view of a physical pool (slot layout for this life cycle).
+
+    Fields:
+        pool_idx: Index of the physical pool within its pool group.
+        buffer_entries: Per-(layer, role) byte layout. ``role`` is a
+            manager-private uint32 used only for byte-level addressing within
+            this side; it is not compared across peers.
+        pool_role: Set of native role-name strings (whatever the cache manager
+            uses, e.g. ``"key"`` / ``"value"`` / ``"deepseek_v4_swa"``) that
+            live in this pool. Used as the *equivalence label* for peer-to-peer
+            pool matching: two pools match iff their ``pool_role`` frozensets
+            are equal. Disagg never enumerates the role-name vocabulary —
+            adding a new role on the manager side requires no disagg change.
+        mapper_kind: Closed-set discriminator for picking the Mapper family.
     """
 
     pool_idx: int
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
+    pool_role: FrozenSet[str] = field(default_factory=frozenset)
+    mapper_kind: MapperKind = MapperKind.STANDARD
 
     def to_dict(self) -> dict:
         return {
             "pool_idx": int(self.pool_idx),
             "buffer_entries": self.buffer_entries.tolist(),
+            "pool_role": sorted(self.pool_role),
+            "mapper_kind": int(self.mapper_kind),
         }
 
     @staticmethod
@@ -96,6 +130,8 @@ class PoolView:
                 [tuple(row) for row in raw],
                 dtype=BUFFER_ENTRY_DTYPE,
             ),
+            pool_role=frozenset(data.get("pool_role", [])),
+            mapper_kind=MapperKind(int(data.get("mapper_kind", MapperKind.STANDARD))),
         )
 
 

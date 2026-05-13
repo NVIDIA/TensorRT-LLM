@@ -1,20 +1,8 @@
 from __future__ import annotations
 
-from enum import Enum, auto
 from typing import Dict, List, Set
 
-from tensorrt_llm._torch.disaggregation.base.region import DataRole as RegionDataRole
-
 from .page import AttentionLayerGroup, KVCachePageTable, MambaLayerGroup, PhysicalPool, PoolView
-
-
-class PoolRole(Enum):
-    """Logical role of a memory pool within a layer group."""
-
-    KV_CACHE = auto()
-    KV_BLOCK_SCALE = auto()
-    INDEXER = auto()
-
 
 # -------------------------------------------------------------------------
 # PhysicalPool helpers
@@ -43,11 +31,6 @@ def get_unique_layers(pool_view: PoolView) -> Set[int]:
     return {int(e["local_layer_id"]) for e in pool_view.buffer_entries}
 
 
-def get_unique_roles(pool_view: PoolView) -> Set[int]:
-    """Unique role values in *pool_view*."""
-    return {int(e["role"]) for e in pool_view.buffer_entries}
-
-
 def get_num_buffer_entries(pool_view: PoolView) -> int:
     """Number of buffer entries."""
     return len(pool_view.buffer_entries)
@@ -64,51 +47,36 @@ def get_pool_view_global_layer_ids(
     pool_view: PoolView, layer_group: AttentionLayerGroup
 ) -> List[int]:
     """
-    Global layer IDs for the layers that appear in *pool_view*, ordered as in
-    *layer_group.local_layers*.
+    Global layer IDs for the layers that appear in *pool_view*, ordered by
+    each layer's first byte offset in the slot.
+
+    Order matters: HeadMatchMapper computes ``self_layer_offset`` as the
+    index of the first overlapping layer in this list and multiplies it by
+    ``slot_size_per_layer`` to seek into the slot. That is correct only if
+    this list mirrors the actual slot layout. ``local_layers`` order is set
+    by the lifecycle's add order (V2's ``layer_grouping[lc_idx]``) which is
+    *not* guaranteed to match storage's slot layout — e.g. when V2's pool
+    grouping reorders layers by buffer-size class. Sorting by offset uses
+    the authoritative source (buffer_entries) and works for both V1 and V2.
     """
-    local_ids_in_pool = get_unique_layers(pool_view)
+    local_id_to_first_offset: Dict[int, int] = {}
+    for entry in pool_view.buffer_entries:
+        lid = int(entry["local_layer_id"])
+        offset = int(entry["offset"])
+        cur = local_id_to_first_offset.get(lid)
+        if cur is None or offset < cur:
+            local_id_to_first_offset[lid] = offset
+
+    if not local_id_to_first_offset:
+        # Empty buffer_entries (e.g. legacy V1 INDEXER pool); fall back to
+        # local_layers order — consumers handle this case explicitly.
+        return [ll.global_layer_id for ll in layer_group.local_layers]
+
+    local_to_global = {ll.local_layer_id: ll.global_layer_id for ll in layer_group.local_layers}
     return [
-        ll.global_layer_id
-        for ll in layer_group.local_layers
-        if ll.local_layer_id in local_ids_in_pool
+        local_to_global[lid]
+        for lid, _ in sorted(local_id_to_first_offset.items(), key=lambda x: x[1])
     ]
-
-
-def get_pool_role(pool_view: PoolView, *, kv_factor: int) -> PoolRole:
-    """
-    Infer :class:`PoolRole` from the DataRole values in *pool_view*
-
-    Raises ``ValueError`` if *pool_view* has no buffer entries — the caller
-    must handle INDEXER pools (``len(pool_view.buffer_entries) == 0``) before
-    invoking this function.
-    """
-    entries = pool_view.buffer_entries
-    if entries is None or len(entries) == 0:
-        raise ValueError(
-            "get_pool_role called on a PoolView with empty buffer_entries. "
-            "Check for INDEXER pools (len(pool_view.buffer_entries) == 0) "
-            "before calling this function."
-        )
-
-    roles = {int(entry["role"]) for entry in entries}
-
-    has_key = int(RegionDataRole.KEY) in roles
-    has_value = int(RegionDataRole.VALUE) in roles
-    has_key_bq = int(RegionDataRole.KEY | RegionDataRole.BLOCK_QUANT) in roles
-    has_value_bq = int(RegionDataRole.VALUE | RegionDataRole.BLOCK_QUANT) in roles
-
-    if has_key_bq or has_value_bq:
-        return PoolRole.KV_BLOCK_SCALE
-    if has_key and has_value:
-        return PoolRole.KV_CACHE
-    if has_key and not has_value:
-        if int(kv_factor) == 1:
-            return PoolRole.KV_CACHE
-        raise ValueError("kv_factor != 1 but pool has only KEY without VALUE")
-    if has_value and not has_key:
-        raise ValueError("pool has only VALUE without KEY")
-    raise ValueError(f"Unrecognized role combination in pool buffer_entries: {roles}")
 
 
 # -------------------------------------------------------------------------
@@ -141,27 +109,6 @@ def get_physical_pool(page_table: KVCachePageTable, lg_idx: int, pool_idx: int) 
     """
     lg = page_table.layer_groups[int(lg_idx)]
     return page_table.pool_groups[int(lg.pool_group_idx)].pools[int(pool_idx)]
-
-
-def get_device_pointer(
-    page_table: KVCachePageTable,
-    *,
-    lg_idx: int,
-    pool_view: PoolView,
-    slot_id: int,
-    local_layer_id: int,
-    role: int,
-) -> int:
-    """
-    Compute the device pointer for a specific buffer entry
-    """
-    pool = get_physical_pool(page_table, lg_idx, int(pool_view.pool_idx))
-    if slot_id >= pool.num_slots:
-        raise ValueError(f"slot_id {slot_id} >= num_slots {pool.num_slots}")
-    for e in pool_view.buffer_entries:
-        if int(e["local_layer_id"]) == int(local_layer_id) and int(e["role"]) == int(role):
-            return int(pool.base_address) + int(slot_id) * int(pool.slot_bytes) + int(e["offset"])
-    raise ValueError(f"Buffer not found: local_layer_id={local_layer_id}, role={role}")
 
 
 # -------------------------------------------------------------------------

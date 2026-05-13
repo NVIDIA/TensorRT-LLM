@@ -2237,28 +2237,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
-    def get_disagg_data_role(self, role: DataRole):
-        from tensorrt_llm._torch.disaggregation.base.region import \
-            DataRole as DisaggDataRole
-
-        role_to_disagg_role = {
-            Role.KEY:
-            DisaggDataRole.KEY,
-            Role.VALUE:
-            DisaggDataRole.VALUE,
-            Role.KEY_BLOCK_SCALE:
-            DisaggDataRole.KEY
-            | DisaggDataRole.BLOCK_QUANT,
-            Role.VALUE_BLOCK_SCALE:
-            DisaggDataRole.VALUE
-            | DisaggDataRole.BLOCK_QUANT,
-        }
-        if role not in role_to_disagg_role:
-            valid_roles = list(role_to_disagg_role.keys())
-            raise ValueError(
-                f"Invalid role: '{role}'. Valid roles: {valid_roles}")
-        return role_to_disagg_role[role]
-
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 

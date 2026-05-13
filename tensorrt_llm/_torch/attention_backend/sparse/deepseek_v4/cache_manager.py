@@ -241,14 +241,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 PageIndexMode.SHARED,
             )
 
-    def get_disagg_data_role(self, role: DataRole):
-        from tensorrt_llm._torch.disaggregation.base.region import DataRole as DisaggDataRole
-
-        valid_roles = [attention_type.role for attention_type in DeepseekV4AttentionType]
-        if role in valid_roles:
-            return DisaggDataRole.KEY
-        raise ValueError(f"Invalid DeepSeek-V4 data role: '{role}'. Valid roles: {valid_roles}")
-
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         layer_semantics = self._manager_layer_id_to_layer_attn.get((layer_id, role))
         if layer_semantics is None:

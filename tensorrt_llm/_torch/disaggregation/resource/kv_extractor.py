@@ -4,7 +4,6 @@ import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     DataLayout,
-    DataRole,
     MemRegionGroup,
     RegionExtractorBase,
     SpecRegion,
@@ -16,6 +15,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     LayerGroup,
     LocalLayer,
     MambaLayerGroup,
+    MapperKind,
     PhysicalPool,
     PhysicalPoolGroup,
     PoolView,
@@ -183,16 +183,24 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
         slot_bytes = stride * len(local_layer_ids)
 
         entries = []
+        kv_role_names: set[str] = {"key"}
+        if not is_key_only:
+            kv_role_names.add("value")
         for i, lid in enumerate(local_layer_ids):
             base_offset = i * stride
-            entries.append((lid, int(DataRole.KEY), base_offset, buffer_size))
+            entries.append((lid, base_offset, buffer_size))
             if not is_key_only:
-                entries.append((lid, int(DataRole.VALUE), base_offset + buffer_size, buffer_size))
+                entries.append((lid, base_offset + buffer_size, buffer_size))
 
         kv_physical = PhysicalPool(
             base_address=base_addr, slot_bytes=slot_bytes, num_slots=num_blocks
         )
-        kv_view = PoolView(pool_idx=0, buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE))
+        kv_view = PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+            pool_role=frozenset(kv_role_names),
+            mapper_kind=MapperKind.STANDARD,
+        )
         physical_pools = [kv_physical]
         pool_views = [kv_view]
 
@@ -211,7 +219,10 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                 num_slots=num_blocks,
             )
             indexer_view = PoolView(
-                pool_idx=1, buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE)
+                pool_idx=1,
+                buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE),
+                pool_role=frozenset({"indexer_k"}),
+                mapper_kind=MapperKind.INDEXER,
             )
             physical_pools.append(indexer_physical)
             pool_views.append(indexer_view)
@@ -285,8 +296,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
     Uses the V2 storage layer APIs (pool.slot_address, pool.slot_size,
-    pool.num_slots) for accurate pool metadata, and determines PoolRole
-    from the DataRole of buffers in each pool.
+    pool.num_slots) for accurate pool metadata, and stamps each PoolView
+    with the manager's native role-name strings (``pool_role``) plus the
+    closed-set ``mapper_kind`` discriminator used by ``build_kv_mapper``.
 
     Important: iterates over life cycles (layer groups), not storage pool
     groups.  Multiple life cycles with different sliding-window sizes may
@@ -308,17 +320,20 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             gpu_level = level_idx
             break
 
-    # Collect buffer entries keyed by (life_cycle_id, pool_idx)
+    # Collect buffer entries keyed by (life_cycle_id, pool_idx).
+    # Also collect the set of native role-name strings per pool — used as
+    # ``PoolView.pool_role``, the manager-supplied equivalence label that
+    # disagg uses to match pools across peers without enumerating roles.
     buffer_by_lc_pool: Dict[tuple, list] = defaultdict(list)
+    native_roles_by_pool: Dict[tuple, set] = defaultdict(set)
 
     for buffer_id, attr in storage._buffer_attr.items():
         layer_id, role = buffer_id
         lc_id = attr.life_cycle_id
         pool_idx = attr.pool_index
         pool_key = (int(lc_id), pool_idx)
-        buffer_by_lc_pool[pool_key].append(
-            (layer_id, manager.get_disagg_data_role(role), attr.offset, attr.size)
-        )
+        buffer_by_lc_pool[pool_key].append((layer_id, attr.offset, attr.size))
+        native_roles_by_pool[pool_key].add(str(role))
 
     # Iterate over life cycles (layer groups), not storage pool groups.
     # Multiple layer_groups can share the same storage pool_group when their
@@ -384,6 +399,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 PoolView(
                     pool_idx=pool_idx,
                     buffer_entries=np.array(buffers_info, dtype=BUFFER_ENTRY_DTYPE),
+                    pool_role=frozenset(native_roles_by_pool[pool_key]),
+                    mapper_kind=MapperKind.STANDARD,
                 )
             )
 
