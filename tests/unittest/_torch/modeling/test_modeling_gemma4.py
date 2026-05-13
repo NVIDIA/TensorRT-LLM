@@ -25,24 +25,38 @@ from copy import deepcopy
 
 import pytest
 import torch
+import transformers
+from packaging.version import Version
 
 # Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
-pytest.importorskip(
-    "transformers", minversion="5.5.0", reason="Gemma4 requires transformers>=5.5.0"
+# Use a module-level pytestmark.skipif (not pytest.importorskip) so collection
+# still picks up the test cases when the version gate fires. importorskip
+# causes pytest to report "collected 0 items / 1 skipped" with exit code 5
+# ("no tests collected"), which the CI test_unittests_v2 wrapper rejects.
+# With pytestmark.skipif, pytest reports "N collected, N skipped, exit 0".
+_HAS_GEMMA4 = Version(transformers.__version__) >= Version("5.5.0")
+
+pytestmark = pytest.mark.skipif(
+    not _HAS_GEMMA4,
+    reason=(
+        f"Gemma4 requires transformers>=5.5.0 "
+        f"(installed: {transformers.__version__})"
+    ),
 )
 
-from transformers import Gemma4Config, Gemma4TextConfig  # noqa: E402
+if _HAS_GEMMA4:
+    from transformers import Gemma4Config, Gemma4TextConfig  # noqa: E402
 
-from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
-from tensorrt_llm._torch.models.modeling_gemma4 import (  # noqa: E402
-    Gemma4Attention,
-    Gemma4DecoderLayer,
-    Gemma4ForCausalLM,
-    Gemma4MoE,
-    Gemma4TextModel,
-    Gemma4TextScaledWordEmbedding,
-)
-from tensorrt_llm.mapping import Mapping  # noqa: E402
+    from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
+    from tensorrt_llm._torch.models.modeling_gemma4 import (  # noqa: E402
+        Gemma4Attention,
+        Gemma4DecoderLayer,
+        Gemma4ForCausalLM,
+        Gemma4MoE,
+        Gemma4TextModel,
+        Gemma4TextScaledWordEmbedding,
+    )
+    from tensorrt_llm.mapping import Mapping  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Small test configs
