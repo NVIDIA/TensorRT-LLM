@@ -490,6 +490,7 @@ unittest/disaggregated/test_agent_multi_backends.py::test_run_with_different_env
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
+unittest/kv_cache_manager_v2_tests/test_kv_cache_salting.py::TestKVCacheSaltCounters::test_aggregate_counters_match_expected SKIP (https://nvbugs/6172980)
 unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0" SKIP (https://nvbugs/5348958)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1 SKIP (https://nvbugs/6109745)
 unittest/llmapi/test_llm_pytorch.py::test_llm_disagg_streaming_gen_cancelled SKIP (https://nvbugs/6078431)
