@@ -734,8 +734,15 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata,
         spec_metadata,
         draft_model,
+        resource_manager=None,
     ):
-        """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
+        """Skip spec dec for non-last rank (PP). Returns placeholder outputs.
+
+        ``resource_manager`` is accepted but unused; it appears in the
+        ``forward()`` signature of one-model workers (Eagle3 / MTP-Eagle) and
+        the caller in ``modeling_speculative.py`` forwards it unconditionally,
+        so the skip path must accept it as well.
+        """
         batch_size = attn_metadata.num_seqs
         accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
