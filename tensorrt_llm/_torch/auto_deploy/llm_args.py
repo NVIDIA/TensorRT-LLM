@@ -111,9 +111,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     @model_validator(mode="after")
     def validate_supported_speculative_config(self):
-        # Check raw user-set fields rather than spec_dec_mode: spec_dec_mode is a
-        # cached_property whose value depends on num_nextn_predict_layers_from_model_config,
-        # a field that can be mutated later from the model config in other backends.
         spec_config = self.speculative_config
         if spec_config is None:
             return self
@@ -126,26 +123,24 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                     f"(got mtp_eagle_one_model={spec_config.mtp_eagle_one_model}, "
                     f"use_mtp_vanilla={spec_config.use_mtp_vanilla})."
                 )
-            return self
-
-        if isinstance(spec_config, EagleDecodingConfig):
+        elif isinstance(spec_config, EagleDecodingConfig):
             if not spec_config.eagle3_one_model:
                 raise ValueError(
                     "AutoDeploy only supports Eagle speculative decoding with "
                     f"eagle3_one_model=True (got eagle3_one_model={spec_config.eagle3_one_model})."
                 )
-            return self
+        else:
+            raise ValueError(
+                "AutoDeploy only supports speculative decoding via "
+                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
+                "EagleDecodingConfig(eagle3_one_model=True)."
+            )
 
-        raise ValueError(
-            "AutoDeploy only supports speculative decoding via "
-            "MTPDecodingConfig(mtp_eagle_one_model=True) or "
-            "EagleDecodingConfig(eagle3_one_model=True)."
-        )
+        self.model_factory = "eagle_one_model"
+        return self
 
     @model_validator(mode="after")
     def setup_hidden_state_capture(self):
-        # The supported-config validator above guarantees spec_config is either an
-        # MTP one-model or Eagle3 one-model config (or None), so no further mode checks here.
         spec_config = self.speculative_config
         if spec_config is None:
             return self
@@ -166,7 +161,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 )
             capture_layers = spec_config.eagle3_layers_to_capture
 
-        self.model_factory = "eagle_one_model"
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
             capture_layers
