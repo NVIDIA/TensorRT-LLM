@@ -455,9 +455,12 @@ torch::Tensor applyTopKTopPForProbOp(torch::Tensor logits, torch::optional<torch
     torch::optional<torch::Tensor> const& topP, int32_t kMax)
 {
     int64_t const vocabSize = logits.size(1);
-    bool const hasTopK = topK.has_value() && topK->defined()
-        && torch::logical_and(topK->gt(0), topK->lt(vocabSize)).any().item<bool>();
-    bool const hasTopP = topP.has_value() && topP->defined() && topP->lt(1.0).any().item<bool>();
+    // Host-only checks: the caller is expected to pass nullopt when filtering is fully
+    // disabled (see SpecMetadata.skip_top_k / skip_top_p). Probing the tensor contents
+    // via `.item<bool>()` here would force a host-device sync and break CUDA graph
+    // capture; the per-row `effectiveTopK` formula below already handles disabled rows.
+    bool const hasTopK = topK.has_value() && topK->defined();
+    bool const hasTopP = topP.has_value() && topP->defined();
 
     if (!hasTopK && !hasTopP)
     {
@@ -465,12 +468,22 @@ torch::Tensor applyTopKTopPForProbOp(torch::Tensor logits, torch::optional<torch
     }
 
     torch::Tensor effectiveTopK;
-    bool hasDisabledTopKRows = false;
     if (hasTopK)
     {
         auto topKLong = topK->to(torch::kLong);
         effectiveTopK
             = torch::where(topKLong > 0, topKLong, torch::full_like(topKLong, vocabSize)).clamp_max(vocabSize);
+    }
+
+    // Fast path uses `topk(kMax)` which is unsafe when any row has effective top-k > kMax
+    // (i.e. disabled rows expand to the full vocab). Detecting this requires a tensor
+    // reduction + `.item<bool>()`, which is incompatible with CUDA graph capture. Only
+    // probe when the caller explicitly opted into the fast path via kMax > 0 (today only
+    // the dynamic-tree caller, which is not graph-captured).
+    bool hasDisabledTopKRows = false;
+    if (hasTopK && kMax > 0 && kMax < vocabSize)
+    {
+        auto topKLong = topK->to(torch::kLong);
         hasDisabledTopKRows = topKLong.le(0).any().item<bool>();
     }
 
@@ -573,20 +586,31 @@ torch::Tensor computeProbsFromLogits(torch::Tensor const& logits, torch::Tensor 
 
     int64_t const vocabSize = scaledLogits.size(1);
     int64_t const nRows = scaledLogits.size(0);
-    bool const hasTopK = topK.has_value() && topK->defined()
-        && torch::logical_and(topK->gt(0), topK->lt(vocabSize)).any().item<bool>();
-    bool const hasTopP = topP.has_value() && topP->defined() && topP->lt(1.0).any().item<bool>();
+    // Host-only presence checks; see comment in applyTopKTopPForProbOp() for why we
+    // avoid probing tensor contents (would sync and break CUDA graph capture).
+    bool const hasTopKPresence = topK.has_value() && topK->defined();
+    bool const hasTopPPresence = topP.has_value() && topP->defined();
+
+    // The kernel path produces -inf for rows whose top_k value is 0, so it is only
+    // safe when every row has an active top_k filter. Determining that requires a
+    // host-device sync, so only probe when the caller has opted into the kernel
+    // path (kMax > 0). The kMax > 0 callers (dynamic-tree) are not graph-captured.
+    bool useKernelPath = false;
+    if (hasTopKPresence && kMax > 0 && kMax < vocabSize)
+    {
+        useKernelPath = torch::logical_and(topK->gt(0), topK->lt(vocabSize)).any().item<bool>();
+    }
 
     torch::Tensor maskedLogits;
-    if (hasTopK && kMax > 0 && kMax < vocabSize)
+    if (useKernelPath)
     {
         // Two-stage CUDA top-k/top-p masking (mirrors invokeBatchTopKSampling).
         maskedLogits = torch::empty_like(scaledLogits);
         auto topKForKernel = topK->to(torch::kInt32).contiguous();
-        auto topPForKernel = hasTopP ? topP->to(torch::kFloat32).contiguous() : torch::Tensor();
+        auto topPForKernel = hasTopPPresence ? topP->to(torch::kFloat32).contiguous() : torch::Tensor();
         auto stream = at::cuda::getCurrentCUDAStream(scaledLogits.device().index());
         invokeTopKTopPMaskingForProbs<float>(scaledLogits.data_ptr<float>(), maskedLogits.data_ptr<float>(),
-            topKForKernel.data_ptr<int32_t>(), hasTopP ? topPForKernel.data_ptr<float>() : nullptr, kMax,
+            topKForKernel.data_ptr<int32_t>(), hasTopPPresence ? topPForKernel.data_ptr<float>() : nullptr, kMax,
             static_cast<int32_t>(nRows), static_cast<int32_t>(vocabSize), stream);
     }
     else

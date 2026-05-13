@@ -1029,7 +1029,11 @@ class SpecWorkerBase(nn.Module, ABC):
         num_target_tokens = batch_size * (runtime_draft_len + 1)
 
         temperatures = spec_metadata.temperatures[:num_target_tokens]
-        top_ks = spec_metadata.top_ks[:num_target_tokens]
+        # Pass None instead of an all-disabled tensor so the C++ op can short-circuit
+        # on a host-side check rather than a `.item<bool>()` sync, which would break
+        # CUDA graph capture.
+        top_ks = None if spec_metadata.skip_top_k else spec_metadata.top_ks[:
+                                                                            num_target_tokens]
         top_ps = None if spec_metadata.skip_top_p else spec_metadata.top_ps[:
                                                                             num_target_tokens]
 
@@ -1127,9 +1131,10 @@ class SpecWorkerBase(nn.Module, ABC):
         if spec_metadata.request_temperatures is not None:
             draft_temps = spec_metadata.request_temperatures[:batch_size].repeat_interleave(
                 draft_tokens_per_request)
-            draft_top_ks = spec_metadata.request_top_ks[:batch_size].repeat_interleave(
-                draft_tokens_per_request
-            ) if spec_metadata.request_top_ks is not None else None
+            draft_top_ks = (
+                spec_metadata.request_top_ks[:batch_size].repeat_interleave(
+                    draft_tokens_per_request) if not spec_metadata.skip_top_k
+                and spec_metadata.request_top_ks is not None else None)
             draft_top_ps = (
                 spec_metadata.request_top_ps[:batch_size].repeat_interleave(
                     draft_tokens_per_request) if not spec_metadata.skip_top_p
