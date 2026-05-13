@@ -686,6 +686,7 @@ def benchmark_fp8_paged_mqa_logits(
                             data["block_table"],
                             dsl_schedule_meta,
                             data["max_model_len"],
+                            output_dtype=torch.float32,
                         )
 
                     dsl_f32_us = _profile_kernel_us(dsl_f32_fn, num_warmup, num_iterations)

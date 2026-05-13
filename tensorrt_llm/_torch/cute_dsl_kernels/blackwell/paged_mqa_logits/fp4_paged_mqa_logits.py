@@ -60,6 +60,13 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+# Compat across CuTe DSL versions:
+#   4.4.x              : nvvm.RoundingModeKind.RN (enum, accepted by cute.arch.*)
+#   4.5.0+ / internal  : nvvm.RoundingModeKind removed; cute.arch.* strictly require
+#                        the string literal 'rn' (passing FPRoundingMode.RN enum
+#                        raises TypeError per nvvm_wrappers.from_str).
+_RND_RN = getattr(getattr(nvvm, "RoundingModeKind", None), "RN", None) or "rn"
+
 
 @dsl_user_op
 def pack_f16x2(
@@ -510,18 +517,41 @@ class FP4MQALogitsKernel:
         sfb_chunk_smem_for_inference = blockscaled_utils.make_smem_layout_sfb(
             tiled_mma, self.mma_tiler, self.sf_vec_size, 1
         )
-        self.tmem_sfa_layout = blockscaled_utils.make_tmem_layout_sfa(
+        # NOTE: post-4.4.x DSL (CFK-3348x MMA Refactor — landed in 4.5.0 and
+        # internal) tightened the C++ binding `_cute_nvgpu_ir.make_tmem_layout_sf{a,b}`
+        # to require a rank-3 input layout ((MMA_inner), num_MMA_M, num_MMA_K)
+        # and emit a rank-3 output. On 4.4.x both input and output preserved
+        # the trailing stages mode. Slice the stages mode off the input to
+        # satisfy 4.5.0+, then append a degenerate size-1 stages mode back to
+        # the output so the downstream 4-tuple slice
+        # `cute.slice_(tCtSF*, (None, None, k*sf_k_step, None))` and S2T copy
+        # ranks remain unchanged across versions.
+        _tmem_sfa_rank3 = blockscaled_utils.make_tmem_layout_sfa(
             tiled_mma,
             self.mma_tiler,
             self.sf_vec_size,
-            sfa_chunk_smem_for_inference,
+            cute.slice_(sfa_chunk_smem_for_inference, (None, None, None, 0)),
         )
-        self.tmem_sfb_layout = blockscaled_utils.make_tmem_layout_sfb(
+        _tmem_sfb_rank3 = blockscaled_utils.make_tmem_layout_sfb(
             tiled_mma,
             self.mma_tiler,
             self.sf_vec_size,
-            sfb_chunk_smem_for_inference,
+            cute.slice_(sfb_chunk_smem_for_inference, (None, None, None, 0)),
         )
+        self.tmem_sfa_layout = cute.append(_tmem_sfa_rank3, cute.make_layout(1, stride=0))
+        self.tmem_sfb_layout = cute.append(_tmem_sfb_rank3, cute.make_layout(1, stride=0))
+        # SF TMEM K-mode count differs by DSL version (CFK-29747).
+        #   4.4.x              (hardcoded mma_tile_inst_k=4) → SF K-mode = 4, sf_k_step = 4//2 = 2
+        #   4.5.0+ / internal  (dynamic = mma_tiler_k/UMMA_K)  → SF K-mode = 2, sf_k_step = 2//2 = 1
+        # Body slices `cute.slice_(tCtSF*, (None, None, k_block * sf_k_step, None))`;
+        # iterator-start address is invariant across versions.
+        _sf_kmode_size = cute.size(_tmem_sfa_rank3, mode=[2])
+        _mma_inst_tile_k_for_sf = self.head_dim // self.umma_inst_k  # = 2 for FP4
+        assert _sf_kmode_size % _mma_inst_tile_k_for_sf == 0, (
+            f"SF K-mode ({_sf_kmode_size}) must be divisible by UMMA K-inst count "
+            f"({_mma_inst_tile_k_for_sf})"
+        )
+        self.sf_k_step = _sf_kmode_size // _mma_inst_tile_k_for_sf
         # SF TMEM col count — compute directly per plan formula.
         # `cute.cosize(tmem_layout)` returns the stride span (huge), not the
         # actual TMEM cell count, so we don't use it here.
@@ -1563,15 +1593,16 @@ class FP4MQALogitsKernel:
                     cute.copy(tiled_copy_s2t_sfa, tCsSFA_s2t, tCtSFA_s2t)
 
                     tCtAcc_0 = tCtAcc_base_0[(None, None, None, umma_prod_state_0.index)]
-                    # Session 3 experiment: rank-4 slice of tmem SFA/SFB to
-                    # select per-K-instruction sub-region. tmem_sf*_layout
-                    # has rank 4: ((MMA_M_atom),MMA,MMA_K,STAGE). Mode 2 is
-                    # MMA_K with size 4 (=4 K-groups for head_dim=128, sf_vec=32).
-                    # Each K-instruction (UMMA_K=64) uses 2 K-groups, so slice
-                    # mode 2 at k_block*2.
+                    # Rank-4 slice of tmem SFA/SFB selects one K-instruction's
+                    # SF region. tmem_sf*_layout shape is
+                    # ((MMA_M_atom),MMA,MMA_K,STAGE) (STAGE is the synthetic
+                    # size-1 appended in __init__). Mode 2 is MMA_K, whose size
+                    # is version-dependent (CFK-29747) — sf_k_step computed in
+                    # __init__ absorbs the difference.
+                    # 4.4.x → sf_k_step=2 (slice at 0,2); 4.5.0+/internal → 1 (slice at 0,1).
                     for k_block in cutlass.range_constexpr(num_k_blocks):
-                        tCtSFA_k = cute.slice_(tCtSFA, (None, None, k_block * 2, None))
-                        tCtSFB_k = cute.slice_(tCtSFB, (None, None, k_block * 2, None))
+                        tCtSFA_k = cute.slice_(tCtSFA, (None, None, k_block * self.sf_k_step, None))
+                        tCtSFB_k = cute.slice_(tCtSFB, (None, None, k_block * self.sf_k_step, None))
                         tiled_mma.set(tcgen05.Field.SFA, tCtSFA_k.iterator)
                         tiled_mma.set(tcgen05.Field.SFB, tCtSFB_k.iterator)
                         cute.gemm(
@@ -1700,10 +1731,11 @@ class FP4MQALogitsKernel:
                     cute.copy(tiled_copy_s2t_sfa_1, tCsSFA_s2t_1, tCtSFA_s2t_1)
 
                     tCtAcc_1 = tCtAcc_base_1[(None, None, None, umma_prod_state_1.index)]
-                    # Session 3: rank-4 slice mode 2 at k_block*2 per K-instr.
+                    # Rank-4 slice mode 2 at k_block*sf_k_step per K-instr.
+                    # See umma_warp_0 for sf_k_step rationale.
                     for k_block in cutlass.range_constexpr(num_k_blocks_1):
-                        tCtSFA_k = cute.slice_(tCtSFA, (None, None, k_block * 2, None))
-                        tCtSFB_k = cute.slice_(tCtSFB, (None, None, k_block * 2, None))
+                        tCtSFA_k = cute.slice_(tCtSFA, (None, None, k_block * self.sf_k_step, None))
+                        tCtSFB_k = cute.slice_(tCtSFB, (None, None, k_block * self.sf_k_step, None))
                         tiled_mma.set(tcgen05.Field.SFA, tCtSFA_k.iterator)
                         tiled_mma.set(tcgen05.Field.SFB, tCtSFB_k.iterator)
                         cute.gemm(
@@ -1914,10 +1946,10 @@ class FP4MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                             # SMEM-path: weights from shared mem
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1974,10 +2006,10 @@ class FP4MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                         # Step 5.9: result reduction — packed path catches both
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
@@ -2151,10 +2183,10 @@ class FP4MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                             # SMEM-path
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -2211,10 +2243,10 @@ class FP4MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                         # Step 5.9: result reduction
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
