@@ -750,6 +750,65 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         print_memory_usage("after evaluation")
 
 
+class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
+    CONFIG_YAML = str(
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "model_registry" /
+        "configs" / "ultra_v3.yaml")
+    MODEL_PATHS = {
+        "nvfp4": hf_id_to_local_model_dir("nvidia/Nemotron-Ultra-V3-NVFP4"),
+    }
+
+    def get_default_sampling_params(self):
+        # Use end_id=None to allow framework to read tokenizer's EOS tokens [2, 11]
+        # and enable task-specific stop sequences (critical for GSM8K)
+        return SamplingParams(end_id=None,
+                              pad_id=None,
+                              n=1,
+                              use_beam_search=False)
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("model_id", ["nvfp4"])
+    def test_accuracy(self, model_id, world_size):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        model_path = self.MODEL_PATHS[model_id]
+        print_memory_usage("test start")
+        with AutoDeployLLM(
+                model=model_path,
+                tokenizer=model_path,
+                world_size=world_size,
+                yaml_extra=[self.CONFIG_YAML],
+                trust_remote_code=True,
+        ) as llm:
+            _set_quant_config(llm, model_id)
+            print_memory_usage("after engine build")
+
+            sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+
+            # Ultra V3 uses extended thinking: enable_thinking=True so the model
+            # can use <think>...</think> CoT before the #### answer.
+            # Increase max_tokens to 1024 to allow the full thinking chain to
+            # complete before the "#### N" answer token -- 256 is too short.
+            sampling_params.max_tokens = 1024
+            task = GSM8K(self.MODEL_NAME)
+            task.NUM_SAMPLES = 128
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs={
+                              "apply_chat_template": True,
+                              "chat_template_kwargs": {
+                                  "enable_thinking": True
+                              },
+                          })
+
+        print_memory_usage("after evaluation")
+
+
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for GLM-4.7-Flash variants"""
 

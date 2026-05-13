@@ -567,6 +567,39 @@ class ADEngine(ModelEngine):
             PyTorchModelEngine._execute_logit_post_processors, self
         )
 
+    def _release_cuda_graphs(self) -> None:
+        def _reset_cuda_graph(graph: object) -> None:
+            if isinstance(graph, torch.cuda.CUDAGraph):
+                graph.reset()
+
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                if module.__class__.__name__ == "CapturedGraph":
+                    cudagraphs = getattr(module, "cudagraphs", None)
+                    if isinstance(cudagraphs, dict):
+                        for graph in list(cudagraphs.values()):
+                            _reset_cuda_graph(graph)
+                        cudagraphs.clear()
+                    module._cuda_graph_mem_pool = None
+                    module._input_buffers = []
+                    module._out_buffer_flat = None
+
+                if module.__class__.__name__ == "PiecewiseCapturedGraph":
+                    static_input_buffers = getattr(module, "_static_input_buffers", None)
+                    if isinstance(static_input_buffers, dict):
+                        static_input_buffers.clear()
+
+                if module.__class__.__name__ == "ADPiecewiseRunner":
+                    entries = getattr(module, "entries", None)
+                    if isinstance(entries, dict):
+                        for entry in entries.values():
+                            _reset_cuda_graph(getattr(entry, "cuda_graph", None))
+                        entries.clear()
+                    module._graph_pool = None
+
+        torch.cuda.empty_cache()
+
     def _store_prefill_multimodal_metadata(
         self,
         ordered_requests: RequestList,

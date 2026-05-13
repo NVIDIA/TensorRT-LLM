@@ -126,6 +126,11 @@ def _flashinfer_cached_ssm(
 
         import flashinfer
 
+        # FlashInfer needs contiguous x/B/C with 128-byte alignment.
+        x_decode = x_decode.contiguous()
+        B_decode = B_decode.contiguous()
+        C_decode = C_decode.contiguous()
+
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
         y_decode = flashinfer.mamba.selective_state_update(
             ssm_state_cache,

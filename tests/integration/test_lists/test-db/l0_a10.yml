@@ -146,7 +146,7 @@ l0_a10:
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules
-  # lint script unit tests (CPU-only, ~0.3s)
+  # helper-script unit tests (CPU-only, ~3s)
   - unittest/scripts
 - condition:
     ranges:
