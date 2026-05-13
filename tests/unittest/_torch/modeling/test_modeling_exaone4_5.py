@@ -179,6 +179,30 @@ class TestExaone4_5(TestModelingMultimodal):
     def get_model_config_class(self):
         return Exaone4_5Config
 
+    def get_hf_inputs(self, modality: str, prompt: List[str], media: List[str]):
+        # On transformers < 5.8 there is no native EXAONE 4.5 processor, so
+        # ``AutoProcessor.from_pretrained`` returns a ``TokenizersBackend``
+        # (itself a ``PreTrainedTokenizerBase`` subclass) without a
+        # ``.tokenizer`` attribute. Monkey-patch ``AutoProcessor.from_pretrained``
+        # for the duration of the base implementation so it surfaces the
+        # backend as its own tokenizer. On transformers >= 5.8 the native
+        # processor already exposes ``.tokenizer`` and this is a no-op.
+        from transformers import AutoProcessor
+
+        original_from_pretrained = AutoProcessor.from_pretrained
+
+        def patched_from_pretrained(*args, **kwargs):
+            processor = original_from_pretrained(*args, **kwargs)
+            if not hasattr(processor, "tokenizer"):
+                object.__setattr__(processor, "tokenizer", processor)
+            return processor
+
+        AutoProcessor.from_pretrained = patched_from_pretrained
+        try:
+            return super().get_hf_inputs(modality, prompt, media)
+        finally:
+            AutoProcessor.from_pretrained = original_from_pretrained
+
     def get_scenarios(self) -> List[TestExaone4_5Scenario]:
         scenarios: List[TestExaone4_5Scenario] = [
             TestExaone4_5Scenario(

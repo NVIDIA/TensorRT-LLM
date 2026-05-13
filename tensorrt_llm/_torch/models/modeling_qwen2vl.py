@@ -42,6 +42,14 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+# Guarded module-level import: ``flashinfer_apply_rope_with_cos_sin_cache_inplace``
+# is only exported from ``custom_ops`` when FlashInfer is installed (see
+# ``_torch/custom_ops/__init__.py``). Unconditional import would break loading
+# this module in FlashInfer-less environments; importing inside the guard mirrors
+# the pattern used in ``custom_ops`` itself.
+if IS_FLASHINFER_AVAILABLE:
+    from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
@@ -621,8 +629,6 @@ class Qwen2_5_VLVisionAttention(Attention):
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
-                from ..custom_ops import \
-                    flashinfer_apply_rope_with_cos_sin_cache_inplace
                 cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
                 flashinfer_apply_rope_with_cos_sin_cache_inplace(
                     position_ids,

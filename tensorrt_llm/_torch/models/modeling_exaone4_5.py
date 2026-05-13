@@ -151,7 +151,6 @@ class Exaone4_5_VisionModel(Qwen2VisionModelBase):
         self, model_config: ModelConfig[PretrainedConfig], model_class: type[Qwen2_5_VisionModel]
     ):
         super().__init__(model_config, model_class=model_class)
-        self.config.tie_word_embeddings = False
 
 
 @register_vision_encoder(Exaone4_5_VisionModel, vlm_base_model=Qwen2_5_VisionModel)
@@ -190,7 +189,6 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.text_config
-        llm_model_config.pretrained_config.tie_word_embeddings = False
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         if not _is_disagg():
