@@ -35,9 +35,7 @@ _SLEEP_CONFIG_DEFAULT = object()
 # ---------------------------------------------------------------------------
 
 
-def _make_worker(backend="pytorch",
-                 world_size=1,
-                 sleep_config=_SLEEP_CONFIG_DEFAULT):
+def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEFAULT):
     """Construct a BaseWorker shell without triggering MPI/CUDA init."""
     from tensorrt_llm.executor.base_worker import BaseWorker
 
@@ -57,8 +55,7 @@ def _make_proxy(cls_name, model_world_size=1, rpc_client=None):
     if cls_name == "ipc":
         from tensorrt_llm.executor.proxy import GenerationExecutorProxy as Cls
     else:
-        from tensorrt_llm.executor.rpc_proxy import \
-            GenerationExecutorRpcProxy as Cls
+        from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy as Cls
     p = object.__new__(Cls)
     p.model_world_size = model_world_size
     p.rpc_client = rpc_client
@@ -82,7 +79,8 @@ class TestBaseWorkerSleepGuards:
 
     def test_autodeploy_backend_raises(self, method):
         """AutoDeploy must be excluded: allocations aren't tagged under
-        sleep_config scopes, so release_with_tag would silently no-op."""
+        sleep_config scopes, so release_with_tag would silently no-op.
+        """
         w = _make_worker(backend="_autodeploy")
         with pytest.raises(ValueError, match="only available for the PyTorch"):
             getattr(w, method)(["kv_cache"])
@@ -96,8 +94,7 @@ class TestBaseWorkerSleepGuards:
     def test_multirank_raises(self, method):
         """world_size > 1 must raise before control_action() is entered."""
         w = _make_worker(world_size=2)
-        with pytest.raises(NotImplementedError,
-                           match="model_world_size == 1"):
+        with pytest.raises(NotImplementedError, match="model_world_size == 1"):
             getattr(w, method)(["kv_cache"])
 
     def test_backend_checked_before_sleep_config(self, method):
@@ -128,8 +125,7 @@ class TestProxyCollectiveRpcGuards:
     def test_raises_for_multirank(self, cls):
         """Raises NotImplementedError when model_world_size > 1."""
         p = _make_proxy(cls, model_world_size=2, rpc_client=MagicMock())
-        with pytest.raises(NotImplementedError,
-                           match="model_world_size == 1"):
+        with pytest.raises(NotImplementedError, match="model_world_size == 1"):
             p.collective_rpc("sleep")
 
     def test_raises_for_unique_reply_rank(self, cls):
