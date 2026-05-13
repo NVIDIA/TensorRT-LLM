@@ -1177,6 +1177,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 taskArgs = [
                     *taskArgs,
                 ]
+                // NVBug 6084775: l0_gb200_multi_nodes runs DeepSeek-R1 EP across 2 nodes
+                // and exercises NVLinkOneSided/MNNVL. SLURM may allocate the two nodes on
+                // different Level=0 NVLink switches (= different NVL72 racks = different
+                // MNNVL fabric domains), where cross-rack cuMemMap addresses are not
+                // routable and the dispatch kernel either traps after a 5-min timeout or
+                // surfaces as CUBLAS_STATUS_EXECUTION_FAILED downstream. --switches=1
+                // tells SLURM to prefer a single Level=0 switch; @30:00 caps the extra
+                // wait so scheduling does not stall indefinitely.
+                if (stageName ==~ /GB200-8_GPUs-2_Nodes-PyTorch(-Post-Merge)?-\d+/) {
+                    taskArgs = [
+                        *taskArgs,
+                        "--switches=1@30:00",
+                    ]
+                }
 
                 def containerImageArg = container
                 def srunPrologue = ""
