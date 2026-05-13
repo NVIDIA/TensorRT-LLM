@@ -2278,7 +2278,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         request_ids = list(range(batch_size))
         initial_cached = [30, 45]
-        token_nums = [t + 1 for t in initial_cached]
+        # Pre-allocate kv_len for all decode steps so add_dummy_requests reserves
+        # enough capacity; otherwise the multi-step replay overflows the cache.
+        token_nums = [t + 1 + num_decode_steps for t in initial_cached]
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
         # Fill KV cache
@@ -2450,7 +2452,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         request_ids = list(range(batch_size))
         initial_cached = [30, 45]
-        token_nums = [t + 1 for t in initial_cached]
+        # Pre-allocate kv_len for all decode steps so add_dummy_requests reserves
+        # enough capacity; otherwise the multi-step replay overflows the cache.
+        token_nums = [t + 1 + num_decode_steps for t in initial_cached]
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
         for i in range(config.num_hidden_layers):
