@@ -2467,20 +2467,21 @@ def _bench_config(
     # tensor, with the per-iter copy captured inside the CUDA graph.  Pure
     # and mix can coexist in one call so a single nsys trace covers both.
     scenarios = []
-    for prev_k in prev_ks:
-        # On the nowrite path, new tokens append at [prev_k, prev_k+T) of
-        # the active buffer, so prev_k+T must fit within max_window.
-        # mode != monolithic dispatches per-slot from PNAT, so any
-        # prev_k <= max_window is valid for those modes.
-        if mode == "monolithic" and not write_checkpoint and prev_k + mtp_len > max_window:
-            continue
-        scenarios.append({
-            "label": f"k{prev_k}",
-            "print_label": prev_k,
-            "fill": prev_k,
-            "pre_iter": None,
-            "iters": None,  # use args.iters
-        })
+    if not (getattr(args, "mix_only", False) and mix_samples_cpu is not None):
+        for prev_k in prev_ks:
+            # On the nowrite path, new tokens append at [prev_k, prev_k+T) of
+            # the active buffer, so prev_k+T must fit within max_window.
+            # mode != monolithic dispatches per-slot from PNAT, so any
+            # prev_k <= max_window is valid for those modes.
+            if mode == "monolithic" and not write_checkpoint and prev_k + mtp_len > max_window:
+                continue
+            scenarios.append({
+                "label": f"k{prev_k}",
+                "print_label": prev_k,
+                "fill": prev_k,
+                "pre_iter": None,
+                "iters": None,  # use args.iters
+            })
     # Mix scenario: skip on monolithic (mono on mixed PNAT corrupts the
     # wrong-mode slots).  Persistent_main + mix is now supported: bench
     # pre-bakes both a per-iter PNAT samples tensor and a per-iter
@@ -4215,6 +4216,13 @@ def _parse_args() -> argparse.Namespace:
         "iter samples a different mix; pure scenarios don't.",
     )
     parser.add_argument(
+        "--mix-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --mix-csv is set, emit only mix scenarios and skip the "
+        "pure prev_k sibling scenarios. Default: false.",
+    )
+    parser.add_argument(
         "--philox-rounding",
         action="store_true",
         help="DEPRECATED — equivalent to --sr-modes SR.  Retained for "
@@ -4247,6 +4255,8 @@ def _parse_args() -> argparse.Namespace:
         "if the fast path breaks due to package changes.",
     )
     args = parser.parse_args()
+    if args.mix_only and args.mix_csv is None:
+        parser.error("--mix-only requires --mix-csv")
 
     # Backward-compat: --philox-rounding implies --sr-modes SR if --sr-modes
     # was left at the default.  If both are set explicitly, error.
