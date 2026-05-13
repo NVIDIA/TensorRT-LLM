@@ -3994,6 +3994,10 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
 
             asyncio.run(run_streaming_with_cancellation())
 
+            # Post-cancel state check: verify that cancellations did not leave
+            # the executor / KV manager in a corrupted state. Use deterministic
+            # greedy generation and compare each concurrent output against a
+            # solo reference run of the same prompt.
             verify_batch_size = 4
             verify_inputs = [
                 long_token_list[i % num_samples]
@@ -4001,11 +4005,25 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
             ]
             verify_params = SamplingParams(max_tokens=16)
 
-            for output in llm.generate(verify_inputs,
-                                       sampling_params=verify_params):
-                token_ids = output.outputs[0].token_ids
+            solo_refs = []
+            for inp in verify_inputs:
+                [solo] = list(llm.generate([inp],
+                                           sampling_params=verify_params))
+                solo_token_ids = solo.outputs[0].token_ids
+                assert len(solo_token_ids) > 0
+                assert not all(tid == 0 for tid in solo_token_ids)
+                solo_refs.append(tuple(solo_token_ids))
+
+            concurrent_outputs = list(
+                llm.generate(verify_inputs, sampling_params=verify_params))
+            for idx, output in enumerate(concurrent_outputs):
+                token_ids = tuple(output.outputs[0].token_ids)
                 assert len(token_ids) > 0
                 assert not all(tid == 0 for tid in token_ids)
+                assert token_ids == solo_refs[idx], (
+                    f"post-cancel verify prompt {idx}: concurrent output "
+                    "diverges from solo reference — cancel left residual "
+                    f"state. solo={solo_refs[idx]} concurrent={token_ids}")
 
 
 @skip_pre_blackwell
@@ -7555,9 +7573,12 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
 
         Mirrors the NVBug 6025177 customer server scenario (PDL,
         chunked prefill, FP8 KV with block reuse + host cache tier,
-        MTP speculative decoding, MoE, CUDA graphs, iter perf stats,
-        xgrammar guided decoding), adapted to GLM-5-FP8 requirements:
-        TP=EP=8, DEEPGEMM MoE backend, MTP nextn=1, glm_moe_dsa tokenizer.
+        MTP speculative decoding, MoE, iter perf stats, xgrammar
+        guided decoding), adapted to GLM-5-FP8 requirements: TP=EP=8,
+        DEEPGEMM MoE backend, MTP nextn=1, glm_moe_dsa tokenizer.
+
+        CUDA graphs are disabled to bypass a graph-capture hang that
+        reproduces on TP=EP=8 during per-batch-size warmup (build 1438).
         """
         kv_cache_config = KvCacheConfig(
             dtype="fp8",
@@ -7579,7 +7600,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             max_seq_len=65536,
             max_batch_size=8,
             speculative_config=mtp_config,
-            cuda_graph_config=CudaGraphConfig(enable_padding=False),
+            cuda_graph_config=None,
             enable_iter_perf_stats=True,
             guided_decoding_backend="xgrammar",
             custom_tokenizer="glm_moe_dsa",
@@ -7638,17 +7659,33 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
                            for i in range(samples_per_batch)]
                 batch_inputs = [long_token_list[i] for i in indices]
 
+                greedy_outputs = []
                 for output in llm.generate(
                         batch_inputs, sampling_params=sampling_params_greedy):
                     token_ids = output.outputs[0].token_ids
                     assert len(token_ids) > 0
                     assert not all(tid == 0 for tid in token_ids)
+                    greedy_outputs.append(tuple(token_ids))
 
+                # Greedy outputs from different prompts collapsing to identical
+                # tokens would indicate cross-request KV-cache contamination.
+                distinct_greedy = len(set(greedy_outputs))
+                assert distinct_greedy >= max(2, samples_per_batch // 2), (
+                    f"greedy batch {batch_idx}: only {distinct_greedy} distinct "
+                    f"outputs out of {samples_per_batch} different prompts — "
+                    "suggests cross-request contamination or output collapse")
+
+                sampling_outputs = []
                 for output in llm.generate(
                         batch_inputs, sampling_params=sampling_params_sampling):
                     token_ids = output.outputs[0].token_ids
                     assert len(token_ids) > 0
                     assert not all(tid == 0 for tid in token_ids)
+                    sampling_outputs.append(tuple(token_ids))
+
+                assert len(set(sampling_outputs)) >= 2, (
+                    f"sampling batch {batch_idx}: all {samples_per_batch} "
+                    "outputs identical at T=0.8 — output collapse")
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(80000)
@@ -7737,6 +7774,10 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
 
             asyncio.run(run_streaming_with_cancellation())
 
+            # Post-cancel state check: verify that cancellations did not leave
+            # the executor / KV manager in a corrupted state. Use deterministic
+            # greedy generation and compare each concurrent output against a
+            # solo reference run of the same prompt.
             verify_batch_size = 4
             verify_inputs = [
                 long_token_list[i % num_samples]
@@ -7744,8 +7785,22 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             ]
             verify_params = SamplingParams(max_tokens=16)
 
-            for output in llm.generate(verify_inputs,
-                                       sampling_params=verify_params):
-                token_ids = output.outputs[0].token_ids
+            solo_refs = []
+            for inp in verify_inputs:
+                [solo] = list(llm.generate([inp],
+                                           sampling_params=verify_params))
+                solo_token_ids = solo.outputs[0].token_ids
+                assert len(solo_token_ids) > 0
+                assert not all(tid == 0 for tid in solo_token_ids)
+                solo_refs.append(tuple(solo_token_ids))
+
+            concurrent_outputs = list(
+                llm.generate(verify_inputs, sampling_params=verify_params))
+            for idx, output in enumerate(concurrent_outputs):
+                token_ids = tuple(output.outputs[0].token_ids)
                 assert len(token_ids) > 0
                 assert not all(tid == 0 for tid in token_ids)
+                assert token_ids == solo_refs[idx], (
+                    f"post-cancel verify prompt {idx}: concurrent output "
+                    "diverges from solo reference — cancel left residual "
+                    f"state. solo={solo_refs[idx]} concurrent={token_ids}")
