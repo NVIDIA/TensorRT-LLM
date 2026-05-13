@@ -101,7 +101,7 @@ Download the HuggingFace checkpoint for your EXAONE-4.5 variant from the [LGAI-E
 
 ```bash
 export HF_MODEL_DIR=hf_models/exaone4_5
-git clone https://huggingface.co/LGAI-EXAONE/EXAONE-4.5-33B $HF_MODEL_DIR
+huggingface-cli download LGAI-EXAONE/EXAONE-4.5-33B --local-dir $HF_MODEL_DIR
 ```
 
 ### K-EXAONE
@@ -112,7 +112,7 @@ Download the HuggingFace checkpoints of the K-EXAONE model:
 
 ```bash
 export HF_MODEL_DIR=hf_models/kexaone
-git clone https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B $HF_MODEL_DIR
+huggingface-cli download LGAI-EXAONE/K-EXAONE-236B-A23B --local-dir $HF_MODEL_DIR
 ```
 
 ## PyTorch flow

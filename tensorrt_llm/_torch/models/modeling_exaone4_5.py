@@ -54,7 +54,7 @@ except ImportError:
     AutoConfig.register(Exaone4_5_VisionConfig.model_type, Exaone4_5_VisionConfig, exist_ok=True)
 
     class Exaone4_5Config(PretrainedConfig):
-        """VLM config: nested ``text_config`` / ``vision_config`` from JSON become real sub-configs."""
+        """VLM config: nested `text_config` / `vision_config` from JSON become real sub-configs."""
 
         model_type = "exaone4_5"
 
@@ -68,7 +68,7 @@ except ImportError:
                 text_config = copy.deepcopy(text_config)
                 model_type = text_config.get("model_type", "exaone4")
                 # BC: EXAONE 4.5 first released with the text model type
-                # as ``exaone4_5_text``, later renamed to ``exaone4``.
+                # as `exaone4_5_text`, later renamed to `exaone4`.
                 if model_type == "exaone4_5_text":
                     model_type = "exaone4"
                 text_config["model_type"] = model_type
@@ -98,6 +98,16 @@ class Exaone4_5InputProcessor(Qwen2VLInputProcessorBase):
             tokenizer=tokenizer,
             trust_remote_code=trust_remote_code,
             **kwargs,
+        )
+
+    def get_mrope_config(self, *args, **kwargs):
+        # EXAONE4.5-VL does not consume mrope metadata, so the input processor
+        # intentionally skips populating `multimodal_data['mrope_config']`.
+        # Calling the base implementation would silently produce data that the
+        # model never reads — fail loudly instead.
+        raise NotImplementedError(
+            "Exaone4_5InputProcessor does not produce mrope_config; "
+            "EXAONE4.5-VL does not use M-RoPE."
         )
 
     @torch.inference_mode()
@@ -144,7 +154,21 @@ class Exaone4_5_VisionModel(Qwen2VisionModelBase):
         self.config.tie_word_embeddings = False
 
 
-class Exaone4_5_VLModel(Qwen2VLModelBase):
+@register_vision_encoder(Exaone4_5_VisionModel, vlm_base_model=Qwen2_5_VisionModel)
+@register_auto_model("Exaone4_5_ForConditionalGeneration")
+@register_input_processor(
+    Exaone4_5InputProcessor,
+    model_type="exaone4_5",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<vision><|image_pad|></vision>",
+            "video": "<vision><|video_pad|></vision>",
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
+    ),
+)
+class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -171,15 +195,20 @@ class Exaone4_5_VLModel(Qwen2VLModelBase):
 
         if not _is_disagg():
             mm_encoder_config = copy.deepcopy(model_config)
-            self.mm_encoder = Exaone4_5_VisionModel(
-                mm_encoder_config,
-                kwargs.get("vision_model_class", Qwen2_5_VisionModel),
-            )
+            self.mm_encoder = Exaone4_5_VisionModel(mm_encoder_config, Qwen2_5_VisionModel)
         else:
             self.mm_encoder = None
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return [
+            "image.pixel_values",
+            "video.pixel_values_videos",
+            "multimodal_embedding",
+        ]
 
     @torch.inference_mode()
     def forward(
@@ -224,34 +253,6 @@ class Exaone4_5_VLModel(Qwen2VLModelBase):
             return_context_logits=return_context_logits,
         )
         return output_prob
-
-
-@register_vision_encoder(Exaone4_5_VLModel, vlm_base_model=Qwen2_5_VisionModel)
-@register_auto_model("Exaone4_5_ForConditionalGeneration")
-@register_input_processor(
-    Exaone4_5InputProcessor,
-    model_type="exaone4_5",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": "<vision><|image_pad|></vision>",
-            "video": "<vision><|video_pad|></vision>",
-        },
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        content_format=ContentFormat.STRING,
-    ),
-)
-class Exaone4_5_ForConditionalGeneration(Exaone4_5_VLModel):
-    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
-        kwargs["vision_model_class"] = Qwen2_5_VisionModel
-        super().__init__(model_config, *args, **kwargs)
-
-    @property
-    def multimodal_data_device_paths(self) -> List[str]:
-        return [
-            "image.pixel_values",
-            "video.pixel_values_videos",
-            "multimodal_embedding",
-        ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         assert isinstance(weight_mapper, Exaone4_5HfWeightMapper)

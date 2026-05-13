@@ -108,7 +108,7 @@ EXAONE_4_5_TEST_CONFIG = {
 
 @dataclass(repr=False)
 class TestExaone4_5Scenario(MultimodalScenario):
-    """Scenario config (name avoids pytest collecting as Test* class)."""
+    """Scenario config for Exaone4.5 multimodal smoke tests."""
 
     pass
 

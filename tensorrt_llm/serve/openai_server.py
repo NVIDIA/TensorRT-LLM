@@ -393,9 +393,16 @@ class OpenAIServer(_VideoRoutesMixin):
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
-            if type(self.model_config).model_type == "kimi_k2":
+            # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
+            # ``type(cfg).model_type``. ``kimi_k2`` / ``deepseek_v32`` are aliases
+            # registered in ``_CONFIG_REGISTRY`` (config_utils.py) that reuse
+            # ``DeepseekV3Config``, whose class-level ``model_type`` is ``"deepseek_v3"``.
+            # Only the JSON ``model_type`` distinguishes these variants. Other call
+            # sites that consult multimodal/chat-template registries keyed on the
+            # canonical class attribute should keep using ``type(cfg).model_type``.
+            if self.model_config.model_type == "kimi_k2":
                 self.tool_call_id_type = "kimi_k2"
-            elif type(self.model_config).model_type == "deepseek_v32":
+            elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
 
         if self.generator.args.return_perf_metrics:

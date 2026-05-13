@@ -312,12 +312,17 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                   **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        masks = torch.zeros_like(input_ids, dtype=torch.bool)
-        for attr in ("image_token_id", "vision_token_id", "video_token_id"):
-            token_id = getattr(self.config, attr, None)
-            if token_id is not None:
-                masks |= input_ids == token_id
-        input_ids[masks] = self.tllm_multimodal_token_id
+        token_ids = [
+            tid
+            for attr in ("image_token_id", "vision_token_id", "video_token_id")
+            if (tid := getattr(self.config, attr, None)) is not None
+        ]
+        if token_ids:
+            ids_tensor = torch.tensor(token_ids,
+                                      device=input_ids.device,
+                                      dtype=input_ids.dtype)
+            input_ids[torch.isin(input_ids,
+                                 ids_tensor)] = self.tllm_multimodal_token_id
         return input_ids
 
     def get_mrope_config(
@@ -799,6 +804,18 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             embed_dim=self.config.hidden_size,
         )
 
+        # The vision RoPE indexes per-axis image grid coordinates (from
+        # ``grid_thw``), not text tokens, so it does not have a natural
+        # "max sequence length" to read off the model config. Per-image
+        # grid sizes are bounded by the total token budget for one
+        # inference step, so we size the table to
+        # ``TorchLlmArgs.max_num_tokens`` (default 8192) -- which acts as
+        # a practical upper bound on ``max(h, w)`` for any realistic image.
+        # The LLM-side RoPE table instead uses ``max_position_embeddings``
+        # since text positions can span the full context length.
+        # TODO: read this from ``TorchLlmArgs.max_num_tokens`` directly
+        # once it is plumbed through to the model-level config, instead of
+        # hard-coding the default.
         self.config.max_position_embeddings = 8192
         self.config.partial_rotary_factor = 0.5
         self.head_dim = self.config.hidden_size // self.config.num_heads
