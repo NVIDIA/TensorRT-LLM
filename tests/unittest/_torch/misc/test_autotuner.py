@@ -1000,13 +1000,32 @@ def _make_shapes(*sizes):
 
 @pytest.fixture()
 def _capture_trtllm_logs(caplog):
-    """Attach caplog handler to the TRT-LLM logger (propagate=False)."""
+    """Capture TRT-LLM logger records into caplog.
+
+    The TRT-LLM logger is configured with ``propagate=False`` and a default
+    level of ERROR, so a bare ``caplog.set_level(...)`` captures nothing.
+    Use a defensive multi-step setup so the fixture works regardless of the
+    environment's initial logger state:
+
+    1. Lower the TRT-LLM logger level to DEBUG.
+    2. Re-enable propagation so records reach pytest's root-attached handler.
+    3. Also attach ``caplog.handler`` directly to the TRT-LLM logger as a
+       second capture path.
+    4. Lower ``caplog.handler``'s own level (both root and TRT-LLM).
+    """
     import logging
     trtllm_logger = logging.getLogger("TRT-LLM")
+    saved_level = trtllm_logger.level
+    saved_propagate = trtllm_logger.propagate
+    trtllm_logger.setLevel(logging.DEBUG)
+    trtllm_logger.propagate = True
     trtllm_logger.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG)
     caplog.set_level(logging.DEBUG, logger="TRT-LLM")
     yield
     trtllm_logger.removeHandler(caplog.handler)
+    trtllm_logger.propagate = saved_propagate
+    trtllm_logger.setLevel(saved_level)
 
 
 class TestFindNearestProfileBounds:
