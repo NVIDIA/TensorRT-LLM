@@ -204,6 +204,19 @@ class TestDefaultADPRouter:
         assert len(result[0]) == 1
         assert len(result[1]) == 0
 
+    def test_attention_dp_relax_none_is_sortable(self):
+        # Requests created by trtllm-serve carry a default SchedulingParams()
+        # where attention_dp_relax is None. The sort key in route_requests must
+        # not produce None or sorted() raises TypeError on None < None.
+        router = DefaultADPRouter(dist=_mock_dist())
+        states = [
+            RankState(rank=0, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
+        ]
+        reqs = [_make_request_item(i, num_tokens=10, attention_dp_relax=None) for i in range(4)]
+        result, _ = router.route_requests(states, reqs, max_num_active_requests=10)
+        assert sum(len(v) for v in result.values()) == 4
+
     def test_default_attention_dp_relax_is_relaxed(self):
         router = DefaultADPRouter(dist=_mock_dist())
         states = [
@@ -943,6 +956,20 @@ class TestKVCacheAwareADPRouterRouting:
         result, _ = router.route_requests(self._rank_states(2), [req], max_num_active_requests=10)
         assert result[0] == []
         assert result[1] == [req]
+
+    def test_attention_dp_relax_none_is_sortable(self):
+        # Mirrors the DefaultADPRouter regression: the KV-aware router also
+        # sorts new_requests by attention_dp_relax, so a None default value
+        # must not break sorted().
+        router = self._make_router(
+            tp_size=2,
+            prefix_matches=[{i: 0 for i in range(4)}, {i: 0 for i in range(4)}],
+        )
+        reqs = [
+            _make_request_item(req_id=i, num_tokens=10, attention_dp_relax=None) for i in range(4)
+        ]
+        result, _ = router.route_requests(self._rank_states(2), reqs, max_num_active_requests=10)
+        assert sum(len(v) for v in result.values()) == 4
 
     def test_default_attention_dp_relax_is_relaxed(self):
         router = self._make_router(tp_size=2)

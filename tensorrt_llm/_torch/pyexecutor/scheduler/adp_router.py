@@ -155,6 +155,16 @@ class ADPRouter(ABC):
     def __init__(self, dist: Distributed):
         self.dist = dist
 
+    @staticmethod
+    def _get_attention_dp_relax(req_item) -> bool:
+        # Missing py_scheduling_params or attention_dp_relax=None are both
+        # treated as relaxed (True). The field is annotated bool but callers
+        # such as trtllm-serve pass through user input that may be None;
+        # without this normalization sorted() raises TypeError on None < bool.
+        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+        relax = getattr(scheduling_params, "attention_dp_relax", None)
+        return True if relax is None else relax
+
     @classmethod
     def create(
         cls,
@@ -300,13 +310,7 @@ class DefaultADPRouter(ADPRouter):
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
 
-        def get_relax_value(req_item):
-            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            if scheduling_params is None:
-                return True
-            return scheduling_params.attention_dp_relax
-
-        sorted_requests = sorted(new_requests, key=get_relax_value)
+        sorted_requests = sorted(new_requests, key=self._get_attention_dp_relax)
 
         remaining_unscheduled = []
         for req_item in sorted_requests:
@@ -572,13 +576,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [float(s.num_active_tokens) for s in all_rank_states]
 
-        def get_relax_value(req_item):
-            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            if scheduling_params is None:
-                return True
-            return scheduling_params.attention_dp_relax
-
-        sorted_requests = sorted(new_requests, key=get_relax_value)
+        sorted_requests = sorted(new_requests, key=self._get_attention_dp_relax)
 
         remaining_unscheduled = []
         for req_item in sorted_requests:
