@@ -476,6 +476,36 @@ async def test_kv_cache_aware_router_single_server_collects_route_info() -> None
 
 
 @pytest.mark.asyncio
+async def test_conversation_router_single_server_collects_token_lists() -> None:
+    router = ConversationRouter(server_role=None,
+                                servers=["server1"],
+                                use_token_ids=False)
+    request = ChatCompletionRequest(model="TinyLlama",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello",
+                                    }])
+
+    def fake_tokenize(req: ChatCompletionRequest) -> list[list[int]]:
+        req.prompt_token_ids = [10, 20, 30]
+        return [[10, 20, 30]]
+
+    with mock.patch.object(router, "_request_to_block_hashes") as hash_mock, \
+            mock.patch.object(router, "_tokenize",
+                              side_effect=fake_tokenize) as tokenize_mock:
+        server, info = await router.get_next_server(
+            request, collect_routing_info=True)
+
+    assert server == "server1"
+    assert request.prompt_token_ids == [10, 20, 30]
+    assert info["routing_mode"] == "single_server_topology"
+    assert info["token_lists"] == [[10, 20, 30]]
+    hash_mock.assert_not_called()
+    tokenize_mock.assert_called_once_with(request)
+    await router.finish_request(request)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("api_type", ["completion", "chat"])
 async def test_kv_cache_aware_router_multi_turn_conversation(
         api_type, mock_aiohttp_session):

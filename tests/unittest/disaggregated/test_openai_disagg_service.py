@@ -8,6 +8,7 @@ from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -157,6 +158,61 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
                 result.choices[0].disaggregated_params.disagg_request_id
                 == ctx_req.disaggregated_params.disagg_request_id
             )
+
+
+@pytest.mark.asyncio
+async def test_ctx_first_applies_router_token_lists_to_ctx_chat_request() -> None:
+    service = _make_service("context_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    prompt_token_ids = [11, 22, 33]
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=("ctx:9000", {
+            "server_info": {},
+            "token_lists": [prompt_token_ids],
+        }))
+    service._gen_router.get_next_server = AsyncMock(
+        return_value=("gen:9001", {"server_info": {}}))
+
+    async def _ctx_response(request: ChatCompletionRequest,
+                            *_args: object,
+                            **_kwargs: object) -> CompletionResponse:
+        assert request.prompt_token_ids == prompt_token_ids
+        response = _make_completion_response(
+            "",
+            finish_reason="length",
+            disagg_request_id=request.disaggregated_params.disagg_request_id,
+            prompt_token_ids=prompt_token_ids,
+            context_only=True,
+        )
+        response.prompt_token_ids = None
+        return response
+
+    async def _gen_response(*_args: object,
+                            **_kwargs: object) -> CompletionResponse:
+        return _make_completion_response(
+            "done",
+            finish_reason="stop",
+            prompt_token_ids=prompt_token_ids,
+            context_only=False,
+        )
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+    service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+
+    request = ChatCompletionRequest(model="test-model",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello",
+                                    }])
+    await service._send_disagg_request(request)
+
+    ctx_route_kwargs = service._ctx_router.get_next_server.call_args.kwargs
+    assert ctx_route_kwargs["collect_routing_info"] is True
+    ctx_req = service._ctx_client.send_request.call_args.args[0]
+    assert ctx_req.prompt_token_ids == prompt_token_ids
+    gen_req = service._gen_client.send_request.call_args.args[0]
+    assert gen_req.prompt_token_ids == prompt_token_ids
 
 
 class TestFirstGenLogProbsSerializeRoundtrip:

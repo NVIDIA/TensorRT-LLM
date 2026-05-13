@@ -365,6 +365,37 @@ class Router(ABC):
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
 
+    def _routing_info(
+            self,
+            server: str,
+            token_lists: Optional[list[list[int]]] = None,
+            routing_mode: Optional[str] = None,
+            candidate_servers: Optional[list[str]] = None,
+            block_hashes: Optional[list[list[int]]] = None,
+            matches: Optional[list[int]] = None,
+            assignment_counts: Optional[list[int]] = None,
+            unused_context_servers: Optional[list[str]] = None,
+            selection_reason: Optional[str] = None) -> dict[str, object]:
+        info = {"server_info": self._server_info.get(server, {})}
+        if token_lists is not None:
+            info["token_lists"] = token_lists
+        if routing_mode is not None:
+            info["selected_server"] = server
+            info["routing_mode"] = routing_mode
+        if candidate_servers is not None:
+            info["candidate_servers"] = candidate_servers
+        if block_hashes is not None:
+            info["block_hashes"] = block_hashes
+        if matches is not None:
+            info["matches"] = matches
+        if assignment_counts is not None:
+            info["assignment_counts"] = assignment_counts
+        if unused_context_servers is not None:
+            info["unused_context_servers"] = unused_context_servers
+        if selection_reason is not None:
+            info["selection_reason"] = selection_reason
+        return info
+
     @abstractmethod
     async def get_next_server(
             self,
@@ -885,6 +916,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             request: OpenAIRequest,
             exclude_server: Optional[str] = None,
             collect_routing_info: bool = False) -> tuple[str, dict]:
+        single_server: Optional[str] = None
+        single_server_state: Optional[KvCacheAwareServerState] = None
         async with self._lock:
             servers = [
                 server for server in self._server_state.keys()
@@ -893,15 +926,49 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if not servers:
                 raise ValueError(
                     f"No available servers after excluding {exclude_server}")
-            if len(servers) == 1 and not collect_routing_info:
+            if len(servers) == 1:
                 server = servers[0]
-                await self._register_request(server, request)
-                return server, {
-                    "candidate_servers": servers,
-                    "selected_server": server,
-                    "routing_mode": "single_server_fastpath",
-                    "server_info": self._server_info.get(server, {}),
-                }
+                if not collect_routing_info:
+                    await self._register_request(server, request)
+                    return server, self._routing_info(
+                        server,
+                        routing_mode="single_server_fastpath",
+                        candidate_servers=servers,
+                    )
+                single_server = server
+                single_server_state = self._server_state[server]
+
+        if single_server is not None:
+            token_lists, block_hashes = await asyncio.to_thread(
+                self._tokenize_and_compute_block_hashes, request)
+            assert single_server_state is not None
+            matches = [await single_server_state.matched_tokens(block_hashes)]
+            async with self._lock:
+                if single_server not in self._server_state:
+                    raise ValueError(
+                        f"Selected server {single_server} is no longer available")
+                assignment_counts = [
+                    self._num_assigned_requests_by_server.get(
+                        single_server, 0)
+                ]
+                unused_context_servers = self._get_unused_context_servers(
+                    [single_server])
+                await self._register_request(single_server, request)
+                self._num_assigned_requests_by_server[single_server] = (
+                    self._num_assigned_requests_by_server.get(
+                        single_server, 0) + 1)
+            return single_server, self._routing_info(
+                single_server,
+                token_lists=token_lists,
+                routing_mode="single_server_topology",
+                candidate_servers=[single_server],
+                block_hashes=block_hashes,
+                matches=matches,
+                assignment_counts=assignment_counts,
+                unused_context_servers=unused_context_servers,
+                selection_reason="score",
+            )
+
         # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
         # chat request with a Rust-backed tokenizer). Running it directly
         # inside the async handler blocks the orchestrator's event loop and
@@ -948,15 +1015,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await self._register_request(server, request)
             self._num_assigned_requests_by_server[server] = (
                 self._num_assigned_requests_by_server.get(server, 0) + 1)
-        return server, {
-            "block_hashes": block_hashes,  # list[list[int]]
-            "token_lists": token_lists,  # list[list[int]]
-            "matches": matches,  # list[int]
-            "assignment_counts": assignment_counts,  # list[int]
-            "unused_context_servers": unused_context_servers,  # list[str]
-            "selection_reason": selection_reason,
-            "server_info": self._server_info.get(server, {}),
-        }
+        return server, self._routing_info(
+            server,
+            token_lists=token_lists,
+            block_hashes=block_hashes,
+            matches=matches,
+            assignment_counts=assignment_counts,
+            unused_context_servers=unused_context_servers,
+            selection_reason=selection_reason,
+        )
 
     async def finish_request(self, request: OpenAIRequest):
         async with self._lock:
@@ -1233,6 +1300,13 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 return [prompt]
         return None
 
+    def _request_to_token_lists(self,
+                                request: OpenAIRequest) -> list[list[int]]:
+        token_ids = self._try_extract_token_ids(request)
+        if token_ids is not None:
+            return token_ids
+        return self._tokenize(request)
+
     def _request_to_block_hashes(self, request: OpenAIRequest) -> list[int]:
         """Compute block hashes for *request*.
 
@@ -1339,28 +1413,63 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             collect_routing_info: bool = False) -> tuple[str, dict]:
         self._validate_servers_available()
 
+        single_server: Optional[str] = None
         async with self._lock:
             servers = [
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ]
-            if len(servers) == 1 and not collect_routing_info:
+            if not servers:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
+            if len(servers) == 1:
                 server = servers[0]
-                await self._register_request(server, request)
+                if not collect_routing_info:
+                    await self._register_request(server, request)
+                    self._add_content_load(
+                        server, request,
+                        self._estimate_content_weight(request))
+                    conv_id = self._get_conversation_id(request)
+                    if conv_id:
+                        self._update_session(conv_id, server, [])
+                    return server, self._routing_info(
+                        server,
+                        routing_mode="single_server_fastpath",
+                        candidate_servers=servers,
+                    )
+                single_server = server
+
+        if single_server is not None:
+            token_lists = await asyncio.to_thread(self._request_to_token_lists,
+                                                  request)
+            async with self._lock:
+                if single_server not in self._server_state:
+                    raise ValueError(
+                        f"Selected server {single_server} is no longer available")
+                await self._register_request(single_server, request)
                 self._add_content_load(
-                    server, request, self._estimate_content_weight(request))
+                    single_server, request,
+                    self._estimate_content_weight(request))
                 conv_id = self._get_conversation_id(request)
                 if conv_id:
-                    self._update_session(conv_id, server, [])
-                return server, {
-                    "server_info": self._server_info.get(server, {}),
-                    "selected_server": server,
-                    "routing_mode": "single_server_fastpath",
-                }
+                    self._update_session(conv_id, single_server, [])
+            return single_server, self._routing_info(
+                single_server,
+                token_lists=token_lists,
+                routing_mode="single_server_topology",
+                candidate_servers=[single_server],
+            )
 
-        # Pre-compute outside the lock (tokenization + hashing)
+        # Pre-compute outside the lock (tokenization + hashing).
+        # Keep block-hash computation before optional token-list collection so
+        # use_token_ids=False continues to hash the raw request text.
         conv_id = self._get_conversation_id(request)
-        block_hashes = self._request_to_block_hashes(request)
+        block_hashes = await asyncio.to_thread(self._request_to_block_hashes,
+                                               request)
+        token_lists = None
+        if collect_routing_info:
+            token_lists = await asyncio.to_thread(self._request_to_token_lists,
+                                                  request)
         weight = self._estimate_content_weight(request, block_hashes)
 
         async with self._lock:
@@ -1392,9 +1501,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                         f"ConversationRouter: STICKY conv_id={conv_id} "
                         f"-> server={sticky_server}, "
                         f"content_loads={loads}, weight={weight}")
-                    return sticky_server, {
-                        "server_info": self._server_info.get(sticky_server, {})
-                    }
+                    return sticky_server, self._routing_info(
+                        sticky_server, token_lists=token_lists)
             elif conv_id:
                 logger.debug(f"ConversationRouter: NEW conv_id={conv_id} "
                              f"not in session_table "
@@ -1420,9 +1528,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                         f"ConversationRouter: IMPLICIT match "
                         f"conv_id={matched_id} -> server={sticky_server}, "
                         f"content_loads={loads}, weight={weight}")
-                    return sticky_server, {
-                        "server_info": self._server_info.get(sticky_server, {})
-                    }
+                    return sticky_server, self._routing_info(
+                        sticky_server, token_lists=token_lists)
 
             # 3. Fallback — least-loaded server for new sessions or
             #    sessions whose sticky server is unavailable.
@@ -1442,7 +1549,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 f"ConversationRouter: FALLBACK conv_id={conv_id} "
                 f"-> server={server}, content_loads={loads}, weight={weight}")
 
-        return server, {"server_info": self._server_info.get(server, {})}
+        return server, self._routing_info(server, token_lists=token_lists)
 
     async def finish_request(self, request: OpenAIRequest):
         async with self._lock:
