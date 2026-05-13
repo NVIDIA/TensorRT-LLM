@@ -73,7 +73,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
 [^3]: Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.
 [^4]: Overlap scheduler isn't supported when using EAGLE-3(Two Model Engine) for GPT-OSS.
-[^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](../../../examples/auto_deploy/model_registry/configs).
 [^6]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
 [^7]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^8]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
