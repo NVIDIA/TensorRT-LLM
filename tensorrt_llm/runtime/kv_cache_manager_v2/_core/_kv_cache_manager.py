@@ -191,9 +191,9 @@ class KVCacheManager:
         "_target_ratio_list_gpu",
         "_target_ratio_list_other",
         "_num_created_kv_caches",
-        "_num_closed_kv_caches",
+        "_num_sampled_kv_caches",
         "_last_adjustment_time",
-        "_last_update_num_closed_requests",
+        "_last_update_num_sampled_kv_caches",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -213,9 +213,9 @@ class KVCacheManager:
     _target_ratio_list_gpu: TypedIndexList[PoolGroupIndex, float]
     _target_ratio_list_other: TypedIndexList[PoolGroupIndex, float]
     _num_created_kv_caches: int
-    _num_closed_kv_caches: int
+    _num_sampled_kv_caches: int
     _last_adjustment_time: float
-    _last_update_num_closed_requests: int
+    _last_update_num_sampled_kv_caches: int
 
     def __init__(self, config: KVCacheManagerConfig) -> None:
         init_cuda_once()
@@ -240,9 +240,9 @@ class KVCacheManager:
         self._target_ratio_list_gpu = self._current_gpu_ratio
         self._target_ratio_list_other = self._current_other_ratios
         self._num_created_kv_caches = 0
-        self._num_closed_kv_caches = 0
+        self._num_sampled_kv_caches = 0
         self._last_adjustment_time = time.monotonic()
-        self._last_update_num_closed_requests = 0
+        self._last_update_num_sampled_kv_caches = 0
 
     def __del__(self) -> None:
         self.shutdown()
@@ -582,7 +582,7 @@ class KVCacheManager:
 
     @property
     def need_adjustment(self) -> bool:
-        if self._num_closed_kv_caches < 2000:
+        if self._num_sampled_kv_caches < 2000:
             return False
         if time.monotonic() - self._last_adjustment_time < 120:
             return False
@@ -606,9 +606,9 @@ class KVCacheManager:
         self._last_adjustment_time = time.monotonic()
 
     def _try_update_target_ratios(self) -> None:
-        if self._num_closed_kv_caches - self._last_update_num_closed_requests < 100:
+        if self._num_sampled_kv_caches - self._last_update_num_sampled_kv_caches < 100:
             return
-        self._last_update_num_closed_requests = self._num_closed_kv_caches
+        self._last_update_num_sampled_kv_caches = self._num_sampled_kv_caches
         tokens_per_block = self.tokens_per_block
         storage = self._storage
 
