@@ -528,6 +528,17 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
     """I/O for the audio modality."""
 
+    def __init__(self, **kwargs) -> None:
+        # AudioMediaIO has no configurable parameters. An explicit __init__
+        # is needed so that BaseMediaIO.create() does not crash when kwargs
+        # are present (e.g. via --media_io_kwargs or the per-request API).
+        if kwargs:
+            logger.warning(
+                "AudioMediaIO received unexpected kwargs %s — audio loading "
+                "has no configurable parameters; kwargs will be ignored.",
+                sorted(kwargs),
+            )
+
     def load_bytes(self, data: bytes) -> Tuple[np.ndarray, int]:
         return soundfile.read(BytesIO(data))
 
@@ -597,10 +608,8 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        # Pass the URL/path string straight to cv2 — it handles bare
-        # paths but not `file://` URIs.
         return _load_video_by_cv2(
-            url,
+            _normalize_file_uri(url),
             self._num_frames,
             self._fps,
             self._format,

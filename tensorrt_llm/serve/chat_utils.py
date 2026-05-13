@@ -100,7 +100,10 @@ def _make_media_io(
     server_kwargs = (server_config.media_io_kwargs
                      if server_config else None) or {}
     request_kwargs = request_kwargs or {}
-    media_io_cls = MEDIA_IO_REGISTRY.get(modality, BaseMediaIO)
+    media_io_cls = MEDIA_IO_REGISTRY.get(modality)
+    if media_io_cls is None:
+        raise ValueError(f"Unsupported modality {modality!r}. "
+                         f"Registered modalities: {list(MEDIA_IO_REGISTRY)}")
     return media_io_cls.create(
         server_kwargs.get(modality),
         request_kwargs.get(modality),
