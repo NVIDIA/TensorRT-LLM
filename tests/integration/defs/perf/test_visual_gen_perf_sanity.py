@@ -506,9 +506,9 @@ class VisualGenPerfSanityTestConfig:
             "num_gpus",
             "request_throughput",
             "per_gpu_throughput",
-            "mean_e2e_latency_ms",
-            "median_e2e_latency_ms",
-            "percentiles_e2e_latency_ms",
+            "mean_latency",
+            "median_latency",
+            "percentiles_latency",
         ]
         missing_keys = [key for key in required_keys if key not in result_data]
         if missing_keys:
@@ -540,7 +540,7 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
-        percentiles = result_data.get("percentiles_e2e_latency_ms", {})
+        percentiles = result_data.get("percentiles_latency", {})
         for percentile in ("p90", "p99"):
             if percentile not in percentiles:
                 raise ValueError(

@@ -63,11 +63,15 @@ MATCH_KEYS = [
 RESULT_METRIC_PATHS = {
     "d_request_throughput": "request_throughput",
     "d_per_gpu_throughput": "per_gpu_throughput",
-    "d_mean_e2e_latency": "mean_e2e_latency_ms",
-    "d_median_e2e_latency": "median_e2e_latency_ms",
-    "d_p90_e2e_latency": "percentiles_e2e_latency_ms.p90",
-    "d_p99_e2e_latency": "percentiles_e2e_latency_ms.p99",
+    "d_mean_e2e_latency": "mean_latency",
+    "d_median_e2e_latency": "median_latency",
+    "d_p90_e2e_latency": "percentiles_latency.p90",
+    "d_p99_e2e_latency": "percentiles_latency.p99",
 }
+
+# Latency metrics in the benchmark JSON are reported in seconds, but the
+# dashboard baseline columns historically stored milliseconds.
+_LATENCY_SECONDS_TO_MS = 1000.0
 
 
 def _get_nested_value(data: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -121,7 +125,8 @@ def extract_visual_gen_metrics(result_data: dict[str, Any]) -> dict[str, float]:
         if value is None:
             missing_paths.append(path)
             continue
-        metrics[metric_name] = float(value)
+        scale = _LATENCY_SECONDS_TO_MS if metric_name.endswith("_latency") else 1.0
+        metrics[metric_name] = float(value) * scale
 
     if missing_paths:
         missing = ", ".join(sorted(missing_paths))
