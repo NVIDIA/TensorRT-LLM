@@ -15,8 +15,8 @@ The following is a table of supported models for the PyTorch backend:
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
-| `Gemma3nForConditionalGeneration` [^8]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
-| `Gemma4ForConditionalGeneration` [^6]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^7], `google/gemma-4-31B-it` [^7] |
+| `Gemma3nForConditionalGeneration` [^7]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
+| `Gemma4ForConditionalGeneration` [^8]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^6], `google/gemma-4-31B-it` [^6] |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^5]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
@@ -74,9 +74,9 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^3]: Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.
 [^4]: Overlap scheduler isn't supported when using EAGLE-3(Two Model Engine) for GPT-OSS.
 [^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](../../../examples/auto_deploy/model_registry/configs).
-[^6]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
-[^7]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^8]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^6]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^7]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^8]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
 [^9]: Audio modality only supported on E2B/E4B variants.
 
 
