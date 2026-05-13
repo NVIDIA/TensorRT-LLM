@@ -605,7 +605,28 @@ public:
             }
         }
 
-        auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
+        // V24: place KernelParams in a thread-local pinned host buffer reused across
+        // launches. On B200 with HMM, the kernel reads kernelParams via grid-constant
+        // (or host-VA dereference); when the buffer is on the host stack the page
+        // gets migrated host<->device each launch, producing ~760KB of HMM page-fault
+        // events / iter that overlap 61.5% of FC1 W4A8 MoE slow-tail
+        // (see optimize_ad_tp1_1k_1k_conc1.md sections 1.17-1.19). Pinned host
+        // memory is wired so HMM cannot migrate it and the kernel reads from BAR1
+        // with no round-trip.
+        static thread_local KernelParams* _tlsPinnedKernelParams = []() -> KernelParams*
+        {
+            KernelParams* p = nullptr;
+            cudaError_t err = cudaMallocHost(reinterpret_cast<void**>(&p), sizeof(KernelParams));
+            if (err != cudaSuccess)
+            {
+                return nullptr;
+            }
+            return p;
+        }();
+        KernelParams _stackFallbackKernelParams;
+        KernelParams& kernelParams
+            = (_tlsPinnedKernelParams != nullptr) ? *_tlsPinnedKernelParams : _stackFallbackKernelParams;
+        kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
             batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
             batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
             batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
