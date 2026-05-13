@@ -1367,7 +1367,7 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
     return out
 
 
-_PRE_GRAPH_WARMUP_ITERS = 3  # standard practice; see commit msg / design doc
+_PRE_GRAPH_WARMUP_ITERS = 1
 _CUPTI_FILTER_PLAN_CACHE: dict[tuple, tuple[int, tuple[str | None, ...]]] = {}
 
 
@@ -1562,7 +1562,7 @@ def _time_kernel_cuda_graph(
     the next group of PNAT/n_writes samples, then graph-captured per-iter
     copies update kernel inputs before each reset + L2 flush + run.
 
-    Pre-graph eager warmup (3 iters): forces PyTorch's caching allocator
+    Pre-graph eager warmup: forces PyTorch's caching allocator
     + Triton's autotune cache to settle before capture so the graph
     doesn't bake in init-only allocations.
 
@@ -1575,16 +1575,19 @@ def _time_kernel_cuda_graph(
     warmup = args.warmup
     iters = iters_override if iters_override is not None else args.iters
 
-    # Pre-graph eager warmup: full per-iter chain × N.  Settles allocator
-    # + autotune; pre_iter_fn included so any side effects it has are
-    # exercised before capture.
+    # Pre-graph eager warmup: full per-iter chain once.  This settles
+    # Triton/PyTorch setup and wrapper-side intermediate allocations;
+    # skipping it risks lazy work leaking into graph capture.
+    warmup_iters = _PRE_GRAPH_WARMUP_ITERS
+    host_timing.add("pre_graph_warmup_iters", warmup_iters)
     host_timing.start()
-    for _ in range(_PRE_GRAPH_WARMUP_ITERS):
+    for _ in range(warmup_iters):
         reset_fn()
         if pre_iter_fn is not None:
             pre_iter_fn(0)
         run_fn()
-    torch.cuda.synchronize()
+    if warmup_iters > 0:
+        torch.cuda.synchronize()
     host_timing.stop("pre_graph_warmup_ms")
 
     total_iters = warmup + iters
