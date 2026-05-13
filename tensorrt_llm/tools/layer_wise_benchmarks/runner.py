@@ -440,9 +440,7 @@ class Runner:
 
         with self.scaled_from_ctx(scaled_from, mapping), self.skip_unused_layers_ctx(layer_indices):
             model, _ = model_loader.load(
-                checkpoint_dir=pretrained_model_name_or_path,
-                checkpoint_loader=checkpoint_loader,
-                trust_remote_code=False,
+                checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):

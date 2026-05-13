@@ -315,7 +315,6 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-        trust_remote_code: bool = True,
     ):
         """
         Loads the model, its weights, and applies necessary configurations.
@@ -328,8 +327,7 @@ class ModelLoader:
             The loaded and initialized PyTorch model.
         """
         config = self._load_and_validate_config(checkpoint_dir,
-                                                checkpoint_loader,
-                                                trust_remote_code)
+                                                checkpoint_loader)
         load_format = self.llm_args.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
@@ -513,13 +511,13 @@ class ModelLoader:
                                 allow_partial_loading=allow_partial_loading)
         torch.cuda.current_stream().synchronize()
 
-    def _load_and_validate_config(self, checkpoint_dir: str,
-                                  checkpoint_loader: BaseCheckpointLoader,
-                                  trust_remote_code: bool) -> ModelConfig:
+    def _load_and_validate_config(
+            self, checkpoint_dir: str,
+            checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=True,
             mapping=self.mapping,
             enable_min_latency=self.llm_args.enable_min_latency,
             use_cuda_graph=self.llm_args.cuda_graph_config is not None,
