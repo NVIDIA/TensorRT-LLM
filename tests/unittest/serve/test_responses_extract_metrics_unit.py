@@ -1,4 +1,20 @@
-"""Unit test for GitHub issue #13949 fix:
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit test for GitHub issue #13949 fix.
+
   _extract_metrics() is NOT called for /v1/responses success paths.
 
 These tests exercise the EXACT 4-line patch applied to openai_server.py.
@@ -21,9 +37,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 async def _responses_create_response(promise, extract_metrics_fn, raw_request):
-    """Mirrors the fixed create_response() inner function from openai_server.py
-    (non-streaming path, lines 1601-1623).
-    """
+    """Mirror the fixed create_response() inner function from openai_server.py."""
     await promise.aresult()          # wait for the LLM to finish
     response = object()              # stand-in for ResponsesResponse
     await extract_metrics_fn(promise, raw_request)   # <-- THE FIX (line 1622)
@@ -38,8 +52,7 @@ async def _aiter(items):
 
 async def _responses_create_streaming_generator(
         promise_items, extract_metrics_fn, raw_request):
-    """Mirrors the fixed create_streaming_generator() inner function from
-    openai_server.py (streaming path, lines 1625-1641).
+    """Mirror the fixed create_streaming_generator() inner function from openai_server.py.
 
     promise_items: list of 'output chunk' objects the async-for loop sees.
     """
@@ -82,7 +95,7 @@ async def test_non_streaming_calls_extract_metrics_once():
         calls.append((res, req))
 
     promise = _FakePromise()
-    response = await _responses_create_response(promise, fake_extract, RAW_REQUEST)
+    _ = await _responses_create_response(promise, fake_extract, RAW_REQUEST)
 
     assert len(calls) == 1, (
         "REGRESSION #13949: _extract_metrics must be called exactly once "

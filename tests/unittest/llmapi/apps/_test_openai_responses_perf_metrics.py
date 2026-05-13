@@ -47,15 +47,17 @@ _INPUT = "What is 1+1? Answer briefly."
 @pytest.fixture(scope="module")
 def temp_extra_llm_api_options_file():
     """Write a temporary YAML file enabling return_perf_metrics and yield its path."""
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir,
-                                  "responses_perf_metrics_options.yaml")
+    fd, temp_file_path = tempfile.mkstemp(
+        prefix="responses_perf_metrics_options_",
+        suffix=".yaml",
+    )
+    os.close(fd)
     try:
         extra_llm_api_options_dict = {
             "return_perf_metrics": True,
             "perf_metrics_max_requests": 20,
         }
-        with open(temp_file_path, "w") as f:
+        with open(temp_file_path, "w", encoding="utf-8") as f:
             yaml.dump(extra_llm_api_options_dict, f)
         yield temp_file_path
     finally:
@@ -84,7 +86,7 @@ def server(temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
 
 def _fetch_perf_metrics(server: RemoteOpenAIServer) -> list:
     """Return the current /perf_metrics list (may be empty)."""
-    response = urlopen(f"{server.url_root}/perf_metrics")
+    response = urlopen(f"{server.url_root}/perf_metrics", timeout=5)  # noqa: S310
     assert response.status == 200
     return json.loads(response.read())
 
@@ -293,7 +295,7 @@ def test_prometheus_counter_advances_for_responses(server: RemoteOpenAIServer):
     METRIC = "trtllm_request_success_total"
 
     def _get_counter() -> float:
-        resp = urlopen(f"{server.url_root}/prometheus/metrics")
+        resp = urlopen(f"{server.url_root}/prometheus/metrics", timeout=5)  # noqa: S310
         assert resp.status == 200
         data = resp.read().decode("utf-8")
         value = _parse_prometheus_counter(data, METRIC)
