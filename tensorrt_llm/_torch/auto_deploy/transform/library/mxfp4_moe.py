@@ -1,14 +1,146 @@
-from typing import Literal, Tuple, Type
+import ctypes
+import os
+from typing import Literal, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+
+# ---------------------------------------------------------------------------
+# V22: cudaMemAdvise(SetReadMostly) on MoE expert weights
+# ---------------------------------------------------------------------------
+# On B200 with HMM driver (PageableMemoryAccess=1, UsesHostPageTables=0),
+# the V18 profiling-specialist analysis (1.39 GB nsys trace) found that
+# FC1 W4A8 MoE outliers are strongly correlated with per-iter UVM page-faults
+# (91/100 top-slowest FC1 have UVM events within +-50us, 4 KB exactly per
+# event = single-page-fault signature). The outliers are layer-slot-locked
+# (specific layer slots 0, 7, 14, 1-4, 12-13, 26, 28, 32 are chronically
+# slow), suggesting those layers' MoE expert weight pages are being migrated
+# host<->device by the HMM driver.
+#
+# cudaMemAdvise(SetReadMostly) tells the driver: "this memory is read-mostly
+# from many devices, replicate read-only copies, do not migrate on access."
+# For MoE weights (read-only at inference, accessed by GPU each iter), this
+# should prevent the per-iter migration churn. cudaMemAdviseSetPreferredLocation
+# is also an option but SetReadMostly is more aggressive (also kills WriteFault
+# migration). For inference-time read-only weights it is the right choice.
+#
+# Env-gated via AD_MOE_WEIGHTS_READMOSTLY (default 0 = off). When on, after
+# expert weights are registered as nn.Parameter, we call cudaMemAdvise on
+# each weight + scale tensor.
+_CUDART: Optional[ctypes.CDLL] = None
+_CUDA_MEM_ADVISE_SET_READ_MOSTLY = 1
+_CUDA_MEM_ADVISE_SET_PREFERRED_LOCATION = 3
+_CUDA_MEM_ADVISE_SET_ACCESSED_BY = 5
+
+
+def _get_cudart() -> Optional[ctypes.CDLL]:
+    global _CUDART
+    if _CUDART is None:
+        try:
+            _CUDART = ctypes.CDLL("libcudart.so")
+            _CUDART.cudaMemAdvise.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            _CUDART.cudaMemAdvise.restype = ctypes.c_int
+        except Exception as e:
+            ad_logger.warning(f"[V22] failed to load libcudart.so for cudaMemAdvise: {e}")
+            _CUDART = None
+    return _CUDART
+
+
+def _use_moe_weights_readmostly() -> bool:
+    return os.environ.get("AD_MOE_WEIGHTS_READMOSTLY", "0") == "1"
+
+
+_V22_DISABLED = False  # Set True if first attempt fails to avoid cascading cuda errors.
+
+
+def _maybe_advise_readmostly(name: str, tensor: torch.Tensor, device_id: int = 0) -> None:
+    """If V22 enabled, call cudaMemAdvise(SetReadMostly) on tensor's storage.
+
+    cudaMemAdvise only works on cudaMallocManaged (Unified Memory). On regular
+    cudaMalloc device memory it returns cudaErrorInvalidValue (1), and the
+    sticky error then breaks subsequent CUDA calls. We check tensor placement
+    via cudaPointerGetAttributes first; only advise if the pointer reports
+    type == cudaMemoryTypeManaged (2). If first call fails, disable for all
+    subsequent calls (one-shot probe).
+    """
+    global _V22_DISABLED
+    if _V22_DISABLED:
+        return
+    if not _use_moe_weights_readmostly():
+        return
+    if not tensor.is_cuda:
+        return
+    cudart = _get_cudart()
+    if cudart is None:
+        return
+    ptr = tensor.data_ptr()
+    size = tensor.element_size() * tensor.numel()
+    if size == 0:
+        return
+
+    # Check pointer memory type. struct cudaPointerAttributes has:
+    #   int type (cudaMemoryTypeManaged=2)
+    #   int device
+    #   void *devicePointer
+    #   void *hostPointer
+    # Size: ~32 bytes. We use a 64-byte buffer to be safe.
+    attr_buf = ctypes.create_string_buffer(64)
+    cudart.cudaPointerGetAttributes.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cudart.cudaPointerGetAttributes.restype = ctypes.c_int
+    rc_attr = cudart.cudaPointerGetAttributes(attr_buf, ctypes.c_void_p(ptr))
+    # Clear any sticky error.
+    try:
+        cudart.cudaGetLastError.restype = ctypes.c_int
+        cudart.cudaGetLastError()
+    except Exception:
+        pass
+
+    if rc_attr != 0:
+        ad_logger.warning(
+            f"[V22] cudaPointerGetAttributes for {name} failed: cuda error {rc_attr}; skipping"
+        )
+        _V22_DISABLED = True
+        return
+
+    # type is the first int in the struct (offset 0).
+    mem_type = int.from_bytes(attr_buf.raw[:4], "little")
+    # cudaMemoryTypeUnregistered=0, Host=1, Device=2, Managed=3 (CUDA 13)
+    # For non-managed device pointers, cudaMemAdvise will fail.
+    if mem_type != 3:  # not Managed
+        ad_logger.warning(
+            f"[V22] skipping {name}: tensor is not Managed memory (type={mem_type}); "
+            f"cudaMemAdvise would fail and corrupt context"
+        )
+        _V22_DISABLED = True
+        return
+
+    rc = cudart.cudaMemAdvise(ptr, size, _CUDA_MEM_ADVISE_SET_READ_MOSTLY, device_id)
+    if rc != 0:
+        # Clear sticky error.
+        try:
+            cudart.cudaGetLastError()
+        except Exception:
+            pass
+        ad_logger.warning(
+            f"[V22] cudaMemAdvise(SetReadMostly) for {name} ({size} bytes) failed: cuda error {rc}; "
+            f"disabling V22 advise for rest of session"
+        )
+        _V22_DISABLED = True
+    else:
+        ad_logger.info(f"[V22] cudaMemAdvise(SetReadMostly) applied to {name} ({size} bytes)")
 
 
 def _moe_dense_mlp_pattern(
@@ -532,6 +664,10 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
                     short, nn.Parameter(tensor.contiguous(), requires_grad=False)
                 )
                 new_attr_paths.append((experts_path + "." if experts_path else "") + short)
+                # V22: advise driver to keep this MoE weight page resident.
+                # Default off; enable via AD_MOE_WEIGHTS_READMOSTLY=1.
+                registered = experts_mod._parameters[short].data  # storage after register
+                _maybe_advise_readmostly(f"{experts_path}.{short}", registered)
 
             sa_short, sb_short, sl_short = (
                 "swiglu_alpha_trtllm_gen",
