@@ -38,6 +38,7 @@ _SLEEP_CONFIG_DEFAULT = object()
 def _make_worker(backend="pytorch",
                  world_size=1,
                  sleep_config=_SLEEP_CONFIG_DEFAULT):
+    """Construct a BaseWorker shell without triggering MPI/CUDA init."""
     from tensorrt_llm.executor.base_worker import BaseWorker
 
     w = object.__new__(BaseWorker)
@@ -52,6 +53,7 @@ def _make_worker(backend="pytorch",
 
 
 def _make_proxy(cls_name, model_world_size=1, rpc_client=None):
+    """Construct an IPC or RPC proxy shell without triggering ZMQ/MPI init."""
     if cls_name == "ipc":
         from tensorrt_llm.executor.proxy import GenerationExecutorProxy as Cls
     else:
@@ -70,8 +72,10 @@ def _make_proxy(cls_name, model_world_size=1, rpc_client=None):
 
 @pytest.mark.parametrize("method", ["sleep", "wakeup"])
 class TestBaseWorkerSleepGuards:
+    """Guard-path tests for BaseWorker.sleep() and wakeup()."""
 
     def test_wrong_backend_raises(self, method):
+        """Raises ValueError when backend is not 'pytorch'."""
         w = _make_worker(backend="tensorrt")
         with pytest.raises(ValueError, match="only available for the PyTorch"):
             getattr(w, method)(["kv_cache"])
@@ -84,6 +88,7 @@ class TestBaseWorkerSleepGuards:
             getattr(w, method)(["kv_cache"])
 
     def test_missing_sleep_config_raises(self, method):
+        """Raises ValueError when sleep_config is not set on llm_args."""
         w = _make_worker(sleep_config=None)
         with pytest.raises(ValueError, match="Sleep feature is not enabled"):
             getattr(w, method)(["kv_cache"])
@@ -116,19 +121,23 @@ class TestBaseWorkerSleepGuards:
 
 @pytest.mark.parametrize("cls", ["ipc", "rpc"])
 class TestProxyCollectiveRpcGuards:
+    """Guard-path tests for both IPC and RPC proxy collective_rpc() shims."""
 
     def test_raises_for_multirank(self, cls):
+        """Raises NotImplementedError when model_world_size > 1."""
         p = _make_proxy(cls, model_world_size=2, rpc_client=MagicMock())
         with pytest.raises(NotImplementedError,
                            match="model_world_size == 1"):
             p.collective_rpc("sleep")
 
     def test_raises_for_unique_reply_rank(self, cls):
+        """Raises NotImplementedError when unique_reply_rank is provided."""
         p = _make_proxy(cls, rpc_client=MagicMock())
         with pytest.raises(NotImplementedError):
             p.collective_rpc("sleep", unique_reply_rank=0)
 
     def test_raises_for_target_ranks(self, cls):
+        """Raises NotImplementedError when target_ranks is provided."""
         p = _make_proxy(cls, rpc_client=MagicMock())
         with pytest.raises(NotImplementedError):
             p.collective_rpc("sleep", target_ranks=[0, 1])
@@ -163,8 +172,10 @@ class TestProxyCollectiveRpcGuards:
 
 # IPC proxy additionally validates the rpc_client initialisation guard.
 class TestIpcProxyRpcClientGuard:
+    """IPC-proxy-specific guard: rpc_client must be initialised."""
 
     def test_raises_when_rpc_client_is_none(self):
+        """Raises RuntimeError when rpc_client has not been set."""
         p = _make_proxy("ipc", rpc_client=None)
         with pytest.raises(RuntimeError, match="RPC client is not initialised"):
             p.collective_rpc("sleep")

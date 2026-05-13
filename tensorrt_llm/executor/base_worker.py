@@ -691,16 +691,31 @@ class BaseWorker(GenerationExecutor):
         the event loop before calling ``release_with_tag()``, matching the
         ``@control_action_decorator`` behaviour used in Ray.
 
+        Only allocations backed by virtual memory (VMM) and registered under
+        the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
+        released.  Components using alternative memory management (e.g.
+        ``LoadFormat.GMS``-managed weights) are not VMM-tagged and will be
+        silently skipped by ``release_with_tag``.
+
         Args:
             sleep_tags: List of
                 :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
                 value strings (e.g. ``["kv_cache"]``).
+
+        Returns:
+            None.  The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been released and the event loop
+            has been resumed.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
             NotImplementedError: If ``parallel_config.world_size > 1``.
         """
+        # _autodeploy is intentionally excluded: its allocations are not tagged
+        # under sleep_config VMM scopes, so release_with_tag would silently
+        # no-op instead of actually freeing GPU memory.  Use _backend directly
+        # rather than _is_pytorch_backend, which also covers _autodeploy.
         if self._backend != "pytorch":
             raise ValueError(
                 "sleep() is only available for the PyTorch (TorchLLM) backend."
@@ -731,18 +746,24 @@ class BaseWorker(GenerationExecutor):
         """Materialize GPU virtual memory for the specified memory type tags.
 
         Single-rank (``world_size == 1``) only.  See :meth:`sleep` for
-        details.
+        details on VMM scope restrictions and backend prerequisites.
 
         Args:
             wakeup_tags: List of
                 :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
                 value strings (e.g. ``["kv_cache"]``).
 
+        Returns:
+            None.  The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been materialized and the event loop
+            has been resumed.
+
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
             NotImplementedError: If ``parallel_config.world_size > 1``.
         """
+        # See sleep() for the reasoning behind the _backend != "pytorch" guard
         if self._backend != "pytorch":
             raise ValueError(
                 "wakeup() is only available for the PyTorch (TorchLLM) backend."
