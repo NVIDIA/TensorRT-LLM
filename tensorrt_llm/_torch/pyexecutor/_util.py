@@ -1250,12 +1250,12 @@ def _create_kv_cache_manager(
                         "using legacy MTP path")
             use_replay = False
 
-        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs sm >= 100.
+        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs 100 <= sm < 120.
         # Flashinfer has a SW fallback at any SM.
         if (stochastic_rounding
                 and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and sm < 100):
-            logger.info("Replay kernel Philox requires sm >= 100; "
+                and sm < 100 or sm in (120, 121)):
+            logger.info("Replay kernel Philox requires 100 <= sm < 120; "
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False
 
