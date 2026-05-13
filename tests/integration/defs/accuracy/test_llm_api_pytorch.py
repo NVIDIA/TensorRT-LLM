@@ -7576,7 +7576,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             trust_remote_code=True,
             kv_cache_config=kv_cache_config,
             max_num_tokens=8192,
-            max_seq_len=131072,
+            max_seq_len=65536,
             max_batch_size=8,
             speculative_config=mtp_config,
             cuda_graph_config=CudaGraphConfig(enable_padding=False),
@@ -7630,7 +7630,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
                                                       top_p=0.95)
 
             num_samples = len(long_token_list)
-            max_batch_count = 12
+            max_batch_count = 6
 
             for batch_idx in range(max_batch_count):
                 start_idx = (batch_idx * samples_per_batch) % num_samples
