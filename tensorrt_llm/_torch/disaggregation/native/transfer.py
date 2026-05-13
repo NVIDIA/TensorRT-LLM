@@ -159,6 +159,7 @@ class SendTaskBase:
         self.status = TaskStatus.INIT
         self._event = threading.Event()
         self._exception: Optional[Exception] = None
+        self.lock = threading.Lock()
         self._params = params
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
@@ -234,7 +235,8 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}
+        self._dealers = {}  # used by listener thread only (single-threaded path)
+        self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         self._pre_cancelled_rids: set[int] = set()
@@ -350,10 +352,25 @@ class Sender(SenderBase):
         return session
 
     def _enqueue(self, write_meta: WriteMeta):
-        # Distribute tasks to threads by unique_rid to ensure same session's tasks
-        # are processed by the same thread in order
-        thread_idx = write_meta.unique_rid % self._num_threads
+        # Route by (unique_rid, peer_rank) so that:
+        # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
+        # - Different peers can run on different threads (better load balancing)
+        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         self._send_task_queues[thread_idx].put(write_meta)
+
+    def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
+        """Get or create a per-thread DEALER socket via threading.local().
+        Each worker thread gets its own cache so there is no cross-thread
+        access to the same ZMQ socket."""
+        if endpoint is None:
+            raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
+        dealers = getattr(self._thread_local, "dealers", None)
+        if dealers is None:
+            dealers = {}
+            self._thread_local.dealers = dealers
+        if endpoint not in dealers:
+            dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+        return dealers[endpoint]
 
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
@@ -361,24 +378,40 @@ class Sender(SenderBase):
         CUASSERT(cudart.cudaSetDevice(device_id))
 
         task_queue = self._send_task_queues[thread_idx]
-        while True:
-            write_meta = task_queue.get()
-            if write_meta is None:
-                break
-            try:
-                if write_meta.meta_type == WriteMetaType.AUX:
-                    logger.debug(
-                        f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+        try:
+            while True:
+                write_meta = task_queue.get()
+                if write_meta is None:
+                    break
+                try:
+                    if write_meta.meta_type == WriteMetaType.AUX:
+                        logger.debug(
+                            f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+                        )
+                        self._deliver_aux_to_agent(write_meta)
+                    else:
+                        self._deliver_kv_to_agent(write_meta)
+                except Exception as e:
+                    logger.error(
+                        f"_process_task_queue[{thread_idx}]: unhandled exception for "
+                        f"unique_rid={write_meta.unique_rid}: {e}"
                     )
-                    self._deliver_aux_to_agent(write_meta)
-                else:
-                    self._deliver_kv_to_agent(write_meta)
-            except Exception as e:
-                logger.error(
-                    f"_process_task_queue[{thread_idx}]: unhandled exception for "
-                    f"unique_rid={write_meta.unique_rid}: {e}"
-                )
-                write_meta.task.fail(e)
+                    write_meta.task.fail(e)
+        finally:
+            # Clean up this thread's DEALER sockets. threading.local storage
+            # is only accessible from the owning thread, so shutdown must
+            # happen here rather than in Sender.shutdown().
+            dealers = getattr(self._thread_local, "dealers", None)
+            if dealers:
+                for endpoint, dealer in dealers.items():
+                    try:
+                        dealer.stop()
+                    except Exception as e:
+                        logger.warning(
+                            f"_process_task_queue[{thread_idx}]: failed to stop dealer "
+                            f"for endpoint {endpoint}: {e}"
+                        )
+                dealers.clear()
 
     @staticmethod
     @nvtx_range("_make_agent_request")
@@ -484,7 +517,7 @@ class Sender(SenderBase):
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
-        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.KV_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
@@ -495,16 +528,20 @@ class Sender(SenderBase):
             ]
         )
 
-        task.transferred_count += 1
         if timer:
             timer.record_task_end(write_meta.peer_rank)
         ri = self._registrar.self_rank_info
         task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-        if task.transferred_count > write_meta.expected_transfers:
+
+        with task.lock:
+            task.transferred_count += 1
+            count = task.transferred_count
+
+        if count > write_meta.expected_transfers:
             session.set_exception(
                 f"KV slice {write_meta.slice_id} received more than {write_meta.expected_transfers} transfers"
             )
-        elif task.transferred_count == write_meta.expected_transfers:
+        elif count == write_meta.expected_transfers:
             if task.is_done:
                 task.status = TaskStatus.ERROR
                 session.set_exception(
@@ -543,7 +580,7 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
 
-        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.AUX_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
@@ -552,18 +589,22 @@ class Sender(SenderBase):
             ]
         )
 
-        aux_task._transfer_count += 1
         if timer:
             timer.record_task_end(write_meta.peer_rank)
         ri = self._registrar.self_rank_info
         aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-        if aux_task._transfer_count == write_meta.expected_transfers:
+
+        with aux_task.lock:
+            aux_task._transfer_count += 1
+            count = aux_task._transfer_count
+
+        if count == write_meta.expected_transfers:
             if aux_task.is_done:
                 aux_task.status = TaskStatus.ERROR
                 session.set_exception("aux task already resolved on completion")
             else:
                 aux_task.complete()
-        elif aux_task._transfer_count > write_meta.expected_transfers:
+        elif count > write_meta.expected_transfers:
             session.set_exception(
                 f"aux task received more than {write_meta.expected_transfers} transfers"
             )
