@@ -12,7 +12,6 @@
     256,
     256
   ],
-  "lpips_max_frames": 8,
   "num_inference_steps": 1,
   "guidance_scale": 5.0,
   "seed": 42,

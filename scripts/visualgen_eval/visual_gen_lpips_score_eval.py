@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Evaluate VisualGen image quality with LPIPS against a JSON dataset.
+r"""Evaluate VisualGen image/video quality with LPIPS against a JSON dataset.
 
 The YAML config follows the same VisualGenArgs format used by trtllm-serve
 --extra_visual_gen_options and examples/visual_gen/configs.
@@ -46,15 +46,21 @@ Example dataset:
 
 The dataset may also be a top-level object with "samples" plus optional
 "params" defaults shared by all samples.
+
+For video-only scoring, provide "reference_video_path" and
+"generated_video_path"; model/config are only required when generation is
+needed.
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 import os
 import pathlib
+import tempfile
 import time
 from typing import Any
 
@@ -94,6 +100,14 @@ REFERENCE_IMAGE_KEYS = (
 )
 GENERATED_IMAGE_KEYS = ("generated_image_path", "generated_image")
 OUTPUT_IMAGE_KEYS = ("output_image_path", "output_image", "output_path")
+REFERENCE_VIDEO_KEYS = (
+    "reference_video_path",
+    "reference_video",
+    "golden_video_path",
+    "golden_video",
+)
+GENERATED_VIDEO_KEYS = ("generated_video_path", "generated_video")
+OUTPUT_VIDEO_KEYS = ("output_video_path", "output_video", "output_path")
 GENERATION_PARAM_KEYS = {
     "height",
     "width",
@@ -109,46 +123,49 @@ GENERATION_PARAM_KEYS = {
     "mask",
     "image_cond_strength",
     "num_images_per_prompt",
+    "audio_sample_rate",
     "extra_params",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate VisualGen images and compute average LPIPS against references.",
+        description="Generate or score VisualGen media and compute average LPIPS.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Dataset formats:\n"
             '  [{"prompt": "...", "reference_image_path": "golden.png"}]\n'
+            '  [{"reference_video_path": "golden.mp4", "generated_video_path": "out.mp4"}]\n'
             '  {"params": {...}, "samples": [{"prompt": "...", '
             '"reference_image_path": "golden.png"}]}\n'
             "\n"
-            "Samples can include params/generation_params, generated_image_path "
-            "to rescore existing outputs, and output_image_path to save generated images."
+            "Samples can include params/generation_params, generated_image_path or "
+            "generated_video_path to rescore existing outputs, and output_*_path "
+            "to save generated media."
         ),
     )
     parser.add_argument(
         "--model",
-        required=True,
         help=(
             "Model path, Hugging Face ID, or known alias such as flux1-dev/flux2-dev. "
-            "Known aliases prefer local $LLM_MODELS_ROOT checkpoints when available."
+            "Known aliases prefer local $LLM_MODELS_ROOT checkpoints when available. "
+            "Required only when generation is needed."
         ),
     )
     parser.add_argument(
         "--config",
-        required=True,
         type=pathlib.Path,
         help=(
             "VisualGenArgs YAML config. This should match trtllm-serve "
-            "--extra_visual_gen_options / examples/visual_gen/configs format."
+            "--extra_visual_gen_options / examples/visual_gen/configs format. "
+            "Required only when generation is needed."
         ),
     )
     parser.add_argument(
         "--dataset",
         required=True,
         type=pathlib.Path,
-        help="JSON dataset with one or more prompt/reference_image_path samples.",
+        help="JSON dataset with prompt/reference path samples or existing generated media paths.",
     )
     parser.add_argument(
         "--model-root",
@@ -183,6 +200,16 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default=None,
         help="LPIPS device override. Defaults to CUDA when available, otherwise CPU.",
+    )
+    parser.add_argument(
+        "--video-image-size",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        help=(
+            "Resize decoded video frames to WIDTH HEIGHT before LPIPS. "
+            "Defaults to dataset lpips_image_size/video_image_size or 256 256."
+        ),
     )
     parser.add_argument(
         "--json",
@@ -327,12 +354,27 @@ def _normalize_dataset(
                 {"prompt": prompt, "reference_image_path": reference}
                 for prompt, reference in zip(prompts, references)
             ]
-        elif "prompt" in loaded and _first_present(loaded, REFERENCE_IMAGE_KEYS) is not None:
+        elif "prompts" in loaded and "reference_video_paths" in loaded:
+            prompts = loaded["prompts"]
+            references = loaded["reference_video_paths"]
+            if not isinstance(prompts, list) or not isinstance(references, list):
+                raise ValueError("'prompts' and 'reference_video_paths' must be lists.")
+            if len(prompts) != len(references):
+                raise ValueError("'prompts' and 'reference_video_paths' must have the same length.")
+            raw_samples = [
+                {"prompt": prompt, "reference_video_path": reference}
+                for prompt, reference in zip(prompts, references)
+            ]
+        elif (
+            _first_present(loaded, REFERENCE_IMAGE_KEYS) is not None
+            or _first_present(loaded, REFERENCE_VIDEO_KEYS) is not None
+        ):
             raw_samples = [loaded]
         else:
             raise ValueError(
                 "Dataset object must contain samples/data/items, prompts plus "
-                "reference_image_paths, or a single prompt/reference_image_path sample."
+                "reference_image_paths/reference_video_paths, or a single "
+                "reference_*_path sample."
             )
         defaults = _extract_generation_params(loaded)
         threshold_value = loaded.get("lpips_threshold", loaded.get("threshold"))
@@ -351,22 +393,49 @@ def _normalize_dataset(
             raise ValueError(f"Dataset sample {index} must be an object.")
         sample = dict(raw_sample)
         sample_id = str(sample.get("id", sample.get("name", f"sample_{index:04d}")))
-        reference = _first_present(sample, REFERENCE_IMAGE_KEYS)
+
+        media_type = sample.get("media_type")
+        reference_image = _first_present(sample, REFERENCE_IMAGE_KEYS)
+        reference_video = _first_present(sample, REFERENCE_VIDEO_KEYS)
+        if media_type is not None:
+            media_type = str(media_type).lower()
+            if media_type not in ("image", "video"):
+                raise ValueError(
+                    f"Dataset sample {sample_id} has unsupported media_type: {media_type}"
+                )
+        elif reference_video is not None:
+            media_type = "video"
+        elif reference_image is not None:
+            media_type = "image"
+        else:
+            media_type = "image"
+
+        if media_type == "video":
+            reference = reference_video
+            generated = _first_present(sample, GENERATED_VIDEO_KEYS)
+            output_media = _first_present(sample, OUTPUT_VIDEO_KEYS)
+            media_label = "video"
+        else:
+            reference = reference_image
+            generated = _first_present(sample, GENERATED_IMAGE_KEYS)
+            output_media = _first_present(sample, OUTPUT_IMAGE_KEYS)
+            media_label = "image"
+
         if reference is None:
             raise ValueError(
-                f"Dataset sample {sample_id} is missing reference_image_path/golden_image_path."
+                f"Dataset sample {sample_id} is missing reference_{media_label}_path/"
+                f"golden_{media_label}_path."
             )
         reference_path = _resolve_path(reference, dataset_dir)
         if not reference_path.exists():
             raise ValueError(
-                f"Reference image for sample {sample_id} does not exist: {reference_path}"
+                f"Reference {media_label} for sample {sample_id} does not exist: {reference_path}"
             )
 
-        generated = _first_present(sample, GENERATED_IMAGE_KEYS)
         generated_path = _resolve_path(generated, dataset_dir) if generated is not None else None
         if generated_path is not None and not generated_path.exists():
             raise ValueError(
-                f"Generated image for sample {sample_id} does not exist: {generated_path}"
+                f"Generated {media_label} for sample {sample_id} does not exist: {generated_path}"
             )
 
         prompt = sample.get("prompt")
@@ -378,9 +447,10 @@ def _normalize_dataset(
             {
                 "id": sample_id,
                 "prompt": prompt,
-                "reference_image_path": reference_path,
-                "generated_image_path": generated_path,
-                "output_image": _first_present(sample, OUTPUT_IMAGE_KEYS),
+                "media_type": media_type,
+                "reference_path": reference_path,
+                "generated_path": generated_path,
+                "output_media": output_media,
                 "params": sample_params,
             }
         )
@@ -476,6 +546,24 @@ def _extract_image(output: Any) -> Any:
     return image
 
 
+def _extract_video(output: Any) -> Any:
+    if torch is None:
+        raise RuntimeError("The torch package is required to process VisualGen video outputs.")
+    video = getattr(output, "video", None)
+    if video is None:
+        raise ValueError(
+            "VisualGen output does not contain a video. "
+            "This sample is marked as video media."
+        )
+    if isinstance(video, (list, tuple)):
+        if not video:
+            raise ValueError("VisualGen returned an empty video list.")
+        video = video[0]
+    if isinstance(video, torch.Tensor):
+        return video.detach().cpu()
+    return video
+
+
 def _score_images(
     lpips_model: Any,
     generated_image: Any,
@@ -493,19 +581,55 @@ def _score_images(
         return float(lpips_model(generated_tensor, reference_tensor).reshape(-1).mean().item())
 
 
+def _score_video_files(
+    lpips_model: Any,
+    generated_video_path: pathlib.Path,
+    reference_video_path: pathlib.Path,
+    device: str,
+    image_size: tuple[int, int],
+) -> float:
+    helper_path = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "tests"
+        / "unittest"
+        / "_torch"
+        / "visual_gen"
+        / "lpips_video_utils.py"
+    )
+    if not helper_path.exists():
+        raise RuntimeError(f"Video LPIPS helper does not exist: {helper_path}")
+
+    spec = importlib.util.spec_from_file_location("lpips_video_utils", helper_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load video LPIPS helper: {helper_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return float(
+        module.average_video_file_lpips_score(
+            generated_video_path,
+            reference_video_path,
+            lpips_model,
+            device,
+            image_size=image_size,
+        )
+    )
+
+
 def _resolve_output_path(
-    output_image: Any,
+    output_media: Any,
     output_dir: pathlib.Path | None,
     dataset_dir: pathlib.Path,
     sample_id: str,
+    default_suffix: str,
 ) -> pathlib.Path | None:
-    if output_image is None and output_dir is None:
+    if output_media is None and output_dir is None:
         return None
 
-    if output_image is None:
-        output_path = pathlib.Path(f"{sample_id}.png")
+    if output_media is None:
+        output_path = pathlib.Path(f"{sample_id}{default_suffix}")
     else:
-        output_path = pathlib.Path(output_image).expanduser()
+        output_path = pathlib.Path(output_media).expanduser()
 
     if output_path.is_absolute():
         return output_path
@@ -533,6 +657,59 @@ def _save_image(image: Any, output_path: pathlib.Path) -> None:
     save_image(image.detach().cpu(), output_path)
 
 
+def _save_video(
+    output: Any,
+    video: Any,
+    output_path: pathlib.Path,
+    params: dict[str, Any],
+) -> pathlib.Path:
+    from tensorrt_llm.media.encoding import save_video
+
+    if torch is None:
+        raise RuntimeError("The torch package is required to save generated videos.")
+    if not isinstance(video, torch.Tensor):
+        raise TypeError(f"Unsupported video type for saving: {type(video)}")
+
+    audio = getattr(output, "audio", None)
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu()
+    frame_rate = getattr(output, "frame_rate", None) or params.get("frame_rate") or 24.0
+    audio_sample_rate = (
+        getattr(output, "audio_sample_rate", None) or params.get("audio_sample_rate") or 24000
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    saved_path = save_video(
+        video.detach().cpu(),
+        output_path,
+        audio=audio,
+        frame_rate=float(frame_rate),
+        audio_sample_rate=int(audio_sample_rate),
+    )
+    return pathlib.Path(saved_path)
+
+
+def _video_lpips_options(
+    loaded_dataset: Any,
+    args: argparse.Namespace,
+) -> tuple[int, int]:
+    if isinstance(loaded_dataset, dict):
+        image_size_value = loaded_dataset.get(
+            "lpips_image_size", loaded_dataset.get("video_image_size")
+        )
+    else:
+        image_size_value = None
+
+    image_size = args.video_image_size or image_size_value or (256, 256)
+    if len(image_size) != 2:
+        raise ValueError("Video LPIPS image size must contain exactly [width, height].")
+    width, height = int(image_size[0]), int(image_size[1])
+    if width <= 0 or height <= 0:
+        raise ValueError("Video LPIPS image size values must be positive.")
+
+    return (width, height)
+
+
 def _make_lpips_model(net: str, device: str) -> Any:
     if lpips is None:
         raise RuntimeError("The lpips package is required to run LPIPS scoring.")
@@ -544,27 +721,33 @@ def _make_lpips_model(net: str, device: str) -> Any:
 
 
 def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
-    _load_yaml(args.config)
+    if args.config is not None:
+        _load_yaml(args.config)
     loaded_dataset = _load_json(args.dataset)
     samples, _, dataset_threshold, dataset_lpips_net = _normalize_dataset(
         loaded_dataset,
         args.dataset,
     )
+    video_image_size = _video_lpips_options(loaded_dataset, args)
 
     threshold = args.threshold if args.threshold is not None else dataset_threshold
     lpips_net = args.lpips_net or dataset_lpips_net
     lpips_device = args.device or (
         "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
     )
-    resolved_model = _resolve_model(args.model, args.model_root)
+    resolved_model = _resolve_model(args.model, args.model_root) if args.model else None
     output_dir = args.output_dir.expanduser() if args.output_dir is not None else None
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    needs_generation = any(sample["generated_image_path"] is None for sample in samples)
+    needs_generation = any(sample["generated_path"] is None for sample in samples)
     visual_gen = None
     default_params = None
     if needs_generation:
+        if args.model is None:
+            raise ValueError("--model is required when any sample needs generation.")
+        if args.config is None:
+            raise ValueError("--config is required when any sample needs generation.")
         from tensorrt_llm import VisualGen, VisualGenArgs
 
         extra_args = VisualGenArgs.from_yaml(args.config)
@@ -574,47 +757,86 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
     lpips_model = _make_lpips_model(lpips_net, lpips_device)
     dataset_dir = args.dataset.resolve().parent
     sample_results = []
+    temp_video_dir = tempfile.TemporaryDirectory(prefix="visual_gen_lpips_video_")
     try:
         for index, sample in enumerate(samples):
             start_time = time.time()
-            generated_path = sample["generated_image_path"]
+            media_type = sample["media_type"]
+            generated_path = sample["generated_path"]
             output_path = None
 
             if generated_path is not None:
-                generated_image = _load_image(generated_path)
                 generation_time_sec = None
                 output_path = generated_path
+                if media_type == "image":
+                    generated_media = _load_image(generated_path)
+                else:
+                    generated_media = generated_path
             else:
                 if visual_gen is None or default_params is None:
                     raise RuntimeError("Internal error: VisualGen was not initialized.")
                 params = _visual_gen_params_from_dict(default_params, sample["params"])
                 output = visual_gen.generate(inputs=sample["prompt"], params=params)
-                generated_image = _extract_image(output)
                 generation_time_sec = time.time() - start_time
-                output_path = _resolve_output_path(
-                    sample["output_image"],
-                    output_dir,
-                    dataset_dir,
-                    sample["id"],
-                )
-                if output_path is not None:
-                    _save_image(generated_image, output_path)
+                if media_type == "image":
+                    generated_media = _extract_image(output)
+                    output_path = _resolve_output_path(
+                        sample["output_media"],
+                        output_dir,
+                        dataset_dir,
+                        sample["id"],
+                        ".png",
+                    )
+                    if output_path is not None:
+                        _save_image(generated_media, output_path)
+                else:
+                    generated_media = _extract_video(output)
+                    output_path = _resolve_output_path(
+                        sample["output_media"],
+                        output_dir,
+                        dataset_dir,
+                        sample["id"],
+                        ".mp4",
+                    )
+                    score_video_path = output_path or (
+                        pathlib.Path(temp_video_dir.name) / f"{sample['id']}.mp4"
+                    )
+                    score_video_path = _save_video(
+                        output,
+                        generated_media,
+                        score_video_path,
+                        sample["params"],
+                    )
+                    if output_path is not None:
+                        output_path = score_video_path
+                    generated_media = score_video_path
 
-            reference_image = _load_image(sample["reference_image_path"])
-            lpips_score = _score_images(
-                lpips_model,
-                generated_image,
-                reference_image,
-                lpips_device,
-            )
+            if media_type == "image":
+                reference_media = _load_image(sample["reference_path"])
+                lpips_score = _score_images(
+                    lpips_model,
+                    generated_media,
+                    reference_media,
+                    lpips_device,
+                )
+            else:
+                lpips_score = _score_video_files(
+                    lpips_model,
+                    generated_media,
+                    sample["reference_path"],
+                    lpips_device,
+                    video_image_size,
+                )
+
             sample_results.append(
                 {
                     "index": index,
                     "id": sample["id"],
+                    "media_type": media_type,
                     "prompt": sample["prompt"],
                     "lpips_score": lpips_score,
-                    "reference_image_path": str(sample["reference_image_path"]),
-                    "generated_image_path": str(output_path) if output_path is not None else None,
+                    "reference_path": str(sample["reference_path"]),
+                    "generated_path": str(output_path) if output_path is not None else None,
                     "generation_time_sec": generation_time_sec,
                     "params": sample["params"],
                 }
@@ -623,6 +845,7 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
         del lpips_model
         if visual_gen is not None:
             visual_gen.shutdown()
+        temp_video_dir.cleanup()
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -633,10 +856,12 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "model": args.model,
         "resolved_model": resolved_model,
-        "config": str(args.config),
+        "config": str(args.config) if args.config is not None else None,
         "dataset": str(args.dataset),
         "lpips_net": lpips_net,
         "lpips_device": lpips_device,
+        "video_image_size": list(video_image_size),
+        "video_frame_selection": "all_paired_frames",
         "threshold": threshold,
         "passed": passed,
         "num_samples": len(sample_results),

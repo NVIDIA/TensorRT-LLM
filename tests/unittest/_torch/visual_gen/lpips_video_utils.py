@@ -84,9 +84,13 @@ def _decode_video_to_lpips_batch(
     return batch.to(device=device, dtype=torch.float32) * 2.0 - 1.0
 
 
-def _sample_frame_indices(frame_count: int, max_frames: int) -> torch.Tensor:
+def _sample_frame_indices(frame_count: int, max_frames: int | None = None) -> torch.Tensor:
     if frame_count <= 0:
         raise ValueError("Cannot sample from an empty video")
+    if max_frames is None or max_frames >= frame_count:
+        return torch.arange(frame_count, dtype=torch.long)
+    if max_frames <= 0:
+        raise ValueError("Video LPIPS max frames must be positive")
     sample_count = min(frame_count, max_frames)
     return torch.linspace(0, frame_count - 1, steps=sample_count).round().long()
 
@@ -97,9 +101,9 @@ def average_video_lpips_score(
     lpips_model,
     device: str,
     image_size: tuple[int, int] = (256, 256),
-    max_frames: int = 8,
+    max_frames: int | None = None,
 ) -> float:
-    """Average LPIPS over evenly sampled paired frames from generated and golden videos."""
+    """Average LPIPS over paired frames from generated and golden videos."""
     generated = _video_tensor_to_lpips_batch(generated_video, image_size, device)
     golden = _decode_video_to_lpips_batch(golden_video_path, image_size, device)
 
@@ -119,7 +123,7 @@ def average_video_file_lpips_score(
     lpips_model,
     device: str,
     image_size: tuple[int, int] = (256, 256),
-    max_frames: int = 8,
+    max_frames: int | None = None,
 ) -> float:
     """Average LPIPS over paired frames decoded from generated and golden videos."""
     generated = _decode_video_to_lpips_batch(generated_video_path, image_size, device)
