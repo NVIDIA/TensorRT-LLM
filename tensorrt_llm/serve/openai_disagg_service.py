@@ -316,7 +316,8 @@ class OpenAIDisaggregatedService(OpenAIService):
             assert isinstance(self._gen_router, KvCacheAwareRouter)
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
-            gen_server, info = await self._gen_router.get_next_server(request)
+            gen_server, info = await self._gen_router.get_next_server(
+                request, collect_routing_info=True)
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
             if (

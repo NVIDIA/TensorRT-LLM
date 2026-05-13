@@ -369,7 +369,8 @@ class Router(ABC):
     async def get_next_server(
             self,
             request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+            exclude_server: Optional[str] = None,
+            collect_routing_info: bool = False) -> tuple[str, dict]:
         '''Select server by request and return some intermediate information, exclude_server is a server to exclude from the selection'''
 
     @abstractmethod
@@ -599,7 +600,8 @@ class RoundRobinRouter(Router):
     async def get_next_server(
             self,
             request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+            exclude_server: Optional[str] = None,
+            collect_routing_info: bool = False) -> tuple[str, dict]:
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -645,7 +647,8 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
     async def get_next_server(
             self,
             request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+            exclude_server: Optional[str] = None,
+            collect_routing_info: bool = False) -> tuple[str, dict]:
         self._validate_servers_available()
 
         async with self._lock:
@@ -880,12 +883,25 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
     async def get_next_server(
             self,
             request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+            exclude_server: Optional[str] = None,
+            collect_routing_info: bool = False) -> tuple[str, dict]:
         async with self._lock:
             servers = [
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ]
+            if not servers:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
+            if len(servers) == 1 and not collect_routing_info:
+                server = servers[0]
+                await self._register_request(server, request)
+                return server, {
+                    "candidate_servers": servers,
+                    "selected_server": server,
+                    "routing_mode": "single_server_fastpath",
+                    "server_info": self._server_info.get(server, {}),
+                }
         # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
         # chat request with a Rust-backed tokenizer). Running it directly
         # inside the async handler blocks the orchestrator's event loop and
@@ -901,21 +917,21 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # select the server by (KV match - load)
         # TODO: more options
         workloads = [
-            state.num_active_requests()
-            for state in self._server_state.values()
+            self._server_state[server].num_active_requests()
+            for server in servers
         ]
         assignment_counts = [
             self._num_assigned_requests_by_server.get(server, 0)
             for server in servers
         ]
+        # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
+        matches = list(
+            await asyncio.gather(*(
+                self._server_state[server].matched_tokens(block_hashes)
+                for server in servers)))
         scores = []
-        matches = []
         for i in range(len(servers)):
-            server = servers[i]
-            # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            matches.append(
-                await self._server_state[server].matched_tokens(block_hashes))
-            score = matches[-1] / padded_tokens - workloads[
+            score = matches[i] / padded_tokens - workloads[
                 i] / self._max_batch_size
             scores.append(score)
         max_score = max(scores)
@@ -1319,8 +1335,28 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     async def get_next_server(
             self,
             request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+            exclude_server: Optional[str] = None,
+            collect_routing_info: bool = False) -> tuple[str, dict]:
         self._validate_servers_available()
+
+        async with self._lock:
+            servers = [
+                server for server in self._server_state.keys()
+                if server != exclude_server
+            ]
+            if len(servers) == 1 and not collect_routing_info:
+                server = servers[0]
+                await self._register_request(server, request)
+                self._add_content_load(
+                    server, request, self._estimate_content_weight(request))
+                conv_id = self._get_conversation_id(request)
+                if conv_id:
+                    self._update_session(conv_id, server, [])
+                return server, {
+                    "server_info": self._server_info.get(server, {}),
+                    "selected_server": server,
+                    "routing_mode": "single_server_fastpath",
+                }
 
         # Pre-compute outside the lock (tokenization + hashing)
         conv_id = self._get_conversation_id(request)
