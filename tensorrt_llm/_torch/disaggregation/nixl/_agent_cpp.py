@@ -42,6 +42,14 @@ class BindingsNixlTransferStatus(TransferStatus):
             )
         return result == TransferState.SUCCESS
 
+    def last_status_str(self) -> str:
+        get = getattr(self._cpp_status, "get_last_status_str", None)
+        return get() if get is not None else "<unavailable>"
+
+    def last_status(self) -> int:
+        get = getattr(self._cpp_status, "get_last_status", None)
+        return int(get()) if get is not None else -1
+
 
 class BindingsNixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using C++ bindings with GIL release support.
@@ -83,6 +91,22 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             f"UCX_TLS={os.environ.get('UCX_TLS', '<unset>')} "
             f"UCX_LOG_LEVEL={os.environ.get('UCX_LOG_LEVEL', '<unset>')}"
         )
+
+    def shutdown(self):
+        cpp_agent = getattr(self, "_cpp_agent", None)
+        if cpp_agent is None:
+            return
+        try:
+            cpp_agent.shutdown()
+        except Exception:
+            pass
+        self._cpp_agent = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
 
     def register_memory(self, descs: RegMemoryDescs):
         """Register memory regions."""
