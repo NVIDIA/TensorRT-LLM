@@ -97,6 +97,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
 
+        # Sticky role markers; flip True once any session opens, used to short-circuit
+        # per-iter tp_allgather when this transceiver never sends/receives.
+        self._ever_had_send_session: bool = False
+        self._ever_had_recv_session: bool = False
+
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
             name = str(uuid.uuid4())
@@ -392,6 +397,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
+        self._ever_had_send_session = True
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         session.send(self._create_kv_slice(req))
@@ -432,6 +438,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
+        self._ever_had_recv_session = True
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
@@ -447,6 +454,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
+        # Skip the tp_allgather in _ctx_consensus when this transceiver never sends (pure GEN role).
+        if not self._ever_had_send_session:
+            return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
@@ -500,6 +510,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
+        # Skip the allgather in _gen_consensus when this transceiver never receives (pure CTX role).
+        if not self._ever_had_recv_session:
+            return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
