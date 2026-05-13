@@ -1000,6 +1000,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         layer_mask: Optional[
             List[bool]] = None,  # this is the full attention layer mask
         is_estimating_kv_cache: bool = False,
+        is_draft: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -1059,6 +1060,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 spec_config=spec_config,
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
+                is_draft=is_draft,
             )
             return
 
@@ -1147,6 +1149,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
+            is_draft=is_draft,
             linear_attention_metadata=self.linear_attention_metadata,
         )
 
