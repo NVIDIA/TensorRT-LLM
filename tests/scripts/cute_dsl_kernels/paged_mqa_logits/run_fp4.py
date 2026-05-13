@@ -157,19 +157,17 @@ def _compute_schedule_metadata(
 
     cum = 0
     seq_idx = 0
-    seq_offset = 0
     for i in range(num_ctas + 1):
         target = i * q_div + min(i, r_mod)
-        while seq_idx < batch_size and cum + (splits_per_seq[seq_idx] - seq_offset) <= target:
-            cum += splits_per_seq[seq_idx] - seq_offset
+        while seq_idx < batch_size and cum + splits_per_seq[seq_idx] <= target:
+            cum += splits_per_seq[seq_idx]
             seq_idx += 1
-            seq_offset = 0
             if seq_idx >= batch_size:
                 break
         if seq_idx >= batch_size:
             schedule[i] = torch.tensor([batch_size, 0], dtype=torch.int32)
         else:
-            local = target - cum + seq_offset
+            local = target - cum
             schedule[i] = torch.tensor([seq_idx, local], dtype=torch.int32)
     return schedule
 
