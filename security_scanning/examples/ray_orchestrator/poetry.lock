@@ -893,14 +893,14 @@ protobuf = ["grpcio-tools (>=1.80.0)"]
 
 [[package]]
 name = "idna"
-version = "3.14"
+version = "3.15"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "idna-3.14-py3-none-any.whl", hash = "sha256:e677eaf072e290f7b725f9acf0b3a2bd55f9fd6f7c70abe5f0e34823d0accf69"},
-    {file = "idna-3.14.tar.gz", hash = "sha256:466d810d7a2cc1022bea9b037c39728d51ae7dad40d480fc9b7d7ecf98ba8ee3"},
+    {file = "idna-3.15-py3-none-any.whl", hash = "sha256:048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8"},
+    {file = "idna-3.15.tar.gz", hash = "sha256:ca962446ea538f7092a95e057da437618e886f4d349216d2b1e294abfdb65fdc"},
 ]
 
 [package.extras]
@@ -1739,14 +1739,14 @@ typing-extensions = ">=4.14.1"
 
 [[package]]
 name = "python-discovery"
-version = "1.3.0"
+version = "1.3.1"
 description = "Python interpreter discovery"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "python_discovery-1.3.0-py3-none-any.whl", hash = "sha256:441d9ced3dfce36e113beb35ca302c71c7ef06f3c0f9c227a0b9bb3bd49b9e9f"},
-    {file = "python_discovery-1.3.0.tar.gz", hash = "sha256:d098f1e86be5d45fe4d14bf1029294aabbd332f4321179dec85e76cddce834b0"},
+    {file = "python_discovery-1.3.1-py3-none-any.whl", hash = "sha256:ed188687ebb3b82c01a17cd5ac62fc94d9f6487a7f1a0f9dfe89753fec91039c"},
+    {file = "python_discovery-1.3.1.tar.gz", hash = "sha256:62f6db28064c9613e7ca76cb3f00c38c839a07c31c00dfe7ed0986493d2150a6"},
 ]
 
 [package.dependencies]
@@ -1754,7 +1754,7 @@ filelock = ">=3.15.4"
 platformdirs = ">=4.3.6,<5"
 
 [package.extras]
-docs = ["furo (>=2025.12.19)", "sphinx (>=9.1)", "sphinx-autodoc-typehints (>=3.6.3)", "sphinxcontrib-mermaid (>=2)"]
+docs = ["furo (>=2025.12.19)", "sphinx (>=9.1)", "sphinx-autodoc-typehints (>=3.6.3)", "sphinxcontrib-mermaid (>=2)", "sphinxcontrib-towncrier (>=0.4)", "towncrier (>=25.8)"]
 testing = ["covdefaults (>=2.3)", "coverage (>=7.5.4)", "pytest (>=8.3.5)", "pytest-mock (>=3.14)", "setuptools (>=75.1)"]
 
 [[package]]
@@ -2162,14 +2162,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "virtualenv"
-version = "21.3.1"
+version = "21.3.2"
 description = "Virtual Python Environment builder"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "virtualenv-21.3.1-py3-none-any.whl", hash = "sha256:d1a71cf58f2f9228fff23a1f6ec15d39785c6b32e03658d104974247145edd35"},
-    {file = "virtualenv-21.3.1.tar.gz", hash = "sha256:c2305bc1fddeec40699b8370d13f8d431b0701f00ce895061ce493aeded4426b"},
+    {file = "virtualenv-21.3.2-py3-none-any.whl", hash = "sha256:c58ea748fa50bb2a4367da5ba3d30b02458ed40b4ea888faad94021f3309f764"},
+    {file = "virtualenv-21.3.2.tar.gz", hash = "sha256:3ecda97894a6fc1c53106356f488690e5c86278c1f693f3fc0805ac85a513686"},
 ]
 
 [package.dependencies]

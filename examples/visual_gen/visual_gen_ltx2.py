@@ -149,9 +149,10 @@ def parse_args():
         type=str,
         default="",
         help=(
-            "Path to the learned LatentUpsampler checkpoint (.safetensors). "
-            "When provided, the pipeline uses two-stage generation: stage 1 "
-            "at half resolution, learned 2x upsample, stage 2 refinement."
+            "Optional path to the learned LatentUpsampler checkpoint (.safetensors). "
+            "If omitted, VisualGen tries to discover it next to the model checkpoint. "
+            "When available, the pipeline uses two-stage generation: stage 1 at half "
+            "resolution, learned 2x upsample, stage 2 refinement."
         ),
     )
     parser.add_argument(
@@ -159,8 +160,9 @@ def parse_args():
         type=str,
         default="",
         help=(
-            "Path to the distilled LoRA checkpoint (.safetensors) for "
-            "stage 2 refinement. The LoRA weights are merged into the "
+            "Optional path to the distilled LoRA checkpoint (.safetensors) for "
+            "stage 2 refinement. If omitted, VisualGen tries to discover it next "
+            "to the model checkpoint. The LoRA weights are merged into the "
             "transformer for stage 2 and un-merged afterwards."
         ),
     )
@@ -176,6 +178,8 @@ def parse_args():
 
 def _build_diffusion_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
+    if args.enable_cache_dit:
+        logger.info("Cache DiT enabled; LTX2 will run as a one-stage pipeline.")
     cache_kwargs = build_cache_config(args)
 
     attention_cfg: dict = {"backend": args.attention_backend}

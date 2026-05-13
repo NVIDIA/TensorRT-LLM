@@ -486,8 +486,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the learned LatentUpsampler checkpoint (.safetensors). "
-            "Required for LTX-2 two-stage pipelines. When provided, the "
-            "pipeline auto-selects LTX2TwoStagesPipeline."
+            "Optional for LTX-2 two-stage pipelines. When provided, the "
+            "pipeline auto-selects LTX2TwoStagesPipeline. If omitted, "
+            "TensorRT-LLM tries to discover it in the checkpoint directory."
         ),
     )
 
@@ -496,8 +497,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the distilled LoRA checkpoint (.safetensors) used in "
-            "the stage 2 refinement pass. The LoRA weights are merged into "
-            "the transformer for stage 2 denoising and un-merged afterwards."
+            "the stage 2 refinement pass. If omitted, TensorRT-LLM tries to "
+            "discover it in the checkpoint directory. The LoRA weights are "
+            "merged into the transformer for stage 2 denoising and un-merged afterwards."
         ),
     )
 
@@ -943,11 +945,11 @@ class DiffusionModelConfig(BaseModel):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # Propagate two-stage paths into extra_attrs for pipeline use
-        if args and args.spatial_upsampler_path:
-            extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
-        if args and args.distilled_lora_path:
-            extra_attrs["distilled_lora_path"] = args.distilled_lora_path
+        if args:
+            if args.spatial_upsampler_path:
+                extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
+            if args.distilled_lora_path:
+                extra_attrs["distilled_lora_path"] = args.distilled_lora_path
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
@@ -987,6 +989,8 @@ class DiffusionModelConfig(BaseModel):
             if native_config is not None:
                 transformer_dict = native_config.get("transformer", {})
                 pretrained_config = SimpleNamespace(**transformer_dict)
+                if not getattr(pretrained_config, "_name_or_path", None):
+                    pretrained_config._name_or_path = str(checkpoint_path)
                 extra_attrs["monolithic_safetensors_config"] = native_config
 
                 # quantization_config lives as a separate safetensors metadata

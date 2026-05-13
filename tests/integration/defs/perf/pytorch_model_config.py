@@ -462,6 +462,25 @@ def get_model_yaml_config(model_label: str,
                 'attn_backend': 'FLASHINFER',
             }
         },
+        # Nemotron-3-Nano-Omni-30B-NVFP4 (text + image multimodal)
+        {
+            'patterns': ['nemotron_3_nano_omni_nvfp4'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 1,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.80,
+                    'mamba_ssm_cache_dtype': 'float32',
+                },
+            }
+        },
         # Nemotron-3-Super-120B-NVFP4: (no MTP)
         {
             'patterns': ['nemotron_3_super_120b_nvfp4-'],
