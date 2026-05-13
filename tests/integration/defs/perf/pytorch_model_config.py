@@ -555,6 +555,15 @@ def get_model_yaml_config(model_label: str,
             moe_config = base_config.setdefault('moe_config', {})
             moe_config.setdefault('backend', 'DEEPGEMM')
 
+    # On RTX PRO 6000 Blackwell (SM120/121), the qwen3_235b_a22b_fp8 ep:8 perf
+    # config deadlocks when attention_dp is enabled. The same config runs fine
+    # on H100/H200/B200, so scope the override to the affected SM range only.
+    if ('qwen3_235b_a22b_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048'
+            '-input_output_len:1000,2000-con:256-ep:8-gpus:8'
+            in model_label.lower()):
+        if _get_sm_version_safe() in (120, 121):
+            base_config['enable_attention_dp'] = False
+
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
         # Derive the requested number of adapters from model_label (segment like "loras:X")
