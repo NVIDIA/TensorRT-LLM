@@ -57,14 +57,24 @@ class NixlTransferStatus final : public TransferStatus
 {
 public:
     NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle);
+    ~NixlTransferStatus() noexcept override;
+
+    NixlTransferStatus(NixlTransferStatus const&) = delete;
+    NixlTransferStatus& operator=(NixlTransferStatus const&) = delete;
+    NixlTransferStatus(NixlTransferStatus&&) = delete;
+    NixlTransferStatus& operator=(NixlTransferStatus&&) = delete;
 
     [[nodiscard]] bool isCompleted() const override;
 
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
+    [[nodiscard]] int getLastStatus() const noexcept;
+    [[nodiscard]] std::string getLastStatusStr() const;
+
 private:
     nixlAgent* mRawAgent{};
     nixlXferReqH* mHandle{};
+    mutable std::atomic<int> mLastStatus{0};
 };
 
 class NixlTransferAgent final : public BaseTransferAgent
@@ -72,6 +82,9 @@ class NixlTransferAgent final : public BaseTransferAgent
 public:
     NixlTransferAgent(BaseAgentConfig const& config);
     ~NixlTransferAgent();
+
+    /// Synchronously release NIXL agent / UCX / prog_thread. Idempotent.
+    void shutdown() noexcept;
 
     void registerMemory(RegisterDescs const& descs) override;
 
@@ -111,9 +124,7 @@ private:
     nixl_opt_args_t mExtraParams;
     std::string mName;
     std::string mAddress;
-
-    std::vector<char> mDRamSrcBuffer;
-    std::vector<char> mDRamDstBuffer;
+    std::atomic<bool> mShutdown{false};
 
     /// Local VMM region info (from registerMemory). Keyed by local virtual address.
     VramRegionMap mLocalVramRegionInfo;
@@ -127,7 +138,7 @@ class NixlLoopbackAgent final : public BaseLoopbackAgent
 {
 public:
     NixlLoopbackAgent(BaseAgentConfig const& config);
-    virtual ~NixlLoopbackAgent() = default;
+    ~NixlLoopbackAgent() override;
 
     virtual void executeLoopbackRequest(
         MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) override;

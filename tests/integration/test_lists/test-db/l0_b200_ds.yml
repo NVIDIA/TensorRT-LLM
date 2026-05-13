@@ -24,6 +24,19 @@ l0_b200_ds:
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py TIMEOUT (90)
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_module.py TIMEOUT (90)
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
+  # ------------- Disaggregated transfer component tests (single GPU) ---------------
+  - unittest/disaggregated/test_agent.py
+  - unittest/disaggregated/test_agent_multi_backends.py
+  - unittest/disaggregated/test_extractor.py
+  - unittest/disaggregated/test_kv_transfer.py
+  - unittest/disaggregated/test_messenger.py
+  - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/test_perf_logger.py
+  - unittest/disaggregated/test_rank_info.py
+  - unittest/disaggregated/test_request_id.py
+  - unittest/disaggregated/test_router.py
+  # Disaggregated KV transfer with DeepSeek-V4 cache manager (single B200, threading-based).
+  - unittest/disaggregated/test_deepseek_v4_kv_transfer.py TIMEOUT (180)
   - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
   # Tokenizer chat-template tests.
   - unittest/llmapi/test_deepseek_v4_tokenizer.py

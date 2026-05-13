@@ -110,7 +110,14 @@ l0_dgx_h100:
   - test_e2e.py::test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance[DeepSeek-V3-Lite-FP8-DeepSeek-V3-Lite/fp8]
   - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
   # ------------- Disaggregated serving tests ---------------
-  - unittest/disaggregated/test_py_cache_transceiver_mp.py
+  # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).
+  # A single wrapper case ran ~3581 s on B200 and brushed the outer pytest
+  # 3600 s per-test timeout; per-workflow shards give each ~12 combos a
+  # fresh budget. Apply the same split on H100 for parity.
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first and not ctx_first_sync"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first_sync"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]

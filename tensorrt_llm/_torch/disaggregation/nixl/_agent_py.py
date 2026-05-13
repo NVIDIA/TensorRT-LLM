@@ -64,6 +64,17 @@ class NixlTransferAgent(BaseTransferAgent):
         )
         self.agent = nixl_agent(name, agent_config)
 
+    def shutdown(self):
+        if getattr(self, "agent", None) is None:
+            return
+        self.agent = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
+
     def _get_validated_reg_descs(self, descs: RegMemoryDescs):
         if not descs.descs:
             raise ValueError("descs.descs must not be empty")

@@ -151,6 +151,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
+
     def _get_block_ids(self, req: LlmRequest, group_idx: int, lg) -> np.ndarray:
         if self._is_v2_manager:
             kv_cache_map = getattr(self._kv_cache_manager, "kv_cache_map")
