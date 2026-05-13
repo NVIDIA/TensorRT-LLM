@@ -187,6 +187,22 @@ def should_skip_trtllm(
     if backend_type != MoeBackendType.TRTLLM:
         return None
 
+    # [Bug] TRTLLMGen MoE on B300 (SM103) has tactic-selection illegal
+    # memory access during autotune. Partial mitigation in PR #13964 head
+    # commit blacklists tactic [tileN=32, configIndex=5] in
+    # cpp/.../trtllmGenKernels/blockScaleMoe/runner.h, but full coverage
+    # of other failing tactics is not yet validated end-to-end. Skip all
+    # TRTLLMGen tests on B300 until the fix is verified.
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() == 103:
+        return (
+            "[Bug] TRTLLMGen MoE on B300 (SM103) hits tactic-selection "
+            "illegal memory access during autotune. Partial fix blacklists "
+            "tactic [tileN=32, configIndex=5]; skipping all TRTLLMGen tests "
+            "on B300 until full coverage is verified."
+        )
+
     # Routing method compatibility check (used by test_moe_module.py)
     # TRTLLMGen C++ routing kernel (runner.cu) implements:
     # - DeepSeekV3 (nGroup<=1: SigmoidBias+ScaledSumNormalize; nGroup>1: full DeepSeek kernel)
@@ -1052,9 +1068,16 @@ def should_skip_to_accelerate_ci(
     if quant_algo is None and is_gated_activation(activation_type):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
-    is_large_model = model_config.num_experts >= 256 and model_config.hidden_size >= 7168
+    # Any e256-class model_config triggers CI Rule-1 minimal coverage:
+    # the full dtype x seq_len x swiglu x routing matrix on e256 models
+    # otherwise blows the per-stage Slurm wall-clock budget (B200 stage
+    # timed out on this PR's first CI run after DeepSeek-V4-Flash was
+    # promoted into CI_MOE_MODEL_CONFIGS). e256 coverage in CI is kept
+    # minimal (DeepSeekV3 routing, bfloat16, seq=1, non-gptoss SwiGLU);
+    # breadth comes from smaller configs (Qwen, GPT-OSS-120B, boundary).
+    is_large_model = model_config.num_experts >= 256
 
-    # --- Rule 1: Large model (e256_k8_h7168_i2048) restrictions ---
+    # --- Rule 1: Large e256-class model restrictions ---
     if is_large_model:
         if routing_method_cls is not None:
             from tensorrt_llm._torch.modules.fused_moe import DeepSeekV3MoeRoutingMethod
