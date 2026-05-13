@@ -647,6 +647,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        # Cross-iter MM encoder prefetch event: stamped by the side-stream
+        # producer in `modeling_multimodal_mixin._dispatch_cross_iter_prefetch`
+        # and consumed (then cleared) in `model_engine._prepare_inputs` when
+        # the request is next scheduled.
+        self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
         if llm_request is not None:
             super().__init__(llm_request)
         else:

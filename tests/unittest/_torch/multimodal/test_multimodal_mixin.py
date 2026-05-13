@@ -44,7 +44,7 @@ class DummyMultimodalModel(MultimodalModelMixin):
     def text_embedding_layer(self) -> Embedding:
         return self.embedding
 
-    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs):
+    def encode_multimodal_inputs(self, multimodal_params):
         raise AssertionError("Tests use cached multimodal embeddings and should not encode.")
 
 
