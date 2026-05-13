@@ -47,7 +47,6 @@ from tensorrt_llm._torch.visual_gen.example_utils import (
     build_cache_config,
 )
 from tensorrt_llm._torch.visual_gen.utils import linear_type_to_quant_config
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -123,7 +122,7 @@ def parse_args():
     )
 
     add_quant_args(parser)
-    add_attention_backend_args(parser, include_sage=True)
+    add_attention_backend_args(parser)
 
     # Parallelism
     parser.add_argument(

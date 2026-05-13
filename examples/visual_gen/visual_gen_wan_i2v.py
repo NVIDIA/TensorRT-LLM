@@ -16,7 +16,6 @@ from tensorrt_llm._torch.visual_gen.example_utils import (
     build_cache_config,
 )
 from tensorrt_llm._torch.visual_gen.utils import linear_type_to_quant_config
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -102,17 +101,6 @@ def parse_args():
 
     add_quant_args(parser)
     add_attention_backend_args(parser)
-
-    # SageAttention (requires --attention_backend TRTLLM)
-    parser.add_argument(
-        "--enable_sage_attention",
-        action="store_true",
-        help=(
-            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
-            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.1, "
-            "(1, 16, 1) otherwise."
-        ),
-    )
 
     # Parallelism
     parser.add_argument(

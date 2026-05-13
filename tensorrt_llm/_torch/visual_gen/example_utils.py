@@ -183,13 +183,8 @@ def add_quant_args(parser):
     )
 
 
-def add_attention_backend_args(parser, include_sage=False):
-    """Add --attention_backend argument (VANILLA, TRTLLM, FA4).
-
-    Args:
-        include_sage: If True, also add --enable_sage_attention. Only models with
-            SageAttention wiring (FLUX, Wan T2V/I2V) should pass True.
-    """
+def add_attention_backend_args(parser):
+    """Add --attention_backend and --enable_sage_attention arguments."""
     parser.add_argument(
         "--attention_backend",
         type=str,
@@ -199,12 +194,11 @@ def add_attention_backend_args(parser, include_sage=False):
         "FA4: Flash Attention 4). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
-    if include_sage:
-        parser.add_argument(
-            "--enable_sage_attention",
-            action="store_true",
-            help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
-        )
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
+    )
 
 
 def add_optimization_args(parser):
