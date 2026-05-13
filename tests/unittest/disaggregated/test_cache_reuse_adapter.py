@@ -203,14 +203,15 @@ class TestAdapterPerLayerGroup:
 # ---------------------------------------------------------------------------
 
 
-def _swa_trim(block_ids, prompt_len, tpb, window_size, cached_tokens, is_gen_only=True):
+def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens, is_gen_only=True):
     """Replicate the SWA branch of KvCacheTransceiverV2._create_kv_slice.
 
     Inputs:
       block_ids: list possibly containing stale entries (V1 pre-eviction view).
-      cached_tokens: reuse-hit prefix reported by the adapter (token-aligned).
-      is_gen_only: True mirrors the gen-side path; False mirrors the ctx-side
-        path where ``cached_per_lg`` is synthetically 0.
+      scalar_cached_tokens: the cache-manager scalar BEFORE adapter SWA clamp.
+      is_gen_only: True mirrors the gen-side path (adapter-clamped cached_lg);
+        False mirrors the ctx-side path where the adapter is not invoked and
+        cache_skip must stay 0 regardless of ``stale_end``.
     """
     block_ids = np.array(block_ids, dtype=np.int64)
     total_blocks = (prompt_len + tpb - 1) // tpb
@@ -220,10 +221,12 @@ def _swa_trim(block_ids, prompt_len, tpb, window_size, cached_tokens, is_gen_onl
         block_ids = (
             block_ids[-expected_valid:] if expected_valid > 0 else np.array([], dtype=np.int64)
         )
-    # Ctx side bypasses adapter (cached=0); gen side uses adapter scalar.
-    cached_lg = cached_tokens if is_gen_only else 0
-    # Reuse-hit blocks beyond the already-pruned stale region.
-    cache_skip = max(0, cached_lg // tpb - stale_end)
+    if is_gen_only:
+        # Adapter clamps cached_lg ≥ stale_end*tpb.
+        cached_lg = max(scalar_cached_tokens, stale_end * tpb)
+        cache_skip = cached_lg // tpb - stale_end
+    else:
+        cache_skip = 0
     if cache_skip > 0:
         block_ids = (
             block_ids[cache_skip:] if cache_skip < block_ids.size else np.array([], dtype=np.int64)
@@ -262,12 +265,14 @@ class TestSwaTrim:
     def test_window_offset_skip_subtracts_stale(self):
         # window=24 → stale_end=1; scalar=16 (2 blocks) → cache_skip=2-1=1.
         # Naive block_ids[scalar//tpb:] would skip 2 from a 3-block list and return 1 block.
-        out = _swa_trim([10, 11, 12], prompt_len=32, tpb=8, window_size=24, cached_tokens=16)
+        out = _swa_trim([10, 11, 12], prompt_len=32, tpb=8, window_size=24, scalar_cached_tokens=16)
         np.testing.assert_array_equal(out, [11, 12])
 
     def test_window_covers_all_no_stale(self):
         # window=prompt_len → stale_end=0; behaves like full-attn.
-        out = _swa_trim([10, 11, 12, 13], prompt_len=32, tpb=8, window_size=32, cached_tokens=8)
+        out = _swa_trim(
+            [10, 11, 12, 13], prompt_len=32, tpb=8, window_size=32, scalar_cached_tokens=8
+        )
         np.testing.assert_array_equal(out, [11, 12, 13])
 
     def test_v1_pre_eviction_includes_stale(self):
@@ -277,7 +282,9 @@ class TestSwaTrim:
 
     def test_ctx_side_no_adapter_no_skip(self):
         # Ctx-side path: adapter not invoked, cached_per_lg synthetically 0.
-        # cache_skip = max(0, 0 - stale_end) = 0 — full valid window is sent.
+        # With stale_end>0, the gen-side formula would produce negative cache_skip
+        # and trip the SWA assertion; ctx side must clamp cache_skip to 0 and
+        # send the full valid window. Regression for PR #13937 follow-up.
         out = _swa_trim([20, 21], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False)
         np.testing.assert_array_equal(out, [20, 21])
 
@@ -288,12 +295,6 @@ class TestSwaTrim:
             [10, 11, 12, 13], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False
         )
         np.testing.assert_array_equal(out, [12, 13])
-
-    def test_gen_side_reuse_inside_stale_no_skip(self):
-        # gen side with reuse-hit fully inside the stale region: cache_skip = 0.
-        # Regression for SWA + reuse-hit < stale_end*tpb (no adapter clamp).
-        out = _swa_trim([20, 21], self.PROMPT_LEN, self.TPB, self.WINDOW, 8, is_gen_only=True)
-        np.testing.assert_array_equal(out, [20, 21])
 
 
 # ---------------------------------------------------------------------------
