@@ -918,6 +918,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     if (useSbatch) {
         mounts += [
             "/home/svc_tensorrt/bloom/scripts",
+            "/home/svc_tensorrt/slurm-logs",
         ]
     } else {
         mounts += [
@@ -1337,6 +1338,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     returnStdout: true,
                     numRetries: 3
                 ).trim()
+                def nodeName = "${cluster.host}-test-${customSuffix}"
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
 
                 def scriptTrack = """#!/bin/bash
@@ -1368,6 +1370,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     # Kill tail -f process
                     kill \$tailPid
+                    mkdir -p /home/svc_tensorrt/slurm-logs/slurm-${slurmJobId}-${nodeName}
+                    mv $jobWorkspace/*.log /home/svc_tensorrt/slurm-logs/slurm-${slurmJobId}-${nodeName}/
 
                     # Wait briefly to ensure accounting is consistent
                     sleep 10
