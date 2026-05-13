@@ -1,17 +1,71 @@
 """Weight loader for diffusion models."""
 
 import json
+import multiprocessing
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
+import psutil
 import torch
 import tqdm
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
+from tensorrt_llm._utils import local_mpi_barrier, local_mpi_rank, local_mpi_size
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+_PREFETCH_CHUNK_SIZE = 16 * 1024 * 1024
+
+
+def _prefetch_file(file_name: str) -> None:
+    if not os.path.exists(file_name):
+        return
+
+    logger.info(f"Prefetching checkpoint file {file_name} to host page cache...")
+    with open(file_name, "rb") as f:
+        while f.read(_PREFETCH_CHUNK_SIZE):
+            pass
+    logger.info(f"Finished prefetching checkpoint file {file_name}.")
+
+
+def _prefetch_safetensors_files(file_names: List[str]) -> None:
+    """Warm safetensors files in host page cache across local ranks."""
+    paths: List[str] = []
+    seen = set()
+    for file_name in file_names:
+        path = os.path.abspath(file_name)
+        if path not in seen:
+            paths.append(path)
+            seen.add(path)
+
+    if not paths:
+        return
+
+    try:
+        prefetch_size = sum(os.path.getsize(path) for path in paths if os.path.exists(path))
+        available_memory = psutil.virtual_memory().available
+        if prefetch_size >= available_memory * 0.9:
+            logger.info(
+                "Skipping visual-gen checkpoint prefetch because files require "
+                f"{prefetch_size / (1024**3):.2f}GB and available host memory is "
+                f"{available_memory / (1024**3):.2f}GB."
+            )
+            return
+
+        local_paths = paths[local_mpi_rank() :: local_mpi_size()]
+        if local_paths:
+            logger.info(
+                f"Prefetching {prefetch_size / (1024**3):.2f}GB visual-gen "
+                "checkpoint files across local ranks."
+            )
+            max_workers = min(multiprocessing.cpu_count() * 2, 16, len(local_paths))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                list(executor.map(_prefetch_file, local_paths))
+    finally:
+        local_mpi_barrier()
 
 
 class WeightLoader(BaseWeightLoader):
@@ -87,6 +141,9 @@ class WeightLoader(BaseWeightLoader):
             weight_files = self._find_weight_files(weight_dir)
             if not weight_files:
                 raise ValueError(f"No weight files found in {weight_dir}")
+
+            if all(wf.endswith(".safetensors") for wf in weight_files):
+                _prefetch_safetensors_files(weight_files)
 
             component_weights = self._load_weight_files(weight_files, component, is_pipeline)
             all_weights[component] = component_weights
