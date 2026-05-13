@@ -5261,7 +5261,7 @@ For more information, please refer to <http://unlicense.org>
   - `Tracker`: https://github.com/tox-dev/py-filelock/issues
 
 
-## flashinfer-python (0.6.10)
+## flashinfer-python (0.6.11)
 
 ### Licenses
 License: `Apache-2.0`
@@ -33239,7 +33239,7 @@ License: `NVIDIA Proprietary Software`
   - `Homepage`: https://developer.nvidia.com/cusparselt
 
 
-## nvidia-cutlass-dsl (4.4.2)
+## nvidia-cutlass-dsl (4.5.0)
 
 ### Licenses
 License: `None`
