@@ -42,6 +42,7 @@ from ..._compat import KvCacheConfig, get_sm_version, prefer_pinned
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
+from ...utils.va_probe import va_probe
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -191,6 +192,18 @@ class _TrtllmPlanner:
             6 if _is_blackwell_trtllm_gen_kernel(get_sm_version()) else 3
         )
 
+        va_probe(
+            "TrtllmPlanner.reset",
+            workspace=self.workspace,
+            host_pool_mapping=self.host_pool_mapping,
+            host_total_kv_lens=self.host_total_kv_lens,
+            host_request_types=self.host_request_types,
+            block_offsets=self.block_offsets,
+            host_past_kv_lengths=self.host_past_kv_lengths,
+            host_context_lengths=self.host_context_lengths,
+            context_lengths_gpu=self.context_lengths_gpu,
+        )
+
     def init_spec_decoding(self, max_batch: int, max_draft_len: int) -> None:
         """Initialize persistent spec-decoding tensors once when configured.
 
@@ -270,6 +283,13 @@ class _TrtllmPlanner:
                 scale_oq = None
                 scale_qo = None
             self._layer_cache[key] = (pool_ptrs, scale_oq, scale_qo)
+            va_probe(
+                f"TrtllmPlanner.get_layer_tensors[kv=0x{key:x}]",
+                kv_cache=kv_cache,
+                pool_ptrs=pool_ptrs,
+                scale_oq=scale_oq,
+                scale_qo=scale_qo,
+            )
 
         pool_ptrs, scale_oq, scale_qo = self._layer_cache[key]
         quant_mode = int(QuantMode.FP8_KV_CACHE) if scale_oq is not None else 0
@@ -488,6 +508,12 @@ def prepare_trtllm_metadata(
     Returns ``block_offsets`` which flows through the graph to each attention op,
     creating an explicit data dependency.
     """
+    va_probe(
+        "prepare_trtllm_metadata.first",
+        batch_info_host=batch_info_host,
+        cu_num_pages=cu_num_pages,
+        cache_loc=cache_loc,
+    )
     batch_info = BatchInfo(batch_info_host)
     # Refresh all per-graph state that depends on batch_info. Eagle mutates batch_info
     # in-place between target verification and the draft loop (switch_to_generate_),
@@ -577,6 +603,20 @@ def trtllm_mha_with_cache(
     pool_pointers encodes kv_cache.data_ptr() (layer-specific), and
     pool_mapping is all zeros. See module docstring for details.
     """
+    va_probe(
+        "trtllm_mha_with_cache.first",
+        q=q,
+        k=k,
+        v=v,
+        batch_info_host=batch_info_host,
+        seq_len=seq_len,
+        seq_len_with_cache=seq_len_with_cache,
+        kv_cache_block_offsets=kv_cache_block_offsets,
+        kv_cache=kv_cache,
+        rotary_cos_sin=rotary_cos_sin,
+        attention_sinks=attention_sinks,
+    )
+
     # Infer dimensions from tensor shapes (bsnd layout)
     num_heads = q.shape[2]
     num_kv_heads = k.shape[2]

@@ -24,6 +24,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
 from ...utils.dist_config import DistConfig
+from ...utils.va_probe import va_probe
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 # O11: when set, skip the Python-side topk/softmax in trtllm_mxfp4_w4a8_moe_fused
@@ -1300,6 +1301,21 @@ def trtllm_mxfp4_w4a8_moe_fused(
     Returns:
         BF16 hidden states of shape ``(*x.shape[:-1], valid_hidden_size)``.
     """
+    va_probe(
+        "trtllm_mxfp4_w4a8_moe_fused.first",
+        x=x,
+        router_weight=router_weight,
+        router_bias=router_bias,
+        fc1_weights_mxfp4=fc1_weights_mxfp4,
+        fc2_weights_mxfp4=fc2_weights_mxfp4,
+        fc1_weights_scale_ue8m0=fc1_weights_scale_ue8m0,
+        fc2_weights_scale_ue8m0=fc2_weights_scale_ue8m0,
+        fc1_bias_f32=fc1_bias_f32,
+        fc2_bias_f32=fc2_bias_f32,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+    )
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 
@@ -1336,6 +1352,15 @@ def trtllm_mxfp4_w4a8_moe_fused(
         x2d,
         False,  # is_sf_swizzled_layout
         alignment=512,
+    )
+
+    va_probe(
+        "trtllm_mxfp4_w4a8_moe_fused.internal",
+        x2d=x2d,
+        x_mxfp8=x_mxfp8,
+        x_scale=x_scale,
+        router_logits=router_logits,
+        _times=8,
     )
 
     num_experts_total = int(router_weight.shape[0])
