@@ -789,15 +789,18 @@ protected:
                 = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
             TLLM_LOG_DEBUG("setUpCacheTransceiver makeFormatter");
 
+            // Generate a per-instance ID so each ctx/gen instance writes to
+            // its own CSV files (mirrors CacheTransceiver behaviour).
+            auto instanceId = "test_" + std::to_string(tensorrt_llm::mpi::MpiComm::world().getRank());
             if (mIsContext)
             {
-                mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter()), instanceId);
             }
             else
             {
-                mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter()), instanceId);
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 

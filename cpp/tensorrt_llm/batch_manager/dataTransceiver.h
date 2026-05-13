@@ -251,7 +251,8 @@ public:
     /// @param manager The connection manager.
     /// @param selfIndex The sequential index of the current executor process.
     /// @param cacheLayer The cache layer bundling all cache states and formatters.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "");
 
     CacheSender() = default;
 
@@ -308,7 +309,8 @@ public:
     /// @param manager The connection manager.
     /// @param selfIndex The sequential index of the current executor process.
     /// @param cacheLayer The cache layer bundling all cache states and formatters.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::string instanceId = "");
 
     CacheReceiver() = default;
 

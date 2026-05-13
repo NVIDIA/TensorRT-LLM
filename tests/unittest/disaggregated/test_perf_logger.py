@@ -1,3 +1,5 @@
+import os
+import tempfile
 import time
 from unittest.mock import patch
 
@@ -76,6 +78,49 @@ class TestPerfLogManager:
         assert mgr.enabled is False
         # log() should be a no-op, not crash
         mgr.log("inst", 0, "csv_line", "info_msg")
+
+    def test_log_gen_transfer_summary_writes_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": tmpdir},
+                clear=False,
+            ):
+                from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
+
+                mgr = PerfLogManager()
+                mgr.log_gen_transfer_summary(
+                    unique_rid=42,
+                    instance_name="test_inst",
+                    instance_rank=0,
+                    gen_side_transfer_time_ms=12.345,
+                    kv_cache_size=1024,
+                )
+                csv_path = os.path.join(tmpdir, "test_inst_0_gen_transfer_summary.csv")
+                assert os.path.exists(csv_path), f"CSV file not created at {csv_path}"
+                with open(csv_path) as f:
+                    lines = f.readlines()
+                assert len(lines) >= 2  # header + at least 1 data row
+                assert "gen_side_transfer_time(ms)" in lines[0]
+                assert "42" in lines[1]
+                assert "12.345" in lines[1]
+                assert "1024" in lines[1]
+
+    def test_log_gen_transfer_summary_disabled_without_env(self):
+        import os as _os
+
+        _os.environ.pop("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", None)
+        from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
+
+        mgr = PerfLogManager()
+        # Should be a no-op, not crash
+        mgr.log_gen_transfer_summary(
+            unique_rid=1,
+            instance_name="test",
+            instance_rank=0,
+            gen_side_transfer_time_ms=0.0,
+            kv_cache_size=0,
+        )
 
     @patch.dict("os.environ", {"TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO": "1"}, clear=False)
     def test_log_task_perf_does_not_crash(self):

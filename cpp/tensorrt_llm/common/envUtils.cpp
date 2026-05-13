@@ -508,6 +508,12 @@ bool getEnvKVCacheTransferAllBlocksForWindow()
     return allBlocksForWindow;
 }
 
+bool getEnvKVCachePoolUseFabricMemory()
+{
+    static bool const useFabricMemory = getBoolEnv("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY");
+    return useFabricMemory;
+}
+
 uint16_t getEnvNixlPort()
 {
     static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
