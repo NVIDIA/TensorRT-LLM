@@ -541,7 +541,11 @@ class ModelConfig(Generic[TConfig]):
                         **kwargs):
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
-        with config_file_lock():
+        if trust_remote_code:
+            maybe_lock = config_file_lock()
+        else:
+            maybe_lock = contextlib.nullcontext()
+        with maybe_lock:
             # When handling the case where model_format is TLLM_ENGINE
             # send cyclic requests to the NONE URL.
             if checkpoint_dir is not None:
