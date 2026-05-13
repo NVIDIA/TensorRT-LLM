@@ -187,40 +187,79 @@ def should_skip_trtllm(
     if backend_type != MoeBackendType.TRTLLM:
         return None
 
-    # [Bug] TRTLLMGen MoE FP8_BLOCK_SCALES on B300 (SM103) hits illegal
-    # memory access during tactic autotune for the boundary config
-    # MoeModelConfig(8, 1, 512, 512) at seq_len=8. From Jenkins inner
-    # pytest stdout (build L0_Test-x86_64-Single-GPU/899, stage
-    # B300-PyTorch-1), this is the only deterministically failing
-    # sub-test: it fails on both the first run and the retry, while
-    # the e8_k1+seq=1+FP8_BLOCK_SCALES (passes) and
-    # e8_k1+seq=8+W4A16_MXFP4 / W4A8_NVFP4_FP8 cases that follow it
-    # PASS on retry; their run-1 failures were cascading IMA errors
-    # from the FP8_BLOCK_SCALES tactic that corrupted the CUDA context.
-    # PR #13964 head commit 5629e0dff9 blacklists tactic
-    # [tileN=32, configIndex=5] for SM103 in fp8BlockScaleMoe.cpp via
-    # isKnownInvalidBlockScaleMoeTactic, which should resolve this;
-    # skip this exact (config, seq_len) combination until the fix is
-    # verified end-to-end on B300.
+    # [Bug] On B300 (SM103), TRTLLM-Gen block-scale MoE produces a CUDA
+    # illegal memory access (IMA) when the autotuner exposes tile=32
+    # with certain configIndex values that have not been blacklisted.
+    # Empirically the IMA originates inside the W4A16_MXFP4 path
+    # (Bf16MxE2m1BlockScaleMoERunner); once it fires, every subsequent
+    # test in the same pytest process ERRORs at setup with
+    # `cudaErrorIllegalAddress`.
+    #
+    # Background:
+    # * Jenkins L0_MergeRequest_PR/37541 (build 899, stage
+    #   B300-PyTorch-1) originally reported the failure on
+    #   FP8_BLOCK_SCALES `e8_k1_h512_i512-seq=8`, which is a cascade
+    #   victim of an upstream tile=32 IMA.
+    # * PR #13964 head commit 5629e0dff9 introduced two related fixes:
+    #     - Python: corrected the swapped
+    #       `(local_num_experts, num_tokens)` ordering in
+    #       `Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics`.
+    #     - C++: blacklisted tactic `[tileN==32, configIndex==5]` on
+    #       SM103 via `isKnownInvalidBlockScaleMoeTactic` in
+    #       `cpp/.../blockScaleMoe/runner.h`.
+    # * Empirical reproduction of
+    #   `pytest test_moe_backend.py::test_moe_backend -k "TRTLLM"`
+    #   on B300 (NVIDIA B300 SXM6, SM103) at commit 5629e0dff9:
+    #
+    #       blacklist body                                  result
+    #       ---------------------------------------------   ----------------
+    #       SM103 && tileN==32 && configIndex==5            23 pass + 1 FAIL
+    #       (PR HEAD)                                        (W4A16_MXFP4) +
+    #                                                        10 cascade ERROR
+    #       return false (blacklist disabled)               identical to above
+    #       SM103 && tileN==32 (all configIndex)            34/34 pass
+    #
+    #   This shows the PR's `[tileN==32, configIndex==5]` blacklist is
+    #   necessary but *not sufficient*; tileN==32 on SM103 has at
+    #   least one additional broken configIndex that needs to be
+    #   blacklisted (or the kernel fixed) for the W4A16_MXFP4 path.
+    #
+    # Reproduce on a B300 node (Slurm `trt-llm_b300` account):
+    #   1. Build TRT-LLM from PR head 5629e0dff9 inside the project's
+    #      tritondevel container (single GPU is sufficient).
+    #   2. cd tests/unittest && \
+    #      python3 -m pytest -v -s \
+    #          _torch/modules/moe/test_moe_backend.py::test_moe_backend \
+    #          -k "TRTLLM" -p no:randomly
+    #   3. Expect:
+    #        FAILED ...alpha=1.702_beta=1.0_limit=7.0-e128_k4_h2880_i2880
+    #               -seq=8-...-quant=W4A16_MXFP4...
+    #             torch.AcceleratorError: CUDA error: illegal memory access
+    #
+    # Skip the directly-observed FAIL until the C++ blacklist is
+    # extended (e.g. `SMVersion==103 && tileTokensDim==32`) or the
+    # underlying kernel is fixed for tileN==32 on SM103.
     from tensorrt_llm._utils import get_sm_version
 
     if (
         get_sm_version() == 103
-        and quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        and quant_algo == QuantAlgo.W4A16_MXFP4
+        and swiglu_gptoss_style
         and model_config is not None
-        and model_config.num_experts == 8
-        and model_config.top_k == 1
-        and model_config.hidden_size == 512
-        and model_config.intermediate_size == 512
+        and model_config.num_experts == 128
+        and model_config.top_k == 4
+        and model_config.hidden_size == 2880
+        and model_config.intermediate_size == 2880
         and seq_len == 8
     ):
         return (
-            "[Bug] TRTLLMGen MoE FP8_BLOCK_SCALES on B300 (SM103) "
-            "with MoeModelConfig(8, 1, 512, 512) and seq_len=8 hits "
-            "illegal memory access during tactic autotune "
-            "(tactic [tileN=32, configIndex=5]). Partial fix in PR "
-            "#13964 head commit 5629e0dff9 blacklists this tactic; "
-            "skip until the fix is verified end-to-end on B300."
+            "[Bug] TRTLLMGen MoE W4A16_MXFP4 on B300 (SM103) with "
+            "MoeModelConfig(128, 4, 2880, 2880), "
+            "swiglu_gptoss_style=True and seq_len=8 hits CUDA "
+            "illegal memory access in a tileN=32 autotune tactic "
+            "not covered by the partial blacklist "
+            "[tileN=32, configIndex=5] in PR #13964 head 5629e0dff9; "
+            "see the comment above for reproduction."
         )
 
     # Routing method compatibility check (used by test_moe_module.py)
