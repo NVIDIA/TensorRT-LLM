@@ -160,11 +160,12 @@ class KvCacheAwareServerState(ServerState):
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
 
-    async def poll_and_update(self):
+    async def poll_and_update(self, session=None):
         """Poll KV cache events and update block table. Called outside the critical path."""
         try:
-            assert self._session is not None, "session must be set on KvCacheAwareServerState"
-            events_raw = await self.poll_events(self._session)
+            session = session if session is not None else self._session
+            assert session is not None, "session must be provided to poll_and_update"
+            events_raw = await self.poll_events(session)
             async with self._lock:
                 if events_raw is not None:
                     self.update_with_events(events_raw)
@@ -777,6 +778,22 @@ class BlockHashMixin:
         block_hashes = self._compute_block_hashes(token_lists)
         return token_lists, block_hashes
 
+    def _tokenize_and_compute_block_hashes_by_algo(
+        self,
+        request: OpenAIRequest,
+        hash_algos: Iterable[str],
+        cache_salt_id: Optional[int] = None,
+    ) -> tuple[list[list[int]], dict[str, list[list[BlockHash]]]]:
+        """Synchronous tokenize + per-algorithm block hashes for thread offload."""
+        token_lists = self._tokenize(request)
+        return token_lists, {
+            hash_algo:
+            self._compute_block_hashes(token_lists,
+                                       hash_algo,
+                                       cache_salt_id=cache_salt_id)
+            for hash_algo in set(hash_algos)
+        }
+
     @staticmethod
     def _text_to_int_sequences(texts: list[str]) -> list[list[int]]:
         """Convert text strings to lists of unicode code points.
@@ -873,13 +890,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             "server_info": self._server_info.get(server, {}),
         }
 
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None):
         async with self._lock:
             server = self._req_routing_table.pop(id(request), None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
         if server is not None and server in self._server_state:
-            await self._server_state[server].poll_and_update()
+            await self._server_state[server].poll_and_update(session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
