@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for MX-specific branches in ``ModelLoader``."""
+"""Unit tests for ModelExpress-specific branches in ``ModelLoader``."""
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -36,7 +36,7 @@ class _TinyModel(nn.Module):
         self._events = events
 
     def _apply(self, fn):
-        # The test is about ModelLoader's MX branching, not CUDA allocation.
+        # The test is about ModelLoader's ModelExpress branching, not CUDA allocation.
         return self
 
     def to(self, *args, **kwargs):
@@ -84,7 +84,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
-        lambda: SimpleNamespace(synchronize=lambda: None),
+        lambda: SimpleNamespace(synchronize=lambda: events.append("sync")),
     )
     return loader
 
@@ -93,9 +93,12 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
     events = []
     loader = _make_loader(monkeypatch, events=events)
     checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.checkpoint_format = "modelexpress"
     checkpoint_loader.is_weights_preloaded.return_value = True
     checkpoint_loader.load_weights.return_value = {}
+    checkpoint_loader.post_load_publish.side_effect = lambda *args, **kwargs: events.append(
+        "post_load_publish"
+    )
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
@@ -109,8 +112,9 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model, checkpoint_dir="/ckpt", weights_preloaded=True
     )
+    assert events[-2:] == ["sync", "post_load_publish"]
 
-    # reload() uses self.weight_mapper unconditionally; MX success must
+    # reload() uses self.weight_mapper unconditionally; ModelExpress success must
     # initialize it even though the initial load skipped _call_load_weights.
     loader.reload(model, {"reloaded": MagicMock()})
     assert loader._call_load_weights.call_count == 1
@@ -120,10 +124,13 @@ def test_mx_partial_fallback_merges_returned_weights(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
     checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.checkpoint_format = "modelexpress"
     checkpoint_loader.is_weights_preloaded.return_value = True
     fallback_weights = {"mismatched.weight": MagicMock()}
     checkpoint_loader.load_weights.return_value = fallback_weights
+    checkpoint_loader.post_load_publish.side_effect = lambda *args, **kwargs: events.append(
+        "post_load_publish"
+    )
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
@@ -135,16 +142,20 @@ def test_mx_partial_fallback_merges_returned_weights(monkeypatch):
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model, checkpoint_dir="/ckpt", weights_preloaded=True
     )
+    assert events[-2:] == ["sync", "post_load_publish"]
 
 
 def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
     checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.checkpoint_format = "modelexpress"
     checkpoint_loader.is_weights_preloaded.return_value = False
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
     checkpoint_loader.get_initialized_weight_mapper.return_value = MagicMock()
+    checkpoint_loader.post_load_publish.side_effect = lambda *args, **kwargs: events.append(
+        "post_load_publish"
+    )
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
@@ -154,3 +165,4 @@ def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model, checkpoint_dir="/ckpt", weights_preloaded=False
     )
+    assert events[-2:] == ["sync", "post_load_publish"]
