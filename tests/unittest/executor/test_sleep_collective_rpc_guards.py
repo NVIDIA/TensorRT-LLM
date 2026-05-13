@@ -78,8 +78,10 @@ class TestBaseWorkerSleepGuards:
             getattr(w, method)(["kv_cache"])
 
     def test_autodeploy_backend_raises(self, method):
-        """AutoDeploy must be excluded: allocations aren't tagged under
-        sleep_config scopes, so release_with_tag would silently no-op.
+        """AutoDeploy must be excluded.
+
+        Its allocations aren't tagged under sleep_config VMM scopes, so
+        release_with_tag would silently no-op instead of freeing GPU memory.
         """
         w = _make_worker(backend="_autodeploy")
         with pytest.raises(ValueError, match="only available for the PyTorch"):
