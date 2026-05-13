@@ -10,6 +10,7 @@ import pytest
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from utils.llm_data import llm_models_root
+from utils.util import force_ampere
 
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
@@ -381,8 +382,9 @@ def test_SleepConfig_restore_modes_normalized_from_defaultdict():
         ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
 
 
+@force_ampere
 def test_SleepConfig_is_picklable():
-    """SleepConfig must survive a pickle round-trip.
+    """SleepConfig with default construction must survive a pickle round-trip.
 
     MPI worker initialisation serialises llm_args (including SleepConfig) via
     pickle to distribute configuration to each rank.  The defaultdict inside
@@ -391,12 +393,16 @@ def test_SleepConfig_is_picklable():
     """
     import pickle
 
-    # Default construction
     cfg_default = SleepConfig()
     rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
     assert rt.restore_modes == cfg_default.restore_modes
 
-    # Construction with explicit per-key overrides
+
+@force_ampere
+def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
+    """SleepConfig with explicit per-key overrides must survive a pickle round-trip."""
+    import pickle
+
     cfg_custom = SleepConfig(
         restore_modes={
             ExecutorMemoryType.KV_CACHE.value: "NONE",
@@ -409,6 +415,7 @@ def test_SleepConfig_is_picklable():
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
 
 
+@force_ampere
 def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
     """The defaultdict default_factory must remain functional after pickle.
 
