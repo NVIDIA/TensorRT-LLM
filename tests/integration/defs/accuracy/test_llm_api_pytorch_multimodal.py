@@ -18,7 +18,12 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_pre_blackwell, skip_pre_hopper
+from ..conftest import (
+    llm_models_root,
+    skip_post_blackwell_ultra,
+    skip_pre_blackwell,
+    skip_pre_hopper,
+)
 from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
 
 
@@ -580,7 +585,14 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 128,
                 QuantAlgo.MIXED_PRECISION,
                 (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
-                marks=skip_pre_blackwell,
+                marks=(
+                    skip_pre_blackwell,
+                    # Skip for B300 / GB300:
+                    # * B300 coverage does not meaningfully extend what we test via B200.
+                    # * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide
+                    #   CI errors.
+                    skip_post_blackwell_ultra,
+                ),
                 id="nvfp4",
             ),
         ],

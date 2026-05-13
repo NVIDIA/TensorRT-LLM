@@ -738,6 +738,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_sof
 accuracy/test_llm_api_pytorch.py::TestQwen3_4B::test_eagle3
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]

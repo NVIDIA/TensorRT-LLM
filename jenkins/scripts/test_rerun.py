@@ -16,49 +16,107 @@ def parse_name(classname, name, filename):
         return filename + "::" + name
 
 
-def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
+def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
+                             rerun_1_file, rerun_2_file, test_to_line):
+    # Parse results xml and write failed tests to the appropriate rerun files.
+    # Returns a set of all test names that appeared in the xml (ran tests).
+    ran_tests = set()
+    tree = ET.parse(xml_filename)
+    root = tree.getroot()
+    suite_list = root.findall('testsuite')
+    for suite in suite_list:
+        for case in suite.findall('testcase'):
+            test_name = parse_name(case.attrib.get('classname', ''),
+                                   case.attrib.get('name', ''),
+                                   case.attrib.get('file', ''))
+            ran_tests.add(test_name)
+            if case.find('failure') is not None or \
+               case.find('error') is not None:
+                duration = float(case.attrib.get('time', 0))
+                if duration <= 5 * 60:
+                    rerun_2_file.write(test_to_line[test_name] + '\n')
+                    print(test_name + " will rerun 2 times")
+                elif duration <= 10 * 60:
+                    rerun_1_file.write(test_to_line[test_name] + '\n')
+                    print(test_name + " will rerun 1 time")
+                elif any(failSig.lower() in ET.tostring(
+                        case, encoding='unicode').lower()
+                         for failSig in failSignaturesList):
+                    rerun_1_file.write(test_to_line[test_name] + '\n')
+                    print(test_name +
+                          " will rerun 1 time, because of fail signature")
+                else:
+                    rerun_0_file.write(test_to_line[test_name] + '\n')
+                    print(test_name + " will not rerun")
+    return ran_tests
+
+
+def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
+                              test_list_filename, unfinished_test_filename):
     # Generate rerun test lists:
-    # 1. Parse the test results xml file
-    # 2. For failed tests:
+    # Part 1. Tests that are failed or errored in the test results xml file:
     #    - If test duration <= 5 min: add to rerun_2.txt (will rerun 2 times)
     #    - If test duration > 5 min and <= 10 min: add to rerun_1.txt (will rerun 1 time)
     #    - If test duration > 10 min but contains fail signatures in error message: add to rerun_1.txt
     #    - If test duration > 10 min and no known failure signatures: add to rerun_0.txt (will not rerun)
+    # Part 2. Tests that are unfinished:
+    #    add to rerun_0.txt (will not rerun)
+    # Part 3. Tests that are not run
+    #    add to rerun_1.txt (will rerun 1 time)
     print(failSignaturesList)
 
     rerun_0_filename = os.path.join(outdir, 'rerun_0.txt')
     rerun_1_filename = os.path.join(outdir, 'rerun_1.txt')
     rerun_2_filename = os.path.join(outdir, 'rerun_2.txt')
 
-    tree = ET.parse(xml_filename)
-    root = tree.getroot()
-    suite = root.find('testsuite')
+    # Map test name to test line in test_list_filename.
+    # e.g. tests: ["test_name1", "test_name2", "test_name3"]
+    # test_to_line: {"test_name1": "test_name1", "test_name2": "test_name2 TIMEOUT (90)", "test_name3": "test_name3 TIMEOUT (30)"}
+    tests = []
+    test_to_line = {}
+    if test_list_filename and os.path.exists(test_list_filename):
+        with open(test_list_filename, 'r') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                test_name = line.split()[0]
+                tests.append(test_name)
+                test_to_line[test_name] = line
+
+    # Get tests that terminated unexpectedly from unfinished_test_filename.
+    # e.g. unfinished_test_line: "stage_name/test_name1"
+    # unfinished_tests: ["test_name1", "test_name2", "test_name3"]
+    unfinished_tests = []
+    if unfinished_test_filename and os.path.exists(unfinished_test_filename):
+        with open(unfinished_test_filename, 'r') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                test_name = line.split('/', 1)[1] if '/' in line else line
+                unfinished_tests.append(test_name)
 
     with open(rerun_0_filename, 'w') as rerun_0_file, \
          open(rerun_1_filename, 'w') as rerun_1_file, \
          open(rerun_2_filename, 'w') as rerun_2_file:
-        for case in suite.findall('testcase'):
-            if case.find('failure') is not None or \
-               case.find('error') is not None:
-                duration = float(case.attrib.get('time', 0))
-                test_name = parse_name(case.attrib.get('classname', ''), \
-                                       case.attrib.get('name', ''), \
-                                       case.attrib.get('file', ''))
-                if duration <= 5 * 60:
-                    rerun_2_file.write(test_name + '\n')
-                    print(test_name + " will rerun 2 times")
-                elif duration <= 10 * 60:
-                    rerun_1_file.write(test_name + '\n')
-                    print(test_name + " will rerun 1 time")
-                elif any(failSig.lower() in ET.tostring(
-                        case, encoding='unicode').lower()
-                         for failSig in failSignaturesList):
-                    rerun_1_file.write(test_name + '\n')
-                    print(test_name +
-                          " will rerun 1 time, because of fail signature")
-                else:
-                    rerun_0_file.write(test_name + '\n')
-                    print(test_name + " will not rerun")
+        # Part 1: process failed/error tests from results xml
+        ran_tests = process_xml_failed_tests(xml_filename, failSignaturesList,
+                                             rerun_0_file, rerun_1_file,
+                                             rerun_2_file, test_to_line)
+
+        for test in tests:
+            if test in ran_tests:
+                continue
+            # Part 2: process unfinished tests
+            elif test in unfinished_tests:
+                rerun_0_file.write(test_to_line[test] + '\n')
+                print(test +
+                      " will not rerun because it terminated unexpectedly.")
+            # Part 3: process tests that did not run
+            else:
+                rerun_1_file.write(test_to_line[test] + '\n')
+                print(test + " will rerun 1 time, because it did not run")
 
     # Remove empty files
     for filename in [rerun_0_filename, rerun_1_filename, rerun_2_filename]:
@@ -421,10 +479,19 @@ if __name__ == '__main__':
         parser.add_argument('--fail-signatures',
                             required=True,
                             help='List of failure signatures to match')
+        parser.add_argument('--test-list',
+                            required=False,
+                            default=None,
+                            help='File containing all tests to run')
+        parser.add_argument('--unfinished-test-file',
+                            required=False,
+                            default=None,
+                            help='File containing unfinished tests')
         args = parser.parse_args(sys.argv[2:])
         failSignaturesList = args.fail_signatures.split(',')
         generate_rerun_tests_list(args.output_dir, args.input_file,
-                                  failSignaturesList)
+                                  failSignaturesList, args.test_list,
+                                  args.unfinished_test_file)
 
     elif (sys.argv[1] == "merge_junit_xmls"):
         parser = argparse.ArgumentParser()

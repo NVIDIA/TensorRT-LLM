@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,6 +72,12 @@ class RequestData:
     # The retention priorities for each new block (same length as new_block_ids).
     # Used for priority-based offload filtering. None means use default priority.
     priorities: Optional[List[int]] = None
+    # Per-request cache salt that the KV cache manager uses to isolate reuse
+    # between requests carrying different salts. Connectors that key cached
+    # content on token sequences (e.g. by hashing tokens to a file path or
+    # remote object id) MUST mix cache_salt_id into their identifiers,
+    # otherwise blocks from a different salt could be incorrectly reused.
+    cache_salt_id: Optional[int] = None
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -342,6 +348,7 @@ class KvCacheConnectorSchedulerOutputRequest:
             computed_position,
             num_scheduled_tokens,
             priorities,
+            cache_salt_id=req.cache_salt_id,
         )
 
 
