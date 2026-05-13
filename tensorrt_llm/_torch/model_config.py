@@ -585,25 +585,47 @@ class ModelConfig(Generic[TConfig]):
         shape = tensor_info.get("shape", [])
         if dtype == "I8" and len(shape) == 2:
             return "mxfp4"
-        if dtype is not None and dtype.startswith("F8_"):
-            return "fp8_block_scales"
+        if dtype == "U8":
+            return "nvfp4"
         return None
+
+    @staticmethod
+    def _has_deepseek_v4_layer_only_modelopt_quant_config(
+            quant_config_file: str) -> bool:
+        with open(quant_config_file) as f:
+            quant_config_dict = json.load(f)
+
+        quantization_config = quant_config_dict.get('quantization', {})
+        return (quantization_config.get('quant_algo', None) is None and
+                quantization_config.get('quantized_layers', None) is not None)
 
     @staticmethod
     def _set_deepseek_v4_routed_moe_quant_config(pretrained_config,
                                                  checkpoint_dir: str,
                                                  moe_backend: str,
                                                  layer_quant_config,
-                                                 spec_config=None):
+                                                 spec_config=None,
+                                                 require_layout: bool = False):
         layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
             checkpoint_dir)
-        if layout != "mxfp4":
+        if layout not in ("mxfp4", "nvfp4"):
+            if require_layout:
+                raise ValueError(
+                    "DeepSeek-V4 checkpoint has layer-specific quantized_layers "
+                    "in hf_quant_config.json, but the routed MoE layout could "
+                    "not be detected from safetensors metadata. Expected "
+                    f"{_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT} to use dtype I8 "
+                    "for MXFP4 or U8 for NVFP4.")
             return layer_quant_config
 
         experts_quant_config = QuantConfig()
-        experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
-            moe_backend)
-        experts_quant_config.group_size = 32
+        if layout == "mxfp4":
+            experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                moe_backend)
+            experts_quant_config.group_size = 32
+        else:
+            experts_quant_config.quant_algo = QuantAlgo.NVFP4
+            experts_quant_config.group_size = 16
         experts_quant_config.exclude_modules = [
             'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
             'embedding', 'unembedding'
@@ -624,8 +646,9 @@ class ModelConfig(Generic[TConfig]):
                 f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
 
         logger.info(
-            "Detected DeepSeek-V4 routed MoE MXFP4 checkpoint layout; using "
-            "%s for routed experts.", experts_quant_config.quant_algo)
+            "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
+            "%s for routed experts.", layout.upper(),
+            experts_quant_config.quant_algo)
         return layer_quant_config
 
     @staticmethod
@@ -899,6 +922,7 @@ class ModelConfig(Generic[TConfig]):
 
         quant_config = QuantConfig()
         layer_quant_config = None
+        require_deepseek_v4_routed_moe_layout = False
         requested_moe_backend = kwargs.get('moe_backend', 'AUTO')
         architecture = pretrained_config.architectures[
             0] if pretrained_config.architectures else ""
@@ -921,8 +945,33 @@ class ModelConfig(Generic[TConfig]):
                 getattr(pretrained_config, "quantization_config", None),
                 source_file="hf_quant_config.json",
             )
+            if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+                require_deepseek_v4_routed_moe_layout = (
+                    cls._has_deepseek_v4_layer_only_modelopt_quant_config(
+                        quant_config_file))
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
                 normalized, checkpoint_dir, moe_backend_hint)
+            hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                      None)
+            if quant_config.quant_algo is None and hf_quant_config is not None:
+                hf_quant_config, hf_layer_quant_config = cls.load_hf_quant_config(
+                    hf_quant_config,
+                    moe_backend_hint,
+                    checkpoint_dir=checkpoint_dir)
+                if hf_quant_config.quant_algo is not None:
+                    logger.info(
+                        "Using quantization_config from config.json as global "
+                        "quantization because hf_quant_config.json does not set "
+                        "a global quant_algo.")
+                    quant_config = hf_quant_config
+                    if hf_layer_quant_config is not None:
+                        if layer_quant_config is None:
+                            layer_quant_config = hf_layer_quant_config
+                        else:
+                            layer_quant_config = {
+                                **hf_layer_quant_config,
+                                **layer_quant_config,
+                            }
         # quantized ckpt in other formats
         elif getattr(pretrained_config, "quantization_config",
                      None) is not None:
@@ -943,8 +992,12 @@ class ModelConfig(Generic[TConfig]):
 
         if architecture in _DEEPSEEK_V4_ARCHITECTURES:
             layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
-                pretrained_config, checkpoint_dir, moe_backend,
-                layer_quant_config, kwargs.get('spec_config', None))
+                pretrained_config,
+                checkpoint_dir,
+                kwargs['moe_backend'],
+                layer_quant_config,
+                kwargs.get('spec_config', None),
+                require_layout=require_deepseek_v4_routed_moe_layout)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
