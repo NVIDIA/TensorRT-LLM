@@ -109,7 +109,7 @@ def test_nvfp4_w4a16_linear_forward(mnk):
             quant_config=qc,
         )
 
-    assert isinstance(linear.linear_method, NVFP4W4A16LinearMethod)
+    assert isinstance(linear.quant_method, NVFP4W4A16LinearMethod)
 
     bs_unswizzled = bs_fp8.view(torch.float8_e4m3fn)
     input_scale_ckpt = torch.tensor([1.0 / (FP8_MAX * E2M1_MAX)])
@@ -190,7 +190,7 @@ def test_w4a4_vs_w4a16_output_comparison(mnk):
             dtype=dtype,
             quant_config=qc,
         )
-    assert isinstance(l_w4a16.linear_method, NVFP4W4A16LinearMethod)
+    assert isinstance(l_w4a16.quant_method, NVFP4W4A16LinearMethod)
     l_w4a16.load_weights([dict(weight_dict)])
     l_w4a16 = l_w4a16.cuda()
 
