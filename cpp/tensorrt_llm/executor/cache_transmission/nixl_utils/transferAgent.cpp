@@ -324,6 +324,25 @@ NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
     TLLM_CHECK(mHandle);
 }
 
+NixlTransferStatus::~NixlTransferStatus() noexcept
+{
+    if (mRawAgent != nullptr && mHandle != nullptr)
+    {
+        try
+        {
+            mRawAgent->releaseXferReq(mHandle);
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw: %s", e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw unknown exception");
+        }
+    }
+}
+
 [[nodiscard]] MemoryDescs NixlHelper::coalesceMemoryDescs(MemoryDescs const& descs)
 {
     auto const& descVec = descs.getDescs();
@@ -489,6 +508,7 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
     while (true)
     {
         auto status = mRawAgent->getXferStatus(mHandle);
+        mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
         if (status == NIXL_SUCCESS)
         {
             return TransferState::kSUCCESS;
@@ -518,9 +538,21 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
     }
 }
 
+int NixlTransferStatus::getLastStatus() const noexcept
+{
+    return mLastStatus.load(std::memory_order_relaxed);
+}
+
+std::string NixlTransferStatus::getLastStatusStr() const
+{
+    return nixlEnumStrings::statusStr(static_cast<nixl_status_t>(getLastStatus()));
+}
+
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
-    return mRawAgent->getXferStatus(mHandle) == NIXL_SUCCESS;
+    auto status = mRawAgent->getXferStatus(mHandle);
+    mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
+    return status == NIXL_SUCCESS;
 }
 
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
@@ -588,10 +620,6 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     }
     mExtraParams.backends.push_back(mRawBackend);
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
-    mDRamSrcBuffer.resize(16);
-    mDRamDstBuffer.resize(16);
-    MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
-    registerMemory(descs);
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -812,9 +840,61 @@ bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs co
     return status == NIXL_SUCCESS;
 }
 
+void NixlTransferAgent::shutdown() noexcept
+{
+    if (mShutdown.exchange(true))
+    {
+        return;
+    }
+    TLLM_LOG_DEBUG("NixlTransferAgent::shutdown");
+
+    if (mRawAgent)
+    {
+        std::vector<std::string> remoteNames;
+        remoteNames.reserve(mRemoteVramRegionInfo.size());
+        for (auto const& [name, _] : mRemoteVramRegionInfo)
+        {
+            remoteNames.push_back(name);
+        }
+        for (auto const& name : remoteNames)
+        {
+            try
+            {
+                invalidateRemoteAgent(name);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_WARNING(
+                    "NixlTransferAgent::shutdown: invalidateRemoteAgent(%s) threw: %s", name.c_str(), e.what());
+            }
+            catch (...)
+            {
+            }
+        }
+    }
+
+    mExtraParams.backends.clear();
+    mRawBackend = nullptr;
+    try
+    {
+        mRawAgent.reset();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent::shutdown: ~nixlAgent threw: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent::shutdown: ~nixlAgent threw unknown exception");
+    }
+    mLocalVramRegionInfo.clear();
+    mRemoteVramRegionInfo.clear();
+}
+
 NixlTransferAgent::~NixlTransferAgent()
 {
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
+    shutdown();
 }
 
 NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
@@ -841,6 +921,22 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
         status = mRawAgent->createBackend("GDS", init, backend);
         if (status != NIXL_SUCCESS || !backend)
             TLLM_THROW("Failed to create NIXL GDS backend, status = %d", status);
+    }
+}
+
+NixlLoopbackAgent::~NixlLoopbackAgent()
+{
+    try
+    {
+        mRawAgent.reset();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlLoopbackAgent::~NixlLoopbackAgent: ~nixlAgent threw: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING("NixlLoopbackAgent::~NixlLoopbackAgent: ~nixlAgent threw unknown exception");
     }
 }
 

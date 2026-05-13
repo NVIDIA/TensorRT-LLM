@@ -8,6 +8,11 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 import os
 import threading
 import uuid
+
+# Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
+# (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
+# falls back to cuda_ipc / cuda_copy without affecting correctness).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -796,123 +801,126 @@ def run_transfer_test(
         gen_tp, gen_pp, gen_enable_dp, gen_managers, config, is_mla
     )
 
-    ctx_info_endpoint = ctx_tcs[0]._context_info_endpoint
+    try:
+        ctx_info_endpoint = ctx_tcs[0]._context_info_endpoint
 
-    # ===== 4. Create requests =====
-    ctx_handle_map: Dict[int, List] = {r: [] for r in range(ctx_world)}
-    gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
-    ctx_request_ids: List[int] = []
-    gen_request_ids: List[int] = []
-    ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
-    gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
+        # ===== 4. Create requests =====
+        ctx_handle_map: Dict[int, List] = {r: [] for r in range(ctx_world)}
+        gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
+        ctx_request_ids: List[int] = []
+        gen_request_ids: List[int] = []
+        ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
+        gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
 
-    sampling_params = SamplingParams()
+        sampling_params = SamplingParams()
 
-    for req_idx, req_len in enumerate(request_lengths):
-        unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
-        ctx_rid = req_idx * 2
-        gen_rid = req_idx * 2 + 1
-        ctx_request_ids.append(ctx_rid)
-        gen_request_ids.append(gen_rid)
+        for req_idx, req_len in enumerate(request_lengths):
+            unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+            ctx_rid = req_idx * 2
+            gen_rid = req_idx * 2 + 1
+            ctx_request_ids.append(ctx_rid)
+            gen_request_ids.append(gen_rid)
 
-        ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp else 0
+            ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp else 0
 
-        ctx_request = LlmRequest(
-            request_id=ctx_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                sampling_params._get_sampling_config()
-            ),
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
-        )
-        ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+            ctx_request = LlmRequest(
+                request_id=ctx_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+            )
+            ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
-        gen_request = LlmRequest(
-            request_id=gen_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                sampling_params._get_sampling_config()
-            ),
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-        )
-        gen_request.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=ctx_rid,
-            ctx_dp_rank=ctx_dp_rank,
-            ctx_info_endpoint=ctx_info_endpoint,
-            disagg_request_id=unique_rid,
-        )
+            gen_request = LlmRequest(
+                request_id=gen_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            )
+            gen_request.py_disaggregated_params = DisaggregatedParams(
+                ctx_request_id=ctx_rid,
+                ctx_dp_rank=ctx_dp_rank,
+                ctx_info_endpoint=ctx_info_endpoint,
+                disagg_request_id=unique_rid,
+            )
 
-        for rank in range(ctx_world):
-            tp_rank = rank % ctx_tp
-            should_handle = (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
-            if should_handle:
-                ctx_handle_map[rank].append((req_idx, ctx_request))
+            for rank in range(ctx_world):
+                tp_rank = rank % ctx_tp
+                should_handle = (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
+                if should_handle:
+                    ctx_handle_map[rank].append((req_idx, ctx_request))
 
+            for rank in range(gen_world):
+                tp_rank = rank % gen_tp
+                should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
+                if should_handle:
+                    gen_handle_map[rank].append((req_idx, gen_request))
+
+        # 5. Add sequences and gen receive first
         for rank in range(gen_world):
-            tp_rank = rank % gen_tp
-            should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
-            if should_handle:
-                gen_handle_map[rank].append((req_idx, gen_request))
+            for req_idx, req in gen_handle_map[rank]:
+                kv = _add_sequence(gen_managers[rank], req.py_request_id, req.prompt_len, use_v2)
+                if kv is not None:
+                    gen_kv_caches[rank].append(kv)
+                gen_tcs[rank].request_and_receive_async(req)
 
-    # 5. Add sequences and gen receive first
-    for rank in range(gen_world):
-        for req_idx, req in gen_handle_map[rank]:
-            kv = _add_sequence(gen_managers[rank], req.py_request_id, req.prompt_len, use_v2)
-            if kv is not None:
-                gen_kv_caches[rank].append(kv)
-            gen_tcs[rank].request_and_receive_async(req)
-
-    # 6. ctx send after
-    for rank in range(ctx_world):
-        for req_idx, req in ctx_handle_map[rank]:
-            kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len, use_v2)
-            if kv is not None:
-                ctx_kv_caches[rank].append(kv)
-            ctx_tcs[rank].respond_and_send_async(req)
-
-    # 7. Wait for completion (threaded, dist calls inside)
-    run_concurrent(ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True))
-    run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
-
-    # 8. Verify
-    verify_all_requests(
-        request_lengths=request_lengths,
-        ctx_managers=ctx_managers,
-        gen_managers=gen_managers,
-        ctx_tp=ctx_tp,
-        ctx_pp=ctx_pp,
-        gen_tp=gen_tp,
-        gen_pp=gen_pp,
-        ctx_enable_dp=ctx_enable_dp,
-        gen_enable_dp=gen_enable_dp,
-        ctx_request_ids=ctx_request_ids,
-        gen_request_ids=gen_request_ids,
-        is_mla=is_mla,
-        use_v2=use_v2,
-        max_attention_window_vec=max_attention_window_vec,
-        num_layers=num_layers,
-    )
-
-    # 9. Cleanup
-    if use_v2:
-        torch.cuda.current_stream().synchronize()
+        # 6. ctx send after
         for rank in range(ctx_world):
-            for kv in ctx_kv_caches[rank]:
-                kv.close()
-        for rank in range(gen_world):
-            for kv in gen_kv_caches[rank]:
-                kv.close()
+            for req_idx, req in ctx_handle_map[rank]:
+                kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len, use_v2)
+                if kv is not None:
+                    ctx_kv_caches[rank].append(kv)
+                ctx_tcs[rank].respond_and_send_async(req)
 
-    for tc in ctx_tcs:
-        if hasattr(tc, "transfer_worker") and tc.transfer_worker is not None:
-            tc.transfer_worker.shutdown()
-    for tc in gen_tcs:
-        if hasattr(tc, "transfer_worker") and tc.transfer_worker is not None:
-            tc.transfer_worker.shutdown()
+        # 7. Wait for completion (threaded, dist calls inside)
+        run_concurrent(
+            ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
+        )
+        run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
+
+        # 8. Verify
+        verify_all_requests(
+            request_lengths=request_lengths,
+            ctx_managers=ctx_managers,
+            gen_managers=gen_managers,
+            ctx_tp=ctx_tp,
+            ctx_pp=ctx_pp,
+            gen_tp=gen_tp,
+            gen_pp=gen_pp,
+            ctx_enable_dp=ctx_enable_dp,
+            gen_enable_dp=gen_enable_dp,
+            ctx_request_ids=ctx_request_ids,
+            gen_request_ids=gen_request_ids,
+            is_mla=is_mla,
+            use_v2=use_v2,
+            max_attention_window_vec=max_attention_window_vec,
+            num_layers=num_layers,
+        )
+
+        # 9. Cleanup
+        if use_v2:
+            torch.cuda.current_stream().synchronize()
+            for rank in range(ctx_world):
+                for kv in ctx_kv_caches[rank]:
+                    kv.close()
+            for rank in range(gen_world):
+                for kv in gen_kv_caches[rank]:
+                    kv.close()
+
+    finally:
+        for tc in ctx_tcs + gen_tcs:
+            try:
+                tc.shutdown()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

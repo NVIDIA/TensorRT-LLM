@@ -21,3 +21,12 @@ l0_dgx_b200_ds:
   # (1 MMLU sample, no GSM8K reference required). Validates the basic
   # forward path without disagg or EPLB complexity.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
+  # ------------- Disaggregated transfer component tests (multi-process) ---------------
+  - unittest/disaggregated/test_kv_transfer_mp.py
+  # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).
+  # A single wrapper case ran ~3581 s and brushed the outer pytest 3600 s
+  # per-test timeout; per-workflow shards give each ~12 combos a fresh budget.
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first and not ctx_first_sync"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first_sync"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"

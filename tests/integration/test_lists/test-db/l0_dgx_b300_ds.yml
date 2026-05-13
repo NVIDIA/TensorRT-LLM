@@ -20,6 +20,15 @@ l0_dgx_b300_ds:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python
+  # ------------- Disaggregated transfer component tests (multi-process) ---------------
+  - unittest/disaggregated/test_kv_transfer_mp.py
+  # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).
+  # A single wrapper case ran ~3581 s and brushed the outer pytest 3600 s
+  # per-test timeout; per-workflow shards give each ~12 combos a fresh budget.
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first and not ctx_first_sync"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first_sync"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
+  - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"
   # ------------- DeepSeek-V4 (4x B300, pre_merge) ---------------
   # B300's larger per-GPU memory (~288 GB) lets V4 EPLB and FP8 aggregate
   # smoke fit at TP=4. (Same tests at TP=8 would also fit on 8x B200, but a
