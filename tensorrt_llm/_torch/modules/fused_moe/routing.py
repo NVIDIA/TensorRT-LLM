@@ -1210,18 +1210,23 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
     ) -> tuple[int, int]:
         """Resolve DeepSeekV3 group settings from the routing method.
 
+        Looks up ``n_group`` and ``topk_group`` on
+        ``routing_method.routing_impl`` first (used by
+        ``DeepSeekV3MoeRoutingMethod``) and falls back to the routing method
+        itself (used by ``DeepSeekV4MoeRoutingMethod``, which stores the
+        group settings directly on the outer object).
+
         Example:
-            If ``routing_method.routing_impl`` stores ``n_group=8`` and
-            ``topk_group=4``, this helper returns ``(8, 4)``.
+            ``DeepSeekV3MoeRoutingMethod`` stores ``n_group``/``topk_group``
+            on its ``routing_impl``; ``DeepSeekV4MoeRoutingMethod`` stores
+            them directly. Either shape returns ``(n_group, topk_group)``.
         """
-        routing_impl = getattr(routing_method, "routing_impl", None)
-        if routing_impl is None or not hasattr(routing_impl,
-                                               "n_group") or not hasattr(
-                                                   routing_impl, "topk_group"):
+        source = getattr(routing_method, "routing_impl", None) or routing_method
+        if not hasattr(source, "n_group") or not hasattr(source, "topk_group"):
             raise ValueError(
-                "DeepSeekV3 perfect-router planning requires routing_method.routing_impl "
-                "to provide n_group and topk_group")
-        return routing_impl.n_group, routing_impl.topk_group
+                "DeepSeekV3 perfect-router planning requires routing_method "
+                "(or its routing_impl) to provide n_group and topk_group")
+        return source.n_group, source.topk_group
 
     def _project_targets(
         self,

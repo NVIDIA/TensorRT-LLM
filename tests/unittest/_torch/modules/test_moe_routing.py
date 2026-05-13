@@ -12,13 +12,14 @@ from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
-    BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod, DefaultMoeRoutingMethod,
+    BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod, LoadBalancedMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod, RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
-from tensorrt_llm._torch.modules.fused_moe.routing import \
-    get_cached_perfect_router_logits
+from tensorrt_llm._torch.modules.fused_moe.routing import (
+    DeepSeekV3PerfectRouterPlanner, get_cached_perfect_router_logits)
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 
@@ -348,6 +349,33 @@ def test_static_moe_routing():
             scales,
             torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
                          dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "routing_cls", [DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod])
+def test_perfect_router_resolve_group_config(routing_cls):
+    """Regression: planner must read n_group/topk_group from V3 and V4 routing.
+
+    DeepSeekV3MoeRoutingMethod nests the settings on ``routing_impl``;
+    DeepSeekV4MoeRoutingMethod stores them directly on the outer object.
+    Both shapes must resolve to the same ``(n_group, topk_group)``.
+    """
+    n_group, topk_group = 8, 4
+    common_kwargs = dict(top_k=8,
+                         n_group=n_group,
+                         topk_group=topk_group,
+                         routed_scaling_factor=1.0,
+                         callable_e_score_correction_bias=lambda: torch.zeros(
+                             64, dtype=torch.float32))
+    if routing_cls is DeepSeekV4MoeRoutingMethod:
+        common_kwargs["callable_tid2eid"] = lambda: torch.zeros(
+            0, dtype=torch.int32)
+        routing = routing_cls(**common_kwargs)
+    else:
+        routing = routing_cls(is_fused=False, **common_kwargs)
+
+    planner = DeepSeekV3PerfectRouterPlanner()
+    assert planner._resolve_group_config(routing) == (n_group, topk_group)
 
 
 # -----------------------------------------------------------------
