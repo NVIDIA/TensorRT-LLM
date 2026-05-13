@@ -46,6 +46,9 @@ from tensorrt_llm._torch.modules.fused_moe import (
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_flashinfer_nvfp4_sm12x import (
+    FlashInferNvfp4Sm12xFusedMoE,
+)
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
@@ -66,6 +69,7 @@ class MoeBackendType(str, Enum):
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
     MEGAMOE = "MEGAMOE_DEEPGEMM"
+    FLASHINFER_NVFP4SM12X = "FLASHINFER_NVFP4SM12X"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -77,6 +81,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
+        MoeBackendType.FLASHINFER_NVFP4SM12X: FlashInferNvfp4Sm12xFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -864,6 +869,35 @@ def should_skip_megamoe(
     return None
 
 
+def should_skip_flashinfer_nvfp4_sm12x(
+    backend_type: MoeBackendType,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+) -> Optional[str]:
+    """Check FlashInferNvfp4Sm12xFusedMoE constraints not covered by can_implement().
+
+    can_implement() already gates SM version, quant_algo, dtype_activation, and
+    swiglu_gptoss_style. This helper covers the additional EP / alltoall hard
+    rejects enforced in __init__ (b12x has no expert-parallel dispatch/combine
+    kernel).
+    """
+    if backend_type != MoeBackendType.FLASHINFER_NVFP4SM12X:
+        return None
+
+    if comm_method is not None or parallel_mode is not None:
+        return (
+            "FlashInferNvfp4Sm12xFusedMoE rejects expert parallelism / alltoall; "
+            f"got comm_method={comm_method}, parallel_mode={parallel_mode}."
+        )
+    if moe_tp_size != 1:
+        return (
+            f"FlashInferNvfp4Sm12xFusedMoE requires ep_size=1; "
+            f"got moe_tp_size={moe_tp_size}."
+        )
+    return None
+
+
 def should_skip_multi_gpu(
     parallel_mode: str,
     model_config: "MoeModelConfig",
@@ -970,8 +1004,12 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM and MEGAMOE do not support autotuner capture
-    if backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.MEGAMOE):
+    # DEEPGEMM, MEGAMOE, and FLASHINFER_NVFP4SM12X do not support autotuner capture
+    if backend_type in (
+        MoeBackendType.DEEPGEMM,
+        MoeBackendType.MEGAMOE,
+        MoeBackendType.FLASHINFER_NVFP4SM12X,
+    ):
         return False
 
     if use_flashinfer:
@@ -1050,6 +1088,7 @@ def get_quick_skip_reason(
                 model_config=model_config,
                 swiglu_gptoss_style=swiglu_gptoss_style,
             ),
+            lambda: should_skip_flashinfer_nvfp4_sm12x(backend_type),
         ]
         for check in skip_checks:
             skip_reason = check()

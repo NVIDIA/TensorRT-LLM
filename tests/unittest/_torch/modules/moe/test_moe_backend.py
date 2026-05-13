@@ -294,6 +294,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
     MoeBackendType.MEGAMOE,
+    MoeBackendType.FLASHINFER_NVFP4SM12X,
 ]
 
 # Data types to test
