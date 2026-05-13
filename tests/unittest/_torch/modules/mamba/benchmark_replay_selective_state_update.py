@@ -1479,7 +1479,6 @@ def _capture_group_graph(args, run_fn, reset_fn, group_iters: int) -> torch.cuda
             if args.l2_flush:
                 _l2_flush.fill_(0.0)
             run_fn()
-    torch.cuda.synchronize()
     return graph
 
 
@@ -1589,7 +1588,6 @@ def _time_kernel_cuda_graph(
     # still runs outside the graph.
     host_timing.start()
     g = _capture_group_graph(args, run_fn, reset_fn, group_iters)
-    torch.cuda.synchronize()
     host_timing.stop("graph_capture_ms")
 
     plan_cache_key = None if cupti_plan_key is None else (cupti_plan_key, group_iters)
