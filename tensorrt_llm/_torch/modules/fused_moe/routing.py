@@ -946,8 +946,14 @@ class BasePerfectRouterPlanner:
         the learned bias must be masked out before those logits are consumed.
         This helper mutates the routing-method instance so subsequent routing
         calls observe the zero-bias callable.
+
+        Routing methods that don't carry a learned bias (e.g.
+        ``DeepSeekV4MoeRoutingMethod`` with ``is_hashed=True`` returns ``None``
+        from its bias callable) have nothing to mask, so this becomes a no-op.
         """
         bias = routing_method.e_score_correction_bias
+        if bias is None:
+            return
         zero_bias = torch.zeros_like(bias, device=device)
         routing_method.callable_e_score_correction_bias = lambda zero_bias=zero_bias: zero_bias
 

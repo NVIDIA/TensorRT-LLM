@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     MiniMaxM2MoeRoutingMethod, RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
+from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     DeepSeekV3PerfectRouterPlanner, get_cached_perfect_router_logits)
 from tensorrt_llm._utils import mpi_rank
@@ -351,31 +352,137 @@ def test_static_moe_routing():
                          dtype=torch.float32))
 
 
+def _make_v3_routing(top_k, n_group, topk_group, num_experts):
+    """Build a DSv3 routing method (bias stored on routing_impl)."""
+    bias = torch.zeros(num_experts, dtype=torch.float32)
+    return DeepSeekV3MoeRoutingMethod(
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=1.0,
+        callable_e_score_correction_bias=lambda: bias,
+        is_fused=False,
+    )
+
+
+def _make_v4_routing(top_k, n_group, topk_group, num_experts, is_hashed):
+    """Build a DSv4 routing method.
+
+    ``is_hashed=True`` mirrors ``DeepseekV4Gate`` hashed gates, where the
+    bias callable returns ``None``. ``is_hashed=False`` returns a zero-bias
+    tensor, mirroring the dense gate path.
+    """
+    if is_hashed:
+        bias_callable = lambda: None  # noqa: E731
+    else:
+        bias = torch.zeros(num_experts, dtype=torch.float32)
+        bias_callable = lambda: bias  # noqa: E731
+    return DeepSeekV4MoeRoutingMethod(
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=1.0,
+        callable_e_score_correction_bias=bias_callable,
+        callable_tid2eid=lambda: torch.zeros(0, dtype=torch.int32),
+        is_hashed=is_hashed,
+    )
+
+
 @pytest.mark.parametrize(
     "routing_cls", [DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod])
 def test_perfect_router_resolve_group_config(routing_cls):
-    """Regression: planner must read n_group/topk_group from V3 and V4 routing.
+    """Unit regression: planner reads n_group/topk_group from V3 and V4 routing.
 
     DeepSeekV3MoeRoutingMethod nests the settings on ``routing_impl``;
     DeepSeekV4MoeRoutingMethod stores them directly on the outer object.
     Both shapes must resolve to the same ``(n_group, topk_group)``.
     """
     n_group, topk_group = 8, 4
-    common_kwargs = dict(top_k=8,
-                         n_group=n_group,
-                         topk_group=topk_group,
-                         routed_scaling_factor=1.0,
-                         callable_e_score_correction_bias=lambda: torch.zeros(
-                             64, dtype=torch.float32))
+    num_experts = 64
     if routing_cls is DeepSeekV4MoeRoutingMethod:
-        common_kwargs["callable_tid2eid"] = lambda: torch.zeros(
-            0, dtype=torch.int32)
-        routing = routing_cls(**common_kwargs)
+        routing = _make_v4_routing(top_k=8,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts,
+                                   is_hashed=False)
     else:
-        routing = routing_cls(is_fused=False, **common_kwargs)
+        routing = _make_v3_routing(top_k=8,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts)
 
     planner = DeepSeekV3PerfectRouterPlanner()
     assert planner._resolve_group_config(routing) == (n_group, topk_group)
+
+
+@pytest.mark.parametrize(
+    "routing_name",
+    ["v3", "v4_dense", "v4_hashed"],
+)
+def test_perfect_router_get_cached_logits_e2e(routing_name):
+    """End-to-end regression: synthesize perfect-router logits on CPU.
+
+    Exercises the full pipeline through ``get_cached_perfect_router_logits``:
+      - Group-aware planner reads n_group/topk_group correctly (V3 and V4
+        layouts).
+      - ``_force_zero_routing_bias_in_place`` handles both Tensor and
+        ``None`` bias values. DSv4 hashed gates return ``None`` from their
+        bias callable, which previously crashed with ``zeros_like(None)``.
+
+    The test is intentionally CPU-only so it can run in non-GPU CI.
+    """
+    n_group, topk_group = 8, 4
+    top_k = 8
+    num_experts = 64
+    num_tokens = 16
+    moe_ep_size = 1
+    ep_rank = 0
+    dtype = torch.float32
+    device = torch.device("cpu")
+
+    if routing_name == "v3":
+        routing = _make_v3_routing(top_k=top_k,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts)
+    elif routing_name == "v4_dense":
+        routing = _make_v4_routing(top_k=top_k,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts,
+                                   is_hashed=False)
+    else:  # v4_hashed
+        routing = _make_v4_routing(top_k=top_k,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts,
+                                   is_hashed=True)
+
+    # Isolate this case from the module-level cache populated by other tests.
+    moe_routing._PERFECT_ROUTER_LOGITS_CACHE.clear()
+
+    logits = get_cached_perfect_router_logits(num_tokens=num_tokens,
+                                              num_experts=num_experts,
+                                              experts_per_token=top_k,
+                                              moe_ep_size=moe_ep_size,
+                                              ep_rank=ep_rank,
+                                              device=device,
+                                              dtype=dtype,
+                                              routing_method=routing)
+
+    assert logits.shape == (num_tokens, num_experts)
+    assert logits.dtype == dtype
+    assert logits.device.type == "cpu"
+    # Cache hit on the second call must not crash either.
+    logits_2 = get_cached_perfect_router_logits(num_tokens=num_tokens,
+                                                num_experts=num_experts,
+                                                experts_per_token=top_k,
+                                                moe_ep_size=moe_ep_size,
+                                                ep_rank=ep_rank,
+                                                device=device,
+                                                dtype=dtype,
+                                                routing_method=routing)
+    assert torch.equal(logits, logits_2)
 
 
 # -----------------------------------------------------------------
