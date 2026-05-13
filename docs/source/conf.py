@@ -68,6 +68,7 @@ extensions = [
     'sphinx_togglebutton',
     'sphinxcontrib.mermaid',
     'trtllm_config_selector',
+    'trtllm_schema_assets',
 ]
 
 if HAS_CPP_XML:
