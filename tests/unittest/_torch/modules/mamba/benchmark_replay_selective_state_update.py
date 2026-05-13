@@ -68,7 +68,7 @@ NVTX traces.  Future agents: prefer reading this JSON over re-running nsys.
   {
     "metadata": {timestamp, cmd, tp_size, warmup, iters, variant, cupti},
     "results": {
-      "<key>": {median, p95, p99, n, [iters_us], [per_kernel]}
+      "<key>": {median, p95, p99, n, iters_us, [n_writes_per_iter], [per_kernel]}
     }
   }
 
@@ -87,7 +87,9 @@ Per-record fields:
     min(kernel_start_ns) across the iter's kernels — same convention as
     nsys-derived collect.py used to use.
   - n: number of timed iters that contributed.
-  - iters_us: list of length n, raw per-iter spans (only with --json-detailed).
+  - iters_us: list of length n, raw per-iter spans.
+  - n_writes_per_iter: for mix rows, list of length n with the number of
+    write-path slots in each timed iteration.
   - per_kernel: {<kernel_name>: {start_us: [...], end_us: [...]}} where
     timestamps are RELATIVE to that iter's first kernel start, in us.  Lets
     you see PDL overlap directly without an external profiler.  Only with
@@ -1361,8 +1363,8 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
                 slot["end_us"].append((r[2] - iter_start_ns) / 1000.0)
 
     out = _stats_from_spans(spans_us)
+    out["iters_us"] = spans_us
     if include_details:
-        out["iters_us"] = spans_us
         out["per_kernel"] = per_kernel
     return out
 
@@ -3076,17 +3078,20 @@ def _bench_config(
                 if stats is None:
                     args._skipped_cells.append(sweep_tag)
 
-                # Attach n_writes_per_iter for --json-detailed bucketing.
+                # Attach n_writes_per_iter when it is needed for scoring.
                 # For pure scenarios, n_writes is constant: 0 (nowrite) or
                 # batch (write), determined by scn["fill"] + mtp_len > max_window.
                 # For mix, scn carries the precomputed per-iter array.
                 per_iter_nw = None
-                if stats is not None and getattr(args, "json_detailed", False):
+                if stats is not None and (
+                    getattr(args, "json_detailed", False) or scn["fill"] is None
+                ):
                     eff_iters = scenario_iters if scenario_iters is not None else args.iters
                     if scn["fill"] is not None:
-                        # Pure scenario: constant n_writes for every iter.
-                        is_write = (scn["fill"] + mtp_len > max_window)
-                        per_iter_nw = [batch if is_write else 0] * eff_iters
+                        if getattr(args, "json_detailed", False):
+                            # Pure scenario: constant n_writes for every iter.
+                            is_write = (scn["fill"] + mtp_len > max_window)
+                            per_iter_nw = [batch if is_write else 0] * eff_iters
                     else:
                         # Mix scenario: slice off warmup, keep timed iters.
                         nw_full = scn.get("n_writes_per_iter")
@@ -3172,9 +3177,9 @@ def _print_row(
     """Print one summary row and optionally accumulate stats for JSON output.
 
     `stats` is a dict from _time_kernel: {median, p95, p99, n, iters_us,
-    [per_kernel]}.  The summary table only shows the headline percentiles.
-    JSON output captures median/p95/p99/n by default; with json_detailed=True
-    it also captures the per-iter and per-kernel data.
+    [n_writes_per_iter], [per_kernel]}.  The summary table only shows the
+    headline percentiles.  JSON output captures compact per-iter spans by
+    default; with json_detailed=True it also captures per-kernel data.
 
     When `jsonl_path` is provided, also appends one JSON line per row to the
     JSONL sidecar (crash-safe incremental persistence; lets a killed sweep
@@ -3198,7 +3203,8 @@ def _print_row(
             row_stats = stats
         else:
             row_stats = {
-                k: stats[k] for k in ("median", "p95", "p99", "n")
+                k: stats[k]
+                for k in ("median", "p95", "p99", "n", "iters_us", "n_writes_per_iter")
                 if k in stats
             }
             if "host_timing" in stats:
@@ -3232,7 +3238,7 @@ def _finish_result_job(args, job: dict) -> None:
         return
 
     per_iter_nw = job.get("per_iter_nw")
-    if per_iter_nw is not None and getattr(args, "json_detailed", False):
+    if per_iter_nw is not None:
         stats["n_writes_per_iter"] = per_iter_nw
 
     _print_row(
@@ -3823,10 +3829,10 @@ def _parse_args() -> argparse.Namespace:
         "--json-detailed",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="When --json-output is set, also include iters_us (raw per-iter "
-        "spans) and per_kernel (per-iter relative start/end timestamps for "
-        "each kernel) — useful for PDL overlap analysis but adds ~4 KB/cell. "
-        "Default off keeps records to ~40 bytes (median/p95/p99/n only).",
+        help="When --json-output is set, also include per_kernel "
+        "(per-iter relative start/end timestamps for each kernel). Compact "
+        "JSON always includes iters_us, and mix rows include "
+        "n_writes_per_iter. Default off keeps records compact.",
     )
     parser.add_argument(
         "--host-timing",
