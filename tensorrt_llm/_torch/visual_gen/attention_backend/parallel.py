@@ -116,6 +116,7 @@ class UlyssesAttention(AttentionBackend):
 
         # Caller passed pre-A2A (sharded) seq_len; the inner backend
         # reshapes by it, so hand it the post-A2A length instead.
+        kwargs["batch_size"] = batch_size
         kwargs["seq_len"] = seq_len
         kwargs["seq_len_kv"] = seq_len
 
@@ -146,6 +147,7 @@ class UlyssesAttention(AttentionBackend):
 
         # Caller passed pre-A2A (sharded) seq_lens; hand the inner
         # backend the post-A2A lengths instead.
+        kwargs["batch_size"] = batch_size
         kwargs["seq_len"] = seq_len_full
         kwargs["seq_len_kv"] = kv_seq_len_full
 

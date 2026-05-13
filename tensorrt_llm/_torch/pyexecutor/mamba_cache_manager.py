@@ -458,6 +458,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         # mamba cache index, maps request_id -> state indices
         self.mamba_cache_index: Dict[int, int] = {}
 
+        # Permanent slot shared by every CUDA-graph padding sentinel id
+        # (CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, one per
+        # draft length). Pool sizing must include +1 headroom for this;
+        # see MixedMambaHybridCacheManager.
+        self._padding_slot: int = self.mamba_cache_free_blocks.pop()
+
         # save intermediate state indices for requests
         self.intermediate_state_indices = torch.arange(max_batch_size,
                                                        dtype=torch.int32,
@@ -513,36 +519,44 @@ class PythonMambaCacheManager(BaseResourceManager):
         request_ids = context_ids + generation_ids
         self._prepare_mamba_cache_blocks(request_ids)
 
+    def _is_padding_sentinel(self, request_id: int) -> bool:
+        # cuda_graph_runner caches one dummy per runtime_draft_len value
+        # (see _get_padded_batch), so any id in the range of dummy request IDs
+        # may be live concurrently.
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+            CUDA_GRAPH_DUMMY_REQUEST_ID
+        max_dl = self.speculative_num_draft_tokens or 0
+        return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
+                CUDA_GRAPH_DUMMY_REQUEST_ID)
+
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        # Allocate a permanent slot for every dummy request ID, including
-        # the CUDA-graph padding sentinel. Padding entries in a batch all
-        # reference the same dummy request ID, so they share one slot via
-        # mamba_cache_index lookup in get_state_indices. This mirrors how
-        # MTP's per-draft-len padding dummies already behave (they use
-        # CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len, which was never
-        # filtered here) and keeps padding writes off every live
-        # request's slot, even under the overlap scheduler where a prior
-        # batch's completed requests linger in mamba_cache_index until
-        # _process_previous_batch runs.
-        if request_ids:
-            for r in request_ids:
-                if r not in self.mamba_cache_index:
-                    if len(self.mamba_cache_free_blocks) == 0:
-                        raise RuntimeError("run out of mamba cache blocks")
-                    block = self.mamba_cache_free_blocks.pop()
-                    self.mamba_cache_index[r] = block
+        # Sentinels alias to the shared _padding_slot; non-sentinel
+        # dummies (warmup, attention-DP idle padding) get their own
+        # slot and are freed individually.
+        if not request_ids:
+            return
+        for r in request_ids:
+            if r in self.mamba_cache_index:
+                continue
+            if self._is_padding_sentinel(r):
+                self.mamba_cache_index[r] = self._padding_slot
+            else:
+                if len(self.mamba_cache_free_blocks) == 0:
+                    raise RuntimeError("run out of mamba cache blocks")
+                block = self.mamba_cache_free_blocks.pop()
+                self.mamba_cache_index[r] = block
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
+        if request_id not in self.mamba_cache_index:
+            return
+        block = self.mamba_cache_index.pop(request_id)
+        # _padding_slot stays reserved; only non-sentinel blocks return.
+        if not self._is_padding_sentinel(request_id):
             self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self, request_ids: List[int],
                           is_padding: List[bool]) -> List[int]:
-        # Padding entries reuse the slot pre-allocated by their dummy
-        # request in add_dummy_requests; see that method for the
-        # overlap-scheduler rationale.
         return [self.mamba_cache_index[rid] for rid in request_ids]
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
@@ -857,12 +871,10 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
-        # Reserve one Mamba slot per possible CUDA-graph padding dummy
-        # (one per runtime_draft_len in 0..max_draft_len) so a full
-        # max_batch_size of real requests still leaves room for padding.
-        max_draft_len = (spec_config.max_draft_len
-                         if spec_config is not None else 0)
-        pool_size = max_batch_size + max_draft_len + 1
+        # +1 headroom for PythonMambaCacheManager._padding_slot, which
+        # is shared by every CUDA-graph padding sentinel regardless of
+        # max_draft_len.
+        pool_size = max_batch_size + 1
 
         MambaCacheManager.__init__(
             self,
@@ -879,7 +891,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
             execution_stream,
-            speculative_num_draft_tokens=(spec_config.max_draft_len
+            speculative_num_draft_tokens=(spec_config.tokens_per_gen_step - 1
                                           if spec_config is not None else None),
             model_type=model_type,
             use_replay_state_update=use_replay_state_update,
@@ -985,12 +997,71 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
-        layer_mask: Optional[List[bool]] = None,
+        layer_mask: Optional[
+            List[bool]] = None,  # this is the full attention layer mask
         is_estimating_kv_cache: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
+        # 3 kinds of layers:
+        # 1) Mamba layers (mamba_layer_mask is True)
+        # 2) Full attention layers (full_attention_layer_mask is True)
+        # 3) Not managed layers (both masks are False)
+        total_layers = len(mamba_layer_mask)
+        if layer_mask is None:
+            full_attention_layer_mask = [False] * total_layers
+        elif len(layer_mask) != total_layers:
+            raise ValueError(
+                f"layer_mask length ({len(layer_mask)}) must match "
+                f"mamba_layer_mask length ({total_layers})")
+        else:
+            full_attention_layer_mask = list(layer_mask)
+        layer_mask = [
+            mamba_layer_mask[i] or full_attention_layer_mask[i]
+            for i in range(total_layers)
+        ]
+        # PP sharding is done across all layers.
+        # This is called again in the super().__init__, but we want it to run first
+        # to set up mtp states before the C++ backend is initialized.
+        self.pp_layers, _ = get_pp_layers(
+            mamba_num_layers + num_layers,
+            mapping,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+        )
+        self.mamba_pp_layers = [
+            layer_idx for layer_idx in self.pp_layers
+            if mamba_layer_mask[layer_idx]
+        ]
+        self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        self.requests = []
+        # Seed externally visible mamba fields before any early return so that
+        # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
+        # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        self.ssm_state_dtype = mamba_ssm_cache_dtype
+
+        if self.local_num_mamba_layers == 0:
+            logger.info(
+                "No local mamba layers for this rank, skipping mamba cache initialization"
+            )
+            super().__init__(
+                kv_cache_config,
+                kv_cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=mapping,
+                dtype=dtype,
+                spec_config=spec_config,
+                layer_mask=full_attention_layer_mask,
+                is_estimating_kv_cache=is_estimating_kv_cache,
+            )
+            return
+
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
@@ -1006,7 +1077,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         nheads = nheads // tp_size
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
-        self.ssm_state_dtype = mamba_ssm_cache_dtype
         self.conv_state_dtype = mamba_cache_dtype
         self.ssm_count = math.prod(self.ssm_state_shape)
         self.conv_count = math.prod(self.conv_state_shape)
@@ -1037,18 +1107,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             kv_cache_config.enable_partial_reuse = False
 
-        full_attention_layer_mask = layer_mask.copy()
-
         kv_cache_config.max_attention_window = []
-        # 3 kinds of layers:
-        # 1) Mamba layers (mamba_layer_mask is True)
-        # 2) Full attention layers (full_attention_layer_mask is True)
-        # 3) Not managed layers (both masks are False)
-        total_layers = len(mamba_layer_mask)
-        layer_mask = [
-            mamba_layer_mask[i] or full_attention_layer_mask[i]
-            for i in range(total_layers)
-        ]
         for i in range(len(layer_mask)):
             if layer_mask[i]:
                 kv_cache_config.max_attention_window.append(
@@ -1070,21 +1129,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         for i, is_mamba in enumerate(mamba_layer_mask):
             if is_mamba:
                 per_layer_kv_heads[i] = 0
-
-        # PP sharding is done across all layers.
-        # This is called again in the super().__init__, but we want it to run first
-        # to set up mtp states before the C++ backend is initialized.
-        self.pp_layers, _ = get_pp_layers(
-            mamba_num_layers + num_layers,
-            mapping,
-            spec_config=spec_config,
-            layer_mask=layer_mask,
-        )
-        self.mamba_pp_layers = [
-            layer_idx for layer_idx in self.pp_layers
-            if mamba_layer_mask[layer_idx]
-        ]
-        self.local_num_mamba_layers = len(self.mamba_pp_layers)
 
         self._setup_mtp_intermediate_states(spec_config, max_batch_size)
 
@@ -1116,7 +1160,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ],
                                               dtype=torch.int32,
                                               device="cpu")
-        self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.layer_offsets[self.mamba_pp_layers[0]]][0]
 
@@ -1275,6 +1318,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
+        if self.local_num_mamba_layers == 0:
+            return
         self._prepare_resources(scheduled_batch)
 
     def is_speculative(self) -> bool:
@@ -1284,6 +1329,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                             attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor,
                             state_indices: Optional[torch.Tensor] = None):
+        if self.local_num_mamba_layers == 0:
+            return
         # Note: cannot use @torch.compile here because all_ssm_states and
         # all_conv_states are dtype-reinterpreted views of the C++ pool
         # (uint8 -> typed), and aot_autograd does not support mutations on
@@ -1382,6 +1429,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:
+        if self.local_num_mamba_layers == 0:
+            return
         block_indices = []
         for req in self.requests:
             if req.is_context_finished:
@@ -1485,7 +1534,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
         if self.spec_config is not None:
-            speculative_num_draft_tokens = self.spec_config.max_draft_len
+            # DFlash/PARD use 2K query tokens per gen, so size by tokens_per_gen_step.
+            speculative_num_draft_tokens = self.spec_config.tokens_per_gen_step - 1
             num_local_mamba_layers = len(self.mamba_pp_layers)
 
             # Legacy SSM intermediate buffer is only needed when replay is

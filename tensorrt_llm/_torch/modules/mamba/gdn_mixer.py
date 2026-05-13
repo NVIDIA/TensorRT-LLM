@@ -466,7 +466,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = kwargs["num_decodes"]
 
         if is_target_verify:
-            draft_token_num = spec_metadata.max_draft_len + 1
+            draft_token_num = spec_metadata.max_total_draft_tokens + 1
             assert num_decodes > 0
             assert mixed_qkv.shape[0] == num_decodes * draft_token_num
             assert a.shape[0] == num_decodes * draft_token_num
@@ -634,7 +634,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
             if is_target_verify:
-                draft_token_num = spec_metadata.max_draft_len + 1
+                draft_token_num = spec_metadata.max_total_draft_tokens + 1
                 assert num_decodes > 0
                 assert mixed_qkv_d.shape[0] == num_decodes * draft_token_num
                 assert a_d.shape[0] == num_decodes * draft_token_num
@@ -738,7 +738,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
                 ssm_states[state_indices_p] = last_recurrent_state
 
-            draft_token_num = spec_metadata.max_draft_len + 1
+            draft_token_num = spec_metadata.max_total_draft_tokens + 1
             query_d = query[:, num_prefill_tokens:, :, :].reshape(
                 num_decodes, draft_token_num, self.num_k_heads // self.attn_tp_size, self.head_k_dim
             )

@@ -85,6 +85,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Optional
 
 import click
 import torch
@@ -190,7 +191,8 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
             for block_pos in range(num_computed_blocks + len(pending_load),
                                    len(block_ids)):
                 if len(chunks[block_pos]) == self.block_size:
-                    hashed_tokens = self._hash_tokens(chunks[block_pos])
+                    hashed_tokens = self._hash_tokens(chunks[block_pos],
+                                                      req.cache_salt_id)
 
                     file_path = self._file_path(hashed_tokens)
 
@@ -200,8 +202,11 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         return metadata
 
-    def _hash_tokens(self, tokens: list[int]) -> int:
-        return abs(hash(tuple(tokens)))
+    def _hash_tokens(self, tokens: list[int],
+                     cache_salt_id: Optional[int]) -> int:
+        # cache_salt_id must participate in the hash so that requests carrying
+        # different salts (or no salt) cannot collide on the same cache file.
+        return abs(hash((cache_salt_id, tuple(tokens))))
 
     def _file_path(self, hash_value: int) -> Path:
         return Path(self.cache_folder) / f"{hash_value}.pt"
@@ -233,7 +238,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         for chunk in remaining_chunks:
             # Only do full blocks.
             if len(chunk) == self.block_size:
-                hashed_tokens = self._hash_tokens(chunk)
+                hashed_tokens = self._hash_tokens(chunk, request.cache_salt_id)
 
                 file_path = self._file_path(hashed_tokens)
 
