@@ -1,9 +1,13 @@
+import os
 from dataclasses import dataclass, field
 from unittest import TestCase
 from unittest.mock import Mock
 
 import pytest
 import torch
+
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (

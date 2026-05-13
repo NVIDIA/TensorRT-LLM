@@ -156,6 +156,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
+
     def _create_kv_slice(
         self,
         req: LlmRequest,
