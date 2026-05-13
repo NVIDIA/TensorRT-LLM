@@ -507,6 +507,19 @@ def create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    # MTP one-model on hybrid linear models: the target's
+    # CppMambaHybridCacheManager already covers MTP attention layers in the
+    # unified pool via extract_mamba_kv_cache_params(spec_config=...). A
+    # separate draft cache would be redundant (and trips the zero-mamba
+    # assert in MambaCacheManager.__init__ because the draft slice is
+    # attention-only). Has to run after model_engine is built so the
+    # pretrained_config is available.
+    if (spec_config is not None
+            and spec_config.spec_dec_mode.is_mtp_one_model()
+            and is_hybrid_linear(
+                model_engine.model.model_config.pretrained_config)):
+        spec_config._allow_separate_draft_kv_cache = False
+
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     calibrator = get_calibrator()
