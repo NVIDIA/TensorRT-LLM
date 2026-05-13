@@ -568,14 +568,14 @@ serving = ["fastapi (>=0.104.0)", "peft", "pydantic (>=2.0.0)", "uvicorn (>=0.24
 
 [[package]]
 name = "cache-dit"
-version = "1.3.6"
+version = "1.3.7"
 description = "Cache-DiT: A PyTorch-native Inference Engine with Cache, Parallelism and Quantization for Diffusion Transformers."
 optional = false
 python-versions = ">=3.12"
 groups = ["main"]
 markers = "python_version == \"3.12\""
 files = [
-    {file = "cache_dit-1.3.6-py3-none-any.whl", hash = "sha256:05e7551b68c80f22555795ba36705c70e03752b9885ed5c550a10706c3899eb7"},
+    {file = "cache_dit-1.3.7-py3-none-any.whl", hash = "sha256:58d1db7f6ee2560af73bf4a6cbe2206ad09a0eec6ef227f32dff9064519373bb"},
 ]
 
 [package.dependencies]
@@ -1176,30 +1176,30 @@ all = ["cuda-toolkit[cufile] (==13.*) ; sys_platform == \"linux\"", "cuda-toolki
 
 [[package]]
 name = "cuda-core"
-version = "1.0.0"
+version = "1.0.1"
 description = "cuda.core: pythonic CUDA module"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_core-1.0.0-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b3d2535f58c46022719f267fa606a78d068d29182be99de172624758500d4db3"},
-    {file = "cuda_core-1.0.0-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c46ffa16ba694cd6782f9f74dc87e72cb66561510c69d2b00defd9e7720ea75c"},
-    {file = "cuda_core-1.0.0-cp310-cp310-win_amd64.whl", hash = "sha256:85b213cdf6a43fc59231ba34d9ed4d15f280a49d4262e2066e400459f76c4d8a"},
-    {file = "cuda_core-1.0.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:41cbf16ad9090741b7411040ec1739eb3758fc2eb2cc1edb5f4a860d8ab77d50"},
-    {file = "cuda_core-1.0.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4d69e60db6459abdae66779fc1566909c274cf1f478b0b9ef03c9b53feba557b"},
-    {file = "cuda_core-1.0.0-cp311-cp311-win_amd64.whl", hash = "sha256:e396aa363dba5808dd74013a7aa1fa612743e681e056e861173055f17187d082"},
-    {file = "cuda_core-1.0.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aad2d101ed4df242f724f042b98918a17a89d7d879fc20804187bdb568e1ba52"},
-    {file = "cuda_core-1.0.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f88d80b7b63193e73c0c77d02a672c4aee416224d25a8f9a00ecfe47be7b1a07"},
-    {file = "cuda_core-1.0.0-cp312-cp312-win_amd64.whl", hash = "sha256:ce25c10f075e0b6cb668e1a68939b33bd762412fa620988ee043688a4b4850dd"},
-    {file = "cuda_core-1.0.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:22a9e0cad660c484cba4fd61bddaa8276773aa856dc1398980aa2c1e90d63fd2"},
-    {file = "cuda_core-1.0.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2a97a55e13227365412568394be8c1a85e24c60b56bc44c45333df71fcf01bcd"},
-    {file = "cuda_core-1.0.0-cp313-cp313-win_amd64.whl", hash = "sha256:0f2244f5acabbc2f4916bf5101a2694e284457967d897032cc20b096222dc1a2"},
-    {file = "cuda_core-1.0.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b59b1a6554119756a68946eca1f0fd2156f0ab4b38f49ba828370bf336a079b9"},
-    {file = "cuda_core-1.0.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:41840d028b8f3eb86ed2dc035527b598fa95223ecc2b8b045be5f5b740bc6b09"},
-    {file = "cuda_core-1.0.0-cp314-cp314-win_amd64.whl", hash = "sha256:085df8962e74885c1b342f959bbc43d5580c38bcd24deef262a3d11a759856a1"},
-    {file = "cuda_core-1.0.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7f77963b3a047f39c3898771b8e0eebd7717be84d08d58241a137af60e40583a"},
-    {file = "cuda_core-1.0.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f652119ce74d66a493f6b2b8454741de0a3c7c3791a6fc788a9527f953eec188"},
-    {file = "cuda_core-1.0.0-cp314-cp314t-win_amd64.whl", hash = "sha256:9cdfa2f664536e50b441c2fc1ae7f02a2d86f02b924f9b6622903557cf92725b"},
+    {file = "cuda_core-1.0.1-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d9632db74eceb1cd72a7c95b61a5e4cfb9cc2291de0503e170334d936cab3316"},
+    {file = "cuda_core-1.0.1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:46690b0864417a5f2f9a7d10408e2570cbacae195c890a41286701eefb01ba79"},
+    {file = "cuda_core-1.0.1-cp310-cp310-win_amd64.whl", hash = "sha256:1693fae113604cf9c114bfe3da15a15981f9d44ae78ecceb0b23e24c628ad19b"},
+    {file = "cuda_core-1.0.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3effd11283bc46fd06348c2fd18a0941ba7718a6f447343858c944c1a93a6dab"},
+    {file = "cuda_core-1.0.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1934517ff8a9dcd21b3f4a28e15e12643164b7d3ec187a4ee7560e22fd2dfc17"},
+    {file = "cuda_core-1.0.1-cp311-cp311-win_amd64.whl", hash = "sha256:95c91d434a9baca066646cefa577227385104670a02fbe8e3defaadda84becf5"},
+    {file = "cuda_core-1.0.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6816dc020aee6103d8071bc02d8e4e1d91f2b49596f666896d608d92224d79d1"},
+    {file = "cuda_core-1.0.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:be7b65311bf78964b7905adbf3c0f8f717d432f2854dc45169277729bf60f1e2"},
+    {file = "cuda_core-1.0.1-cp312-cp312-win_amd64.whl", hash = "sha256:1a5c1aa3b738a7599ea289498d038fe625d259fd7ab795394541eee58a8e29bc"},
+    {file = "cuda_core-1.0.1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c427e5025096d96fcd5092fdc85d5d5e4ac3dea007914e90472ed52f27220446"},
+    {file = "cuda_core-1.0.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b392178202c652368883dbe3773cee14f3e1ed6b8bf45d1a1bcdd37c73604e06"},
+    {file = "cuda_core-1.0.1-cp313-cp313-win_amd64.whl", hash = "sha256:b99e3ca9bf3bd2c7d3028e5dc541b00e432e21373816889cdf2722b675bd9be8"},
+    {file = "cuda_core-1.0.1-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e9b0f115a68f2f84c0f6d9b7e863a29517f6dfe5f7b7d07d1d9da8904754e9a2"},
+    {file = "cuda_core-1.0.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:af2db9e50e81d73e4f0b72ad279d0a9c789372393938fe75c17236b9ed974d7d"},
+    {file = "cuda_core-1.0.1-cp314-cp314-win_amd64.whl", hash = "sha256:29783ba03d36960b6612b15ff97123e88cfadfb7b1884f3581839f6bfba4b29f"},
+    {file = "cuda_core-1.0.1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4410bf1ef15c2ec23dccc302da76893c9354b530dee422e3277b116231bf5fe1"},
+    {file = "cuda_core-1.0.1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e0f1324486bb90be6bde28bd0afbaf78a38827948d37f93f90318a01da8a3f8c"},
+    {file = "cuda_core-1.0.1-cp314-cp314t-win_amd64.whl", hash = "sha256:180bc808166483b0d6658a7c0d3f1312083b220f301de49476c1bc459cc46cf8"},
 ]
 
 [package.dependencies]
@@ -2151,14 +2151,14 @@ typing = ["types-PyYAML", "types-simplejson", "types-toml", "types-tqdm", "types
 
 [[package]]
 name = "idna"
-version = "3.14"
+version = "3.15"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "idna-3.14-py3-none-any.whl", hash = "sha256:e677eaf072e290f7b725f9acf0b3a2bd55f9fd6f7c70abe5f0e34823d0accf69"},
-    {file = "idna-3.14.tar.gz", hash = "sha256:466d810d7a2cc1022bea9b037c39728d51ae7dad40d480fc9b7d7ecf98ba8ee3"},
+    {file = "idna-3.15-py3-none-any.whl", hash = "sha256:048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8"},
+    {file = "idna-3.15.tar.gz", hash = "sha256:ca962446ea538f7092a95e057da437618e886f4d349216d2b1e294abfdb65fdc"},
 ]
 
 [package.extras]
@@ -6134,14 +6134,14 @@ numpy = "*"
 
 [[package]]
 name = "sse-starlette"
-version = "3.4.3"
+version = "3.4.4"
 description = "SSE plugin for Starlette"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sse_starlette-3.4.3-py3-none-any.whl", hash = "sha256:bf8a90d76192062f01b55095593606bfc7edd0e3ad481339a6e16e7890bc9367"},
-    {file = "sse_starlette-3.4.3.tar.gz", hash = "sha256:a7f6d87cf482cf38b911c31075811c7f8b4efbada8ac9d5199a8e239fed513c9"},
+    {file = "sse_starlette-3.4.4-py3-none-any.whl", hash = "sha256:3f4dd50d8aed2771a091f3a83000323fc3844541c16b4fe585ae2420cc6df973"},
+    {file = "sse_starlette-3.4.4.tar.gz", hash = "sha256:07e0fa0460138baf25cdd5fb28683472c3995dc1642225191b3832d62526bcb0"},
 ]
 
 [package.dependencies]
@@ -7304,4 +7304,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6138be7bcfa5c0a04a402a080963774d8eb4d31953898b4f2a6f22f37df494cc"
+content-hash = "1a04cc0fd346e1a2b6ea42b7869a08d2876e6f6f55601cb7808b681b535ba073"

@@ -1316,7 +1316,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         --install-sh ${scriptInstallPathNode} \\
                         --script-prefix ${scriptLaunchPrefixPathLocal} \\
                         --srun-args ${scriptLaunchSrunArgsPathLocal} \\
-                        --split-group ${splitId}
+                        --split-group ${splitId} \\
+                        --stage-name ${stageName}
                     """
                 } else {
                     if(nodeCount > 1) {
@@ -2549,22 +2550,19 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    def testListCmd = testCmdLine.find { it.contains("--test-list=") }
+    def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
+    def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+    def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}'
+        --fail-signatures='${failSignaturesList}' \
+        ${testListArg} \
+        ${unfinishedTestArg}
     """
-
-    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
-    // fail the stage immediately without attempting any reruns
-    def rerunTestList = "${rerunDir}/rerun_0.txt"
-    if (fileExists(rerunTestList)) {
-        sh "cat ${rerunTestList}"
-        echo "There are some failed tests that cannot be rerun, skip the rerun step."
-        return true
-    }
 
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
@@ -2578,13 +2576,6 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
             validLineCount += count
         }
-    }
-    if (validLineCount > 5) {
-        echo "There are more than 5 failed ${testType} tests, skip the rerun step."
-        return true
-    } else if (validLineCount == 0) {
-        echo "No failed ${testType} tests need to be rerun, skip the rerun step."
-        return true
     }
 
     // Rerun tests
@@ -3879,42 +3870,42 @@ def launchTestJobs(pipeline, testFilter)
         2
     )
     // GB300 PerfSanity post-merge disaggregated
-    // // 2 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-    //     2,
-    //     8,
-    //     2
-    // )
-    // // 3 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-    //     2,
-    //     12,
-    //     3
-    // )
-    // // 5 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-    //     2,
-    //     20,
-    //     5
-    // )
-    // // 9 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-    //     2,
-    //     36,
-    //     9
-    // )
+    // 2 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        4,
+        8,
+        2
+    )
+    // 3 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
+        4,
+        12,
+        3
+    )
+    // 5 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
+        4,
+        20,
+        5
+    )
+    // 9 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
+        4,
+        36,
+        9
+    )
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
