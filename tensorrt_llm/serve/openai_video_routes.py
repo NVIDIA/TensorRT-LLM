@@ -95,10 +95,12 @@ class _VideoRoutesMixin:
             # the video payload — avoids HTTP body for clients that share lustre
             # with the server.
             if request.response_format == "video_path":
-                return JSONResponse(content={
-                    "video_id": video_id,
-                    "video_path": actual_output_path,
-                })
+                return JSONResponse(
+                    content={
+                        "video_id": video_id,
+                        "video_path": actual_output_path,
+                    }
+                )
 
             media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
 
