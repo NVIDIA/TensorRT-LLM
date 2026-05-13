@@ -288,6 +288,12 @@ public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
+
+    // Backend-specific reason for the last failure observed by wait(); empty when none.
+    [[nodiscard]] virtual std::string lastErrorMessage() const
+    {
+        return {};
+    }
 };
 
 struct BaseAgentConfig

@@ -68,9 +68,13 @@ public:
 
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
+    [[nodiscard]] std::string lastErrorMessage() const override;
+
 private:
     nixlAgent* mRawAgent{};
     nixlXferReqH* mHandle{};
+    // Cached NIXL status from the failure observed in wait(); NIXL_SUCCESS when no failure.
+    mutable nixl_status_t mLastStatus{NIXL_SUCCESS};
 };
 
 class NixlTransferAgent final : public BaseTransferAgent

@@ -149,12 +149,15 @@ struct NotificationSyncInfo
 
     std::string mAgentName;
     DataContext mContext;
+    // Sender's transfer result; receiver throws on false so it does not hang in waitForSyncInfo.
+    bool mSuccess{true};
 
     static void serialize(NotificationSyncInfo const& notificationSyncInfo, std::ostream& os)
     {
         namespace su = executor::serialize_utils;
         su::serialize(notificationSyncInfo.mAgentName, os);
         su::serialize(notificationSyncInfo.mContext.getTag(), os);
+        su::serialize(notificationSyncInfo.mSuccess, os);
     }
 
     static NotificationSyncInfo deserialize(std::istream& is)
@@ -162,15 +165,17 @@ struct NotificationSyncInfo
         namespace su = executor::serialize_utils;
         auto agentName = su::deserialize<decltype(mAgentName)>(is);
         auto contextTag = su::deserialize<decltype(mContext.getTag())>(is);
+        auto success = su::deserialize<decltype(mSuccess)>(is);
         DataContext context{contextTag};
-        return NotificationSyncInfo{agentName, context};
+        return NotificationSyncInfo{agentName, context, success};
     }
 
     static size_t serializedSize(NotificationSyncInfo const& notificationSyncInfo)
     {
         namespace su = executor::serialize_utils;
         return su::serializedSize(notificationSyncInfo.mAgentName)
-            + su::serializedSize(notificationSyncInfo.mContext.getTag());
+            + su::serializedSize(notificationSyncInfo.mContext.getTag())
+            + su::serializedSize(notificationSyncInfo.mSuccess);
     }
 };
 

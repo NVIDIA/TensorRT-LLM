@@ -139,14 +139,17 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
     TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName};
     auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
-    NotificationSyncInfo syncInfo{mRemoteAgentName, ctx};
+    TransferState transferState = status->wait();
+    bool const transferOk = (transferState == TransferState::kSUCCESS);
+    // Always notify (including on failure) so the receiver unblocks; mSuccess carries the result.
+    NotificationSyncInfo syncInfo{mRemoteAgentName, ctx, transferOk};
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    TransferState transferState = status->wait();
-    TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+    TLLM_CHECK_WITH_INFO(transferOk, "AgentConnection::send failed (size=%ld, remote=%s, %s)", size,
+        mRemoteAgentName.c_str(), status->lastErrorMessage().c_str());
 }
 
 void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) const
@@ -154,6 +157,8 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 
     NotificationSyncInfo syncInfo{mAgentName, ctx};
     mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
+    TLLM_CHECK_WITH_INFO(
+        syncInfo.mSuccess, "AgentConnection::recv failed: peer reported a transfer failure on the send side");
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
@@ -617,6 +622,8 @@ void AgentConnectionManager::waitForNotification(
                         if (notificationData.mContext.getTag() == expectedInfo.mContext.getTag()
                             && notificationData.mAgentName == expectedInfo.mAgentName)
                         {
+                            // Propagate sender-reported transfer result to caller.
+                            expectedInfo.mSuccess = notificationData.mSuccess;
                             erase = true;
                             notifIt = notifs.erase(notifIt);
                             if (notifs.empty())

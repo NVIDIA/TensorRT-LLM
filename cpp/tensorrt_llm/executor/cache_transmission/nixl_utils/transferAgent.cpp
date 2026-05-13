@@ -495,6 +495,10 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
         }
         else if (status != NIXL_IN_PROG)
         {
+            // Surface the actual NIXL status so failures are diagnosable upstream.
+            mLastStatus = status;
+            TLLM_LOG_ERROR(
+                "NixlTransferStatus::wait failed with NIXL status: %s", nixlEnumStrings::statusStr(status).c_str());
             return TransferState::kFAILURE;
         }
 
@@ -521,6 +525,15 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
     return mRawAgent->getXferStatus(mHandle) == NIXL_SUCCESS;
+}
+
+[[nodiscard]] std::string NixlTransferStatus::lastErrorMessage() const
+{
+    if (mLastStatus == NIXL_SUCCESS)
+    {
+        return {};
+    }
+    return "NIXL status: " + nixlEnumStrings::statusStr(mLastStatus);
 }
 
 [[nodiscard]] MemoryDescs NixlHelper::splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize)
