@@ -298,9 +298,9 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif issubclass(moe_cls, CutlassFusedMoE):
-        # CutlassFusedMoE and any of its subclasses (e.g. FlashInferNvfp4Sm12xFusedMoE)
-        # share the same constructor signature.
+    elif moe_cls in (CutlassFusedMoE, FlashInferNvfp4Sm12xFusedMoE):
+        # CuteDslFusedMoE and DeepGemmFusedMoE also subclass CutlassFusedMoE but
+        # have narrower constructors, so they take their own branches below.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
