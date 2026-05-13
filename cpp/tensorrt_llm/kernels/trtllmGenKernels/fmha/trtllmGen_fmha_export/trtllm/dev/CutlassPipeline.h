@@ -1366,10 +1366,12 @@ public:
                                                       ClusterShape clusterShape,
                                                       InitBarriers = {},
                                                       InitMasks = {},
-                                                      int32_t barInitWarpId = 0)
+                                                      int32_t barInitWarpId = 0,
+                                                      int32_t prodArvCnt = 1)
     : mPipeline{sharedStorage,
-                Params{Pipeline::ThreadCategory::Producer,            // unused for UTCMMA.1CTA
-                       1u,                                            // prod_cnt
+                Params{Pipeline::ThreadCategory::Producer, // unused for UTCMMA.1CTA
+                       reinterpret_cast<uint32_t const&>(
+                         prodArvCnt), // prod_cnt (1 per warp via elect_one)
                        reinterpret_cast<uint32_t const&>(consArvCnt), // cons_cnt
                        cute::block_rank_in_cluster(),                 // dst block id
                        barInitWarpId},
@@ -1386,7 +1388,7 @@ public:
           decltype(sharedStorage.empty_barrier_),
           Pipeline::Stages>(sharedStorage.full_barrier_,
                             sharedStorage.empty_barrier_,
-                            1u,
+                            prodArvCnt,
                             consArvCnt);
       }
     }
@@ -1460,6 +1462,7 @@ private:
 template <int NumStages,
           bool UsesCpAsyncBarrierArrive = false,
           bool UsesFenceBeforeProdCommit = false,
+          bool UsesUmmaProducerCommit = false,
           class AtomThrShapeMNK = cute::Shape<cute::_1, cute::_1, cute::_1>>
 class CutlassUmmaConsumerAsyncPipeline {
   // The CUTLASS pipeline.
@@ -1477,6 +1480,8 @@ public:
 
 public:
   // Ctor.
+  // prodCnt: number of producer arrives expected (for LDS+STTM producers)
+  // consCnt: number of consumer arrives expected (for MMA consumers), default 1 for backward compat
   template <typename ClusterShape,
             typename InitBarriers = cute::true_type,
             typename InitMasks = cute::true_type>
@@ -1486,7 +1491,8 @@ public:
                                                               ClusterShape clusterShape,
                                                               InitBarriers = {},
                                                               InitMasks = {},
-                                                              int32_t barInitWarpId = 0)
+                                                              int32_t barInitWarpId = 0,
+                                                              int32_t consCnt = 1)
     : mPipeline{sharedStorage,
                 // FIXME: ThreadCategory::Consumer is required for the pipeline to init the
                 // multicast mask. That mask is passed by consumer_release to
@@ -1494,12 +1500,13 @@ public:
                 // it differently for consumer and producer (i.e. in the Task).
                 Params{Pipeline::ThreadCategory::Consumer,
                        reinterpret_cast<uint32_t const&>(prodCnt), // prod_cnt
-                       1u,                                         // cons_cnt
+                       reinterpret_cast<uint32_t const&>(consCnt), // cons_cnt
                        0u,                                         // dst block id
                        barInitWarpId},
                 clusterShape,
                 /*InitBarriers=*/cute::false_type{},
-                InitMasks{}} {
+                InitMasks{}}
+    , mBlockIdMask{0} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
       // Initialize barriers. Doing this here instead of in cutlass avoids unnecessary shuffle of
       // warp id for each pipeline and redundant predicates and branches.
@@ -1507,10 +1514,29 @@ public:
         cutlass::arch::detail::initialize_barrier_array_pair_aligned<
           decltype(sharedStorage.full_barrier_),
           decltype(sharedStorage.empty_barrier_),
-          Pipeline::Stages>(sharedStorage.full_barrier_, sharedStorage.empty_barrier_, prodCnt, 1u);
+          Pipeline::Stages>(sharedStorage.full_barrier_,
+                            sharedStorage.empty_barrier_,
+                            prodCnt,
+                            consCnt);
       }
     }
     // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
+    init_block_id_mask(clusterShape);
+  }
+
+  // Create the umma_peer_mask, which only encodes the current CTA pair in the cluster.
+  // This overrides the base implementation of init_block_id_mask, which creates the multicast
+  // mask that encodes all CTA pairs in the cluster.
+  // FIXME: we need to find a better way of dealing with this.
+  template <typename ClusterShape>
+  __device__ void init_block_id_mask(ClusterShape clusterShape,
+                                     dim3 blockIdInCluster = cute::block_id_in_cluster()) {
+    if constexpr (IsMma2Sm) {
+      auto cluster_layout = cute::make_layout(clusterShape);
+      mBlockIdMask = cutlass::detail::calculate_umma_peer_mask(clusterShape,
+                                                               AtomThrShapeMNK{},
+                                                               blockIdInCluster);
+    }
   }
 
   // Consumer release the barrier.
@@ -1540,12 +1566,22 @@ public:
   inline __device__ void producer_commit(PipelineState const& state) {
     if constexpr (UsesCpAsyncBarrierArrive) {
       mPipeline.producer_commit(state, cutlass::arch::cpasync_barrier_arrive);
+    } else if constexpr (UsesUmmaProducerCommit) {
+      uint64_t* smemPtr = reinterpret_cast<uint64_t*>(mPipeline.producer_get_barrier(state));
+      if (IsMma2Sm) {
+        cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr, mBlockIdMask);
+      } else {
+        cutlass::arch::umma_arrive(smemPtr);
+      }
     } else {
-      if constexpr (UsesFenceBeforeProdCommit) {
-        // Need a fence when we need to make the local STS visible to the other CTA in the CGA
+      if constexpr (IsMma2Sm && UsesFenceBeforeProdCommit) {
+        // Need a fence when we need to make the local stores visible to the other CTA in the CGA
         asm volatile("{\n\t"
                      "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;\n\t"
                      "}");
+      } else if constexpr (UsesFenceBeforeProdCommit) {
+        // Need a fence to make local stores visible to async proxy
+        cuda_ptx::fence_proxy_async();
       }
       mPipeline.producer_commit(state);
     }
@@ -1568,6 +1604,10 @@ public:
 private:
   // The pipeline.
   Pipeline mPipeline;
+  // The blockId mask.
+  uint16_t mBlockIdMask;
+  // Does it use 2CTA UTCMMA ?
+  static constexpr bool IsMma2Sm = cute::size(AtomThrShapeMNK{}) > 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

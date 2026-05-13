@@ -6,8 +6,7 @@ from typing import TextIO
 import torch.nn as nn
 from torch.fx import GraphModule
 
-from ....logger import Singleton
-from .logger import ADLogger
+from .logger import ADLogger, Singleton
 
 
 def _get_dtype_or_type(val):

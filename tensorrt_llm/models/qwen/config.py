@@ -14,6 +14,7 @@
 # limitations under the License.
 from typing import Optional, Union
 
+from ..._utils import get_hf_rope_theta
 from ...layers import MoeConfig
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
@@ -138,7 +139,7 @@ class QWenConfig(PretrainedConfig):
             rotary_base = getattr(hf_config, "rotary_emb_base", 10000.0)
         else:
             rms_norm_eps = hf_config.rms_norm_eps
-            rotary_base = getattr(hf_config, "rope_theta", 100000.0)
+            rotary_base = get_hf_rope_theta(hf_config, 100000.0)
 
         num_labels = 1
         if hf_config.architectures[0] == "Qwen2ForSequenceClassification":

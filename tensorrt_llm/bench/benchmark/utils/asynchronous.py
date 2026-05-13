@@ -132,7 +132,8 @@ class LlmManager:
 
                 input_ids = await loop.run_in_executor(
                     None, lambda: tokenizer.apply_chat_template(
-                        messages, add_generation_prompt=True))
+                        messages, add_generation_prompt=True, return_dict=False)
+                )
 
                 output: RequestOutput = self.llm.generate_async(
                     input_ids,

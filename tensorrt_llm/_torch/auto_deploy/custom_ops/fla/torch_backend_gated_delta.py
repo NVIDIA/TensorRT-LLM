@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,

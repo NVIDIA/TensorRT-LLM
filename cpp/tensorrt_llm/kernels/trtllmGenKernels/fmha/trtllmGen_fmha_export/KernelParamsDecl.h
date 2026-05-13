@@ -31,6 +31,8 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
   // The descriptor for O.
@@ -104,6 +106,9 @@ struct KernelParams {
   int32_t* ptrSkipSoftmaxStats;
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparseMla topK lengths with shape of [numTokensQ]
+  //  where each tokenQ has a corresponding topK length.
+  int32_t const* ptrSparseMlaTopKLens;
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
@@ -156,13 +161,13 @@ struct KernelParams {
   float mScaleSfO;
   // Threshold to decide whether warp skips softmax ops
   float mSkipSoftmaxThresholdScaleFactor;
+  // The sparse attention topK value.
+  int32_t mSparseAttnTopK;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
   int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-  // The sparseMla topK value.
-  int32_t mSparseMlaTopK;
   // The flag to use block sparse attention.
   bool mUseBlockSparseAttention;
   // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).

@@ -384,13 +384,17 @@ class PyResult:
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              multimodal_lengths: List[int]):
-        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+        """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
-            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
-            multimodal_lengths: List of token lengths for each multimodal item
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape
+                [total_tokens, hidden_dim].
+            multimodal_lengths: Current per-item split lengths.
         """
-        # Split the concatenated tensor by lengths to get per-item embeddings
+        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
+        # a prompt-side MM-token count that may include non-embedding
+        # special/framing tokens. This split needs per-item encoder-output
+        # embedding lengths instead.
         split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
 
         # Create a SharedTensorContainer handle for each split
@@ -955,6 +959,10 @@ def executor_request_to_llm_request(
         mrope_rotary_cos_sin = executor_request.mrope_config.mrope_rotary_cos_sin
         mrope_position_deltas = executor_request.mrope_config.mrope_position_deltas
 
+    agent_hierarchy = None
+    if getattr(executor_request, "py_scheduling_params", None) is not None:
+        agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
+
     llm_request = LlmRequest(
         request_id=req_id,
         max_new_tokens=executor_request.max_tokens,
@@ -1022,6 +1030,7 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
     )

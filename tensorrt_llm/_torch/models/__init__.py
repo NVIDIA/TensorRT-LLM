@@ -97,3 +97,15 @@ else:
     print(
         f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
+
+# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
+# Import silently on failure -- `get_model_architecture` in modeling_utils.py
+# raises a targeted "upgrade transformers" error only when the user actually
+# tries to load a Gemma4 model.
+try:
+    from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
+    from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
+
+    __all__.extend(["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"])
+except ImportError:
+    pass

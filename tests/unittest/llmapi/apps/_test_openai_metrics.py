@@ -38,7 +38,7 @@ def client(llm):
                                                       (False, 503)])
 def test_health(client, llm, is_healthy, response_code):
     if not is_healthy:
-        with patch.object(llm._executor, 'is_shutdown', return_value=True):
+        with patch.object(llm._executor, 'check_health', return_value=False):
             response = client.get("/health")
             assert response.status_code == response_code
     else:

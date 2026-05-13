@@ -56,8 +56,10 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
 {
     if (mUseTllmGen)
     {
+        auto [dataTypeK, dataTypeV] = unpack_kv_data_type(mFixedParams.dataTypeKv);
         mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mFixedParams.dataType, mFixedParams.dataTypeKv, mFixedParams.dataTypeOut));
+            new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV, mFixedParams.dataTypeOut,
+                mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0, mFixedParams.sageBlockSizeV));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
@@ -131,12 +133,17 @@ bool FmhaDispatcher::isSupported()
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
-        // Set the kernel type and mask type if sparseMLA is used.
-        if (mFixedParams.useSparseMLA)
+        // Sparse context attention uses a generation-style kernel with per-token sparse indices.
+        if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mSparseAttention
+                = (mFixedParams.useSparseMLA && mFixedParams.headSizeV == mFixedParams.headSize)
+                ? SparseType::DynamicTokenSparse
+                : SparseType::StaticTokenSparse;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+            // Generation-style kernels on long KV can pick MultiCtasKv cubins
+            tllmRunnerParams.mMultiCtasKvMode = true;
         }
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
@@ -238,21 +245,50 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
         tllmRunnerParams.mSfStartTokenIdx = 0;
+        // SageAttention scaling factors.
+        tllmRunnerParams.sageAttnSfsQPtr = runnerParams.qScalePtr;
+        tllmRunnerParams.sageAttnSfsKPtr = runnerParams.kScalePtr;
+        tllmRunnerParams.sageAttnSfsPPtr = nullptr;
+        tllmRunnerParams.sageAttnSfsVPtr = runnerParams.vScalePtr;
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         // For skip softmax
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
+
         tllmRunnerParams.stream = runnerParams.stream;
-        // Set the sparse attention parameters if sparseMLA is used.
-        if (mFixedParams.useSparseMLA)
+        // Sparse context attention: reuse the generation-style kernel with per-token sparse indices.
+        // Same approach as sparse MLA: keep original batch structure, tileSizeQ only groups heads.
+        // The kernel iterates over tokens via numCtasPerSeqQ when maxSeqLenQ > 1.
+        if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseMla = true;
-            tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
+            bool const useDynamicSparseMLA = runnerParams.sparse_params.sparse_mla_topk_lens != nullptr;
+            tllmRunnerParams.mSparseAttention
+                = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;
+            tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.num_sparse_topk;
+            tllmRunnerParams.ptrSparseMlaTopKLens = runnerParams.sparse_params.sparse_mla_topk_lens;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+            if (useDynamicSparseMLA)
+            {
+                TLLM_CHECK_WITH_INFO(runnerParams.sparse_params.sliding_window_kv_cache_pool != nullptr,
+                    "SWA KV pool must be set for dynamic sparse MLA.");
+                // Dynamic sparse MLA always has an SWA pool. The compressed pool is optional; when it
+                // is absent (ratio == 1), use SWA as kvPtr only to keep TG's primary TMA descriptor valid.
+                tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_kv_cache_pool != nullptr
+                    ? runnerParams.sparse_params.sparse_kv_cache_pool
+                    : runnerParams.sparse_params.sliding_window_kv_cache_pool;
+                tllmRunnerParams.slidingWindowKvPoolBasePtr = runnerParams.sparse_params.sliding_window_kv_cache_pool;
+            }
+            else
+            {
+                tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_kv_cache_pool;
+            }
+            // Enable MultiCtasKv so the autotuner can select GmemReduction cubins
+            tllmRunnerParams.mMultiCtasKvMode = true;
+            tllmRunnerParams.multiCtasKvScratchPtr = runnerParams.multiCtasKvScratchPtr;
+            tllmRunnerParams.multiCtasKvCounterPtr = runnerParams.multiCtasKvCounterPtr;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);

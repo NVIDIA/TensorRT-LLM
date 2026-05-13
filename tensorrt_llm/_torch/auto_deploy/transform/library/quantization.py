@@ -19,6 +19,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
+    extract_op_args,
     extract_weight_nodes,
     get_quantization_params_from_linear_node,
     is_bmm_op,
@@ -39,7 +40,7 @@ from ...utils.quantization_utils import (
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 try:
-    from .....quantization.utils.fp4_utils import float4_sf_dtype
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 
@@ -204,6 +205,10 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
+        if self.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(self.post_load_hook, weight_name=lin_weight.node_key)
+            )
 
         with gm.graph.inserting_before(node):
             scales = {}
@@ -212,8 +217,20 @@ class Quantization(BaseTransform):
 
         custom_args = self.build_custom_args_for_linear(scales)
 
+        # Extract sharding hints by name so we don't depend on positional layout.
+        [tp_mode, output_sizes, tp_min_local_shape, layer_type] = extract_op_args(
+            node, "tp_mode", "output_sizes", "tp_min_local_shape", "layer_type"
+        )
+        [inp, weight, bias] = extract_op_args(node, "input", "weight", "bias")
         node.target = self.target_op()
-        node.args = (*node.args, *custom_args)
+        node.args = (inp, weight, bias, *custom_args)
+        node.kwargs = {
+            **node.kwargs,
+            "tp_mode": tp_mode,
+            "output_sizes": output_sizes,
+            "tp_min_local_shape": tp_min_local_shape,
+            "layer_type": layer_type,
+        }
 
     def _insert_quantized_bmm(
         self,
@@ -869,6 +886,15 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 # Rename to match our buffer name
                 mod_prefix = weight_name.rsplit(".", 1)[0]
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    # NOTE: post_load_hook intentionally inherited as None from the base
+    # `Quantization`. UE8M0 conversion + TMA col-major layout for DeepGEMM is
+    # done atomically inside `_dispatch_trtllm_finegrained_fp8_to_deepgemm`
+    # (transform/library/fuse_quant.py) for every node we actually swap to
+    # `trtllm_fp8_deepgemm`. Doing it there guarantees the graph never carries
+    # a UE8M0 scale paired with a raw-FP32-scale op, which previously caused
+    # NaN whenever dispatch failed to swap (deepgemm op missing in build,
+    # fuse_finegrained_fp8_linear disabled, partial pipeline, etc.).
 
     def _apply(
         self,

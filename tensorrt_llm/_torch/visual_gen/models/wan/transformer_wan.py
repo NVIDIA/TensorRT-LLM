@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
-from transformers.modeling_utils import get_parameter_device
 
+from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
@@ -17,6 +17,15 @@ from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import get_parameter_device
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
+
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -102,7 +111,7 @@ class WanImageEmbedding(nn.Module):
         dtype = model_config.torch_dtype if model_config else None
         # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm1 = LayerNorm(
-            hidden_size=in_features, eps=1e-6, dtype=torch.float32, has_weights=True, has_bias=True
+            hidden_size=in_features, eps=1e-5, dtype=torch.float32, has_weights=True, has_bias=True
         )
 
         # Match HF FeedForward structure: Linear(in, in) → GELU → Linear(in, out)
@@ -136,7 +145,7 @@ class WanImageEmbedding(nn.Module):
         )
 
         self.norm2 = LayerNorm(
-            hidden_size=out_features, eps=1e-6, dtype=torch.float32, has_weights=True, has_bias=True
+            hidden_size=out_features, eps=1e-5, dtype=torch.float32, has_weights=True, has_bias=True
         )
 
         if pos_embed_seq_len is not None:
@@ -200,8 +209,18 @@ class WanTimeTextImageEmbedding(nn.Module):
                 image_embed_dim, dim, pos_embed_seq_len=pos_embed_seq_len, model_config=model_config
             )
 
-    def forward(self, timestep, encoder_hidden_states, encoder_hidden_states_image=None):
+    def forward(
+        self,
+        timestep,
+        encoder_hidden_states,
+        encoder_hidden_states_image=None,
+        timestep_seq_len=None,
+    ):
         timestep = self.timesteps_proj(timestep)
+
+        # Unflatten timestep if seq_len is provided
+        if timestep_seq_len is not None:
+            timestep = timestep.unflatten(0, (-1, timestep_seq_len))
 
         # Get time_embedder dtype
         time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
@@ -245,6 +264,7 @@ class WanBlock(nn.Module):
         head_dim = getattr(config, "attention_head_dim", 128)
         ffn_dim = getattr(config, "ffn_dim", 8960)
         eps = getattr(config, "eps", 1e-6)
+        cross_attn_norm = getattr(config, "cross_attn_norm", True)
 
         dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
@@ -287,9 +307,16 @@ class WanBlock(nn.Module):
             layer_idx=_layer_idx,
         )
 
-        self.norm2 = LayerNorm(
-            hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=True, has_bias=True
-        )
+        if cross_attn_norm:
+            self.norm2 = LayerNorm(
+                hidden_size=hidden_size,
+                eps=eps,
+                dtype=torch.float32,
+                has_weights=True,
+                has_bias=True,
+            )
+        else:
+            self.norm2 = nn.Identity()
         self.norm3 = LayerNorm(
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
@@ -344,9 +371,23 @@ class WanBlock(nn.Module):
         freqs_cos,
         freqs_sin,
     ):
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            self.scale_shift_table.float() + temb.float()
-        ).chunk(6, dim=1)
+        if temb.ndim == 4:
+            # temb: batch_size, seq_len, 6, hidden_size
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table.unsqueeze(0).float() + temb.float()
+            ).chunk(6, dim=2)
+            # batch_size, seq_len, 1, hidden_size -> batch_size, seq_len, hidden_size
+            shift_msa = shift_msa.squeeze(2)
+            scale_msa = scale_msa.squeeze(2)
+            gate_msa = gate_msa.squeeze(2)
+            c_shift_msa = c_shift_msa.squeeze(2)
+            c_scale_msa = c_scale_msa.squeeze(2)
+            c_gate_msa = c_gate_msa.squeeze(2)
+        else:
+            # temb: batch_size, 6, hidden_size
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table.float() + temb.float()
+            ).chunk(6, dim=1)
 
         normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
         normed = normed.to(x.dtype)
@@ -375,32 +416,35 @@ class WanBlock(nn.Module):
             encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
 
         # Text cross-attention
-        attn2_output = self.attn2(norm_x, encoder_hidden_states=encoder_hidden_states_text)
+        batch_size, seq_len = norm_x.shape[:2]
+        q, k, v = self.attn2.get_qkv(norm_x, encoder_hidden_states_text)
+        q, k = self.attn2.apply_qk_norm(q, k)
+        attn2_output = self.attn2._attn_impl(
+            q,
+            k,
+            v,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            kv_seq_len=encoder_hidden_states_text.shape[1],
+        )
 
-        # I2V: Additional image cross-attention if image embeddings are present
+        # I2V: image cross-attention
         if encoder_hidden_states_img is not None:
-            batch_size, seq_len = norm_x.shape[:2]
-
-            query = self.attn2.get_qkv(norm_x, None)[0]  # Q only
-            query, _ = self.attn2.apply_qk_norm(query, query)
-
             key_img = self.add_k_proj(encoder_hidden_states_img)
             value_img = self.add_v_proj(encoder_hidden_states_img)
             key_img = self.norm_added_k(key_img)
-
-            query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
-            key_img = key_img.view(
-                batch_size, encoder_hidden_states_img.shape[1], self.num_heads, self.head_dim
+            attn_img_output = self.attn2._attn_impl(
+                q,
+                key_img,
+                value_img,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                kv_seq_len=encoder_hidden_states_img.shape[1],
             )
-            value_img = value_img.view(
-                batch_size, encoder_hidden_states_img.shape[1], self.num_heads, self.head_dim
-            )
-
-            attn_img_output = self.attn2._attn_impl(query, key_img, value_img)
-
             attn2_output = attn2_output + attn_img_output
 
-        x = x + attn2_output
+        # Apply to_out once to the combined (text + image) attention output
+        x = x + self.attn2.to_out[0](attn2_output)
 
         # 3. Feed-forward
         normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
@@ -427,16 +471,34 @@ class WanTransformer3DModel(nn.Module):
             raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_mesh_size = attn2d_row_size * attn2d_col_size
         ulysses_size = vgm.ulysses_size if vgm else 1
-        if ulysses_size > 1 and num_heads % ulysses_size != 0:
+        use_attn2d = attn2d_mesh_size > 1
+        use_ulysses = ulysses_size > 1
+
+        if use_ulysses and num_heads % ulysses_size != 0:
             raise ValueError(
                 f"num_attention_heads ({num_heads}) must be divisible by "
                 f"ulysses_size ({ulysses_size})"
             )
-        self.use_ulysses = ulysses_size > 1
-        self.ulysses_size = ulysses_size
-        self.ulysses_pg = vgm.ulysses_group if vgm else None
-        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
+
+        if use_attn2d:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = attn2d_mesh_size
+            self.seq_parallel_pg = vgm.attn2d_mesh_group
+            self.seq_parallel_rank = vgm.attn2d_mesh_rank
+        elif use_ulysses:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = ulysses_size
+            self.seq_parallel_pg = vgm.ulysses_group
+            self.seq_parallel_rank = vgm.ulysses_rank
+        else:
+            self.use_seq_parallel = False
+            self.seq_parallel_size = 1
+            self.seq_parallel_pg = None
+            self.seq_parallel_rank = 0
 
         config = model_config.pretrained_config
 
@@ -588,11 +650,11 @@ class WanTransformer3DModel(nn.Module):
         **kwargs,
     ):
         """
-        Forward pass with optional Ulysses sequence parallelism.
+        Forward pass with optional parallelism (Ulysses head-sharding or Attention2D context parallelism).
 
-        With Ulysses enabled (ulysses_size > 1):
+        With parallelism enabled (seq_parallel_size > 1):
             1. Shard input sequence across ranks: [B, S] -> [B, S/P]
-            2. Each block's attention does internal all-to-all for full sequence
+            2. Each block's attention handles communication internally
             3. Gather output sequence: [B, S/P] -> [B, S]
 
         When TeaCache is enabled, TeaCacheHook intercepts and replaces this call.
@@ -607,33 +669,54 @@ class WanTransformer3DModel(nn.Module):
         # Patchify and flatten: [B, C, T, H, W] -> [B, S, hidden_size]
         x = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
 
-        # Shard sequence for Ulysses parallelism: [B, S] -> [B, S/P]
-        if self.use_ulysses:
+        # Shard sequence across ranks: [B, S] -> [B, S/P]
+        chunk_size = None
+        if self.use_seq_parallel:
             seq_len = x.shape[1]
-            if seq_len % self.ulysses_size != 0:
+            if seq_len % self.seq_parallel_size != 0:
                 raise ValueError(
-                    f"Sequence length ({seq_len}) is not divisible by ulysses_size ({self.ulysses_size}). "
-                    f"Adjust video dimensions or use a different ulysses_size."
+                    f"Sequence length ({seq_len}) is not divisible by "
+                    f"seq_parallel_size ({self.seq_parallel_size}). "
+                    f"Adjust video dimensions or parallelism settings."
                 )
 
-            chunk_size = seq_len // self.ulysses_size
-            x = x[:, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size, :]
+            chunk_size = seq_len // self.seq_parallel_size
+            chunk_start = self.seq_parallel_rank * chunk_size
+            chunk_end = chunk_start + chunk_size
+            x = x[:, chunk_start:chunk_end, :]
 
             # Shard RoPE frequencies to match sequence sharding
             # RoPE freqs shape: [B, S, ...], so shard along dim 1 (sequence dimension)
             if freqs_cos is not None and freqs_sin is not None:
-                freqs_cos = freqs_cos[
-                    :, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size
-                ]
-                freqs_sin = freqs_sin[
-                    :, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size
-                ]
+                freqs_cos = freqs_cos[:, chunk_start:chunk_end]
+                freqs_sin = freqs_sin[:, chunk_start:chunk_end]
 
         # Time and text/image embeddings
+        # Timestep shape: [batch_size] or [batch_size, seq_len]
+        if timestep.ndim == 2:
+            ts_seq_len = timestep.shape[1]
+            timestep = timestep.flatten()
+        else:
+            ts_seq_len = None
+
         temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(timestep, encoder_hidden_states, encoder_hidden_states_image)
+            self.condition_embedder(
+                timestep,
+                encoder_hidden_states,
+                encoder_hidden_states_image,
+                timestep_seq_len=ts_seq_len,
+            )
         )
-        temb_proj = temb_proj.view(-1, 6, self.config.hidden_size)
+        # Reshape temb_proj based on whether timesteps were expanded
+        if ts_seq_len is not None:
+            # batch_size, seq_len, 6, hidden_size
+            temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
+            # Shard per-patch temb_proj to match the local sequence chunk
+            if chunk_size is not None:
+                temb_proj = temb_proj[:, chunk_start:chunk_end]
+        else:
+            # batch_size, 6, hidden_size
+            temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:
@@ -649,7 +732,7 @@ class WanTransformer3DModel(nn.Module):
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
 
-        # Transformer blocks (attention handles all-to-all internally for Ulysses)
+        # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:
             x = block(
                 x,
@@ -660,15 +743,22 @@ class WanTransformer3DModel(nn.Module):
             )
 
         # Gather sequence from all ranks: [B, S/P] -> [B, S]
-        if self.use_ulysses:
+        if self.use_seq_parallel:
             # Ensure tensor is contiguous before all_gather
             x = x.contiguous()
-            x_list = [torch.zeros_like(x) for _ in range(self.ulysses_size)]
-            torch.distributed.all_gather(x_list, x, group=self.ulysses_pg)
+            x_list = [torch.zeros_like(x) for _ in range(self.seq_parallel_size)]
+            torch.distributed.all_gather(x_list, x, group=self.seq_parallel_pg)
             x = torch.cat(x_list, dim=1)
 
         # Output projection and unpatchify
-        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+        if temb.ndim == 3:
+            # batch_size, seq_len, hidden_size
+            shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift = shift.squeeze(2)
+            scale = scale.squeeze(2)
+        else:
+            # batch_size, hidden_size
+            shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
         x = self.norm_out(x) * (1 + scale) + shift
         x = x.to(hidden_states.dtype)
 

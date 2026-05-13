@@ -17,6 +17,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     CudaGraphConfig,
     ParallelConfig,
     PipelineConfig,
+    SageAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
@@ -72,6 +73,40 @@ class TestVisualGenArgsStrictValidation:
                 checkpoint_path="/tmp/model",
                 linear={"type": "default"},
             )
+
+
+class TestAttentionConfigSageFallback:
+    """Unsupported SageAttention options are logged and disabled."""
+
+    def test_sage_config_fallback_on_non_trtllm_backend(self):
+        with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
+            attention = AttentionConfig(
+                backend="VANILLA",
+                sage_attention_config=SageAttentionConfig(),
+            )
+
+        assert attention.sage_attention_config is None
+        critical.assert_called_once()
+        assert "requires backend='TRTLLM'" in critical.call_args.args[0]
+
+    def test_sage_config_fallback_when_unsupported(self):
+        with patch("tensorrt_llm._torch.visual_gen.config.logger.critical") as critical:
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                sage_attention_config=SageAttentionConfig(num_elts_per_blk_q=127),
+            )
+
+        assert attention.sage_attention_config is None
+        critical.assert_called_once()
+        assert "Unsupported self.sage_attention_config" in critical.call_args.args[0]
+
+    def test_supported_sage_configs(self):
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            sage_attention_config=SageAttentionConfig(),
+        )
+
+        assert attention.sage_attention_config is not None
 
 
 class TestVisualGenArgsCacheBackend:
@@ -187,6 +222,39 @@ class TestParallelConfigValidation:
         with pytest.raises(ValueError, match="exceeds world_size"):
             pc.validate_world_size(4)
 
+    def test_attn2d_config_basic(self):
+        pc = ParallelConfig(dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        assert pc.seq_parallel_size == 4
+        assert pc.total_parallel_size == 4
+        assert pc.n_workers == 4
+
+    def test_attn2d_with_cfg(self):
+        pc = ParallelConfig(dit_cfg_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        assert pc.seq_parallel_size == 4
+        assert pc.total_parallel_size == 8
+        assert pc.n_workers == 8
+
+    def test_attn2d_validate_world_size_passes(self):
+        pc = ParallelConfig(dit_cfg_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        pc.validate_world_size(8)
+
+    def test_attn2d_validate_world_size_fails(self):
+        pc = ParallelConfig(dit_cfg_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        with pytest.raises(ValueError, match="exceeds world_size"):
+            pc.validate_world_size(4)
+
+    def test_attn2d_asymmetric_mesh(self):
+        pc = ParallelConfig(dit_attn2d_row_size=1, dit_attn2d_col_size=4)
+        assert pc.seq_parallel_size == 4
+
+    def test_seq_parallel_size_ulysses(self):
+        pc = ParallelConfig(dit_ulysses_size=4)
+        assert pc.seq_parallel_size == 4
+
+    def test_attn2d_default_is_disabled(self):
+        pc = ParallelConfig()
+        assert pc.seq_parallel_size == 1
+
 
 class TestVisualGenArgsPickle:
     """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""
@@ -239,8 +307,8 @@ class TestDiffusionRequestBatchPrompt:
         assert len(req.prompt) == 2
 
 
-class TestVisualGenBatchInputParsing:
-    """Test that VisualGen.generate_async() correctly parses batch inputs.
+class TestVisualGenInputParsing:
+    """Test that VisualGen.generate_async() correctly parses inputs.
 
     Uses mocking to avoid spawning GPU worker processes.
     """
@@ -258,116 +326,59 @@ class TestVisualGenBatchInputParsing:
             vg.executor = MagicMock()
             return vg
 
-    def _make_params(self):
-        from tensorrt_llm.visual_gen import VisualGenParams
-
-        return VisualGenParams()
-
     def test_string_input(self):
         """String input → single-element list in DiffusionRequest."""
         vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
 
-        vg.generate_async(inputs="a cat", params=params)
+        vg.generate_async(inputs="a cat")
 
-        # Check the DiffusionRequest passed to enqueue_requests
         call_args = vg.executor.enqueue_requests.call_args[0][0]
         assert len(call_args) == 1
         assert call_args[0].prompt == ["a cat"]
-
-    def test_dict_input(self):
-        """Dict input → prompt wrapped in list + negative_prompt extracted."""
-        vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
-
-        vg.generate_async(
-            inputs={"prompt": "a cat", "negative_prompt": "blurry"},
-            params=params,
-        )
-
-        call_args = vg.executor.enqueue_requests.call_args[0][0]
-        assert call_args[0].prompt == ["a cat"]
-        assert call_args[0].negative_prompt == "blurry"
 
     def test_list_of_strings_input(self):
         """List of strings → batch prompt in single DiffusionRequest."""
         vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
 
-        vg.generate_async(inputs=["a sunset", "a city"], params=params)
+        vg.generate_async(inputs=["a sunset", "a city"])
 
         call_args = vg.executor.enqueue_requests.call_args[0][0]
         assert len(call_args) == 1
         req = call_args[0]
         assert req.prompt == ["a sunset", "a city"]
-        assert req.negative_prompt is None
 
-    def test_list_of_dicts_input(self):
-        """List of dicts → batch prompts with negative_prompt from first dict."""
+    def test_params_default_none(self):
+        """Omitting params passes None; executor materializes defaults later."""
         vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
 
-        vg.generate_async(
-            inputs=[
-                {"prompt": "a sunset", "negative_prompt": "dark"},
-                {"prompt": "a city"},
-            ],
-            params=params,
-        )
+        vg.generate_async(inputs="a cat")
 
         call_args = vg.executor.enqueue_requests.call_args[0][0]
         req = call_args[0]
-        assert req.prompt == ["a sunset", "a city"]
-        assert req.negative_prompt == "dark"
+        assert req.params is None
 
-    def test_mixed_list_input(self):
-        """Mixed list of strings and dicts → batch prompts extracted."""
+    def test_negative_prompt_via_params(self):
+        """negative_prompt is passed through params, not inputs."""
+        from tensorrt_llm.visual_gen import VisualGenParams
+
         vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
+        params = VisualGenParams(negative_prompt="blurry")
 
-        vg.generate_async(inputs=["a sunset", {"prompt": "a city"}], params=params)
+        vg.generate_async(inputs="a cat", params=params)
 
         call_args = vg.executor.enqueue_requests.call_args[0][0]
-        req = call_args[0]
-        assert req.prompt == ["a sunset", "a city"]
-
-    def test_conflicting_negative_prompt_raises(self):
-        """Conflicting per-item negative_prompt raises ValueError."""
-        vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
-
-        with pytest.raises(ValueError, match="Per-item negative_prompt is not supported"):
-            vg.generate_async(
-                inputs=[
-                    {"prompt": "a sunset", "negative_prompt": "dark"},
-                    {"prompt": "a city", "negative_prompt": "light"},
-                ],
-                params=params,
-            )
+        assert call_args[0].params.negative_prompt == "blurry"
 
     def test_empty_batch_raises(self):
         """Empty batch input raises ValueError."""
         vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
 
         with pytest.raises(ValueError, match="at least one item"):
-            vg.generate_async(inputs=[], params=params)
-
-    def test_missing_prompt_in_dict_raises(self):
-        """Dict without 'prompt' key raises ValueError."""
-        vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
-
-        with pytest.raises(ValueError, match="missing 'prompt'"):
-            vg.generate_async(
-                inputs=[{"negative_prompt": "dark"}],
-                params=params,
-            )
+            vg.generate_async(inputs=[])
 
     def test_invalid_input_raises(self):
         """Invalid input type raises ValueError."""
         vg = self._make_visual_gen_with_mock_executor()
-        params = self._make_params()
 
         with pytest.raises(ValueError, match="Invalid inputs type"):
-            vg.generate_async(inputs=12345, params=params)
+            vg.generate_async(inputs=12345)

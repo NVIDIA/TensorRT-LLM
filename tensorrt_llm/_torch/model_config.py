@@ -4,14 +4,13 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 import filelock
 import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
     load_pretrained_config)
@@ -19,13 +18,41 @@ from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          MoeLoadBalancerConfig)
+                                          KvCacheConfig, MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+if TYPE_CHECKING:
+    from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
+                                              SparseAttentionConfig,
+                                              SpeculativeConfig)
+
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
+
+
+def _unified_kv_pool_includes_mamba(
+        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
+    """Whether the KV cache pool will include mamba layers for a hybrid model.
+
+    True for the default Python ``MambaHybridCacheManager`` route, where
+    mamba state is allocated alongside attention KV inside one pool (with
+    zero KV heads on mamba layers). False for the V1-route managers used
+    when:
+
+      * disaggregated serving forces the C++ mamba manager
+        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
+      * one-model speculative decoding splits mamba and attention into
+        separate caches.
+
+    Single source of truth for the binding-side layer-counting decision; do
+    not duplicate the predicate at call sites.
+    """
+    use_disagg = is_disagg or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    use_spec = spec_config is not None
+    return not (use_disagg or use_spec)
 
 
 @contextlib.contextmanager
@@ -126,6 +153,8 @@ class ModelConfig(Generic[TConfig]):
     # cute dsl op configs
     use_cute_dsl_blockscaling_mm: bool = False
     use_cute_dsl_blockscaling_bmm: bool = False
+    use_cute_dsl_bf16_bmm: bool = False
+    use_cute_dsl_bf16_gemm: bool = False
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
@@ -311,8 +340,7 @@ class ModelConfig(Generic[TConfig]):
                         f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
                         f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
                     )
-            quant_config.kv_cache_quant_algo = json_quant_configs[
-                "kv_cache_quant_algo"]
+            quant_config.kv_cache_quant_algo = kv_cache_quant_algo
             for layer in mixed_quant_configs:
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
@@ -439,6 +467,19 @@ class ModelConfig(Generic[TConfig]):
                     "Supported: 8.")
 
             quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+        elif hf_quant_config.get("quant_method") == "nvfp4":
+            quant_config.quant_algo = QuantAlgo.NVFP4
+            group_size = hf_quant_config.get("group_size", 16)
+            assert group_size == 16, "NVFP4 only supports group_size=16"
+            quant_config.group_size = group_size
+            default_exclude = ['*.mlp.gate', 'lm_head']
+
+            # Merge HF config's modules_to_not_convert with default exclude_modules
+            if hf_exclude_modules is not None:
+                quant_config.exclude_modules = list(
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
+            else:
+                quant_config.exclude_modules = default_exclude
         return quant_config, layer_quant_config
 
     @staticmethod
@@ -523,8 +564,10 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                        use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -532,8 +575,10 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False
+                        use_cute_dsl_paged_mqa_logits = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        indexer_k_dtype = "fp8"
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -543,9 +588,12 @@ class ModelConfig(Generic[TConfig]):
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
                             use_cute_dsl_topk=use_cute_dsl_topk,
+                            use_cute_dsl_paged_mqa_logits=
+                            use_cute_dsl_paged_mqa_logits,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
-                            enable_heuristic_topk=enable_heuristic_topk)
+                            enable_heuristic_topk=enable_heuristic_topk,
+                            indexer_k_dtype=indexer_k_dtype)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -562,6 +610,13 @@ class ModelConfig(Generic[TConfig]):
         # Some checkpoints lack torch_dtype, populate with dtype
         pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
                                                 None)
+
+        # Prior to transformers 5, composite configs (e.g. Qwen2_5_VLConfig) delegated attribute
+        # lookups to their text sub-config, so accesses like `config.vocab_size` /
+        # `config.hidden_size` resolved transparently.
+        # 5.x removed that delegation, so eagerly mirror the text sub-config onto  the top-level
+        # config to keep downstream consumers working.
+        _mirror_text_subconfig_attrs(pretrained_config)
 
         # Apply model_kwargs to override config parameters if provided
         model_kwargs = kwargs.pop('model_kwargs', None)
@@ -636,9 +691,13 @@ class ModelConfig(Generic[TConfig]):
         model_config._frozen = True
         return model_config
 
-    def get_bindings_model_config(self,
-                                  tokens_per_block: Optional[int] = None
-                                  ) -> "ModelConfigCpp":
+    def get_bindings_model_config(
+        self,
+        is_disagg: bool = False,
+        tokens_per_block: Optional[int] = None,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        spec_config: Optional['SpeculativeConfig'] = None,
+    ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
@@ -670,6 +729,10 @@ class ModelConfig(Generic[TConfig]):
         num_attention_layers = self.get_num_attention_layers()
         if (self.spec_config is not None
                 and self.spec_config.spec_dec_mode.is_mtp_one_model()):
+            assert self.spec_config.num_nextn_predict_layers is not None, (
+                "num_nextn_predict_layers must be set from model config before building ModelConfig. "
+                "Ensure update_spec_config_from_model_config() has been called."
+            )
             num_layers += self.spec_config.num_nextn_predict_layers
             num_attention_layers += self.spec_config.num_nextn_predict_layers
 
@@ -693,6 +756,7 @@ class ModelConfig(Generic[TConfig]):
 
         num_key_value_heads = getattr(self.pretrained_config,
                                       "num_key_value_heads", num_heads)
+
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
@@ -796,10 +860,53 @@ class ModelConfig(Generic[TConfig]):
         else:
             return None
 
-    def get_num_attention_layers(self):
-        if is_nemotron_hybrid(self.pretrained_config):
-            return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif is_qwen3_hybrid(self.pretrained_config):
-            return get_qwen3_hybrid_num_attention_layers(self.pretrained_config)
-        else:
-            return self.pretrained_config.num_hidden_layers
+    def get_num_attention_layers(self) -> int:
+        """Number of full-attention layers in the model.
+
+        Pure model property: independent of which KV cache manager will run.
+        For non-hybrid models this equals num_hidden_layers. For hybrid Mamba
+        models (Nemotron-hybrid, Qwen3-hybrid) it returns only the attention
+        count derived from the layer pattern; mamba layers are reported by
+        ``get_num_mamba_layers``.
+        """
+        cfg = self.pretrained_config
+        if is_nemotron_hybrid(cfg):
+            return cfg.hybrid_override_pattern.count("*")
+        if is_qwen3_hybrid(cfg):
+            return get_qwen3_hybrid_num_attention_layers(cfg)
+        return cfg.num_hidden_layers
+
+    def get_num_mamba_layers(self) -> int:
+        """Number of Mamba / linear-attention layers (0 for non-hybrid)."""
+        cfg = self.pretrained_config
+        if is_nemotron_hybrid(cfg):
+            return cfg.hybrid_override_pattern.count("M")
+        if is_qwen3_hybrid(cfg):
+            return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
+                cfg)
+        return 0
+
+
+def _mirror_text_subconfig_attrs(
+        pretrained_config: transformers.PretrainedConfig) -> None:
+    """Mirror text sub-config attributes onto the parent config.
+
+    Composite configs (e.g. Qwen2_5_VLConfig) keep text-side fields like `vocab_size`,
+    `hidden_size`, `num_attention_heads`, etc. inside a `text_config` sub-config.
+    Prior to transformers 5, the parent config delegated attribute lookups there automatically;
+    that delegation was removed in 5.x.
+
+    Copying the sub-config's attributes onto the parent keeps downstream code (which accesses these
+    on the top-level config) working without having to learn about the composite layout.
+    """
+    text_config = getattr(pretrained_config, "text_config", None)
+    if text_config is None or not isinstance(text_config,
+                                             transformers.PretrainedConfig):
+        return
+    for key, value in vars(text_config).items():
+        if key.startswith("_"):
+            continue
+        try:
+            getattr(pretrained_config, key)
+        except AttributeError:
+            setattr(pretrained_config, key, value)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ public:
     /// @brief Perform any per-iteration bookkeeping
     virtual void refresh() = 0;
 
-    virtual bool verifyQueueIntegrity() = 0;
+    virtual bool verifyQueueIntegrity() const = 0;
 };
 
 struct ExpiringBlockComparator
@@ -95,7 +95,7 @@ public:
     // Making this public and virtual makes it possible to test.
     [[nodiscard]] virtual std::chrono::steady_clock::time_point::duration getTime() const;
 
-    bool verifyQueueIntegrity() override;
+    bool verifyQueueIntegrity() const override;
 
 private:
     /// @brief A fixed-size container supporting both non-negative and negative indexing.
@@ -109,6 +109,8 @@ private:
 
         T& operator[](KVCacheBlock::IdType id)
         {
+            TLLM_CHECK_WITH_INFO(id != KVCacheBlock::kPlaceholderBlockId,
+                "SWA sentinel placeholders are not part of the indexed free queues");
             return id >= 0 ? positive[id] : negative[-id];
         }
     };
