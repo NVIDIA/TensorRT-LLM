@@ -256,7 +256,12 @@ class AttentionMetadata:
         # The model executor sets seqlens to None initially.
         if self._seq_lens_kv is not None:
             self._seq_lens_kv = maybe_pin_memory(self._seq_lens_kv)
-            self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(non_blocking=True)
+            if self.is_cuda_graph and self._seq_lens_kv_cuda is not None:
+                self._seq_lens_kv_cuda.copy_(self._seq_lens_kv,
+                                             non_blocking=True)
+            else:
+                self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(
+                    non_blocking=True)
 
     @property
     def seq_lens_kv_cuda(self):
@@ -397,6 +402,78 @@ class AttentionMetadata:
         """
         Hook to be called when using helix parallelism.
         """
+
+    def create_cross_metadata(
+        self,
+        encoder_seq_lens: torch.Tensor,
+        enc_dec_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2,
+                                        None] = None,
+        *,
+        encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
+    ) -> "AttentionMetadata":
+        """Build a sub-metadata instance for cross-attention.
+
+        The returned metadata shares Q-side fields (``seq_lens``,
+        ``request_ids``, ``num_contexts``) with ``self`` (the decoder
+        self-attention metadata) and overrides the K/V-side with the encoder
+        lengths so that ``returned.is_cross is True``.
+
+        This is intended to be called by the runtime / unit tests once the
+        encoder lengths and cross-pool KV cache manager are known. The
+        returned object is a *new* metadata instance (not stored on
+        ``self.cross``); callers can attach it to ``self.cross`` if desired.
+
+        Args:
+            encoder_seq_lens: Per-request encoder sequence length (CPU
+                int32 tensor). On the first decoder context step this is
+                the full encoder length; on generation steps it should be
+                ``0`` (no new K/V tokens to add to the cross pool — the
+                encoder K/V are already cached).
+            enc_dec_kv_cache_manager: KV cache manager for the cross pool.
+                When ``None``, the returned metadata uses the stateless
+                (no-KV-cache) path (suitable for unit tests).
+            encoder_num_cached_tokens_per_seq: Per-request count of encoder
+                K/V tokens already present in the cross pool. ``None``
+                defaults to 0 (context phase, nothing cached yet).
+
+        Returns:
+            A new ``AttentionMetadata`` of the same subclass as ``self``,
+            with ``seq_lens_kv`` set to ``encoder_seq_lens`` so that
+            ``is_cross`` becomes ``True``.
+        """
+        cross_md = copy.copy(self)
+        cross_md._saved_tensors = {}
+        if self.is_cuda_graph:
+            # Cross-attention has K/V lengths from the encoder, while
+            # self-attention has K/V lengths from the decoder. Keep their
+            # CUDA graph metadata buffers separate so preparing cross metadata
+            # cannot overwrite self-attention sequence lengths.
+            cross_md.cuda_graph_buffers = Buffers()
+        cross_md.kv_cache_manager = enc_dec_kv_cache_manager
+        cross_md._seq_lens_kv = None
+        cross_md._seq_lens_kv_cuda = None
+        cross_md.cross = None
+        cross_md.seq_lens_kv = encoder_seq_lens
+        if encoder_num_cached_tokens_per_seq is not None:
+            from ..metadata import KVCacheParams
+            base_params = self.kv_cache_params
+            cross_md.kv_cache_params = KVCacheParams(
+                use_cache=base_params.use_cache if base_params is not None else
+                (enc_dec_kv_cache_manager is not None),
+                num_cached_tokens_per_seq=list(
+                    encoder_num_cached_tokens_per_seq),
+                block_ids_per_seq=base_params.block_ids_per_seq
+                if base_params is not None else None,
+                host_max_attention_window_sizes=base_params.
+                host_max_attention_window_sizes
+                if base_params is not None else None,
+                host_sink_token_length=base_params.host_sink_token_length
+                if base_params is not None else None,
+                num_extra_kv_tokens=base_params.num_extra_kv_tokens
+                if base_params is not None else 0,
+            )
+        cross_md.__post_init__()
+        return cross_md
 
     def update_for_spec_dec(self) -> None:
         """
@@ -705,6 +782,8 @@ class AttentionForwardArgs:
     attention_window_size: Optional[int] = None
     attention_mask_data: Optional[torch.Tensor] = None
     attention_sinks: Optional[torch.Tensor] = None
+    relative_attention_bias: Optional[torch.Tensor] = None
+    relative_attention_max_distance: int = 0
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None

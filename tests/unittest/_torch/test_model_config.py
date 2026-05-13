@@ -16,6 +16,7 @@ def make_pretrained_config(
     head_dim: int | None = None,
     num_hidden_layers: int = 1,
     vocab_size: int = 3000,
+    is_encoder_decoder: bool = False,
 ):
     # A minimal config object that provides the attributes used by
     # ModelConfig.get_bindings_model_config().
@@ -32,6 +33,7 @@ def make_pretrained_config(
         num_hidden_layers=num_hidden_layers,
         vocab_size=vocab_size,
         torch_dtype=torch.float16,
+        is_encoder_decoder=is_encoder_decoder,
     )
 
 
@@ -116,3 +118,14 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        )
+    )
+
+    assert model_config.is_encoder_decoder is True
