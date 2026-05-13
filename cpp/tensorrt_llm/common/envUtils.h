@@ -65,6 +65,11 @@ bool getEnvEnablePDL();
 // Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL();
 
+// Whether PDL is enabled for the trtllm-gen MoE pipeline kernels.
+// Disabled by default to avoid the disagg/ADP dispatch hang.
+// Set TRTLLM_ENABLE_TRTLLMGEN_MOE_PDL=1 to re-enable.
+bool getEnvEnableTrtllmgenMoePdl();
+
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
     cudaStream_t stream, Args&&... args)
@@ -79,6 +84,28 @@ inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 g
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    kernelConfig.attrs = attrs;
+    kernelConfig.numAttrs = 1;
+
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...));
+}
+
+// Like launchWithPdlWhenEnabled, but AND's the global PDL gate with a
+// per-subsystem gate. PDL is enabled only when both are true.
+template <typename KernelFn, typename... Args>
+inline void launchWithPdlWhenBothEnabled(char const* name, bool enableSubsys, KernelFn kernelFn, dim3 grid, dim3 block,
+    size_t dynamicShmSize, cudaStream_t stream, Args&&... args)
+{
+    bool const enablePdl = tensorrt_llm::common::getEnvEnablePDL() && enableSubsys;
+    cudaLaunchConfig_t kernelConfig;
+    kernelConfig.gridDim = grid;
+    kernelConfig.blockDim = block;
+    kernelConfig.dynamicSmemBytes = dynamicShmSize;
+    kernelConfig.stream = stream;
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enablePdl;
     kernelConfig.attrs = attrs;
     kernelConfig.numAttrs = 1;
 

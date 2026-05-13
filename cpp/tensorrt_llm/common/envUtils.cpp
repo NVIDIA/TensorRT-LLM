@@ -283,6 +283,15 @@ bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
     return enabled;
 }
 
+bool getEnvEnableTrtllmgenMoePdl()
+{
+    static std::once_flag flag;
+    static bool enabled = false;
+
+    std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_PDL"); });
+    return enabled;
+}
+
 bool getEnvUseUCXKvCache()
 {
     static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");

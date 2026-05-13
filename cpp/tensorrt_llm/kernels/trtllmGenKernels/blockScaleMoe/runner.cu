@@ -482,11 +482,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     convertSfData.numTokens = args.num_tokens;
     convertSfData.sfLayoutSrc = btg::SfLayout::R128c4;
     convertSfData.sfLayoutDst = btg::SfLayout::Linear;
-    convertSfData.mUsePdl = true;
+    convertSfData.mUsePdl = tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl();
 
     // Setup activation data
     activationData.mDtypeElt = args.mDtypeElt;
-    activationData.mUsePdl = true;
+    activationData.mUsePdl = tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl();
     activationData.mUseDeepSeekFp8 = true;
     activationData.inPtr = workspace.gemm1_output;
     activationData.outPtr = workspace.activation_output;
@@ -509,7 +509,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         // Setup finalize data
         finalizeData.mDtypeElt = args.mDtypeOut;
         finalizeData.mDtypeExpW = args.mDtypeExpW;
-        finalizeData.mUsePdl = true;
+        finalizeData.mUsePdl = tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl();
         finalizeData.mUseDeepSeekFp8 = false;
         finalizeData.inPtr = workspace.gemm2_output;
         finalizeData.outPtr = args.output;

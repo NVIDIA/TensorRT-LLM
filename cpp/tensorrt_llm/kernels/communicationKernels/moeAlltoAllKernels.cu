@@ -29,6 +29,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::moe_comm
 {
 
+using tensorrt_llm::common::launchWithPdlWhenBothEnabled;
 using tensorrt_llm::common::launchWithPdlWhenEnabled;
 
 #define ENABLE_DEBUG_PRINT 0
@@ -589,7 +590,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
-    launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
+    launchWithPdlWhenBothEnabled("moeA2APrepareDispatchKernel",
+        tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl(), moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
         params.stream, params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
 }
 
@@ -657,10 +659,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         int shared_bytes = 2 * params.top_k * (int) sizeof(int);
         SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
             auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS>;
-            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
-                params.eplb_stats_num_experts);
+            launchWithPdlWhenBothEnabled("moeA2ADispatchKernel", tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl(),
+                kernel_fn, grid_size, kBlockSize, shared_bytes, params.stream, params.token_selected_experts,
+                kernel_ptrs, params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                params.ep_size, params.num_experts, params.eplb_stats_num_experts);
         }))
     }
     else
@@ -674,10 +676,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int) sizeof(int);
         SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
             auto kernel_fn = moeA2ADispatchKernel<WarpPolicy, TOP_K, EPLB_STATS>;
-            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
-                params.eplb_stats_num_experts);
+            launchWithPdlWhenBothEnabled("moeA2ADispatchKernel", tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl(),
+                kernel_fn, grid_size, kBlockSize, shared_bytes, params.stream, params.token_selected_experts,
+                kernel_ptrs, params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                params.ep_size, params.num_experts, params.eplb_stats_num_experts);
         }))
     }
 }
@@ -1281,7 +1283,8 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
                 : params.elements_per_token * static_cast<int>(sizeof(SrcT));
             auto kernel_fn = params.one_block_per_token ? moeA2APrepareCombineKernel<BlockPolicy, LOW_PRECISION, SrcT>
                                                         : moeA2APrepareCombineKernel<WarpPolicy, LOW_PRECISION, SrcT>;
-            launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
+            launchWithPdlWhenBothEnabled("moeA2APrepareCombineKernel",
+                tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl(), kernel_fn, grid, kBlockSize, 0, params.stream,
                 recv_buffer_bytes, payload, params.elements_per_token, params.ep_size, params.max_tokens_per_rank,
                 params.flag_val, params.recv_counters, stride_per_token);
         });
@@ -1359,9 +1362,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         SWITCH_POLICY(params.one_block_per_token, Policy, {
             SWITCH_TOP_K(params.top_k, TOP_K, {
                 auto kernel_fn = moeA2ACombineKernel<TKernelType, Policy, TOP_K>;
-                launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
-                    kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
-                    params.ep_rank, params.ep_size, stride_per_token);
+                launchWithPdlWhenBothEnabled("moeA2ACombineKernel",
+                    tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl(), kernel_fn, grid, kBlockSize, 0,
+                    params.stream, kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                    params.local_num_tokens, params.ep_rank, params.ep_size, stride_per_token);
             });
         });
     });
@@ -1399,7 +1403,8 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
     constexpr int kBlockSize = 256;
     int total_tokens = ep_size * max_tokens_per_rank;
     int grid = ceilDiv(total_tokens, kBlockSize);
-    launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0,
+    launchWithPdlWhenBothEnabled("moeA2ASanitizeExpertIdsKernel",
+        tensorrt_llm::common::getEnvEnableTrtllmgenMoePdl(), moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0,
         stream, expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
 }
 
