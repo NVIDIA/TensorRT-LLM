@@ -1502,7 +1502,36 @@ class PyTorchModelEngine(ModelEngine):
         return self.spec_metadata
 
     def cleanup(self) -> None:
-        """Release resources owned by this model engine."""
+        """Release resources owned by this model engine.
+
+        Tears down, in order:
+
+        1. The optional ``ModelLoader`` (which in turn releases any
+           GMS client; see :meth:`ModelLoader.cleanup`).
+        2. The model module reference.
+        3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
+        4. Input processors.
+        5. Userbuffers (``ub.ub_deallocate`` per buffer); on per-buffer
+           failure the unfreed buffers are kept attached so a deterministic
+           retry doesn't double-free already-released ones, and the
+           collected errors are re-raised after the loop.
+
+        Idempotency:
+            Subsequent calls are no-ops (guarded by ``_cleanup_done``).
+            The flag is set only at the end, so a partial cleanup that
+            raises mid-way will be retried on the next call.
+
+        Raises:
+            RuntimeError: If one or more userbuffer deallocations fail
+                (chained from the first error). All other steps are
+                best-effort and either succeed or leak silently with
+                their errors logged at warning level by callees.
+
+        Called from:
+            - :meth:`PyExecutor.shutdown` (deterministic teardown).
+            - :meth:`__del__` (best-effort fallback during garbage
+              collection / interpreter shutdown).
+        """
         if getattr(self, "_cleanup_done", False):
             return
 
@@ -1545,12 +1574,21 @@ class PyTorchModelEngine(ModelEngine):
         self._cleanup_done = True
 
     def __del__(self) -> None:
+        """Best-effort cleanup during garbage collection.
+
+        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (raised
+        when one or more userbuffer deallocations fail) and
+        ``AttributeError`` (typical on partially-initialized engines
+        torn down during interpreter shutdown when module references
+        have already been cleared); both are logged and swallowed
+        because destructors cannot reliably surface exceptions.
+
+        Deterministic callers (``PyExecutor.shutdown``) should call
+        :meth:`cleanup` directly so they see any failure.
+        """
         try:
             self.cleanup()
         except (RuntimeError, AttributeError) as e:
-            # Destructors run during interpreter shutdown and cannot reliably
-            # surface errors. Log best-effort so process-lifetime leaks are
-            # visible; deterministic callers should use cleanup().
             logger.warning(
                 "PyTorchModelEngine cleanup failed during destruction: %s", e)
 

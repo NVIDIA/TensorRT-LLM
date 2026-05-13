@@ -18,6 +18,13 @@ single ``torch.cuda.current_device()`` call to record the device index.
 We monkeypatch that to a fixed integer for the whole module so every
 control-path test (construction, pre-connect, connect-failure, RW/RO
 gating, protocol conformance) runs on CPU CI without a GPU.
+
+TODO(GMS-RESTART-E2E): an end-to-end "restart-after-death with weights
+resident in GMS" smoke test is the right precursor to shadow-engine
+failover work — it validates KV-cache memory accounting on the
+restarted worker. Lives in a separate GPU + daemon test suite, not
+here. Tracked as a follow-up PR; see PR #13926 review thread
+(galletas1712) and §06 of the failover design doc.
 """
 
 import sys

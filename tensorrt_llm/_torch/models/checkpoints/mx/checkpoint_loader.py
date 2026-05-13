@@ -150,11 +150,29 @@ class MXCheckpointLoader(HfCheckpointLoader):
         return self._query_timeout_s
 
     def is_weights_preloaded(self) -> bool:
-        """Whether the last load_weights() call wired weights directly into the model.
+        """Whether the last :meth:`load_weights` call wired weights directly into the model.
 
-        ``True`` means MX P2P transfer succeeded, weights are already in model
-        parameter buffers, and the standard weight-mapping pipeline should be
-        skipped for those parameters.
+        Reports the result of the most recent ``load_weights()`` invocation
+        on this loader instance. ``ModelLoader`` consults this signal to
+        decide whether to run the standard weight-mapping pipeline:
+
+        - ``True``: MX P2P transfer succeeded; weights already live in
+          model parameter buffers via direct writes from the upstream
+          ``MxLiveWeightLoader``. The mapping pipeline is skipped for
+          all parameters covered by P2P.
+        - ``False``: either P2P was never attempted (no MX server URL,
+          no model reference, library missing) or it failed and we
+          fell back to disk; weights still need to flow through
+          ``model.load_weights(...)`` via the standard mapper.
+
+        Note this is a per-loader-instance flag, not a global one. The
+        flag is reset to ``False`` at the start of each ``load_weights``
+        call, so the value is only meaningful immediately after a
+        successful call.
+
+        Returns:
+            ``True`` iff the last ``load_weights`` populated the model
+            via P2P; ``False`` before any call and on any fallback path.
         """
         return self._p2p_succeeded
 

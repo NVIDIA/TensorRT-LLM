@@ -117,7 +117,14 @@ def _spec_config_needing_draft_weights():
     [
         pytest.param(
             True,
-            ["pool_enter", "load_weights", "pool_exit", "post_load_weights"],
+            [
+                "pool_enter",
+                "_apply",
+                "to",
+                "load_weights",
+                "post_load_weights",
+                "pool_exit",
+            ],
             id="rw",
         ),
         pytest.param(
@@ -131,9 +138,11 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
     """Verify ``ModelLoader.load`` dispatches correctly per GMS lock mode.
 
     Cases:
-        rw: the writer loads weights under the GMS memory pool, runs them
-            through the standard mapping pipeline, then commits the
-            populated pool for read-only consumers.
+        rw: the writer opens the GMS pool BEFORE meta-tensor materialization
+            and ``model.to('cuda')``, runs the entire model bring-up
+            (``_apply`` for meta materialization, ``to('cuda')``, weight
+            load, ``post_load_weights``) inside the pool, then commits via
+            ``finalize_write`` once the scope exits.
         ro: the reader runs ``post_load_weights`` to wire module aliases
             first, then GMS materializes weights via zero-copy mapping.
     """
@@ -166,6 +175,72 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
         checkpoint_loader.load_weights.assert_not_called()
         loader._call_load_weights.assert_not_called()
         backend.materialize_module.assert_called_once_with(model)
+
+
+def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
+    """Every step that may allocate or rebind tensors must run inside the GMS pool.
+
+    The widened ``mem_pool_scope`` covers meta-tensor materialization,
+    ``model.to('cuda')``, weight load, and the post_load_* hooks. Only
+    ``finalize_write`` runs after the pool closes, so the committed
+    layout reflects the post-post_load model. Asserts the exact ordering
+    so a future refactor cannot silently re-narrow the scope.
+    """
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    backend = _build_gms_backend(is_rw=True, events=events)
+
+    backend.move_untracked_params.side_effect = lambda _model: events.append(
+        "move_untracked_params"
+    )
+    backend.finalize_write.side_effect = lambda _model: events.append("finalize_write")
+    _install_gms_backend(monkeypatch, backend)
+
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+    checkpoint_loader.post_load_apply.side_effect = lambda *_a, **_kw: events.append(
+        "post_load_apply"
+    )
+    checkpoint_loader.post_load_publish.side_effect = lambda *_a, **_kw: events.append(
+        "post_load_publish"
+    )
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert events == [
+        "pool_enter",
+        "_apply",
+        "to",
+        "load_weights",
+        "post_load_apply",
+        "post_load_publish",
+        "post_load_weights",
+        "move_untracked_params",
+        "pool_exit",
+        "finalize_write",
+    ]
+
+    # Belt-and-braces: inside the events list, every "interesting" step
+    # must sit between pool_enter and pool_exit, with finalize_write the
+    # only thing strictly after.
+    enter_idx = events.index("pool_enter")
+    exit_idx = events.index("pool_exit")
+    finalize_idx = events.index("finalize_write")
+    assert finalize_idx > exit_idx, "finalize_write must follow pool exit"
+    for inside in (
+        "_apply",
+        "to",
+        "load_weights",
+        "post_load_apply",
+        "post_load_publish",
+        "post_load_weights",
+        "move_untracked_params",
+    ):
+        idx = events.index(inside)
+        assert enter_idx < idx < exit_idx, (
+            f"{inside!r} (idx={idx}) must run inside the pool (enter={enter_idx}, exit={exit_idx})"
+        )
 
 
 def test_gms_rw_loader_preload_skips_mapping_pipeline(monkeypatch):

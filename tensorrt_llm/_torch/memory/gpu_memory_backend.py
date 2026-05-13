@@ -207,9 +207,19 @@ class GMSBackend:
 
         self._is_rw = self._client.granted_lock_type == GrantedLockType.RW
 
-        # GMS-backed VMM tensors can segfault if torch.cuda.empty_cache()
-        # tries to free them. Apply the upstream safety patch once we're
-        # connected. Idempotent and cheap.
+        # Process-wide safety patch: torch.cuda.empty_cache() can segfault
+        # when it tries to free GMS-backed VMM regions. Upstream's
+        # patch_empty_cache() rebinds torch.cuda.empty_cache to a GMS-aware
+        # variant that skips those regions.
+        #
+        # Process-wide is intentional, not a leak: torch internals, MoE
+        # balancer, draft-model setup, and unrelated TRT-LLM call sites all
+        # invoke empty_cache and would crash otherwise. A per-call-site
+        # wrapper would miss the calls we don't own.
+        #
+        # TODO(GMS-API): replace with a TRT-LLM-owned implementation once
+        # upstream's API stabilizes (see TODO on move_untracked_params).
+        # Idempotent and cheap.
         try:
             patch_empty_cache()
         except Exception as e:
@@ -226,10 +236,31 @@ class GMSBackend:
 
     @property
     def is_rw(self) -> Optional[bool]:
+        """Whether this client holds the writer lock for the GMS pool.
+
+        Returns:
+            ``True`` if RW (writer) was granted, ``False`` if RO (reader)
+            was granted, ``None`` before :meth:`connect` has been called
+            successfully or after :meth:`cleanup` has run. Transitions
+            from ``True`` to ``False`` after :meth:`finalize_write`.
+        """
         return self._is_rw
 
     def has_committed_weights(self) -> bool:
-        """Whether the granted session is RO (i.e. committed weights exist)."""
+        """Whether committed weights are available for RO materialization.
+
+        Reports the granted lock type at the time of call, which only
+        becomes ``RO`` once a writer in this or another process has
+        published a finalized layout for ``tag``.
+
+        Returns:
+            ``True`` if the granted lock is ``RO`` (committed weights
+            exist and can be zero-copy mapped); ``False`` otherwise,
+            including pre-connect, post-cleanup, and any error paths.
+            Never raises — best-effort by design so callers can use it
+            as a precondition check before invoking
+            :meth:`materialize_module`.
+        """
         if self._client is None:
             return False
         try:
@@ -250,11 +281,25 @@ class GMSBackend:
     ) -> Iterator[None]:
         """Context manager scoping CUDA allocations to the GMS pool.
 
-        All ``torch.empty``/``torch.zeros``/etc. allocations inside this
-        scope are routed through the GMS pluggable allocator and end up
-        in the shared memory region for the configured ``tag``.
+        All ``torch.empty`` / ``torch.zeros`` / etc. allocations inside
+        this scope are routed through the GMS pluggable allocator and
+        land in the shared memory region for the configured ``tag``.
+        Allocations made via paths that bypass the active allocator
+        (e.g. C++ ops that call ``cudaMalloc`` directly) escape this
+        scope and must be swept by :meth:`move_untracked_params`
+        before :meth:`finalize_write` is called.
 
-        Only valid when granted RW; raises otherwise.
+        Args:
+            device: Target CUDA device. Defaults to
+                ``torch.device('cuda', current_device())``.
+
+        Yields:
+            ``None`` — the value is unused; this is a scoping context.
+
+        Raises:
+            RuntimeError: If ``connect()`` has not been called yet, or
+                if the granted lock is RO (only the writer may allocate
+                into the pool).
         """
         if self._client is None:
             raise RuntimeError("GMS client not connected. Call connect() first.")
@@ -284,11 +329,19 @@ class GMSBackend:
         Mirrors ``gpu_memory_service.integrations.trtllm.model_loader.
         _move_untracked_params`` so behavior matches the upstream
         reference integration.
+
+        Args:
+            model: The ``nn.Module`` to scan for stray CUDA parameters.
+                Buffers (``tensor_type != 'parameter'``), CPU tensors,
+                and tensors already backed by a GMS mapping are skipped.
+
+        Raises:
+            RuntimeError: If ``connect()`` has not been called yet.
         """
+        # TODO(GMS-API): Clean up once the stable GMS API becomes available.
         if self._client is None:
             raise RuntimeError("GMS client not connected. Call connect() first.")
 
-        # Align with the upstream API contract.
         from gpu_memory_service.client.torch.module import _iter_module_tensors
         from gpu_memory_service.client.torch.tensor import _tensor_from_pointer
 
@@ -325,13 +378,28 @@ class GMSBackend:
     def finalize_write(self, model: nn.Module) -> int:
         """Register tensors, commit them, and transition this client to RO.
 
-        Returns the total number of bytes committed. After this returns
-        successfully, ``is_rw`` is ``False`` and other instances on the
-        same node connecting in ``"auto"`` or ``"ro"`` mode will receive
-        a zero-copy RO mapping of the committed layout.
+        After this returns successfully, ``is_rw`` flips to ``False``
+        and other instances on the same node connecting in ``"auto"``
+        or ``"ro"`` mode will receive a zero-copy RO mapping of the
+        committed layout. The transition is in-place: this client
+        keeps the same socket connection.
 
         Mirrors ``gpu_memory_service.integrations.common.utils.
         finalize_gms_write``.
+
+        Args:
+            model: The fully-loaded ``nn.Module`` whose CUDA parameters
+                will be registered with the GMS daemon. Every parameter
+                must already live in the GMS pool — call
+                :meth:`move_untracked_params` first to sweep strays
+                allocated outside :meth:`mem_pool_scope`.
+
+        Returns:
+            Total bytes committed to the GMS pool for this ``tag``.
+
+        Raises:
+            RuntimeError: If ``connect()`` has not been called yet, or
+                if the granted lock is RO (only the writer may commit).
         """
         if self._client is None:
             raise RuntimeError("GMS client not connected. Call connect() first.")
@@ -357,14 +425,29 @@ class GMSBackend:
     # ------------------------------------------------------------------
 
     def materialize_module(self, model: nn.Module) -> None:
-        """Zero-copy import committed weights into model params.
+        """Zero-copy import committed weights into model params (RO path).
 
-        Replaces meta-initialized parameters with CUDA tensors backed by
-        GPU pointers from the shared memory region with no data copies.
+        Replaces meta-initialized parameters with CUDA tensors backed
+        by GPU pointers from the shared memory region — no data copies,
+        no disk I/O, just CUDA VMM remapping. The model's submodule
+        layout must already match the writer's at commit time, including
+        any aliases / derived buffers introduced by ``post_load_weights``.
 
-        **Important**: ``post_load_weights()`` must be called on the
-        model BEFORE this method, so that module aliases and derived
-        parameters are already in place at materialization time.
+        Args:
+            model: The ``nn.Module`` to materialize. Walks the full
+                module tree (including submodules like ``draft_model``
+                added for speculative decoding) and rebinds matching
+                parameters to GMS-backed storage.
+
+        Raises:
+            RuntimeError: If ``connect()`` has not been called yet.
+
+        Note:
+            ``post_load_weights()`` must be called on the model BEFORE
+            this method. The order ensures that any aliases / derived
+            parameters created by post-load hooks are present on the
+            module tree at materialization time, so they are bound to
+            the same GMS storage as their primary tensor.
         """
         if self._client is None:
             raise RuntimeError("GMS client not connected. Call connect() first.")
@@ -387,7 +470,23 @@ class GMSBackend:
     # ------------------------------------------------------------------
 
     def cleanup(self) -> None:
-        """Release the GMS session and evict it from the per-tag registry."""
+        """Release the GMS session and evict it from the per-tag registry.
+
+        Idempotent: a second call after a successful cleanup is a no-op
+        because the client handle is dropped. Best-effort: any failure
+        in upstream ``client.close()`` or ``evict_gms_client_memory_manager``
+        is logged (warning for the outer error, debug for ``close()``)
+        and swallowed so callers — including ``__del__`` paths in
+        ``ModelLoader`` and ``PyTorchModelEngine`` — never raise from
+        teardown.
+
+        After return:
+            - The local client handle is unset (``_client is None``).
+            - A subsequent :meth:`connect` may re-establish a fresh
+              session against the same daemon.
+            - GMS-backed CUDA mappings remain alive on-device for any
+              other process holding an RO lock on this ``tag``.
+        """
         if self._client is None:
             return
         try:
@@ -414,7 +513,18 @@ def _ptr_in_gms(gms_client, ptr: int) -> bool:
     """Whether a raw CUDA pointer falls inside an existing GMS mapping.
 
     Mirrors ``gpu_memory_service.integrations.trtllm.model_loader._ptr_in_gms``.
-    Tolerates absence of the ``_mappings`` attribute on older GMS releases.
+    Tolerates absence of the ``_mappings`` attribute on older GMS
+    releases by returning ``False`` (treating the pointer as "untracked"
+    so the caller's stray-handling path runs).
+
+    Args:
+        gms_client: A connected ``GMSClientMemoryManager``.
+        ptr: A raw CUDA virtual address (``tensor.data_ptr()`` or a
+            storage base pointer).
+
+    Returns:
+        ``True`` if ``ptr`` lies inside any mapping the client tracks
+        for any tag, ``False`` otherwise. Never raises.
     """
     mappings = getattr(gms_client, "_mappings", None)
     if not mappings:
@@ -428,6 +538,18 @@ def _ptr_in_gms(gms_client, ptr: int) -> bool:
 
 
 def _storage_nbytes(tensor: torch.Tensor) -> int:
-    """Bytes owned by ``tensor``'s underlying storage, including any padding."""
+    """Bytes owned by ``tensor``'s underlying storage, including any padding.
+
+    Used to size GMS mappings created in :meth:`GMSBackend.move_untracked_params`
+    so the replacement allocation matches the original storage exactly,
+    not the (possibly smaller) view the tensor exposes.
+
+    Args:
+        tensor: Any CUDA ``torch.Tensor``. View-vs-base distinction is
+            intentional: we always want the whole storage size.
+
+    Returns:
+        Total bytes of the underlying ``UntypedStorage``.
+    """
     storage = tensor.untyped_storage()
     return int(storage.nbytes())
