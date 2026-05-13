@@ -393,12 +393,8 @@ def test_SleepConfig_is_picklable():
 
     # Default construction
     cfg_default = SleepConfig()
-    rt = pickle.loads(pickle.dumps(cfg_default))
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
     assert rt.restore_modes == cfg_default.restore_modes
-    # Verify the default_factory still works after round-trip (i.e. missing
-    # keys return a RestoreMode, not raise KeyError).
-    missing_key = ExecutorMemoryType.SAMPLER
-    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
 
     # Construction with explicit per-key overrides
     cfg_custom = SleepConfig(
@@ -406,11 +402,29 @@ def test_SleepConfig_is_picklable():
             ExecutorMemoryType.KV_CACHE.value: "NONE",
             ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
         })
-    rt_custom = pickle.loads(pickle.dumps(cfg_custom))
+    rt_custom = pickle.loads(pickle.dumps(cfg_custom))  # noqa: S301
     assert rt_custom.restore_modes[
         ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
     assert rt_custom.restore_modes[
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+
+
+def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
+    """The defaultdict default_factory must remain functional after pickle.
+
+    Missing keys should return a valid RestoreMode rather than raising
+    KeyError, proving the factory (not just the already-present entries)
+    was serialised correctly.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+
+    missing_key = ExecutorMemoryType.SAMPLER
+    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
+    assert rt.restore_modes[missing_key] == cfg_default.restore_modes[
+        missing_key]
 
 
 def test_DynamicBatchConfig_declaration():
