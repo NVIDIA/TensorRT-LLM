@@ -663,7 +663,8 @@ _CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL = 10
 _CUPTI_ACTIVITY_ATTR_ZEROED_OUT_ACTIVITY_BUFFER = 5
 _CUPTI_HOST_BUFFER_BYTES = 1024 * 1024
 _CUPTI_HOST_BUFFER_COUNT = 16
-_DEFAULT_CUDA_GRAPH_GROUP_ITERS = 2
+_DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE = 2
+_DEFAULT_CUDA_GRAPH_GROUP_ITERS_MIX = 4
 
 
 def _load_libcupti() -> ctypes.CDLL:
@@ -1471,10 +1472,18 @@ def _target_name_or_none(name: str | None) -> str | None:
     return None
 
 
-def _capture_group_graph(args, run_fn, reset_fn, group_iters: int) -> torch.cuda.CUDAGraph:
+def _capture_group_graph(
+    args,
+    run_fn,
+    reset_fn,
+    group_iters: int,
+    graph_pre_iter_fn=None,
+) -> torch.cuda.CUDAGraph:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        for _ in range(group_iters):
+        for j in range(group_iters):
+            if graph_pre_iter_fn is not None:
+                graph_pre_iter_fn(j)
             reset_fn()
             if args.l2_flush:
                 _l2_flush.fill_(0.0)
@@ -1482,10 +1491,18 @@ def _capture_group_graph(args, run_fn, reset_fn, group_iters: int) -> torch.cuda
     return graph
 
 
-def _graph_group_iters(args, total_iters: int, pre_iter_fn) -> int:
-    if pre_iter_fn is not None:
+def _graph_group_iters(args, total_iters: int, pre_iter_fn, pre_iter_group_factory) -> int:
+    if pre_iter_fn is not None and pre_iter_group_factory is None:
         return 1
-    requested_group_iters = max(1, int(args.cuda_graph_group_iters))
+    requested = getattr(args, "cuda_graph_group_iters", None)
+    if requested is None:
+        requested_group_iters = (
+            _DEFAULT_CUDA_GRAPH_GROUP_ITERS_MIX
+            if pre_iter_group_factory is not None
+            else _DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE
+        )
+    else:
+        requested_group_iters = max(1, int(requested))
     for group_iters in (requested_group_iters, 2):
         if total_iters % group_iters == 0:
             return group_iters
@@ -1525,16 +1542,15 @@ def _time_kernel_cuda_graph(
     *,
     expected_K: int,
     pre_iter_fn=None,
+    pre_iter_group_factory=None,
     iters_override: int | None = None,
     cupti_plan_key: tuple | None = None,
 ) -> dict:
     """CUDA-graph CUPTI timer (graph-per-iter design).
 
-    Captures one CUDA graph holding a single iter's worth of work (reset
-    + l2_flush + run_fn) and replays it `warmup + iters` times.  Per-iter
-    setup (`pre_iter_fn`, e.g. mix-mode PNAT/n_writes copies) runs OUTSIDE
-    the graph, on the same CUDA stream so the order
-    `pre_iter_fn → l2_flush → run_fn` is preserved on every replay.
+    Captures one CUDA graph holding a small group of logical iterations
+    (per-iter setup + reset + l2_flush + run_fn) and replays it enough
+    times to cover `warmup + iters`.
 
     Why graph-per-iter (vs the older "one giant graph holding all iters"
     design): instantiating a CUDA graph is expensive — proportional to
@@ -1542,12 +1558,9 @@ def _time_kernel_cuda_graph(
     cheaper than one big graph instantiated for each cell of a sweep.
     Replays are cheap regardless.
 
-    Why pre_iter_fn outside the graph: it depends on the iter index `i`
-    (different sample per iter), but graph capture would bake in the
-    capture-time `i`.  Putting the per-iter copy outside the graph also
-    has a useful side effect: PNAT (the per-iter input) is loaded into
-    L2 by the copy, then evicted by the in-graph L2 flush, so the kernel
-    reads PNAT cold — closer to production behavior than the old design.
+    Mix cells use a per-replay device window: an outside-graph copy loads
+    the next group of PNAT/n_writes samples, then graph-captured per-iter
+    copies update kernel inputs before each reset + L2 flush + run.
 
     Pre-graph eager warmup (3 iters): forces PyTorch's caching allocator
     + Triton's autotune cache to settle before capture so the graph
@@ -1575,7 +1588,11 @@ def _time_kernel_cuda_graph(
     host_timing.stop("pre_graph_warmup_ms")
 
     total_iters = warmup + iters
-    group_iters = _graph_group_iters(args, total_iters, pre_iter_fn)
+    group_iters = _graph_group_iters(args, total_iters, pre_iter_fn, pre_iter_group_factory)
+    pre_replay_fn = None
+    graph_pre_iter_fn = None
+    if pre_iter_group_factory is not None and group_iters > 1:
+        pre_replay_fn, graph_pre_iter_fn = pre_iter_group_factory(group_iters)
 
     # Reset just before capture so warmup state changes don't bleed in.
     host_timing.start()
@@ -1584,11 +1601,17 @@ def _time_kernel_cuda_graph(
     host_timing.stop("pre_capture_reset_ms")
 
     # Capture a small group of identical logical iterations.  Mix/pre_iter
-    # cells stay at one iter per replay because their per-iter input update
-    # still runs outside the graph.
+    # cells can group when they provide a graph-side pre-iter updater backed
+    # by a per-replay device window.
     host_timing.start()
-    g = _capture_group_graph(args, run_fn, reset_fn, group_iters)
+    g = _capture_group_graph(args, run_fn, reset_fn, group_iters, graph_pre_iter_fn)
     host_timing.stop("graph_capture_ms")
+
+    if pre_replay_fn is not None:
+        host_timing.start()
+        pre_replay_fn(0)
+        torch.cuda.synchronize()
+        host_timing.stop("graph_preload_ms")
 
     plan_cache_key = None if cupti_plan_key is None else (cupti_plan_key, group_iters)
     host_timing.add("cupti_plan_cached", (
@@ -1612,10 +1635,10 @@ def _time_kernel_cuda_graph(
             file=sys.stderr,
         )
 
-    # Time: replay the per-iter graph `warmup + iters` times, with
-    # pre_iter_fn called between replays on the same stream.  CUPTI
-    # records every kernel launch; _stats_from_cupti_records validates
-    # against expected_K and slices warmup off the front.
+    # Time: replay the grouped graph enough times to cover warmup+iters.
+    # Mix cells preload one device window per replay on the same stream.
+    # CUPTI records every kernel launch; _stats_from_cupti_records
+    # validates against expected_K and slices warmup off the front.
     graph_replays = total_iters // group_iters
     filter_plan = ((records_per_replay, ordinal_names),) * graph_replays
     cupti_flush_period_ms = max(0, int(getattr(args, "cupti_flush_period_ms", 0)))
@@ -1631,7 +1654,9 @@ def _time_kernel_cuda_graph(
     torch.cuda.nvtx.range_push(tag)
     host_timing.start()
     for i in range(graph_replays):
-        if pre_iter_fn is not None:
+        if pre_replay_fn is not None:
+            pre_replay_fn(i)
+        elif pre_iter_fn is not None:
             pre_iter_fn(i)
         g.replay()
     host_timing.stop("graph_enqueue_ms")
@@ -1820,6 +1845,7 @@ def _time_kernel(
     *,
     expected_K: int,
     pre_iter_fn=None,
+    pre_iter_group_factory=None,
     iters_override: int | None = None,
     cupti_plan_key: tuple | None = None,
 ) -> dict:
@@ -1846,6 +1872,7 @@ def _time_kernel(
             args, run_fn, reset_fn, tag,
             expected_K=expected_K,
             pre_iter_fn=pre_iter_fn,
+            pre_iter_group_factory=pre_iter_group_factory,
             iters_override=iters_override,
             cupti_plan_key=cupti_plan_key,
         )
@@ -2454,10 +2481,9 @@ def _bench_config(
     # Mix scenario: skip on monolithic (mono on mixed PNAT corrupts the
     # wrong-mode slots).  Persistent_main + mix is now supported: bench
     # pre-bakes both a per-iter PNAT samples tensor and a per-iter
-    # n_writes samples tensor; pre_iter_fn copies row i of each into the
-    # kernel-input tensors (PNAT and n_writes_dev) on the same stream as
-    # the captured CUDA graph, so they're cold w.r.t. the in-graph L2
-    # flush.
+    # n_writes samples tensor; grouped graph capture copies window rows
+    # into kernel-input tensors (PNAT and n_writes_dev) before each
+    # in-graph L2 flush, so the timed kernels read PNAT cold.
     if mix_samples_cpu is not None and mode != "monolithic":
         device = state_work.device
         # Hardcode-sort: per-iter prev_tokens are CPU-sorted write-first.
@@ -2494,6 +2520,7 @@ def _bench_config(
         # Build _mix_pre_iter — the closure that runs OUTSIDE the captured
         # graph between replays.  Updates: prev_tokens (always),
         # slot_perm_buf (when sort_slots), n_writes_dev_mix (persistent).
+        perm_samples_gpu = None
         if sort_slots and perm_samples_cpu is not None:
             perm_samples_gpu = torch.from_numpy(perm_samples_cpu).to(
                 device=device, dtype=torch.int32
@@ -2520,6 +2547,45 @@ def _bench_config(
                 def _mix_pre_iter(i, _s=samples_gpu, _pt=prev_tokens):
                     _pt.copy_(_s[i])
 
+        def _mix_pre_iter_group_factory(
+            group_iters,
+            _s=samples_gpu,
+            _ps=perm_samples_gpu,
+            _ns=n_writes_samples_gpu,
+            _pt=prev_tokens,
+            _pm=slot_perm_buf,
+            _nw=n_writes_dev_mix,
+        ):
+            sample_window = torch.empty(
+                (group_iters, _s.shape[1]), device=_s.device, dtype=_s.dtype,
+            )
+            perm_window = (
+                torch.empty((group_iters, _ps.shape[1]), device=_ps.device, dtype=_ps.dtype)
+                if _ps is not None else None
+            )
+            nw_window = (
+                torch.empty((group_iters,), device=_ns.device, dtype=_ns.dtype)
+                if _ns is not None else None
+            )
+
+            def _pre_replay(replay_idx):
+                start = replay_idx * group_iters
+                end = start + group_iters
+                sample_window.copy_(_s[start:end])
+                if perm_window is not None:
+                    perm_window.copy_(_ps[start:end])
+                if nw_window is not None:
+                    nw_window.copy_(_ns[start:end])
+
+            def _graph_pre_iter(j):
+                _pt.copy_(sample_window[j])
+                if perm_window is not None:
+                    _pm.copy_(perm_window[j])
+                if nw_window is not None:
+                    _nw.copy_(nw_window[j:j + 1])
+
+            return _pre_replay, _graph_pre_iter
+
         # Mix iters override: if --mix-iters set, use it; else use args.iters.
         mix_iters = getattr(args, "mix_iters", None)
         scenarios.append({
@@ -2527,6 +2593,7 @@ def _bench_config(
             "print_label": "mix",
             "fill": None,
             "pre_iter": _mix_pre_iter,
+            "pre_iter_group_factory": _mix_pre_iter_group_factory,
             "iters": mix_iters,  # None => use args.iters
             # Pass through to _run_incr so the wrapper receives _n_writes_dev
             # (mix scenarios) instead of _n_writes (pure scenarios).
@@ -2548,6 +2615,7 @@ def _bench_config(
             prev_tokens.fill_(scn["fill"])
         prev_k_for_print = scn["print_label"]
         scenario_pre_iter = scn["pre_iter"]
+        scenario_pre_iter_group_factory = scn.get("pre_iter_group_factory")
         scenario_iters = scn.get("iters")  # None => use args.iters
         tag = f"incr_b{batch}_mtp{mtp_len}_{scn['label']}_s{state_dtype_name}_a{act_dtype_name}"
 
@@ -2788,8 +2856,8 @@ def _bench_config(
                             )
                         # n_writes plumbing: pure scenarios pass an int
                         # (host knows the value, can host-skip empty halves);
-                        # mix scenarios pass a (1,) device tensor that the
-                        # bench's pre_iter_fn updates per replay.
+                        # mix scenarios pass a (1,) device tensor updated
+                        # per iter by the benchmark pre-iter path.
                         # _persistent_skip_empty_halves=False on mix so both
                         # halves always launch (kernel uses device n_writes
                         # to derive its slot range).
@@ -2989,6 +3057,7 @@ def _bench_config(
                         args, _run_incr, reset_fn, sweep_tag,
                         expected_K=expected_K,
                         pre_iter_fn=scenario_pre_iter,
+                        pre_iter_group_factory=scenario_pre_iter_group_factory,
                         iters_override=scenario_iters,
                         cupti_plan_key=plan_key,
                     )
@@ -3704,11 +3773,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cuda-graph-group-iters",
         type=int,
-        default=_DEFAULT_CUDA_GRAPH_GROUP_ITERS,
-        help="For pure CUDA-graph cells, capture this many logical benchmark "
-        "iterations per graph replay when warmup + iters is divisible by this "
-        "value. Mix cells stay at one logical iteration per replay because "
-        "their per-iteration input update runs outside the graph.",
+        default=None,
+        help="Capture this many logical benchmark iterations per graph "
+        "replay when warmup + iters is divisible by this value. Default "
+        f"auto-selects {_DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE} for pure "
+        f"cells and {_DEFAULT_CUDA_GRAPH_GROUP_ITERS_MIX} for mix cells. "
+        "Mix cells use a per-replay device window so they can group "
+        "iterations too.",
     )
     parser.add_argument(
         "--cupti",
