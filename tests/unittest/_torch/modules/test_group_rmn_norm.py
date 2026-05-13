@@ -16,43 +16,7 @@
 import pytest
 import torch
 
-import tensorrt_llm._torch.modules.rms_norm as rms_norm_module
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm, group_rms_norm
-
-
-@pytest.mark.parametrize("has_residual", [False, True])
-def test_rms_norm_falls_back_when_flashinfer_is_unimplemented(
-        monkeypatch, has_residual):
-    hidden_size = 4
-    eps = 1e-6
-    hidden_states = torch.randn((2, hidden_size), dtype=torch.float32)
-    residual = torch.randn_like(hidden_states) if has_residual else None
-
-    norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=torch.float32)
-    reference_norm = RMSNorm(hidden_size=hidden_size,
-                             eps=eps,
-                             dtype=torch.float32)
-    reference_norm.load_state_dict(norm.state_dict())
-
-    monkeypatch.setattr(rms_norm_module, "IS_FLASHINFER_AVAILABLE", False)
-    if has_residual:
-        expected = reference_norm(hidden_states.clone(), residual.clone())
-    else:
-        expected = reference_norm(hidden_states.clone())
-
-    def _raise_not_implemented(self, hidden_states, residual):
-        raise NotImplementedError("CuTe RMSNorm unavailable")
-
-    monkeypatch.setattr(rms_norm_module, "IS_FLASHINFER_AVAILABLE", True)
-    monkeypatch.setattr(RMSNorm, "_flashinfer_rms_norm", _raise_not_implemented)
-
-    if has_residual:
-        actual = norm(hidden_states.clone(), residual.clone())
-        torch.testing.assert_close(actual[0], expected[0])
-        torch.testing.assert_close(actual[1], expected[1])
-    else:
-        actual = norm(hidden_states.clone())
-        torch.testing.assert_close(actual, expected)
 
 
 def _prepare_rms_test_data(batch_size, hidden_dims, eps, dtype, enable_weights):

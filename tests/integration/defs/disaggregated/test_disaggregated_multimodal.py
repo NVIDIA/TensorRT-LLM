@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 import shutil
 from pathlib import Path
@@ -124,15 +123,6 @@ def _make_qwen3vl_epd_config(model_path: str) -> dict[str, Any]:
     }
 
 
-def _read_layout_entries(capture_path: Path) -> list[dict[str, Any]]:
-    assert capture_path.exists(), f"layout capture file was not created: {capture_path}"
-    entries: list[dict[str, Any]] = []
-    for line in capture_path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            entries.append(json.loads(line))
-    return entries
-
-
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(70000)
 @pytest.mark.timeout(1800)
@@ -144,7 +134,6 @@ def test_qwen3vl_epd_video_split_item_runs(model_relative_path: str, llm_venv, t
     model_path = _find_model_path(models_root, model_relative_path)
     video_path = _find_split_video_path(models_root)
     config_path = tmp_path / "qwen3vl_epd_video_smoke.yaml"
-    capture_path = tmp_path / "mm_run_layout.jsonl"
     config_path.write_text(
         yaml.safe_dump(_make_qwen3vl_epd_config(str(model_path)), sort_keys=False),
         encoding="utf-8",
@@ -152,7 +141,6 @@ def test_qwen3vl_epd_video_split_item_runs(model_relative_path: str, llm_venv, t
 
     env = llm_venv._new_env.copy()
     env["TLLM_MULTIMODAL_DISAGGREGATED"] = "1"
-    env["TRTLLM_MM_RUN_LAYOUT_CAPTURE"] = str(capture_path)
     env["UCX_MM_ERROR_HANDLING"] = "y"
     env["UCX_TLS"] = get_ucx_tls()
 
@@ -192,13 +180,6 @@ def test_qwen3vl_epd_video_split_item_runs(model_relative_path: str, llm_venv, t
         )
         generated_text = response.choices[0].message.content or ""
         assert generated_text.strip()
-
-        entries = _read_layout_entries(capture_path)
-        split_entries = [
-            entry for entry in entries if int(entry.get("max_item_run_count") or 0) > 1
-        ]
-        assert split_entries, f"expected at least one split video item-run entry, got {entries}"
-        assert any(entry.get("disagg_role") == "context" for entry in split_entries)
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if work_dir:

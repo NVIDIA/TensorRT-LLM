@@ -44,12 +44,6 @@ REQUEST_TYPE_MAPPING = {
 # request ids do not use 0; disaggregated global ids use a separate high range.
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
-_MULTIMODAL_RUN_REQUEST_KEYS = (
-    "multimodal_item_run_cu_offsets",
-    "multimodal_run_positions",
-    "multimodal_run_lengths",
-)
-
 if TYPE_CHECKING:
     from .sampling_utils import Strategy
 
@@ -618,17 +612,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
     but detour some features to Python implementation"""
 
-    def _init_cpp_request(self, *args, **kwargs):
-        try:
-            super().__init__(*args, **kwargs)
-        except TypeError as exc:
-            if not any(key in str(exc) for key in _MULTIMODAL_RUN_REQUEST_KEYS):
-                raise
-            fallback_kwargs = dict(kwargs)
-            for key in _MULTIMODAL_RUN_REQUEST_KEYS:
-                fallback_kwargs.pop(key, None)
-            super().__init__(*args, **fallback_kwargs)
-
     def __init__(
             self,
             *args,
@@ -661,14 +644,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
-        multimodal_run_metadata = {
-            key: kwargs.get(key)
-            for key in _MULTIMODAL_RUN_REQUEST_KEYS
-        }
         if llm_request is not None:
             super().__init__(llm_request)
         else:
-            init_kwargs = dict(
+            super().__init__(
+                *args,
                 client_id=client_id,
                 return_log_probs=return_log_probs,
                 return_context_logits=False,
@@ -676,15 +656,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 return_perf_metrics=return_perf_metrics,
                 stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
                 if stop_words_list else None,
+                **kwargs,
             )
-            init_kwargs.update(kwargs)
-            self._init_cpp_request(
-                *args,
-                **init_kwargs,
-            )
-        for key, value in multimodal_run_metadata.items():
-            if value is not None and not hasattr(self, key):
-                setattr(self, key, value)
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type

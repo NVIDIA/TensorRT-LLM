@@ -40,37 +40,6 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
     )
 
 
-def test_multimodal_input_to_executor_falls_back_for_legacy_bindings():
-    class LegacyExecutor:
-        class MultimodalInput:
-            def __init__(
-                self,
-                multimodal_hashes,
-                multimodal_positions,
-                multimodal_lengths,
-                multimodal_uuids=None,
-            ):
-                self.multimodal_hashes = multimodal_hashes
-                self.multimodal_positions = multimodal_positions
-                self.multimodal_lengths = multimodal_lengths
-                self.multimodal_uuids = multimodal_uuids
-
-    mm_input = MultimodalInput.from_components(
-        [[1, 2, 3, 4, 5, 6, 7, 8]],
-        [2],
-        [4],
-        mm_item_run_cu_offsets=[0, 1],
-        mm_run_positions=[2],
-        mm_run_lengths=[4],
-    )
-
-    executor_input = mm_input.to_executor(LegacyExecutor)
-
-    assert executor_input.multimodal_hashes == [[1, 2, 3, 4, 5, 6, 7, 8]]
-    assert executor_input.multimodal_positions == [2]
-    assert executor_input.multimodal_lengths == [4]
-
-
 def test_add_multimodal_run_metadata_preserves_item_runs_in_py_data():
     mm_input = MultimodalInput.from_components(
         [[1, 2, 3, 4, 5, 6, 7, 8]],

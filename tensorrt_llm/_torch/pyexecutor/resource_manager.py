@@ -8,8 +8,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, NamedTuple,
-                    Optional, Sequence, Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -157,33 +157,6 @@ def _ensure_int64_cpu_tensor(
                 f"got {values.device}")
         return values.to(dtype=torch.int64)
     return torch.as_tensor(values, dtype=torch.int64)
-
-
-def _create_kv_cache_manager_cpp(kwargs: dict) -> Any:
-    candidates = []
-    if "temp_attention_window_inputs" in kwargs:
-        candidate = dict(kwargs)
-        candidate.pop("temp_attention_window_inputs")
-        candidates.append(candidate)
-    if "chunk_size" in kwargs:
-        candidate = dict(kwargs)
-        candidate.pop("chunk_size")
-        candidates.append(candidate)
-    if ("temp_attention_window_inputs" in kwargs and "chunk_size" in kwargs):
-        candidate = dict(kwargs)
-        candidate.pop("temp_attention_window_inputs")
-        candidate.pop("chunk_size")
-        candidates.append(candidate)
-
-    try:
-        return KVCacheManagerCpp(**kwargs)
-    except TypeError as original_exc:
-        for candidate in candidates:
-            try:
-                return KVCacheManagerCpp(**candidate)
-            except TypeError:
-                pass
-        raise original_exc
 
 
 def _resolve_multimodal_run_metadata(
@@ -891,7 +864,6 @@ class KVCacheManager(BaseResourceManager):
             'max_num_sequences': max_batch_size,
             'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
-            'temp_attention_window_inputs': None,
             'dtype': dtype,
             'sink_token_length': 0,
             'stream': self._stream.cuda_stream,  # Pass to BufferManager
@@ -926,7 +898,7 @@ class KVCacheManager(BaseResourceManager):
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size)
 
-        self.impl = _create_kv_cache_manager_cpp(kwargs)
+        self.impl = KVCacheManagerCpp(**kwargs)
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0
         self._warmup_missed_blocks = 0

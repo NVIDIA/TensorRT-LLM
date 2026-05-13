@@ -2,8 +2,6 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
-import json
-import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -29,9 +27,6 @@ _MULTIMODAL_RUN_METADATA_KEYS = (
     "multimodal_run_positions",
     "multimodal_run_lengths",
 )
-
-_MM_RUN_LAYOUT_CAPTURE_ENV = "TRTLLM_MM_RUN_LAYOUT_CAPTURE"
-_MM_RUN_LAYOUT_LOG_ENV = "TRTLLM_MM_RUN_LAYOUT_LOG"
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
@@ -167,7 +162,6 @@ class MultimodalInput:
                     )
 
         self._validate_multimodal_runs()
-        self._maybe_capture_multimodal_run_layout()
 
     def _validate_multimodal_runs(self) -> None:
         run_fields = (
@@ -252,83 +246,6 @@ class MultimodalInput:
                         "multimodal runs must be ordered and non-overlapping "
                         "within each item")
 
-    def _multimodal_run_layout_summary(self) -> Optional[Dict[str, Any]]:
-        if (self.multimodal_item_run_cu_offsets is None
-                or self.multimodal_run_positions is None
-                or self.multimodal_run_lengths is None):
-            return None
-
-        runs_per_item = [
-            self.multimodal_item_run_cu_offsets[i + 1] -
-            self.multimodal_item_run_cu_offsets[i]
-            for i in range(len(self.multimodal_item_run_cu_offsets) - 1)
-        ]
-        legacy_equivalent = True
-        for item_idx, (position, length) in enumerate(
-                zip(self.multimodal_positions, self.multimodal_lengths)):
-            run_begin = self.multimodal_item_run_cu_offsets[item_idx]
-            run_end = self.multimodal_item_run_cu_offsets[item_idx + 1]
-            if run_end - run_begin != 1:
-                legacy_equivalent = False
-                break
-            if (self.multimodal_run_positions[run_begin] != position
-                    or self.multimodal_run_lengths[run_begin] != length):
-                legacy_equivalent = False
-                break
-
-        return {
-            "disagg_role":
-            os.environ.get("TRTLLM_DISAGG_ROLE"),
-            "has_split_item":
-            any(count > 1 for count in runs_per_item),
-            "legacy_equivalent":
-            legacy_equivalent,
-            "max_item_run_count":
-            max(runs_per_item, default=0),
-            "multimodal_hash_count":
-            len(self.multimodal_hashes),
-            "multimodal_item_run_cu_offsets":
-            list(self.multimodal_item_run_cu_offsets),
-            "multimodal_lengths":
-            list(self.multimodal_lengths),
-            "multimodal_positions":
-            list(self.multimodal_positions),
-            "multimodal_run_lengths":
-            list(self.multimodal_run_lengths),
-            "multimodal_run_positions":
-            list(self.multimodal_run_positions),
-            "pid":
-            os.getpid(),
-            "runs_per_item":
-            runs_per_item,
-        }
-
-    def _maybe_capture_multimodal_run_layout(self) -> None:
-        capture_path = os.environ.get(_MM_RUN_LAYOUT_CAPTURE_ENV)
-        log_layout = os.environ.get(_MM_RUN_LAYOUT_LOG_ENV) == "1"
-        if not capture_path and not log_layout:
-            return
-
-        summary = self._multimodal_run_layout_summary()
-        if summary is None:
-            return
-
-        if capture_path:
-            try:
-                capture_dir = os.path.dirname(capture_path)
-                if capture_dir:
-                    os.makedirs(capture_dir, exist_ok=True)
-                with open(capture_path, "a", encoding="utf-8") as capture:
-                    capture.write(json.dumps(summary, sort_keys=True) + "\n")
-            except OSError as exc:
-                logger.warning(
-                    "Failed to capture multimodal run layout to %s: %s",
-                    capture_path, exc)
-
-        if log_layout:
-            logger.info("multimodal run layout: %s",
-                        json.dumps(summary, sort_keys=True))
-
     @classmethod
     def from_components(
         cls,
@@ -369,20 +286,8 @@ class MultimodalInput:
                       multimodal_positions=self.multimodal_positions,
                       multimodal_lengths=self.multimodal_lengths,
                       multimodal_uuids=self.multimodal_uuids)
-        run_metadata = self.run_metadata()
-        if not run_metadata:
-            return executor_module.MultimodalInput(**kwargs)
-
-        try:
-            return executor_module.MultimodalInput(**kwargs, **run_metadata)
-        except TypeError as exc:
-            if not _is_legacy_multimodal_input_binding_error(exc):
-                raise
-            return executor_module.MultimodalInput(**kwargs)
-
-
-def _is_legacy_multimodal_input_binding_error(exc: TypeError) -> bool:
-    return "multimodal_item_run_cu_offsets" in str(exc)
+        kwargs.update(self.run_metadata())
+        return executor_module.MultimodalInput(**kwargs)
 
 
 def add_multimodal_run_metadata(

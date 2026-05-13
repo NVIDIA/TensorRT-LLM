@@ -228,14 +228,8 @@ class RMSNorm(nn.Module):
                     use_gemma=self.use_gemma,
                 )
         elif IS_FLASHINFER_AVAILABLE:
-            try:
-                hidden_states, residual = self._flashinfer_rms_norm(
-                    hidden_states, residual)
-            except NotImplementedError:
-                # FlashInfer may be importable even when the runtime CUDA
-                # toolkit cannot support its CuTe RMSNorm backend.
-                hidden_states, residual = self._torch_rms_norm(
-                    hidden_states, residual)
+            hidden_states, residual = self._flashinfer_rms_norm(
+                hidden_states, residual)
         else:
             hidden_states, residual = self._torch_rms_norm(
                 hidden_states, residual)
