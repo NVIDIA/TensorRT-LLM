@@ -26,9 +26,14 @@ def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
                         format='%(asctime)s - %(levelname)s - %(message)s')
     # Convert input paths to pathlib.Path objects
     build_dir = Path(build_dir)
-    trt_dir = Path(trt_dir)
-
-    assert trt_dir.is_dir()
+    if trt_dir is not None:
+        trt_dir = Path(trt_dir)
+        if not trt_dir.is_dir():
+            logging.warning(
+                f"trt_dir '{trt_dir}' does not exist. "
+                "Ignoring -DTensorRT_ROOT; FindTensorRT.cmake will fall back "
+                "to system paths (NGC PyTorch image layout).")
+            trt_dir = None
 
     def cmake_parse(path: PathLike) -> str:
         return str(path).replace("\\", "/")
@@ -45,15 +50,16 @@ def build_cpp_examples(build_dir: PathLike, trt_dir: PathLike,
     with working_directory(build_dir):
         # Run CMake with the specified TensorRT directories
         generator = ["-GNinja"] if platform.system() == "Windows" else []
+        trt_root_arg = ([f'-DTensorRT_ROOT={cmake_parse(trt_dir)}']
+                        if trt_dir is not None else [])
         generate_command = [
             'cmake',
             '-S',
             '..',
             '-B',
             '.',
-            f'-DTensorRT_ROOT={cmake_parse(trt_dir)}',
             f'-DENABLE_MULTI_DEVICE={enable_multi_device}',
-        ] + generator
+        ] + trt_root_arg + generator
         logging.info(f"Executing {generate_command}")
         subprocess.run(generate_command, check=True)
 
@@ -69,7 +75,7 @@ if __name__ == '__main__':
                         default='examples/cpp/executor/build',
                         help='Build directory path')
     parser.add_argument('--trt-dir',
-                        default='/usr/local/tensorrt',
+                        default=None,
                         help='TensorRT directory path')
     parser.add_argument('--enable-multi-device',
                         default='ON',
