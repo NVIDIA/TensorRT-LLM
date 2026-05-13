@@ -56,6 +56,7 @@ MODEL_PATH_DICT = {
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
@@ -381,6 +382,8 @@ class ServerConfig:
             # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
+            # moe_config
+            "l_load_balancer_num_slots",
         ]
 
     def to_db_data(self) -> dict:
@@ -1178,7 +1181,9 @@ class PerfSanityTestConfig:
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 raise RuntimeError("Failed to get GPU type")
 
-        self.upload_to_db = "upload" in test_case_name.split("-")[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.gpu_type = get_gpu_type()
 
         # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode

@@ -2453,21 +2453,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @parametrize_with_ids("v2_kv_cache", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids(
         "batch_wait_timeout_iters,batch_wait_max_tokens_ratio", [(0, 0),
-                                                                 (10, 0.75),
+                                                                 (10, 1.0),
                                                                  (10, 0),
                                                                  (0, 0.75)])
     def test_nvfp4_batch_waiting(self, torch_compile, fp8kv, cuda_graph,
                                  overlap_scheduler, mtp_nextn,
                                  batch_wait_timeout_iters,
-                                 batch_wait_max_tokens_ratio):
+                                 batch_wait_max_tokens_ratio, v2_kv_cache):
         moe_backend = "CUTLASS"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        # V2 KV cache manager auto-selects the V2 scheduler, which is the
+        # path that grows ctx KV during scheduling and needs the
+        # delay-batching ctx revert to release pages during the wait window.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -6234,6 +6239,22 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @skip_pre_hopper
+    def test_dflash(self):
+        target_model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+        dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
+        spec_config = DFlashDecodingConfig(max_draft_len=4,
+                                           speculative_model=dflash_model_path)
+        with LLM(target_model_path,
+                 max_seq_len=4096,
+                 max_batch_size=8,
+                 kv_cache_config=self.kv_cache_config,
+                 cuda_graph_config=self.cuda_graph_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
 
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
@@ -6790,7 +6811,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(80000)
-    @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS"])
+    @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"])
     def test_nvfp4_4gpus_static_eplb(self, moe_backend):
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with open(f"{model_path}/config.json") as f:
@@ -6816,12 +6837,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
-    @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS"])
+    @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"])
     def test_nvfp4_4gpus_online_eplb(self, moe_backend):
-        if moe_backend == "TRTLLM":
-            pytest.skip(
-                "TRTLLM + online EPLB is not supported yet, see https://nvbugs/5997893."
-            )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         num_experts = 512  # 512 experts per token for Nemotron V3 Super.
         # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
@@ -6886,8 +6903,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"],
-                             ids=["trtllm", "cutlass"])
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"],
+                             ids=["trtllm", "cutlass", "cutedsl"])
     @pytest.mark.parametrize(
         "attention_dp",
         [
@@ -6929,22 +6946,28 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp",
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
         [
-            (1, 1, 256, False),
-            (4, 1, 256, False),
-            (4, 4, 512, False),
-            (4, 4, 256, True),
+            (1, 1, 256, False, False),
+            (4, 1, 256, False, True),
+            (4, 4, 256, False, False),
+            (4, 4, 256, True, False),
+            (4, 4, 512, True, True),
         ],
-        ids=["TP1", "TP4", "TEP4", "TEP4_ADP"],
+        ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
-                                     mamba_state_cache_interval, attention_dp):
+                                     mamba_state_cache_interval, attention_dp,
+                                     use_mtp):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
             pytest.skip(
                 f"Device count {get_device_count()} is less than required {gpu_needed}"
             )
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
@@ -6962,6 +6985,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="TRTLLM"),
+                speculative_config=mtp_config if use_mtp else None,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
@@ -7021,7 +7045,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         with LLM(
                 model_path,
                 kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=False,
+                    enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
                 ),
@@ -7323,7 +7347,6 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend="DEEPGEMM"),
             speculative_config=MTPDecodingConfig(),
             enable_chunked_prefill=True,
-            custom_tokenizer="glm_moe_dsa",
         )
 
         with LLM(self.MODEL_PATH,

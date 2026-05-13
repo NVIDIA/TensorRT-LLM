@@ -340,6 +340,7 @@ class BaseMultimodalInputProcessor(ABC):
         *,
         video: List[Union[Image.Image, torch.Tensor]],
         video_metadata: Optional[dict] = None,
+        video_audio: Optional[Any] = None,
         **kwargs,
     ):
         """
@@ -352,10 +353,9 @@ class BaseMultimodalInputProcessor(ABC):
         Example: for a video item, return the prompt-side token count for that
         one video unit, not the number of video frames.
 
-        `video_metadata` is consumed here (not forwarded into
-        `get_num_multimodal_tokens`) so subclasses that don't need are unaffected.
-        Subclasses that need `video_metadata` (e.g. Nemotron Nano
-        accounting for audio extracted from video) override this method.
+        `video_metadata` and `video_audio` are consumed here (not forwarded
+        into `get_num_multimodal_tokens`) so subclasses that don't need them
+        are unaffected.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """

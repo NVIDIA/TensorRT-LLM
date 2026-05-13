@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import List, Sequence, Union
 
 import numpy as np
 
@@ -38,8 +38,31 @@ class CacheReuseAdapter(ABC):
     def tokens_per_block(self) -> int: ...
 
     @abstractmethod
-    def get_cached_token_count(self, req: LlmRequest) -> int:
-        """Block-aligned count of prefix tokens already cached for *req*."""
+    def _global_cached_token_count(self, req: LlmRequest) -> int:
+        """Block-aligned cached prefix length reported by the cache manager."""
+
+    def get_cached_token_count_per_layer_group(
+        self,
+        req: LlmRequest,
+        layer_groups: Sequence[AttentionLayerGroup],
+    ) -> List[int]:
+        """Per-layer-group cached prefix (block-aligned). SWA groups are
+        clamped up to stale_end*tpb (blocks below it are evicted)."""
+        if not self.enable_block_reuse:
+            return [0] * len(layer_groups)
+        scalar = self._global_cached_token_count(req)
+        if scalar <= 0:
+            return [0] * len(layer_groups)
+        tpb = self.tokens_per_block
+        out: List[int] = []
+        for lg in layer_groups:
+            window = lg.sliding_window_size
+            if window is None:
+                out.append(scalar)
+            else:
+                stale_end = max(0, (req.prompt_len + 1 - window) // tpb)
+                out.append(max(scalar, stale_end * tpb))
+        return out
 
     @abstractmethod
     def get_block_ids(
@@ -72,12 +95,11 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
-    def get_cached_token_count(self, req: LlmRequest) -> int:
+    def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
-        cached = req.prepopulated_prompt_len
         tpb = self.tokens_per_block
-        return (cached // tpb) * tpb
+        return (req.prepopulated_prompt_len // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         first_layer = get_global_layer_ids(lg)[0]
@@ -106,15 +128,14 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
-    def get_cached_token_count(self, req: LlmRequest) -> int:
+    def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
         kv_cache = self._mgr.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return 0
-        cached = kv_cache.num_committed_tokens
         tpb = self.tokens_per_block
-        return (cached // tpb) * tpb
+        return (kv_cache.num_committed_tokens // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         return np.fromiter(

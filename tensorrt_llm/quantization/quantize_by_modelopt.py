@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,7 @@ from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from modelopt.torch.utils import print_rank_0
 from safetensors.torch import load_file, save_file
+from torch import nn
 from torch.utils.data import DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
@@ -281,6 +282,74 @@ def get_hf_config(ckpt_path):
         return AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
 
 
+class _FusedExpertLinearView(nn.Module):
+    # Linear-like module whose weight is a view into a shared 3D MoE tensor.
+    # Used by _unfuse_mixtral_for_modelopt to present the per-expert structure
+    # that modelopt's exporter iterates, without copying weights.
+    def __init__(self, weight_view: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight_view, requires_grad=False)
+        self.bias = None
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
+class _MixtralExpertShim(nn.Module):
+    pass
+
+
+class _MixtralSparseMoeBlockShim(nn.Module):
+    # Name kept as "MixtralSparseMoeBlock" via __init__ override so that
+    # modelopt's `"mixtral" in type(experts).__name__.lower()` checks match.
+    pass
+
+
+_MixtralSparseMoeBlockShim.__name__ = "MixtralSparseMoeBlock"
+
+
+def _unfuse_mixtral_for_modelopt(model: nn.Module) -> None:
+    # transformers 5.x stores Mixtral experts as a single MixtralExperts module
+    # with 3D fused tensors (`gate_up_proj`, `down_proj`) under `layer.mlp`,
+    # and dropped the per-expert ModuleList layout that nvidia-modelopt 0.37
+    # iterates. This shim synthesizes the old-style `layer.block_sparse_moe`
+    # with `experts[i].{w1,w2,w3}.weight` as zero-copy views into the fused
+    # tensors so modelopt's MoE exporter works unmodified.
+    try:
+        from transformers.models.mixtral.modeling_mixtral import MixtralExperts
+    except ImportError:
+        return
+
+    if not (hasattr(model, "model") and hasattr(model.model, "layers")):
+        return
+
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+        experts = getattr(mlp, "experts", None)
+        if not isinstance(experts, MixtralExperts):
+            continue
+
+        num_experts = experts.num_experts
+        intermediate = experts.intermediate_dim
+        gate_up = experts.gate_up_proj  # [N, 2*I, H]
+        down = experts.down_proj  # [N, H, I]
+
+        new_experts = nn.ModuleList()
+        for i in range(num_experts):
+            shim = _MixtralExpertShim()
+            shim.w1 = _FusedExpertLinearView(gate_up[i, :intermediate, :])
+            shim.w3 = _FusedExpertLinearView(gate_up[i, intermediate:, :])
+            shim.w2 = _FusedExpertLinearView(down[i])
+            new_experts.append(shim)
+
+        new_block = _MixtralSparseMoeBlockShim()
+        new_block.experts = new_experts
+        new_block.gate = mlp.gate
+        layer.block_sparse_moe = new_block
+
+
 def _get_llava_qwen_model(model_dir, dtype, device):
     if "hf" in model_dir:
         from transformers import LlavaOnevisionForConditionalGeneration
@@ -352,6 +421,12 @@ def get_model(ckpt_path: str,
             model.lm_head = lm_head
 
     model.eval()
+
+    # transformers 5.x changed Mixtral MoE to a fused 3D layout that
+    # nvidia-modelopt 0.37 cannot iterate. Restructure into per-expert
+    # block_sparse_moe layout using zero-copy tensor views.
+    if hf_config.model_type == "mixtral":
+        _unfuse_mixtral_for_modelopt(model)
 
     model_dtype = next(model.parameters()).dtype
     if torch_dtype != model_dtype:

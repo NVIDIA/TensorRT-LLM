@@ -494,7 +494,8 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                                        void const* vBasePtr,
                                        void* oBasePtr,
                                        void const* kSfBasePtr,
-                                       void const* vSfBasePtr) {
+                                       void const* vSfBasePtr,
+                                       void const* slidingWindowKvPoolBasePtr = nullptr) {
   return setKernelParams(options,
                          params.logicalGridDimX,
                          params.logicalGridDimY,
@@ -507,6 +508,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          vBasePtr,
                          kSfBasePtr,
                          vSfBasePtr,
+                         slidingWindowKvPoolBasePtr,
                          params.ptrPageIdxKv,
                          params.ptrOutputScale,
                          params.ptrScaleSoftmaxLog2,
@@ -515,6 +517,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrCustomMask,
                          params.ptrCustomMaskOffsets,
                          params.ptrFirstSparseMaskOffsetsKv,
+                         params.ptrSparseMlaTopKLens,
                          params.ptrSageAttnSfsQ,
                          params.ptrSageAttnSfsK,
                          params.ptrSageAttnSfsP,
@@ -551,6 +554,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     void const* vBasePtr,
                                     void const* kSfBasePtr,
                                     void const* vSfBasePtr,
+                                    void const* slidingWindowKvPoolBasePtr,
                                     int const* kvPageIdxD,
                                     float const* outputScaleD,
                                     float const* scaleSoftmaxLog2D,
@@ -559,6 +563,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     uint32_t const* customMaskPtrD,
                                     int64_t const* customMaskOffsetsPtrD,
                                     int32_t const* firstSparseMaskOffsetsKvPtrD,
+                                    int32_t const* sparseMlaTopKLensPtrD,
                                     float const* ptrSageAttnSfsQ,
                                     float const* ptrSageAttnSfsK,
                                     float const* ptrSageAttnSfsP,
@@ -656,6 +661,20 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                       /*swizzled=*/kernelTraits.mSwizzleKv,
                                       /*unpack4b=*/storeTransformedKvInTmem);
 
+  // Build the TMA descriptor for the DSv4 sparse MLA sliding-window KV pool.
+  // Same shape/stride and dtype as tmaK_, but with a different base pointer.
+  if (options.mHasSlidingWindowKvPool && isTokenSparse(options.mSparseType) &&
+      slidingWindowKvPoolBasePtr != nullptr) {
+    params.tmaKSlidingWindowKvPool_ =
+      buildNdTmaDescriptor(options.mDtypeK,
+                           shapeK,
+                           strideK,
+                           tileShapeK,
+                           const_cast<void*>(slidingWindowKvPoolBasePtr),
+                           /*swizzled = */ kernelTraits.mSwizzleKv,
+                           /*unpack4b=*/storeTransformedKvInTmem);
+  }
+
   // Shape/stride for gmem tensor V.
   auto [shapeV, strideV] = makeTmaShapeStrideKv(options,
                                                 params,
@@ -752,6 +771,9 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
 
   // The softmax stats buffer.
   params.ptrSoftmaxStats = options.mStoresSoftmaxStats ? softmaxStatsD : nullptr;
+
+  // The variable sparseMla topK lengths.
+  params.ptrSparseMlaTopKLens = sparseMlaTopKLensPtrD;
 
   // The output buffer.
   params.ptrO = oPtrD;
@@ -867,6 +889,7 @@ static KernelParams updateKernelParams(FmhaOptions_ const&,
                                        void const*,
                                        void*,
                                        void const*,
+                                       void const*,
                                        void const*) {
   return KernelParams{};
 }
@@ -883,15 +906,24 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     void const*,
                                     void const*,
                                     void const*,
+                                    void const*,
+                                    void const*,
+                                    void const*,
                                     int const*,
+                                    float const*,
+                                    float const*,
+                                    float const*,
                                     float const*,
                                     uint32_t const*,
                                     int64_t const*,
+                                    int32_t const*,
                                     int32_t const*,
                                     float const*,
                                     float const*,
                                     float const*,
                                     float const*,
+                                    float const*,
+                                    void*,
                                     void*,
                                     int*,
                                     void*,
@@ -904,7 +936,8 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     float,
                                     int32_t,
                                     bool,
-                                    bool) {
+                                    bool,
+                                    void const* = nullptr) {
   return KernelParams{};
 }
 #endif
