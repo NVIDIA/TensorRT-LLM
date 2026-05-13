@@ -361,6 +361,7 @@ class _KVCache:
         self._avg_history_length = Average()
         self._avg_capacity = Average()
         self._avg_history_length.update(self.history_length)
+        self._avg_capacity.update(self.capacity)
         manager._living_kv_caches.add(rawref.ref(self))
         manager._avg_reused_length.update(self.history_length)
         manager._num_created_kv_caches += 1
@@ -596,7 +597,6 @@ class _KVCache:
         # sizes pools for sequences that never arrive. They are already tracked
         # as stats-excluded at creation; honour that here too.
         if self.capacity > 0 and not manager.is_stats_excluded(self.id):
-            self._avg_capacity.update(self.capacity)
             manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
             manager._num_sampled_kv_caches += 1
@@ -605,6 +605,7 @@ class _KVCache:
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
+        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
@@ -755,17 +756,22 @@ class _KVCache:
     # two APIs) where we use more pages than necessary for SWA layers. So we use a single API to avoid
     # this. Usually this is a concern only for prefill phase where we create many tokens in one step. For
     # other cases, we can just set the capacity and history_length properties instead.
-    def resize(self, capacity: int | None, history_length: int | None = None) -> bool:
+    def resize(
+        self,
+        capacity: int | None,
+        history_length: int | None = None,
+        _track_avg: bool = True,
+    ) -> bool:
         assert self.status == self.Status.ACTIVE
         tokens_per_block = self.tokens_per_block
         assert div_up(self._capacity, tokens_per_block) == len(self._blocks)
         if capacity is None:
             capacity = self._capacity
-        else:
+        elif _track_avg:
             self._avg_capacity.update(capacity)
         if history_length is None:
             history_length = self._history_length
-        else:
+        elif _track_avg:
             self._avg_history_length.update(history_length)
         if history_length < self._history_length:
             raise ValueError("History length cannot be decreased")
@@ -1032,7 +1038,8 @@ class _KVCache:
                 self._commit_state = self.CommitState.USER_STOP
             return
         if self.history_length < self.num_committed_tokens:
-            self.history_length = self.num_committed_tokens
+            success = self.resize(None, self.num_committed_tokens, _track_avg=False)
+            assert success
         num_committed_blocks = self._num_committed_blocks
         new_num_full_blocks = BlockOrdinal(self.num_committed_tokens // self.tokens_per_block)
         has_partial_snapshot = (
