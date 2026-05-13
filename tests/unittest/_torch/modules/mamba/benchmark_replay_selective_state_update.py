@@ -665,7 +665,7 @@ _CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL = 10
 _CUPTI_ACTIVITY_ATTR_ZEROED_OUT_ACTIVITY_BUFFER = 5
 _CUPTI_HOST_BUFFER_BYTES = 1024 * 1024
 _CUPTI_HOST_BUFFER_COUNT = 16
-_DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE = 2
+_DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE = 1
 _DEFAULT_CUDA_GRAPH_GROUP_ITERS_MIX = 4
 
 
@@ -1327,6 +1327,7 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
             f"(warmup+iters) = {expected_total} records, got {total}. "
             f"Kernel record counts: {name_counts}.{zero_msg} SKIPPING cell.",
             file=sys.stderr,
+            flush=True,
         )
         # Per-record dump: (name, start_ns_rel, end_ns_rel, corr_id, graph_id, stream_id).
         # Times relative to first record so absolute ns isn't drowning output.
@@ -1341,9 +1342,11 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
                     f"  rec[{i:3d}] name={r[0]!r} start={rel_start:.2f}us "
                     f"end={rel_end:.2f}us corr={r[3]} graph={r[4]} stream={r[6]}",
                     file=sys.stderr,
+                    flush=True,
                 )
             if len(records) > 30:
-                print(f"  ... ({len(records) - 30} more records elided)", file=sys.stderr)
+                print(f"  ... ({len(records) - 30} more records elided)",
+                      file=sys.stderr, flush=True)
         return None
     K = expected_K
     timed = records[warmup * K:]
@@ -1494,21 +1497,23 @@ def _capture_group_graph(
 
 
 def _graph_group_iters(args, total_iters: int, pre_iter_fn, pre_iter_group_factory) -> int:
+    """Pick the graph-group size unconditionally; the caller is expected to
+    round total_iters up to a multiple of this so all iters fit in clean
+    replays.  Sample arrays are pre-padded at allocation (see _sample_pnat
+    call site) so the per-replay window can index past the user-requested
+    iter count by up to group_iters-1 extra samples.
+    """
     if pre_iter_fn is not None and pre_iter_group_factory is None:
+        # Per-iter callback without a group-factory: can't batch.
         return 1
     requested = getattr(args, "cuda_graph_group_iters", None)
     if requested is None:
-        requested_group_iters = (
+        return (
             _DEFAULT_CUDA_GRAPH_GROUP_ITERS_MIX
             if pre_iter_group_factory is not None
             else _DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE
         )
-    else:
-        requested_group_iters = max(1, int(requested))
-    for group_iters in (requested_group_iters, 2):
-        if total_iters % group_iters == 0:
-            return group_iters
-    return 1
+    return max(1, int(requested))
 
 
 def _get_cupti_filter_plan(timer: CuptiKernelTimer, graph, cache_key: tuple | None,
@@ -1594,6 +1599,13 @@ def _time_kernel_cuda_graph(
 
     total_iters = warmup + iters
     group_iters = _graph_group_iters(args, total_iters, pre_iter_fn, pre_iter_group_factory)
+    # Args are rounded at argparse-time so warmup+iters/mix_iters are already
+    # multiples of the relevant group_iters.  Assert here to catch any caller
+    # bypassing argparse.
+    assert total_iters % group_iters == 0, (
+        f"total_iters={total_iters} not a multiple of group_iters={group_iters}; "
+        f"args.warmup/iters/mix_iters should be rounded post-argparse."
+    )
     pre_replay_fn = None
     graph_pre_iter_fn = None
     if pre_iter_group_factory is not None and group_iters > 1:
@@ -1900,45 +1912,53 @@ def _warm_one_config(args, cfg, baseline_fn) -> None:
     aren't picklable).  Each worker process holds its own GIL → no
     serialization between concurrent compiles.
 
-    ``cfg`` is a tuple of (outer_cfg, inner_overrides):
+    ``cfg`` is a tuple of (outer_cfg, inner_overrides_or_list):
       * outer_cfg = (batch, mtp_len, prev_ks, state_dtype, act_dtype,
                      sr_mode, rect, write_ckpt, mode,
                      sort_slots, reverse_nowrite, hardcode_sort)
-      * inner_overrides = dict of args attribute name -> single-value string
-                         to clamp the per-cell inner-knob sweep to ONE
-                         combination.  Triggers exactly one Triton compile
-                         per worker invocation, so N workers achieve
-                         N-way concurrency regardless of outer config
-                         count.  (Prior design fanned out only at outer
-                         granularity, capping concurrency at ~10 even
-                         with --compile-threads 50.)
+      * inner_overrides_or_list = dict of args attribute name -> value-string,
+        OR a list of such dicts.  In the list form (CPS-grouped task) the
+        worker compiles each entry sequentially within the same process so
+        Triton's in-process kernel cache catches value-spec hits across
+        related entries (e.g. CPS={1,2} and {4,8} each form a `div_by_16`
+        spec bucket; the second compile in a bucket short-circuits).
 
     ``baseline_fn`` is optional — when ``None``, only the checkpointing
     kernel is warmed (the baseline-selection kernel can be warmed once in
     the parent if needed).  This lets us avoid pickling C-extension
     function references across processes.
     """
-    outer_cfg, inner_overrides = cfg
+    outer_cfg, inner_overrides_or_list = cfg
+    overrides_list = (inner_overrides_or_list
+                      if isinstance(inner_overrides_or_list, list)
+                      else [inner_overrides_or_list])
     (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode,
      rect, write_ckpt, mode, sort_slots, reverse_nowrite, hardcode_sort) = outer_cfg
-    # Clone args and override inner-knob sweep lists to single values.
-    # _bench_config then iterates a 1×1×...×1 cartesian inside.
     import argparse as _ap
-    args_copy = _ap.Namespace(**vars(args))
-    for k, v in inner_overrides.items():
-        setattr(args_copy, k, v)
-    _bench_config(
-        args_copy, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
-        sr_mode=sr_mode, rectangle_for_nowrite=rect,
-        write_checkpoint=write_ckpt, mode=mode,
-        sort_slots=sort_slots, reverse_nowrite=reverse_nowrite,
-        hardcode_sort=hardcode_sort,
-        warmup_only=True,
-    )
+    for inner_overrides in overrides_list:
+        # Fresh clone per entry: prevents knob-value leakage between
+        # consecutive cells in a CPS-grouped task (entries may set
+        # different non-CPS knobs in degenerate edge cases).
+        args_copy = _ap.Namespace(**vars(args))
+        for k, v in inner_overrides.items():
+            setattr(args_copy, k, v)
+        _bench_config(
+            args_copy, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
+            sr_mode=sr_mode, rectangle_for_nowrite=rect,
+            write_checkpoint=write_ckpt, mode=mode,
+            sort_slots=sort_slots, reverse_nowrite=reverse_nowrite,
+            hardcode_sort=hardcode_sort,
+            warmup_only=True,
+        )
 
 
 def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
                           baseline_fn, max_workers: int) -> None:
+    _cw_t0 = time.perf_counter()
+    def _cw(label: str) -> None:
+        dt = time.perf_counter() - _cw_t0
+        print(f"[compile-warmup] t={dt:7.2f}s  {label}", file=sys.stderr, flush=True)
+    _cw("entered _compile_warmup_phase")
     """Parallel compile-warmup using a ProcessPoolExecutor with `spawn`
     start method.
 
@@ -2040,10 +2060,27 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                                                     hardcode_sort,
                                                 ))
 
-    # Enumerate inner-knob cartesian — same axes _bench_config iterates
-    # internally.  Each (outer × inner) tuple becomes one task; workers
-    # then trigger exactly one Triton compile per task, giving true
-    # N-way concurrency with --compile-threads N.
+    # Enumerate inner-knob signatures.  Two paths:
+    #   (1) --cell-list mode (preferred when set): pull exactly the cells
+    #       that will be timed from args._cell_list_set.  No synthetic
+    #       cartesian — we only pre-compile what will run.
+    #   (2) Sweep-args mode: cartesian over split-aware axes that read
+    #       BOTH unsplit (args.X) and per-half (args.X_write/_nowrite)
+    #       knob settings.  Older code read only args.X and silently
+    #       enumerated 1 inner combo when callers set only the per-half
+    #       versions (all cell-list usage, plus any --block-size-m-write/
+    #       _nowrite CLI invocation), causing massive in-process JIT
+    #       compile tax for persistent_main especially.
+    #
+    # In BOTH paths we GROUP tasks by non-CPS signature so each worker
+    # process compiles all CPS values for its group sequentially.
+    # NUM_PERSISTENT = CPS * num_sms is a runtime int but Triton auto-
+    # specializes on `div_by_16`, partitioning {CPS=1,2} (132,264) from
+    # {CPS=4,8} (528,1056) into two distinct compiled variants.  By
+    # keeping all CPS variants for one (M,W,S,LS,TMA,...) signature in
+    # the same worker, the second compile in each spec bucket hits the
+    # in-process Triton cache (no disk-cache round trip).
+
     def _ps(val):
         if val is None or (isinstance(val, str) and not val):
             return [None]
@@ -2051,60 +2088,127 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
             return [v.strip() for v in val.split(",") if v.strip()]
         return [val]
 
-    # CPS (cta_per_sm) collapsed to first value: NUM_PERSISTENT is runtime now,
-    # so different CPS values share the same compiled kernel.  Collapsing here
-    # avoids enumerating 4-8x redundant tasks that would each pay ~50-100ms
-    # bench setup overhead for a cache hit on the same kernel hash.
-    _cps_for_compile = _ps(args.cta_per_sm)[:1]
-    knob_axes = [
-        ("block_size_m",                 _ps(args.block_size_m)),
-        ("num_warps",                    _ps(args.num_warps)),
-        ("num_stages",                   _ps(args.num_stages)),
-        ("precompute_num_warps",         _ps(args.precompute_num_warps)),
-        ("precompute_num_stages",        _ps(args.precompute_num_stages)),
-        ("heads_per_block",              _ps(args.heads_per_block)),
-        ("maxnreg",                      _ps(args.maxnreg)),
-        ("num_ctas",                     _ps(args.num_ctas)),
-        ("cta_per_sm",                   _cps_for_compile),  # collapsed (runtime)
-        ("num_loop_stages",              _ps(args.num_loop_stages)),
-        ("flatten",                      _ps(args.flatten)),
-        ("warp_specialize",              _ps(args.warp_specialize)),
-        ("use_tma_rect_load",            _ps(args.use_tma_rect_load)),
-        ("use_tma_replay_write_load",    _ps(args.use_tma_replay_write_load)),
-        ("use_tma_replay_nowrite_load",  _ps(args.use_tma_replay_nowrite_load)),
-        ("use_tma_replay_write_store",   _ps(args.use_tma_replay_write_store)),
-    ]
-    import itertools as _it
-    inner_combos = list(_it.product(*(values for _, values in knob_axes)))
+    def _split_or_pair(shared_attr, w_attr, nw_attr):
+        """Return list of (write_val, nowrite_val) strings.
 
-    # Cross product outer × inner.  Override only knobs that have an
-    # explicit value (skip None — those leave args.<knob> at its CLI default,
-    # which _bench_config handles via its own _parse_sweep).
+        Reads shared (args.X), write-side (args.X_write), and nowrite-side
+        (args.X_nowrite) values.  If both per-half attrs are None, emits
+        tied pairs (v,v) over the shared values.  If either per-half is
+        set, cartesian-iterates per-half values, falling back to shared
+        for whichever side is None.
+        """
+        w = _ps(getattr(args, w_attr, None))
+        nw = _ps(getattr(args, nw_attr, None))
+        s = _ps(getattr(args, shared_attr, None))
+        if w == [None] and nw == [None]:
+            return [(v, v) for v in s]
+        if w == [None]:
+            w = s
+        if nw == [None]:
+            nw = s
+        return [(a, b) for a in w for b in nw]
+
+    _cw(f"built {len(configs)} outer configs")
+    # Build per-cell inner-overrides dicts.
+    cell_set = getattr(args, "_cell_list_set", set())
+    cell_keys = getattr(args, "_cell_list_keys", ())
+    if cell_set:
+        inner_dicts = []
+        for tup in cell_set:
+            d = dict(zip(cell_keys, tup))
+            inner = {}
+            for k, v in d.items():
+                if k in _CELL_LIST_KEY_TO_ARG:
+                    inner[_CELL_LIST_KEY_TO_ARG[k]] = str(v)
+            inner_dicts.append(inner)
+    else:
+        m_pairs   = _split_or_pair("block_size_m",     "block_size_m_write",     "block_size_m_nowrite")
+        w_pairs   = _split_or_pair("num_warps",        "num_warps_write",        "num_warps_nowrite")
+        ns_pairs  = _split_or_pair("num_stages",       "num_stages_write",       "num_stages_nowrite")
+        cps_pairs = _split_or_pair("cta_per_sm",       "cta_per_sm_write",       "cta_per_sm_nowrite")
+        ls_pairs  = _split_or_pair("num_loop_stages",  "num_loop_stages_write",  "num_loop_stages_nowrite")
+        pw_vals   = _ps(args.precompute_num_warps)
+        ps_vals   = _ps(args.precompute_num_stages)
+        h_vals    = _ps(args.heads_per_block)
+        mr_vals   = _ps(args.maxnreg)
+        ct_vals   = _ps(args.num_ctas)
+        fl_vals   = _ps(args.flatten)
+        wsp_vals  = _ps(args.warp_specialize)
+        trl_vals  = _ps(args.use_tma_rect_load)
+        twl_vals  = _ps(args.use_tma_replay_write_load)
+        tnl_vals  = _ps(args.use_tma_replay_nowrite_load)
+        tws_vals  = _ps(args.use_tma_replay_write_store)
+        import itertools as _it
+        inner_dicts = []
+        for ((mw, mnw), (ww, wnw), (sw, snw), (cw, cnw), (lw, lnw),
+             pw, ps_, h, mr, ct, fl, wsp,
+             trl, twl, tnl, tws) in _it.product(
+                m_pairs, w_pairs, ns_pairs, cps_pairs, ls_pairs,
+                pw_vals, ps_vals, h_vals, mr_vals, ct_vals,
+                fl_vals, wsp_vals,
+                trl_vals, twl_vals, tnl_vals, tws_vals):
+            d = {}
+            for k, v in (
+                ("block_size_m_write", mw),
+                ("block_size_m_nowrite", mnw),
+                ("num_warps_write", ww),
+                ("num_warps_nowrite", wnw),
+                ("num_stages_write", sw),
+                ("num_stages_nowrite", snw),
+                ("cta_per_sm_write", cw),
+                ("cta_per_sm_nowrite", cnw),
+                ("num_loop_stages_write", lw),
+                ("num_loop_stages_nowrite", lnw),
+                ("precompute_num_warps", pw),
+                ("precompute_num_stages", ps_),
+                ("heads_per_block", h),
+                ("maxnreg", mr),
+                ("num_ctas", ct),
+                ("flatten", fl),
+                ("warp_specialize", wsp),
+                ("use_tma_rect_load", trl),
+                ("use_tma_replay_write_load", twl),
+                ("use_tma_replay_nowrite_load", tnl),
+                ("use_tma_replay_write_store", tws),
+            ):
+                if v is not None:
+                    d[k] = str(v)
+            inner_dicts.append(d)
+
+    # Group by non-CPS signature.  All inner_dicts that match on every
+    # key except CPSw/CPSnw/cta_per_sm land in the same worker task; the
+    # worker will compile them in sequence, sharing Triton's in-process
+    # kernel cache across the divides bucket boundary at most once per
+    # bucket (CPS in {1,2} vs {4,8}).
+    _cps_keys = ("cta_per_sm_write", "cta_per_sm_nowrite", "cta_per_sm")
+    groups: dict = {}
+    for d in inner_dicts:
+        sig = tuple(sorted((k, v) for k, v in d.items() if k not in _cps_keys))
+        groups.setdefault(sig, []).append(d)
+
     tasks = []
     for outer in configs:
-        for inner_tuple in inner_combos:
-            inner_overrides = {
-                name: str(val)
-                for (name, _), val in zip(knob_axes, inner_tuple)
-                if val is not None
-            }
-            tasks.append((outer, inner_overrides))
+        for sig, group in groups.items():
+            tasks.append((outer, group))
 
-    # Shuffle to reduce cross-worker race on the same kernel hash.  Two
-    # workers picking adjacent tasks (same mode, neighboring knob value)
-    # could both miss + compile the same kernel hash; shuffling spreads
-    # workloads across different kernel hash families.
+    # Shuffle ACROSS groups (not within — within-group order is the
+    # CPS sequence that benefits from in-process cache adjacency).
     import random as _r
     _r.shuffle(tasks)
 
+    n_total_cells = sum(len(g) for g in groups.values())
+    _cw(f"built {len(tasks)} tasks covering {n_total_cells} cells in {len(groups)} groups")
     print(f"[compile-warmup] {len(tasks)} compile tasks "
-          f"({len(configs)} outer × {len(inner_combos)} inner combos) "
+          f"({len(configs)} outer × {len(groups)} cell-groups "
+          f"covering {n_total_cells} cells, CPS-grouped) "
           f"across {max_workers} processes (ProcessPoolExecutor, spawn start)")
     t0 = time.perf_counter()
 
     ctx = multiprocessing.get_context("spawn")
     errors = []
+    _cw("about to create ProcessPoolExecutor")
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+        _cw("ProcessPoolExecutor created, about to submit tasks")
         # baseline_fn=None: workers compile only the checkpointing kernel.
         # Baseline kernels (if any) get compiled lazily in the parent during
         # the timing phase — usually just one extra compile, negligible.
@@ -2112,28 +2216,27 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
             ex.submit(_warm_one_config, args, task, None): task
             for task in tasks
         }
+        _cw(f"submitted {len(futures)} tasks, waiting for results")
+        _n_done = 0
         for fut in futures:
             try:
                 fut.result()
             except Exception as e:
                 errors.append((futures[fut], e))
+            _n_done += 1
+            # Progress beacons at 10/25/50/75/100% to gauge effective parallelism.
+            if _n_done in (max(1, len(futures)//10),
+                           max(1, len(futures)//4),
+                           max(1, len(futures)//2),
+                           max(1, (3*len(futures))//4),
+                           len(futures)):
+                _cw(f"{_n_done}/{len(futures)} tasks complete")
 
     if errors:
-        # Don't abort the whole bench just because some (M, W, S, TMA, ...)
-        # combinations refuse to compile.  Driver-style invocations
-        # (search loops, sparse cell-lists) often hit a few bad combos in
-        # otherwise-valid sweeps; aborting wastes the rest of the bench's
-        # work.  Log them once each and continue — the inner-loop runs
-        # below will trip their compile again per-cell, fail safely
-        # (per-cell is caught), and the cells just don't get timed.
-        print(f"[compile-warmup] {len(errors)} configs failed to compile "
-              f"(continuing; cells will be skipped):", file=sys.stderr)
-        for cfg, e in errors[:5]:
-            first_line = str(e).strip().split("\n")[0][:120]
-            print(f"  FAILED {cfg}: {type(e).__name__}: {first_line}",
+        for cfg, e in errors:
+            print(f"[compile-warmup] FAILED config {cfg}: {type(e).__name__}: {e}",
                   file=sys.stderr)
-        if len(errors) > 5:
-            print(f"  ... and {len(errors) - 5} more", file=sys.stderr)
+        raise errors[0][1]
 
     print(f"[compile-warmup] done in {time.perf_counter() - t0:.1f}s")
 
@@ -3088,6 +3191,7 @@ def _bench_config(
                             f"[retry] CUPTI mismatch on {sweep_tag!r}; "
                             f"retrying ({attempt + 1}/{retry_budget})",
                             file=sys.stderr,
+                            flush=True,
                         )
                 if stats is None:
                     args._skipped_cells.append(sweep_tag)
@@ -3508,6 +3612,15 @@ def _current_cell_tuple(args, locals_dict: dict) -> tuple | None:
 
 
 def _run_benchmark(args) -> None:
+    # Phase-timing markers — emit timestamped checkpoints so a captured-stdout
+    # run can later attribute wall time to setup vs compile-warmup vs prewarm
+    # vs timing.  Single-line format makes log-grepping trivial.
+    _phase_t0 = time.perf_counter()
+    def _phase(label: str) -> None:
+        dt = time.perf_counter() - _phase_t0
+        print(f"[phase] t={dt:7.2f}s  {label}", file=sys.stderr, flush=True)
+    _phase("enter _run_benchmark")
+
     # Pending-results FIFO for srxl's deferred CUPTI parsing pipeline.  Each
     # entry holds a _PendingCuptiStats handle; _drain_pending_results pulls
     # ready entries and routes them to _print_row (which appends to JSONL).
@@ -3637,11 +3750,14 @@ def _run_benchmark(args) -> None:
     # Cell-list state may already have been populated by main() (so that
     # the args.*_list derivations downstream see the override).  Default to
     # empty if not.
+    _phase(f"done loading _done_keys ({len(args._done_keys)} entries)")
+
     if not hasattr(args, "_cell_list_keys"):
         args._cell_list_keys: tuple = ()
         args._cell_list_set: set = set()
         if getattr(args, "cell_list", None):
             _load_cell_list_into_args(args)
+    _phase(f"done loading cell-list ({len(args._cell_list_set)} cells)")
 
     assert args.nheads % args.tp_size == 0, (
         f"nheads ({args.nheads}) must be divisible by tp_size ({args.tp_size})"
@@ -3682,11 +3798,13 @@ def _run_benchmark(args) -> None:
     elif args.l2_flush:
         _init_l2_flush()
 
+    _phase("about to enter compile-warmup")
     if args.compile_threads > 0:
         _compile_warmup_phase(
             args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
             baseline_fn, max_workers=args.compile_threads,
         )
+    _phase("returned from compile-warmup")
 
     # Pre-warm the per-(state_dtype, act_dtype, mtp_len, ...) tensor cache at
     # the largest requested batch size.  Without this, the timing loop would
@@ -3703,6 +3821,7 @@ def _run_benchmark(args) -> None:
                     args.tp_nheads, args.head_dim, args.d_state, args.tp_ngroups,
                     max_window=getattr(args, "max_window", None) or None,
                 )
+    _phase("done tensor prewarm — entering timing")
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStart()
@@ -3970,7 +4089,12 @@ def _parse_args() -> argparse.Namespace:
         default="bf16",
         help="Comma-separated activation dtypes for x/B/C/dt: fp32,bf16",
     )
-    parser.add_argument("--warmup", type=int, default=20, help="Number of warmup iterations")
+    parser.add_argument("--warmup", type=int, default=4,
+                        help="Number of warmup iterations.  Default aligns with "
+                        "the graph group-iters (default 4 for mix scenarios) so "
+                        "warmup + iters / mix-iters lands on a clean multiple "
+                        "without per-args rounding overhead.  Earlier default of "
+                        "20 was overkill for steady-state warming.")
     parser.add_argument("--iters", type=int, default=100, help="Number of timed iterations")
     parser.add_argument(
         "--compile-threads",
@@ -4488,6 +4612,33 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.mix_only and args.mix_csv is None:
         parser.error("--mix-only requires --mix-csv")
+
+    # Round iter counts up so warmup + iters (and warmup + mix_iters) are clean
+    # multiples of the graph group-iters used downstream.  Default mix group is
+    # 4, default pure group is 2.  An explicit --cuda-graph-group-iters can
+    # request a larger group.  We round to the max of the two so all scenarios
+    # in a single run (pure + mix) share a clean total_iters.  The cost is at
+    # most (group-1) extra iters per scenario — negligible — and the win is
+    # that graph_group_iters never falls back to 1 (which caused ~5x slowdown
+    # in observed benchmark walls).
+    _group_for_rounding = max(
+        _DEFAULT_CUDA_GRAPH_GROUP_ITERS_MIX,
+        _DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE,
+        getattr(args, "cuda_graph_group_iters", None) or 0,
+    )
+    def _round_iters_to_group(name, val):
+        total = args.warmup + val
+        if total % _group_for_rounding == 0:
+            return val
+        new_total = ((total + _group_for_rounding - 1) // _group_for_rounding) * _group_for_rounding
+        new_val = new_total - args.warmup
+        print(f"[bench] rounding --{name} {val} → {new_val} so warmup+{name} "
+              f"({new_total}) is a multiple of graph group_iters={_group_for_rounding}",
+              file=sys.stderr)
+        return new_val
+    args.iters = _round_iters_to_group("iters", args.iters)
+    if getattr(args, "mix_iters", None):
+        args.mix_iters = _round_iters_to_group("mix-iters", args.mix_iters)
 
     # Cell-list (if any) must be applied BEFORE the post-argparse string→list
     # derivations below — those build args.*_list from args.* strings, so a
