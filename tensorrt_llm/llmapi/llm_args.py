@@ -2060,7 +2060,8 @@ class SleepConfig(StrictBaseModel):
             cls._normalize_restore_mode(value)
             for key, value in cases.items()
         }
-        return defaultdict(_SleepConfigDefaultFactory(default_mode), normalized_cases)
+        return defaultdict(_SleepConfigDefaultFactory(default_mode),
+                           normalized_cases)
 
     @field_validator('restore_modes', mode='plain')
     @classmethod

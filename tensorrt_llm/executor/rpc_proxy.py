@@ -192,13 +192,13 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         return self._iter_kv_events_result
 
     def collective_rpc(
-            self,
-            method: str,
-            args: tuple = (),
-            kwargs: Optional[dict] = None,
-            non_block: bool = False,
-            unique_reply_rank: Optional[int] = None,
-            target_ranks: Optional[Union[int, List[int]]] = None,
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: Optional[Union[int, List[int]]] = None,
     ) -> List:
         """Execute a method call on the rank-0 RpcWorker via the RPC client.
 

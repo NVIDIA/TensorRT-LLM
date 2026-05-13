@@ -718,8 +718,7 @@ class BaseWorker(GenerationExecutor):
         # rather than _is_pytorch_backend, which also covers _autodeploy.
         if self._backend != "pytorch":
             raise ValueError(
-                "sleep() is only available for the PyTorch (TorchLLM) backend."
-            )
+                "sleep() is only available for the PyTorch (TorchLLM) backend.")
         if self.llm_args is None or self.llm_args.sleep_config is None:
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in "

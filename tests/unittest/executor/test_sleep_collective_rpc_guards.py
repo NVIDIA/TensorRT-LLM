@@ -107,8 +107,10 @@ class TestBaseWorkerSleepGuards:
             getattr(w, method)(["kv_cache"])
 
     def test_sleep_config_checked_before_world_size(self, method):
-        """sleep_config check fires before world_size so the error is
-        actionable (set sleep_config, not 'go to TP1')."""
+        """sleep_config check fires before world_size.
+
+        The error should be actionable: set sleep_config, not "go to TP1".
+        """
         w = _make_worker(world_size=2, sleep_config=None)
         with pytest.raises(ValueError, match="Sleep feature is not enabled"):
             getattr(w, method)(["kv_cache"])
