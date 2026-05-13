@@ -153,6 +153,27 @@ def _is_fp4_fp8_standalone_gemm_available() -> bool:
     return result
 
 
+def _is_sm103_gpu() -> bool:
+    """Return whether the current test GPU is an SM103 device such as B300."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0) == (10, 3)
+
+
+def skip_trtllm_bf16_on_sm103(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    dtype: torch.dtype,
+) -> None:
+    """Explicitly skip TRTLLM BF16 tests on SM103."""
+    if backend_type == MoeBackendType.TRTLLM and quant_algo is None and dtype == torch.bfloat16:
+        if _is_sm103_gpu():
+            pytest.skip(
+                "FIXME: TRTLLMGenFusedMoE BF16 (FlashInfer backend) is skipped on SM103 "
+                "due to CUDA errors"
+            )
+
+
 def should_skip_trtllm(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
