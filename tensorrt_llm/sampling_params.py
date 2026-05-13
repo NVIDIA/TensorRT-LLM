@@ -28,6 +28,17 @@ from tensorrt_llm.logger import logger
 MAX_TOP_LOGPROBS = 20
 
 
+def check_logprobs_limit(
+    name: str, value: Optional[int], max_value: int = MAX_TOP_LOGPROBS
+) -> None:
+    if value is None:
+        return
+    if value < 0:
+        raise ValueError(f"{name} must be positive, zero or None")
+    if value > max_value:
+        raise ValueError(f"{name} must be less than or equal to {max_value}")
+
+
 @dataclass(slots=True, kw_only=True)
 class GuidedDecodingParams:
     """Guided decoding parameters for text generation. Only one of the fields could be effective.
@@ -369,14 +380,8 @@ class SamplingParams:
             self.logprobs = None
         if self.logprobs is True:
             self.logprobs = 0
-        if self.logprobs is not None and self.logprobs < 0:
-            raise ValueError("logprobs must be positive, zero or None")
-        if self.logprobs is not None and self.logprobs > MAX_TOP_LOGPROBS:
-            raise ValueError(f"logprobs must be less than or equal to {MAX_TOP_LOGPROBS}")
-        if self.prompt_logprobs is not None and self.prompt_logprobs < 0:
-            raise ValueError("prompt_logprobs must be positive, zero or None")
-        if self.prompt_logprobs is not None and self.prompt_logprobs > MAX_TOP_LOGPROBS:
-            raise ValueError(f"prompt_logprobs must be less than or equal to {MAX_TOP_LOGPROBS}")
+        check_logprobs_limit("logprobs", self.logprobs)
+        check_logprobs_limit("prompt_logprobs", self.prompt_logprobs)
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).

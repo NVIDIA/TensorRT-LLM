@@ -42,8 +42,8 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.sampling_params import check_logprobs_limit
 from tensorrt_llm.scheduling_params import AgentHierarchy
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
 
 
 def _logit_bias_to_embedding_bias(
@@ -463,12 +463,7 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if (logprobs := data.get("logprobs")) is not None:
-            if logprobs < 0:
-                raise ValueError("logprobs must be positive or zero")
-            if logprobs > MAX_TOP_LOGPROBS:
-                raise ValueError(f"logprobs must be less than or equal to "
-                                 f"{MAX_TOP_LOGPROBS}")
+        check_logprobs_limit("logprobs", data.get("logprobs"))
         return data
 
     @model_validator(mode="before")
@@ -869,11 +864,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @classmethod
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
-            if top_logprobs < 0:
-                raise ValueError("top_logprobs must be positive or zero")
-            if top_logprobs > MAX_TOP_LOGPROBS:
-                raise ValueError(f"top_logprobs must be less than or equal to "
-                                 f"{MAX_TOP_LOGPROBS}")
+            check_logprobs_limit("top_logprobs", top_logprobs)
             if not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")

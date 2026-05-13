@@ -71,7 +71,12 @@ from tensorrt_llm.bindings.internal.runtime import (
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, LogprobMode, SamplingParams
+from tensorrt_llm.sampling_params import (
+    MAX_TOP_LOGPROBS,
+    LogprobMode,
+    SamplingParams,
+    check_logprobs_limit,
+)
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
@@ -3370,10 +3375,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             (req.py_num_logprobs or 0 for req in requests),
             default=0,
         )
-        if self.batch_max_topk_logprobs > self.DEFAULT_MAX_TOPK_LOGPROBS:
-            raise ValueError(
-                f"logprobs must be less than or equal to {self.DEFAULT_MAX_TOPK_LOGPROBS}"
-            )
+        check_logprobs_limit(
+            "logprobs", self.batch_max_topk_logprobs, self.DEFAULT_MAX_TOPK_LOGPROBS
+        )
         if self.max_topk_logprobs < self.batch_max_topk_logprobs:
             self.max_topk_logprobs = self.batch_max_topk_logprobs
             self.TOPK_LOGPROBS_SHAPE = (

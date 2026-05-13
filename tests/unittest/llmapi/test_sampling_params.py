@@ -12,12 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from types import SimpleNamespace
-
 import pytest
 
-from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams
+from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
+
+
+@pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
+def test_check_logprobs_limit(field):
+    check_logprobs_limit(field, None)
+    check_logprobs_limit(field, 0)
+    check_logprobs_limit(field, MAX_TOP_LOGPROBS)
+
+    with pytest.raises(ValueError, match=f"{field} must be positive"):
+        check_logprobs_limit(field, -1)
+
+    with pytest.raises(ValueError, match=f"less than or equal to {MAX_TOP_LOGPROBS}"):
+        check_logprobs_limit(field, MAX_TOP_LOGPROBS + 1)
 
 
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs"])
@@ -43,13 +54,3 @@ def test_completion_logprobs_assignment_revalidates():
 
     with pytest.raises(ValueError, match=f"less than or equal to {MAX_TOP_LOGPROBS}"):
         request.to_sampling_params(backend="pytorch")
-
-
-def test_sampler_logprobs_runtime_guard():
-    from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
-
-    sampler = TorchSampler.__new__(TorchSampler)
-    requests = [SimpleNamespace(py_num_logprobs=MAX_TOP_LOGPROBS + 1)]
-
-    with pytest.raises(ValueError, match=f"less than or equal to {MAX_TOP_LOGPROBS}"):
-        sampler._prepare_log_probs(requests)
