@@ -79,10 +79,7 @@ from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
 
 # isort: off
-from ..modules.fused_moe.routing import (
-    get_cached_perfect_router_logits,
-    precompute_common_perfect_router_logits,
-)
+from ..modules.fused_moe.routing import get_cached_perfect_router_logits
 
 # isort: on
 from ..modules.gated_mlp import GatedMLP
@@ -1493,15 +1490,6 @@ class DeepseekV4MoE(nn.Module):
         # Store config values for perfect routing.
         self.model_config = model_config
         self.dtype = dtype
-
-        # Perfect router caching - precompute common logits if enabled.
-        if os.environ.get("ENABLE_PERFECT_ROUTER", "0") == "1":
-            precompute_common_perfect_router_logits(
-                num_experts=num_experts,
-                experts_per_token=top_k,
-                moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=dtype,
-            )
 
     def _compute_shared_expert_tp_size(
         self, intermediate_size: int, block_size: int
