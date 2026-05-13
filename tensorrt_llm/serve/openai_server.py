@@ -1608,6 +1608,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     tool_parser=args.tool_parser,
                 )
 
+            await self._extract_metrics(promise, raw_request)
             return response
 
         async def create_streaming_generator(promise: RequestOutput,
@@ -1618,12 +1619,15 @@ class OpenAIServer(_VideoRoutesMixin):
             for initial_response in initial_responses:
                 yield initial_response
 
+            res = None
             async for res in promise:
                 pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                         res, args)
                 for pp_res in pp_results:
                     yield pp_res
+            if res is not None:
+                await self._extract_metrics(res, raw_request)
 
         try:
             if request.background:
