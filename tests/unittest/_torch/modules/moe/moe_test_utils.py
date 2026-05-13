@@ -187,30 +187,40 @@ def should_skip_trtllm(
     if backend_type != MoeBackendType.TRTLLM:
         return None
 
-    # [Bug] TRTLLMGen MoE on B300 (SM103) with W4A16_MXFP4 + bf16
-    # activation hits tactic-selection illegal memory access during
-    # autotune. Root cause: Python
-    # Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics passed
-    # (num_experts, num_tokens) swapped versus the C++
-    # getValidConfigIndices signature, so the returned valid-tactic list
-    # included [tileN=32, configIndex=5] which IMAs on SM103. PR #13964
-    # head commit 5629e0dff9 fixes the Python arg order AND adds
-    # isKnownInvalidBlockScaleMoeTactic in runner.h to also block this
-    # tactic from the C++ side for fp4/fp8/mxFp4 BlockScaleMoe runners.
-    # Other TRTLLMGen quant_algos on B300 are covered by that C++
-    # blacklist; only W4A16_MXFP4 was exposed via the Python bug, so
-    # restrict the skip to that specific case until the fix is
+    # [Bug] TRTLLMGen MoE FP8_BLOCK_SCALES on B300 (SM103) hits illegal
+    # memory access during tactic autotune for the boundary config
+    # MoeModelConfig(8, 1, 512, 512) at seq_len=8. From Jenkins inner
+    # pytest stdout (build L0_Test-x86_64-Single-GPU/899, stage
+    # B300-PyTorch-1), this is the only deterministically failing
+    # sub-test: it fails on both the first run and the retry, while
+    # the e8_k1+seq=1+FP8_BLOCK_SCALES (passes) and
+    # e8_k1+seq=8+W4A16_MXFP4 / W4A8_NVFP4_FP8 cases that follow it
+    # PASS on retry; their run-1 failures were cascading IMA errors
+    # from the FP8_BLOCK_SCALES tactic that corrupted the CUDA context.
+    # PR #13964 head commit 5629e0dff9 blacklists tactic
+    # [tileN=32, configIndex=5] for SM103 in fp8BlockScaleMoe.cpp via
+    # isKnownInvalidBlockScaleMoeTactic, which should resolve this;
+    # skip this exact (config, seq_len) combination until the fix is
     # verified end-to-end on B300.
     from tensorrt_llm._utils import get_sm_version
 
-    if get_sm_version() == 103 and quant_algo == QuantAlgo.W4A16_MXFP4:
+    if (
+        get_sm_version() == 103
+        and quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        and model_config is not None
+        and model_config.num_experts == 8
+        and model_config.top_k == 1
+        and model_config.hidden_size == 512
+        and model_config.intermediate_size == 512
+        and seq_len == 8
+    ):
         return (
-            "[Bug] TRTLLMGen MoE W4A16_MXFP4 on B300 (SM103) hits "
-            "illegal memory access during autotune: "
-            "Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics returned an "
-            "invalid tactic list that selected [tileN=32, configIndex=5]. "
-            "Partial fix in PR #13964 head commit 5629e0dff9; skipping "
-            "until the fix is verified end-to-end on B300."
+            "[Bug] TRTLLMGen MoE FP8_BLOCK_SCALES on B300 (SM103) "
+            "with MoeModelConfig(8, 1, 512, 512) and seq_len=8 hits "
+            "illegal memory access during tactic autotune "
+            "(tactic [tileN=32, configIndex=5]). Partial fix in PR "
+            "#13964 head commit 5629e0dff9 blacklists this tactic; "
+            "skip until the fix is verified end-to-end on B300."
         )
 
     # Routing method compatibility check (used by test_moe_module.py)
