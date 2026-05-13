@@ -17,6 +17,7 @@ to always use the `short_factor` path (removing dynamic updates).
 import math
 import re
 import types
+from collections.abc import Mapping
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -146,12 +147,25 @@ def _ensure_rope_scaling_type_key(config):
     Transformers 5.x uses ``"rope_type"`` instead of ``"type"`` in the
     rope_scaling / rope_parameters dict.  Copy ``rope_type`` → ``type``
     so both old and new code can read the dict.
+
+    On transformers>=5.5 ``rope_scaling`` may be a ``RopeParameters`` typed
+    mapping rather than a plain ``dict``; accept any ``Mapping`` so the
+    backfill still runs.
     """
     rope_scaling = getattr(config, "rope_scaling", None)
-    if isinstance(rope_scaling, dict) and "type" not in rope_scaling:
+    if isinstance(rope_scaling, Mapping) and "type" not in rope_scaling:
         rope_type = rope_scaling.get("rope_type")
         if rope_type is not None:
-            rope_scaling["type"] = rope_type
+            try:
+                rope_scaling["type"] = rope_type
+            except (TypeError, AttributeError):
+                # Immutable typed mapping; copy to a plain dict so callers can read "type".
+                new_scaling = dict(rope_scaling)
+                new_scaling["type"] = rope_type
+                try:
+                    config.rope_scaling = new_scaling
+                except (AttributeError, TypeError):
+                    pass
 
 
 def _clear_default_rope_scaling_for_custom_models(config):
