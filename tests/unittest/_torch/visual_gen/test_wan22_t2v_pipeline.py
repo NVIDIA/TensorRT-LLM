@@ -23,6 +23,7 @@ Override checkpoint path:
 
 import importlib
 import os
+import tempfile
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
@@ -35,7 +36,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
-from lpips_video_utils import average_video_lpips_score
+from lpips_video_utils import average_video_file_lpips_score
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     VisualGenArgs,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.media.encoding import save_video
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -93,6 +95,7 @@ WAN22_LPIPS_NUM_FRAMES = 9
 WAN22_LPIPS_NUM_INFERENCE_STEPS = NUM_STEPS
 WAN22_LPIPS_GUIDANCE_SCALE = 4.0
 WAN22_LPIPS_SEED = SEED
+WAN22_LPIPS_FRAME_RATE = 16.0
 WAN22_LPIPS_IMAGE_SIZE = (256, 256)
 WAN22_LPIPS_MAX_FRAMES = 8
 WAN22_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "wan22_t2v_lpips_golden_video.mp4"
@@ -335,14 +338,21 @@ class TestWan22T2VLPIPSRegression:
 
         lpips_model = _load_lpips_model("cuda")
         try:
-            lpips_score = average_video_lpips_score(
-                generated_video,
-                WAN22_LPIPS_GOLDEN_PATH,
-                lpips_model,
-                "cuda",
-                image_size=WAN22_LPIPS_IMAGE_SIZE,
-                max_frames=WAN22_LPIPS_MAX_FRAMES,
-            )
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                generated_video_path = Path(tmp_dir) / "wan22_t2v_generated.mp4"
+                save_video(
+                    generated_video,
+                    generated_video_path,
+                    frame_rate=WAN22_LPIPS_FRAME_RATE,
+                )
+                lpips_score = average_video_file_lpips_score(
+                    generated_video_path,
+                    WAN22_LPIPS_GOLDEN_PATH,
+                    lpips_model,
+                    "cuda",
+                    image_size=WAN22_LPIPS_IMAGE_SIZE,
+                    max_frames=WAN22_LPIPS_MAX_FRAMES,
+                )
         finally:
             del lpips_model
             gc.collect()

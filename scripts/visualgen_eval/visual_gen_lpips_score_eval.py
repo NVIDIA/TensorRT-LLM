@@ -515,10 +515,22 @@ def _resolve_output_path(
 
 
 def _save_image(image: Any, output_path: pathlib.Path) -> None:
-    from tensorrt_llm.serve.media_storage import MediaStorage
+    from tensorrt_llm.media.encoding import save_image
+
+    if torch is None:
+        raise RuntimeError("The torch package is required to save generated images.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    MediaStorage.save_image(image, str(output_path))
+    if Image is not None and isinstance(image, Image.Image):
+        if np is None:
+            raise RuntimeError("The numpy package is required to save PIL images.")
+        image = torch.from_numpy(np.array(image.convert("RGB")))
+    elif np is not None and isinstance(image, np.ndarray):
+        image = torch.from_numpy(image)
+    elif not isinstance(image, torch.Tensor):
+        raise TypeError(f"Unsupported image type for saving: {type(image)}")
+
+    save_image(image.detach().cpu(), output_path)
 
 
 def _make_lpips_model(net: str, device: str) -> Any:

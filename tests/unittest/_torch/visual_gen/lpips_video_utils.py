@@ -111,3 +111,25 @@ def average_video_lpips_score(
     with torch.no_grad():
         scores = lpips_model(generated, golden).flatten()
     return scores.mean().item()
+
+
+def average_video_file_lpips_score(
+    generated_video_path: Path,
+    golden_video_path: Path,
+    lpips_model,
+    device: str,
+    image_size: tuple[int, int] = (256, 256),
+    max_frames: int = 8,
+) -> float:
+    """Average LPIPS over paired frames decoded from generated and golden videos."""
+    generated = _decode_video_to_lpips_batch(generated_video_path, image_size, device)
+    golden = _decode_video_to_lpips_batch(golden_video_path, image_size, device)
+
+    paired_frame_count = min(generated.shape[0], golden.shape[0])
+    indices = _sample_frame_indices(paired_frame_count, max_frames).to(device=device)
+    generated = generated[:paired_frame_count].index_select(0, indices)
+    golden = golden[:paired_frame_count].index_select(0, indices)
+
+    with torch.no_grad():
+        scores = lpips_model(generated, golden).flatten()
+    return scores.mean().item()
