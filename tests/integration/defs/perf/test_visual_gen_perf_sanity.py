@@ -178,6 +178,12 @@ class VisualGenPerfSanityTestConfig:
         self.config_file, self.select_pattern, self.upload_to_db = parse_test_case_name(
             test_case_name
         )
+        # Match test_perf_sanity.py: only upload when running in CI where the
+        # OpenSearch endpoint is configured. Without this gate, vg_upload runs
+        # in local/dev environments hard-fail at post time despite a healthy benchmark.
+        self.upload_to_db = self.upload_to_db and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.raw_gpu_type, self.gpu_type = get_gpu_types()
         self.config_dir = get_config_dir()
 
