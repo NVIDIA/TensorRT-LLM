@@ -2491,19 +2491,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             model_config.video_pruning_rate if model_config.video_pruning_rate is not None else 0.0
         )
 
-    @property
-    def multimodal_data_device_paths(self) -> List[str]:
-        return [
-            "image.pixel_values",
-            "image.evs_ids",
-            "video.pixel_values",
-            "video.evs_ids",
-            "video.audio.input_audio_features",
-            "video.audio.feature_attention_mask",
-            "audio.input_audio_features",
-            "audio.feature_attention_mask",
-        ]
-
     def load_weights(self, weights):
         # Construct vision/sound encoders here (outside MetaInitMode) so their
         # HF-based submodules allocate regular CPU tensors. Then move them to
