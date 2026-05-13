@@ -46,6 +46,7 @@ _INPUT = "What is 1+1? Answer briefly."
 
 @pytest.fixture(scope="module")
 def temp_extra_llm_api_options_file():
+    """Write a temporary YAML file enabling return_perf_metrics and yield its path."""
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir,
                                   "responses_perf_metrics_options.yaml")
@@ -64,6 +65,7 @@ def temp_extra_llm_api_options_file():
 
 @pytest.fixture(scope="module")
 def server(temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
+    """Start a RemoteOpenAIServer with perf-metrics enabled and yield it to tests."""
     model_path = get_model_path(_MODEL)
     args = [
         "--reasoning_parser", "qwen3",

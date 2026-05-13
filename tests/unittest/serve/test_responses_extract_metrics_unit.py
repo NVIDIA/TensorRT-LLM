@@ -62,6 +62,7 @@ async def _responses_create_streaming_generator(
 class _FakePromise:
     """Minimal stand-in for RequestOutput / Future used in the non-stream path."""
     async def aresult(self):
+        """Return immediately to simulate a resolved future."""
         return None   # just returns immediately
 
 
@@ -74,6 +75,7 @@ RAW_REQUEST = object()  # opaque stand-in for FastAPI Request
 
 @pytest.mark.asyncio
 async def test_non_streaming_calls_extract_metrics_once():
+    """Verify _extract_metrics is called exactly once in the non-streaming path."""
     calls = []
 
     async def fake_extract(res, req):
@@ -98,6 +100,7 @@ async def test_non_streaming_calls_extract_metrics_once():
 
 @pytest.mark.asyncio
 async def test_streaming_with_items_calls_extract_metrics_once():
+    """Verify _extract_metrics is called once with the last chunk in the streaming path."""
     CHUNK_A, CHUNK_B, CHUNK_C = object(), object(), object()
     chunks = [CHUNK_A, CHUNK_B, CHUNK_C]
     calls = []
@@ -129,6 +132,7 @@ async def test_streaming_with_items_calls_extract_metrics_once():
 
 @pytest.mark.asyncio
 async def test_streaming_single_item_calls_extract_metrics_once():
+    """Verify _extract_metrics is called once even when only a single chunk is yielded."""
     ONLY_CHUNK = object()
     calls = []
 
@@ -152,6 +156,7 @@ async def test_streaming_single_item_calls_extract_metrics_once():
 
 @pytest.mark.asyncio
 async def test_streaming_empty_iterator_does_not_call_extract_metrics():
+    """Verify _extract_metrics is NOT called when the streaming iterator yields no items."""
     calls = []
 
     async def fake_extract(res, req):
@@ -232,6 +237,7 @@ async def test_non_streaming_extract_called_after_aresult():
 @pytest.mark.asyncio
 async def test_non_streaming_and_streaming_are_independent():
     """_extract_metrics call counts are independent across both code paths."""
+    """Verify that non-streaming and streaming call counts are tracked independently."""
     ns_calls = []
     st_calls = []
 

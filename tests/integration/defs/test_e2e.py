@@ -1142,6 +1142,7 @@ def test_openai_responses_entrypoint(llm_root, llm_venv):
 
 
 def test_openai_responses_perf_metrics(llm_root, llm_venv):
+    """Run the /v1/responses perf_metrics regression suite (issue #13949)."""
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
         "-m", "pytest",
