@@ -606,7 +606,7 @@ async def test_kv_cache_aware_router_finish_request_polls_events(servers):
     await router.get_next_server(request)
     await router.finish_request(request, session)
 
-    assert session.post_url == f"{servers[0]}/kv_cache_events"
+    assert session.post_url == f"http://{servers[0]}/kv_cache_events"
     assert await router._server_state[servers[0]].matched_tokens(
         block_hashes, hash_algo=KV_CACHE_HASH_ALGO_V1) == 8
 
