@@ -47,35 +47,14 @@ def get_pool_view_global_layer_ids(
     pool_view: PoolView, layer_group: AttentionLayerGroup
 ) -> List[int]:
     """
-    Global layer IDs for the layers that appear in *pool_view*, ordered by
-    each layer's first byte offset in the slot.
-
-    Order matters: HeadMatchMapper computes ``self_layer_offset`` as the
-    index of the first overlapping layer in this list and multiplies it by
-    ``slot_size_per_layer`` to seek into the slot. That is correct only if
-    this list mirrors the actual slot layout. ``local_layers`` order is set
-    by the lifecycle's add order (V2's ``layer_grouping[lc_idx]``) which is
-    *not* guaranteed to match storage's slot layout — e.g. when V2's pool
-    grouping reorders layers by buffer-size class. Sorting by offset uses
-    the authoritative source (buffer_entries) and works for both V1 and V2.
+    Global layer IDs for the layers that appear in *pool_view*, ordered as in
+    *layer_group.local_layers*.
     """
-    local_id_to_first_offset: Dict[int, int] = {}
-    for entry in pool_view.buffer_entries:
-        lid = int(entry["local_layer_id"])
-        offset = int(entry["offset"])
-        cur = local_id_to_first_offset.get(lid)
-        if cur is None or offset < cur:
-            local_id_to_first_offset[lid] = offset
-
-    if not local_id_to_first_offset:
-        # Empty buffer_entries (e.g. legacy V1 INDEXER pool); fall back to
-        # local_layers order — consumers handle this case explicitly.
-        return [ll.global_layer_id for ll in layer_group.local_layers]
-
-    local_to_global = {ll.local_layer_id: ll.global_layer_id for ll in layer_group.local_layers}
+    local_ids_in_pool = get_unique_layers(pool_view)
     return [
-        local_to_global[lid]
-        for lid, _ in sorted(local_id_to_first_offset.items(), key=lambda x: x[1])
+        ll.global_layer_id
+        for ll in layer_group.local_layers
+        if ll.local_layer_id in local_ids_in_pool
     ]
 
 

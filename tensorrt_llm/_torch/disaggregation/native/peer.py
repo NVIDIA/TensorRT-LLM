@@ -213,14 +213,19 @@ class PeerRegistrar:
 
         # INDEXER pools carry no per-buffer layer info, so layer ids and
         # layer count come from the layer_group itself.
+        #
+        # Sort by global_layer_id so that ``.index(first_overlap_layer)``
+        # below returns the layer's slot position. This relies on the
+        # convention that managers (V1 / V2 / DSv4) assign global_layer_id
+        # monotonically with the layer's byte offset in the slot.
         if self_pv.mapper_kind == MapperKind.INDEXER:
-            self_global_ids = get_global_layer_ids(self_lg)
-            peer_global_ids = get_global_layer_ids(peer_lg)
+            self_global_ids = sorted(get_global_layer_ids(self_lg))
+            peer_global_ids = sorted(get_global_layer_ids(peer_lg))
             self_num_layers = get_layer_group_num_layers(self_lg)
             peer_num_layers = get_layer_group_num_layers(peer_lg)
         else:
-            self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
-            peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
+            self_global_ids = sorted(get_pool_view_global_layer_ids(self_pv, self_lg))
+            peer_global_ids = sorted(get_pool_view_global_layer_ids(peer_pv, peer_lg))
             self_num_layers = get_pool_view_num_layers(self_pv)
             peer_num_layers = get_pool_view_num_layers(peer_pv)
 
