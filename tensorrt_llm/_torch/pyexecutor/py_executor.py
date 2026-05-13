@@ -2114,7 +2114,6 @@ class PyExecutor:
         self._handle_errors(
             "Disagg KV cache transfer error",
             requests=local_error_requests,
-            charge_budget=False,
         )
 
     def _executor_loop(self):
