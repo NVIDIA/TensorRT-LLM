@@ -27,6 +27,10 @@ from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
 from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
+from ..quantization.modelopt_config import (ModelOptQuantConfig,
+                                            is_modelopt_quant_config,
+                                            parse_modelopt_quant_config,
+                                            warn_if_inline_quant_config_differs)
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 # yapf: disable
@@ -318,6 +322,64 @@ class ModelLoader:
         self.model_obj.model_dir = self._model_dir  # mark as a local model
         assert self.model_obj.is_local_model
 
+    @staticmethod
+    def _apply_modelopt_quant_config(
+            parsed: ModelOptQuantConfig, quant_config: QuantConfig,
+            explicit_kv_cache_quant_algo: Optional[QuantAlgo],
+            kv_cache_dtype: Optional[str]) -> None:
+        """Apply a parsed modelopt config onto ``quant_config`` in place."""
+        hf_quant_algo = parsed.quant_algo
+        if hf_quant_algo is None:
+            raise ValueError("Pre-quantized checkpoint must have quant_algo.")
+        hf_quant_algo = QuantAlgo(hf_quant_algo)
+        if quant_config.quant_algo is None:
+            logger.info(
+                f"Setting quant_algo={hf_quant_algo} from HF quant config.")
+            quant_config.quant_algo = hf_quant_algo
+        elif quant_config.quant_algo != hf_quant_algo:
+            raise ValueError(
+                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
+            )
+
+        hf_kv_cache_quant_algo = (QuantAlgo(parsed.kv_cache_quant_algo)
+                                  if parsed.kv_cache_quant_algo is not None else
+                                  None)
+        if hf_kv_cache_quant_algo is not None:
+            if explicit_kv_cache_quant_algo is not None:
+                if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                    logger.warning(
+                        f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
+                    )
+                quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
+            elif quant_config.kv_cache_quant_algo is None:
+                logger.info(
+                    f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                )
+                quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
+            elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                raise ValueError(
+                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                )
+        else:
+            if quant_config.kv_cache_quant_algo not in [
+                    None, QuantAlgo.FP8, QuantAlgo.NVFP4
+            ]:
+                raise ValueError(
+                    f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                )
+
+        # quantized_layers is consumed separately by the PyTorch model_config
+        # layer; exclude_modules and group_size are picked up below if set.
+        if parsed.group_size is not None:
+            logger.info(
+                f"Setting group_size={parsed.group_size} from HF quant config.")
+            quant_config.group_size = parsed.group_size
+        if parsed.exclude_modules:
+            logger.info(
+                f"Setting exclude_modules ({len(parsed.exclude_modules)} entries) from HF quant config."
+            )
+            quant_config.exclude_modules = parsed.exclude_modules
+
     def _update_from_hf_quant_config(self) -> bool:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
 
@@ -337,75 +399,28 @@ class ModelLoader:
                 f"Found {hf_quant_config_path}, pre-quantized checkpoint is used."
             )
             with open(hf_quant_config_path, "r") as f:
-                hf_quant_config = json.load(f)
-                hf_quant_config = hf_quant_config["quantization"]
+                hf_quant_config_raw = json.load(f)
+            parsed = parse_modelopt_quant_config(hf_quant_config_raw)
 
-            hf_quant_algo = hf_quant_config.pop("quant_algo", None)
-            if hf_quant_algo is not None:
-                # fp8_pb_wo from modelopt is the same as fp8_block_scales
-                if hf_quant_algo == "fp8_pb_wo":
-                    hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                else:
-                    hf_quant_algo = QuantAlgo(hf_quant_algo)
-                if quant_config.quant_algo is None:
-                    logger.info(
-                        f"Setting quant_algo={hf_quant_algo} from HF quant config."
-                    )
-                    quant_config.quant_algo = hf_quant_algo
-                elif quant_config.quant_algo != hf_quant_algo:
-                    raise ValueError(
-                        f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
-                    )
-            else:
-                raise ValueError(
-                    "Pre-quantized checkpoint must have quant_algo.")
+            # Cross-check against inline config.json.quantization_config if any.
+            hf_config_path = f"{self._model_dir}/config.json"
+            inline_quant_config = None
+            try:
+                with open(hf_config_path, "r") as f:
+                    inline_quant_config = json.load(f).get(
+                        "quantization_config")
+            except FileNotFoundError:
+                pass
+            warn_if_inline_quant_config_differs(
+                parsed,
+                inline_quant_config,
+                source_file="hf_quant_config.json",
+            )
 
-            hf_kv_cache_quant_algo = hf_quant_config.pop(
-                "kv_cache_quant_algo", None)
-            if hf_kv_cache_quant_algo is not None:
-                hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
-                if explicit_kv_cache_quant_algo is not None:
-                    if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                        logger.warning(
-                            f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
-                        )
-                    quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
-                elif quant_config.kv_cache_quant_algo is None:
-                    logger.info(
-                        f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                    )
-                    quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
-                elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                    raise ValueError(
-                        f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                    )
-            else:
-                if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
-                ]:
-                    raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
-                    )
-
-            # quantized_layers is handled separately (e.g. via LayerQuantConfig
-            # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
-            hf_quant_config.pop("quantized_layers", None)
-
-            quant_config_fields = set(quant_config.model_fields.keys())
-            for key, value in hf_quant_config.items():
-                if key not in quant_config_fields:
-                    logger.warning(
-                        f"Ignoring unknown field '{key}' from HF quant config (not a QuantConfig field)."
-                    )
-                    continue
-                logger.info(
-                    f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
-                )
-                setattr(quant_config, key, value)
-
-            # Update the quant_config in llm_args for pytorch
+            self._apply_modelopt_quant_config(parsed, quant_config,
+                                              explicit_kv_cache_quant_algo,
+                                              kv_cache_dtype)
             self.llm_args.quant_config = quant_config
-
             return True
 
         hf_config_path = f"{self._model_dir}/config.json"
@@ -429,6 +444,14 @@ class ModelLoader:
             )
 
         if hf_quant_config is not None:
+            # Inline modelopt config -- legacy or flat. Reuse the file-path parser.
+            if is_modelopt_quant_config(hf_quant_config):
+                parsed = parse_modelopt_quant_config(hf_quant_config)
+                self._apply_modelopt_quant_config(parsed, quant_config,
+                                                  explicit_kv_cache_quant_algo,
+                                                  kv_cache_dtype)
+                self.llm_args.quant_config = quant_config
+                return True
             # DeepSeek V3 FP8 ckpt
             if hf_quant_config.get("quant_method") == "fp8":
                 if hf_quant_config.get("weight_block_size") is not None:

@@ -25,6 +25,11 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
+from tensorrt_llm.quantization.modelopt_config import (
+    is_modelopt_quant_config,
+    parse_modelopt_quant_config,
+)
+
 from ..utils.logger import ad_logger
 
 
@@ -110,14 +115,23 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
     DEFAULT_KV_CACHE_DTYPE = "fp8"
 
     def read_config(self, config: Dict) -> Dict:
-        producer = config.get("producer", {}).get("name")
-        # sanity check
-        if producer != "modelopt":
-            raise ValueError(f"Expected producer 'modelopt', got '{producer}'")
+        # Accept either modelopt shape: legacy (producer.name == "modelopt"
+        # with a "quantization" wrapper) or flat (quant_method == "modelopt").
+        # A bare producer check would reject flat configs that omit producer.
+        if not is_modelopt_quant_config(config):
+            raise ValueError(
+                "Expected a modelopt quant config "
+                f"(producer={config.get('producer')}, "
+                f"quant_method={config.get('quant_method')})"
+            )
 
-        quant_config = config.get("quantization", {})
+        # Downstream auto-deploy transforms read field-by-field from a dict
+        # using the legacy field names. Parse via the parallel readers and
+        # re-render as the legacy inner dict for those consumers.
+        parsed = parse_modelopt_quant_config(config)
+        quant_config = parsed.to_legacy_inner_dict()
 
-        quant_algo = quant_config.get("quant_algo", "").upper()
+        quant_algo = (quant_config.get("quant_algo") or "").upper()
 
         if quant_algo == "MIXED_PRECISION":
             self._read_mixed_precision_config(quant_config)

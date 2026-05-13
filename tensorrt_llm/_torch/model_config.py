@@ -23,6 +23,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.modelopt_config import (
+    ModelOptQuantConfig, is_modelopt_quant_config, parse_modelopt_quant_config,
+    warn_if_inline_quant_config_differs)
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -295,60 +298,64 @@ class ModelConfig(Generic[TConfig]):
     @staticmethod
     def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
                                    moe_backend):
+        with open(quant_config_file) as f:
+            raw = json.load(f)
+        parsed = parse_modelopt_quant_config(raw)
+        return ModelConfig._build_quant_config_from_modelopt(
+            parsed, checkpoint_dir, moe_backend)
+
+    @staticmethod
+    def _build_quant_config_from_modelopt(parsed: ModelOptQuantConfig,
+                                          checkpoint_dir, moe_backend):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        with open(quant_config_file) as f:
-            quant_config_dict = json.load(f)
-
-        json_quant_configs = quant_config_dict['quantization']
-
-        quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
-        # fp8_pb_wo from modelopt is the same as FP8_BLOCK_SCALES
-        if quant_config.quant_algo == "fp8_pb_wo":
-            quant_config.quant_algo = 'FP8_BLOCK_SCALES'
-        quant_config.kv_cache_quant_algo = json_quant_configs.get(
-            'kv_cache_quant_algo', None)
-        quant_config.group_size = json_quant_configs.get('group_size', None)
-        quant_config.exclude_modules = json_quant_configs.get(
-            'exclude_modules', None)
+        quant_config.quant_algo = parsed.quant_algo
+        quant_config.kv_cache_quant_algo = parsed.kv_cache_quant_algo
+        quant_config.group_size = parsed.group_size
+        quant_config.exclude_modules = list(
+            parsed.exclude_modules) if parsed.exclude_modules else None
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
-            json_extended_quant_configs: dict = {}
+            # Optional overlay: quant_cfg.json may carry per-layer overrides
+            # and/or a kv_cache_quant_algo that must agree with the file.
             # See tests/unittest/llmapi/test_llm_quant.py
+            extended: dict = {}
             try:
-                mixed_quant_config_file = transformers.utils.hub.cached_file(
+                ext_file = transformers.utils.hub.cached_file(
                     checkpoint_dir, 'quant_cfg.json')
-                with open(mixed_quant_config_file) as fm:
-                    json_extended_quant_configs = json.load(fm)
+                with open(ext_file) as fm:
+                    extended = json.load(fm)
             except Exception:
                 logger.info(
-                    f"No quant_cfg.json found for layer quant info, using hf_quant_config.json."
+                    "No quant_cfg.json found for layer quant info, using hf_quant_config.json."
                 )
-            json_quant_configs.update(json_extended_quant_configs)
-            # kv_cache_quant_algo is global regardless of MIXED_PRECISION
-            kv_cache_quant_algo = json_quant_configs.get(
-                'kv_cache_quant_algo', None)
-            mixed_quant_configs = json_quant_configs.get(
-                'quantized_layers', None)
-            if (kv_quant_lhs := json_extended_quant_configs.get(
-                    "kv_cache_quant_algo", None)) is not None and (
-                        kv_quant_rhs :=
-                        quant_config.kv_cache_quant_algo) is not None:
-                if kv_quant_lhs != kv_quant_rhs:
-                    raise RuntimeError(
-                        f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
-                        f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
-                    )
+
+            extended_kv = extended.get("kv_cache_quant_algo")
+            if (extended_kv is not None
+                    and parsed.kv_cache_quant_algo is not None
+                    and extended_kv != parsed.kv_cache_quant_algo):
+                raise RuntimeError(
+                    f"The kvcache config in 'quant_cfg.json', {extended_kv},"
+                    f"is different from 'hf_quant_config.json', {parsed.kv_cache_quant_algo}!"
+                )
+            kv_cache_quant_algo = (extended_kv if extended_kv is not None else
+                                   parsed.kv_cache_quant_algo)
             quant_config.kv_cache_quant_algo = kv_cache_quant_algo
-            for layer in mixed_quant_configs:
-                config = QuantConfig()
-                config.kv_cache_quant_algo = kv_cache_quant_algo
-                config.quant_algo = mixed_quant_configs[layer]['quant_algo']
-                config.group_size = mixed_quant_configs[layer].get(
-                    'group_size', None)
-                mixed_quant_configs[layer] = config
-            layer_quant_config = mixed_quant_configs
+
+            # extended.quantized_layers replaces the file's wholesale, matching
+            # the historical ``dict.update`` overlay semantics.
+            quantized_layers = extended.get("quantized_layers",
+                                            parsed.quantized_layers)
+
+            per_layer = {}
+            for layer, cfg in quantized_layers.items():
+                c = QuantConfig()
+                c.kv_cache_quant_algo = kv_cache_quant_algo
+                c.quant_algo = cfg['quant_algo']
+                c.group_size = cfg.get('group_size')
+                per_layer[layer] = c
+            layer_quant_config = per_layer
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
@@ -374,9 +381,22 @@ class ModelConfig(Generic[TConfig]):
             return quant_algo
 
     @staticmethod
-    def load_hf_quant_config(hf_quant_config, moe_backend):
+    def load_hf_quant_config(hf_quant_config, moe_backend, checkpoint_dir=None):
         quant_config = QuantConfig()
         layer_quant_config = None
+
+        # Inline modelopt config -- legacy ("quantization" wrapper +
+        # producer.name == "modelopt") or flat (quant_method == "modelopt").
+        # The elif chain below only knows fp8 / mxfp4 / compressed-tensors
+        # / nvfp4, so without this route the modelopt case falls through
+        # to NotImplementedError. Early-return because the modelopt builder
+        # returns the full (QuantConfig, layer_quant_config) tuple including
+        # MIXED_PRECISION layer expansion, which doesn't fit the elif
+        # "mutate one QuantConfig" pattern.
+        if is_modelopt_quant_config(hf_quant_config):
+            parsed = parse_modelopt_quant_config(hf_quant_config)
+            return ModelConfig._build_quant_config_from_modelopt(
+                parsed, checkpoint_dir, moe_backend)
 
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
@@ -673,13 +693,21 @@ class ModelConfig(Generic[TConfig]):
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,
                                             'hf_quant_config.json'):
-            quant_config, layer_quant_config = cls.load_modelopt_quant_config(
-                quant_config_file, checkpoint_dir, moe_backend)
+            with open(quant_config_file) as f:
+                hf_quant_config_raw = json.load(f)
+            parsed = parse_modelopt_quant_config(hf_quant_config_raw)
+            quant_config, layer_quant_config = cls._build_quant_config_from_modelopt(
+                parsed, checkpoint_dir, moe_backend)
+            warn_if_inline_quant_config_differs(
+                parsed,
+                getattr(pretrained_config, "quantization_config", None),
+                source_file="hf_quant_config.json",
+            )
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):
             hf_quant_config = pretrained_config.quantization_config
             quant_config, layer_quant_config = cls.load_hf_quant_config(
-                hf_quant_config, moe_backend)
+                hf_quant_config, moe_backend, checkpoint_dir=checkpoint_dir)
         elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend)
