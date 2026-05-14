@@ -12,6 +12,7 @@ _MODEL_MODULES = {
     "modeling_gemma3n": ["Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"],
     "modeling_gemma4": ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"],
     "modeling_glm4_moe_lite": ["Glm4MoeLiteForCausalLM"],
+    "modeling_gpt_oss": ["GptOssForCausalLM"],
     "modeling_kimi_k2": ["KimiK2ForCausalLM", "KimiK25ForConditionalGeneration"],
     "modeling_llama4": ["Llama4ForCausalLM", "Llama4ForConditionalGeneration"],
     "modeling_minimax_m2": ["MiniMaxM2ForCausalLM"],

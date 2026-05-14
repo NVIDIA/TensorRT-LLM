@@ -559,6 +559,7 @@ def trtllm_mha_with_cache(
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
+    attention_sinks: Optional[torch.Tensor] = None,
     num_heads_hint: int = 0,
     num_kv_heads_hint: int = 0,
     head_dim_hint: int = 0,
@@ -631,6 +632,12 @@ def trtllm_mha_with_cache(
         v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
         qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
+    # The thop.attention C++ kernel expects attention_sinks in float32 (see
+    # attentionOp.cpp:365). Models typically hold sinks at the same dtype as
+    # the rest of the parameters (e.g. bf16 for GPT-OSS), so cast here.
+    if attention_sinks is not None and attention_sinks.dtype != torch.float32:
+        attention_sinks = attention_sinks.to(torch.float32)
+
     # Prepare output: if caller provided an `out` buffer, write directly into it
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
     # If out_scale is set, attention quantizes output to FP8.
@@ -691,7 +698,7 @@ def trtllm_mha_with_cache(
         None,  # latent_cache (MLA)
         None,  # q_pe (MLA)
         None,  # block_ids_per_seq
-        None,  # attention_sinks
+        attention_sinks,  # attention_sinks (per-head learnable scalar, e.g. GPT-OSS)
         True,  # is_fused_qkv
         True,  # update_kv_cache
         1,  # predicted_tokens_per_seq (always 1 except for MLA kernel)
@@ -784,6 +791,7 @@ def trtllm_mha_with_cache_fake(
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
+    attention_sinks: Optional[torch.Tensor] = None,
     num_heads_hint: int = 0,
     num_kv_heads_hint: int = 0,
     head_dim_hint: int = 0,
@@ -967,6 +975,11 @@ class TrtllmAttention(AttentionDescriptor):
         # Get sliding_window from source attention node
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
+        # Forward optional attention sinks (per-head learnable scalar) — used by
+        # GPT-OSS-style models. Stored as an FX get_attr Node when present and
+        # bound to the actual nn.Parameter at runtime.
+        sinks_node = extract_op_args(source_attn_node, "sinks")[0]
+
         # Optional out_scale is injected by prepare_node_for_cache_insertion when available.
         out_scale = source_attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
         if not isinstance(out_scale, Node):
@@ -998,6 +1011,7 @@ class TrtllmAttention(AttentionDescriptor):
             rope_cos_sin,
             pos_emb_type,
             rot_emb_dim,
+            sinks_node,
             num_heads_hint,
             num_kv_heads_hint,
             head_dim_hint,

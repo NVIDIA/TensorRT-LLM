@@ -178,7 +178,11 @@ class ParallelConfig(StrictBaseModel):
            2x2 mesh: Q gathered across row group, K/V gathered across col group
     """
 
-    enable_parallel_vae: bool = True
+    parallel_vae_size: int = PydanticField(
+        1,
+        ge=1,
+        description="Number of ranks used for VAE parallelism. 1 disables parallel VAE.",
+    )
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     # DiT Parallelism
@@ -674,10 +678,6 @@ class DiffusionModelConfig(BaseModel):
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
-
-    # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
-    enable_parallel_vae: bool = True
-    parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     dynamic_weight_quant: bool = False
 

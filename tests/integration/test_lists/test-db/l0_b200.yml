@@ -129,10 +129,12 @@ l0_b200:
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
+  - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]

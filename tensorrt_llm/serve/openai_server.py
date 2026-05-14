@@ -45,7 +45,8 @@ from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -1172,7 +1173,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1322,7 +1323,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
