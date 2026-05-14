@@ -966,12 +966,21 @@ class SequenceInfo:
             self._input_buffer.add_truncatable_tensor(
                 f"extra_page_per_seq{suffix}", self.max_batch_size, torch.int
             )
+            # Per-group seq_len_with_cache: under SWA front-eviction the window's
+            # live cache length diverges from the global (input_pos + seq_len),
+            # so groups 1..N-1 carry their own window-capped values for both the
+            # kernel's mask math and the prepare-extra-metadata op (which uses
+            # it to compute write positions for new KV tokens).
+            self._input_buffer.add_truncatable_tensor(
+                f"seq_len_with_cache{suffix}", self.max_batch_size, torch.int
+            )
             # Register as available args (device + host variants)
             group_names = [
                 f"cache_loc{suffix}",
                 f"cu_num_pages{suffix}",
                 f"last_page_len{suffix}",
                 f"extra_page_per_seq{suffix}",
+                f"seq_len_with_cache{suffix}",
             ]
             for base_name in group_names:
                 self._available_args.add(base_name)
@@ -1222,6 +1231,8 @@ class SequenceInfo:
         cache_loc_per_group: Optional[Dict[int, Sequence[int]]] = None,
         cu_num_pages_per_group: Optional[Dict[int, Sequence[int]]] = None,
         extra_page_per_seq_per_group: Optional[Dict[int, Sequence[int]]] = None,
+        seq_len_with_cache_per_group: Optional[Dict[int, Sequence[int]]] = None,
+        last_page_len_per_group: Optional[Dict[int, Sequence[int]]] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1316,6 +1327,7 @@ class SequenceInfo:
         # Default per-group metadata when the caller doesn't provide per-group
         # data (warmup, set_example_sequence, CUDA graph capture).  Replicate
         # group 0's data to all groups so every kernel receives valid metadata.
+        # seq_len_with_cache is replicated with the global value below.
         if cache_loc_per_group is None and self.num_window_groups >= 2:
             for group_idx in range(1, self.num_window_groups):
                 suffix = f"_g{group_idx}"
@@ -1332,6 +1344,8 @@ class SequenceInfo:
                 ("cache_loc_per_group", cache_loc_per_group),
                 ("cu_num_pages_per_group", cu_num_pages_per_group),
                 ("extra_page_per_seq_per_group", extra_page_per_seq_per_group),
+                ("seq_len_with_cache_per_group", seq_len_with_cache_per_group),
+                ("last_page_len_per_group", last_page_len_per_group),
             ):
                 if mapping is None:
                     continue
@@ -1347,6 +1361,13 @@ class SequenceInfo:
                 self._stage_arg(f"cache_loc{suffix}", group_cache_loc)
                 if cu_num_pages_per_group is not None:
                     self._stage_arg(f"cu_num_pages{suffix}", cu_num_pages_per_group[group_idx])
+                # Use per-group last_page_len when supplied (window-capped for SWA
+                # under eviction), otherwise fall back to the global value.
+                if last_page_len_per_group is not None:
+                    self._stage_arg(
+                        f"last_page_len{suffix}", last_page_len_per_group[group_idx]
+                    )
+                elif cu_num_pages_per_group is not None:
                     self._stage_arg(f"last_page_len{suffix}", lpl_host)
                 if extra_page_per_seq_per_group is not None:
                     self._stage_arg(
@@ -1372,10 +1393,25 @@ class SequenceInfo:
             pages_per_seq = cu_num_pages_host[1:] - cu_num_pages_host[:-1]
             self._stage_arg("pages_per_seq", pages_per_seq)
 
-        # update sequence length with cache (unclamped global value — per-group
-        # clamping is handled separately in the VSWA staging blocks below)
+        # update sequence length with cache.  Group 0 always carries the
+        # unclamped global value (input_pos + seq_len); non-zero groups carry
+        # window-capped values when the caller supplies them (SWA front-eviction
+        # path), otherwise they replicate the global value.
         seq_len_with_cache = ip_host + sl_host
         self._stage_arg("seq_len_with_cache", seq_len_with_cache)
+        if self.num_window_groups >= 2:
+            for group_idx in range(1, self.num_window_groups):
+                suffix = f"_g{group_idx}"
+                if (
+                    seq_len_with_cache_per_group is not None
+                    and group_idx in seq_len_with_cache_per_group
+                ):
+                    self._stage_arg(
+                        f"seq_len_with_cache{suffix}",
+                        seq_len_with_cache_per_group[group_idx],
+                    )
+                else:
+                    self._stage_arg(f"seq_len_with_cache{suffix}", seq_len_with_cache)
 
         # prompt_lens: original context length per sequence, constant across iterations.
         # Defaults to seq_len when not provided (correct for prefill).
@@ -1604,6 +1640,15 @@ class SequenceInfo:
         # --- seq_len_with_cache (device) ---
         swc = self.get_arg("seq_len_with_cache", truncate=True)
         swc += offset
+
+        # Keep per-group seq_len_with_cache in sync with the global value for
+        # the overlap scheduler path.  This is exact in the non-eviction regime;
+        # under eviction the next nest_sequences re-caps to the window.
+        for group_idx in range(1, self.num_window_groups):
+            suffix = f"_g{group_idx}"
+            if self._is_active(f"seq_len_with_cache{suffix}"):
+                swc_g = self.get_arg(f"seq_len_with_cache{suffix}", truncate=True)
+                swc_g += offset
 
         # --- use_initial_states (device) ---
         use_initial_states = self.get_arg("use_initial_states", truncate=True)

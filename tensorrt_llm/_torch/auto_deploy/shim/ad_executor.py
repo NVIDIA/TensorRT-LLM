@@ -863,11 +863,19 @@ class ADEngine(ModelEngine):
         cache_loc_per_group: Optional[Dict[int, List[int]]] = None
         cu_num_pages_per_group: Optional[Dict[int, List[int]]] = None
         extra_page_per_seq_per_group: Optional[Dict[int, List[int]]] = None
+        # Per-pool window-capped metadata.  Group 0 keeps the unclamped global
+        # value; groups 1..N-1 cap at their window so SWA front-eviction stays
+        # invisible to the kernel (it sees a coherent local-coord view of the
+        # live page list).
+        seq_len_with_cache_per_group: Optional[Dict[int, List[int]]] = None
+        last_page_len_per_group: Optional[Dict[int, List[int]]] = None
         batch_cache_indices: Optional[List[List[int]]] = None
         if is_vswa:
             cache_loc_per_group = {g: [] for g in range(1, len(kv_group_windows))}
             cu_num_pages_per_group = {g: [0] for g in range(1, len(kv_group_windows))}
             extra_page_per_seq_per_group = {g: [] for g in range(1, len(kv_group_windows))}
+            seq_len_with_cache_per_group = {g: [] for g in range(1, len(kv_group_windows))}
+            last_page_len_per_group = {g: [] for g in range(1, len(kv_group_windows))}
         else:
             # Per-iter host overhead optimization (#13560): single batched
             # cache lookup for all requests in the single-window path.
@@ -902,6 +910,13 @@ class ADEngine(ModelEngine):
                     all_indices = kv_cache_manager.get_cache_indices(
                         request, window_size=group_window
                     )
+                    # SWA front-eviction: get_cache_indices returns the FULL
+                    # historical page list including front-evicted entries (the
+                    # C++ side bumps a counter rather than popping mCacheBlockIds).
+                    # The live slice starts at [front_removed:].
+                    front_removed = kv_cache_manager.get_num_front_blocks_removed(
+                        request.py_request_id, window_size=group_window
+                    )
                     # Active blocks = pages needed to fit end_compute_i tokens within
                     # this window.  The trailing slot in all_indices (when present)
                     # is the reserved spillover page.
@@ -909,24 +924,38 @@ class ADEngine(ModelEngine):
                     pages_for_active = (
                         active_token_count + kv_cache_manager.tokens_per_block - 1
                     ) // kv_cache_manager.tokens_per_block
-                    num_active = min(len(all_indices), pages_for_active)
-                    active_indices = all_indices[:num_active]
+                    live_len = len(all_indices) - front_removed
+                    num_active = min(live_len, pages_for_active)
+                    active_indices = all_indices[front_removed : front_removed + num_active]
+                    extra_slot_idx = front_removed + num_active
+                    has_extra = len(all_indices) > extra_slot_idx
 
                     if pool_idx == 0:
                         cache_loc.extend(active_indices)
                         cu_num_pages.append(cu_num_pages[i] + num_active)
-                        if len(all_indices) > num_active:
-                            extra_page_per_seq.append(all_indices[num_active])
+                        if has_extra:
+                            extra_page_per_seq.append(all_indices[extra_slot_idx])
                         else:
                             extra_page_per_seq.append(-1)
                     else:
                         cache_loc_per_group[pool_idx].extend(active_indices)
                         prev = cu_num_pages_per_group[pool_idx][i]
                         cu_num_pages_per_group[pool_idx].append(prev + num_active)
-                        if len(all_indices) > num_active:
-                            extra_page_per_seq_per_group[pool_idx].append(all_indices[num_active])
+                        if has_extra:
+                            extra_page_per_seq_per_group[pool_idx].append(
+                                all_indices[extra_slot_idx]
+                            )
                         else:
                             extra_page_per_seq_per_group[pool_idx].append(-1)
+                        # Window-capped seq_len_with_cache for this pool:
+                        # active_token_count covers the cached portion + new tokens
+                        # in window-local coords.  last_page_len follows from it.
+                        seq_len_with_cache_per_group[pool_idx].append(active_token_count)
+                        if active_token_count > 0:
+                            lpl_i = (active_token_count - 1) % _tokens_per_block + 1
+                        else:
+                            lpl_i = 0
+                        last_page_len_per_group[pool_idx].append(lpl_i)
             else:
                 # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
                 num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
@@ -971,6 +1000,8 @@ class ADEngine(ModelEngine):
             cache_loc_per_group=cache_loc_per_group,
             cu_num_pages_per_group=cu_num_pages_per_group,
             extra_page_per_seq_per_group=extra_page_per_seq_per_group,
+            seq_len_with_cache_per_group=seq_len_with_cache_per_group,
+            last_page_len_per_group=last_page_len_per_group,
             gather_context_logits=gather_context_logits,
             _gather_idx=flat_gather_indices,
             _mask_scatter_indices=mask_scatter_indices,
