@@ -2361,6 +2361,37 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{req.py_request_id} from {kv_cache.capacity} to "
                 f"{reverted_cap}")
 
+    def revert_allocate_context(self, req: LlmRequest) -> None:
+        """Undo the capacity growth from this iter's ``resize_context``.
+
+        When delay batching (``_balance_adp_requests`` /
+        ``_waiting_requests``) defers a context request after V2
+        scheduling, the forward pass is skipped for that request but the
+        scheduler already grew its KV cache capacity to cover the chunk.
+        This shrinks capacity back to the pre-resize value so the
+        freshly-allocated pages can be reused during the wait window —
+        important for long contexts where one deferred request can hold
+        GBs of KV.
+        """
+        pre_cap = getattr(req, "py_ctx_pre_resize_cap", None)
+        if pre_cap is None:
+            return
+        # Mark as consumed even if the resize below is skipped, so a
+        # later iter does not see a stale snapshot.
+        req.py_ctx_pre_resize_cap = None
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        if pre_cap >= kv_cache.capacity:
+            return
+        if not kv_cache.resize(pre_cap):
+            raise RuntimeError(
+                f"Failed to revert KV cache capacity for context "
+                f"request {req.py_request_id} from "
+                f"{kv_cache.capacity} to {pre_cap}")
+        if pre_cap > 0:
+            kv_cache.suspend()
+
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
 
@@ -2410,8 +2441,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         all_tokens, req, end=len(all_tokens) - 1)
                 else:
                     tokens = None
-                kv_cache = self._create_kv_cache(req.py_request_id,
-                                                 req.lora_task_id, tokens)
+                kv_cache = self._create_kv_cache(
+                    req.py_request_id,
+                    req.lora_task_id,
+                    tokens,
+                    cache_salt_id=req.cache_salt_id)
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2441,6 +2475,10 @@ class KVCacheManagerV2(BaseResourceManager):
         overlaps with existing capacity are handled correctly.
         Returns True on success, False if resize failed (first chunk is
         suspended on failure).
+
+        Snapshots the pre-resize capacity on ``req.py_ctx_pre_resize_cap``
+        when growth happens so ``revert_allocate_context`` can undo it if
+        delay batching defers the request.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -2448,12 +2486,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
+        pre_cap = kv_cache.capacity
 
         if not kv_cache.resize(capacity):
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
 
+        # None means "no growth this iter, nothing to revert"; this also
+        # invalidates a stale snapshot from a prior iter on the same req.
+        req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
@@ -2512,8 +2554,11 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
-                    kv_cache = self._create_kv_cache(req.py_request_id,
-                                                     req.lora_task_id, None)
+                    kv_cache = self._create_kv_cache(
+                        req.py_request_id,
+                        req.lora_task_id,
+                        None,
+                        cache_salt_id=req.cache_salt_id)
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -2683,6 +2728,10 @@ class KVCacheManagerV2(BaseResourceManager):
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
+                # Dummy/warmup request. ``stop_committing()`` below blocks all
+                # writes to the radix tree, so the choice of branch does not
+                # affect committed state. ``cache_salt_id`` is left defaulted
+                # to None to avoid coupling synthetic data to any salted branch.
                 kv_cache = self._create_kv_cache(req.py_request_id,
                                                  req.lora_task_id, input_tokens)
                 assert kv_cache.num_committed_tokens == 0
@@ -2703,6 +2752,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
                         req.py_request_id, req.lora_task_id, input_tokens)
+                    # Dummy path: see comment above, no salt.
                     success = draft_kv_cache.resume(
                         draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
@@ -3041,10 +3091,15 @@ class KVCacheManagerV2(BaseResourceManager):
                                            self.index_scales, self.kv_offset,
                                            self._stream.cuda_stream)
 
-    def _create_kv_cache(self, request_id: int, lora_task_id: int | None,
-                         input_tokens: Sequence[TokenIdExt] | None):
+    def _create_kv_cache(self,
+                         request_id: int,
+                         lora_task_id: int | None,
+                         input_tokens: Sequence[TokenIdExt] | None,
+                         cache_salt_id: int | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
-        kv_cache = self.impl.create_kv_cache(lora_task_id, input_tokens)
+        kv_cache = self.impl.create_kv_cache(lora_task_id,
+                                             input_tokens,
+                                             cache_salt_id=cache_salt_id)
         self.kv_cache_map[request_id] = kv_cache
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):

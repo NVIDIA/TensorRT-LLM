@@ -281,9 +281,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-            if (res := self.result_queue.get()) is None:
-                return False  # shutdown the thread
+        if (res := self.result_queue.get()) is None:
+            return False  # shutdown the thread
 
         async_queues = []
         event_loop = None
@@ -337,7 +336,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread = ManagedThread(
                 weakref.WeakMethod(self.dispatch_result_task),
                 error_queue=self._error_queue,
-                name="proxy_dispatch_result_thread")
+                name="proxy_dispatch_result_thread",
+                context=customized_gc_thresholds(
+                    self.garbage_collection_gen0_threshold),
+            )
 
             self.dispatch_result_thread.start()
 

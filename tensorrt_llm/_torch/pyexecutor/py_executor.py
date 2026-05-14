@@ -49,6 +49,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
@@ -394,13 +395,16 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        # V2 scheduler calls suspend_request() during scheduling, which
-        # offloads GPU pages while preserving the radix tree.  The executor
-        # does not need to call _terminate_requests (GPU resources are already
-        # freed by suspend) or _pause_requests (V2's prepare_context handles
-        # resume internally, so resetting to CONTEXT_INIT is unnecessary).
-        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
-                                                        KVCacheManagerV2)
+        # V2 manager owns KV alloc + suspend during scheduling: it
+        # eagerly grows ctx/gen capacity in the schedule loop and calls
+        # suspend_request() when needed (offloads GPU pages while
+        # preserving the radix tree).  The executor therefore does not
+        # need to call _terminate_requests (GPU resources are already
+        # freed by suspend) or _pause_requests (V2's prepare_context
+        # handles resume internally, so resetting to CONTEXT_INIT is
+        # unnecessary).  Several revert/skip paths gate on this flag.
+        self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
+                                            KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
@@ -469,6 +473,13 @@ class PyExecutor:
         # Set of request IDs that are currently in flight across all micro batches.
         # The scheduler will avoid scheduling requests that are already in flight.
         self.inflight_req_ids = ReqIdsSet()
+
+        # Synchronize all ranks before warmup. This prevents a PP
+        # communication deadlock when ranks on the last PP stage are delayed
+        # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
+        # creation) while earlier PP stages already start warmup forward
+        # passes that require matching pp_recv on the later stages.
+        self.dist.barrier()
 
         # During warmup, we don't enable the profiler
         # Run warmup on the execution_stream for proper synchronization with
@@ -563,6 +574,7 @@ class PyExecutor:
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
+        self._adp_iter_stats = ADPIterStatsBuffer()
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1221,11 +1233,37 @@ class PyExecutor:
             else:
                 self._latest_kv_iter_stats = None
 
-        stats.inflight_batching_stats.num_context_requests = scheduled_batch.num_context_requests
-        stats.inflight_batching_stats.num_gen_requests = scheduled_batch.num_generation_requests
-        stats.inflight_batching_stats.num_scheduled_requests = stats.inflight_batching_stats.num_context_requests + stats.inflight_batching_stats.num_gen_requests
-        stats.inflight_batching_stats.num_paused_requests = len(
-            scheduled_batch.paused_requests)
+        def is_stats_dummy_request(req) -> bool:
+            return bool(getattr(req, "is_dummy", False))
+
+        # Attention-DP may add dummy requests to keep ranks aligned during
+        # distributed scheduling. CUDA graph padding can add dummies too.
+        # Those placeholders are not user work, so count the request lists
+        # with a filter instead of using the cached batch counters, which
+        # include every scheduled item.
+        if getattr(self, "enable_attention_dp", False):
+            # The sum(...) scans are small and keep planner-facing metrics
+            # from treating dummy requests as real load.
+            num_context_requests = sum(
+                1 for req in scheduled_batch.context_requests
+                if not is_stats_dummy_request(req))
+            num_gen_requests = sum(
+                1 for req in scheduled_batch.generation_requests
+                if not is_stats_dummy_request(req))
+            num_paused_requests = sum(1
+                                      for req in scheduled_batch.paused_requests
+                                      if not is_stats_dummy_request(req))
+        else:
+            num_context_requests = scheduled_batch.num_context_requests
+            num_gen_requests = scheduled_batch.num_generation_requests
+            num_paused_requests = len(scheduled_batch.paused_requests)
+
+        stats.inflight_batching_stats.num_context_requests = num_context_requests
+        stats.inflight_batching_stats.num_gen_requests = num_gen_requests
+        stats.inflight_batching_stats.num_scheduled_requests = (
+            stats.inflight_batching_stats.num_context_requests +
+            stats.inflight_batching_stats.num_gen_requests)
+        stats.inflight_batching_stats.num_paused_requests = num_paused_requests
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
         stats.inflight_batching_stats.micro_batch_id = micro_batch_id
 
@@ -1297,7 +1335,7 @@ class PyExecutor:
         # RuntimeError on a mutated request.
         num_ctx_kv_tokens = 0
         for req in scheduled_batch.context_requests:
-            if getattr(req, "is_attention_dp_dummy", False):
+            if is_stats_dummy_request(req):
                 continue
             last_chunk = getattr(req, "py_last_context_chunk", None)
             if last_chunk is not None and last_chunk[0] is not None:
@@ -1314,7 +1352,7 @@ class PyExecutor:
         # summed across scheduled generation requests.
         num_gen_kv_tokens = 0
         for req in scheduled_batch.generation_requests:
-            if getattr(req, "is_attention_dp_dummy", False):
+            if is_stats_dummy_request(req):
                 continue
             try:
                 num_gen_kv_tokens += req.get_num_tokens(0)
@@ -1366,7 +1404,7 @@ class PyExecutor:
         # pool for this iteration.
         num_paused_kv_tokens = 0
         for req in scheduled_batch.paused_requests:
-            if getattr(req, "is_attention_dp_dummy", False):
+            if is_stats_dummy_request(req):
                 continue
             try:
                 num_paused_kv_tokens += req.get_num_tokens(0)
@@ -1385,41 +1423,38 @@ class PyExecutor:
 
     def _append_iter_stats(self,
                            stats: IterationStats,
-                           req_stats: Optional[List[RequestStats]] = None):
-        """Append one iteration's stats to the export buffer.
+                           req_stats: Optional[List[RequestStats]] = None,
+                           kv_iter_stats: Optional[Dict[int, object]] = None,
+                           attention_dp_rank: Optional[int] = None):
+        """Append one iteration's finalized stats to the export buffer.
 
-        Under attention-DP with ``tp_size > 1`` each rank has diverging
-        scheduler/KV-cache state. When the environment variable
-        ``TLLM_METRICS_ALL_RANKS=1`` is set, this method collectively
-        gathers every rank's :class:`IterationStats` (+ optional per-request
-        stats and KV iteration stats) via :meth:`tp_allgather` and rank 0
-        stores one pre-serialized JSON dict per rank (tagged with
-        ``"rank"``) in ``self.stats`` so ``/metrics`` can export stats from
-        every rank. Non-leader ranks drop the gathered result.
-
-        The env var defaults to off so upstream behavior (rank-0-only
-        export) is preserved unless users explicitly opt in. Under pure TP
-        (no attention-DP) every rank runs the same requests on the same
-        iteration, so the gather would be redundant and only adds a CPU-GPU
-        sync on the hot path — we fall through to the legacy rank-0-only
-        append in that case regardless of the env var.
+        The normal Attention-DP path fans out rank-local rows before calling
+        this method; those calls pass ``attention_dp_rank`` and must not enter
+        the collective all-rank gather below.
 
         Args:
-            stats: Iteration-level stats from the local rank.
-            req_stats: Optional per-request stats from the local rank.
+            stats: Iteration-level stats.
+            req_stats: Optional per-request stats.
+            kv_iter_stats: Optional KV iteration stats captured with ``stats``.
+            attention_dp_rank: Optional ADP rank for fanned-out rank-local rows.
         """
+        # Non-ADP appends immediately, so the latest KV stats belong to this
+        # IterationStats. ADP appends later and passes the saved iter-matched
+        # KV stats explicitly.
+        if not self.enable_attention_dp:
+            kv_iter_stats = self._latest_kv_iter_stats
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
-                and self.enable_attention_dp):
+                and self.enable_attention_dp and attention_dp_rank is None):
             import json as _json
             local_dict = _json.loads(stats.to_json_str())
             if req_stats:
                 local_dict["requestStats"] = [
                     _json.loads(r.to_json_str()) for r in req_stats
                 ]
-            if self._latest_kv_iter_stats is not None:
+            if kv_iter_stats is not None:
                 local_dict["kvCacheIterationStats"] = {
                     str(window_size): {
                         "primaryMaxNumBlocks": s.primary_max_num_blocks,
@@ -1445,7 +1480,7 @@ class PyExecutor:
                         "iterIntraDeviceCopyBytes":
                         s.iter_intra_device_copy_bytes,
                     }
-                    for window_size, s in self._latest_kv_iter_stats.items()
+                    for window_size, s in kv_iter_stats.items()
                 }
             local_dict["rank"] = self.dist.tp_rank
 
@@ -1471,7 +1506,8 @@ class PyExecutor:
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
-            self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
+            self.stats.append(
+                (stats, req_stats, kv_iter_stats, attention_dp_rank))
 
     def _process_iter_stats(
         self,
@@ -1480,6 +1516,7 @@ class PyExecutor:
         batch_state: BatchState,
         micro_batch_id: int = 0,
     ):
+        """All ranks: build local stats; ADP queues them for later fanout."""
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
@@ -1491,11 +1528,17 @@ class PyExecutor:
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
 
-        self._append_iter_stats(
-            self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
-                                    len(finished_requests),
-                                    batch_state.scheduled_requests,
-                                    micro_batch_id), req_stats)
+        stats = self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
+                                        len(finished_requests),
+                                        batch_state.scheduled_requests,
+                                        micro_batch_id)
+        if self.enable_attention_dp:
+            self._adp_iter_stats.queue(stats,
+                                       req_stats,
+                                       kv_iter_stats=self._latest_kv_iter_stats,
+                                       is_rank0=self.dist.rank == 0)
+        else:
+            self._append_iter_stats(stats, req_stats)
 
     def _executor_loop_cleanup(self):
 
@@ -2103,9 +2146,25 @@ class PyExecutor:
         can_queue check.  V1 allocates in prepare_resources() after the
         can_queue check, so no revert is needed.
         """
-        if self._scheduler_manages_kv_suspend:
+        if self._is_kv_manager_v2:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
+
+    def _revert_ctx_alloc(self, dropped_context_requests):
+        """Revert KV cache capacity growth for ctx requests deferred by
+        delay batching.
+
+        With KV cache manager V2 + scheduler V2, ctx KV cache is grown
+        during scheduling (``resize_context``).  When delay batching
+        (``_balance_adp_requests`` for ADP, or ``_waiting_requests``
+        for non-ADP batch waiting) defers ctx requests, the
+        freshly-allocated pages would otherwise sit idle until the
+        request is re-scheduled, blocking pool space — particularly
+        painful for long-context workloads where each deferred ctx can
+        hold GBs of KV.
+        """
+        for req in dropped_context_requests:
+            self.kv_cache_manager.revert_allocate_context(req)
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
@@ -2351,7 +2410,7 @@ class PyExecutor:
                 if should_retry:
                     continue
 
-                if not self._scheduler_manages_kv_suspend:
+                if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
 
@@ -2631,7 +2690,7 @@ class PyExecutor:
                 if should_retry:
                     continue
 
-                if not self._scheduler_manages_kv_suspend:
+                if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
@@ -2756,7 +2815,7 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                if not self._scheduler_manages_kv_suspend:
+                if not self._is_kv_manager_v2:
                     self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
@@ -3059,8 +3118,22 @@ class PyExecutor:
             # (e.g. KV-cache-aware) that need new_requests to gather additional
             # info, the allgather position may need to be revisited.
 
+            # The rank-state allgather is always required for ADP routing.
+            # When iteration stats are enabled, piggyback this rank's oldest
+            # pending payload and use the gathered states below to fan out or
+            # clear stats once every rank is aligned.
+            iter_stats_payload = (self._adp_iter_stats.next_payload()
+                                  if self.enable_iter_perf_stats else None)
             all_rank_states = self.adp_router.gather_all_rank_states(
-                active_requests)
+                active_requests, iter_stats_payload=iter_stats_payload)
+            if self.enable_iter_perf_stats:
+                for record in self._adp_iter_stats.finalize(
+                        all_rank_states, is_rank0=self.dist.rank == 0):
+                    self._append_iter_stats(
+                        record.stats,
+                        record.req_stats,
+                        kv_iter_stats=record.kv_iter_stats,
+                        attention_dp_rank=record.attention_dp_rank)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
@@ -3303,7 +3376,8 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
-        scheduled_context_requests = scheduler_output.context_requests
+        original_ctx_requests = scheduler_output.context_requests
+        scheduled_context_requests = original_ctx_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
                 scheduler_output.context_requests,
@@ -3326,6 +3400,20 @@ class PyExecutor:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
+
+        # V2 scheduler grew KV cache for ctx during scheduling; release
+        # those pages for any ctx that delay batching has dropped, so
+        # the wait window does not hold pool capacity hostage.  V1
+        # allocates after delay batching, so skip the dropped-set
+        # computation entirely on V1.
+        if (self._is_kv_manager_v2 and len(scheduled_context_requests)
+                < len(original_ctx_requests)):
+            kept = {r.py_request_id for r in scheduled_context_requests}
+            dropped = [
+                r for r in original_ctx_requests if r.py_request_id not in kept
+            ]
+            self._revert_ctx_alloc(dropped)
+
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests

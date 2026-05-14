@@ -26,7 +26,7 @@ async def _iter_sse_data(response_content):
     Callers receive only JSON-ready strings.
     """
     buf = b""
-    async for chunk in response_content:
+    async for chunk in response_content.iter_any():
         buf += chunk
         while b"\n" in buf:
             line_bytes, buf = buf.split(b"\n", 1)

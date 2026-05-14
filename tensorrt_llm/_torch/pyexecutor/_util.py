@@ -287,8 +287,14 @@ class KvCacheCreator:
             effective_draft_config = self._get_effective_draft_config()
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
+                # Resolve draft manager class from draft config — may differ
+                # from target (e.g. hybrid target + plain transformer draft).
+                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+                    effective_draft_config,
+                    self._kv_cache_config,
+                    is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
-                    self._kv_cache_manager_cls, effective_draft_config)
+                    draft_kv_cache_manager_cls, effective_draft_config)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
