@@ -746,6 +746,8 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
                 output=moe_output,
+                tune_max_num_tokens=self.max_num_tokens,
+                use_dp=self.use_dp,
             )
 
             if not do_finalize:
@@ -791,6 +793,8 @@ class TRTLLMGenFusedMoE(MoE):
                 token_final_scales,
                 token_selected_experts,
                 output=moe_output,
+                tune_max_num_tokens=self.max_num_tokens,
+                use_dp=self.use_dp,
             )
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result

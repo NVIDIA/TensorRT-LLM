@@ -28,34 +28,41 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Union
 
 import torch
 
-from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from .communication import (
-    AllGatherReduceScatter,
-    Communication,
-    CommunicationFactory,
-    DeepEP,
-    DeepEPLowLatency,
-    NVLinkOneSided,
-    NVLinkTwoSided,
-)
+from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cutlass import CutlassFusedMoE
-from .fused_moe_deepgemm import DeepGemmFusedMoE
-from .fused_moe_densegemm import DenseGEMMFusedMoE
-from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from .moe_scheduler import MoEScheduler, create_moe_scheduler
+
+# Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
+# layer_idx + load balancer) and must be mirrored onto the backend after
+# the backend was constructed with layer_idx=None / init_load_balancer=False.
+# Adding a new EPLB-derived attribute? Append it here so the sync stays
+# in one place and __init__ does not silently drift.
+_BACKEND_SYNC_ATTRS = (
+    "layer_idx",
+    "layer_idx_str",
+    "num_slots",
+    "layer_load_balancer",
+    "repeat_count",
+    "repeat_idx",
+    "initial_local_expert_ids",
+    "initial_global_assignments",
+    "slot_start",
+    "slot_end",
+    "expert_size_per_partition",
+)
 
 
 class ConfigurableMoE(MoE):
@@ -63,7 +70,10 @@ class ConfigurableMoE(MoE):
     Configurable MoE layer using composition pattern with automatic configuration
 
     This class orchestrates the MoE execution flow by composing:
-    - moe_backend: Existing FusedMoE implementation (CutlassFusedMoE, CuteDslFusedMoE, etc.)
+    - moe_backend: Existing FusedMoE implementation used as a pluggable backend.
+                   Currently supported backends (see ``create_moe.get_moe_cls``):
+                   CutlassFusedMoE, TRTLLMGenFusedMoE, DeepGemmFusedMoE,
+                   CuteDslFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm.
                    Note: Current FusedMoE implementations are used as backends (transitional).
                          Future will have dedicated MoEBackend interface.
     - Communication: Handles distributed communication (auto-selected)
@@ -81,8 +91,6 @@ class ConfigurableMoE(MoE):
         weight_loading_mode: Weight loading mode
         layer_idx: Layer index
         **kwargs: Additional arguments
-            - backend_type: Backend type ('cutlass', 'trtllm_gen_min_latency', etc.)
-                           Default: 'cutlass'
             - tune_max_num_tokens: Max tokens for profiling (passed to backend)
             - Other backend-specific arguments
 
@@ -93,8 +101,11 @@ class ConfigurableMoE(MoE):
 
     Auto-Detection:
         - EPLB: Enabled if get_moe_load_balancer() is not None
-        - Backend: Defaults to CutlassMoEBackend, override via backend_type
-        - Communication: Auto-selected based on hardware (NVLINK > DeepEP > AllGather)
+        - Backend: Selected by ``model_config.moe_backend`` via ``create_moe.get_moe_cls``;
+                   defaults to CutlassFusedMoE when the requested backend is unsupported
+                   for the active quant/SM config.
+        - Communication: Auto-selected based on hardware (NVLINK > DeepEP > AllGather);
+                         skipped entirely for FUSED_COMM backends (e.g. MegaMoEDeepGemm).
     """
 
     @classmethod
@@ -163,71 +174,13 @@ class ConfigurableMoE(MoE):
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
-        # ========== Create MoE Backend (Default: Cutlass) ==========
-        from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
-
-        # Get MoE backend class based on override_quant_config or model_config
-        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
-
-        # Call create_moe_backend with all necessary parameters
-        # init_load_balancer=False: Prevents backend from registering itself with load balancer
-        # without_comm=True: Prevents backend from initializing communication (ConfigurableMoE handles it)
-        # skip_create_weights_in_init=True: Prevents backend from creating weights in __init__
-        #   because backend uses layer_idx=None and may have different expert assignments
-        #   We will create weights after syncing attributes from ConfigurableMoE
-        tmp_skip_create_weights_in_init = model_config.skip_create_weights_in_init
-        model_config._frozen = False
-        model_config.skip_create_weights_in_init = True
-        model_config._frozen = True
-
-        backend = create_moe_backend(
-            moe_cls=moe_cls,
-            routing_method=routing_method,
-            num_experts=self.num_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            dtype=self.dtype,
-            reduce_results=self.reduce_results,
+        # ========== Create MoE Backend (selected by model_config.moe_backend) ==========
+        self._create_and_sync_backend(
             model_config=model_config,
-            aux_stream_dict=self.aux_stream_dict,
-            weight_loading_mode=self.weight_loading_mode,
-            bias=kwargs.get("bias", False),
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            layer_idx=None,
-            swiglu_alpha=kwargs.get("swiglu_alpha"),
-            swiglu_beta=kwargs.get("swiglu_beta"),
-            swiglu_limit=kwargs.get("swiglu_limit"),
-            init_load_balancer=False,
-            without_comm=True,
-            activation_type=self.activation_type,
+            routing_method=routing_method,
+            override_quant_config=override_quant_config,
+            **kwargs,
         )
-
-        self.validate_backend(backend)
-        self.backend = backend
-        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
-        # Sync critical attributes from ConfigurableMoE to backend
-        # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
-        # Backend was created with init_load_balancer=False and without_comm=True to avoid
-        # duplicate initialization. Now sync all attributes from ConfigurableMoE to backend.
-        if self.backend is not None:
-            self.backend.layer_idx = self.layer_idx
-            self.backend.layer_idx_str = self.layer_idx_str
-            self.backend.num_slots = self.num_slots
-            self.backend.layer_load_balancer = self.layer_load_balancer
-            self.backend.repeat_count = self.repeat_count
-            self.backend.repeat_idx = self.repeat_idx
-            self.backend.initial_local_expert_ids = self.initial_local_expert_ids
-            self.backend.initial_global_assignments = self.initial_global_assignments
-            self.backend.slot_start = self.slot_start
-            self.backend.slot_end = self.slot_end
-            self.backend.expert_size_per_partition = self.expert_size_per_partition
-
-        # Create weights here, because the backend needs the layer_load_balancer info to create weights
-        model_config._frozen = False
-        model_config.skip_create_weights_in_init = tmp_skip_create_weights_in_init
-        model_config._frozen = True
-        if not model_config.skip_create_weights_in_init:
-            self.backend.create_weights()
 
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
@@ -274,10 +227,113 @@ class ConfigurableMoE(MoE):
         # TODO: in the future, all the weights related work should be done only in backend.
         self._weights_removed = True
 
+        # ========== Create forward scheduler (ExternalComm / FusedComm) ==========
+        # Constructed last so the scheduler may safely read any wrapper state
+        # (comm, aux_stream, event_dict, moe_max_num_tokens, dwdp_*) at init
+        # time without ordering surprises. Selection is based on
+        # ``backend.scheduler_kind`` set on the backend class.
+        self.scheduler: MoEScheduler = create_moe_scheduler(self)
+
+    @staticmethod
+    @contextmanager
+    def _temporarily_skip_weight_creation(model_config: ModelConfig):
+        """Force ``model_config.skip_create_weights_in_init = True`` for the duration.
+
+        The backend is constructed with ``layer_idx=None`` and an unset load
+        balancer, so weight allocation must be deferred until ConfigurableMoE
+        has synced the real EPLB-derived attributes onto the backend (see
+        ``_BACKEND_SYNC_ATTRS``). The flag is also flipped through the
+        ``_frozen`` Pydantic guard, hence the bracketing dance. Using a
+        contextmanager guarantees the original state is restored even if
+        backend construction raises.
+        """
+        previous = model_config.skip_create_weights_in_init
+        model_config._frozen = False
+        model_config.skip_create_weights_in_init = True
+        model_config._frozen = True
+        try:
+            yield
+        finally:
+            model_config._frozen = False
+            model_config.skip_create_weights_in_init = previous
+            model_config._frozen = True
+
+    def _create_and_sync_backend(
+        self,
+        *,
+        model_config: ModelConfig,
+        routing_method: BaseMoeRoutingMethod,
+        override_quant_config: Optional["QuantConfig"],
+        **kwargs,
+    ) -> None:
+        """Build the MoE backend, mirror EPLB attrs, then create weights.
+
+        Why this dance:
+        - ``init_load_balancer=False`` / ``without_comm=True``: the backend
+          would otherwise re-register itself with the load balancer and
+          initialize its own communication; ConfigurableMoE owns both.
+        - ``layer_idx=None``: the wrapper passes the real ``layer_idx`` to
+          ``MoE.__init__`` to drive load-balancer setup. The backend
+          receives ``None`` so its own EPLB hooks no-op until we sync the
+          real values via ``_BACKEND_SYNC_ATTRS`` below.
+        - ``skip_create_weights_in_init=True`` (via contextmanager): weights
+          depend on ``layer_load_balancer`` / ``initial_local_expert_ids``
+          / etc., which only become known after the sync. Defer weight
+          creation to the explicit ``backend.create_weights()`` call below.
+        """
+        from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+
+        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
+
+        with self._temporarily_skip_weight_creation(model_config):
+            backend = create_moe_backend(
+                moe_cls=moe_cls,
+                routing_method=routing_method,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                dtype=self.dtype,
+                reduce_results=self.reduce_results,
+                model_config=model_config,
+                aux_stream_dict=self.aux_stream_dict,
+                weight_loading_mode=self.weight_loading_mode,
+                bias=kwargs.get("bias", False),
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                layer_idx=None,
+                swiglu_alpha=kwargs.get("swiglu_alpha"),
+                swiglu_beta=kwargs.get("swiglu_beta"),
+                swiglu_limit=kwargs.get("swiglu_limit"),
+                init_load_balancer=False,
+                without_comm=True,
+                activation_type=self.activation_type,
+            )
+
+        self.validate_backend(backend)
+        self.backend = backend
+        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
+
+        # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
+        # backend code path that reads e.g. ``self.layer_load_balancer`` or
+        # ``self.num_slots`` sees the real values resolved by MoE.__init__.
+        if self.backend is not None:
+            for attr in _BACKEND_SYNC_ATTRS:
+                setattr(self.backend, attr, getattr(self, attr))
+
+        # Sync done -- now the backend has enough info to allocate weight
+        # tensors with the right shard / slot count.
+        if not model_config.skip_create_weights_in_init:
+            self.backend.create_weights()
+
     def _supports_load_balancer(self) -> bool:
-        """Check if this MoE implementation supports load balancer."""
-        # During initialization, backend might not be created yet
-        # Return True by default (most backends support it), backend will validate later
+        """Check if this MoE implementation supports load balancer.
+
+        ``MoE.__init__`` can query this before ``ConfigurableMoE`` has
+        created ``self.backend``. In that initialization window, fall back to
+        the wrapper-level DP/parallelism condition; ``validate_backend`` runs
+        after backend construction and enforces the backend-specific answer.
+        """
+        # During initialization, backend might not be created yet.
+        # Backend-specific support is checked later by validate_backend.
         if not hasattr(self, "backend") or self.backend is None:
             return self.use_dp and self.parallel_size > 1
         return self.backend._supports_load_balancer()
@@ -309,19 +365,6 @@ class ConfigurableMoE(MoE):
         return bool(
             quant_mode is not None and hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4()
         )
-
-    def _create_comm_strategy(self, model_config: ModelConfig) -> Optional[Communication]:
-        """
-        Create communication strategy based on configuration
-
-        Default: None (will use factory to auto-select when needed)
-        Auto-selects best strategy based on hardware and configuration
-
-        """
-        # Communication strategy is None by default
-        # Will be created lazily in determine_communication_method() when first needed
-        # For now, return None and create on-demand
-        return None
 
     def _get_quant_config_dict(self, model_config: ModelConfig) -> Optional[Dict]:
         """
@@ -440,9 +483,14 @@ class ConfigurableMoE(MoE):
         """
         Auto-create the best communication strategy based on hardware and configuration
 
-        Uses factory to select optimal strategy.
-
+        Uses factory to select optimal strategy. Backends whose fused kernel
+        owns cross-rank exchange (``scheduler_kind=FUSED_COMM``) skip
+        host-side comm entirely; layering Communication.dispatch / combine
+        on top of the fused exchange would double-count traffic and break
+        the in-kernel NVLink barrier semantics.
         """
+        if self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM:
+            return None
         return CommunicationFactory.create_strategy(
             model_config=self.model_config,
             num_experts=self.num_experts,
@@ -468,714 +516,66 @@ class ConfigurableMoE(MoE):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Universal forward implementation framework
+        """Forward entry point.
 
-        Flow:
-        1. Handle padding
-        2. Calculate chunk count and determine communication method
-        3. Execute MoE computation (single or multiple chunks)
-        4. Handle output truncation and EPLB repeat
+        Acts as a thin wrapper that:
+
+        1. Validates / fills ``output_dtype``.
+        2. Delegates the per-pass execution to ``self.scheduler`` (chosen
+           once at init time from ``backend.scheduler_kind``).
+        3. Records DWDP compute/prefetch (per layer, not per chunk).
+        4. Advances the EPLB ``repeat_idx``.
+
+        DP-padding handling and chunking live in the scheduler.
         """
-        # TODO: to clarify whether the output_dtype is needed.
+        del kwargs
+
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
         else:
             output_dtype = x.dtype
 
-        # ========== Mega MoE fast-path ==========
-        # DeepGEMM's ``fp8_fp4_mega_moe`` subsumes dispatch + GEMM1 + SwiGLU
-        # + GEMM2 + combine into one collective launch and owns routing
-        # weight application + EP exchange. It does not fit the pipeline
-        # below (EPLB, chunk-quant, padded-broadcast); short-circuit
-        # BEFORE the ``all_rank_num_tokens_padded`` computation so the
-        # backend receives the raw per-rank unpadded token counts it
-        # needs to slice off ADP padding. EPLB is also rejected here as
-        # a hard check (``validate_backend`` enforces this at __init__,
-        # but keep the assert defensively in case LB state changes).
-        from .mega_moe import MegaMoEDeepGemmFusedMoE
+        outputs = self.scheduler.forward(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
 
-        if isinstance(self.backend, MegaMoEDeepGemmFusedMoE):
-            assert not self._using_load_balancer(), (
-                "MegaMoEDeepGemmFusedMoE does not support EPLB; disable the load "
-                "balancer or pick a different backend."
-            )
-            return self._forward_chunk_mega_impl(
-                x,
-                router_logits,
-                output_dtype=output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens,
-                do_finalize=do_finalize,
-            )
-
-        # ========== Step 1: Handle padding ==========
-        if all_rank_num_tokens is None:
-            all_rank_num_tokens = [x.shape[0]]
-
-        all_rank_max_num_tokens = max(all_rank_num_tokens)
-
-        if use_dp_padding:
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens] * len(all_rank_num_tokens)
-        else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
-
-        # ========== Step 2: Determine communication method ==========
-        num_chunks = self.calculate_num_chunks(all_rank_num_tokens_padded)
-
-        # Determine and setup communication strategy (may fallback to AllGather)
-        self.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
-
-        # ========== Step 3: Execute MoE computation ==========
-        if num_chunks == 1:
-            # Single chunk case
-            outputs = self._forward_single_chunk(
-                x,
-                router_logits,
-                output_dtype,
-                all_rank_num_tokens_padded,
-                use_dp_padding,
-                do_finalize,
-            )
-        else:
-            # Multiple chunks case
-            outputs = self._forward_multiple_chunks(
-                x,
-                router_logits,
-                num_chunks,
-                output_dtype,
-                all_rank_num_tokens_padded,
-                use_dp_padding,
-                do_finalize,
-            )
-
-        # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk)
+        # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
+        # Owned at the wrapper because schedulers must not run it twice (external-comm
+        # might enter via single- or multi-chunk paths).
         if self.enable_dwdp:
             self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
 
-        # ========== Step 4: Handle output truncation and EPLB repeat ==========
-        if self.use_dp and self.parallel_size > 1:
-            outputs = outputs[: all_rank_num_tokens[self.mapping.tp_rank]]
-
-        # EPLB repeat logic
+        # EPLB repeat counter: advance once per forward, regardless of chunk count.
+        # Schedulers are forbidden from rotating ``repeat_idx`` themselves.
         self.repeat_idx = (self.repeat_idx + 1) % self.repeat_count
-
-        return outputs
-
-    def _prepare_workspace_deepgemm(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        all_rank_num_tokens: List[int],
-    ) -> Optional[torch.Tensor]:
-        """
-        Prepare workspace for DeepGemmFusedMoE backend.
-
-        Args:
-            x: Input tensor
-            all_rank_num_tokens: List of token counts for all ranks (used when use_dp is True)
-
-        Returns:
-            Workspace tensor or None if not using DeepGemmFusedMoE
-        """
-        if not isinstance(self.backend, DeepGemmFusedMoE):
-            return None
-
-        # Calculate the number of rows
-        num_rows = x.shape[0]
-        if self.use_dp and self.comm is not None:
-            # When using communication, dispatch will create tensors with shape:
-            # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
-            # So we need to allocate workspace based on this size
-            if isinstance(self.comm, DeepEPLowLatency):
-                # deeptplowlatency dispatch outputs shape is
-                # [#local_experts * moe_ep_size * max_tokens_per_rank, hidden size]
-                # local_experts = self.num_slots / moe_ep_size
-                num_rows = self.num_slots * max(all_rank_num_tokens)
-            else:
-                num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
-
-        workspaces = self.backend.get_workspaces([num_rows])
-        return workspaces[0]
-
-    def _forward_single_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype],
-        all_rank_num_tokens: List[int],
-        use_dp_padding: Optional[bool],
-        do_finalize: bool = True,
-    ) -> torch.Tensor:
-        """
-        Single chunk execution path
-
-        """
-        # Calculate EPLB flags (first call or last call)
-        is_first_call = self.repeat_idx == 0
-        is_last_call = self.repeat_idx == self.repeat_count - 1
-
-        # ========== Create workspace for DeepGemmFusedMoE ==========
-        workspace = self._prepare_workspace_deepgemm(x, all_rank_num_tokens)
-
-        # Execute unified flow (handles both separated and fused routing)
-        outputs = self._forward_chunk_impl(
-            x,
-            router_logits,
-            output_dtype,
-            all_rank_num_tokens,
-            use_dp_padding,
-            is_first_call,
-            is_last_call,
-            do_finalize,
-            workspace=workspace,
-        )
-
-        return outputs
-
-    def _forward_chunk_mega_impl(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        *,
-        output_dtype: Optional[torch.dtype],
-        all_rank_num_tokens: Optional[List[int]],
-        do_finalize: bool,
-    ) -> torch.Tensor:
-        """Run ``MegaMoEDeepGemmFusedMoE`` by the separated-routing-and-quant path.
-
-        Mirrors the CUTLASS / CUTEDSL pipeline: compute routing + BF16→FP8
-        pre-quant once in ConfigurableMoE, then hand the pre-quantized
-        tensors to ``backend.run_with_prequant`` which only does buffer
-        copies + the fused kernel launch. This keeps pre-processing out
-        of the inner-loop backend call so the GPU work visible to DG's
-        kernel matches what DG's own benchmarks measure (~330 us at
-        DSV3 seq=32 ep=4) instead of the 890 us we saw when routing +
-        Python ``per_token_cast_to_fp8`` ran inside the backend.
-
-        Quant uses a ``torch.compile``-fused variant (see
-        ``mega_moe.backend._get_fused_per_token_cast_to_fp8``) so the ~8
-        Python-launched elementwise / reduction kernels DG's helper
-        decomposes into collapse to a single Inductor-generated Triton
-        kernel.
-
-        Phase 1: EPLB disabled (see ``MegaMoEDeepGemmFusedMoE._supports_load_balancer``);
-        ``apply_router_weight_on_input`` also rejected at backend init.
-        """
-        assert not self.apply_router_weight_on_input, (
-            "ConfigurableMoE with MegaMoEDeepGemmFusedMoE does not support apply_router_weight_on_input"
-        )
-        assert do_finalize, (
-            "MegaMoE's fused kernel always finalizes — do_finalize=False is not supported"
-        )
-
-        # Resolve the raw (unpadded) token count under ADP. MegaMoE's
-        # SymmBuffer collective requires every rank to enter the kernel,
-        # even on zero-token ranks, so we *don't* short-circuit when
-        # num_tokens == 0 — we still run quant/route on the empty slice
-        # (cheap) and let the kernel launch proceed.
-        # ``all_rank_num_tokens`` is one entry per EP rank (Phase 1
-        # asserts ``ep_size == parallel_size``), so index by ``moe_ep_rank``.
-        if all_rank_num_tokens is not None:
-            num_tokens = int(all_rank_num_tokens[self.mapping.moe_ep_rank])
-        else:
-            num_tokens = x.shape[0]
-        assert num_tokens <= x.shape[0]
-
-        if output_dtype is None:
-            output_dtype = x.dtype if not isinstance(x, Fp4QuantizedTensor) else torch.bfloat16
-
-        # Slice to real tokens (skip DP padding rows if any) and compute
-        # routing + pre-quant. These used to live inside
-        # ``backend.forward_impl``; hoisting them up collapses the Python
-        # call stack by two frames and — more importantly — lets the
-        # backend's ``run_with_prequant`` match DG's ``run_fused`` shape
-        # contract exactly (4 x buf.copy_ + kernel).
-        x_real = x[:num_tokens]
-        router_logits_real = router_logits[:num_tokens]
-
-        if num_tokens > 0:
-            topk_idx, topk_weights = self.routing_method.apply(router_logits_real)
-            topk_idx = topk_idx.to(torch.int64)
-            topk_weights = topk_weights.to(torch.float32)
-            x_fp8, x_sf = self.backend.quantize_input(x_real)
-        else:
-            # Zero-token rank: fabricate empty tensors so
-            # ``run_with_prequant`` still takes the same shape contract.
-            # x_sf is (m, hidden_size // 128) int32 — packed UE8M0 stores
-            # 4 u8 scales per int32 over a 32-element block, i.e. 128
-            # input elements per int32 stride.
-            device = x.device
-            x_fp8 = torch.empty((0, self.hidden_size), dtype=torch.float8_e4m3fn, device=device)
-            x_sf = torch.empty((0, self.hidden_size // 128), dtype=torch.int32, device=device)
-            topk_idx = torch.empty(
-                (0, self.routing_method.experts_per_token), dtype=torch.int64, device=device
-            )
-            topk_weights = torch.empty(
-                (0, self.routing_method.experts_per_token), dtype=torch.float32, device=device
-            )
-
-        return self.backend.run_with_prequant(
-            x_fp8=x_fp8,
-            x_sf=x_sf,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            num_tokens=num_tokens,
-            output_dtype=output_dtype,
-        )
-
-    def _forward_chunk_impl(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype],
-        all_rank_num_tokens: List[int],
-        use_dp_padding: bool,
-        is_first_call: bool,
-        is_last_call: bool,
-        do_finalize: bool = True,
-        workspace: Optional[dict] = None,
-    ) -> torch.Tensor:
-        """
-        Unified execution flow for all backends
-
-        Flow (based on EPLB_in_MOE[1].html):
-        1. [EPLB] Start wait GPU stage (first call only, if enabled)
-        2. Apply routing (only if backend supports routing separation)
-        3. [EPLB] Update statistics and route (only if EPLB enabled)
-        4. Quantization and Communication (adaptive ordering)
-        5. MoE computation (backend)
-        6. [EPLB] Start CPU stage (last call only, if enabled)
-        7. Communication combine
-        8. [EPLB] Done CPU stage (last call only, if enabled)
-
-        - Separated routing: fused_moe_wide_ep.py:456-780, fused_moe_cutlass.py:236-443
-        - Fused routing: fused_moe_trtllm_gen.py
-        """
-
-        # Mega MoE never reaches here: ``forward_impl`` short-circuits to
-        # ``_forward_chunk_mega_impl`` before the chunk/padding pipeline runs
-        # so the backend can see raw ``all_rank_num_tokens``. Any isinstance
-        # check here would be dead code.
-
-        # ========== Step 1: EPLB - Start wait GPU stage ==========
-        self._load_balancer_start_wait_gpu_stage(is_first_call)
-
-        # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
-
-        if self.backend._supports_load_balancer():
-            # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
-
-            # Convert to standard dtypes for consistency with other MoE implementations
-            token_selected_experts = token_selected_experts.to(torch.int32)
-
-            assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
-            assert token_selected_experts.shape == token_final_scales.shape
-            # CutlassFusedMoE and DenseGEMMFusedMoE expect float32, while TRTLLMGenFusedMoE uses bfloat16
-            if isinstance(self.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
-                assert token_final_scales.dtype == torch.float32
-            assert token_selected_experts.dtype == torch.int32
-
-            # Convert token_final_scales to bfloat16 if needed (TRTLLMGen backend requires it)
-            if token_final_scales is not None and isinstance(self.backend, TRTLLMGenFusedMoE):
-                token_final_scales = token_final_scales.to(torch.bfloat16)
-
-            # Apply router weight on input if enabled
-            if self.apply_router_weight_on_input:
-                assert x.dtype != torch.float8_e4m3fn, (
-                    "Current workaround for apply_router_weight_on_input does not support fp8 input"
-                )
-                x = x * token_final_scales.to(x.dtype)
-                # TODO: remove this once we have correct fusedmoe kernel ready
-                # Check if using DeepEP strategies (they don't support token_final_scales=None)
-                if isinstance(self.comm, (DeepEP, DeepEPLowLatency)):
-                    # DeepEP doesn't support token_final_scales is None
-                    token_final_scales = torch.ones_like(token_final_scales)
-                else:
-                    token_final_scales = None
-
-        else:
-            # Fused routing: Backend handles routing internally
-            # EPLB must NOT be enabled for fused routing backends
-            assert not self._using_load_balancer(), (
-                f"EPLB is enabled but backend {self.backend.__class__.__name__} "
-                f"has fused routing (does not support routing separation)"
-            )
-
-            # For fused routing, we don't have token_selected_experts yet
-            # Will be handled by backend.run_moe_with_routing() later
-            token_selected_experts = None
-            token_final_scales = None
-
-        # ========== Step 3: EPLB - Update statistics and route ==========
-        # Only executed if backend supports routing separation AND EPLB is enabled
-        if self.layer_load_balancer and token_selected_experts is not None:
-            self._load_balancer_done_wait_gpu_stage(is_first_call)
-
-            # Update EPLB statistics (method depends on communication strategy)
-            # Use base class method: ignore_allreduce=True for NVLINK two-sided/one-sided (uses local stats only)
-            ignore_allreduce = (
-                self._is_using_nvlink_two_sided() or self._is_using_nvlink_one_sided()
-            )
-            self._load_balancer_update_statistic(
-                token_selected_experts,
-                is_first_call,
-                is_last_call,
-                ignore_allreduce=ignore_allreduce,
-            )
-
-            # EPLB routing: expert IDs -> slot IDs
-            token_selected_slots = self._load_balancer_route(token_selected_experts, self.use_dp)
-        else:
-            token_selected_slots = token_selected_experts
-
-        if token_selected_slots is not None:
-            ExpertStatistic.set_layer(self.layer_idx)
-            ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
-        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
-            self.num_slots, token_selected_slots
-        )
-
-        # ========== Step 3.5: Communication Prepare Phase (BEFORE quantization) ==========
-        # NVLINK two-sided has a prepare phase to gather EPLB statistics
-
-        local_statistic_tensor_for_dispatch = None
-        eplb_dispatch_kwargs = {}
-        should_update_eplb_after_dispatch = False
-        # Only NVLINK two-sided needs prepare_dispatch
-        if self._is_using_nvlink_two_sided():
-            # Get local statistic info if this is the last call and EPLB is enabled
-            local_statistic_tensor = None
-            if is_last_call:
-                local_statistic_tensor = self._load_balancer_get_local_statistic_tensor()
-
-            # Call prepare_dispatch (gathers statistics for NVLINK two-sided)
-            # prepare_dispatch stores alltoall_info in _dispatch_state and returns gathered_stats
-            gathered_stats = self.comm.prepare_dispatch(
-                token_selected_slots, all_rank_num_tokens, local_statistic_tensor
-            )
-
-            # Update EPLB with gathered statistics (if available)
-            if gathered_stats is not None:
-                gathered_stats = gathered_stats.view((self.mapping.moe_ep_size, self.num_experts))
-                self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
-        # TODO: The abstract does not work well as NVLinkTwoSided gathers EPLB stats in prepare_dispatch,
-        # while NVLinkOneSided gathers EPLB stats in dispatch.
-        elif self._is_using_nvlink_one_sided():
-            if self.layer_load_balancer and is_last_call:
-                local_statistic_tensor_for_dispatch = (
-                    self._load_balancer_get_local_statistic_tensor()
-                )
-            if local_statistic_tensor_for_dispatch is not None:
-                eplb_dispatch_kwargs["eplb_local_stats"] = local_statistic_tensor_for_dispatch
-                should_update_eplb_after_dispatch = True
-
-        # ========== Step 4 & 5: Quantization and Communication Dispatch ==========
-        # Order depends on whether strategy supports post-quant dispatch
-        if self.comm is not None:
-            # Check if we should use post-quant dispatch
-            # supports_post_quant_dispatch checks strategy capability for the current quant mode
-            supports_post_quant = self.comm.supports_post_quant_dispatch()
-
-            # Call dummy_allreduce before allgather for load balancing debug
-            if self.enable_dummy_allreduce:
-                self.dummy_allreduce()
-
-            dispatch_kwargs = dict(eplb_dispatch_kwargs)
-            if isinstance(self.comm, DeepEP) and isinstance(self.backend, TRTLLMGenFusedMoE):
-                dispatch_kwargs["enable_sanitize_expert_ids"] = True
-
-            if supports_post_quant:
-                # ===== Post-quant flow: Quantize → Dispatch =====
-
-                # Step 4a: Quantization FIRST
-                x, x_sf = self.backend.quantize_input(x)
-
-                # Step 4b: Dispatch AFTER quantization
-                # Get pre_quant_scale for W4AFP8 if available (only DeepEPLowLatency needs it)
-                # Other strategies will ignore this via **kwargs, so it's safe to pass unconditionally
-                if hasattr(self, "quant_scales") and self.quant_scales is not None:
-                    if hasattr(self.quant_scales, "pre_quant_scale_1"):
-                        dispatch_kwargs["pre_quant_scale"] = self.quant_scales.pre_quant_scale_1
-                x, x_sf, token_selected_slots, token_final_scales = self.comm.dispatch(
-                    hidden_states=x,
-                    hidden_states_sf=x_sf,
-                    token_selected_slots=token_selected_slots,
-                    token_final_scales=token_final_scales,
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    use_dp_padding=use_dp_padding,
-                    **dispatch_kwargs,
-                )
-                if should_update_eplb_after_dispatch:
-                    gathered_stats = self.comm.get_eplb_gathered_statistics()
-                    self._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
-            else:
-                # ===== Pre-quant flow: Dispatch → Quantize =====
-
-                # Step 4a: Dispatch FIRST (unquantized data)
-                x, x_sf, token_selected_slots, token_final_scales = self.comm.dispatch(
-                    hidden_states=x,
-                    hidden_states_sf=None,  # Not quantized yet
-                    token_selected_slots=token_selected_slots,
-                    token_final_scales=token_final_scales,
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    use_dp_padding=use_dp_padding,
-                    **dispatch_kwargs,
-                )
-
-                # Step 4b: Quantization AFTER dispatch
-                x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
-        else:
-            # No communication, just quantize
-            # (use non-post-quant-comm path for TRTLLMGenFusedMoE)
-            x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
-
-        # ========== Step 6: MoE Computation ==========
-
-        # Call unified run_moe interface with common parameters
-        # If EPLB is enabled, token_selected_slots represents expert slots
-        # Otherwise, token_selected_experts represents expert IDs
-        final_hidden_states = self.backend.run_moe(
-            x=x,
-            token_selected_experts=token_selected_slots,
-            token_final_scales=token_final_scales,
-            x_sf=x_sf,
-            **self._get_backend_kwargs(
-                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
-            ),
-        )
-
-        # ========== Step 8: EPLB - Start CPU stage ==========
-        self._load_balancer_start_set_cpu_stage(is_last_call)
-
-        # ========== Step 9: Communication - Combine ==========
-        if self.comm is not None:
-            if self.enable_dummy_allreduce:
-                self.dummy_allreduce()
-            # Use unified combine interface (reads dispatch state from strategy)
-            all_rank_max_num_tokens = max(all_rank_num_tokens)
-            final_hidden_states = self.comm.combine(
-                final_hidden_states,
-                all_rank_max_num_tokens=all_rank_max_num_tokens,
-            )
-        else:
-            # For non-comm case, It should be attention TP or single rank.
-            # only check if allreduce is needed
-            if self.parallel_size > 1 and self.reduce_results:
-                final_hidden_states = self.all_reduce(final_hidden_states)
-        # ========== Step 10: EPLB - Done CPU stage ==========
-        self._load_balancer_done_set_cpu_stage(is_last_call)
-
-        return final_hidden_states
-
-    def _prepare_workspaces_for_chunk(
-        self,
-        all_rank_num_tokens_list: List[Optional[List[int]]],
-        chunk_size_list: List[int],
-        use_multi_stream: bool,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Prepare workspaces for chunked execution with DeepGemmFusedMoE backend.
-        This will also be used for alltoall communication in the future.
-
-        Args:
-            all_rank_num_tokens_list: List of token counts per rank for each chunk (None if not using DP)
-            chunk_size_list: List of chunk sizes
-            use_multi_stream: Whether to use multi-stream execution (requires workspace_1)
-
-        Returns:
-            Tuple of (workspace_0, workspace_1), where workspace_1 is None if not using multi-stream
-        """
-        workspace_0 = None
-        workspace_1 = None
-
-        if not isinstance(self.backend, DeepGemmFusedMoE):
-            return workspace_0, workspace_1
-
-        # Always need at least workspace_0
-        chunk_size_0 = (
-            self.mapping.moe_ep_size * max(all_rank_num_tokens_list[0])
-            if self.use_dp and all_rank_num_tokens_list[0] is not None
-            else chunk_size_list[0]
-        )
-        workspace_chunk_sizes = [chunk_size_0]
-
-        # Add workspace_1 if using multi-stream for alternating between streams
-        # Reuse chunk_size_0 since it's always >= chunk_size_1 (first chunk is largest)
-        if use_multi_stream:
-            workspace_chunk_sizes.append(chunk_size_0)
-
-        workspaces = self.backend.get_workspaces(workspace_chunk_sizes)
-        workspace_0 = workspaces[0]
-        if use_multi_stream:
-            workspace_1 = workspaces[1]
-
-        return workspace_0, workspace_1
-
-    def _forward_multiple_chunks(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        num_chunks: int,
-        output_dtype: Optional[torch.dtype],
-        all_rank_num_tokens: List[int],
-        use_dp_padding: Optional[bool],
-        do_finalize: bool = True,
-    ) -> torch.Tensor:
-        """
-        Multiple chunks execution path with auxiliary stream for overlapping
-
-        Same as original implementation - chunking logic is backend-agnostic
-
-        """
-        # ========== Chunk preparation ==========
-        if self.use_dp:
-            # When using DP: need all ranks' token counts for reducescatter
-            all_rank_chunk_size_list = [
-                self.split_chunk(val, num_chunks) for val in all_rank_num_tokens
-            ]
-            all_rank_num_tokens_list = [
-                [val[idx_chunk] for val in all_rank_chunk_size_list]
-                for idx_chunk in range(num_chunks)
-            ]
-            chunk_size_list = all_rank_chunk_size_list[self.rank]
-
-            # For alltoall, replace 0 with 1 (avoid empty tensor)
-            if self.enable_alltoall:
-                all_rank_num_tokens_list = [
-                    [1 if val == 0 else val for val in val_list]
-                    for val_list in all_rank_num_tokens_list
-                ]
-        else:
-            # When not using DP: only need current rank's input size
-            all_rank_num_tokens_list = [None] * num_chunks
-            chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
-
-        x_list = x.split(chunk_size_list)
-        router_logits_list = router_logits.split(chunk_size_list)
-
-        # Determine if we need multiple streams for overlapped execution
-        use_multi_stream = not self.enable_alltoall and self.aux_stream is not None
-
-        # ========== Setup auxiliary stream ==========
-        if use_multi_stream:
-            self.event_dict[EventType.Main].record()
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.Main].wait()
-
-        # ========== Create workspace for DeepGemmFusedMoE ==========
-        workspace_0, workspace_1 = self._prepare_workspaces_for_chunk(
-            all_rank_num_tokens_list, chunk_size_list, use_multi_stream
-        )
-
-        # ========== Padding empty chunk ==========
-        chunked_used = torch.ones(num_chunks, dtype=torch.bool)
-        if self.use_dp:
-            # For empty chunk, will use chunk 0 instead. The current split heuristic
-            # ensures that if an empty chunk exists, Chunk 0 contains exactly one token.
-            assert x_list[0].numel() != 0, "chunk 0 shouldn't be empty"
-            x_list = list(x_list)
-            router_logits_list = list(router_logits_list)
-            for idx_chunk in range(num_chunks):
-                _x = x_list[idx_chunk]
-                if _x.numel() == 0:
-                    chunked_used[idx_chunk] = False
-                    x_list[idx_chunk] = x_list[0]
-                    router_logits_list[idx_chunk] = router_logits_list[0]
-                    all_rank_num_tokens_list[idx_chunk][self.mapping.tp_rank] = (
-                        all_rank_num_tokens_list[0][self.mapping.tp_rank]
-                    )
-            x_list = tuple(x_list)
-            router_logits_list = tuple(router_logits_list)
-
-        # ========== Execute chunking with overlap ==========
-        outputs_list = []
-        for idx_chunk, (x_chunk, router_logits_chunk) in enumerate(zip(x_list, router_logits_list)):
-            # Calculate EPLB's first/last call
-            is_first_call = idx_chunk == 0 and self.repeat_idx == 0
-            is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
-
-            if use_multi_stream:
-                # Alternate between main stream and auxiliary stream
-                # Each stream processes complete chunks (forward + reducescatter)
-                if idx_chunk % 2 == 0:
-                    # Even chunk: execute on auxiliary stream
-                    with torch.cuda.stream(self.aux_stream):
-                        outputs = self._forward_chunk_impl(
-                            x_chunk,
-                            router_logits_chunk,
-                            output_dtype,
-                            all_rank_num_tokens_list[idx_chunk],
-                            use_dp_padding,
-                            is_first_call,
-                            is_last_call,
-                            do_finalize,
-                            workspace=workspace_0,
-                        )
-                else:
-                    # Odd chunk: execute on main stream
-                    outputs = self._forward_chunk_impl(
-                        x_chunk,
-                        router_logits_chunk,
-                        output_dtype,
-                        all_rank_num_tokens_list[idx_chunk],
-                        use_dp_padding,
-                        is_first_call,
-                        is_last_call,
-                        do_finalize,
-                        workspace=workspace_1,
-                    )
-            else:
-                # No overlap
-                outputs = self._forward_chunk_impl(
-                    x_chunk,
-                    router_logits_chunk,
-                    output_dtype,
-                    all_rank_num_tokens_list[idx_chunk],
-                    use_dp_padding,
-                    is_first_call,
-                    is_last_call,
-                    do_finalize,
-                    workspace=workspace_0,
-                )
-
-            if chunked_used[idx_chunk]:
-                outputs_list.append(outputs)
-
-        # ========== Wait for auxiliary stream to complete ==========
-        if use_multi_stream:
-            # Wait for auxiliary stream to complete all its chunks
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.MoeChunkingOverlap].record()
-            self.event_dict[EventType.MoeChunkingOverlap].wait()
-
-        # ========== Concatenate outputs from all chunks ==========
-        outputs = torch.cat(outputs_list)
 
         return outputs
 
     # ========== Backend Validation ==========
 
     def validate_backend(self, backend: MoE):
-        """
-        Validate MOE backend.
+        """Validate MoE backend compatibility with this ConfigurableMoE.
 
-        It validates that:
-        1. Backend is not None
-        2. If EPLB is enabled, backend must support routing separation
+        Generic checks (always run):
+          1. ``backend`` is not None.
+          2. If EPLB is enabled, the backend must support routing
+             separation (``backend._supports_load_balancer()``).
 
-        Args:
-            backend: MoEBackend instance to set
-
-        Raises:
-            ValueError: If backend is incompatible with current configuration
-
-        Note: EPLB initialization is done in __init__, not in setter.
-              Setter only validates compatibility.
+        Backend-specific checks are delegated to
+        ``backend.validate_configurable_moe(self)``; backends with extra
+        constraints (e.g. fused-comm backends rejecting dynamic
+        EPLB) override that hook. EPLB / num_slots / ep_size are already
+        populated on ``self`` by ``MoE.__init__`` -> ``_init_load_balancer``
+        before this is called, so backends may inspect them directly.
         """
         if backend is None:
             raise ValueError("Backend cannot be None")
 
-        # Validate EPLB compatibility
         if self._using_load_balancer() and not backend._supports_load_balancer():
             raise ValueError(
                 f"EPLB is enabled but backend {backend.__class__.__name__} "
@@ -1183,179 +583,7 @@ class ConfigurableMoE(MoE):
                 f"Either disable EPLB or use a backend that supports load balancer."
             )
 
-    # ========== Helper Methods ==========
-
-    def _is_using_nvlink_two_sided(self) -> bool:
-        """Check if using NVLinkTwoSided communication strategy"""
-        return isinstance(self.comm, NVLinkTwoSided)
-
-    def _is_using_nvlink_one_sided(self) -> bool:
-        """Check if using NVLinkOneSided communication strategy"""
-        return isinstance(self.comm, NVLinkOneSided)
-
-    def _get_nvlink_onesided_moe_output(
-        self,
-        all_rank_num_tokens: Optional[List[int]],
-        output_dtype: Optional[torch.dtype],
-    ) -> Optional[torch.Tensor]:
-        """
-        Get workspace output buffer for NVLinkOneSided communication backend.
-
-        This method handles moe_output allocation for both CutlassFusedMoE and TRTLLMGenFusedMoE
-        when using NVLinkOneSided communication strategy.
-
-        Args:
-            all_rank_num_tokens: Token counts per rank
-            output_dtype: Output data type
-
-        Returns:
-            moe_output tensor if NVLinkOneSided is used and backend supports it, None otherwise
-        """
-        if not isinstance(self.comm, NVLinkOneSided):
-            return None
-
-        if not self.backend.supports_moe_output_in_alltoall_workspace():
-            # Ensure payload_in_workspace is False if backend doesn't support it
-            self.comm.payload_in_workspace = False
-            return None
-
-        # Determine workspace dtype and whether backend supports workspace output
-        workspace_dtype = output_dtype
-        if isinstance(self.backend, TRTLLMGenFusedMoE):
-            # TRTLLMGen specific configuration
-            self.comm.invalid_token_expert_id = -1
-            workspace_dtype = torch.bfloat16
-
-        # Calculate runtime max tokens per rank
-        assert all_rank_num_tokens is not None, (
-            "all_rank_num_tokens must be provided for NVLinkOneSided backend"
-        )
-        runtime_max_tokens_per_rank = max(all_rank_num_tokens)
-
-        # Get workspace-backed output tensor
-        moe_output = self.comm.get_combine_payload_tensor_in_workspace(
-            runtime_max_tokens_per_rank, self.hidden_size, workspace_dtype
-        )
-
-        # Dynamically enable payload_in_workspace for this forward pass
-        self.comm.payload_in_workspace = True
-        return moe_output
-
-    def _get_backend_kwargs(
-        self,
-        router_logits: Optional[torch.Tensor] = None,
-        do_finalize: bool = True,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        output_dtype: Optional[torch.dtype] = None,
-        x: Optional[torch.Tensor] = None,
-        workspace: Optional[dict] = None,
-    ) -> Dict:
-        """
-        Get backend-specific keyword arguments for run_moe
-
-        Returns backend-specific parameters that are not part of the common run_moe interface.
-        Different backends need different parameters - this method provides them via kwargs.
-
-        TODO: This is not finalized, will be updated later.
-        Common kwargs (multiple backends):
-            - cluster_size, cluster_rank: Cutlass, DeepGemm
-            - min_latency_mode: Cutlass, WideEP, DeepGemm
-            - use_fused_finalize: Cutlass, WideEP
-            - tuner_num_tokens, tuner_top_k: Cutlass, WideEP
-
-        Backend-specific kwargs:
-            - Cutlass: swizzled_input_sf, enable_alltoall, output_tensor
-            - WideEP: swizzled_input_sf (fixed False), use_all_to_all
-            - DeepGemm: workspace, permutation tensors
-            - TRTLLMGen: router_logits, do_finalize, moe_output
-
-        Args:
-            router_logits: Router logits tensor (for TRTLLMGen backend)
-            do_finalize: Whether to finalize output (for TRTLLMGen backend)
-            all_rank_num_tokens: Token counts per rank (for TRTLLMGen backend moe_output)
-            output_dtype: Output data type
-            x: Input tensor (for calculating tuner_num_tokens in Cutlass)
-
-        Returns:
-            Dict: Backend-specific keyword arguments
-        """
-        kwargs = {}
-
-        # Common parameters for Cutlass and DeepGemm
-        if self.backend.__class__ in (
-            CutlassFusedMoE,
-            DeepGemmFusedMoE,
-            CuteDslFusedMoE,
-            DenseGEMMFusedMoE,
-        ):
-            pass
-
-        # Cutlass-specific parameters
-        if self.backend.__class__ == CutlassFusedMoE:
-            # Determine if scaling factors are swizzled based on communication flow
-            # In post-quant communication (quantize -> dispatch), scaling factors are not swizzled
-            # In pre-quant communication (dispatch -> quantize), scaling factors are swizzled
-            supports_post_quant = self.comm is not None and self.comm.supports_post_quant_dispatch()
-            kwargs["is_sf_swizzled"] = not supports_post_quant
-            kwargs["output_dtype"] = output_dtype
-
-            # Prepare additional information for profiling in case padding is applied when using alltoall.
-            # Only the non-alltoall case is considered for profiling in the warmup phase.
-            # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner
-            # should be the same as when not using alltoall.
-            kwargs["enable_alltoall"] = self.enable_alltoall
-            if self.enable_alltoall:
-                if all_rank_num_tokens is not None:
-                    kwargs["tuner_num_tokens"] = sum(all_rank_num_tokens)
-                else:
-                    kwargs["tuner_num_tokens"] = (
-                        x.shape[0] * self.mapping.tp_size if x is not None else None
-                    )
-                kwargs["tuner_top_k"] = self.routing_method.top_k
-
-            # Get moe_output for NVLinkOneSided backend
-            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
-            )
-
-        # CuteDSL-specific parameters
-        elif self.backend.__class__ == CuteDslFusedMoE:
-            kwargs["enable_alltoall"] = self.enable_alltoall
-
-            # Get moe_output for NVLinkOneSided backend
-            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
-            )
-
-            if self.enable_dwdp:
-                kwargs["dwdp_weight_view"] = self.dwdp_manager.build_weight_view(
-                    self.layer_idx, self.backend
-                )
-
-        # DeepGemm-specific parameters
-        elif self.backend.__class__ == DeepGemmFusedMoE:
-            if workspace is not None:
-                kwargs["workspace"] = workspace
-
-        # TRTLLMGen-specific parameters
-        elif self.backend.__class__ == TRTLLMGenFusedMoE:
-            # Determine router_logits based on whether routing has been done
-            # If backend doesn't support load balancer, routing is done before communication
-            # In that case, router_logits should be None (routing already done)
-            router_logits_arg = None
-            if not self.backend._supports_load_balancer():
-                # For fused routing backends, router_logits is only needed if routing hasn't been done yet
-                router_logits_arg = router_logits
-
-            kwargs["router_logits"] = router_logits_arg
-            kwargs["do_finalize"] = do_finalize
-
-            # Get moe_output for NVLinkOneSided backend
-            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
-            )
-
-        return kwargs
+        backend.validate_configurable_moe(self)
 
     def create_weights(self):
         """

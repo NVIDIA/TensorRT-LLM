@@ -63,7 +63,7 @@ Note:
 * The command maps port `8000` from the container to your host so you can access the LLM API endpoint from your host.
 * See <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all available containers. Containers published in the main branch weekly have an `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use the latest main branch, you can build from source: [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html)
+If you want to use the latest main branch, you can build from source: [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
 
 > **All commands below should be run inside the Docker container.**
 
@@ -77,7 +77,6 @@ If you want to use the latest main branch, you can build from source: [https://n
 
 ```bash
 cat > /tmp/config.yml <<EOF
-custom_tokenizer: glm_moe_dsa
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 128
@@ -99,7 +98,6 @@ GLM-5 natively supports Multi-Token Prediction (MTP), which enables speculative 
 
 ```bash
 cat > /tmp/config.yml <<EOF
-custom_tokenizer: glm_moe_dsa
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 128
@@ -155,10 +153,6 @@ trtllm-serve \
 ### LLM API Options (YAML Configuration)
 
 These options provide control over TensorRT LLM's behavior and are set within the YAML file passed to the `trtllm-serve` command via the `--config` argument.
-
-#### `custom_tokenizer`
-
-* **Description:** Specifies a custom tokenizer to use. GLM-5 requires the `glm_moe_dsa` tokenizer.
 
 #### `kv_cache_config`
 

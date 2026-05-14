@@ -335,6 +335,8 @@ def main():
     with open(config_yaml, "r") as f:
         config = yaml.safe_load(f)
 
+    is_gb300 = "GB300" in args.stage_name.upper()
+
     # Determine install script path
     install_script = args.install_sh
 
@@ -390,6 +392,17 @@ def main():
 
     pytest_common_vars = ""
 
+    ucx_tls_cmd = (
+        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
+        if is_gb300
+        else "unset UCX_TLS UCX_NET_DEVICES &&"
+    )
+    ucx_tls_server_cmd = (
+        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
+        if is_gb300
+        else "unset UCX_TLS UCX_NET_DEVICES &&"
+    )
+
     script_prefix_lines.extend(
         [
             worker_pytest_command,
@@ -400,13 +413,14 @@ def main():
             f'export GEN_WORKER_ENV_VARS="{gen_worker_env_vars}"',
             f'export SERVER_ENV_VARS="{server_env_vars}"',
             f'export BENCHMARK_ENV_VARS="{env_config["benchmark_env_var"]}"',
-            'export pytestCommandCTXWorker="unset UCX_TLS UCX_NET_DEVICES && $CTX_WORKER_ENV_VARS'
+            f'export pytestCommandCTXWorker="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS'
             ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
-            'export pytestCommandGENWorker="unset UCX_TLS UCX_NET_DEVICES && $GEN_WORKER_ENV_VARS'
+            f'export pytestCommandGENWorker="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS'
             ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
-            'export pytestCommandDisaggServer="unset UCX_TLS UCX_NET_DEVICES &&'
+            f'export pytestCommandDisaggServer="{ucx_tls_server_cmd}'
             ' $SERVER_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandDisaggServer"',
-            'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandBenchmark"',
+            f'export pytestCommandBenchmark="{ucx_tls_cmd} $BENCHMARK_ENV_VARS'
+            ' $PYTEST_COMMON_VARS $partialPytestCommandBenchmark"',
             f"export runScript={args.run_sh}",
             f"export installScript={install_script}",
             f"export configYamlPath={config_yaml}",

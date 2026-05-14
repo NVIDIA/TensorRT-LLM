@@ -130,6 +130,8 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     for tree attention setup and verification routing.
     """
 
+    hidden_states: Optional[torch.Tensor] = None
+
     def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
         self.max_num_requests = max_num_requests
         self.spec_tree_manager = SpecTreeManager(
@@ -369,11 +371,22 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        self.hidden_states = torch.empty(
-            (self.max_num_tokens,
-             self.hidden_size * len(self.layers_to_capture)),
-            dtype=self.dtype,
-            device='cuda')
+        if (self.spec_resource_manager is not None
+                and self.spec_resource_manager.hidden_states is not None):
+            self.hidden_states = self.spec_resource_manager.hidden_states
+            expected_cols = self.hidden_size * len(self.layers_to_capture)
+            assert self.hidden_states.shape[1] == expected_cols, (
+                f"hidden_states shape mismatch: "
+                f"{type(self.spec_resource_manager).__name__} has "
+                f"{self.hidden_states.shape}, but metadata expects "
+                f"(:, {expected_cols}) from hidden_size={self.hidden_size} "
+                f"x capture_layers={list(self.layers_to_capture)}")
+        else:
+            self.hidden_states = torch.empty(
+                (self.max_num_tokens,
+                 self.hidden_size * len(self.layers_to_capture)),
+                dtype=self.dtype,
+                device='cuda')
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,

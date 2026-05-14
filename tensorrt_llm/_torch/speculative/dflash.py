@@ -25,6 +25,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -397,6 +398,14 @@ class DFlashWorker(SpecWorkerBase):
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 
+        # Update GDN/Mamba recurrent states to the accepted token's state.
+        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
+
         # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
         if K > 1:
             acc_padding = torch.zeros(
@@ -409,7 +418,12 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata, num_accepted_tokens, num_contexts, batch_size
         )
 
-        position_ids = position_ids.squeeze(0)
+        # Collapse mrope [3, 1, N] to 1D by taking the first (temporal) dimension.
+        # The draft model uses standard 1D RoPE, so only scalar positions are needed.
+        if position_ids.ndim == 3:
+            position_ids = position_ids[0, 0]
+        else:
+            position_ids = position_ids.squeeze(0)
 
         # Get total tokens processed by target model (for hidden state extraction)
         total_target_tokens = input_ids.shape[0]

@@ -38,6 +38,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
+from .video_mme import VideoMME as VideoMMEEvaluator
 
 
 def compute_theta(num_samples: int,
@@ -282,6 +283,31 @@ class VoxPopuli(AccuracyTask):
         "dataset_path": DATASET_DIR,
         "split": "test",
         "text_column": "normalized_text",
+    }
+
+
+class VideoMME(AccuracyTask):
+    """Multiple-choice video QA accuracy task on the local Video-MME short shard."""
+
+    DATASET = "videomme"
+    DATASET_DIR = f"{llm_models_root()}/datasets/lmms-lab__Video-MME-short-v1"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = 300
+
+    MAX_BATCH_SIZE = 128
+    MAX_INPUT_LEN = 32768
+    # The prompt asks for one option letter; keep a compact cap with room for
+    # short extra text.
+    MAX_OUTPUT_LEN = 32
+
+    EVALUATOR_CLS = VideoMMEEvaluator
+    EVALUATOR_KWARGS = {
+        "dataset_path": DATASET_DIR,
+        "random_seed": 0,
+        "num_frames": 8,
     }
 
 
