@@ -263,11 +263,11 @@ class PythonMambaCacheManager(BaseResourceManager):
         # 0 means temporal saved state is actually the last state, not two back.
         prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
         cache_buf_idx: torch.Tensor | None = None  # (cache,) int32 — shared across layers
-        old_x: torch.Tensor | None = None  # (layers, cache, T, nheads, dim)
-        old_B: torch.Tensor | None = None  # (layers, cache, 2, T, ngroups, dstate)
+        old_x: torch.Tensor | None = None  # (layers, cache, history, nheads, dim)
+        old_B: torch.Tensor | None = None  # (layers, cache, 2, history, ngroups, dstate)
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
-        old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, T) fp32
-        old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, T) fp32
+        old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
+        old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
 
     def __init__(
         self,
@@ -292,6 +292,8 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.spec_state_size = spec_state_size
         self._use_replay_state_update = use_replay_state_update
+        self.replay_history_size: Optional[int] = None
+        self.replay_step_width: Optional[int] = None
 
         # get tp size
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
@@ -355,6 +357,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         # create state container
         if speculative_num_draft_tokens is not None:
             T = speculative_num_draft_tokens + 1
+            self.replay_step_width = T
 
             # Conv intermediate cache — same for both paths
             intermediate_conv_window_cache = torch.zeros(
@@ -370,6 +373,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 assert n_groups % tp_size == 0, \
                     "replay state update requires n_groups divisible by tp_size"
                 n_groups_per_rank = n_groups // tp_size
+                self.replay_history_size = max(16, T)
 
                 # Compact replay cache.
                 # old_x is single-buffered (written by main kernel after replay).
@@ -382,7 +386,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                            device=device)
                 spec_kwargs['old_x'] = torch.zeros(num_local_layers,
                                                    max_batch_size,
-                                                   T,
+                                                   self.replay_history_size,
                                                    nheads,
                                                    head_dim,
                                                    dtype=dtype,
@@ -390,7 +394,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 spec_kwargs['old_B'] = torch.zeros(num_local_layers,
                                                    max_batch_size,
                                                    2,
-                                                   T,
+                                                   self.replay_history_size,
                                                    n_groups_per_rank,
                                                    d_state,
                                                    dtype=dtype,
@@ -399,16 +403,17 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                     max_batch_size,
                                                     2,
                                                     nheads,
-                                                    T,
+                                                    self.replay_history_size,
                                                     dtype=torch.float32,
                                                     device=device)
-                spec_kwargs['old_dA_cumsum'] = torch.zeros(num_local_layers,
-                                                           max_batch_size,
-                                                           2,
-                                                           nheads,
-                                                           T,
-                                                           dtype=torch.float32,
-                                                           device=device)
+                spec_kwargs['old_dA_cumsum'] = torch.zeros(
+                    num_local_layers,
+                    max_batch_size,
+                    2,
+                    nheads,
+                    self.replay_history_size,
+                    dtype=torch.float32,
+                    device=device)
                 ssm_spec_cache = [
                     spec_kwargs['old_x'], spec_kwargs['old_B'],
                     spec_kwargs['old_dt'], spec_kwargs['old_dA_cumsum']
@@ -638,14 +643,26 @@ class PythonMambaCacheManager(BaseResourceManager):
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
         if self._use_replay_state_update:
-            # SSM state is handled incrementally by the kernel.  Update the
-            # number of accepted tokens and flip the double-buffer index so the
-            # next step's replay reads from the buffer that was just written by
-            # the precompute kernel.
+            # SSM state is handled incrementally by the kernel.  Mirror the
+            # kernel's per-slot checkpoint predicate from the previous PNAT and
+            # fixed replay step width: checkpoint steps write a fresh history
+            # buffer and flip, while no-checkpoint steps append to the active
+            # buffer and keep reading from it next step.
+            accepted_tokens = num_accepted_tokens[num_contexts:num_contexts +
+                                                  num_gens]
+            prev_num_accepted_tokens = \
+                self.mamba_cache.prev_num_accepted_tokens[state_indices_d]
+            wrote_checkpoint = (prev_num_accepted_tokens +
+                                self.replay_step_width
+                                > self.replay_history_size)
+            next_num_accepted_tokens = torch.where(
+                wrote_checkpoint, accepted_tokens,
+                prev_num_accepted_tokens + accepted_tokens)
+            cache_buf_idx = self.mamba_cache.cache_buf_idx[state_indices_d]
             self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = \
-                num_accepted_tokens[num_contexts:num_contexts + num_gens]
+                next_num_accepted_tokens
             self.mamba_cache.cache_buf_idx[state_indices_d] = \
-                1 - self.mamba_cache.cache_buf_idx[state_indices_d]
+                torch.where(wrote_checkpoint, 1 - cache_buf_idx, cache_buf_idx)
         else:
             # Legacy: copy accepted SSM state from intermediate cache.
             ssm_states = self.mamba_cache.temporal
@@ -1039,6 +1056,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
         # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        self.replay_step_width: Optional[int] = (
+            spec_config.max_draft_len +
+            1 if spec_config is not None and use_replay_state_update else None)
+        self.replay_history_size: Optional[int] = (max(
+            16, self.replay_step_width) if self.replay_step_width is not None
+                                                   else None)
         self.ssm_state_dtype = mamba_ssm_cache_dtype
 
         if self.local_num_mamba_layers == 0:
@@ -1351,15 +1374,26 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
         if self._use_replay_state_update:
-            # SSM state is handled incrementally by the replay kernel.  Update
-            # the per-slot accepted-token counter and flip the double-buffer
-            # index so the next step reads from the buffer that was just
-            # written by the precompute kernel.
-            accepted = num_accepted_tokens[num_contexts:num_contexts + num_gens]
-            self.prev_num_accepted_tokens[state_indices_d] = accepted.to(
-                self.prev_num_accepted_tokens.dtype)
-            self.cache_buf_idx[state_indices_d] = \
-                1 - self.cache_buf_idx[state_indices_d]
+            # SSM state is handled incrementally by the kernel. Mirror the
+            # kernel's checkpoint predicate from the previous PNAT and fixed
+            # replay step width: checkpoint steps flip buffers, while no-write
+            # steps append to the active history.
+            accepted = num_accepted_tokens[num_contexts:num_contexts +
+                                           num_gens].to(
+                                               self.prev_num_accepted_tokens.
+                                               dtype)
+            prev_num_accepted_tokens = \
+                self.prev_num_accepted_tokens[state_indices_d]
+            wrote_checkpoint = (prev_num_accepted_tokens +
+                                self.replay_step_width
+                                > self.replay_history_size)
+            next_num_accepted_tokens = torch.where(
+                wrote_checkpoint, accepted, prev_num_accepted_tokens + accepted)
+            cache_buf_idx = self.cache_buf_idx[state_indices_d]
+            self.prev_num_accepted_tokens[state_indices_d] = \
+                next_num_accepted_tokens
+            self.cache_buf_idx[state_indices_d] = torch.where(
+                wrote_checkpoint, 1 - cache_buf_idx, cache_buf_idx)
         else:
             # Legacy: copy accepted SSM states from intermediate buffer back to pool
             accepted_ssm = self.intermediate_ssm_states[:, src_state_indices,
@@ -1584,7 +1618,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self.old_dA_cumsum = None
             return
 
-        T = spec_config.max_draft_len + 1
+        history_size = self.replay_history_size
         num_local_mamba_layers = self.local_num_mamba_layers
         # all_ssm_states: [num_local_mamba_layers, num_blocks_in_pool, ...]
         cache_size = self.all_ssm_states.shape[1]
@@ -1602,7 +1636,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # x is not double-buffered
         self.old_x = torch.zeros(num_local_mamba_layers,
                                  cache_size,
-                                 T,
+                                 history_size,
                                  nheads,
                                  head_dim,
                                  dtype=self.conv_state_dtype,
@@ -1611,7 +1645,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.old_B = torch.zeros(num_local_mamba_layers,
                                  cache_size,
                                  2,
-                                 T,
+                                 history_size,
                                  n_groups_per_rank,
                                  d_state,
                                  dtype=self.conv_state_dtype,
@@ -1620,14 +1654,14 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                   cache_size,
                                   2,
                                   nheads,
-                                  T,
+                                  history_size,
                                   dtype=torch.float32,
                                   device=device)
         self.old_dA_cumsum = torch.zeros(num_local_mamba_layers,
                                          cache_size,
                                          2,
                                          nheads,
-                                         T,
+                                         history_size,
                                          dtype=torch.float32,
                                          device=device)
 
