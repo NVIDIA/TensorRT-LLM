@@ -239,7 +239,12 @@ def parse_args():
         "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
         "Cannot be combined with --ulysses_size (not yet implemented).",
     )
-    parser.add_argument("--ring_size", type=int, default=1, help="Ring parallel size")
+    parser.add_argument(
+        "--ring_size",
+        type=int,
+        default=1,
+        help="Ring Attention parallel size. Cannot be combined with --attn2d_row_size / --attn2d_col_size.",
+    )
     parser.add_argument(
         "--parallel_vae_size",
         type=int,
@@ -328,6 +333,10 @@ def main():
     if attn2d_size > 1 and args.ulysses_size > 1:
         raise ValueError(
             "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
+    if args.ring_size > 1 and attn2d_size > 1:
+        raise ValueError(
+            "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
 
     if args.ulysses_size > 1:
