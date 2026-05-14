@@ -19,7 +19,7 @@ import pytest
 import torch
 import yaml
 from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
-                           llm_models_root, skip_pre_ada,
+                           llm_models_root, skip_pre_ada, skip_pre_blackwell,
                            skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir
 
