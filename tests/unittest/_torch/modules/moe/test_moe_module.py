@@ -249,6 +249,13 @@ def _create_model_config(
         else None
     )
 
+    # FLASHINFER_NVFP4SM12X is an internal-only MoeBackendType — it has no
+    # corresponding user-facing MoeConfig.backend literal. Route through
+    # "CUTLASS" so the test exercises the heuristic auto-promotion path that
+    # users hit on SM120/121 + NVFP4.
+    if moe_backend == MoeBackendType.FLASHINFER_NVFP4SM12X.value:
+        moe_backend = MoeBackendType.CUTLASS.value
+
     kwargs = dict(
         pretrained_config=pretrained_config,
         mapping=mapping,
@@ -817,6 +824,7 @@ BACKEND_TYPES = [
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
     MoeBackendType.MEGAMOE,
+    MoeBackendType.FLASHINFER_NVFP4SM12X,
 ]
 
 # Data types to test
