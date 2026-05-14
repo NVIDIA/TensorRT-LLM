@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
 from dataclasses import dataclass
@@ -1817,13 +1819,15 @@ class Indexer(nn.Module):
         k_scale: torch.Tensor,
         weights: torch.Tensor,
         use_custom_topk: bool = True,
+        update_k_cache: bool = True,
     ) -> torch.Tensor:
         """Run the indexer TopK kernel for both prefill and decode phases."""
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size == 128, \
             "Only support quant_block_size = 128 for now"
         # Update the indexer k cache before prefill chunks gather from it.
-        self._update_k_cache(k_fp8, k_scale, metadata)
+        if update_k_cache:
+            self._update_k_cache(k_fp8, k_scale, metadata)
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
