@@ -561,6 +561,8 @@ class PyTorchModelEngine(ModelEngine):
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
 
+        self._prepare_inputs_event: Optional[torch.cuda.Event] = None
+
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
@@ -3998,11 +4000,16 @@ class PyTorchModelEngine(ModelEngine):
                     spec_tree_manager._all_slot_ids_buf[idx] = slot
                     idx += 1
 
+            if self._prepare_inputs_event is not None:
+                # Wait for H2D copy in last iteration, otherwise _prepare_inputs will modify host input and break last iteration's input
+                self._prepare_inputs_event.synchronize()
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager, can_run_graph)
+            self._prepare_inputs_event = torch.cuda.Event()
+            self._prepare_inputs_event.record()
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
