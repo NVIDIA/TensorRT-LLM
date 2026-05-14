@@ -151,6 +151,8 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_sch
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True] SKIP (https://nvbugs/6162114)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa SKIP (https://nvbugs/6162114)
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype SKIP (https://nvbugs/5520319)
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False] SKIP (https://nvbugs/6162122)
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=True] SKIP (https://nvbugs/6162122)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_eagle3_tp8[eagle3_one_model=False-torch_compile=True] SKIP (https://nvbugs/5775326)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4[torch_compile=True] SKIP (https://nvbugs/5821415)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4[torch_compile=True] SKIP (https://nvbugs/5821415)
