@@ -955,6 +955,20 @@ class AutoTuner:
             return (best_runner, best_tactic)
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
+        # NOTE on rank-divergent early return:
+        #   With ADP + MoE EP, different ranks see different per-expert routing
+        #   shapes, so `is_cache_hit` can diverge across ranks. The slow path
+        #   below ends in `_maybe_sync_cache_data`, which issues a TP/CP
+        #   collective (allgather or broadcast). If some ranks early-return here
+        #   while others enter the collective, the collective deadlocks.
+        #   To pair every rank's early-return decision with the same collective,
+        #   require ALL ranks to have hit cache before any rank short-circuits.
+        #   The allgather must be UNCONDITIONAL — every rank, hit or miss, has
+        #   to call it so its return value is symmetric.
+        if self.is_tuning_mode and self._is_distributed():
+            all_hit = all(self._dist.tp_cp_allgather(obj=is_cache_hit))
+            if not all_hit:
+                is_cache_hit = False
         if self.is_tuning_mode and is_cache_hit:
             return (runners[best_runner_id], best_tactic)
 
