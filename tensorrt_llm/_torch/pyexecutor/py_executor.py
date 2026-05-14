@@ -59,8 +59,9 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
-from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, get_draft_token_length)
+from .llm_request import (MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
+                          LlmRequest, LlmRequestState, LlmResponse,
+                          get_draft_token_length)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
@@ -4409,6 +4410,17 @@ class PyExecutor:
             request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
+            py_num_accepted = getattr(request,
+                                      'py_num_accepted_draft_tokens', 0)
+            draft_len = get_draft_token_length(request)
+            if draft_len > 0:
+                for pos in range(
+                        min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
+                    request.py_per_pos_drafted[pos] += 1
+                for pos in range(
+                        min(py_num_accepted, MAX_SPEC_DECODE_POSITIONS)):
+                    request.py_per_pos_accepted[pos] += 1
+
             self.perf_manager.append_step_metrics(
                 request, self.iter_counter, batch_token_time=batch_token_time)
 
@@ -4432,6 +4444,8 @@ class PyExecutor:
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
+                    response.result.per_pos_drafted = request.py_per_pos_drafted
+                    response.result.per_pos_accepted = request.py_per_pos_accepted
                     new_responses.append((req_id, response))
 
             if request_done:
