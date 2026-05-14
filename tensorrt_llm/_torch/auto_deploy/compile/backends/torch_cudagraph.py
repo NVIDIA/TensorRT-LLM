@@ -148,6 +148,7 @@ class CapturedGraph(nn.Module):
             set(resource_input_names) if resource_input_names is not None else None
         )
         self.cudagraphs: Dict[Tuple[int, ...], CUDAGraph] = {}
+        self._cudagraph_output_extents: Dict[Tuple[int, ...], Tuple[int, ...]] = {}
         self._input_buffers: List[torch.Tensor] = []
         self._out_buffer_flat: List[torch.Tensor] = None
         self._output_dynamic_dim: int = 0
@@ -180,8 +181,8 @@ class CapturedGraph(nn.Module):
         args: Tuple,
         kwargs: Dict,
         refresh_args_static: Optional[Callable] = None,
-    ) -> torch.cuda.CUDAGraph:
-        """Capture and return one cuda graph."""
+    ) -> Tuple[torch.cuda.CUDAGraph, Tuple[int, ...]]:
+        """Capture and return one cuda graph and its output dynamic extents."""
         # warm-up and invoke autotuner
         with autotune():
             for _ in range(3):
@@ -197,16 +198,23 @@ class CapturedGraph(nn.Module):
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         od = self._output_dynamic_dim
+        output_extents = []
         with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
             # compute output
             out = self.model(*args, **kwargs)
             # write out into output buffer up to out batch size
             out_flat = tree_flatten_spec(out, self._out_spec)
             for o_buffer, o in zip(self._out_buffer_flat, out_flat):
-                o_buffer.narrow(od, 0, o.shape[od]).copy_(o)
+                output_extent = o.shape[od]
+                assert o_buffer.shape[od] >= output_extent, (
+                    "CUDA graph output extent exceeds backing buffer during capture: "
+                    f"output_extent={output_extent}, buffer_extent={o_buffer.shape[od]}"
+                )
+                o_buffer.narrow(od, 0, output_extent).copy_(o)
+                output_extents.append(output_extent)
         torch.cuda.synchronize()
         self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
-        return graph
+        return graph, tuple(output_extents)
 
     def capture_graph(self, get_args_kwargs: GetArgsKwargsForBatchSize, batch_sizes: List[int]):
         """Capture and pre-fetch the graph for desired batch sizes."""
@@ -317,11 +325,13 @@ class CapturedGraph(nn.Module):
 
             # capture graph for truncated inputs
             combined_shape = sum((tuple(input.shape) for input in inputs_truncated), start=())
-            self.cudagraphs[combined_shape] = self._capture_one_graph(
+            graph, output_extents = self._capture_one_graph(
                 args=args,
                 kwargs=kwargs,
                 refresh_args_static=refresh_args_static,
             )
+            self.cudagraphs[combined_shape] = graph
+            self._cudagraph_output_extents[combined_shape] = output_extents
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
@@ -346,6 +356,28 @@ class CapturedGraph(nn.Module):
         if combined_shape not in self.cudagraphs:
             return self.model(*args, **kwargs)
 
+        output_extents = self._cudagraph_output_extents.get(combined_shape)
+        if output_extents is None:
+            return self.model(*args, **kwargs)
+
+        if len(output_extents) != len(self._out_buffer_flat):
+            return self.model(*args, **kwargs)
+
+        # A captured graph may still be selected for a runtime batch whose
+        # dynamic extent is larger than the buffers allocated during capture.
+        # Run eager instead of replaying into undersized graph buffers.
+        for i, input_tensor in enumerate(args_batched):
+            dim_i = self.dynamic_dims[i]
+            if input_tensor.shape[dim_i] > self._input_buffers[i].shape[dim_i]:
+                return self.model(*args, **kwargs)
+
+        od = self._output_dynamic_dim
+        if any(
+            o_b.shape[od] < output_extent
+            for o_b, output_extent in zip(self._out_buffer_flat, output_extents)
+        ):
+            return self.model(*args, **kwargs)
+
         # copy inputs to input buffers along their respective dynamic dims
         for i, input_tensor in enumerate(args_batched):
             dim_i = self.dynamic_dims[i]
@@ -356,9 +388,10 @@ class CapturedGraph(nn.Module):
         self.cudagraphs[combined_shape].replay()
 
         # retrieve output from buffer, cut to batch size, and unflatten
-        od = self._output_dynamic_dim
-        bs = args_batched[0].shape[self.dynamic_dims[0]]
-        out_flat = [o_b.narrow(od, 0, bs) for o_b in self._out_buffer_flat]
+        out_flat = [
+            o_b.narrow(od, 0, output_extent)
+            for o_b, output_extent in zip(self._out_buffer_flat, output_extents)
+        ]
         return self._out_spec.unflatten(out_flat)
 
 

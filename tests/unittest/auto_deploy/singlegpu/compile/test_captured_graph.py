@@ -229,7 +229,7 @@ class TestCapturedGraphCapture:
 
         def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             captured_shapes.append(tuple(arg.shape for arg in args))
-            return object()
+            return object(), (0,)
 
         monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
 
@@ -266,7 +266,7 @@ class TestCapturedGraphCapture:
         )
 
         def fake_capture_one_graph(self, *args, **kwargs):
-            return object()
+            return object(), (2,)
 
         monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
 
@@ -297,7 +297,7 @@ class TestCapturedGraphCapture:
         def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             del args, refresh_args_static
             captured_kwarg_orders.append(tuple(kwargs))
-            return object()
+            return object(), (4,)
 
         monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
 
@@ -334,7 +334,7 @@ class TestCapturedGraphCapture:
         def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             del args, refresh_args_static
             captured_kwarg_orders.append(tuple(kwargs))
-            return object()
+            return object(), (4,)
 
         monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
 
@@ -363,7 +363,7 @@ class TestCapturedGraphCapture:
         def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             del args, refresh_args_static
             captured_kwarg_orders.append(tuple(kwargs))
-            return object()
+            return object(), (4,)
 
         monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
 
@@ -384,6 +384,129 @@ class TestCapturedGraphCapture:
             (4, 2),
         ]
         assert captured_kwarg_orders == [("runtime_a", "r0_cache", "runtime_b")]
+
+    def test_capture_graph_records_smaller_output_extent_from_real_cuda_graph(self):
+        class ShrinkingOutputModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_calls = 0
+
+            def forward(self, x):
+                self.forward_calls += 1
+                return x[:-1] + 1
+
+        model = ShrinkingOutputModel().eval().to("cuda")
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+        bs = 5
+        hidden_size = 2
+        capture_input = torch.zeros(bs, hidden_size, device="cuda")
+
+        def get_args_kwargs(batch_size):
+            return (capture_input[:batch_size],), {}
+
+        with torch.inference_mode():
+            compiled_model.capture_graph(get_args_kwargs, [bs])
+
+            assert compiled_model._cudagraph_output_extents[(bs, hidden_size)] == (bs - 1,)
+            calls_after_capture = model.forward_calls
+
+            replay_input = torch.arange(
+                bs * hidden_size,
+                dtype=torch.float32,
+                device="cuda",
+            ).reshape(bs, hidden_size)
+            out = compiled_model(replay_input)
+
+            assert model.forward_calls == calls_after_capture
+            assert out.shape == (bs - 1, hidden_size)
+            torch.testing.assert_close(out, replay_input[:-1] + 1)
+
+    def test_forward_uses_captured_output_extent_when_input_extent_is_larger(self, monkeypatch):
+        class GatherLikeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_calls = 0
+
+            def forward(self, x):
+                self.forward_calls += 1
+                return x[:-1] + 1
+
+        class ReplayGraph:
+            def __init__(self, compiled_model, output_extent):
+                self.compiled_model = compiled_model
+                self.output_extent = output_extent
+                self.replay_calls = 0
+
+            def replay(self):
+                self.replay_calls += 1
+                input_buffer = self.compiled_model._input_buffers[0]
+                out_buffer = self.compiled_model._out_buffer_flat[0]
+                out_buffer.narrow(0, 0, self.output_extent).copy_(
+                    input_buffer.narrow(0, 0, self.output_extent) + 1
+                )
+
+        model = GatherLikeModel()
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+        graphs = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del kwargs, refresh_args_static
+            output_extent = args[0].shape[0] - 1
+            graph = ReplayGraph(self, output_extent)
+            graphs.append(graph)
+            return graph, (output_extent,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (torch.ones(bs, 2),), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [5])
+
+        calls_after_capture = model.forward_calls
+        out = compiled_model(torch.full((5, 2), 3.0))
+
+        assert model.forward_calls == calls_after_capture
+        assert graphs[0].replay_calls == 1
+        assert out.shape == (4, 2)
+        torch.testing.assert_close(out, torch.full((4, 2), 4.0))
+
+    def test_forward_falls_back_when_captured_output_extent_exceeds_buffer(self, monkeypatch):
+        class EchoModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_calls = 0
+
+            def forward(self, x):
+                self.forward_calls += 1
+                return x + 1
+
+        class GraphShouldNotReplay:
+            def replay(self):
+                raise AssertionError("oversized runtime batch should fall back to eager")
+
+        model = EchoModel()
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del self, args, kwargs, refresh_args_static
+            return GraphShouldNotReplay(), (4,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (torch.ones(bs, 2),), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+        compiled_model._input_buffers[0] = torch.empty(5, 2)
+        compiled_model.cudagraphs[(5, 2)] = GraphShouldNotReplay()
+        compiled_model._cudagraph_output_extents[(5, 2)] = (5,)
+
+        calls_after_capture = model.forward_calls
+        out = compiled_model(torch.ones(5, 2))
+
+        assert model.forward_calls == calls_after_capture + 1
+        torch.testing.assert_close(out, torch.full((5, 2), 2.0))
 
 
 # ============================================================================
