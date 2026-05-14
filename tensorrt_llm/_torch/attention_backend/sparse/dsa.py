@@ -122,6 +122,28 @@ def warmup_heuristic_topk_decode(top_k: int = 2048,
 _DG_SCHEDULE_BLOCK_KV = 64
 
 
+def _pick_fp4_dsl_expand(next_n: int) -> Tuple[int, int]:
+    """Pick (expand_factor, effective_next_n) for the DSL FP4 paged kernel.
+
+    The CuTe DSL FP4 paged MQA logits kernel only supports
+    ``effective_next_n ∈ {1, 2, 3}``. For larger ``next_n`` we reshape
+    ``[B, next_n, ...]`` to ``[B * expand_factor, effective_next_n, ...]``
+    caller-side. To minimize HBM bandwidth we pick the smallest
+    ``expand_factor`` (== largest ``effective_next_n``) that divides
+    ``next_n`` cleanly.
+
+    Examples:
+        next_n=4 -> (2, 2): two atoms of next_n=2 (DG's kNextNAtom=2 style)
+        next_n=5 -> (5, 1): only divisor; 5x HBM
+        next_n=6 -> (2, 3): two atoms of next_n=3 (prefer eff=3 over eff=2)
+        next_n=9 -> (3, 3): three atoms of next_n=3
+    """
+    for eff in (3, 2):
+        if next_n % eff == 0:
+            return next_n // eff, eff
+    return next_n, 1
+
+
 def _compute_slot_mappings(
     global_positions: torch.Tensor,
     block_offsets: torch.Tensor,
@@ -403,6 +425,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     skip_indexer_for_gen_reqs: bool = False
     # Whether to use the expanded buffers for MTP support
     use_expanded_buffers_for_mtp: bool = False
+    # Whether to reshape the DSL FP4 paged MQA logits Q tensor into
+    # supported next_n ∈ {1, 2, 3} via caller-side atom-split (see
+    # `_pick_fp4_dsl_expand`). Reuses `kv_lens_expanded_cuda` /
+    # `block_table_expanded` / `scheduler_metadata_buffer_expanded`; runtime
+    # mutually exclusive with `use_expanded_buffers_for_mtp` (the latter
+    # requires `not _use_dsl`).
+    expand_for_dsl_fp4: bool = False
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -1046,6 +1075,41 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     non_blocking=True)
                 self.block_table_expanded.clamp_(min=0)
 
+        # CuTe DSL FP4 paged MQA logits kernel natively supports
+        # next_n ∈ {1, 2, 3} only. For next_n ≥ 4 we caller-side reshape
+        # [B, next_n, ...] -> [B * expand_factor, eff_next_n, ...] (see
+        # `_pick_fp4_dsl_expand`). The expanded buffers (`kv_lens_expanded_cuda`
+        # / `block_table_expanded` / `scheduler_metadata_buffer_expanded`,
+        # all sized for the worst-case `1+max_draft_tokens` factor) are
+        # reused: under `_use_dsl=True` the existing FP8 DG expand path
+        # never writes to them (it's gated on `not _use_dsl`), so there's
+        # no conflict.
+        self.expand_for_dsl_fp4 = (_use_dsl
+                                   and self.kv_cache_manager is not None
+                                   and self.kv_cache_manager.use_fp4
+                                   and self.max_draft_tokens >= 3)
+        if self.expand_for_dsl_fp4 and self.num_generations > 0:
+            next_n = 1 + self.max_draft_tokens
+            expand_factor, _ = _pick_fp4_dsl_expand(next_n)
+            num_tokens = self.num_generations * expand_factor
+            gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
+            gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(expand_factor)
+            self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
+            self.kv_lens_expanded_cuda[:num_tokens].copy_(
+                self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
+            if self.kv_cache_manager is not None:
+                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
+                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
+                    self.num_contexts:self.num_seqs, :max_len]
+                expanded_blocks = gen_block_tensor.repeat_interleave(
+                    expand_factor, dim=0)
+                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
+                    expanded_blocks, non_blocking=True)
+                self.block_table_expanded[:num_tokens].copy_(
+                    self.host_block_table_expanded[:num_tokens],
+                    non_blocking=True)
+                self.block_table_expanded.clamp_(min=0)
+
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
 
@@ -1597,6 +1661,26 @@ class Indexer(nn.Module):
                 metadata.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
 
+            # DSL FP4 atom-split schedule. The DSL kernel reshapes
+            # [B, next_n, ...] -> [B * factor, eff_next_n, ...] caller-side
+            # for next_n > 3 (kernel only supports {1, 2, 3} natively); the
+            # matching schedule is built from the doubled-batch shape so
+            # `num_next_n_atoms` keeps encoding the effective next_n. Runtime
+            # mutually exclusive with the `else` branch above (the latter
+            # requires `use_expanded_buffers_for_mtp` which is False under DSL).
+            if metadata.expand_for_dsl_fp4 and metadata.num_generations > 0:
+                expand_factor, _ = _pick_fp4_dsl_expand(
+                    1 + metadata.max_draft_tokens)
+                num_tokens = metadata.num_generations * expand_factor
+                kv_lens_expanded_2d = metadata.kv_lens_expanded_cuda[:
+                                                                     num_tokens].view(
+                                                                         -1, 1)
+                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                    kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV,
+                    metadata.num_sms)
+                metadata.scheduler_metadata_buffer_expanded.copy_(
+                    scheduler_metadata_buffer_expanded, non_blocking=True)
+
         # Compute slot_mapping for all requests (both context and generation)
         Indexer.recompute_slot_mappings(metadata)
 
@@ -1960,10 +2044,50 @@ class Indexer(nn.Module):
                 # avoids materializing a 2D contiguous tensor per call.
                 dsl_context_lens = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
-                logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
-                    q_decode, k_cache, weights_decode, dsl_context_lens,
-                    block_table, metadata.scheduler_metadata_buffer,
-                    max_seq_len)
+                if self.use_fp4:
+                    # FP4 DSL signature splits DG's (q, sf_q) tuple into two
+                    # separate args and requires q.dtype == uint8 (q_decode
+                    # came in via the FP8 plumbing as int8; reinterpret with
+                    # no copy). sf_q is the q_scale slice reshaped to
+                    # (B, next_n, H) int32 — mirrors the non-DSL FP4 branch.
+                    decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
+                                             num_gen_tokens, ...]
+                    decode_q_scale = decode_q_scale.view(
+                        q_decode.shape[0], q_decode.shape[1], self.n_heads)
+                    dsl_q = q_decode.view(torch.uint8)
+                    dsl_block_table = block_table
+                    dsl_schedule_meta = metadata.scheduler_metadata_buffer
+
+                    # DSL FP4 kernel natively supports next_n ∈ {1, 2, 3}; for
+                    # larger next_n, reshape [B, next_n, ...] -> [B*factor,
+                    # eff_next_n, ...] (HBM-optimal — see
+                    # `_pick_fp4_dsl_expand`). Row layout of logits is
+                    # preserved by the reshape so no reassembly is needed at
+                    # the output side. The expanded metadata is populated
+                    # in DSAtrtllmAttentionMetadata.prepare /
+                    # Indexer.prepare under `expand_for_dsl_fp4`.
+                    if next_n > 3:
+                        factor, eff_next_n = _pick_fp4_dsl_expand(next_n)
+                        exp_B = num_generations * factor
+                        dsl_q = dsl_q.reshape(exp_B, eff_next_n, self.n_heads,
+                                              self.head_dim // 2)
+                        decode_q_scale = decode_q_scale.reshape(
+                            exp_B, eff_next_n, self.n_heads)
+                        dsl_context_lens = metadata.kv_lens_expanded_cuda[:
+                                                                          exp_B]
+                        dsl_block_table = metadata.block_table_expanded[:exp_B]
+                        dsl_schedule_meta = (
+                            metadata.scheduler_metadata_buffer_expanded)
+
+                    logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+                        dsl_q, decode_q_scale, k_cache, weights_decode,
+                        dsl_context_lens, dsl_block_table, dsl_schedule_meta,
+                        max_seq_len)
+                else:
+                    logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+                        q_decode, k_cache, weights_decode, dsl_context_lens,
+                        block_table, metadata.scheduler_metadata_buffer,
+                        max_seq_len)
             else:
                 decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                          num_gen_tokens,
