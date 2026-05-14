@@ -184,8 +184,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             )
         elif self._indexer_k_dtype == "fp4":
             assert self.index_head_dim == 128, (
-                "FP4 indexer K cache requires index_head_dim=128, got "
-                f"{self.index_head_dim}."
+                f"FP4 indexer K cache requires index_head_dim=128, got {self.index_head_dim}."
             )
             self._indexer_cache_dtype = KVCacheDtype.MXFP4_BLOCKWISE
             # Pool dtype is uint8 because PyTorch can't allocate float4

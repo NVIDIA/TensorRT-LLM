@@ -163,8 +163,7 @@ def get_token_bytes(
             # ½ byte per value + 1 ue8m0 byte per 32 values.
             return index_head_dim // 2 + index_head_dim // 32
         raise ValueError(
-            f"Unsupported indexer_k_dtype {indexer_k_dtype!r}; "
-            "expected 'fp8' or 'fp4'."
+            f"Unsupported indexer_k_dtype {indexer_k_dtype!r}; expected 'fp8' or 'fp4'."
         )
 
     return attn_dim * dtype_bytes
@@ -949,9 +948,7 @@ class DeepseekV4Indexer(Indexer):
         # indexer doesn't use, so the translation lives here at the
         # boundary instead of leaking through the user-facing config.
         self.indexer_k_dtype = sparse_attention_config.indexer_k_dtype
-        compressor_preset = (
-            "mxfp4" if self.indexer_k_dtype == "fp4" else "fp8_blockwise"
-        )
+        compressor_preset = "mxfp4" if self.indexer_k_dtype == "fp4" else "fp8_blockwise"
         self.indexer_cache_dtype = resolve_kv_cache_dtype(compressor_preset)
         self.compressor = Compressor(
             indexer_mla_params,

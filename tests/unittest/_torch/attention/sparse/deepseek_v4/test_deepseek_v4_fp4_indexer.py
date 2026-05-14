@@ -35,7 +35,6 @@ from tensorrt_llm.llmapi.llm_args import (
     DeepSeekV4SparseAttentionConfig,
 )
 
-
 # ---------------------------------------------------------------------------
 # Pydantic config validators
 # ---------------------------------------------------------------------------
@@ -90,8 +89,7 @@ def test_indexer_compress_fp4_halves_pool_footprint():
     fp8 = _indexer_compress_bytes("fp8")
     fp4 = _indexer_compress_bytes("fp4")
     assert fp4 / fp8 < 0.52, (
-        f"FP4 indexer K cache footprint did not shrink as expected: "
-        f"{fp4}/{fp8}"
+        f"FP4 indexer K cache footprint did not shrink as expected: {fp4}/{fp8}"
     )
 
 
