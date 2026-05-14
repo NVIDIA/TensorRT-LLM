@@ -247,6 +247,237 @@ void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int nu
 #undef LAUNCH_PER_HEAD_KERNEL
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// Cross-head QK Norm + RoPE kernel (WAN, LTX-2)
+//
+// One CTA per (token, Q-or-K). RMSNorm is computed across ALL heads combined
+// (norm dim = num_heads * head_dim), then RoPE is applied in-register.
+//
+// Grid:  (num_tokens, 2)   — blockIdx.y==0 → Q,  blockIdx.y==1 → K
+// Block: up to 1024 threads; each thread handles multiple bf16x2 pairs
+//        at stride blockDim.x.
+//
+// The packed QKV layout is [num_tokens, (Hq + Hk + Hv) * head_dim].
+// Only Q and K regions are read/written; V is untouched.
+//
+template <bool interleave>
+__global__ void fusedDiTCrossHeadQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
+    int const q_dim,                                                  // num_heads_q * head_dim
+    int const k_dim,                                                  // num_heads_k * head_dim
+    int const total_row,                                              // (Hq+Hk+Hv) * head_dim
+    int const head_dim, float const eps,
+    __nv_bfloat16 const* q_weight,                                    // [q_dim]
+    __nv_bfloat16 const* k_weight,                                    // [k_dim]
+    float const* cos_emb,                                             // [num_tokens, head_dim]
+    float const* sin_emb,                                             // [num_tokens, head_dim]
+    int const num_tokens)
+{
+    int const tokenIdx = blockIdx.x;
+    if (tokenIdx >= num_tokens)
+    {
+        return;
+    }
+    bool const isQ = (blockIdx.y == 0);
+    int const norm_dim = isQ ? q_dim : k_dim;
+    __nv_bfloat16 const* weight = isQ ? q_weight : k_weight;
+
+    // Base offset into packed QKV for this token's Q or K region
+    int64_t const baseOffset = static_cast<int64_t>(tokenIdx) * total_row + (isQ ? 0 : q_dim);
+
+    // ---- Step 1: Load elements and accumulate sum-of-squares ----
+    int const halfDim = norm_dim / 2; // number of bf16x2 pairs
+    float threadSumSq = 0.0f;
+
+    for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
+    {
+        int const elemIdx = i * 2;
+        __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162 const*>(&qkv[baseOffset + elemIdx]);
+        float2 valf = __bfloat1622float2(val);
+        threadSumSq += valf.x * valf.x + valf.y * valf.y;
+    }
+
+    // ---- Step 2: CTA-level reduction for sum-of-squares ----
+    float totalSumSq = tensorrt_llm::common::blockReduceSum(threadSumSq);
+
+    __shared__ float s_rms_rcp;
+    if (threadIdx.x == 0)
+    {
+        s_rms_rcp = rsqrtf(totalSumSq / static_cast<float>(norm_dim) + eps);
+    }
+    __syncthreads();
+    float const rms_rcp = s_rms_rcp;
+
+    // ---- Step 3: Apply norm weight and interleaved RoPE, then store ----
+    // cos/sin embeddings are [num_tokens, head_dim] and broadcast across heads.
+    int64_t const embBase = static_cast<int64_t>(tokenIdx) * head_dim;
+
+    // Reload from global memory rather than caching in registers: norm_dim can be
+    // very large (e.g. 40 heads * 128 = 5120), so hoarding per-thread register arrays
+    // would tank occupancy.  The second load likely hits L1/L2 cache from Step 1.
+    if constexpr (interleave)
+    {
+        for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
+        {
+            int const elemIdx = i * 2;
+            //
+            __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162 const*>(&qkv[baseOffset + elemIdx]);
+            __nv_bfloat162 w = *reinterpret_cast<__nv_bfloat162 const*>(&weight[elemIdx]);
+            float2 valf = __bfloat1622float2(val);
+            float2 wf = __bfloat1622float2(w);
+
+            float x0 = valf.x * rms_rcp * wf.x;
+            float x1 = valf.y * rms_rcp * wf.y;
+
+            // Interleaved RoPE: pair (x[2j], x[2j+1]) within each head
+            int const dimInHead0 = elemIdx % head_dim;
+            int const dimInHead1 = dimInHead0 + 1;
+
+            float cos0 = cos_emb[embBase + dimInHead0];
+            float sin0 = sin_emb[embBase + dimInHead0];
+            float cos1 = cos_emb[embBase + dimInHead1];
+            float sin1 = sin_emb[embBase + dimInHead1];
+
+            float out0 = x0 * cos0 - x1 * sin0;
+            float out1 = x1 * cos1 + x0 * sin1;
+
+            *reinterpret_cast<__nv_bfloat162*>(&qkv[baseOffset + elemIdx])
+                = __float22bfloat162_rn(make_float2(out0, out1));
+        }
+    }
+    else
+    {
+        // rotate_half requires a two-pass approach: within the same head, element i
+        // is paired with element i + head_dim/2, which is processed by a different
+        // thread.  We stage normalized values in shared memory so that Pass 2 can
+        // read partners without racing against other threads' RoPE-phase writes to
+        // global memory.
+        //
+        // Layout: s_norm[0..norm_dim) holds the post-normalize (pre-RoPE) values.
+        // Allocated as dynamic shared memory sized = norm_dim * sizeof(bf16).
+        extern __shared__ __nv_bfloat16 s_norm[];
+
+        // Pass 1: normalize all elements and store them to shared memory.
+        for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
+        {
+            int const elemIdx = i * 2;
+            __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162 const*>(&qkv[baseOffset + elemIdx]);
+            __nv_bfloat162 w = *reinterpret_cast<__nv_bfloat162 const*>(&weight[elemIdx]);
+            float2 valf = __bfloat1622float2(val);
+            float2 wf = __bfloat1622float2(w);
+
+            float x0 = valf.x * rms_rcp * wf.x;
+            float x1 = valf.y * rms_rcp * wf.y;
+
+            *reinterpret_cast<__nv_bfloat162*>(&s_norm[elemIdx]) = __float22bfloat162_rn(make_float2(x0, x1));
+        }
+        __syncthreads();
+
+        // Pass 2: apply rotate_half RoPE. Self + partner are both read from
+        // s_norm (read-only in this pass), and results are written to qkv in
+        // global memory. Since different threads write disjoint (elemIdx,
+        // elemIdx+1) pairs, and partner reads come from shared memory which is
+        // never written during Pass 2, there is no read/write race.
+        int const halfHead = head_dim / 2;
+        for (int i = threadIdx.x; i < halfDim; i += blockDim.x)
+        {
+            int const elemIdx = i * 2;
+
+            __nv_bfloat162 selfVal = *reinterpret_cast<__nv_bfloat162 const*>(&s_norm[elemIdx]);
+            float2 selfF = __bfloat1622float2(selfVal);
+            float x0 = selfF.x;
+            float x1 = selfF.y;
+
+            int const localDim0 = elemIdx % head_dim;
+            int const localDim1 = localDim0 + 1;
+            // elemIdx is always even (i*2) and head_dim is always even (it must be
+            // a power of 2: 64/128/256 for supported models), so head boundaries
+            // fall on even indices.  Therefore elemIdx and elemIdx+1 always belong
+            // to the same head and share the same head offset.
+            int const headOff = elemIdx - localDim0;
+
+            // Partner is head_dim/2 away within the same head
+            int pDim0 = (localDim0 < halfHead) ? (headOff + localDim0 + halfHead) : (headOff + localDim0 - halfHead);
+
+            // pDim0 is always even: localDim0 is even (elemIdx = i*2), halfHead is
+            // even (head_dim is a power of 2), and headOff is a multiple of
+            // head_dim.  So we can load the (pDim0, pDim0+1) partner pair as a
+            // single bf16x2 vector load from shared memory.
+            __nv_bfloat162 partnerVal = *reinterpret_cast<__nv_bfloat162 const*>(&s_norm[pDim0]);
+            float2 partnerF = __bfloat1622float2(partnerVal);
+            float p0 = partnerF.x;
+            float p1 = partnerF.y;
+
+            // First half: result = self * cos - partner * sin
+            // Second half: result = self * cos + partner * sin
+            // A single sign suffices for both elements: localDim0 is always even
+            // (elemIdx = i*2) and halfHead is always even (head_dim is power of 2),
+            // so the half-boundary (halfHead-1 / halfHead = odd/even) can never
+            // fall between localDim0 and localDim1.  Both are always in the same half.
+            float sign = (localDim0 < halfHead) ? -1.0f : 1.0f;
+
+            float cos0 = cos_emb[embBase + localDim0];
+            float sin0 = sin_emb[embBase + localDim0];
+            float cos1 = cos_emb[embBase + localDim1];
+            float sin1 = sin_emb[embBase + localDim1];
+
+            float out0 = x0 * cos0 + sign * p0 * sin0;
+            float out1 = x1 * cos1 + sign * p1 * sin1;
+
+            *reinterpret_cast<__nv_bfloat162*>(&qkv[baseOffset + elemIdx])
+                = __float22bfloat162_rn(make_float2(out0, out1));
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void launchFusedDiTCrossHeadQKNormRope(void* qkv, int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
+    int head_dim, float eps, void const* q_weight, void const* k_weight, float const* cos_emb, float const* sin_emb,
+    bool interleave, cudaStream_t stream)
+{
+    int const q_dim = num_heads_q * head_dim;
+    int const k_dim = num_heads_k * head_dim;
+    int const total_row = (num_heads_q + num_heads_k + num_heads_v) * head_dim;
+    int const max_dim = (q_dim > k_dim) ? q_dim : k_dim;
+
+    // Block size: enough threads to cover max_dim/2 bf16x2 pairs, capped at 1024
+    int const halfDim = max_dim / 2;
+    int blockSize = 256;
+    if (halfDim > 256)
+    {
+        blockSize = 512;
+    }
+    if (halfDim > 512)
+    {
+        blockSize = 1024;
+    }
+
+    dim3 grid(num_tokens, 2); // y=0 → Q, y=1 → K
+    dim3 block(blockSize);
+
+    // rotate_half requires shared memory to stage normalized values (avoids a
+    // read/write race on partner elements in global memory); the interleaved path
+    // computes each output pair from the thread's own values and needs no smem.
+    size_t const smem_bytes = interleave ? 0 : static_cast<size_t>(max_dim) * sizeof(__nv_bfloat16);
+
+#define LAUNCH_CROSS_HEAD_KERNEL(INTERLEAVE)                                                                           \
+    fusedDiTCrossHeadQKNormRopeKernel<INTERLEAVE>                                                                      \
+        <<<grid, block, smem_bytes, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), q_dim, k_dim, total_row,          \
+            head_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),                                           \
+            reinterpret_cast<__nv_bfloat16 const*>(k_weight), cos_emb, sin_emb, num_tokens)
+
+    if (interleave)
+    {
+        LAUNCH_CROSS_HEAD_KERNEL(true);
+    }
+    else
+    {
+        LAUNCH_CROSS_HEAD_KERNEL(false);
+    }
+#undef LAUNCH_CROSS_HEAD_KERNEL
+}
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

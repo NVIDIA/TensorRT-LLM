@@ -53,6 +53,27 @@ void launchFusedDiTQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], i
     int tokens_per_batch,                // seq_len per batch element for dual-stream; 0 = flat
     cudaStream_t stream);
 
+// Fused cross-head QK Normalization + RoPE for Diffusion Transformers (DiT).
+//
+// Cross-head norm: one CTA per (token, Q-or-K), CTA-level shared-memory reduction.
+// For WAN, LTX-2, and other models using full-dim QK norm.
+//
+// Features:
+//   - Precomputed cos/sin embeddings (broadcast across heads)
+//   - Interleaved or rotate_half RoPE modes
+//
+// Operates in-place on the packed QKV tensor. Only Q and K are modified;
+// V is left untouched.
+
+void launchFusedDiTCrossHeadQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
+    int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps,
+    void const* q_weight,                         // [num_heads_q * head_dim]
+    void const* k_weight,                         // [num_heads_k * head_dim]
+    float const* cos_emb,                         // [num_tokens, head_dim], float32
+    float const* sin_emb,                         // [num_tokens, head_dim], float32
+    bool interleave,                              // true = interleaved pairs, false = rotate_half
+    cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

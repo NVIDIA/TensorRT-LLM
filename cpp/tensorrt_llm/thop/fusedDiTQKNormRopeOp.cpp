@@ -98,6 +98,55 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
         static_cast<int>(tokens_per_batch), stream);
 }
 
+// Fused cross-head QK Norm + RoPE for Diffusion Transformers.
+// Full-dim norm for WAN, LTX-2 — norm computed across all heads combined.
+void fused_dit_cross_head_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim]
+    int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, double eps,
+    torch::Tensor& q_weight,                               // [num_heads_q * head_dim]
+    torch::Tensor& k_weight,                               // [num_heads_k * head_dim]
+    torch::Tensor& cos_emb,                                // [num_tokens, head_dim], float32
+    torch::Tensor& sin_emb,                                // [num_tokens, head_dim], float32
+    bool interleave)
+{
+    TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, total_heads*head_dim]");
+    TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D");
+    TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D");
+    TORCH_CHECK(cos_emb.dim() == 2, "cos_emb must be 2D: [num_tokens, head_dim]");
+    TORCH_CHECK(sin_emb.dim() == 2, "sin_emb must be 2D: [num_tokens, head_dim]");
+
+    CHECK_INPUT(qkv, torch::kBFloat16);
+    CHECK_INPUT(q_weight, torch::kBFloat16);
+    CHECK_INPUT(k_weight, torch::kBFloat16);
+    CHECK_INPUT(cos_emb, torch::kFloat32);
+    CHECK_INPUT(sin_emb, torch::kFloat32);
+
+    int64_t num_tokens = qkv.size(0);
+    int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
+    TORCH_CHECK(qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total_heads * head_dim");
+    TORCH_CHECK(cos_emb.size(0) == num_tokens && cos_emb.size(1) == head_dim, "cos_emb must be [num_tokens, head_dim]");
+    TORCH_CHECK(sin_emb.size(0) == num_tokens && sin_emb.size(1) == head_dim, "sin_emb must be [num_tokens, head_dim]");
+
+    int64_t q_dim = num_heads_q * head_dim;
+    int64_t k_dim = num_heads_k * head_dim;
+    TORCH_CHECK(q_weight.size(0) == q_dim,
+        "Cross-head norm requires q_weight of size [num_heads_q * head_dim]. Got: ", q_weight.size(0),
+        ", expected: ", q_dim);
+    TORCH_CHECK(k_weight.size(0) == k_dim,
+        "Cross-head norm requires k_weight of size [num_heads_k * head_dim]. Got: ", k_weight.size(0),
+        ", expected: ", k_dim);
+
+    TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even for RoPE rotate_half. Got: ", head_dim);
+    TORCH_CHECK(q_dim % 2 == 0 && k_dim % 2 == 0, "q_dim and k_dim must be even for bf16x2 vectorized access");
+
+    auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
+
+    tensorrt_llm::kernels::launchFusedDiTCrossHeadQKNormRope(qkv.data_ptr(), static_cast<int>(num_tokens),
+        static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
+        static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
+        reinterpret_cast<float const*>(cos_emb.data_ptr()), reinterpret_cast<float const*>(sin_emb.data_ptr()),
+        interleave, stream);
+}
+
 // Register the PyTorch operator schema
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -107,12 +156,17 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? q_add_weight, Tensor? k_add_weight, "
         "Tensor cos_emb, Tensor sin_emb, SymInt num_txt_tokens, "
         "bool interleave, SymInt tokens_per_batch) -> ()");
+    m.def(
+        "fused_dit_cross_head_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, "
+        "int head_dim, float eps, Tensor q_weight, Tensor k_weight, "
+        "Tensor cos_emb, Tensor sin_emb, bool interleave) -> ()");
 }
 
 // Register the CUDA implementation
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fused_dit_qk_norm_rope", &fused_dit_qk_norm_rope);
+    m.impl("fused_dit_cross_head_qk_norm_rope", &fused_dit_cross_head_qk_norm_rope);
 }
 
 } // namespace torch_ext

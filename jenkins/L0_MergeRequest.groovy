@@ -38,6 +38,7 @@ def getContainerURIs()
     keys = [
         "LLM_DOCKER_IMAGE",
         "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_SBSA_WHEEL_DOCKER_IMAGE",
         "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
         "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
     ]
@@ -1383,6 +1384,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
@@ -1437,6 +1439,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
@@ -1469,11 +1472,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
                         }
 
+                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
+                        // instead of the BuildDockerImages helper job's own counter.
+                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                        def branchTag = branch.replaceAll('/', '_')
+                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
+
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
                             'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                             'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                            'defaultTag': defaultTag,
                         ]
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)

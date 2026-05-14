@@ -67,11 +67,9 @@ class Attention(nn.Module):
         self.bias = bias
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
-        # Default: enable for per_head norm only (FLUX). Full-dim not yet supported.
-        if fuse_qk_norm_rope is not None:
-            self.fuse_qk_norm_rope = fuse_qk_norm_rope
-        else:
-            self.fuse_qk_norm_rope = qk_norm_mode != "full"
+        # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
+        # Defaults to False; models that want the fused kernel must pass True explicitly.
+        self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
@@ -256,7 +254,11 @@ class Attention(nn.Module):
         q_add_weight: Optional[torch.Tensor] = None,
         k_add_weight: Optional[torch.Tensor] = None,
     ) -> None:
-        """Apply fused QK Norm + RoPE in-place on packed QKV tensor."""
+        """Apply fused QK Norm + RoPE in-place on packed QKV tensor.
+
+        Dispatches to per-head kernel (FLUX) or cross-head kernel (WAN)
+        based on qk_norm_mode.
+        """
         cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
         sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
 
@@ -268,29 +270,44 @@ class Attention(nn.Module):
         cos_tiled = cos_2d.repeat(B, 1) if B > 1 else cos_2d
         sin_tiled = sin_2d.repeat(B, 1) if B > 1 else sin_2d
 
-        # Dual-stream batch correction: when B>1 and dual-stream is active,
-        # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
-        # local position within each batch element for the text/image boundary.
-        # 0 = no dual-stream (single-stream or batch=1).
-        tokens_per_batch = S if num_txt_tokens > 0 else 0
+        if self.qk_norm_mode == "full":
+            torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
+                qkv_2d,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                self.eps,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos_tiled,
+                sin_tiled,
+                self.interleave,
+            )
+        else:
+            # Dual-stream batch correction: when B>1 and dual-stream is active,
+            # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
+            # local position within each batch element for the text/image boundary.
+            # 0 = no dual-stream (single-stream or batch=1).
+            tokens_per_batch = S if num_txt_tokens > 0 else 0
 
-        torch.ops.trtllm.fused_dit_qk_norm_rope(
-            qkv_2d,
-            self.num_attention_heads,
-            self.num_key_value_heads,
-            self.num_key_value_heads,
-            self.head_dim,
-            self.eps,
-            self.norm_q.weight,
-            self.norm_k.weight,
-            q_add_weight,
-            k_add_weight,
-            cos_tiled,
-            sin_tiled,
-            num_txt_tokens,
-            self.interleave,
-            tokens_per_batch,
-        )
+            torch.ops.trtllm.fused_dit_qk_norm_rope(
+                qkv_2d,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                self.eps,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                q_add_weight,
+                k_add_weight,
+                cos_tiled,
+                sin_tiled,
+                num_txt_tokens,
+                self.interleave,
+                tokens_per_batch,
+            )
 
     def _attn_impl(
         self,
