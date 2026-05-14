@@ -3791,6 +3791,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 "[65536]'). Re-enable once fused_moe_wide_ep.py supports MXFP4."
             )),
         "TRTLLM",
+        "MEGAMOE_DEEPGEMM",
     ])
     def test_nvfp4_4gpus_static_eplb(self, moe_backend):
         eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,

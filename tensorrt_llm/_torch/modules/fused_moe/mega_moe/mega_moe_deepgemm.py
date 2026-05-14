@@ -22,6 +22,8 @@ allocation, and DeepGEMM weight transform.
 
 from __future__ import annotations
 
+import os
+import socket
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -137,11 +139,10 @@ class MegaMoEDeepGemm(MoE):
         # not a capability one, and ``__init__``'s ``_resolve_ep_pg`` will
         # surface a clear error if dist is not initialized by the launcher.
         sm = get_sm_version()
-        if sm != 100:
-            return False, (
-                f"MegaMoEDeepGemm requires SM100 (only arch with "
-                f"sm100_fp8_fp4_mega_moe.cuh in DeepGEMM); got SM{sm}"
-            )
+        # DG's sm100_fp8_fp4_mega_moe cubin is sm_100f SASS — runs on
+        # SM100 and SM103 alike.
+        if sm not in (100, 103):
+            return False, (f"MegaMoEDeepGemm requires SM100 or SM103; got SM{sm}")
         if dtype_activation not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return False, (
                 f"MegaMoEDeepGemm supports activations in "
@@ -197,9 +198,10 @@ class MegaMoEDeepGemm(MoE):
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
         without_comm: bool = False,
-        # DG tunables.
+        # DG tunables. ``swiglu_limit_scalar`` mirrors the upstream MoE
+        # kwarg; bridged to DG's ``activation_clamp`` at the call site.
         activation: str = "swiglu",
-        activation_clamp: Optional[float] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         fast_math: bool = True,
         **kwargs,
     ) -> None:
@@ -278,7 +280,7 @@ class MegaMoEDeepGemm(MoE):
             )
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
-        self.activation_clamp = activation_clamp
+        self.swiglu_limit_scalar = swiglu_limit_scalar
         self.fast_math = fast_math
 
         # Buffer sizing. MoE layers execute serially per forward; a single
@@ -359,6 +361,88 @@ class MegaMoEDeepGemm(MoE):
                 f"replication factor or ep_size."
             )
 
+    @staticmethod
+    def _maybe_init_dist_from_mpi() -> None:
+        """Initialize torch.distributed from mpi4py when running under TRT-LLM's MPI executor.
+
+        Safe to call collectively: every MPI rank reaches MegaMoE's
+        ``__init__`` synchronously during model build. Rank 0 picks a
+        free port and bcasts (host, port) so single- and multi-node both
+        work; the retry on RuntimeError absorbs the close()→bind() race
+        on busy hosts. ``device_id`` uses intra-node local rank because
+        ``global_rank % device_count`` is wrong on multi-node launches.
+        """
+        try:
+            from mpi4py import MPI
+        except ImportError:
+            return
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        world_size = comm.Get_size()
+        if world_size <= 1:
+            return
+
+        try:
+            local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+            local_rank = local_comm.Get_rank()
+        except Exception:
+            local_rank = int(
+                os.environ.get(
+                    "OMPI_COMM_WORLD_LOCAL_RANK",
+                    os.environ.get(
+                        "MV2_COMM_WORLD_LOCAL_RANK", rank % max(1, torch.cuda.device_count())
+                    ),
+                )
+            )
+
+        def _pick_rendezvous():
+            if rank == 0:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.bind(("", 0))
+                    port = sock.getsockname()[1]
+                host = socket.gethostbyname(socket.gethostname())
+                return (host, port)
+            return None
+
+        # Respect pre-set launcher env vars (Slurm, Ray, torchrun).
+        if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+            host, port = comm.bcast(_pick_rendezvous(), root=0)
+            os.environ.setdefault("MASTER_ADDR", host)
+            os.environ.setdefault("MASTER_PORT", str(port))
+            os.environ.setdefault("RANK", str(rank))
+            os.environ.setdefault("WORLD_SIZE", str(world_size))
+        else:
+            host = os.environ["MASTER_ADDR"]
+            port = int(os.environ["MASTER_PORT"])
+
+        device_id = None
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device_id = torch.device("cuda", local_rank % torch.cuda.device_count())
+        try:
+            dist.init_process_group(
+                backend="nccl",
+                rank=rank,
+                world_size=world_size,
+                device_id=device_id,
+            )
+        except RuntimeError:
+            # close()→bind() race: redraw a port and retry once.
+            new_host, new_port = comm.bcast(_pick_rendezvous(), root=0)
+            os.environ["MASTER_ADDR"] = new_host
+            os.environ["MASTER_PORT"] = str(new_port)
+            host, port = new_host, new_port
+            dist.init_process_group(
+                backend="nccl",
+                rank=rank,
+                world_size=world_size,
+                device_id=device_id,
+            )
+        logger.info(
+            f"[MegaMoE] Initialized torch.distributed from mpi4py "
+            f"(rank={rank}, local_rank={local_rank}, "
+            f"world_size={world_size}, master={host}:{port}, backend=nccl)"
+        )
+
     # ------------------------------------------------------------------
     # EP process-group resolution (no collective at forward time)
     # ------------------------------------------------------------------
@@ -377,10 +461,14 @@ class MegaMoEDeepGemm(MoE):
         at ``mpi_disabled=1`` / Ray as the supported path.
         """
         if not dist.is_initialized():
-            raise RuntimeError(
-                "MegaMoEDeepGemm requires torch.distributed to be "
-                "initialized before module construction (mpirun or Ray)."
-            )
+            # TRT-LLM's default executor uses mpi4py and never calls
+            # torch.distributed.init; bootstrap from MPI when present.
+            self._maybe_init_dist_from_mpi()
+            if not dist.is_initialized():
+                raise RuntimeError(
+                    "MegaMoEDeepGemm requires torch.distributed to be "
+                    "initialized before module construction (mpirun or Ray)."
+                )
         # Preferred: reuse the existing PG from the mapping (Ray / DeviceMesh).
         # Log at info() only on layer 0 so deep models do not spam N copies of
         # the same message; deeper layers log at debug() for triage.
@@ -585,7 +673,7 @@ class MegaMoEDeepGemm(MoE):
             self._t_l2,
             buf,
             activation=self.activation,
-            activation_clamp=self.activation_clamp,
+            activation_clamp=self.swiglu_limit_scalar,
             fast_math=self.fast_math,
         )
         return y.to(output_dtype)
