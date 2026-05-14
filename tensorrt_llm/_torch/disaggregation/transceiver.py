@@ -202,16 +202,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         if expected_valid > 0
                         else np.array([], dtype=np.int64)
                     )
-                if is_gen_only:
-                    # Adapter contract: SWA cached_tokens >= stale_end*tpb (clamped).
-                    cache_skip = cached_per_lg[idx] // tpb - stale_end
-                    assert cache_skip >= 0, (
-                        f"SWA adapter must clamp cached_tokens to >= stale_end*tpb "
-                        f"(cached={cached_per_lg[idx]}, stale_end*tpb={stale_end * tpb})"
-                    )
-                else:
-                    # Ctx side bypasses the adapter (cached_per_lg synthetically 0); no further skip.
-                    cache_skip = 0
+                # Stale prefix already pruned above; skip reuse-hit blocks that
+                # land inside the window. Clamp to 0: ctx side has cached_per_lg
+                # synthetically 0, and a reuse hit may fall entirely inside the
+                # stale region (those blocks were already pruned, no extra skip).
+                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
                 cache_skip = cached_per_lg[idx] // tpb
 
