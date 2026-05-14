@@ -29,7 +29,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root, skip_pre_blackwell
 from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
-                            LlmapiAccuracyTestHarness)
+                            LlmapiAccuracyTestHarness, PassKeyRetrieval64k)
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
@@ -1180,6 +1180,47 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(
                 llm,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @pytest.mark.timeout(7200)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_bf16_long_context(self):
+        """End-to-end accuracy guard for the SWA front-eviction path.
+
+        Gemma-4's SWA window is 1024 tokens; the global-attention layers see
+        the full context. A 64k-prompt PassKey retrieval task drives heavy
+        front-eviction on the SWA pool while keeping the passkey reachable
+        through the full-attention layers — the workload that exercises the
+        Phase-2 (window-coherent metadata + per-group prepare-extra) path
+        added by the accompanying source change.
+
+        Pre-Phase-2: the SWA layer reads stale/evicted page entries and the
+        write-position for new tokens overshoots the live page list, so
+        accuracy collapses well below the registered reference even though
+        MMMU / MMLU / GSM8K (all short-prompt) stay healthy.
+        """
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        if get_device_count() < registry_world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+
+        sampling_params = SamplingParams(
+            max_tokens=PassKeyRetrieval64k.MAX_OUTPUT_LEN,
+            truncate_prompt_tokens=PassKeyRetrieval64k.MAX_INPUT_LEN,
+            end_id=None,
+            pad_id=None,
+            n=1,
+            use_beam_search=False,
+        )
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           world_size=registry_world_size,
+                           yaml_extra=yaml_paths) as llm:
+            task = PassKeyRetrieval64k(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
 
