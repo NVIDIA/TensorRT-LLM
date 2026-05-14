@@ -16,7 +16,6 @@ server_configs:
       attention:
         backend: VANILLA
       parallel:
-        enable_parallel_vae: false
         dit_cfg_size: 1
         dit_ulysses_size: 4
       cache:
