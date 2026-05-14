@@ -32,23 +32,10 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
+from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
+                                    fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
+                                    fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
-
-# FP4 MQA logit kernels are only present in DeepGEMM tags that have the
-# upstream FP4 attention work merged in (e.g. deepseek-ai/DeepGEMM
-# c491439e or later). The DeepSeek-V4 branch currently pins a fork that
-# predates that work, so import them lazily; the FP4 dispatch in
-# Indexer._call_(paged_)mqa_logits raises a clear error if the user
-# enables MXFP4 without a DeepGEMM that ships these symbols.
-try:
-    from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
-                                        fp8_fp4_paged_mqa_logits)
-    _HAS_FP4_MQA_LOGITS_KERNELS = True
-except ImportError:
-    fp8_fp4_mqa_logits = None
-    fp8_fp4_paged_mqa_logits = None
-    _HAS_FP4_MQA_LOGITS_KERNELS = False
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -2014,14 +2001,6 @@ class Indexer(nn.Module):
         the kv side and 2D for the q side per the kernel's asserts.
         """
         if self.use_fp4:
-            if not _HAS_FP4_MQA_LOGITS_KERNELS:
-                raise RuntimeError(
-                    "FP4 indexer requested (indexer_k_dtype='fp4') but the "
-                    "linked DeepGEMM build does not expose fp8_fp4_mqa_logits. "
-                    "Bump the DeepGEMM submodule to a tag that includes the "
-                    "FP4 attention kernels (e.g. deepseek-ai/DeepGEMM "
-                    "c491439e or later, rebased onto the TRT-LLM DeepGEMM "
-                    "fork).")
             k_fp4_bytes = k_fp8.view(torch.int8)
             k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
             # q_scale arrives as (chunk_tokens, n_heads, 1); the FP4 kernel
@@ -2047,14 +2026,6 @@ class Indexer(nn.Module):
                                q_scale: Optional[torch.Tensor]) -> torch.Tensor:
         """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits."""
         if self.use_fp4:
-            if not _HAS_FP4_MQA_LOGITS_KERNELS:
-                raise RuntimeError(
-                    "FP4 indexer requested (indexer_k_dtype='fp4') but the "
-                    "linked DeepGEMM build does not expose "
-                    "fp8_fp4_paged_mqa_logits. Bump the DeepGEMM submodule "
-                    "to a tag that includes the FP4 attention kernels (e.g. "
-                    "deepseek-ai/DeepGEMM c491439e or later, rebased onto "
-                    "the TRT-LLM DeepGEMM fork).")
             return fp8_fp4_paged_mqa_logits(
                 (q_decode, q_scale), k_cache, weights_decode, context_lens,
                 block_table, scheduler_metadata_buffer, max_seq_len)
