@@ -262,7 +262,7 @@ def _logic_ring_invalid_mask(rank, world_size):
     k = torch.randn(2, 8, 8, 64, device=device)
     v = torch.randn(2, 8, 8, 64, device=device)
 
-    with pytest.raises(NotImplementedError, match="Causal"):
+    with pytest.raises(NotImplementedError, match="only supports FULL attention mask"):
         attn(q, k, v, batch_size=2, attention_mask=PredefinedAttentionMask.CAUSAL)
 
 
