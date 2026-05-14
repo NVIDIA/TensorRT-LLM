@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,7 @@
 Tests cover:
 1. Core API functionality (add_*, clear_targets, chaining)
 2. Line profiler integration with report validation
-3. @host_profile_target decorator registration
+3. TLLM_LINE_PROFILER_FUNCTIONS env var override semantics
 4. E2E test with actual model inference
 """
 
@@ -33,11 +33,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
+    LINE_PROFILER_FUNCTIONS_ENV_VAR,
+    PROFILE_START_STOP_ENV_VAR,
     HostProfiler,
     ProfileTarget,
-    _decorated_targets,
-    get_decorated_targets,
-    host_profile_target,
+    host_profiler_context,
 )
 
 
@@ -204,104 +204,132 @@ def test_profiling_cycle_and_report_validation():
 
 
 # ---------------------------------------------------------------------------
-# @host_profile_target decorator tests
+# TLLM_LINE_PROFILER_FUNCTIONS env var override tests
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-def _clean_decorated_targets():
-    """Save, clear, and restore the global decorator registry around a test."""
-    saved = _decorated_targets.copy()
-    _decorated_targets.clear()
-    yield
-    _decorated_targets.clear()
-    _decorated_targets.extend(saved)
+def test_env_functions_replaces_defaults():
+    """Test TLLM_LINE_PROFILER_FUNCTIONS replaces default targets.
 
-
-def test_host_profile_target_decorator_registration(_clean_decorated_targets):
-    """Test @host_profile_target registers functions correctly and is zero-overhead.
-
-    Covers: bare decorator, enabled=False, class methods, and identity preservation.
-    """
-
-    # 1. Bare decorator registers and returns the original function
-    @host_profile_target
-    def func_a():
-        return "a"
-
-    assert get_decorated_targets() == [func_a]
-    assert func_a() == "a"  # still callable, unchanged
-
-    # 2. enabled=False skips registration
-    @host_profile_target(enabled=False)
-    def func_skipped():
-        return "skip"
-
-    assert len(get_decorated_targets()) == 1  # still just func_a
-
-    # 3. Class method
-    class MyClass:
-        @host_profile_target
-        def my_method(self, x):
-            return x * 2
-
-    targets = get_decorated_targets()
-    assert len(targets) == 2
-    assert targets[1].__name__ == "my_method"
-    assert MyClass().my_method(5) == 10
-
-
-def test_host_profile_target_profiler_integration(_clean_decorated_targets):
-    """Test HostProfiler discovers decorator-registered targets and produces output.
-
-    Covers: decorator-only profiling, mixed config + decorator targets, deduplication.
+    When set, host_profiler_context should disable defaults and only profile
+    the env-var specified functions.
     """
     try:
         import line_profiler  # noqa: F401
     except ImportError:
         pytest.skip("line_profiler not installed")
 
-    @host_profile_target
-    def decorator_func(n):
-        total = 0
-        for i in range(n):
-            total += i
-        return total
-
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
         output_path = f.name
 
     try:
-        profiler = HostProfiler(output_path=output_path, use_defaults=False)
-        # Also add _sample_function_to_profile via config
-        profiler.add_standalone_function(__name__, "_sample_function_to_profile")
-        # Add decorator_func a second time via config — should be deduplicated
-        profiler.add_function(__name__, None, "decorator_func")
+        # Set TLLM_LINE_PROFILER_FUNCTIONS — this should replace defaults
+        func_path = f"{__name__}::_sample_function_to_profile"
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(LINE_PROFILER_FUNCTIONS_ENV_VAR, func_path)
+            mp.setenv("TLLM_LINE_PROFILER_PATH", output_path)
 
-        assert profiler.start() is True
+            with host_profiler_context() as profiler:
+                assert profiler is not None
+                # Only env-var targets in profiler.targets (no defaults)
+                assert len(profiler.targets) == 1
+                assert profiler.targets[0].method_name == "_sample_function_to_profile"
 
-        for _ in range(50):
-            _sample_function_to_profile(10)
-            decorator_func(10)
-
-        assert profiler.stop() is True
+                for _ in range(50):
+                    _sample_function_to_profile(10)
 
         with open(output_path) as f:
             content = f.read()
 
         assert "Timer unit:" in content
-        # Config-based target appears
+        # Env-var target appears
         assert "_sample_function_to_profile" in content
-        # Decorator-based target appears
-        assert "decorator_func" in content
-        # Deduplication: decorator_func appears exactly once despite double registration
-        matches = re.findall(r"Function:.*decorator_func\s+at line", content)
-        assert len(matches) == 1, (
-            f"Expected exactly 1 entry for decorator_func, found {len(matches)}"
-        )
+        # Default targets like _forward_step should NOT appear
+        assert "_forward_step" not in content
     finally:
         if os.path.exists(output_path):
             os.unlink(output_path)
+
+
+def test_iteration_aware_profiling():
+    """Test iteration-aware profiling using TLLM_PROFILE_START_STOP.
+
+    Covers both cases:
+    1. With TLLM_PROFILE_START_STOP set: only specified iterations are profiled.
+    2. Without TLLM_PROFILE_START_STOP: all iterations are profiled.
+    """
+    try:
+        import line_profiler  # noqa: F401
+    except ImportError:
+        pytest.skip("line_profiler not installed")
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        range_output = f.name
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        full_output = f.name
+
+    try:
+        # --- Case 1: iteration range set (profile iterations 5-9 only) ---
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(PROFILE_START_STOP_ENV_VAR, "5-10")
+            mp.setenv("TLLM_LINE_PROFILER_PATH", range_output)
+
+            profiler = HostProfiler(output_path=range_output, use_defaults=False)
+            profiler.add_standalone_function(__name__, "_sample_function_to_profile")
+            assert profiler.start() is True
+            assert profiler._iteration_aware is True
+            assert profiler._tracing_active is False
+
+            for i in range(20):
+                profiler.notify_iteration(i)
+                _sample_function_to_profile(10)
+
+            assert profiler.stop() is True
+
+        with open(range_output) as f:
+            range_content = f.read()
+
+        assert "Timer unit:" in range_content
+        assert "_sample_function_to_profile" in range_content
+        range_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", range_content, re.MULTILINE)
+        range_max = max(int(h) for h in range_hits if int(h) > 0)
+        assert range_max <= 6, (
+            f"Expected hits ~5 (iterations 5-9), got max {range_max}. "
+            "Iteration filtering may not be working."
+        )
+
+        # --- Case 2: no iteration range (profiles everything) ---
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv(PROFILE_START_STOP_ENV_VAR, raising=False)
+            mp.setenv("TLLM_LINE_PROFILER_PATH", full_output)
+
+            profiler = HostProfiler(output_path=full_output, use_defaults=False)
+            profiler.add_standalone_function(__name__, "_sample_function_to_profile")
+            assert profiler.start() is True
+            assert profiler._iteration_aware is False
+            assert profiler._tracing_active is True
+
+            # notify_iteration is a no-op when not iteration-aware
+            for i in range(20):
+                profiler.notify_iteration(i)
+                _sample_function_to_profile(10)
+
+            assert profiler.stop() is True
+
+        with open(full_output) as f:
+            full_content = f.read()
+
+        assert "_sample_function_to_profile" in full_content
+        full_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", full_content, re.MULTILINE)
+        full_max = max(int(h) for h in full_hits if int(h) > 0)
+        assert full_max >= 20, f"Expected hits >= 20 (all iterations), got {full_max}"
+
+        # Sanity: iteration-ranged hits should be much less than full
+        assert range_max < full_max
+    finally:
+        for p in (range_output, full_output):
+            if os.path.exists(p):
+                os.unlink(p)
 
 
 # Core PyExecutor methods that are always executed during inference.

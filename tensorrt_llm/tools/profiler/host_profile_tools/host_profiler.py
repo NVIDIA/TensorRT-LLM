@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,16 +33,23 @@ import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, overload
+from typing import Callable, Dict, List, Optional
 
 from tensorrt_llm.logger import logger
 
 # Environment variable to enable line_profiler output path.
 LINE_PROFILER_PATH_ENV_VAR = "TLLM_LINE_PROFILER_PATH"
 
-# Environment variable to specify additional functions to profile (comma-separated).
+# Environment variable to specify functions to profile (comma-separated).
+# When set, REPLACES the default targets (only the specified functions are profiled).
 # Format: "module.Class.method,module.Class.method2,..."
 LINE_PROFILER_FUNCTIONS_ENV_VAR = "TLLM_LINE_PROFILER_FUNCTIONS"
+
+# Reuse the same env var as the nsys/cuda profiler for iteration-based profiling.
+# Format: "start-stop" or "start1-stop1,start2-stop2" or single "iter"
+# When set, line_profiler is only active during the specified iterations.
+# When NOT set, line_profiler is active for the entire event loop.
+PROFILE_START_STOP_ENV_VAR = "TLLM_PROFILE_START_STOP"
 
 
 @dataclass
@@ -119,103 +126,7 @@ class ProfileTarget:
 
 
 # ---------------------------------------------------------------------------
-# Decorator-based registration
-# ---------------------------------------------------------------------------
-
-# Global registry for functions decorated with @host_profile_target.
-# Stores raw function objects (not ProfileTarget), so line_profiler can use
-# them directly without the module-path → resolve round-trip.
-_decorated_targets: List[Callable] = []
-
-
-@overload
-def host_profile_target(func: Callable) -> Callable: ...
-
-
-@overload
-def host_profile_target(*, enabled: bool = True) -> Callable: ...
-
-
-def host_profile_target(func: Optional[Callable] = None, *, enabled: bool = True):
-    """Decorator to register a function or method as a host profiling target.
-
-    This decorator has **zero runtime overhead** — it does not wrap or alter
-    the decorated function in any way.  It simply appends the raw function
-    object to a global registry that :class:`HostProfiler` queries when
-    profiling starts.
-
-    Supports all callable forms: regular methods, ``@staticmethod``,
-    ``@classmethod``, and standalone module-level functions.
-
-    Placement:
-        For best results, place ``@host_profile_target`` as the **innermost**
-        decorator (closest to the ``def`` keyword) so that the unwrapped
-        function is registered.  If placed after wrapping decorators (e.g.
-        ``@torch.inference_mode``), the profiler's existing unwrap logic
-        (``__wrapped__``) will still find the real function, but innermost
-        placement is preferred.
-
-    Args:
-        func: The function to register (used when called without parentheses).
-        enabled: If ``False``, the function is *not* registered. Useful for
-            temporarily disabling profiling on a target without removing the
-            decorator.
-
-    Returns:
-        The original function, unchanged.
-
-    Examples:
-        Register a standalone function::
-
-            @host_profile_target
-            def my_helper(): ...
-
-        Register a class method::
-
-            class MyClass:
-                @host_profile_target
-                def forward(self, x): ...
-
-        Combine with other decorators (innermost placement)::
-
-            class MyClass:
-                @torch.inference_mode()
-                @host_profile_target
-                def forward(self, x): ...
-
-        Conditionally disable registration::
-
-            @host_profile_target(enabled=False)
-            def experimental(): ...
-    """
-
-    def _register(fn: Callable) -> Callable:
-        if enabled:
-            # Unwrap descriptors so we store the raw function.
-            raw_fn = fn
-            if isinstance(fn, (staticmethod, classmethod)):
-                raw_fn = fn.__func__
-            _decorated_targets.append(raw_fn)
-        return fn  # Return unchanged — zero overhead
-
-    if func is not None:
-        # Called without parentheses: @host_profile_target
-        return _register(func)
-    # Called with parentheses: @host_profile_target(enabled=False)
-    return _register
-
-
-def get_decorated_targets() -> List[Callable]:
-    """Return a copy of all functions registered via ``@host_profile_target``.
-
-    Returns:
-        List of raw function objects.
-    """
-    return list(_decorated_targets)
-
-
-# ---------------------------------------------------------------------------
-# Static config-based registration (legacy / bulk registration)
+# Static config-based registration
 # ---------------------------------------------------------------------------
 
 # Default functions to profile for host overhead analysis
@@ -500,6 +411,13 @@ class HostProfiler:
         self.targets: List[ProfileTarget] = []
         self._line_profiler = None
         self._enabled = False
+        # Whether line_profiler tracing is currently active (toggled per iteration)
+        self._tracing_active = False
+
+        # Parse iteration ranges from TLLM_PROFILE_START_STOP.
+        # When set, profiling is only active during the specified iterations.
+        self._profile_start_iters, self._profile_stop_iters = self._parse_iteration_ranges()
+        self._iteration_aware = bool(self._profile_start_iters or self._profile_stop_iters)
 
         # Add default targets if requested
         if use_defaults:
@@ -512,8 +430,38 @@ class HostProfiler:
         # Parse additional targets from environment variable
         self._parse_env_targets()
 
+    @staticmethod
+    def _parse_iteration_ranges():
+        """Parse TLLM_PROFILE_START_STOP env var into start/stop iteration sets.
+
+        Format: "start-stop" or "start1-stop1,start2-stop2" or single "iter"
+        Returns:
+            Tuple of (frozenset of start iters, frozenset of stop iters)
+        """
+        spans = os.environ.get(PROFILE_START_STOP_ENV_VAR, None)
+        starts, stops = [], []
+
+        if spans:
+            for span in spans.split(","):
+                try:
+                    if "-" in span:
+                        start, stop = span.strip().split("-")
+                        starts.append(int(start))
+                        stops.append(int(stop))
+                    else:
+                        it = int(span.strip())
+                        starts.append(it)
+                        stops.append(it)
+                except ValueError:
+                    logger.warning(f"Cannot parse span '{span}' in {PROFILE_START_STOP_ENV_VAR}")
+
+        return frozenset(starts), frozenset(stops)
+
     def _parse_env_targets(self) -> None:
-        """Parse additional profile targets from environment variable.
+        """Parse profile targets from environment variable.
+
+        When TLLM_LINE_PROFILER_FUNCTIONS is set, it replaces the default
+        targets (defaults are disabled in host_profiler_context).
 
         Supported formats:
             - module.Class.method  -> class method
@@ -695,56 +643,44 @@ class HostProfiler:
 
             self._line_profiler = LineProfiler()
 
-            # Add all config-based target functions
+            # Add all target functions
             resolved_count = 0
-            # Track __code__ ids to avoid registering the same function twice
-            # (e.g. if it appears in both the config and the decorator registry).
-            registered_code_ids: set = set()
-
             for target in self.targets:
                 func = target.resolve()
                 if func is not None:
-                    code_id = id(func.__code__)
-                    if code_id not in registered_code_ids:
-                        logger.info(
-                            f"line profiler func code ID: {code_id}, target: {target.full_path}"
-                        )
-                        self._line_profiler.add_function(func)
-                        registered_code_ids.add(code_id)
-                        resolved_count += 1
-
-            # Add decorator-registered targets (@host_profile_target)
-            decorator_count = 0
-            for func in get_decorated_targets():
-                # Unwrap in case decorator was not innermost
-                raw_func = func
-                while hasattr(raw_func, "__wrapped__"):
-                    raw_func = raw_func.__wrapped__
-                code_id = id(raw_func.__code__)
-                if code_id not in registered_code_ids:
-                    qualname = f"{raw_func.__module__}.{raw_func.__qualname__}"
                     logger.info(
-                        f"line profiler func code ID: {code_id}, target (decorator): {qualname}"
+                        f"line profiler func code ID: {id(func.__code__)}, target: {target.full_path}"
                     )
-                    self._line_profiler.add_function(raw_func)
-                    registered_code_ids.add(code_id)
-                    decorator_count += 1
+                    self._line_profiler.add_function(func)
+                    resolved_count += 1
 
-            total = resolved_count + decorator_count
-            if total == 0:
+            if resolved_count == 0:
                 logger.warning("No profile targets could be resolved")
                 self._line_profiler = None
                 return False
 
-            self._line_profiler.enable()
             self._enabled = True
             self._profiler_thread_id = threading.current_thread().ident
-            logger.info(
-                f"Line profiler enabled with {total} targets "
-                f"({resolved_count} config-based, {decorator_count} decorator-based). "
-                f"Thread ID: {self._profiler_thread_id}, Thread name: {threading.current_thread().name}. "
-                f"Results will be saved to: {self.output_path}"
-            )
+
+            if self._iteration_aware:
+                # Defer enabling — notify_iteration() will toggle on/off
+                logger.info(
+                    f"Line profiler initialized with {resolved_count}/{len(self.targets)} targets "
+                    f"(iteration-aware: start={sorted(self._profile_start_iters)}, "
+                    f"stop={sorted(self._profile_stop_iters)}). "
+                    f"Thread ID: {self._profiler_thread_id}, Thread name: {threading.current_thread().name}. "
+                    f"Results will be saved to: {self.output_path}"
+                )
+            else:
+                # Enable immediately — profile the entire event loop
+                self._line_profiler.enable()
+                self._tracing_active = True
+                logger.info(
+                    f"Line profiler enabled with {resolved_count}/{len(self.targets)} targets. "
+                    f"Thread ID: {self._profiler_thread_id}, Thread name: {threading.current_thread().name}. "
+                    f"Results will be saved to: {self.output_path}"
+                )
+
             dump_profiler_functions()
             return True
 
@@ -763,7 +699,9 @@ class HostProfiler:
             return False
 
         try:
-            self._line_profiler.disable()
+            if self._tracing_active:
+                self._line_profiler.disable()
+                self._tracing_active = False
             self._enabled = False
 
             # Save results
@@ -779,6 +717,34 @@ class HostProfiler:
 
         finally:
             self._line_profiler = None
+
+    def notify_iteration(self, iter_counter: int) -> None:
+        """Notify the profiler of the current iteration for iteration-aware profiling.
+
+        When TLLM_PROFILE_START_STOP is set, this method toggles line_profiler
+        tracing on/off at the specified iteration boundaries — matching the same
+        semantics used by the nsys/cudaProfiler integration.
+
+        When TLLM_PROFILE_START_STOP is NOT set, this is a no-op (profiling runs
+        for the entire event loop).
+
+        Should be called once per iteration from the executor event loop.
+
+        Args:
+            iter_counter: The current iteration number.
+        """
+        if not self._iteration_aware or self._line_profiler is None:
+            return
+
+        if iter_counter in self._profile_stop_iters and self._tracing_active:
+            self._line_profiler.disable()
+            self._tracing_active = False
+            logger.info(f"Line profiler tracing stopped at iteration {iter_counter}")
+
+        if iter_counter in self._profile_start_iters and not self._tracing_active:
+            self._line_profiler.enable()
+            self._tracing_active = True
+            logger.info(f"Line profiler tracing started at iteration {iter_counter}")
 
     @contextmanager
     def profile(self):
@@ -877,7 +843,9 @@ def host_profiler_context(enable: bool = True, output_path: Optional[str] = None
         yield None
         return
 
-    profiler = HostProfiler(output_path=output_path)
+    # When TLLM_LINE_PROFILER_FUNCTIONS is set, it replaces the defaults
+    use_defaults = not os.environ.get(LINE_PROFILER_FUNCTIONS_ENV_VAR, "")
+    profiler = HostProfiler(output_path=output_path, use_defaults=use_defaults)
     set_global_profiler(profiler)
 
     started = profiler.start()

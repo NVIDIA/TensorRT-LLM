@@ -1,3 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # Host Profiler
 
 Line-by-line CPU profiler for diagnosing host-side overhead in the
@@ -28,6 +45,21 @@ TLLM_LINE_PROFILER_PATH=./lp_results.txt \
 
 When the executor shuts down, results are written to the specified file.
 
+### 2b. Profile specific iterations only (recommended)
+
+Use `TLLM_PROFILE_START_STOP` (the same env var used by nsys/cudaProfiler) to
+restrict line profiling to specific iteration ranges. This avoids warmup noise
+and reduces overhead:
+
+```bash
+TLLM_PROFILE_START_STOP=10-20 \
+TLLM_LINE_PROFILER_PATH=./lp_results.txt \
+    python my_inference_script.py
+```
+
+Multiple ranges are supported: `"10-20,50-60"`. When this env var is **not**
+set, profiling covers the entire event loop.
+
 ### 3. Read the results
 
 The output follows `line_profiler`'s standard format — one section per
@@ -51,60 +83,12 @@ Line #   Hits   Time  Per Hit  % Time  Line Contents
 
 ## Registering Functions to Profile
 
-There are **three** ways to tell the profiler which functions to trace. They
-can be combined freely — the profiler deduplicates by `__code__` identity.
+There are **two** ways to tell the profiler which functions to trace.
 
-### Method 1: `@host_profile_target` Decorator (Recommended for New Code)
-
-Decorate any function or method directly at the definition site:
-
-```python
-from tensorrt_llm.tools.profiler.host_profile_tools import host_profile_target
-
-
-@host_profile_target
-def my_standalone_helper(batch):
-    ...
-
-
-class MyProcessor:
-
-    @host_profile_target
-    def process(self, data):
-        ...
-```
-
-**Key points:**
-
-- **Zero runtime overhead** — the decorator does *not* wrap the function. It
-  simply registers the raw function object in a global list.
-- Place `@host_profile_target` as the **innermost** decorator (closest to
-  `def`) so the unwrapped function is registered:
-
-  ```python
-  class MyClass:
-      @torch.inference_mode()   # outermost
-      @nvtx_range("forward")    # middle
-      @host_profile_target      # innermost — registers the raw function
-      def forward(self, x):
-          ...
-  ```
-
-- Supports `@staticmethod` and `@classmethod` (extracts `__func__`
-  automatically).
-- Disable temporarily without removing the decorator:
-
-  ```python
-  @host_profile_target(enabled=False)
-  def experimental():
-      ...
-  ```
-
-### Method 2: Static Config Dict (Bulk Registration)
+### Method 1: Static Config Dict (Built-in Defaults)
 
 The module ships with a built-in `_DEFAULT_PROFILE_CONFIG` dictionary that
-registers critical PyExecutor methods by default. This is useful for bulk
-registration of functions you don't own or can't easily decorate:
+registers critical PyExecutor methods by default:
 
 ```python
 # In host_profiler.py
@@ -132,9 +116,11 @@ _DEFAULT_PROFILE_CONFIG = {
 | `{None: ["*"]}` | All standalone functions in the module |
 | `{"*": ["*"]}` | All classes + all their methods in the module |
 
-### Method 3: Environment Variable (Ad-hoc, No Code Changes)
+### Method 2: Environment Variable (Ad-hoc, No Code Changes)
 
-Set `TLLM_LINE_PROFILER_FUNCTIONS` to a comma-separated list of paths:
+Set `TLLM_LINE_PROFILER_FUNCTIONS` to a comma-separated list of paths.
+When set, this **replaces** the default targets — only the specified functions
+are profiled:
 
 ```bash
 # Class method format: module.Class.method
@@ -146,6 +132,9 @@ TLLM_LINE_PROFILER_PATH=./results.txt \
 ```
 
 This is ideal for one-off investigations — no code changes required.
+
+> **Note:** If `TLLM_LINE_PROFILER_FUNCTIONS` is *not* set, the built-in
+> default targets (PyExecutor, sampler, scheduler, etc.) are used automatically.
 
 ---
 
@@ -203,9 +192,8 @@ if profiler is not None and profiler.enabled:
 
 ## How It Works
 
-1. **Registration** — Target functions are collected from three sources:
-   the static config dict, `@host_profile_target` decorators, and environment
-   variables. All sources are merged and deduplicated.
+1. **Registration** — Target functions are collected from the static config
+   dict or the environment variable (which replaces the defaults when set).
 
 2. **Unwrapping** — Decorated functions (e.g., `@torch.inference_mode`) are
    unwrapped via `__wrapped__` to obtain the original function's `__code__`
@@ -242,6 +230,5 @@ warmup phase (which would produce incomplete/misleading results).
   (the executor worker thread). Other threads are not affected.
 - **Multiple ranks**: Debug output (`dump_profiler_functions`) only prints on
   rank 0 to avoid interleaved logs in multi-GPU runs.
-- **Combining methods**: Use the decorator for functions you own and the
-  environment variable for quick ad-hoc additions. They work together
-  seamlessly.
+- **Override vs defaults**: Use `TLLM_LINE_PROFILER_FUNCTIONS` to replace
+  the defaults with your own set. Omit it to use the built-in defaults.
