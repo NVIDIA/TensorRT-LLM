@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import MethodType, SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -407,6 +407,43 @@ def maybe_pad_for_cuda_graph(func):
         return ret
 
     return wrapper
+
+
+def _compute_window_local_view(
+    all_indices: Sequence[int],
+    front_removed: int,
+    end_compute_i: int,
+    group_window: int,
+    tokens_per_block: int,
+) -> Tuple[List[int], int, int, int]:
+    """Compute the window-coherent metadata view for one (request, window) pair.
+
+    Under SWA front-eviction, the C++ KVCacheManager returns the full historical
+    page list (including evicted entries at the front) from get_cache_indices
+    while a separate per-window counter (get_num_front_blocks_removed) tracks
+    how many of those entries are stale.  This helper slices the historical
+    list down to the live window in window-local coordinates so the kernel
+    sees a contiguous page table starting at position 0.
+
+    Returns:
+        active_indices: the live slice of all_indices to hand the kernel.
+        extra_page: the spillover page id (the next slot past num_active), or
+            -1 when there is no spillover slot.
+        seq_len_with_cache: window-capped total length (cached + new tokens).
+        last_page_len: derived from seq_len_with_cache and tokens_per_block.
+    """
+    active_token_count = min(end_compute_i, group_window)
+    pages_for_active = (active_token_count + tokens_per_block - 1) // tokens_per_block
+    live_len = len(all_indices) - front_removed
+    num_active = min(live_len, pages_for_active)
+    active_indices = list(all_indices[front_removed : front_removed + num_active])
+    extra_slot_idx = front_removed + num_active
+    extra_page = all_indices[extra_slot_idx] if len(all_indices) > extra_slot_idx else -1
+    if active_token_count > 0:
+        last_page_len = (active_token_count - 1) % tokens_per_block + 1
+    else:
+        last_page_len = 0
+    return active_indices, extra_page, active_token_count, last_page_len
 
 
 class ADEngine(ModelEngine):
@@ -913,48 +950,37 @@ class ADEngine(ModelEngine):
                     # SWA front-eviction: get_cache_indices returns the FULL
                     # historical page list including front-evicted entries (the
                     # C++ side bumps a counter rather than popping mCacheBlockIds).
-                    # The live slice starts at [front_removed:].
+                    # _compute_window_local_view slices it down to the live
+                    # window in window-local coords.
                     front_removed = kv_cache_manager.get_num_front_blocks_removed(
                         request.py_request_id, window_size=group_window
                     )
-                    # Active blocks = pages needed to fit end_compute_i tokens within
-                    # this window.  The trailing slot in all_indices (when present)
-                    # is the reserved spillover page.
-                    active_token_count = min(end_compute_i, group_window)
-                    pages_for_active = (
-                        active_token_count + kv_cache_manager.tokens_per_block - 1
-                    ) // kv_cache_manager.tokens_per_block
-                    live_len = len(all_indices) - front_removed
-                    num_active = min(live_len, pages_for_active)
-                    active_indices = all_indices[front_removed : front_removed + num_active]
-                    extra_slot_idx = front_removed + num_active
-                    has_extra = len(all_indices) > extra_slot_idx
+                    (
+                        active_indices,
+                        extra_page,
+                        active_token_count,
+                        lpl_i,
+                    ) = _compute_window_local_view(
+                        all_indices,
+                        front_removed=front_removed,
+                        end_compute_i=end_compute_i,
+                        group_window=group_window,
+                        tokens_per_block=_tokens_per_block,
+                    )
+                    num_active = len(active_indices)
 
                     if pool_idx == 0:
                         cache_loc.extend(active_indices)
                         cu_num_pages.append(cu_num_pages[i] + num_active)
-                        if has_extra:
-                            extra_page_per_seq.append(all_indices[extra_slot_idx])
-                        else:
-                            extra_page_per_seq.append(-1)
+                        extra_page_per_seq.append(extra_page)
                     else:
                         cache_loc_per_group[pool_idx].extend(active_indices)
                         prev = cu_num_pages_per_group[pool_idx][i]
                         cu_num_pages_per_group[pool_idx].append(prev + num_active)
-                        if has_extra:
-                            extra_page_per_seq_per_group[pool_idx].append(
-                                all_indices[extra_slot_idx]
-                            )
-                        else:
-                            extra_page_per_seq_per_group[pool_idx].append(-1)
-                        # Window-capped seq_len_with_cache for this pool:
-                        # active_token_count covers the cached portion + new tokens
-                        # in window-local coords.  last_page_len follows from it.
+                        extra_page_per_seq_per_group[pool_idx].append(extra_page)
+                        # Window-capped seq_len_with_cache + last_page_len for
+                        # this pool — group 0 keeps the unclamped global value.
                         seq_len_with_cache_per_group[pool_idx].append(active_token_count)
-                        if active_token_count > 0:
-                            lpl_i = (active_token_count - 1) % _tokens_per_block + 1
-                        else:
-                            lpl_i = 0
                         last_page_len_per_group[pool_idx].append(lpl_i)
             else:
                 # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)

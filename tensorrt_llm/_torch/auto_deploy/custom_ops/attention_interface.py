@@ -1364,9 +1364,7 @@ class SequenceInfo:
                 # Use per-group last_page_len when supplied (window-capped for SWA
                 # under eviction), otherwise fall back to the global value.
                 if last_page_len_per_group is not None:
-                    self._stage_arg(
-                        f"last_page_len{suffix}", last_page_len_per_group[group_idx]
-                    )
+                    self._stage_arg(f"last_page_len{suffix}", last_page_len_per_group[group_idx])
                 elif cu_num_pages_per_group is not None:
                     self._stage_arg(f"last_page_len{suffix}", lpl_host)
                 if extra_page_per_seq_per_group is not None:

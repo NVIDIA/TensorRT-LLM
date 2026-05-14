@@ -453,13 +453,9 @@ class _InsertCachedOperator(BaseTransform):
                         if base in vswa_swappable_bases:
                             is_host = arg_name.endswith(host_suffix)
                             group_arg = f"{base}_g{gi}{host_suffix if is_host else ''}"
-                            group_inputs.append(
-                                self._add_or_retrieve_input(gm, cm, group_arg)
-                            )
+                            group_inputs.append(self._add_or_retrieve_input(gm, cm, group_arg))
                         else:
-                            group_inputs.append(
-                                self._add_or_retrieve_input(gm, cm, arg_name)
-                            )
+                            group_inputs.append(self._add_or_retrieve_input(gm, cm, arg_name))
                     meta_nodes_extra_by_group[gi] = self._insert_extra_metadata_op(
                         gm, prep_meta_op, group_inputs, const_args_extra, num_meta_out
                     )

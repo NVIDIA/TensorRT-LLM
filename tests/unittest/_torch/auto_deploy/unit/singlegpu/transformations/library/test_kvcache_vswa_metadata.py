@@ -39,15 +39,15 @@ class _TwoWindowModule(torch.nn.Module):
             qkv,
             qkv,
             qkv,
-            None,        # attn_mask
-            0.0,         # dropout_p
-            True,        # is_causal
-            1.0,         # scale
-            None,        # sinks
-            256,         # sliding_window  <-- SWA group
-            None,        # logit_cap
+            None,  # attn_mask
+            0.0,  # dropout_p
+            True,  # is_causal
+            1.0,  # scale
+            None,  # sinks
+            256,  # sliding_window  <-- SWA group
+            None,  # logit_cap
             "bsnd",
-            0,           # layer_idx
+            0,  # layer_idx
         )
         full_layer = torch.ops.auto_deploy.torch_attention(
             qkv,
@@ -58,7 +58,7 @@ class _TwoWindowModule(torch.nn.Module):
             True,
             1.0,
             None,
-            None,        # sliding_window=None  <-- full-attention group
+            None,  # sliding_window=None  <-- full-attention group
             None,
             "bsnd",
             1,
@@ -157,9 +157,7 @@ def test_vswa_each_layer_routes_to_its_groups_extra_metadata():
 
     cached_op = torch.ops.auto_deploy.triton_paged_mha_with_cache.default
     cached_calls = [
-        node
-        for node in gm.graph.nodes
-        if node.op == "call_function" and node.target == cached_op
+        node for node in gm.graph.nodes if node.op == "call_function" and node.target == cached_op
     ]
     assert len(cached_calls) == 2
 

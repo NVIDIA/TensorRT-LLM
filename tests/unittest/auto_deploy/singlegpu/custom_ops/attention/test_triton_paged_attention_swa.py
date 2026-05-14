@@ -94,10 +94,11 @@ def _write_kv_to_cache(
     page_table: torch.Tensor,
     page_size: int,
 ):
-    """Write all of (k, v) sequentially into kv_cache at the pages listed in
-    page_table. k, v are flat [tokens, n_kv_heads, head_dim]. page_table is
-    a 1D int32 tensor listing physical page ids in token-order. Assumes
-    page_table covers exactly enough pages for k.shape[0] tokens.
+    """Write all of (k, v) sequentially into kv_cache at the listed pages.
+
+    k, v are flat [tokens, n_kv_heads, head_dim]. page_table is a 1D int32
+    tensor listing physical page ids in token-order. Assumes page_table
+    covers exactly enough pages for k.shape[0] tokens.
     """
     from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
         update_paged_kv_cache,
@@ -290,9 +291,7 @@ class TestTritonPagedSWAFrontEviction:
 
         b_idx = torch.zeros(new_chunk, dtype=torch.int32, device="cuda")
         positions = torch.arange(new_chunk, dtype=torch.int32, device="cuda")
-        kv_indptr_for_write = torch.tensor(
-            [0, new_pages_needed], dtype=torch.int32, device="cuda"
-        )
+        kv_indptr_for_write = torch.tensor([0, new_pages_needed], dtype=torch.int32, device="cuda")
         update_paged_kv_cache(
             new_k, new_v, b_idx, positions, kv_cache, new_page_table, kv_indptr_for_write
         )
@@ -348,7 +347,9 @@ class TestTritonPagedSWAFrontEviction:
             full_v.float(),
             # sw=0 in the kernel ⇒ no SW pruning; reproduce that by feeding a
             # window larger than the entire kv length.
-            sliding_window=sliding_window if with_sliding_window else (live_cache_tokens + new_chunk + 1),
+            sliding_window=sliding_window
+            if with_sliding_window
+            else (live_cache_tokens + new_chunk + 1),
             cache_len_before_q=live_cache_tokens,
         ).to(output.dtype)
 
