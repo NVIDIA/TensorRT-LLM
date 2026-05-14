@@ -7,7 +7,7 @@ by NVIDIA TensorRT LLM team
 Large-scale MoE models such as DeepSeek-V3/R1, Mixtral, and Qwen3-MoE often use tensor parallelism
 for latency-sensitive inference. In the low-latency range where tens to a few hundred tokens enter a
 routed MoE layer, the routed experts are still largely memory-bound, while grouped-GEMM execution pays
-overheads from small per-expert shapes, expert scheduling, alpha generation, and routed-output
+overheads from small per-expert shapes, expert scheduling, input permutation, and routed-output
 accumulation.
 
 This post introduces **DENSEGEMM**, a TensorRT-LLM backend for NVFP4 MoE on NVIDIA Blackwell
@@ -19,11 +19,11 @@ limited latency impact, while the denser GEMM shapes improve hardware utilizatio
 The implementation in TensorRT-LLM is staged. The current backend applies this dense formulation to the
 routed experts first, while shared experts and Router/TopK scheduling remain outside the dense backend.
 On a DeepSeek-V3-style B200 profile, this current routed-expert implementation is best in the
-`num_tokens = 48-256` range, reaching up to 1.30x speedup over the TRTLLM-Gen grouped-GEMM path in the
-measured routed-MoE backend benchmark.
+`num_tokens = 48-256` range, reaching up to 1.20x speedup over the TRTLLM-Gen grouped-GEMM path in the
+measured TP8 MoE module benchmark.
 
 <p align="center">
-<img src="../media/tech_blog23_Picture1.png" alt="TP MoE critical path" width="700"/>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog23_Picture1.png" alt="TP MoE critical path" width="700"/>
 </p>
 <p align="center"><em>Figure 1. Conventional TP routed-MoE path: routing and small grouped GEMMs
 dominate low-latency execution.</em></p>
@@ -69,8 +69,8 @@ main claims should be read with the following scope:
   standalone `shared_experts` FFN, Router GEMM and TopK are computed before the dense backend is invoked,
   and `TRTLLM_MOE_FUSED_FC2_ALPHA` is disabled by default.
 - **Performance numbers** refer to the current routed-expert implementation, not the full target
-  workflow. The benchmark excludes the two tensor-parallel AllReduces that flank the MoE module and the
-  separate shared-expert FFN.
+  workflow. The benchmark uses TP8 with `TRTLLM_MOE_FUSED_FC2_ALPHA=1` and reports per-rank MoE module
+  compute latency. The two tensor-parallel AllReduces that flank the MoE module are excluded.
 - The practical sweet spot in the measured B200 DeepSeek-V3-style profile is `num_tokens = 48-256`.
   Below that range, TRTLLM-Gen is faster; above it, DENSEGEMM's redundant compute starts to cost latency.
 
@@ -94,12 +94,14 @@ as many expert-local grouped GEMM problems.
 In the full target workflow, DENSEGEMM treats both routed experts and the shared expert as slices of the
 same dense FC1/FC2 representation:
 
-- **FC1**: W1 / W3 weights for all routed experts plus the shared expert are concatenated along N into a
-  single matrix of shape `[hidden, (num_experts + 1) x 2 x intermediate]`. All tokens execute one
-  `x @ W^T`. W1 / W3 are interleaved in groups of 64 within N so SwiGLU can be fused in the epilogue.
-- **FC2**: W2 weights are concatenated along K into a single matrix of shape
-  `[(num_experts + 1) x intermediate, hidden]`. Each expert occupies a 256-element block along K with
-  its own alpha, fused as block-wise scaling along M and K in the mainloop.
+- **FC1**: W1 / W3 weights for all routed experts plus the shared expert are packed as one
+  PyTorch-style weight matrix of shape `[(num_experts + 1) x 2 x intermediate, hidden]`. All tokens
+  execute one `x @ W^T`, producing an output whose dense N dimension is
+  `(num_experts + 1) x 2 x intermediate`. W1 / W3 are interleaved in groups of 64 within N so SwiGLU can
+  be fused in the epilogue.
+- **FC2**: W2 weights are concatenated along K and stored in hidden-major layout as
+  `[hidden, (num_experts + 1) x intermediate]`. FC2 computes `A @ W2^T`; each 256-element K block belongs
+  to one expert and has its own alpha, fused as block-wise scaling along M and K in the mainloop.
 - **Alpha mask**: alpha has shape `[num_tokens, num_experts + 1]`. For routed experts, alpha is
   `topk_score` when the token selects the expert and 0 otherwise. For the shared expert, alpha is 1.0
   for every token, making it an always-on expert in the same dense GEMM.
@@ -112,53 +114,55 @@ This is the intended end state: shared expert and routed experts share the same 
 expert selection is represented by alpha, and the intra-MoE critical path moves closer to
 `Quantize -> FC1 -> FC2`.
 
+### Target Data Flow
+
+The figure below shows the target TP scenario. The two AllReduces flanking the MoE module are dictated
+by TP itself; DENSEGEMM does not change that communication. The target workflow densifies the whole MoE
+FFN, while the current implementation realizes the routed-expert dense FC1/FC2 portion first.
+
+<p align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog23_Picture2.png" alt="DENSEGEMM TP data flow" width="800"/>
+</p>
+<p align="center"><em>Figure 2. Target DENSEGEMM TP flow. The current implementation realizes the
+routed-expert dense FC1/FC2 portion and keeps shared experts plus Router/TopK scheduling staged.</em></p>
+
 ### Current Implementation in TensorRT-LLM
 
 The current TensorRT-LLM implementation is the first stage of that workflow. It implements dense GEMM
 for routed experts and keeps the remaining pieces conservative:
 
-- **Routed experts only**: FC1 uses shape `[hidden, num_experts x 2 x intermediate]`; FC2 uses shape
-  `[num_experts x intermediate, hidden]`; alpha has shape `[num_tokens, num_experts]`.
+- **Routed experts only**: FC1 packs W1 / W3 as `[num_experts x 2 x intermediate, hidden]`; FC2 stores W2
+  as `[hidden, num_experts x intermediate]`; alpha has shape `[num_tokens, num_experts]`.
 - **Shared expert remains standalone**: DeepSeek-style shared experts are still created and executed as
   `self.shared_experts`, then added to the routed output at the model layer.
 - **Router/TopK remain serialized before the backend**: the model computes `router_logits` before calling
   the MoE backend, and `ConfigurableMoE` applies routing before `backend.run_moe`.
 - **FC2 alpha fusion is optional**: by default, `gen_fc2_alpha_fused` builds the per-token-per-expert
   alpha consumed by the dense FC2 kernel. Setting `TRTLLM_MOE_FUSED_FC2_ALPHA=1` can pre-multiply FC2
-  alpha into FC1's `alpha_post`, but this is disabled by default because of a known TP accuracy issue.
+  alpha into FC1's `alpha_post`, but this is disabled by default because module-level numerical
+  equivalence is not closed yet.
 
 The performance data in this post measures this current implementation, not the full target workflow.
 
 ### Why the Implementation is Staged
 
 The staged implementation is a pragmatic way to land the core roofline trade-off first while containing
-accuracy and integration risk:
+performance and integration risk:
 
-- **Shared-expert fusion changes more than kernel shape.** In DeepSeek-style models, the shared expert
-  can have separate quantization config, TP sharding, and output scaling from the routed experts. Folding
-  it into the routed dense layout requires common weight packing, scale handling, and model-layer
-  integration.
-- **Router/TopK overlap crosses the model/backend boundary.** The current model layer computes
+- **Shared-expert fusion is currently blocked by kernel performance.** Folding the shared expert into
+  the dense FC1/FC2 representation is the desired method-level direction, but the current fused kernel
+  path regresses both GEMM latencies enough that the fusion is not yet worthwhile. This is a kernel
+  optimization problem, not a limitation of the dense-MoE formulation itself.
+- **Router/TopK overlap cuts across the software architecture.** The current model layer computes
   `router_logits` before invoking the backend, and the wrapper applies routing before `run_moe`. Hiding
-  Router/TopK behind FC1 requires a scheduling change above the FC1/FC2 kernels, not only a kernel
-  rewrite.
-- **Fused FC2 alpha needs accuracy closure.** The fused-alpha path is attractive for latency, but it is
-  not the default until the known TP accuracy issue is resolved.
+  Router/TopK behind FC1 would require moving scheduling responsibilities across the model/backend
+  boundary, which is a significant software architecture change rather than only a kernel rewrite.
+- **Fused FC2 alpha needs module-level numerical closure.** The fused-alpha path is attractive for
+  latency and has not shown an obvious end-to-end accuracy drop on GPQA Diamond, but it changes where
+  quantization happens and therefore does not yet pass the module-level equivalence test.
 - **The routed-expert path validates the main premise.** It is enough to test the central claim that, in
   a memory-bound low-latency window, denser GEMM shapes can beat grouped GEMM despite redundant
   arithmetic.
-
-### Data Flow
-
-The figure below shows the TP scenario. The two AllReduces flanking the MoE module are dictated by TP
-itself; DENSEGEMM does not change that communication. The target workflow densifies the whole MoE FFN,
-while the current implementation realizes the routed-expert dense FC1/FC2 portion first.
-
-<p align="center">
-<img src="../media/tech_blog23_Picture2.png" alt="DENSEGEMM TP data flow" width="800"/>
-</p>
-<p align="center"><em>Figure 2. Target DENSEGEMM TP flow. The current implementation realizes the
-routed-expert dense FC1/FC2 portion and keeps shared experts plus Router/TopK scheduling staged.</em></p>
 
 ## Advantages over the Grouped-GEMM Flow
 
@@ -167,7 +171,7 @@ target workflow.
 
 ### Available Today
 
-Against a conventional grouped-GEMM TP path, the current backend has three measured advantages:
+Against a conventional grouped-GEMM TP path, the current backend has four measured advantages:
 
 1. **Routed FC1 and FC2 use larger, denser GEMM shapes.** Grouped GEMM splits tokens across experts;
    FC1's N is only `2 x intermediate` per expert and FC2's K is only `intermediate` per expert.
@@ -175,11 +179,15 @@ Against a conventional grouped-GEMM TP path, the current backend has three measu
    FC2's K to `E x intermediate`. In the low-latency range, those larger shapes better utilize the
    tcgen05 / TMA pipeline.
 
-2. **Expert selection is represented as alpha math inside dense GEMM.** Once alpha is scattered, selected
+2. **FC1 consumes the input without expert-order permutation.** The dense routed FC1 operates directly on
+   the token-major input, so the backend avoids the grouped-GEMM path's FC1 input permutation / dispatch
+   step that reorders tokens by selected experts.
+
+3. **Expert selection is represented as alpha math inside dense GEMM.** Once alpha is scattered, selected
    and non-selected routed experts share the same dense mainloop. The backend trades redundant
    multiply-by-zero work for fewer small-shape scheduling decisions.
 
-3. **Routed-output weighting is fused into dense FC2.** The top-k weights enter through alpha, so the
+4. **Routed-output weighting is fused into dense FC2.** The top-k weights enter through alpha, so the
    selected experts' contribution is applied during dense FC2, or through FC1's optional `alpha_post`
    fusion, rather than as a separate post-processing pass for the dense backend.
 
@@ -235,9 +243,9 @@ Below are the per-rank symbols (that is, dimensions after TP / EP partitioning):
 | `k` | top_k (experts activated per token, typically 4-8) |
 | `H` | hidden size (per-rank, after TP) |
 | `I` | intermediate size (per-rank) |
-| `b` | bytes per weight element (NVFP4 is about 0.5) |
+| `b` | packed payload bytes per weight element (NVFP4 payload is 0.5, before scale overhead) |
 | `BW` | HBM bandwidth (B200 is about 8 TB/s) |
-| `P` | NVFP4 dense peak FLOPs (B200 is about 10 PFLOPS) |
+| `P` | NVFP4 dense peak FLOPs (B200-class dense FP4 is roughly 9-10 PFLOPS) |
 
 Total weight bytes per routed expert (W1 + W2 + W3 in SwiGLU form):
 
@@ -250,7 +258,7 @@ B_exp = (2 x H x I + H x I) x b = 3 x H x I x b
 The arithmetic-intensity ridge point at NVFP4 dense FLOPs and HBM bandwidth on Blackwell B200 is:
 
 ```
-AI_crit = P / BW = 10e15 / 8e12 = 1250 FLOPs / Byte
+AI_crit = P / BW = (9-10)e15 / 8e12 ~= 1125-1250 FLOPs / Byte
 ```
 
 The arithmetic intensity of dense routed FC1 over `M` tokens and `E` experts (ignoring activation bytes
@@ -268,20 +276,22 @@ memory-bound depends primarily on `M`, not on `hidden`, `intermediate`, or `num_
 Memory-bound condition:
 
 ```
-AI_FC1 < AI_crit  <=>  4M < 1250  <=>  M < ~312
+AI_FC1 < AI_crit  <=>  4M < 1125-1250  <=>  M < ~281-312
 ```
 
-The same analysis gives `AI_FC2` of about `4M`, with the same ridge point of about 312. Hence, for `M`
-up to roughly 312, FC1 and FC2 are roofline-predicted to be memory-bound, and DENSEGEMM's redundant
-arithmetic should have limited latency impact:
+The same analysis gives `AI_FC2` of about `4M`, with the same ridge point of roughly 281-312 tokens.
+Hence, for `M` up to a few hundred tokens, FC1 and FC2 are roofline-predicted to be memory-bound, and
+DENSEGEMM's redundant arithmetic should have limited latency impact:
 
-> **Roofline upper bound: M up to roughly 312 (B200 NVFP4 dense, 10 PFLOPS / 8 TB/s).** Beyond this, the
-> redundant compute introduced by densification begins to translate into actual latency cost.
+> **Roofline estimate: M up to roughly 280-310 when counting packed FP4 weight payload bytes.** Beyond
+> this range, the redundant compute introduced by densification begins to translate into actual latency
+> cost.
 
 The empirical FC1 memory-to-compute crossover is at about `M = 336` (see the roofline table in the
-performance section), close to the theoretical ridge point of 312. The empirical value is slightly higher
-because dense GEMM still sustains around 80% SOL% near the crossover, effectively pushing the
-equivalent-FLOPs ceiling slightly back.
+performance section), close to this simplified estimate. The payload-only model intentionally ignores
+NVFP4 scale-factor loads, input/output activation traffic, epilogue work, and tactic changes; these
+effects make the boundary less sharp and can move the practical crossover into the low-to-mid 300-token
+range.
 
 ## Kernel Implementation (CuTe DSL on Blackwell)
 
@@ -313,7 +323,9 @@ Notes:
   256-aligned K scales can be loaded into SMEM by TMA and fed to the mainloop alpha multiply.
 - **Optional fusion `TRTLLM_MOE_FUSED_FC2_ALPHA`**: setting this environment variable to `1`
   pre-multiplies the per-token-per-expert FC2 alpha into FC1's `alpha_post`, reducing FC2 to a regular
-  NVFP4 GEMM with scalar alpha. This is disabled by default because of a known TP accuracy issue.
+  NVFP4 GEMM with scalar alpha. This is disabled by default because the changed quantization point still
+  needs module-level numerical closure, even though GPQA Diamond end-to-end accuracy does not show an
+  obvious regression.
 
 ## Performance Evaluation
 
@@ -323,68 +335,58 @@ Notes:
 - **Workload profile**: DeepSeek-V3-style routed MoE with `hidden = 7168`, `num_experts = 256`,
   `top_k = 8`, activation = SwiGLU, precision = NVFP4. `intermediate` may differ across comparison
   entries to reflect the per-rank shard size after TP partitioning.
-- **Object under measurement**: per-rank routed-MoE backend compute latency under TP deployment,
-  including Router GEMM, TopK, alpha generation, FC1, FC2, and necessary quantization. The shared expert
-  FFN and the two flanking AllReduces are excluded from this backend comparison.
+- **Parallel strategy**: TP8; measurements are reported for one tensor-parallel rank on one B200.
+- **Environment**: `TRTLLM_MOE_FUSED_FC2_ALPHA=1`.
+- **Object under measurement**: per-rank MoE module compute latency under the TP8 deployment, including
+  Router GEMM, TopK, alpha generation, FC1, FC2, and necessary quantization. The two flanking AllReduces
+  are excluded from this comparison.
 - **Comparison points**: DENSEGEMM (this work, dense routed-expert path) vs TRTLLM-Gen (per-expert
   grouped GEMM, TP) vs CUTLASS (reference).
 
-### Per-Rank Routed-MoE Backend Latency
+### Per-Rank MoE Module Latency
 
-The table below reports latency for representative `num_tokens` values. Before reading the full table,
-the three main takeaways are:
+The table below reports latency for representative `num_tokens` values with
+`TRTLLM_MOE_FUSED_FC2_ALPHA=1`. Before reading the full table, the three main takeaways are:
 
 - DENSEGEMM is not the min-latency winner at `num_tokens <= 32`.
-- DENSEGEMM is strongest in the `num_tokens = 48-256` range.
+- DENSEGEMM is strongest in the `num_tokens = 48-256` range, with the largest observed lead at
+  `num_tokens = 128`.
 - TRTLLM-Gen catches up and overtakes once DENSEGEMM approaches the compute-bound crossover.
 
 The speedup column is `t_TRTLLM-Gen / t_DENSEGEMM`; values greater than 1 indicate DENSEGEMM is faster.
 
 | num_tokens | DENSEGEMM (us) | TRTLLM-Gen (us) | CUTLASS (us) | DENSEGEMM vs TRTLLM-Gen |
 |---:|---:|---:|---:|:---:|
-| 1   | 153.62 | 30.32  | 109.44 | 0.20x |
-| 8   | 144.44 | 56.08  | 156.41 | 0.39x |
-| 16  | 145.34 | 80.28  | 202.66 | 0.55x |
-| 32  | 137.98 | 113.35 | 259.59 | 0.82x |
-| **48**  | **133.41** | 149.10 | 302.68 | **1.12x** |
-| **64**  | **134.18** | 155.28 | 324.80 | **1.16x** |
-| **128** | **136.16** | 176.79 | 344.26 | **1.30x** |
-| **256** | **162.88** | 189.93 | 347.44 | **1.17x** |
-| 272 | 221.21 | 191.64 | 346.75 | 0.87x |
-| 336 | 225.74 | 193.54 | 354.81 | 0.86x |
-| 512 | 263.12 | 202.36 | 361.31 | 0.77x |
+| 1 | 156.21 | 31.21 | 96.77 | 0.20x |
+| 8 | 147.20 | 63.39 | 150.55 | 0.43x |
+| 16 | 148.09 | 90.91 | 200.05 | 0.61x |
+| 32 | 140.59 | 119.07 | 262.73 | 0.85x |
+| **48** | **136.11** | 141.37 | 290.50 | **1.04x** |
+| **64** | **136.79** | 149.23 | 308.44 | **1.09x** |
+| **128** | **138.86** | 166.35 | 335.65 | **1.20x** |
+| **192** | **161.16** | 176.63 | 350.68 | **1.10x** |
+| **256** | **165.91** | 176.21 | 351.98 | **1.06x** |
+| 272 | 223.99 | 184.42 | 357.90 | 0.82x |
+| 336 | 228.42 | 189.59 | 363.58 | 0.83x |
+| 384 | 231.17 | 196.47 | 368.12 | 0.85x |
 
 Observations:
 
-- **`num_tokens = 48-256` is DENSEGEMM's measured sweet spot**, with a 12%-30% lead over TRTLLM-Gen and
-  a 2x-3x lead over CUTLASS across that range.
+- **`num_tokens = 48-256` is DENSEGEMM's measured sweet spot**, with a 4%-20% lead over TRTLLM-Gen and
+  a 2.1x-2.4x lead over CUTLASS across that range.
 - **DENSEGEMM is not advantageous at `num_tokens <= 32`.** The current implementation loads weights for
   all 256 routed experts; at small batch sizes, the weight-load time is roughly fixed at about 145 us,
   while TRTLLM-Gen only loads selected experts.
-- **TRTLLM-Gen overtakes DENSEGEMM at `num_tokens >= 272`** for two reasons: the FC1 best config switches
-  to `128x256 @ (1,2)` and latency steps up from about 96 us to 144 us, and the workload approaches the
-  compute-bound crossover where redundant dense arithmetic starts to matter.
-
-### Internal Kernel Breakdown (`num_tokens = 128`)
-
-| Component | Latency (us) |
-|---|---:|
-| `deepseek_v3_topk_kernel` | 4.17 |
-| FC1 (`densegemm_fc1`)     | 82.97 |
-| FC2 (`densegemm_fc2`)     | 48.06 |
-| `quantize_with_block_size` | 3.66 |
-| Misc (gen_alpha, etc.)    | 1.47 |
-| **Total**                 | **136.16** |
-
-FC1 + FC2 sum to 131 us, or about 96% of the measured total. Router/TopK overhead is small in this
-profile, but it is still part of the current routed-MoE path rather than a hidden parallel module.
+- **TRTLLM-Gen overtakes DENSEGEMM at `num_tokens >= 272`** because DENSEGEMM steps up to a slower
+  FC1 tactic/configuration while the workload approaches the compute-bound crossover where redundant
+  dense arithmetic starts to matter.
 
 ### Roofline Sanity Check
 
 The measured FC1 behavior matches the roofline prediction. At `num_tokens = 48` and `128`, FC1 reaches
 about 80% of B200 HBM bandwidth and stays close to the memory-bound lower bound. Around
 `num_tokens = 336`, FC1 crosses into the compute-bound region: `xRoofline` rises above 2x and effective
-bandwidth drops below 50%. This matches the routed-MoE latency trend where DENSEGEMM wins in the
+bandwidth drops below 50%. This matches the MoE module latency trend where DENSEGEMM wins in the
 `48-256` range but loses again once the redundant dense arithmetic becomes visible.
 
 ## Current Limitations and Future Work
@@ -396,7 +398,9 @@ toward the target workflow. The remaining gaps are:
   of denser GEMM shapes.
 - Router GEMM and TopK are still serialized before the backend's FC1/FC2 compute.
 - DeepSeek-style shared experts are still executed separately as `shared_experts`.
-- `TRTLLM_MOE_FUSED_FC2_ALPHA` is disabled by default because of a known TP accuracy issue.
+- `TRTLLM_MOE_FUSED_FC2_ALPHA` is disabled by default because changing the quantization point breaks the
+  current module-level equivalence test, even though GPQA Diamond end-to-end accuracy does not show an
+  obvious regression.
 
 Future directions include:
 
@@ -407,14 +411,12 @@ Future directions include:
    can run concurrently with FC1 and synchronize only when alpha is consumed.
 3. **Shared-expert fusion.** Folding the shared expert into the dense FC1/FC2 representation would remove
    the separate shared FFN scheduling path for DeepSeek-style models.
-4. **Fused FC2 alpha accuracy closure.** Make `TRTLLM_MOE_FUSED_FC2_ALPHA=1` accurate under TP so the
-   latency-friendly fused-alpha path can become a default path where it is beneficial.
+4. **Fused FC2 alpha numerical closure.** Close the module-level numerical gap introduced by moving the
+   quantization point so the latency-friendly `TRTLLM_MOE_FUSED_FC2_ALPHA=1` path can become a default
+   path where it is beneficial.
 5. **Broader TP/EP coverage.** The current implementation assumes a specific routed-expert deployment
    shape. Future work can adapt DENSEGEMM to broader TPxEPy combinations, supporting deployments from
    8xB200 to GB200 NVL72.
-6. **Throughput-at-latency chunking.** In the 320-10k token range, partition the grouped GEMM by experts
-   into multiple chunks: chunks that remain within the low-latency regime run with dense GEMM, while
-   compute-bound chunks remain on the grouped path.
 
 ## References
 
@@ -423,4 +425,3 @@ Future directions include:
 - FC1 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py`](../../../../tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py)
 - FC2 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py`](../../../../tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py)
 - Custom op registration: [`tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py`](../../../../tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py)
-- Companion blogs: [blog18 - Optimizing MoE Communication with One-Sided AlltoAll over NVLink](./blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.md); [blog04 - Scaling Expert Parallelism in TensorRT-LLM](./blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
