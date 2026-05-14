@@ -1179,7 +1179,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
 
         pool_size = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
 
-
         MambaCacheManager.__init__(
             self,
             mamba_d_state,
