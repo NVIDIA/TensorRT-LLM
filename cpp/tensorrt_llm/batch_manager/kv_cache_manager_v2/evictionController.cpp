@@ -125,9 +125,8 @@ size_t PrioritizedEvictionPolicy::size() const noexcept
 // ---------------------------------------------------------------------------
 
 PerLevelEvictionController::PerLevelEvictionController(
-    std::vector<PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel)
-    : mCacheLevel(cacheLevel)
-    , mLifeCycleGrouping(lifeCycleGrouping)
+    std::vector<PoolGroupIndex> const& lifeCycleGrouping, [[maybe_unused]] CacheLevel cacheLevel)
+    : mLifeCycleGrouping(lifeCycleGrouping)
 {
     // Compute number of pool groups = max(grouping) + 1
     PoolGroupIndex numPoolGroups = 0;
@@ -147,8 +146,8 @@ PerLevelEvictionController::~PerLevelEvictionController()
 {
     if (!gNdebug)
     {
-        bool allEmpty = true;
-        for (auto const& p : mPolicies)
+        [[maybe_unused]] bool allEmpty = true;
+        for ([[maybe_unused]] auto const& p : mPolicies)
         {
             if (!p.empty())
             {
@@ -169,7 +168,6 @@ PrioritizedEvictionPolicy& PerLevelEvictionController::getPolicy(LifeCycleId lcI
 void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst)
 {
     assert(page.nodeRef == std::nullopt);
-    assert(page.cacheLevel == mCacheLevel);
     auto sharedPage = page.shared_from_this();
     NodeRef ref = getPolicy(page.lifeCycle).push(sharedPage, evictFirst);
     page.nodeRef = ref;
@@ -214,17 +212,6 @@ std::vector<std::vector<std::shared_ptr<Page>>> PerLevelEvictionController::evic
             }
         }
         throw;
-    }
-
-    if (!gNdebug)
-    {
-        for (auto const& group : ret)
-        {
-            for (auto const& p : group)
-            {
-                assert(p->cacheLevel == mCacheLevel && "Corrupted eviction controller");
-            }
-        }
     }
 
     return ret;

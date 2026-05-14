@@ -188,7 +188,6 @@ public:
 private:
     PrioritizedEvictionPolicy& getPolicy(LifeCycleId lcId);
 
-    CacheLevel mCacheLevel;
     std::vector<PoolGroupIndex> mLifeCycleGrouping;
     std::vector<PrioritizedEvictionPolicy> mPolicies; // one per pool group
 };

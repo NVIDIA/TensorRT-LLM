@@ -264,6 +264,7 @@ std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<B
     for (auto& [key, entries] : groups)
     {
         auto [lc, poolIdx] = key;
+        auto localLc = lc;
         PoolGroupIndex pgIdx = static_cast<PoolGroupIndex>(mStorage->getPoolGroupIndex(lc));
 
         // Sort by start offset.
@@ -277,7 +278,7 @@ std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<B
         auto flush = [&](size_t cStart, size_t cEnd, std::vector<ExpandedBuffer>& bufs)
         {
             result.push_back(AggregatedPageDesc{
-                MemAddress(poolBase + cStart), static_cast<int>(cEnd - cStart), stride, lc, std::move(bufs)});
+                MemAddress(poolBase + cStart), static_cast<int>(cEnd - cStart), stride, localLc, std::move(bufs)});
         };
 
         size_t curStart = entries[0].start, curEnd = entries[0].end;
@@ -460,7 +461,7 @@ void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
 
 std::vector<std::vector<std::shared_ptr<Page>>> KvCacheManager::_gatherPersistentPages() const
 {
-    CacheLevel lastLevel = static_cast<CacheLevel>(mStorage->numCacheLevels() - 1);
+    [[maybe_unused]] CacheLevel lastLevel = static_cast<CacheLevel>(mStorage->numCacheLevels() - 1);
     int numPg = mStorage->numPoolGroups();
     std::vector<std::vector<std::shared_ptr<Page>>> result(static_cast<size_t>(numPg));
 
@@ -585,7 +586,7 @@ bool KvCacheManager::needAdjustment() const
 
 void KvCacheManager::adjust()
 {
-    for (KvCache* kvc : mLivingKvCaches)
+    for ([[maybe_unused]] KvCache* kvc : mLivingKvCaches)
         assert(kvc->status() == KvCache::Status::SUSPENDED);
 
     int numLevels = mStorage->numCacheLevels();

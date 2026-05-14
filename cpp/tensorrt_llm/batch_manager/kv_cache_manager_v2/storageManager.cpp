@@ -348,7 +348,7 @@ void StorageManager::forceEvict(CacheLevel level, std::vector<int> const& minNum
         // Last level: all evicted pages must be DROPPABLE (they get dropped, not migrated).
         for (auto const& pages : evicted)
         {
-            for (auto const& page : pages)
+            for ([[maybe_unused]] auto const& page : pages)
             {
                 assert(page->status() == PageStatus::DROPPABLE && "Corrupted eviction controller");
             }
@@ -380,7 +380,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     if (!gNdebug)
     {
         assert(static_cast<int>(goals.size()) == numCacheLevels() && "goals.rows must equal numCacheLevels");
-        for (auto const& row : goals)
+        for ([[maybe_unused]] auto const& row : goals)
         {
             assert(static_cast<int>(row.size()) == numPoolGroups() && "goals.cols must equal numPoolGroups");
         }
@@ -391,7 +391,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     {
         for (auto const& pages : fallenPages)
         {
-            for (auto const& p : pages)
+            for ([[maybe_unused]] auto const& p : pages)
             {
                 assert(p->cacheLevel < lvlId && "Fallen pages must come from upper cache levels");
             }
@@ -441,19 +441,19 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
         for (int pg = 0; pg < numPoolGroups(); ++pg)
         {
             auto& ev = evicted.at(static_cast<size_t>(pg));
-            int oldFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
-            int numEvicted = static_cast<int>(ev.size());
+            [[maybe_unused]] int oldFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
+            [[maybe_unused]] int numEvicted = static_cast<int>(ev.size());
             // A9: all evicted pages at last level must be DROPPABLE.
             if (!gNdebug)
             {
-                for (auto const& p : ev)
+                for ([[maybe_unused]] auto const& p : ev)
                 {
                     assert(p->status() == PageStatus::DROPPABLE && "Evicted page at last level must be DROPPABLE");
                 }
             }
             // Drop droppable evicted pages (GC).
             ev.clear();
-            int newFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
+            [[maybe_unused]] int newFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
             assert(newFree >= numEvicted + oldFree);
 
             // A10: held_pages count must not exceed new_free.
@@ -482,7 +482,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
         // A12: no held pages at non-last level.
         if (!gNdebug)
         {
-            for (auto const& hp : heldPages)
+            for ([[maybe_unused]] auto const& hp : heldPages)
             {
                 assert(hp.empty() && "held_pages must be empty at non-last level");
             }
@@ -514,7 +514,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     // A13: all fallen pages must have been consumed.
     if (!gNdebug)
     {
-        for (auto const& fp : fallenPages)
+        for ([[maybe_unused]] auto const& fp : fallenPages)
         {
             assert(fp.empty() && "All fallen pages must be consumed after level loop");
         }
@@ -792,7 +792,7 @@ void StorageManager::shrinkPoolGroup(
     assert(static_cast<int>(persistentPages.size()) <= newNumSlots && "Not enough slots to hold all persistent pages");
     if (!gNdebug)
     {
-        for (auto const& p : persistentPages)
+        for ([[maybe_unused]] auto const& p : persistentPages)
         {
             assert(p->cacheLevel == level && "Persistent page cache level mismatch");
             assert(mLifeCycleGrouping.at(static_cast<size_t>(p->lifeCycle)) == pgIdx
@@ -866,7 +866,7 @@ void StorageManager::shrinkPoolGroup(
     // A17: all overflow pages must be at the expected cache level.
     if (!gNdebug)
     {
-        for (auto const& p : overflowPages)
+        for ([[maybe_unused]] auto const& p : overflowPages)
         {
             assert(p->cacheLevel == level && "Overflow page cache level mismatch");
         }

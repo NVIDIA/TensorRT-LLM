@@ -169,7 +169,7 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
         // Window blocks: [staleEnd, numBlocks) — skip scratch blocks.
         for (int ord = staleEnd; ord < static_cast<int>(mBlocks.size()); ++ord)
         {
-            auto& block = mBlocks[static_cast<size_t>(ord)];
+            [[maybe_unused]] auto& block = mBlocks[static_cast<size_t>(ord)];
             for (int bi = 0; bi < mBeamWidth; ++bi)
             {
                 bool isScratch = scratchRange.contains(ord);
@@ -445,7 +445,6 @@ void KvCache::suspend()
     // SharedPageLock destructors inside the scope use finishEvent() to synchronize.
     {
         auto scope = recordEventScope();
-        auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
 
         // Convert SharedPageLocks → PageHolders for active (non-stale) pages only.
         // Mirrors Python: for ordinal, beam_idx, lc_idx in self._active_pages()
@@ -718,7 +717,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         {
             for (int lc = 0; lc < numLc; ++lc)
             {
-                int expected
+                [[maybe_unused]] int expected
                     = numNewSlots[static_cast<size_t>(lc)] + std::max(0, deltaScratchSlots[static_cast<size_t>(lc)]);
                 assert(static_cast<int>(slots[static_cast<size_t>(lc)].size()) == expected);
             }
@@ -741,7 +740,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         {
             for (auto const& beamIndices : mBasePageIndices)
                 for (auto const& buf : beamIndices)
-                    if (auto const* vec = std::get_if<std::vector<int>>(&buf))
+                    if ([[maybe_unused]] auto const* vec = std::get_if<std::vector<int>>(&buf))
                         assert(static_cast<int>(vec->size()) == oldNumBlocks);
         }
 
@@ -903,7 +902,7 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
         {
             for (auto const& buf : beamIndices)
             {
-                if (auto const* vec = std::get_if<std::vector<int>>(&buf))
+                if ([[maybe_unused]] auto const* vec = std::get_if<std::vector<int>>(&buf))
                     assert(static_cast<int>(vec->size()) == curNumBlocks);
             }
         }
@@ -1436,10 +1435,11 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     // Check for SWA sink blocks.
     for (auto [lcId, attn] : swaLcs)
     {
+        auto localLcId = lcId;
         int sinkBlocks = attn->numSinkBlocks;
         int limit = std::min(sinkBlocks, static_cast<int>(matched.size()));
         int n = findIndex(
-            matched.begin(), matched.begin() + limit, [&](auto const& m) { return !hasPage(*m.block, lcId); });
+            matched.begin(), matched.begin() + limit, [&](auto const& m) { return !hasPage(*m.block, localLcId); });
         if (n < sinkBlocks)
             matched.resize(static_cast<size_t>(n));
     }
@@ -1470,11 +1470,13 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
         bool trimmed = false;
         for (auto [lcId, attn] : swaLcs)
         {
+            auto localLcId = lcId;
             if (!attn->windowSize.has_value())
                 continue;
 
             // Check tail: first block from end that HAS a page.
-            int n = findIndex(matched.rbegin(), matched.rend(), [&](auto const& m) { return hasPage(*m.block, lcId); });
+            int n = findIndex(
+                matched.rbegin(), matched.rend(), [&](auto const& m) { return hasPage(*m.block, localLcId); });
             if (n != 0)
             {
                 matched.resize(matched.size() - static_cast<size_t>(n));
@@ -1488,8 +1490,9 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
             if (staleEnd < static_cast<int>(matched.size()))
             {
                 auto tailBegin = matched.begin() + staleEnd;
-                int nMissing = findIndex(std::make_reverse_iterator(matched.end()),
-                    std::make_reverse_iterator(tailBegin), [&](auto const& m) { return !hasPage(*m.block, lcId); });
+                int nMissing
+                    = findIndex(std::make_reverse_iterator(matched.end()), std::make_reverse_iterator(tailBegin),
+                        [&](auto const& m) { return !hasPage(*m.block, localLcId); });
                 if (static_cast<int>(matched.size()) - nMissing > staleEnd)
                 {
                     matched.resize(matched.size() - static_cast<size_t>(nMissing));

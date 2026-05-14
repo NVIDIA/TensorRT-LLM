@@ -89,7 +89,7 @@ struct SeqBlock
                     for (auto const& bp : beamBlock)
                         if (!blockPageIsNull(bp))
                         {
-                            auto pg = blockPageGetPage(bp);
+                            [[maybe_unused]] auto pg = blockPageGetPage(bp);
                             assert(!pg || std::dynamic_pointer_cast<CommittedPage>(pg));
                         }
             }
@@ -100,7 +100,7 @@ struct SeqBlock
                     for (auto const& bp : beamBlock)
                         if (!blockPageIsNull(bp))
                         {
-                            auto pg = blockPageGetPage(bp);
+                            [[maybe_unused]] auto pg = blockPageGetPage(bp);
                             assert(!pg || std::dynamic_pointer_cast<UncommittedPage>(pg));
                         }
             }
