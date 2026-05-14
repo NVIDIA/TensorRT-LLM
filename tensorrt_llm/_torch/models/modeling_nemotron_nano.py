@@ -769,7 +769,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         batched_embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
         scale_squared = self.downsample_ratio**2
         per_image_token_counts = [
-            int(round(seq_len * scale_squared))
+            round(seq_len * scale_squared)
             for seq_len in calc_seq_lens(image_sizes, self.patch_size)
         ]
         per_request_token_counts: List[int] = []
