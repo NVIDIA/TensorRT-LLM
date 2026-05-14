@@ -571,8 +571,8 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
             // rather than silently routing through self.
             if (!crossBlocksManager)
             {
-                TLLM_LOG_WARNING(
-                    "Encoder-init request %lu scheduled without a enc_dec_kv_cache_manager; skipping.", req->mRequestId);
+                TLLM_LOG_WARNING("Encoder-init request %lu scheduled without a enc_dec_kv_cache_manager; skipping.",
+                    req->mRequestId);
                 return false;
             }
             auto const crossScheduledIfFits = crossBlocksManager->prepareNewNumberOfBlocksIfWeEndUpScheduling(*req);

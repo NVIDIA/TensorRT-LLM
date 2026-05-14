@@ -174,7 +174,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             max_num_tokens,
             max_batch_size,
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None",
-            type(enc_dec_kv_cache_manager).__name__ if enc_dec_kv_cache_manager is not None else "None",
+            type(enc_dec_kv_cache_manager).__name__
+            if enc_dec_kv_cache_manager is not None
+            else "None",
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True

@@ -1002,7 +1002,9 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
         reserved_blocks = NoEvictScheduledBlocksManager(scheduler.kv_cache_manager)
         reserved_cross_blocks: Optional[NoEvictScheduledBlocksManager] = None
         if scheduler.enc_dec_kv_cache_manager is not None:
-            reserved_cross_blocks = NoEvictScheduledBlocksManager(scheduler.enc_dec_kv_cache_manager)
+            reserved_cross_blocks = NoEvictScheduledBlocksManager(
+                scheduler.enc_dec_kv_cache_manager
+            )
 
         # PEFT state - only used when has_peft
         claimed_peft_pages = 0
@@ -1091,7 +1093,8 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             continue
 
                         if not reserved_cross_blocks.enough_available_blocks(
-                                req, cached_summary=cached_cross_summary):
+                            req, cached_summary=cached_cross_summary
+                        ):
                             break
 
                         if has_peft:
@@ -1106,11 +1109,13 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
                         scheduled_requests.append(req)
                         reserved_cross_blocks.decrement_reserved_blocks(
-                            req, cached_summary=cached_cross_summary)
+                            req, cached_summary=cached_cross_summary
+                        )
 
                     elif req.is_context_init_state or req.is_disagg_generation_init_state:
                         enough_blocks = reserved_blocks.enough_available_blocks(
-                            req, cached_summary=cached_summary)
+                            req, cached_summary=cached_summary
+                        )
                         enough_cross_blocks = True
                         if reserved_cross_blocks is not None:
                             enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(
@@ -1291,7 +1296,8 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
             blocks_if_scheduled = None
         else:
             blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
-                req, cached_summary=cached_summary)
+                req, cached_summary=cached_summary
+            )
             if blocks_if_scheduled is None:
                 return False, num_scheduled_peft_pages
             cross_blocks_if_scheduled: Optional[dict] = None

@@ -98,8 +98,7 @@ public:
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, std::optional<int64_t> compressed_kv_cache_pool_ptr,
         bool const cross_attention, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> encoder_input_lengths,
-        std::optional<torch::Tensor> relative_attention_bias) const
+        std::optional<torch::Tensor> encoder_input_lengths, std::optional<torch::Tensor> relative_attention_bias) const
         = 0;
 };
 

@@ -257,12 +257,11 @@ class KvCacheCreator:
                 )
         return cls
 
-    def _per_manager_cache_cost(
-            self,
-            manager_cls,
-            model_config,
-            kv_cache_config: Optional[KvCacheConfig] = None,
-            **extra_kwargs) -> CacheCost:
+    def _per_manager_cache_cost(self,
+                                manager_cls,
+                                model_config,
+                                kv_cache_config: Optional[KvCacheConfig] = None,
+                                **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
         return CacheCost.from_raw(
@@ -274,9 +273,9 @@ class KvCacheCreator:
                 kv_cache_config=kv_cache_config,
                 **extra_kwargs))
 
-    def _get_kv_size_per_token(
-            self,
-            kv_cache_config: Optional[KvCacheConfig] = None) -> CacheCost:
+    def _get_kv_size_per_token(self,
+                               kv_cache_config: Optional[KvCacheConfig] = None
+                               ) -> CacheCost:
         """Aggregate KV cost across target + (optional) draft as a CacheCost.
 
         ``max_batch_size`` and ``kv_cache_config`` are passed unconditionally;
@@ -866,9 +865,7 @@ class KvCacheCreator:
                            is not None else self._kv_cache_config)
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config,
-            draft_kv_config,
-            is_disagg=self._is_disagg)
+            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
 
         # Use V2 if enabled and the base class is KVCacheManager
         if draft_kv_cache_manager_cls == KVCacheManagerV2:
@@ -934,8 +931,7 @@ class KvCacheCreator:
 
         total_kv = self._get_kv_size_per_token(target_kv_cache_config)
         target_kv = self._per_manager_cache_cost(
-            self._kv_cache_manager_cls,
-            self._model_engine.model.model_config,
+            self._kv_cache_manager_cls, self._model_engine.model.model_config,
             target_kv_cache_config)
         # The draft contribution is whatever the aggregate has on top of the
         # target. Both pieces are CacheCost; subtraction is component-wise.
@@ -1267,8 +1263,8 @@ class KvCacheCreator:
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
-        resources[
-            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER] = enc_dec_kv_cache_manager
+        resources[ResourceManagerType.
+                  ENC_DEC_KV_CACHE_MANAGER] = enc_dec_kv_cache_manager
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""

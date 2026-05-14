@@ -407,7 +407,7 @@ class AttentionMetadata:
         self,
         encoder_seq_lens: torch.Tensor,
         enc_dec_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2,
-                                      None] = None,
+                                        None] = None,
         *,
         encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
     ) -> "AttentionMetadata":
