@@ -35,7 +35,6 @@ python models/wan_t2v.py --extra_visual_gen_options configs/wan2.2-t2v-fp4-1gpu.
 ```bash
 # Install dependencies (from repository root)
 pip install -r requirements-dev.txt
-pip install "diffusers>=0.37.0"
 ```
 
 
@@ -85,6 +84,17 @@ python visual_gen_wan_t2v.py \
     --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
+    --output_path output.mp4
+```
+
+**With SageAttention (FP8/INT8 per-block quantized attention):**
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --attention_backend TRTLLM \
+    --enable_sage_attention \
     --output_path output.mp4
 ```
 
@@ -275,8 +285,10 @@ python visual_gen_ltx2.py \
 | `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
 | `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
 | `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
+| `--enable_sage_attention` | ✓ | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | ✓ | — | 1 | Ulysses parallelism |
+| `--parallel_vae_size` | - | ✓ | — | 1 | Parallelism used for VAE |
 | `--attn2d_row_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh row size |
 | `--attn2d_col_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh column size |
 | `--linear_type` | ✓ | ✓ | — | default | Quantization type |

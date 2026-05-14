@@ -72,6 +72,9 @@ results_trt/
 llm-test-workspace/
 ad-test-workspace/
 
+# FetchContent reference cache
+3rdparty/.cache_3rdparty/
+
 # build/debug
 *.safetensors
 */tllm_debug/**

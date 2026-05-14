@@ -15,11 +15,17 @@
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.evaluate.post_processing import strip_thinking_and_extract_mmmu_answer
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_pre_blackwell, skip_pre_hopper
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VoxPopuli
+from ..conftest import (
+    llm_models_root,
+    skip_post_blackwell_ultra,
+    skip_pre_blackwell,
+    skip_pre_hopper,
+)
+from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
 
 
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
@@ -447,6 +453,64 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+class TestKimiK25(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K2.5"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+    )
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.75,
+    )
+
+    # Thinking mode (thinking=True): model uses <think>...</think>
+    # chain-of-thought reasoning before outputting the answer.
+    # post_process_fn strips the thinking block and extracts the final
+    # answer, compensating for lm-eval's MMMU regex which fails on common
+    # reasoning-model output formats (see
+    # tensorrt_llm.evaluate.post_processing for cross-engine evidence).
+    # preserve_caller_max_tokens=True keeps our 16384 max_tokens instead of
+    # being overridden by lm-eval task's default 512 (too small for CoT).
+    EXTRA_EVALUATOR_KWARGS = dict(
+        chat_template_kwargs={"thinking": True},
+        post_process_fn=strip_thinking_and_extract_mmmu_answer,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp",
+        [(1, False), (1, True), (8, False), (8, True)],
+        ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
+    )
+    def test_nvfp4(self, ep_size, attention_dp):
+        """NVFP4 accuracy on MMMU benchmark (8x B200)."""
+        with LLM(
+            self.MODEL_PATH,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            enable_attention_dp=attention_dp,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
 class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
@@ -509,7 +573,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         temperature=0.0,
         top_k=1,
     )
-    voxpopuli_extra_evaluator_kwargs = {
+    no_thinking_evaluator_kwargs = {
         # We explicitly disable thinking, because otherwise the thinking traces could
         # be absurdly long (20k+ tokens), which is not helpful for test-runtime, nor
         # for reproducibility (the more tokens there are, the higher likelihood of the
@@ -521,7 +585,19 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     VOXPOPULI_TASK_SPEC = (
         VoxPopuli,
         voxpopuli_sampling_params,
-        voxpopuli_extra_evaluator_kwargs,
+        no_thinking_evaluator_kwargs,
+    )
+
+    videomme_sampling_params = SamplingParams(
+        max_tokens=VideoMME.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=VideoMME.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    VIDEOMME_TASK_SPEC = (
+        VideoMME,
+        videomme_sampling_params,
+        no_thinking_evaluator_kwargs,
     )
 
     @pytest.mark.skip_less_device_memory(80000)
@@ -552,7 +628,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 64,
                 QuantAlgo.FP8,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
                 marks=skip_pre_hopper,
                 id="fp8",
             ),
@@ -567,8 +643,15 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 128,
                 QuantAlgo.MIXED_PRECISION,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
-                marks=skip_pre_blackwell,
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                marks=(
+                    skip_pre_blackwell,
+                    # Skip for B300 / GB300:
+                    # * B300 coverage does not meaningfully extend what we test via B200.
+                    # * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide
+                    #   CI errors.
+                    skip_post_blackwell_ultra,
+                ),
                 id="nvfp4",
             ),
         ],

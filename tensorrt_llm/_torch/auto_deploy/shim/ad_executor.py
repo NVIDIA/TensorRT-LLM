@@ -567,6 +567,39 @@ class ADEngine(ModelEngine):
             PyTorchModelEngine._execute_logit_post_processors, self
         )
 
+    def _release_cuda_graphs(self) -> None:
+        def _reset_cuda_graph(graph: object) -> None:
+            if isinstance(graph, torch.cuda.CUDAGraph):
+                graph.reset()
+
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                if module.__class__.__name__ == "CapturedGraph":
+                    cudagraphs = getattr(module, "cudagraphs", None)
+                    if isinstance(cudagraphs, dict):
+                        for graph in list(cudagraphs.values()):
+                            _reset_cuda_graph(graph)
+                        cudagraphs.clear()
+                    module._cuda_graph_mem_pool = None
+                    module._input_buffers = []
+                    module._out_buffer_flat = None
+
+                if module.__class__.__name__ == "PiecewiseCapturedGraph":
+                    static_input_buffers = getattr(module, "_static_input_buffers", None)
+                    if isinstance(static_input_buffers, dict):
+                        static_input_buffers.clear()
+
+                if module.__class__.__name__ == "ADPiecewiseRunner":
+                    entries = getattr(module, "entries", None)
+                    if isinstance(entries, dict):
+                        for entry in entries.values():
+                            _reset_cuda_graph(getattr(entry, "cuda_graph", None))
+                        entries.clear()
+                    module._graph_pool = None
+
+        torch.cuda.empty_cache()
+
     def _store_prefill_multimodal_metadata(
         self,
         ordered_requests: RequestList,
@@ -844,6 +877,11 @@ class ADEngine(ModelEngine):
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
         state_slot_idx: List[int] = []
+
+        batch_cache_indices = kv_cache_manager.get_batch_cache_indices(
+            [r.py_request_id for r in ordered_requests]
+        )
+
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
             request.py_batch_idx = request.py_seq_slot
@@ -860,7 +898,7 @@ class ADEngine(ModelEngine):
             num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
             # construct cache information for the current request
-            cache_indices = kv_cache_manager.get_cache_indices(request)
+            cache_indices = batch_cache_indices[i]
             cache_loc.extend(cache_indices[:num_active_blocks_i])
             cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
             if len(cache_indices) > num_active_blocks_i:

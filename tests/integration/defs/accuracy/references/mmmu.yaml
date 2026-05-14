@@ -62,3 +62,9 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
 Qwen/Qwen3.5-35B-A3B:
   - dtype: bfloat16
     accuracy: 60.444
+# Kimi K2.5 multimodal (MoonViT + DeepSeek-V3 MoE backbone, ~1T params).
+# Values below are measured with NVFP4 checkpoint (thinking mode enabled).
+moonshotai/Kimi-K2.5:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 81.56

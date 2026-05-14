@@ -311,6 +311,18 @@ def _parse_tool_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def resolve_top_level_model_type(model_config: AutoConfig) -> str:
+    """Return the top-level HF model_type for a loaded config.
+
+    Newer composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
+    attribute to `text_config`, returning e.g. "qwen2_5_vl_text" instead of the
+    top-level "qwen2_5_vl" used as the AutoConfig/registry key. The class-level
+    attribute is unaffected by this delegation, so prefer it.
+    """
+    return getattr(type(model_config), "model_type", None) or getattr(
+        model_config, "model_type", "")
+
+
 def parse_chat_messages_coroutines(
     messages: List[ChatCompletionMessageParam],
     model_config: AutoConfig,
@@ -343,8 +355,9 @@ def parse_chat_messages_coroutines(
     """
     conversation = []
     mm_placeholder_counts = []
+    model_type = resolve_top_level_model_type(model_config)
     mm_data_tracker = MultimodalDataTracker(
-        model_config.model_type,
+        model_type,
         multimodal_server_config,
         request_media_io_kwargs=request_media_io_kwargs)
 
@@ -361,7 +374,6 @@ def parse_chat_messages_coroutines(
     #    path calls `_build_openai_content`, which reconstructs `conv["content"]` from
     #    `content_parts` - overwriting any STRING-style placeholders inserted here.
     # See also: `_resolve_content_format` (inputs/utils.py) for the full resolution used downstream.
-    model_type = model_config.model_type
     registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
         model_type)
     if registry_format is not None:

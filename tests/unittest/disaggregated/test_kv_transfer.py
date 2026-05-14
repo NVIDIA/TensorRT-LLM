@@ -11,6 +11,7 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
@@ -32,6 +33,14 @@ from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
+
+# Default to 4 worker threads for all KV transfer tests in this module.
+KV_TRANSFER_TEST_NUM_THREADS = 4
+
+
+@pytest.fixture(autouse=True)
+def _set_kv_transfer_num_threads(monkeypatch):
+    monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", KV_TRANSFER_TEST_NUM_THREADS)
 
 
 @dataclass
@@ -1064,14 +1073,13 @@ def test_transfer_with_gen_prefix_offset(use_v2):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
 
     Simulates gen-side prefix cache: ctx sends all blocks for [0, request_len),
-    gen only provides suffix block IDs with start_token_idx > 0.
-    _align_kv_blocks should align correctly so only the suffix data is written.
+    gen only provides the suffix block list. The receiver-side prefix is
+    implicit in the block count; the sender derives dst_start from it.
     """
     tensorrt_llm.logger.set_level("info")
     tokens_per_block = 8
     request_len = 32  # 4 blocks
     prefix_blocks = 2  # gen has 2 blocks already cached
-    prefix_tokens = prefix_blocks * tokens_per_block
 
     setup = create_transfer_worker_setup(
         ctx_tp=1,
@@ -1158,12 +1166,12 @@ def test_transfer_with_gen_prefix_offset(use_v2):
             token_range=TokenRange(start=0, end=request_len),
         )
 
-        # Gen receives only suffix blocks with start_token_idx offset
+        # Gen receives only the suffix list; dst_start is derived from block count.
         rx = gen_tw.create_rx_session(gen_request)
         recv_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=gen_suffix_block_ids,
-            token_range=TokenRange(start=prefix_tokens, end=request_len),
+            token_range=TokenRange(start=0, end=request_len),
         )
         rx.receive(recv_slice)
         tx.send(send_slice)
