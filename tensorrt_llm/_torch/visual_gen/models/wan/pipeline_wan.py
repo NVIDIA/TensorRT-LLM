@@ -493,6 +493,24 @@ class WanPipeline(BasePipeline):
                     f"Loaded fixed latent from {self.fixed_latent_path}, "
                     f"shape={self.fixed_latent.shape}"
                 )
+            # The fixed latent is reused across requests, so it must match the
+            # request shape exactly; otherwise the mismatch surfaces deep inside
+            # denoising/decoding with an unactionable error.
+            expected_shape = (
+                batch_size,
+                getattr(self.transformer.config, "in_channels", 16),
+                (num_frames - 1) // self.vae_scale_factor_temporal + 1,
+                height // self.vae_scale_factor_spatial,
+                width // self.vae_scale_factor_spatial,
+            )
+            if tuple(self.fixed_latent.shape) != expected_shape:
+                raise ValueError(
+                    f"Fixed latent shape {tuple(self.fixed_latent.shape)} does not match "
+                    f"expected request shape {expected_shape} "
+                    f"(batch_size={batch_size}, num_frames={num_frames}, "
+                    f"height={height}, width={width}). "
+                    f"Regenerate the fixed latent at {self.fixed_latent_path}."
+                )
             latents = self.fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
