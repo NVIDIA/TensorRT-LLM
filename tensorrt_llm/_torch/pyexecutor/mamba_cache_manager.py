@@ -1219,6 +1219,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._row_indices = torch.arange(self.max_batch_size,
                                          dtype=torch.long,
                                          device="cpu")
+        self._request_id_to_state_index = {}
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1583,7 +1584,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
-        self._request_id_to_state_index = {}
         for i, req in enumerate(self.requests):
             self._request_id_to_state_index[
                 req.py_request_id] = host_block_offsets[i].item()
@@ -1591,8 +1591,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
                           is_padding: Optional[List[bool]] = None) -> list:
-        if request_ids is not None and hasattr(self,
-                                               '_request_id_to_state_index'):
+        if request_ids is not None:
             # Return indices in the order of the caller's request_ids,
             # not the internal self.requests order.  This is critical when
             # the batch is reordered after prepare_resources (e.g. disagg
