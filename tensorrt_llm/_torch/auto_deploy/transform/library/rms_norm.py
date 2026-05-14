@@ -23,9 +23,12 @@ from ..interface import (
 
 _BACKEND_OPS = {
     "flashinfer": torch.ops.auto_deploy.flashinfer_rms_norm,
+    "grafia": torch.ops.auto_deploy.grafia_rms_norm,
     "triton": torch.ops.auto_deploy.triton_rms_norm,
     "torch": torch.ops.auto_deploy.torch_rmsnorm,
 }
+_GRAFIA_RMS_NORM_HIDDEN_SIZE = 2880
+_GRAFIA_RMS_NORM_ROWS = 107
 
 
 def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -101,6 +104,72 @@ def _rms_norm_replacement(
         f"Invalid {backend=}; must be one of {list(_BACKEND_OPS)}"
     )
     return _BACKEND_OPS[backend.lower()](data, weight, eps)
+
+
+def _meta_val(node_or_value):
+    return node_or_value.meta.get("val") if isinstance(node_or_value, Node) else None
+
+
+def _numel_from_shape(shape) -> int | None:
+    numel = 1
+    for dim in shape:
+        if not isinstance(dim, int):
+            return None
+        numel *= dim
+    return numel
+
+
+def _grafia_rms_norm_support_error(node: Node) -> str | None:
+    if len(node.args) < 2:
+        return "expected torch_rmsnorm(input, weight, eps) arguments"
+
+    input_meta = _meta_val(node.args[0])
+    weight_meta = _meta_val(node.args[1])
+    if input_meta is None or weight_meta is None:
+        return "missing tensor metadata"
+
+    input_device = getattr(input_meta, "device", None)
+    weight_device = getattr(weight_meta, "device", None)
+    if getattr(input_device, "type", None) != "cuda" or getattr(weight_device, "type", None) != "cuda":
+        return f"expected CUDA metadata, got input={input_device}, weight={weight_device}"
+    if getattr(input_meta, "dtype", None) is not torch.bfloat16:
+        return f"expected BF16 input metadata, got {getattr(input_meta, 'dtype', None)}"
+    if getattr(weight_meta, "dtype", None) is not torch.bfloat16:
+        return f"expected BF16 weight metadata, got {getattr(weight_meta, 'dtype', None)}"
+
+    input_shape = tuple(getattr(input_meta, "shape", ()))
+    weight_shape = tuple(getattr(weight_meta, "shape", ()))
+    if not input_shape:
+        return "expected input rank >= 1"
+    if input_shape[-1] != _GRAFIA_RMS_NORM_HIDDEN_SIZE:
+        return (
+            f"expected hidden_size == {_GRAFIA_RMS_NORM_HIDDEN_SIZE}, "
+            f"got {input_shape[-1]}"
+        )
+    numel = _numel_from_shape(input_shape)
+    if numel is None:
+        return "expected static input shape"
+    rows = numel // input_shape[-1]
+    if rows != _GRAFIA_RMS_NORM_ROWS:
+        return f"expected flattened rows == {_GRAFIA_RMS_NORM_ROWS}, got {rows}"
+    if weight_shape != (_GRAFIA_RMS_NORM_HIDDEN_SIZE,):
+        return (
+            f"expected weight shape ({_GRAFIA_RMS_NORM_HIDDEN_SIZE},), "
+            f"got {weight_shape}"
+        )
+
+    try:
+        if input_meta.stride(-1) != 1:
+            return "expected contiguous input last dimension"
+    except (AttributeError, IndexError, TypeError):
+        return "missing input stride metadata"
+    try:
+        if not weight_meta.is_contiguous():
+            return "expected contiguous weight metadata"
+    except (AttributeError, TypeError):
+        return "missing weight stride metadata"
+
+    return None
 
 
 @TransformRegistry.register("match_rmsnorm_pattern")
@@ -212,7 +281,18 @@ class FuseRMSNormConfig(TransformConfig):
 
     rmsnorm_backend: str = Field(
         default="flashinfer",
-        description="Backend to use for RMSNorm computation ('flashinfer', 'triton', or 'torch').",
+        description=(
+            "Backend to use for RMSNorm computation "
+            "('flashinfer', 'grafia', 'triton', or 'torch')."
+        ),
+    )
+    grafia_rmsnorm_fallback_backend: str = Field(
+        default="flashinfer",
+        description="Backend to use when rmsnorm_backend='grafia' and node metadata is unsupported.",
+    )
+    grafia_rmsnorm_strict: bool = Field(
+        default=False,
+        description="Raise instead of falling back when rmsnorm_backend='grafia' is unsupported.",
     )
     gated_rmsnorm_backend: str = Field(
         default="triton",
@@ -254,6 +334,13 @@ class FuseRMSNorm(BaseTransform):
             raise ValueError(
                 f"Invalid rmsnorm_backend, must be one of {list(_BACKEND_OPS)}, got {self.config.rmsnorm_backend}"
             )
+        if self.config.grafia_rmsnorm_fallback_backend.lower() not in _BACKEND_OPS:
+            raise ValueError(
+                "Invalid grafia_rmsnorm_fallback_backend, must be one of "
+                f"{list(_BACKEND_OPS)}, got {self.config.grafia_rmsnorm_fallback_backend}"
+            )
+        if self.config.grafia_rmsnorm_fallback_backend.lower() == "grafia":
+            raise ValueError("grafia_rmsnorm_fallback_backend cannot be 'grafia'")
 
         # Validate gated_rmsnorm_backend (currently only triton is supported)
         if self.config.gated_rmsnorm_backend.lower() != "triton":
@@ -264,10 +351,10 @@ class FuseRMSNorm(BaseTransform):
 
         graph = gm.graph
         backend = self.config.rmsnorm_backend.lower()
+        fallback_backend = self.config.grafia_rmsnorm_fallback_backend.lower()
         # Use the .default overload so downstream pattern matchers (which trace
         # the pattern via Python dispatch and end up with OpOverload targets)
         # see matching node targets, not an OpOverloadPacket.
-        target_op = _BACKEND_OPS[backend].default
         cnt = 0
 
         # First, fuse the norm-before-gate decomposition:
@@ -338,6 +425,7 @@ class FuseRMSNorm(BaseTransform):
                     torch.ops.auto_deploy.triton_rmsnorm_gated.default,
                     args=(x, weight, gate, eps, group_size, True),
                 )
+                fused_node.meta.update(output_node.meta)
 
             output_node.replace_all_uses_with(fused_node)
             graph.erase_node(output_node)
@@ -361,6 +449,18 @@ class FuseRMSNorm(BaseTransform):
         # Replace torch_rmsnorm ops with the selected backend
         for node in list(graph.nodes):
             if is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
+                target_backend = backend
+                if backend == "grafia":
+                    support_error = _grafia_rms_norm_support_error(node)
+                    if support_error is not None:
+                        if self.config.grafia_rmsnorm_strict:
+                            raise ValueError(
+                                "rmsnorm_backend='grafia' can route only CTM "
+                                "rmsnorm_rts-supported nodes: "
+                                f"{support_error}. Node: {node.format_node()}"
+                            )
+                        target_backend = fallback_backend
+                target_op = _BACKEND_OPS[target_backend].default
                 # Replace with the selected backend op
                 with graph.inserting_after(node):
                     new_node: Node = graph.call_function(
