@@ -766,7 +766,7 @@ class BasicAVTransformerBlock(nn.Module):
                 # seq-dim concat), so the cos/sin all-gather is unneeded and K
                 # rope work is U× cheaper. a2v keeps the all-gather path
                 # (Q=video huge, K/V=audio small — AG of the small audio is
-                # far cheaper than the wrapper's three full-video collectives).
+                # far cheaper than full-video a2a collectives).
                 # key_padding_mask zeros attention on audio pad slots when
                 # audio_pad_for_ulysses=True.
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
@@ -775,6 +775,7 @@ class BasicAVTransformerBlock(nn.Module):
                 if self._audio_is_sharded:
                     k_a2v = self._sp_all_gather(k_a2v)
                     v_a2v = self._sp_all_gather(v_a2v)
+
                 a2v_out = (
                     self.audio_to_video_attn(
                         vx_scaled,
@@ -1655,11 +1656,6 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        # Audio padding for Ulysses: when audio_pad_for_ulysses=True and
-        # T_a % U != 0, pad audio on entry to make it shardable. Build a
-        # [B, T_a_padded] bool mask (True=valid, False=pad) that travels
-        # through TransformerArgs to audio_attn1 + a2v cross-attn. Strip the
-        # padded tail on output below.
         # Audio padding for Ulysses: when self._audio_pad > 0 (set once by
         # configure_audio_ulysses under audio_pad_for_ulysses=True), pad audio
         # on entry to make it shardable. Build a [B, T_a_padded] bool mask
