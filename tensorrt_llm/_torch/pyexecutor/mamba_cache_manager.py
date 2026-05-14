@@ -132,60 +132,6 @@ def _mamba_rank_offset(mapping: Mapping) -> int:
             mapping.rank * 1_009)
 
 
-def _cap_mamba_max_batch_size(mamba_d_state, mamba_d_conv, mamba_num_heads,
-                              mamba_n_groups, mamba_head_dim, mamba_num_layers,
-                              mamba_layer_mask, mamba_cache_dtype,
-                              mamba_ssm_cache_dtype, max_batch_size, mapping,
-                              spec_config):
-    """Cap max_batch_size so Mamba state allocation fits in GPU memory."""
-    tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-    d_inner = mamba_head_dim * mamba_num_heads
-    conv_dim = (d_inner + 2 * mamba_n_groups * mamba_d_state) // tp_size
-    nheads = mamba_num_heads // tp_size
-
-    pp_layers, _ = get_pp_layers(mamba_num_layers,
-                                 mapping,
-                                 layer_mask=mamba_layer_mask)
-    num_local_layers = len(pp_layers)
-
-    max_num_sequences = max_batch_size * mapping.pp_size
-
-    ssm_dtype = mamba_ssm_cache_dtype if mamba_ssm_cache_dtype is not None else mamba_cache_dtype
-    ssm_elem = torch.empty(0, dtype=ssm_dtype).element_size()
-    conv_elem = torch.empty(0, dtype=mamba_cache_dtype).element_size()
-
-    # Per-sequence bytes: conv_state + ssm_state per layer
-    per_seq_bytes = num_local_layers * (
-        conv_dim * (mamba_d_conv - 1) * conv_elem +
-        nheads * mamba_head_dim * mamba_d_state * ssm_elem)
-
-    # Account for speculative decoding intermediate states
-    if spec_config is not None:
-        draft_len = spec_config.max_draft_len
-        per_seq_bytes += num_local_layers * (draft_len + 1) * (
-            nheads * mamba_head_dim * mamba_d_state * ssm_elem + conv_dim *
-            (mamba_d_conv - 1) * conv_elem)
-
-    if per_seq_bytes == 0:
-        return max_batch_size
-
-    free_memory = torch.cuda.mem_get_info()[0]
-    # Reserve half of free memory for Mamba state; the rest is for KV cache
-    # and activations.
-    budget = free_memory // 2
-    max_feasible = budget // per_seq_bytes
-
-    if max_feasible < max_num_sequences:
-        new_max_batch_size = max(1, max_feasible // mapping.pp_size)
-        logger.warning(f"Capping max_batch_size from {max_batch_size} to "
-                       f"{new_max_batch_size} for Mamba hybrid model "
-                       f"(free GPU memory: {free_memory / 2**30:.1f} GiB, "
-                       f"per-sequence Mamba state: {per_seq_bytes} bytes)")
-        return new_max_batch_size
-
-    return max_batch_size
-
-
 def use_cpp_mamba_cache_manager() -> bool:
     """Check if C++ MambaCacheManager should be used.
 
@@ -1231,13 +1177,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         KVCacheManager.free_resources(self, request, pin_on_release)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        # Check Mamba cache capacity before allocation.  CUDA graph warmup
-        # creates dummy requests for various batch sizes and expects None
-        # (not an exception) when resources are insufficient so it can skip
-        # oversized batch configurations gracefully.
-        max_mamba = MambaCacheManager.get_max_resource_count(self)
-        if len(request_ids) > max_mamba:
-            return None
         MambaCacheManager.add_dummy_requests(self, request_ids)
         return KVCacheManager.add_dummy_requests(self, request_ids, **kwargs)
 

@@ -241,6 +241,64 @@ class KvCacheCreator:
             model_engine)
         self._draft_config = draft_config
         self._skip_est = skip_est
+        self._cap_max_batch_size_for_hybrid_mamba()
+
+    def _cap_max_batch_size_for_hybrid_mamba(self) -> None:
+        """Reduce ``max_batch_size`` so the per-request Mamba state allocation
+        leaves enough budget for KV cache estimation.
+
+        Hybrid Mamba models contribute a per-batch-slot fixed cost (the
+        ``intercept`` term in :meth:`get_cache_size_per_token`) of
+        ``max_batch_size * num_mamba_layers_per_rank * state_bytes_per_layer``.
+        With ``attention_dp`` enabled the Mamba state is not TP-sharded, so
+        large ``max_batch_size`` values (e.g. driven by ``CudaGraphConfig``
+        batch_sizes) can push the intercept above the entire KV cache budget,
+        making :meth:`CacheCost.tokens_for_budget` clamp to 0 and the
+        downstream KV cache estimation assert "Impossible to fit in any
+        sequence in kvCache".
+
+        Must run before :meth:`try_prepare_estimation`/`_get_kv_size_per_token`,
+        because :meth:`get_cache_size_per_token` is a static method that uses
+        the ``max_batch_size`` passed in at call time.
+        """
+        if self._skip_est:
+            return
+        config = self._model_engine.model.model_config.pretrained_config
+        if not is_hybrid_linear(config):
+            return
+        try:
+            mamba_params = extract_mamba_kv_cache_params(
+                config,
+                spec_config=self._speculative_config,
+                quant_config=self._model_engine.model.model_config.quant_config,
+            )
+        except ValueError:
+            return
+        if mamba_params.num_mamba_layers == 0:
+            return
+        state_bytes_per_layer = mamba_params.get_states_bytes_per_layer(
+            self._mapping)
+        num_mamba_layers_per_rank = len(
+            self._mapping.pp_layers(mamba_params.num_mamba_layers))
+        state_bytes_per_rank = (num_mamba_layers_per_rank *
+                                state_bytes_per_layer)
+        if state_bytes_per_rank <= 0:
+            return
+        free_mem, _ = torch.cuda.mem_get_info()
+        budget = int(self._kv_cache_config.free_gpu_memory_fraction * free_mem)
+        # Reserve at least half the budget for KV cache tokens (slope term);
+        # the remainder is the maximum we let the Mamba state intercept consume.
+        max_intercept_bytes = budget // 2
+        max_feasible_batch = max_intercept_bytes // state_bytes_per_rank
+        if max_feasible_batch < 1:
+            max_feasible_batch = 1
+        if max_feasible_batch < self._max_batch_size:
+            logger.warning(
+                f"Capping max_batch_size from {self._max_batch_size} to "
+                f"{max_feasible_batch} for hybrid Mamba model "
+                f"(KV cache budget: {budget / (1 << 30):.1f} GiB, "
+                f"per-request Mamba state: {state_bytes_per_rank} bytes)")
+            self._max_batch_size = int(max_feasible_batch)
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
         config = model_engine.model.model_config.pretrained_config
