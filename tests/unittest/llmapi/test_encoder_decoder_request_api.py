@@ -47,7 +47,10 @@ class _FakeExecutor(GenerationExecutor):
         pass
 
 
-def _make_llm_for_preprocess(decoder_start_token_id=0):
+def _make_llm_for_preprocess(
+    decoder_start_token_id=0,
+    is_encoder_decoder=False,
+):
     llm = BaseLLM.__new__(BaseLLM)
     llm.args = SimpleNamespace(
         backend="pytorch",
@@ -57,14 +60,21 @@ def _make_llm_for_preprocess(decoder_start_token_id=0):
         parallel_config=SimpleNamespace(cp_size=1),
     )
     llm._generation_config = None
-    llm._hf_model_config = SimpleNamespace(decoder_start_token_id=decoder_start_token_id)
+    llm._hf_model_config = SimpleNamespace(
+        decoder_start_token_id=decoder_start_token_id,
+        is_encoder_decoder=is_encoder_decoder,
+    )
+    llm._encode_only = False
     llm.input_processor = SimpleNamespace()
     llm._tokenizer = None
     return llm
 
 
-def _make_llm_with_mock_executor(decoder_start_token_id=0):
-    llm = _make_llm_for_preprocess(decoder_start_token_id)
+def _make_llm_with_mock_executor(
+    decoder_start_token_id=0,
+    is_encoder_decoder=False,
+):
+    llm = _make_llm_for_preprocess(decoder_start_token_id, is_encoder_decoder)
     result = MagicMock()
     result._streaming = False
     result.metrics_dict = {}
@@ -74,12 +84,15 @@ def _make_llm_with_mock_executor(decoder_start_token_id=0):
     return llm
 
 
-def test_encoder_decoder_kwargs_do_not_shift_priority_position():
+def test_encoder_decoder_kwargs_are_not_public_llm_parameters():
     generate_params = list(signature(BaseLLM.generate).parameters)
     generate_async_params = list(signature(BaseLLM.generate_async).parameters)
+    preprocess_params = list(signature(BaseLLM.preprocess).parameters)
 
-    assert generate_params.index("priority") < generate_params.index("encoder_inputs")
-    assert generate_async_params.index("priority") < generate_async_params.index("encoder_inputs")
+    for params in (generate_params, generate_async_params, preprocess_params):
+        assert "encoder_inputs" not in params
+        assert "encoder_input_token_ids" not in params
+        assert "decoder_input_token_ids" not in params
 
 
 def test_generation_request_stores_encoder_input_token_ids():
@@ -140,56 +153,71 @@ def test_base_worker_forwards_encoder_input_token_ids_to_executor_request():
     assert captured["encoder_input_token_ids"] == [31, 32]
 
 
-def test_preprocess_synthesizes_decoder_start_token_for_encoder_request():
-    llm = _make_llm_for_preprocess(decoder_start_token_id=0)
+def test_preprocess_uses_text_inputs_as_encoder_inputs_for_encoder_decoder():
+    llm = _make_llm_for_preprocess(
+        decoder_start_token_id=7,
+        is_encoder_decoder=True,
+    )
+    llm.input_processor = MagicMock(return_value=([11, 12, 1], None))
 
     inputs = BaseLLM.preprocess(
         llm,
-        {"encoder_input_token_ids": [41, 42]},
+        "translate English to German: The house is wonderful.",
         sampling_params=_sampling_params(),
     )
 
-    assert inputs.prompt_token_ids == [0]
-    assert inputs.encoder_input_token_ids == [41, 42]
+    assert inputs.prompt_token_ids == [7]
+    assert inputs.encoder_input_token_ids == [11, 12, 1]
 
 
-def test_preprocess_accepts_decoder_input_token_ids_for_encoder_request():
-    llm = _make_llm_for_preprocess(decoder_start_token_id=None)
+def test_preprocess_uses_token_inputs_as_encoder_inputs_for_encoder_decoder():
+    llm = _make_llm_for_preprocess(
+        decoder_start_token_id=7,
+        is_encoder_decoder=True,
+    )
 
     inputs = BaseLLM.preprocess(
         llm,
-        {
-            "encoder_input_token_ids": [51, 52],
-            "decoder_input_token_ids": [2, 3],
-        },
+        [11, 12, 1],
         sampling_params=_sampling_params(),
     )
 
-    assert inputs.prompt_token_ids == [2, 3]
-    assert inputs.encoder_input_token_ids == [51, 52]
+    assert inputs.prompt_token_ids == [7]
+    assert inputs.encoder_input_token_ids == [11, 12, 1]
 
 
-def test_preprocess_accepts_explicit_encoder_token_kwarg():
-    llm = _make_llm_for_preprocess()
-
-    inputs = BaseLLM.preprocess(
-        llm,
-        [2, 3],
-        sampling_params=_sampling_params(),
-        encoder_input_token_ids=[55, 56],
+def test_preprocess_requires_decoder_start_token_for_encoder_decoder_inputs():
+    llm = _make_llm_for_preprocess(
+        decoder_start_token_id=None,
+        is_encoder_decoder=True,
     )
-
-    assert inputs.prompt_token_ids == [2, 3]
-    assert inputs.encoder_input_token_ids == [55, 56]
-
-
-def test_preprocess_requires_decoder_start_token_when_decoder_input_missing():
-    llm = _make_llm_for_preprocess(decoder_start_token_id=None)
 
     with pytest.raises(ValueError, match="decoder_start_token_id"):
         BaseLLM.preprocess(
             llm,
-            {"encoder_input_token_ids": [61, 62]},
+            [11, 12],
+            sampling_params=_sampling_params(),
+        )
+
+
+@pytest.mark.parametrize(
+    "inputs, match",
+    [
+        ({"encoder_input_token_ids": [41, 42]}, "not supported"),
+        ({"encoder_inputs": "source"}, "encoder_inputs is not supported"),
+        (
+            {"prompt_token_ids": [0], "decoder_input_token_ids": [2, 3]},
+            "decoder_input_token_ids is not supported",
+        ),
+    ],
+)
+def test_preprocess_rejects_encoder_decoder_dict_aliases(inputs, match):
+    llm = _make_llm_for_preprocess()
+
+    with pytest.raises(ValueError, match=match):
+        BaseLLM.preprocess(
+            llm,
+            inputs,
             sampling_params=_sampling_params(),
         )
 
@@ -209,52 +237,21 @@ def test_generate_async_forwards_preprocessed_encoder_input_token_ids():
     assert llm._executor.generate_async.call_args.kwargs["encoder_input_token_ids"] == [71, 72]
 
 
-def test_generate_async_accepts_encoder_token_kwarg_with_preprocessed_inputs():
-    llm = _make_llm_with_mock_executor()
+def test_generate_async_uses_inputs_as_encoder_inputs_for_encoder_decoder():
+    llm = _make_llm_with_mock_executor(
+        decoder_start_token_id=7,
+        is_encoder_decoder=True,
+    )
+    llm.input_processor = MagicMock(return_value=([71, 72], None))
 
     BaseLLM.generate_async(
         llm,
-        PreprocessedInputs(prompt_token_ids=[0]),
+        "translate English to German: The house is wonderful.",
         sampling_params=_sampling_params(),
-        encoder_input_token_ids=[81, 82],
     )
 
-    assert llm._executor.generate_async.call_args.kwargs["encoder_input_token_ids"] == [81, 82]
-
-
-def test_generate_async_rejects_conflicting_preprocessed_encoder_tokens():
-    llm = _make_llm_with_mock_executor()
-
-    with pytest.raises(ValueError, match="Conflicting encoder_input_token_ids"):
-        BaseLLM.generate_async(
-            llm,
-            PreprocessedInputs(
-                prompt_token_ids=[0],
-                encoder_input_token_ids=[91, 92],
-            ),
-            sampling_params=_sampling_params(),
-            encoder_input_token_ids=[93, 94],
-        )
-
-
-def test_generate_async_rejects_raw_kwargs_with_preprocessed_inputs():
-    llm = _make_llm_with_mock_executor()
-
-    with pytest.raises(ValueError, match="encoder_inputs cannot"):
-        BaseLLM.generate_async(
-            llm,
-            PreprocessedInputs(prompt_token_ids=[0]),
-            sampling_params=_sampling_params(),
-            encoder_inputs="source",
-        )
-
-    with pytest.raises(ValueError, match="decoder_input_token_ids cannot"):
-        BaseLLM.generate_async(
-            llm,
-            PreprocessedInputs(prompt_token_ids=[0]),
-            sampling_params=_sampling_params(),
-            decoder_input_token_ids=[1],
-        )
+    assert llm._executor.generate_async.call_args.args[0] == [7]
+    assert llm._executor.generate_async.call_args.kwargs["encoder_input_token_ids"] == [71, 72]
 
 
 def test_generate_async_accepts_old_positional_priority_argument():

@@ -396,8 +396,6 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
     config = AutoConfig.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     encoder_input_token_ids = tokenizer(_SOURCE_TEXT, add_special_tokens=True)["input_ids"]
-    decoder_start_token_id = config.decoder_start_token_id
-    assert decoder_start_token_id is not None
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
         f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}"
@@ -427,50 +425,24 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
         model_kwargs={"torch_dtype": torch_dtype},
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
     ) as llm:
-        text_response = llm.generate(
-            {
-                "encoder_inputs": _SOURCE_TEXT,
-            },
+        response = llm.generate(
+            _SOURCE_TEXT,
             sampling_params=sampling_params,
             use_tqdm=False,
         )
-        text_token_ids = _assert_t5_response(
-            text_response,
+        token_ids = _assert_t5_response(
+            response,
             encoder_input_len=len(encoder_input_token_ids),
             hidden_size=config.d_model,
             num_return_sequences=num_return_sequences,
         )
-        _print_generated_text(tokenizer, case_id, "encoder_inputs output", text_token_ids)
+        _print_generated_text(tokenizer, case_id, "output", token_ids)
         _assert_expected_generation(
             tokenizer,
-            text_token_ids,
+            token_ids,
             exact_match,
             expected_output_token_ids_by_output,
         )
-
-        explicit_token_response = llm.generate(
-            {
-                "encoder_input_token_ids": encoder_input_token_ids,
-                "decoder_input_token_ids": [decoder_start_token_id],
-            },
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )
-        explicit_token_ids = _assert_t5_response(
-            explicit_token_response,
-            encoder_input_len=len(encoder_input_token_ids),
-            hidden_size=config.d_model,
-            num_return_sequences=num_return_sequences,
-        )
-        _print_generated_text(tokenizer, case_id, "explicit token output", explicit_token_ids)
-        _assert_expected_generation(
-            tokenizer,
-            explicit_token_ids,
-            exact_match,
-            expected_output_token_ids_by_output,
-        )
-
-    assert explicit_token_ids == text_token_ids
 
 
 @pytest.mark.parametrize(
@@ -494,8 +466,6 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
     model_path = _get_t5_model_path(model_name)
     config = AutoConfig.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    decoder_start_token_id = config.decoder_start_token_id
-    assert decoder_start_token_id is not None
     sampling_params = _sampling_params(num_beams, num_return_sequences)
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
@@ -532,25 +502,13 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
         model_kwargs={"torch_dtype": torch_dtype},
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
     ) as llm:
-        text_responses = llm.generate(
-            [{"encoder_inputs": source_text} for source_text in _MIXED_ENCODER_SOURCE_TEXTS],
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )
-        explicit_token_responses = llm.generate(
-            [
-                {
-                    "encoder_input_token_ids": encoder_input_token_ids,
-                    "decoder_input_token_ids": [decoder_start_token_id],
-                }
-                for encoder_input_token_ids in encoder_input_token_ids_by_request
-            ],
+        responses = llm.generate(
+            _MIXED_ENCODER_SOURCE_TEXTS,
             sampling_params=sampling_params,
             use_tqdm=False,
         )
 
-        assert len(text_responses) == len(_MIXED_ENCODER_SOURCE_TEXTS)
-        assert len(explicit_token_responses) == len(_MIXED_ENCODER_SOURCE_TEXTS)
+        assert len(responses) == len(_MIXED_ENCODER_SOURCE_TEXTS)
 
         for request_idx, encoder_input_token_ids in enumerate(encoder_input_token_ids_by_request):
             expected_token_ids = (
@@ -562,9 +520,9 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
                 request_idx
             ]
 
-            text_response = text_responses[request_idx]
-            text_token_ids = _assert_t5_response(
-                text_response,
+            response = responses[request_idx]
+            token_ids = _assert_t5_response(
+                response,
                 encoder_input_len=len(encoder_input_token_ids),
                 hidden_size=config.d_model,
                 num_return_sequences=num_return_sequences,
@@ -572,37 +530,13 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
             _print_generated_text(
                 tokenizer,
                 f"{case_id}, request={request_idx}",
-                "encoder_inputs output",
-                text_token_ids,
+                "output",
+                token_ids,
             )
             _assert_expected_generation(
                 tokenizer,
-                text_token_ids,
+                token_ids,
                 exact_match=exact_match,
                 expected_token_ids_by_output=expected_token_ids,
                 expected_text_fragment=expected_text_fragment,
             )
-
-            explicit_token_response = explicit_token_responses[request_idx]
-            explicit_token_ids = _assert_t5_response(
-                explicit_token_response,
-                encoder_input_len=len(encoder_input_token_ids),
-                hidden_size=config.d_model,
-                num_return_sequences=num_return_sequences,
-            )
-            _print_generated_text(
-                tokenizer,
-                f"{case_id}, request={request_idx}",
-                "explicit token output",
-                explicit_token_ids,
-            )
-            _assert_expected_generation(
-                tokenizer,
-                explicit_token_ids,
-                exact_match=exact_match,
-                expected_token_ids_by_output=expected_token_ids,
-                expected_text_fragment=expected_text_fragment,
-            )
-
-            if expected_token_ids is not None:
-                assert explicit_token_ids == text_token_ids

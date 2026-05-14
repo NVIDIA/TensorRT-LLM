@@ -35,15 +35,6 @@ class TextPrompt(TypedDict):
     query: NotRequired[str]
     """The query input text for star attention."""
 
-    encoder_inputs: NotRequired[Union[str, List[int]]]
-    """The encoder-side input for encoder-decoder models."""
-
-    encoder_input_token_ids: NotRequired[List[int]]
-    """The encoder-side token IDs for encoder-decoder models."""
-
-    decoder_input_token_ids: NotRequired[List[int]]
-    """Optional decoder-side token IDs for encoder-decoder models."""
-
 
 class TokensPrompt(TypedDict):
     """Schema for a tokenized prompt."""
@@ -75,15 +66,6 @@ class TokensPrompt(TypedDict):
     query_token_ids: NotRequired[List[int]]
     """The query input token IDs for star attention."""
 
-    encoder_inputs: NotRequired[Union[str, List[int]]]
-    """The encoder-side input for encoder-decoder models."""
-
-    encoder_input_token_ids: NotRequired[List[int]]
-    """The encoder-side token IDs for encoder-decoder models."""
-
-    decoder_input_token_ids: NotRequired[List[int]]
-    """Optional decoder-side token IDs for encoder-decoder models."""
-
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
 
@@ -96,9 +78,7 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
         prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
     elif isinstance(inputs, dict):
         assert inputs.get("prompt") is not None \
-            or inputs.get("prompt_token_ids") is not None \
-            or inputs.get("encoder_inputs") is not None \
-            or inputs.get("encoder_input_token_ids") is not None
+            or inputs.get("prompt_token_ids") is not None
         return inputs
     else:
         raise TypeError(
