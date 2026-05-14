@@ -1881,7 +1881,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pp_partition[-1] = num_hidden_layers - sum(pp_partition[:-1])
         else:
             pp_partition = None
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        free_gpu_memory_fraction = 0.6 if torch_compile else 0.75
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=free_gpu_memory_fraction)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
