@@ -16,7 +16,7 @@
 from pathlib import Path
 
 import pytest
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
 from tensorrt_llm.llmapi import (
     LLM,
@@ -298,7 +298,6 @@ def _sampling_params(num_beams: int, num_return_sequences: int) -> SamplingParam
         assert num_return_sequences == 1
         return SamplingParams(
             max_tokens=_MAX_NEW_TOKENS,
-            return_encoder_output=True,
             temperature=0.0,
         )
 
@@ -306,7 +305,6 @@ def _sampling_params(num_beams: int, num_return_sequences: int) -> SamplingParam
         best_of=num_beams,
         max_tokens=_MAX_NEW_TOKENS,
         n=num_return_sequences,
-        return_encoder_output=True,
         temperature=0.0,
         use_beam_search=True,
     )
@@ -321,14 +319,9 @@ def _cuda_graph_config(
 
 def _assert_t5_response(
     response: RequestOutput,
-    encoder_input_len: int,
-    hidden_size: int,
     num_return_sequences: int,
 ) -> list[list[int]]:
     assert response.finished
-    assert response.encoder_output is not None
-    assert response.encoder_output.device.type == "cpu"
-    assert tuple(response.encoder_output.shape) == (encoder_input_len, hidden_size)
 
     assert len(response.outputs) == num_return_sequences
     token_ids_by_output = []
@@ -393,9 +386,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_t5_model_path(model_name)
-    config = AutoConfig.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    encoder_input_token_ids = tokenizer(_SOURCE_TEXT, add_special_tokens=True)["input_ids"]
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
         f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}"
@@ -432,8 +423,6 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
         )
         token_ids = _assert_t5_response(
             response,
-            encoder_input_len=len(encoder_input_token_ids),
-            hidden_size=config.d_model,
             num_return_sequences=num_return_sequences,
         )
         _print_generated_text(tokenizer, case_id, "output", token_ids)
@@ -464,7 +453,6 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_t5_model_path(model_name)
-    config = AutoConfig.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     sampling_params = _sampling_params(num_beams, num_return_sequences)
     case_id = (
@@ -472,11 +460,6 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
         f"cuda_graph=True, beams={num_beams}, returns={num_return_sequences}, "
         "mixed_encoder_lengths=True, batch_size=2"
     )
-    encoder_input_token_ids_by_request = [
-        tokenizer(source_text, add_special_tokens=True)["input_ids"]
-        for source_text in _MIXED_ENCODER_SOURCE_TEXTS
-    ]
-
     with LLM(
         model_path,
         backend="pytorch",
@@ -510,7 +493,7 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
 
         assert len(responses) == len(_MIXED_ENCODER_SOURCE_TEXTS)
 
-        for request_idx, encoder_input_token_ids in enumerate(encoder_input_token_ids_by_request):
+        for request_idx, response in enumerate(responses):
             expected_token_ids = (
                 None
                 if expected_output_token_ids_by_request is None
@@ -520,11 +503,8 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
                 request_idx
             ]
 
-            response = responses[request_idx]
             token_ids = _assert_t5_response(
                 response,
-                encoder_input_len=len(encoder_input_token_ids),
-                hidden_size=config.d_model,
                 num_return_sequences=num_return_sequences,
             )
             _print_generated_text(

@@ -201,7 +201,6 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
-        self._encoder_output: Optional[torch.Tensor] = None
         # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
         self.time_breakdown_metrics: Optional[Dict] = None
 
@@ -255,10 +254,6 @@ class GenerationResultBase:
     @property
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
-
-    @property
-    def encoder_output(self) -> Optional[torch.Tensor]:
-        return self._encoder_output
 
     @property
     def disaggregated_params(self) -> Optional[DisaggregatedParams]:
@@ -527,9 +522,6 @@ class GenerationResultBase:
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
-
-            if getattr(response_result, "encoder_output", None) is not None:
-                self._encoder_output = response_result.encoder_output
 
             if hasattr(response_result, "mm_embedding_handles"
                        ) and response_result.mm_embedding_handles is not None:
