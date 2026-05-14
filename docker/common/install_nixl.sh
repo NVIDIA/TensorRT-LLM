@@ -24,7 +24,23 @@ git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
 
 # Remove POSIX backend compilation from meson.build
-sed -i "/^subdir('posix')/d" src/plugins/meson.build
+sed -i -E "/^[[:space:]]*subdir\(['\"]posix['\"]\)/d" src/plugins/meson.build
+DISABLE_GPUNETIO="${DISABLE_NIXL_GPUNETIO:-0}"
+if [[ "${DISABLE_GPUNETIO}" != "1" ]] && [[ -d /opt/mellanox/doca/include ]] &&
+   ! grep -Rqs "need_mcst" /opt/mellanox/doca/include; then
+  DISABLE_GPUNETIO=1
+fi
+if [[ "${DISABLE_GPUNETIO}" == "1" ]]; then
+  # NIXL 0.9.0's GPUNETIO plugin is not compatible with DOCA 3.3 headers
+  # (doca_gpu_dev_verbs_qp::need_mcst was removed). TRT-LLM's RDMA DOCA path
+  # uses its own extension, so keep NIXL on the stable UCX/GDS plugins.
+  sed -i -E "/^[[:space:]]*subdir\(['\"]gpunetio['\"]\)/d" src/plugins/meson.build
+  if grep -nE "^[[:space:]]*subdir\(['\"]gpunetio['\"]\)" src/plugins/meson.build; then
+    echo "Failed to disable NIXL GPUNETIO plugin" >&2
+    exit 1
+  fi
+  echo "NIXL GPUNETIO plugin disabled"
+fi
 
 CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)
 

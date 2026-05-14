@@ -33,6 +33,7 @@ option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
+option(TRTLLM_ENABLE_RDMA "Build optional RDMA Python extensions" OFF)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -243,7 +244,8 @@ add_subdirectory(${3RDPARTY_DIR} 3rdparty)
 
 if(BUILD_DEEP_EP
    OR BUILD_DEEP_GEMM
-   OR BUILD_FLASH_MLA)
+   OR BUILD_FLASH_MLA
+   OR TRTLLM_ENABLE_RDMA)
   FetchContent_MakeAvailable(pybind11)
   include_directories(${CMAKE_BINARY_DIR}/_deps/pybind11-src/include)
 endif()
@@ -639,6 +641,15 @@ include_directories(SYSTEM ${TORCH_INCLUDE_DIRS})
 
 add_subdirectory(tensorrt_llm)
 
+if(TRTLLM_ENABLE_RDMA)
+  add_subdirectory(
+    ${TRT_LLM_ROOT_DIR}/tensorrt_llm/_torch/speculative/doca_rdma_ext
+    ${CMAKE_BINARY_DIR}/tensorrt_llm/doca_rdma_ext)
+  add_subdirectory(
+    ${TRT_LLM_ROOT_DIR}/tensorrt_llm/_torch/speculative/ibverbs_ext
+    ${CMAKE_BINARY_DIR}/tensorrt_llm/ibverbs_ext)
+endif()
+
 if(BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
@@ -665,4 +676,8 @@ endif()
 set(BUILD_WHEEL_TARGETS
     tensorrt_llm;nvinfer_plugin_tensorrt_llm
     CACHE STRING "Targets used to build wheel")
+if(TRTLLM_ENABLE_RDMA)
+  list(APPEND BUILD_WHEEL_TARGETS doca_rdma_ext)
+  list(APPEND BUILD_WHEEL_TARGETS ibverbs_ext)
+endif()
 add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})

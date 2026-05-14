@@ -394,8 +394,9 @@ class ModelLoader:
                 self._call_load_weights(model.load_weights, weights,
                                         self.weight_mapper)
 
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if (self.spec_config is not None and self.spec_config.
+                        spec_dec_mode.need_load_draft_weights() and not getattr(
+                            self.spec_config, "draft_offload_enabled", False)):
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
@@ -414,8 +415,9 @@ class ModelLoader:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 initialize_dummy_weights(model)
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if (self.spec_config is not None and self.spec_config.
+                        spec_dec_mode.need_load_draft_weights() and not getattr(
+                            self.spec_config, "draft_offload_enabled", False)):
                     model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.VISION_ONLY:

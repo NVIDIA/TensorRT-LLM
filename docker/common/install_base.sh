@@ -23,6 +23,71 @@ install_boost() {
     && rm -rf /tmp/boost_1_80_0 /tmp/boost.tar.gz
 }
 
+install_doca_ubuntu() {
+  local os_version
+  local doca_arch
+  local doca_lib_arch
+
+  os_version="$(grep -oP '(?<=^VERSION_ID=).+' /etc/os-release | tr -d '"')"
+  DOCA_VERSION="${DOCA_VERSION:-3.3.0}"
+  DOCA_UBUNTU_VERSION="${DOCA_UBUNTU_VERSION:-ubuntu${os_version}}"
+
+  case "$(uname -m)" in
+    x86_64)
+      doca_arch="x86_64"
+      doca_lib_arch="x86_64-linux-gnu"
+      ;;
+    aarch64|arm64)
+      doca_arch="aarch64"
+      doca_lib_arch="aarch64-linux-gnu"
+      ;;
+    *)
+      echo "Unsupported architecture for DOCA SDK: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "Installing DOCA SDK ${DOCA_VERSION} for ${DOCA_UBUNTU_VERSION}/${doca_arch}..."
+  echo "deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/${DOCA_VERSION}/${DOCA_UBUNTU_VERSION}/${doca_arch}/ ./" \
+    > /etc/apt/sources.list.d/doca.list
+
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    doca-devel \
+    doca-sdk-verbs \
+    libdoca-sdk-verbs-dev \
+    doca-sdk-gpunetio \
+    libdoca-sdk-gpunetio-dev
+
+  # Match the userspace RDMA stack against the DOCA repository when those
+  # packages are provided there.
+  apt-get install --reinstall -y \
+    rdma-core \
+    libibverbs1 \
+    libibverbs-dev \
+    ibverbs-utils \
+    ibverbs-providers
+
+  dpkg-query -W 'doca-*' 'libdoca-*' 2>/dev/null || true
+  if [ -e "/opt/mellanox/doca/lib/${doca_lib_arch}/libdoca_gpunetio.so" ] &&
+     readelf -d "/opt/mellanox/doca/lib/${doca_lib_arch}/libdoca_gpunetio.so" | grep -q "libcudart.so.12"; then
+    echo "ERROR: libdoca_gpunetio.so still links against libcudart.so.12; expected DOCA ${DOCA_VERSION} CUDA-13-compatible packages." >&2
+    exit 1
+  fi
+
+  if [ -d /opt/mellanox/doca/include ]; then
+    ln -sf /opt/mellanox/doca/include/*.h /usr/local/cuda/include/ 2>/dev/null || true
+    ln -sf /opt/mellanox/doca/include/*.cuh /usr/local/cuda/include/ 2>/dev/null || true
+  fi
+
+  echo 'export DOCA_DIR=/opt/mellanox/doca' >> "${ENV}"
+  echo 'export DOCA_INCLUDE_DIR=/opt/mellanox/doca/include' >> "${ENV}"
+  echo "export DOCA_LIB_DIR=/opt/mellanox/doca/lib/${doca_lib_arch}" >> "${ENV}"
+  echo "export PKG_CONFIG_PATH=/opt/mellanox/doca/lib/${doca_lib_arch}/pkgconfig:\$PKG_CONFIG_PATH" >> "${ENV}"
+  echo "export LD_LIBRARY_PATH=/opt/mellanox/doca/lib/${doca_lib_arch}:\$LD_LIBRARY_PATH" >> "${ENV}"
+  ldconfig
+}
+
 set_bash_env() {
   if [ ! -f ${BASH_ENV} ];then
     touch ${BASH_ENV}
@@ -69,6 +134,13 @@ init_ubuntu() {
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
+    rdma-core \
+    libibverbs1 \
+    libibverbs-dev \
+    ibverbs-utils \
+    ibverbs-providers \
+    gcc \
+    libc-dev \
     libtool \
     autoconf \
     automake \
@@ -91,6 +163,9 @@ init_ubuntu() {
     libzmq3-dev
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
+  fi
+  if [[ "${TRTLLM_ENABLE_RDMA:-0}" == "1" || "${TRTLLM_ENABLE_RDMA:-0}" == "ON" ]]; then
+    install_doca_ubuntu
   fi
 
   # PEP 668: Allow break system packages for ubuntu24.04,

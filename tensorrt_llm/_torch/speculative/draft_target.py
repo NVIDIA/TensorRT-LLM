@@ -20,6 +20,7 @@ where the draft and target models share the same model engine. The draft model
 layers are integrated into the target model's KV cache and run in a single forward pass.
 """
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -27,6 +28,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -36,6 +38,13 @@ from .mtp import MTPSampler
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DraftTargetDecodingConfig
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -96,6 +105,60 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self._rdma_offload_enabled = bool(
+            getattr(spec_config, "draft_offload_enabled", False)
+            or _env_enabled("TLLM_DRAFT_RDMA_OFFLOAD")
+        )
+        self._rdma_offload_v2 = bool(
+            getattr(spec_config, "draft_offload_v2", False)
+            or _env_enabled("TLLM_DRAFT_RDMA_OFFLOAD_V2")
+        )
+        self._rdma_v2_offload_layer = None
+        if self._rdma_offload_enabled:
+            if getattr(mapping, "tp_size", 1) != 1 or getattr(mapping, "pp_size", 1) != 1:
+                raise RuntimeError(
+                    "RDMA draft offload target path currently supports only "
+                    "single-rank TP/PP. Disable draft_offload_enabled for "
+                    "multi-rank runs."
+                )
+            if not self._rdma_offload_v2:
+                raise RuntimeError("RDMA draft offload requires draft_offload_v2=True")
+            from .ibverbs_draft_offload import IbverbsDraftOffloadConfig, IbverbsDraftOffloadLayer
+
+            self._rdma_v2_offload_layer = IbverbsDraftOffloadLayer(
+                IbverbsDraftOffloadConfig(
+                    nic_name=getattr(spec_config, "draft_offload_nic_name", "mlx5_0"),
+                    server_host=getattr(spec_config, "draft_offload_server_host", "127.0.0.1"),
+                    server_port=int(getattr(spec_config, "draft_offload_server_port", 47000)),
+                    remote_peer_name=getattr(
+                        spec_config, "draft_offload_v2_remote_peer_name", "draft_lpu"
+                    ),
+                    max_num_requests=int(
+                        getattr(spec_config, "draft_offload_v2_max_num_requests", 256)
+                    ),
+                    max_draft_len=int(spec_config.max_draft_len),
+                    transport=str(getattr(spec_config, "draft_offload_v2_transport", "ibverbs")),
+                    draft_model_path=getattr(spec_config, "draft_offload_v2_model_path", None),
+                    draft_model_dtype=str(
+                        getattr(spec_config, "draft_offload_v2_model_dtype", "bfloat16")
+                    ),
+                    draft_kv_cache_free_fraction=float(
+                        getattr(spec_config, "draft_offload_v2_kv_cache_free_fraction", 0.4)
+                    ),
+                    tcp_prompt_port=int(
+                        getattr(spec_config, "draft_offload_v2_tcp_prompt_port", 0)
+                    ),
+                )
+            )
+            logger.info(
+                "DraftTarget RDMA-v2 (izzy compatible) enabled: host=%s port=%s nic=%s "
+                "max_num_requests=%s max_draft_len=%s",
+                spec_config.draft_offload_server_host,
+                spec_config.draft_offload_server_port,
+                spec_config.draft_offload_nic_name,
+                spec_config.draft_offload_v2_max_num_requests,
+                spec_config.max_draft_len,
+            )
 
     @property
     def max_draft_len(self) -> int:
@@ -162,6 +225,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         spec_metadata: DraftTargetOneModelSpecMetadata,
         draft_model: nn.Module,
         resource_manager=None,
+        is_warmup: bool = False,
     ):
         """
         Technically incorrect at the moment.
@@ -183,6 +247,42 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata
         )
+
+        if self._rdma_offload_enabled:
+            if bool(is_warmup):
+                # Warmup: initialize RDMA connection so the first real decode
+                # step does not pay connection-setup latency. The channel
+                # starts lazily on first real forward, so warmup only returns
+                # a correctly-shaped zero tensor.
+                next_draft_tokens = torch.zeros(
+                    (batch_size, self.max_draft_len), dtype=torch.int32, device=logits.device
+                )
+            else:
+                next_draft_tokens = self._rdma_offload_draft_tokens(
+                    accepted_tokens=accepted_tokens,
+                    num_accepted_tokens=num_accepted_tokens,
+                    position_ids=position_ids,
+                    logits=logits,
+                    batch_size=batch_size,
+                    request_ids=getattr(spec_metadata, "request_ids", None),
+                    input_ids=input_ids,
+                    attn_metadata=attn_metadata,
+                )
+            next_new_tokens = self._prepare_next_new_tokens(
+                accepted_tokens,
+                next_draft_tokens,
+                spec_metadata.batch_indices_cuda,
+                batch_size,
+                num_accepted_tokens,
+            )
+            attn_metadata.use_spec_decoding = True
+            return {
+                "logits": raw_logits,
+                "new_tokens": accepted_tokens,
+                "new_tokens_lens": num_accepted_tokens,
+                "next_draft_tokens": next_draft_tokens,
+                "next_new_tokens": next_new_tokens,
+            }
 
         # Prepare attention metadata for speculative decoding and save state for restore
         self._prepare_attn_metadata_for_draft_target(attn_metadata, spec_metadata)
@@ -296,6 +396,92 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _rdma_offload_draft_tokens(
+        self,
+        *,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        logits: torch.Tensor,
+        batch_size: int,
+        request_ids: Optional[list] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        attn_metadata: Optional["AttentionMetadata"] = None,
+    ) -> torch.Tensor:
+        # V2 path: izzy-compatible 96-byte WRITE_WITH_IMM via
+        # ``IbverbsDraftOffloadLayer``.  All bookkeeping (round_seq,
+        # route binding, response dispatch) happens inside the layer.
+        if self._rdma_v2_offload_layer is not None:
+            if request_ids is None or len(request_ids) != int(batch_size):
+                # Fall back to a synthetic request id; v2 needs one per row.
+                request_ids = list(range(int(batch_size)))
+            # ``IbverbsDraftOffloadLayer.forward`` expects exactly one
+            # start-position per request (length == batch_size), but
+            # TRT-LLM passes the *full* per-token position_ids
+            # (length == total prompt+gen tokens in batch).  Build a
+            # per-request position vector — last position is what the
+            # draft side needs to know where to resume from.  Only
+            # batch_size=1 is exercised today (Phase 4 limitation); the
+            # multi-request path lands in Phase 9.
+            if position_ids is None or int(position_ids.numel()) == 0:
+                per_request_positions = torch.zeros(
+                    (int(batch_size),), dtype=torch.int64, device=logits.device
+                )
+            elif int(position_ids.numel()) == int(batch_size):
+                per_request_positions = position_ids.reshape(-1)
+            else:
+                last_pos = int(position_ids.reshape(-1)[-1].detach().cpu().item())
+                per_request_positions = torch.tensor(
+                    [last_pos] * int(batch_size), dtype=torch.int64, device=logits.device
+                )
+
+            # Auto prompt push on context phase: when ``num_contexts > 0``
+            # the request is being prefilled on the target side this step,
+            # so the draft side must also prefill before the first round
+            # trip lands. We push the full prompt token sequence for each
+            # context row. Batch_size==1 today (see the multi-request
+            # caveat above); the multi-row generalization slices
+            # ``input_ids`` by ``attn_metadata.seq_lens[:num_contexts]``.
+            if attn_metadata is not None and input_ids is not None:
+                num_contexts = int(getattr(attn_metadata, "num_contexts", 0))
+                if num_contexts > 0:
+                    flat = input_ids.reshape(-1)
+                    seq_lens = getattr(attn_metadata, "_seq_lens", None)
+                    if seq_lens is None:
+                        seq_lens = getattr(attn_metadata, "seq_lens", None)
+                    cursor = 0
+                    for row in range(num_contexts):
+                        if seq_lens is not None:
+                            length = int(seq_lens[row].item())
+                        else:
+                            # Fall back to the single-request shortcut.
+                            length = int(getattr(attn_metadata, "num_ctx_tokens", flat.numel()))
+                        prompt_tokens = flat[cursor : cursor + length].detach().cpu().tolist()
+                        cursor += length
+                        try:
+                            self._rdma_v2_offload_layer.push_prompt(
+                                int(request_ids[row]),
+                                prompt_tokens,
+                            )
+                        except RuntimeError as exc:
+                            logger.warning(
+                                "draft_offload push_prompt failed for request %s: %s",
+                                request_ids[row],
+                                exc,
+                            )
+
+            return self._rdma_v2_offload_layer(
+                input_ids=accepted_tokens,
+                position_ids=per_request_positions,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                batch_size=int(batch_size),
+                num_contexts=0,
+                request_ids=request_ids,
+            )
+
+        raise RuntimeError("RDMA draft offload layer was not initialized")
 
     def sample_and_accept_draft_tokens(
         self,
