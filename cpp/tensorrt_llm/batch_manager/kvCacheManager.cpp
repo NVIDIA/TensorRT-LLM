@@ -1173,6 +1173,8 @@ void BlockManager::releasePools()
 
 void WindowBlockManager::releasePools()
 {
+    mBufferManager.getStream().synchronize();
+
     for (auto& pool : mPools)
     {
         if (pool.primaryPtr)
@@ -1186,7 +1188,6 @@ void WindowBlockManager::releasePools()
     }
     // Release fabric memory backing (must happen after ITensor release)
     mFabricMemoryPools.clear();
-    mBufferManager.getStream().synchronize();
     mBufferManager.memoryPoolTrimTo(0);
 }
 
