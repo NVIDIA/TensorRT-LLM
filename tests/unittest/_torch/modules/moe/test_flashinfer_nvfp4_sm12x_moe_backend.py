@@ -15,10 +15,11 @@
 """Negative-path + dispatch tests for FlashInferNvfp4Sm12xFusedMoE.
 
 These checks run without a GPU: they verify the can_implement() gating
-matrix, the hard-error policy in create_moe.get_moe_cls, and the
-hybrid CUTLASS-prefill / b12x-decode dispatch predicate. Functional
-correctness of the b12x kernel is covered by end-to-end model tests on
-SM120/SM121 hardware.
+matrix, the heuristic auto-promotion in create_moe.get_moe_cls (the
+backend is selected transparently from `moe_backend=CUTLASS` on
+SM120/SM121 + NVFP4), and the hybrid CUTLASS-prefill / b12x-decode
+dispatch predicate. Functional correctness of the b12x kernel is
+covered by end-to-end model tests on SM120/SM121 hardware.
 """
 
 from unittest.mock import patch
@@ -28,10 +29,12 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.create_moe import get_moe_cls
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_flashinfer_nvfp4_sm12x import (
     FlashInferNvfp4Sm12xFusedMoE,
 )
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
 
 _FUSED_MOE_MODULE = "tensorrt_llm._torch.modules.fused_moe.fused_moe_flashinfer_nvfp4_sm12x"
 
@@ -90,39 +93,65 @@ def test_can_implement_rejects_unsupported_activation_dtype(dtype):
     assert reason is not None
 
 
-def test_get_moe_cls_raises_on_non_nvfp4():
-    """create_moe.get_moe_cls must hard-error rather than fall back silently."""
+def test_get_moe_cls_falls_back_to_cutlass_on_non_nvfp4():
+    """Heuristic auto-promotion only fires on NVFP4; otherwise CUTLASS path stays."""
     cfg = ModelConfig()
-    cfg.moe_backend = "FLASHINFER_NVFP4SM12X"
+    cfg.moe_backend = "CUTLASS"
     cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
-    with pytest.raises(ValueError, match="NVFP4"):
-        get_moe_cls(cfg)
-
-
-def test_get_moe_cls_raises_on_missing_quant():
-    cfg = ModelConfig()
-    cfg.moe_backend = "FLASHINFER_NVFP4SM12X"
-    cfg.quant_config = None
-    with pytest.raises(ValueError, match="NVFP4"):
-        get_moe_cls(cfg)
-
-
-def test_get_moe_cls_raises_on_unsupported_sm():
-    cfg = ModelConfig()
-    cfg.moe_backend = "FLASHINFER_NVFP4SM12X"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=100):
-        with pytest.raises(ValueError, match="SM"):
-            get_moe_cls(cfg)
-
-
-def test_get_moe_cls_returns_flashinfer_on_supported_sm():
-    cfg = ModelConfig()
-    cfg.moe_backend = "FLASHINFER_NVFP4SM12X"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
         cls = get_moe_cls(cfg)
+    assert cls is CutlassFusedMoE
+
+
+def test_get_moe_cls_falls_back_to_cutlass_on_missing_quant():
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTLASS"
+    cfg.quant_config = None
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
+        cls = get_moe_cls(cfg)
+    assert cls is CutlassFusedMoE
+
+
+def test_get_moe_cls_falls_back_to_cutlass_on_unsupported_sm():
+    """NVFP4 + non-SM120/121 must not auto-promote."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTLASS"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=100):
+        cls = get_moe_cls(cfg)
+    assert cls is CutlassFusedMoE
+
+
+@pytest.mark.parametrize("sm_version", sorted(FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_get_moe_cls_auto_promotes_on_supported_sm(sm_version):
+    """CUTLASS + NVFP4 + SM120/121 + flashinfer importable → hybrid backend."""
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTLASS"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
+        cls = get_moe_cls(cfg)
     assert cls is FlashInferNvfp4Sm12xFusedMoE
+
+
+def test_get_moe_cls_falls_back_when_flashinfer_missing(monkeypatch):
+    """Eligible hardware but flashinfer not importable → CutlassFusedMoE."""
+    import builtins
+
+    cfg = ModelConfig()
+    cfg.moe_backend = "CUTLASS"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    real_import = builtins.__import__
+
+    def _raise_on_flashinfer(name, *args, **kwargs):
+        if name == "flashinfer":
+            raise ImportError("flashinfer not installed (simulated)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _raise_on_flashinfer)
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
+        cls = get_moe_cls(cfg)
+    assert cls is CutlassFusedMoE
 
 
 # --------------------------------------------------------------------------

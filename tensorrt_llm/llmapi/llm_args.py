@@ -580,7 +580,7 @@ class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "FLASHINFER_NVFP4SM12X"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."

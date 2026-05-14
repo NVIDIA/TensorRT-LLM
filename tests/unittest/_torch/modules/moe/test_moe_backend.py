@@ -139,11 +139,20 @@ def create_test_backend(
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = dtype
 
+    # FLASHINFER_NVFP4SM12X is internal-only: the user-facing API selects it
+    # transparently via the CUTLASS heuristic auto-promotion on SM120/121 +
+    # NVFP4. Route through "CUTLASS" so the test exercises the same code path
+    # users hit.
+    moe_backend_value = (
+        "CUTLASS"
+        if backend_type == MoeBackendType.FLASHINFER_NVFP4SM12X
+        else backend_type.value
+    )
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
         mapping=mapping,
-        moe_backend=backend_type.value,
+        moe_backend=moe_backend_value,
     )
 
     return create_moe_backend(

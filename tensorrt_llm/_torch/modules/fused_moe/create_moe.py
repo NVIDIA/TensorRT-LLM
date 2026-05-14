@@ -34,6 +34,27 @@ def get_moe_cls(
     if override_quant_config is not None:
         quant_config = override_quant_config
     if moe_backend.upper() == "CUTLASS":
+        # Auto-promote to FlashInferNvfp4Sm12xFusedMoE (hybrid CUTLASS-prefill
+        # / b12x-decode) on SM120 / SM121 + NVFP4 when flashinfer is available.
+        # Falls back to plain CutlassFusedMoE otherwise.
+        if quant_config is not None and quant_config.quant_mode.has_nvfp4():
+            from tensorrt_llm._utils import get_sm_version
+            sm_version = get_sm_version()
+            if sm_version in FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS:
+                try:
+                    import flashinfer  # noqa: F401
+                    logger.info(
+                        "Auto-selecting FlashInferNvfp4Sm12xFusedMoE for hybrid "
+                        "CUTLASS-prefill / b12x-decode (SM%d + NVFP4).",
+                        sm_version,
+                    )
+                    return FlashInferNvfp4Sm12xFusedMoE
+                except ImportError:
+                    logger.warning(
+                        "FlashInferNvfp4Sm12xFusedMoE eligible (SM%d + NVFP4) "
+                        "but flashinfer is not importable; using CutlassFusedMoE.",
+                        sm_version,
+                    )
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
@@ -139,23 +160,6 @@ def get_moe_cls(
                 "Falling back to CutlassFusedMoE.")
             return CutlassFusedMoE
         return MegaMoEDeepGemm
-    elif moe_backend.upper() == "FLASHINFER_NVFP4SM12X":
-        # FlashInferNvfp4Sm12xFusedMoE is the hybrid CUTLASS-prefill /
-        # b12x-decode NVFP4 MoE backend for SM120/SM121. Hard-error rather
-        # than silently falling back to CUTLASS so a misconfigured request
-        # is loud at startup, not a silent perf regression.
-        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
-            raise ValueError(
-                "FlashInferNvfp4Sm12xFusedMoE requires NVFP4 quantization "
-                f"(got quant_config={quant_config}).")
-        from tensorrt_llm._utils import get_sm_version
-        sm_version = get_sm_version()
-        if sm_version not in FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS:
-            sm_list = "/".join(f"SM{v}" for v in sorted(
-                FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS))
-            raise ValueError(f"FlashInferNvfp4Sm12xFusedMoE requires {sm_list} "
-                             f"(got SM{sm_version}).")
-        return FlashInferNvfp4Sm12xFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
