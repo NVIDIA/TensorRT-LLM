@@ -13,7 +13,7 @@ For trtllm-bench, the test extracts the following key performance metrics from l
 
 - **BUILD_TIME**: Model build time
 - **INFERENCE_TIME**: Inference time
-- **TOKEN_THROUGHPUT**: Token throughput
+- **TOTAL_OUTPUT_THROUGHPUT**: Total output token throughput (system-wide)
 - **SEQ_THROUGHPUT**: Sequence throughput
 - **FIRST_TOKEN_TIME**: First token generation time
 - **OUTPUT_TOKEN_TIME**: Output token time
