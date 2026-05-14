@@ -22,7 +22,7 @@ The following is a table of supported models for the PyTorch backend:
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
 | `GraniteForCausalLM` [^5]            | Granite 3, Granite Guardian 3      | `ibm-granite/granite-3.1-8b-instruct`, `ibm-granite/granite-3.3-8b-instruct`, `ibm-granite/granite-guardian-3.2-5b` |
 | `GraniteMoeHybridForCausalLM` [^5]   | Granite 4.0 Hybrid MoE             | `ibm-granite/granite-4.0-h-small`            |
-| `GptOssForCausalLM` [^10]            | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
+| `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
 | `HunYuanDenseForCausalLM` [^5]       | Hunyuan Dense                      | `tencent/Hunyuan-7B-Instruct`                |
 | `HunYuanMoEForCausalLM` [^5]         | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
 | `InternLM3ForCausalLM` [^5]          | InternLM3                          | `internlm/internlm3-8b-instruct`             |
@@ -78,8 +78,6 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^7]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^8]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
 [^9]: Audio modality only supported on E2B/E4B variants.
-[^10]: Also supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend (native PyTorch backend support is unchanged). See AD configs for [20B](../../../examples/auto_deploy/model_registry/configs/gpt_oss_20b.yaml) and [120B](../../../examples/auto_deploy/model_registry/configs/gpt_oss_120b.yaml).
-
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
