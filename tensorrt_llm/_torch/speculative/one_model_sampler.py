@@ -116,7 +116,7 @@ def compute_probs_from_logits(
     """
     Compute probabilities from logits with temperature, top-k, and top-p applied.
     """
-    if logits.is_cuda and hasattr(torch.ops.trtllm, "compute_probs_from_logits_op"):
+    if logits.is_cuda:
         return torch.ops.trtllm.compute_probs_from_logits_op(
             logits, temperatures, top_k, top_p, skip_temperature
         )

@@ -1199,6 +1199,21 @@ def _register_fake():
           skip_temperature: bool = False) -> torch.Tensor:
         return logits.new_empty(list(logits.shape), dtype=torch.float32)
 
+    @torch.library.register_fake("trtllm::build_draft_prob_indices_out_op")
+    def _(topkScoreIndices: torch.Tensor, draftProbIndices: torch.Tensor,
+          topK: int, numDraftTokens: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::verify_dynamic_tree_rejection_out_op")
+    def _(candidates: torch.Tensor, draftProbs: torch.Tensor,
+          targetProbs: torch.Tensor, targetSupportIndices: torch.Tensor,
+          targetSupportLengths: torch.Tensor, draftProbIndices: torch.Tensor,
+          retrieveNextToken: torch.Tensor, retrieveNextSibling: torch.Tensor,
+          treeValid: torch.Tensor, acceptIndex: torch.Tensor,
+          acceptTokenNum: torch.Tensor, acceptToken: torch.Tensor,
+          numSpecStep: int, seed: torch.Tensor, offset: torch.Tensor) -> None:
+        return None
+
     @torch.library.register_fake(
         "trtllm::compute_draft_probs_for_dynamic_tree_rejection_op")
     def _(draftLogits: torch.Tensor,
