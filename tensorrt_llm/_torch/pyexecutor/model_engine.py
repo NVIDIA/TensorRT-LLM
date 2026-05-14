@@ -4000,9 +4000,6 @@ class PyTorchModelEngine(ModelEngine):
                     spec_tree_manager._all_slot_ids_buf[idx] = slot
                     idx += 1
 
-            if self._prepare_inputs_event is not None:
-                # Wait for H2D copy in last iteration, otherwise _prepare_inputs will modify host input and break last iteration's input
-                self._prepare_inputs_event.synchronize()
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
@@ -4259,3 +4256,11 @@ class PyTorchModelEngine(ModelEngine):
                 lp(request.py_request_id, logits_row, token_ids, None, None)
 
             logits_tensor[idx] = logits_row.view(-1)
+
+    def wait_for_input_copy(self):
+        """
+        Wait for input preparation and H2D copy of previous iteration before modifying host input,
+        otherwise the input of previous iteration will be overwritten.
+        """
+        if self._prepare_inputs_event is not None:
+            self._prepare_inputs_event.synchronize()
