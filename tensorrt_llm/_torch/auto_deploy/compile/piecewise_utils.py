@@ -102,21 +102,6 @@ _INPLACE_DYNAMIC_OPS = [
     "auto_deploy::cuda_cached_causal_conv1d",
 ]
 
-# Multi-stream passthrough functions that switch the CUDA current stream.
-# In the piecewise CG path these are run inside ``disable_multi_stream()``
-# (see ``multi_stream_utils.disable_multi_stream``), which turns each into a
-# no-op.  They are therefore safe to capture inside a static CUDA graph
-# segment — no reclassification-as-dynamic is necessary.  Multi-stream
-# execution is still active for decode batches via the monolithic CG path.
-_STREAM_SWITCH_FUNCTION_NAMES = frozenset(
-    {
-        "begin_aux_stream_passthrough",
-        "end_aux_stream_passthrough",
-        "wait_aux_stream_passthrough",
-        "record_event_passthrough",
-    }
-)
-
 
 def _get_all_dynamic_op_names() -> Set[str]:
     """Return the full set of dynamic op qualified names."""
@@ -348,12 +333,6 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
             submod_names.append(name)
 
     submod_names.sort(key=lambda n: int(n.split("_")[1]))
-
-    # NOTE: multi-stream passthrough nodes (begin_aux/end_aux/wait_aux/
-    # record_event_passthrough) are intentionally left inside their static
-    # partitions.  They are executed inside ``disable_multi_stream()`` on the
-    # piecewise path, so they become no-ops and are safely captured as part
-    # of the static CUDA graph segment.  No reclassification is needed here.
 
     dynamic_indices = []
     static_indices = []
