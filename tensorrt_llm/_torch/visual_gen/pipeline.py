@@ -468,35 +468,55 @@ class BasePipeline(nn.Module):
             self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
-        if not self.model_config.enable_parallel_vae:
-            return
-        if not dist.is_initialized() or dist.get_world_size() <= 1:
-            return
-        if self.vae is None:
+        """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
+
+        ``self._parallel_vae_enabled`` is a *global* mode flag: it is computed
+        from inputs that are identical on every rank (config + mapping +
+        deterministic capability check), so every rank agrees on whether
+        parallel-VAE decode ownership applies. The actual ``ParallelVAEFactory``
+        wrap is a local side effect that only runs on ranks in ``vae_ranks``.
+        """
+        parallel_cfg = self.model_config.parallel
+        vgm = self.model_config.visual_gen_mapping
+
+        # Global preconditions — evaluate identically on every rank.
+        self._parallel_vae_enabled = (
+            parallel_cfg.parallel_vae_size > 1
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and self.vae is not None
+            and vgm is not None
+            and ParallelVAEFactory.supports(type(self.vae))
+        )
+        if not self._parallel_vae_enabled:
+            # Quick check to see if it wasn't enabled due to missing support.
+            if (
+                parallel_cfg.parallel_vae_size > 1
+                and self.vae is not None
+                and not ParallelVAEFactory.supports(type(self.vae))
+            ):
+                logger.warning(
+                    f"Parallel VAE not supported for {self.__class__.__name__} "
+                    f"(VAE type: {type(self.vae).__name__}). "
+                    "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
+                    "parallel VAE for this VAE type."
+                )
             return
 
-        # Uses all ranks today; replace with a subset to dedicate specific ranks to VAE.
-        pg = dist.new_group(list(range(dist.get_world_size())))
-        try:
-            self.vae = ParallelVAEFactory.from_vae(
-                self.vae,
-                split_dim=self.model_config.parallel_vae_split_dim,
-                pg=pg,
-            )
-        except ValueError:
-            logger.warning(
-                f"Parallel VAE not supported for {self.__class__.__name__} "
-                f"(VAE type: {type(self.vae).__name__}). "
-                "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
-                "parallel VAE for this VAE type."
-            )
+        # Local side effect: only ranks in the VAE group wrap the VAE module.
+        if self.rank not in vgm.vae_ranks or vgm.vae_group is None:
             return
 
-        self._parallel_vae_enabled = True
+        self.vae = ParallelVAEFactory.from_vae(
+            self.vae,
+            split_dim=parallel_cfg.parallel_vae_split_dim,
+            pg=vgm.vae_group,
+            adj_groups=vgm.vae_adj_groups,
+        )
         logger.info(
             f"Parallel VAE enabled: {type(self.vae).__name__}, "
-            f"split_dim={self.model_config.parallel_vae_split_dim}, "
-            f"world_size={dist.get_world_size(pg)}"
+            f"split_dim={parallel_cfg.parallel_vae_split_dim}, "
+            f"world_size={dist.get_world_size(vgm.vae_group)}"
         )
 
     def torch_compile(self) -> None:
@@ -621,40 +641,40 @@ class BasePipeline(nn.Module):
         decode_fn: Callable[[torch.Tensor], Any],
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
-        """Execute VAE decoding. Only rank 0 performs decoding.
-        If parallel VAE is enabled, all processes perform decoding.
+        """Execute VAE decoding.
+
+        Decode ownership is decided from the global ``_parallel_vae_enabled``
+        flag set by ``setup_parallel_vae``:
+
+        - parallel-VAE mode on: ranks in ``vgm.vae_ranks`` decode collectively.
+        - parallel-VAE mode off: only rank 0 decodes.
+
+        Non-decoding ranks return ``None`` placeholders.
 
         Args:
-            latents: Primary latents to decode (e.g., video)
-            decode_fn: Decoder function for primary latents
+            latents: Primary latents to decode (e.g., video).
+            decode_fn: Decoder function for primary latents.
             extra_latents: Optional dict of additional latents to decode.
-                          Format: {name: (latents_tensor, decode_fn)}
-                          Example: {"audio": (audio_latents, audio_decode_fn)}
+                Format: ``{name: (latents_tensor, decode_fn)}``.
+                Example: ``{"audio": (audio_latents, audio_decode_fn)}``.
 
         Returns:
-            Single result if no extra_latents, tuple of results if extra_latents provided.
-            Non-rank-0 processes return None placeholders.
+            Single result if no ``extra_latents``, else a tuple of results.
+            Non-decoding ranks return ``None`` (or a tuple of ``None``).
         """
-
         if self._parallel_vae_enabled:
+            vgm = self.model_config.visual_gen_mapping
+            decode_ranks = set(vgm.vae_ranks)
+        else:
+            decode_ranks = {0}
+
+        if self.rank in decode_ranks:
             primary_result = decode_fn(latents)
             if extra_latents:
                 extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
                 return (primary_result,) + tuple(extra_results)
             return primary_result
 
-        if self.rank == 0:
-            primary_result = decode_fn(latents)
-
-            if extra_latents:
-                extra_results = []
-                for name, (extra_latent, extra_decode_fn) in extra_latents.items():
-                    extra_results.append(extra_decode_fn(extra_latent))
-                return (primary_result,) + tuple(extra_results)
-
-            return primary_result
-
-        # Return None placeholders for non-rank-0 processes
         n_results = 1 + (len(extra_latents) if extra_latents else 0)
         return (None,) * n_results if n_results > 1 else None
 

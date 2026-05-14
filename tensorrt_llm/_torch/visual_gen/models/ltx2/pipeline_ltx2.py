@@ -5,9 +5,10 @@
 import copy
 import gc
 import json
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -44,6 +45,95 @@ from .ltx2_core.types import (
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
 from .transformer_ltx2 import LTXModel, LTXModelType
+
+LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def ltx2_force_one_stage_enabled() -> bool:
+    return os.environ.get(LTX2_FORCE_ONE_STAGE_ENV, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _get_ltx2_auxiliary_search_dir(checkpoint_path: Path) -> Optional[Path]:
+    if checkpoint_path.is_dir():
+        return checkpoint_path
+    if checkpoint_path.is_file():
+        return checkpoint_path.parent
+    return None
+
+
+def _pick_unique_file(search_dir: Path, pattern: str) -> str:
+    matches = sorted(search_dir.glob(pattern))
+    if len(matches) == 1:
+        return str(matches[0])
+    if len(matches) > 1:
+        logger.warning(
+            f"Multiple files matching {pattern!r} under {search_dir}: "
+            f"{[m.name for m in matches]}. Pass the path explicitly to disambiguate."
+        )
+    return ""
+
+
+def discover_ltx2_two_stage_paths(
+    checkpoint_path: Path,
+    spatial_upsampler_path: str = "",
+    distilled_lora_path: str = "",
+) -> Tuple[str, str]:
+    """Resolve LTX2 two-stage auxiliary checkpoint paths."""
+    search_dir = _get_ltx2_auxiliary_search_dir(checkpoint_path)
+    if search_dir is None:
+        return spatial_upsampler_path, distilled_lora_path
+
+    if not spatial_upsampler_path:
+        spatial_upsampler_path = _pick_unique_file(
+            search_dir, "*spatial-upscaler*.safetensors"
+        ) or _pick_unique_file(search_dir, "*upsampler*.safetensors")
+    if not distilled_lora_path:
+        distilled_lora_path = _pick_unique_file(
+            search_dir, "*distilled-lora*.safetensors"
+        ) or _pick_unique_file(search_dir, "*distilled*lora*.safetensors")
+
+    return spatial_upsampler_path, distilled_lora_path
+
+
+def resolve_ltx2_pipeline_extra_attrs(
+    checkpoint_path: Path,
+    extra_attrs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve LTX2 pipeline-selection attributes before variant selection."""
+    extra_attrs = dict(extra_attrs or {})
+    spatial_upsampler_path = extra_attrs.get("spatial_upsampler_path", "")
+    distilled_lora_path = extra_attrs.get("distilled_lora_path", "")
+    resolved_upsampler_path, resolved_lora_path = discover_ltx2_two_stage_paths(
+        checkpoint_path,
+        spatial_upsampler_path,
+        distilled_lora_path,
+    )
+    if not resolved_upsampler_path and not resolved_lora_path:
+        return {}
+
+    if bool(resolved_upsampler_path) != bool(resolved_lora_path):
+        if spatial_upsampler_path or distilled_lora_path:
+            missing = "distilled_lora_path" if resolved_upsampler_path else "spatial_upsampler_path"
+            raise ValueError(
+                "LTX2 two-stage pipeline requires both spatial_upsampler_path "
+                f"and distilled_lora_path, but {missing} was not provided or discovered."
+            )
+        logger.warning(
+            "Found only one LTX2 two-stage auxiliary checkpoint in "
+            f"{checkpoint_path}; falling back to the one-stage pipeline. "
+            "Pass both paths explicitly to enable two-stage inference."
+        )
+        return {}
+
+    if not spatial_upsampler_path:
+        logger.info(f"Discovered LTX2 spatial upsampler: {resolved_upsampler_path}")
+    if not distilled_lora_path:
+        logger.info(f"Discovered LTX2 distilled LoRA: {resolved_lora_path}")
+    return {
+        "spatial_upsampler_path": resolved_upsampler_path,
+        "distilled_lora_path": resolved_lora_path,
+    }
 
 
 def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -> None:
@@ -487,6 +577,19 @@ class LTX2Pipeline(BasePipeline):
 
     @classmethod
     def resolve_variant(cls, config):
+        if getattr(config, "cache_backend", None) == "cache_dit":
+            logger.info("Cache-DiT is enabled; forcing one-stage LTX2 pipeline.")
+            return cls
+
+        if ltx2_force_one_stage_enabled():
+            logger.info(f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled; forcing one-stage LTX2 pipeline.")
+            return cls
+
+        checkpoint_path = getattr(config.pretrained_config, "_name_or_path", "")
+        if checkpoint_path:
+            config.extra_attrs.update(
+                resolve_ltx2_pipeline_extra_attrs(Path(checkpoint_path), config.extra_attrs)
+            )
         if config.extra_attrs.get("spatial_upsampler_path") and config.extra_attrs.get(
             "distilled_lora_path"
         ):

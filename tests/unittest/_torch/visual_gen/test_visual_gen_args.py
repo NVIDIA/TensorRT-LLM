@@ -255,6 +255,10 @@ class TestParallelConfigValidation:
         pc = ParallelConfig()
         assert pc.seq_parallel_size == 1
 
+    def test_parallel_vae_size_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            ParallelConfig(parallel_vae_size=0)
+
 
 class TestVisualGenArgsPickle:
     """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""
