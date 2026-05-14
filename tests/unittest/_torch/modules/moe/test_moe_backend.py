@@ -144,9 +144,7 @@ def create_test_backend(
     # NVFP4. Route through "CUTLASS" so the test exercises the same code path
     # users hit.
     moe_backend_value = (
-        "CUTLASS"
-        if backend_type == MoeBackendType.FLASHINFER_NVFP4SM12X
-        else backend_type.value
+        "CUTLASS" if backend_type == MoeBackendType.FLASHINFER_NVFP4SM12X else backend_type.value
     )
     model_config = ModelConfig(
         pretrained_config=pretrained_config,

@@ -891,10 +891,7 @@ def should_skip_flashinfer_nvfp4_sm12x(
             f"got comm_method={comm_method}, parallel_mode={parallel_mode}."
         )
     if moe_tp_size != 1:
-        return (
-            f"FlashInferNvfp4Sm12xFusedMoE requires ep_size=1; "
-            f"got moe_tp_size={moe_tp_size}."
-        )
+        return f"FlashInferNvfp4Sm12xFusedMoE requires ep_size=1; got moe_tp_size={moe_tp_size}."
     return None
 
 

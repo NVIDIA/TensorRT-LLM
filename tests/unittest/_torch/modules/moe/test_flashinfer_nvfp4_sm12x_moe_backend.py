@@ -35,7 +35,6 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_flashinfer_nvfp4_sm12x impo
 )
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-
 _FUSED_MOE_MODULE = "tensorrt_llm._torch.modules.fused_moe.fused_moe_flashinfer_nvfp4_sm12x"
 
 
