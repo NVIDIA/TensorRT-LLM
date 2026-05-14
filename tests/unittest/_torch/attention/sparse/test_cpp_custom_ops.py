@@ -159,7 +159,7 @@ def test_indexer_k_cache_gather_contiguous(
         total_kv_len, num_blocks, block_size, per_token_size, device
     )
 
-    # C++ op
+    # C++ op (head_dim is payload bytes per token: 128 for FP8)
     cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
         k_cache, slot_fp8, slot_scale, k_token_start, num_tokens, HEAD_DIM
     )
