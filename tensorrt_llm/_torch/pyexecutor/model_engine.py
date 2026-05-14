@@ -853,6 +853,30 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
+    def _assert_all_tp_ranks_have_warmup_batch(self, batch,
+                                               num_tokens: int) -> None:
+        """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
+
+        Under attention-DP, each rank's KV cache available capacity can differ at
+        runtime, causing _create_warmup_request to return None on some ranks while
+        others proceed into forward() with tp_comm collectives — deadlocking the
+        job. This check prevents the deadlock by failing early with diagnostic info.
+        """
+        if self.mapping.tp_size <= 1:
+            return
+        has_batch = int(batch is not None)
+        all_flags = list(self.dist.tp_allgather(has_batch))
+        if any(all_flags) and not all(all_flags):
+            # Gather token counts for diagnostics
+            all_tokens = list(self.dist.tp_allgather(num_tokens))
+            failed_ranks = [i for i, f in enumerate(all_flags) if not f]
+            raise RuntimeError(
+                f"Warmup batch creation failed on TP rank(s) {failed_ranks} "
+                f"but succeeded on others. This would cause a collective "
+                f"deadlock. Per-rank curr_max_num_tokens: {all_tokens}. "
+                f"This indicates asymmetric KV cache capacity across TP ranks. "
+                f"Consider increasing --kv_cache_free_gpu_mem_fraction.")
+
     def _general_warmup_impl(
             self, resource_manager: ResourceManager,
             warmup_requests_configs: List[Tuple[int, int]]) -> None:
@@ -866,8 +890,12 @@ class PyTorchModelEngine(ModelEngine):
                         self._create_warmup_request(resource_manager,
                                                     num_tokens, num_gen_tokens),
                         resource_manager) as batch:
+                    if batch is None and self.mapping.tp_size <= 1:
+                        continue  # Not enough KV cache space (single rank, safe to skip)
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, num_tokens)
                     if batch is None:
-                        continue  # Not enough KV cache space
+                        continue  # All ranks agree: not enough space
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
@@ -901,6 +929,11 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,
                                              resource_manager) as batch:
+                if batch is None and self.mapping.tp_size <= 1:
+                    pass  # Single rank, safe to skip
+                else:
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, curr_max_num_tokens)
                 if batch is not None:
                     # Reset the flag is_first_draft for the draft model.
                     # This is necessary for overlap scheduler.
