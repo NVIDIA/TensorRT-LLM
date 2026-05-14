@@ -1728,21 +1728,11 @@ class MLA(nn.Module):
         return k_pe
 
     def _deepseek_v4_q_b_layernorm(self, q: torch.Tensor) -> torch.Tensor:
-        try:
-            q_norm_op = torch.ops.trtllm.deepseek_v4_q_norm
-        except AttributeError:
-            q_norm_op = None
-
         assert (q.dim() == 2
                 and q.shape[1] == self.num_heads_tp * self.qk_head_dim)
-        total_rows = q.shape[0] * self.num_heads_tp
-        if (q_norm_op is not None and q.is_cuda and q.is_contiguous()
-                and q.dtype in (torch.float16, torch.bfloat16)
-                and self.qk_head_dim == 512 and total_rows >= 8192):
-            return q_norm_op(q, self.num_heads_tp, self.qk_head_dim,
-                             float(self.q_b_layernorm.variance_epsilon))
-
-        return self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)
+        return torch.ops.trtllm.deepseek_v4_q_norm(
+            q, self.num_heads_tp, self.qk_head_dim,
+            float(self.q_b_layernorm.variance_epsilon))
 
     def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
                           k: torch.Tensor, v: torch.Tensor,

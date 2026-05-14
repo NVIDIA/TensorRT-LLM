@@ -659,8 +659,8 @@ def _register_fake():
         num_n_blocks = (k + 127) // 128
         num_packed_sf_k = (num_n_blocks + 3) // 4
         return torch.empty_like(input,
-                                 dtype=torch.float8_e4m3fn), input.new_empty(
-                                     (m, num_packed_sf_k), dtype=torch.int32)
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    (m, num_packed_sf_k), dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
