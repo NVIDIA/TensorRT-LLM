@@ -116,6 +116,12 @@ SLURM_INFRA_RETRY_MAX = 2
 // or BOTH in the shared-lib PATTERN_CATALOG.
 K8S_INFRA_RETRY_MAX = 2
 
+// How often the periodicUploadProgress watcher snapshots the in-progress
+// ${stageName}/ directory (containing the PeriodicJUnitXML reporter's
+// results.xml) up to Artifactory. 5 minutes balances Artifactory traffic
+// against staleness for multi-hour test stages.
+PROGRESS_UPLOAD_INTERVAL_SEC = 300
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -948,6 +954,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
     def stageIsInterrupted = false
+    // Tracks whether the Run Pytest stage's track step returned without
+    // throwing. Only on `true` do we sweep this stage's progress tar from
+    // Artifactory in the finally block (forensic tars from failed runs are
+    // kept). Set after the `node(...)` block; defaults to false so any
+    // earlier-thrown exception leaves the progress tar untouched.
+    def pytestSucceeded = false
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -1397,25 +1409,50 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Track the Slurm job
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptTrackPathNode
-                    ),
-                    numRetries: 3
+                // Track the Slurm job alongside a controller-side watcher
+                // that SSH-stats the remote results.xml and SCPs / uploads
+                // a progress tar whenever the file's mtime advances. The
+                // sentinel is touched in `finally` so the watcher exits
+                // whether track succeeded, failed, or was interrupted.
+                def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
+                sh "rm -f ${pytestDoneFile}"
+                parallel(
+                    'track': {
+                        try {
+                            Utils.exec(
+                                pipeline,
+                                timeout: false,
+                                script: Utils.sshUserCmd(
+                                    remote,
+                                    scriptTrackPathNode
+                                ),
+                                numRetries: 3
+                            )
+                        } finally {
+                            sh "touch ${pytestDoneFile}"
+                        }
+                    },
+                    'progress-upload': {
+                        periodicUploadProgressSlurm(pipeline, remote, jobUID, stageName, pytestDoneFile)
+                    },
+                    failFast: false,
                 )
             }
             echo "Finished test stage execution."
             }  // end CloudManager.withSlurmSshCredentials
         }  // end withCredentials
+        // Reached only if no stage above (Initialize Test, Run Pytest) threw.
+        pytestSucceeded = true
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
     } finally {
         uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
+        if (pytestSucceeded) {
+            // pytest reached its natural end: drop the in-progress checkpoint
+            // tar; the final tar just uploaded by uploadResults supersedes it.
+            deleteProgressArtifact(stageName)
+        }
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -2814,6 +2851,145 @@ REUSED_TESTS_EOF
     }
 }
 
+// Watcher that runs alongside pytest and periodically snapshots the stage's
+// in-progress test-results directory to Artifactory under a separate
+// `test-results-progress/` path. The PeriodicJUnitXML pytest plugin already
+// rewrites `${WORKSPACE}/${stageName}/results.xml` atomically every batch;
+// this function snapshots whatever is on disk so a pod eviction / SIGKILL
+// that prevents the stage's `finally` upload still leaves a usable
+// checkpoint behind.
+//
+// Polls the XML's mtime so unchanged files are skipped. Upload failures are
+// logged and swallowed -- the watcher must never break the pytest branch.
+// Exits cleanly when ${sentinelPath} appears (touched by the pytest branch's
+// `finally`) or on interrupt.
+//
+// Progress tarballs use a `-progress.tar.gz` suffix so they do not collide
+// with the final stage tar's `ensureStageResultNotUploaded` guard.
+def periodicUploadProgress(stageName, sentinelPath, intervalSec = PROGRESS_UPLOAD_INTERVAL_SEC) {
+    def xmlPath = "${WORKSPACE}/${stageName}/results.xml"
+    def progressTar = "results-${stageName}-progress.tar.gz"
+    def remoteTarget = "${UPLOAD_PATH}/test-results-progress/"
+    long lastMtime = 0
+    try {
+        while (!fileExists(sentinelPath)) {
+            sleep(intervalSec)
+            if (fileExists(sentinelPath)) break
+            if (!fileExists(xmlPath)) continue
+            try {
+                def mtimeStr = sh(returnStdout: true,
+                                  script: "stat -c %Y '${xmlPath}' 2>/dev/null || echo 0").trim()
+                long mtime = mtimeStr ? (mtimeStr as long) : 0L
+                if (mtime <= lastMtime) continue
+                lastMtime = mtime
+                sh "tar -czf ${progressTar} ${stageName}/"
+                trtllm_utils.uploadArtifacts(progressTar, remoteTarget)
+                echo "[PROGRESS-UPLOAD] ${stageName}: uploaded checkpoint (mtime=${mtime})"
+            } catch (InterruptedException ie) {
+                throw ie
+            } catch (Exception ue) {
+                echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal): ${ue.message}"
+            }
+        }
+        echo "[PROGRESS-UPLOAD] ${stageName}: pytest done, watcher exiting"
+    } catch (InterruptedException e) {
+        echo "[PROGRESS-UPLOAD] ${stageName}: watcher interrupted, exiting"
+        throw e
+    }
+}
+
+// SLURM-sbatch variant of periodicUploadProgress. Used by
+// runLLMTestlistWithSbatch where pytest runs on a SLURM compute node (no
+// Jenkins agent) and writes results to /home/svc_tensorrt/bloom/scripts/
+// ${jobUID}/ on the SLURM front-end node, mounted-shared with the compute
+// node. The watcher runs on the Jenkins controller: SSH-stats the remote
+// XML's mtime; on advance, SCPs the latest results*.xml into the
+// controller's ${WORKSPACE}/${stageName}/ then tars + uploads via the
+// existing trtllm_utils.uploadArtifacts.
+//
+// Only XML files are fetched (no perf folders) -- those are written at
+// session end and would just bloat each checkpoint without adding recovery
+// value. Failures inside the loop are echoed and swallowed; only
+// InterruptedException escapes.
+def periodicUploadProgressSlurm(pipeline, Map remote, String jobUID, String stageName,
+                                String sentinelPath, int intervalSec = PROGRESS_UPLOAD_INTERVAL_SEC) {
+    def remoteWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+    def remoteXmlGlob = "${remoteWorkspace}/results*.xml"
+    def remoteMtimeProbe = "${remoteWorkspace}/results.xml"
+    def progressTar = "results-${stageName}-progress.tar.gz"
+    def remoteTarget = "${UPLOAD_PATH}/test-results-progress/"
+    long lastMtime = 0
+    try {
+        while (!fileExists(sentinelPath)) {
+            sleep(intervalSec)
+            if (fileExists(sentinelPath)) break
+            try {
+                def mtimeStr = Utils.exec(
+                    pipeline,
+                    script: Utils.sshUserCmd(remote,
+                        "\"stat -c %Y ${remoteMtimeProbe} 2>/dev/null || echo 0\""),
+                    returnStdout: true,
+                    numRetries: 1,
+                ).trim()
+                long mtime = mtimeStr.isNumber() ? (mtimeStr as long) : 0L
+                if (mtime <= lastMtime) continue
+                lastMtime = mtime
+                sh "mkdir -p ${stageName}"
+                def scpRc = Utils.exec(
+                    pipeline,
+                    script: scpFromRemoteCmd(remote, remoteXmlGlob, "${stageName}/"),
+                    returnStatus: true,
+                    numRetries: 1,
+                )
+                if (scpRc != 0) {
+                    echo "[PROGRESS-UPLOAD] ${stageName}: scp returned ${scpRc}; skipping this iteration"
+                    continue
+                }
+                sh "tar -czf ${progressTar} ${stageName}/"
+                trtllm_utils.uploadArtifacts(progressTar, remoteTarget)
+                echo "[PROGRESS-UPLOAD] ${stageName}: uploaded sbatch checkpoint (mtime=${mtime})"
+            } catch (InterruptedException ie) {
+                throw ie
+            } catch (Exception ue) {
+                echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal): ${ue.message}"
+            }
+        }
+        echo "[PROGRESS-UPLOAD] ${stageName}: track done, watcher exiting"
+    } catch (InterruptedException e) {
+        echo "[PROGRESS-UPLOAD] ${stageName}: watcher interrupted, exiting"
+        throw e
+    }
+}
+
+// Removes the in-progress checkpoint tarball this stage uploaded via
+// periodicUploadProgress. Called only when the pytest+rerun execution
+// succeeded -- forensic checkpoints from failed runs are kept so the
+// orphan reflects "this attempt did not finish cleanly".
+//
+// Build-scoped: ${UPLOAD_PATH} is per-build, so unswept progress tars are
+// garbage-collected with the rest of the build's artifacts anyway.
+def deleteProgressArtifact(stageName) {
+    def target = "${UPLOAD_PATH}/test-results-progress/results-${stageName}-progress.tar.gz"
+    try {
+        rtServer(
+            id: 'Artifactory',
+            url: 'https://urm.nvidia.com/artifactory',
+            credentialsId: 'urm-artifactory-creds',
+            bypassProxy: true,
+            timeout: 300,
+        )
+        rtDelete(
+            serverId: 'Artifactory',
+            spec: """{ "files": [ { "pattern": "${target}" } ] }""",
+        )
+        echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${target}"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "[PROGRESS-UPLOAD] ${stageName}: progress tar delete failed (non-fatal): ${e.message}"
+    }
+}
+
 /**
  * Decode a postTag into the postTags used by prior attempts of the same
  * stage in this build.
@@ -3077,26 +3253,45 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
+                // Sentinel that the watcher polls to know pytest has exited
+                // (success or failure). Lives outside ${stageName}/ so the
+                // `rm -rf ${stageName}/` at pytest startup doesn't wipe it.
+                def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
+                sh "rm -f ${pytestDoneFile}"
                 try {
-                    if (preprocessedLists.regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
-                    } else {
-                        echo "No regular tests to run for stage ${stageName}"
-                        noRegularTests = true
-                        sh "mkdir -p ${stageName}"
-                        // Create an empty results.xml file for consistency
-                        sh """
-                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                            echo '<testsuites>' >> ${stageName}/results.xml
-                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                            echo '</testsuite>' >> ${stageName}/results.xml
-                            echo '</testsuites>' >> ${stageName}/results.xml
-                        """
-                    }
+                    parallel(
+                        'pytest': {
+                            try {
+                                if (preprocessedLists.regularCount > 0) {
+                                    sh """
+                                        rm -rf ${stageName}/ && \
+                                        cd ${llmSrc}/tests/integration/defs && \
+                                        ${pytestCommand.join(" ")}
+                                    """
+                                } else {
+                                    echo "No regular tests to run for stage ${stageName}"
+                                    noRegularTests = true
+                                    sh "mkdir -p ${stageName}"
+                                    // Create an empty results.xml file for consistency
+                                    sh """
+                                        echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
+                                        echo '<testsuites>' >> ${stageName}/results.xml
+                                        echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
+                                        echo '</testsuite>' >> ${stageName}/results.xml
+                                        echo '</testsuites>' >> ${stageName}/results.xml
+                                    """
+                                }
+                            } finally {
+                                // Touched in finally so the watcher exits whether
+                                // pytest succeeded, failed, or was interrupted.
+                                sh "touch ${pytestDoneFile}"
+                            }
+                        },
+                        'progress-upload': {
+                            periodicUploadProgress(stageName, pytestDoneFile)
+                        },
+                        failFast: false,
+                    )
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
@@ -3134,6 +3329,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (rerunFailed) {
             error "Some tests still failed after rerun attempts, please check the test report."
         }
+
+        // pytest succeeded (possibly after rerun) -- the in-progress checkpoint
+        // tar is no longer needed; the stage's `finally` will upload the final
+        // results tar shortly. Drop the progress tar so consumers don't pick
+        // up a stale snapshot. Forensic tars from failed runs are intentionally
+        // left in place.
+        deleteProgressArtifact(stageName)
 
         if (perfMode) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
