@@ -179,7 +179,7 @@ std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_p
     resetSlot();
     readyEvent = CachedCudaEvent::makeNull();
 
-    assert(!hasValidSlot() && readyEvent.isNull());
+    assert(!hasValidSlot() && readyEvent.isClosed());
     assert(committed->hasValidSlot() && "committed page must have a valid slot after transfer");
 
     // Register in block storage.

@@ -451,7 +451,7 @@ void KvCache::suspend()
         // Mirrors Python: for ordinal, beam_idx, lc_idx in self._active_pages()
         for (auto const& ap : _activePages())
         {
-            auto& bp = (ap.ordinal != kBadBlockOrdinal)
+            auto& bp = (ap.lcId != ssmLcId)
                 ? mBlocks[static_cast<size_t>(ap.ordinal)].pages[ap.beamIdx][static_cast<size_t>(ap.lcId)]
                 : mSsmBlocks[static_cast<size_t>(ap.beamIdx)][static_cast<size_t>(ap.lcId)];
             // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
