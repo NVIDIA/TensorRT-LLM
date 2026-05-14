@@ -270,10 +270,22 @@ def _make_ctx_request(
     return req
 
 
-def _make_gen_request(num_draft_tokens=0):
+def _make_gen_request(num_draft_tokens: int = 0) -> Mock:
     """Helper to create a mock generation request."""
     req = Mock()
     req.num_draft_tokens = num_draft_tokens
+    req.py_draft_tokens = None
+    return req
+
+
+def _make_disagg_trans_complete_request(draft_tokens: list[int] | None) -> Mock:
+    req = Mock()
+    req.is_disagg_generation_transmission_complete = True
+    req.context_phase_params = Mock(draft_tokens=draft_tokens)
+    req.py_draft_tokens = []
+    req.draft_tokens = []
+    req.py_draft_pages_allocated = 0
+    req.num_draft_tokens = 0
     return req
 
 
@@ -358,6 +370,29 @@ class TestComputeScheduledTokens:
         """Generation requests contribute 1 + num_draft_tokens each."""
         gen = [_make_gen_request(3), _make_gen_request(0)]
         assert PyExecutor._compute_scheduled_tokens([], gen) == (1 + 3) + (1 + 0)
+
+    def test_disagg_trans_complete_draft_tokens_are_scheduler_visible(self) -> None:
+        gen = [_make_gen_request(3) for _ in range(127)]
+        trans_complete = _make_disagg_trans_complete_request([11, 12, 13])
+        gen.append(trans_complete)
+
+        assert PyExecutor._compute_scheduled_tokens([], gen) == 127 * 4 + 1
+
+        PyExecutor._sync_disagg_generation_trans_complete_draft_tokens(gen)
+
+        assert trans_complete.py_draft_tokens == [11, 12, 13]
+        assert trans_complete.draft_tokens == [11, 12, 13]
+        assert trans_complete.py_draft_pages_allocated == 3
+        assert PyExecutor._compute_scheduled_tokens([], gen) == 128 * 4
+
+    def test_disagg_trans_complete_missing_draft_tokens_are_scheduler_visible(self) -> None:
+        trans_complete = _make_disagg_trans_complete_request(None)
+        PyExecutor._sync_disagg_generation_trans_complete_draft_tokens([trans_complete])
+
+        assert trans_complete.py_draft_tokens == []
+        assert trans_complete.draft_tokens == []
+        assert trans_complete.py_draft_pages_allocated == 0
+        assert PyExecutor._compute_scheduled_tokens([], [trans_complete]) == 1
 
     def test_mixed_context_and_generation(self):
         """Combined context (with chunk-shift) and generation tokens."""
