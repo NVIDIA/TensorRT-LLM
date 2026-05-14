@@ -745,19 +745,6 @@ class PyTorchModelEngine(ModelEngine):
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
-        # Synchronize the max-shape across TP ranks. Each rank's
-        # `get_num_available_tokens` answer is a function of that rank's
-        # available KV-cache memory, which can differ between ranks (allocator
-        # fragmentation, system reservations, workspace pre-alloc rounding,
-        # etc.). The subsequent `_general_warmup_impl` runs a forward at
-        # `(curr_max_num_tokens, 0)` which issues collective MoE ops; if
-        # ranks disagree on the shape, some ranks silently `continue`
-        # ("Not enough KV cache space") while others enter the collective,
-        # producing a CUDA 719 cascade in MoE routing. Taking the minimum
-        # across the TP group makes every rank use the same shape.
-        if self.mapping.tp_size > 1:
-            curr_max_num_tokens = min(
-                self.dist.tp_allgather(curr_max_num_tokens))
         max_batch_size = min(
             self.batch_size, curr_max_num_tokens //
             (1 + self.max_total_draft_tokens) // self.max_beam_width)
