@@ -16,7 +16,6 @@ server_configs:
         backend: VANILLA
       text_encoder_path: google/gemma-3-12b-it
       parallel:
-        enable_parallel_vae: false
         dit_cfg_size: 2
         dit_ulysses_size: 4
       spatial_upsampler_path: LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors
@@ -48,7 +47,6 @@ server_configs:
         backend: VANILLA
       text_encoder_path: google/gemma-3-12b-it
       parallel:
-        enable_parallel_vae: false
         dit_cfg_size: 2
         dit_ulysses_size: 4
       spatial_upsampler_path: LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors
@@ -78,7 +76,6 @@ server_configs:
         backend: VANILLA
       text_encoder_path: google/gemma-3-12b-it
       parallel:
-        enable_parallel_vae: false
         dit_cfg_size: 2
         dit_ulysses_size: 4
       cuda_graph:
