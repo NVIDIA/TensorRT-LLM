@@ -619,9 +619,7 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
     )
     head_dim = kv_lora_rank + qk_rope_head_dim
 
-    cache_manager, sparse_config = _create_cache_manager(
-        scenario, context_lengths, max_seq_len=1
-    )
+    cache_manager, sparse_config = _create_cache_manager(scenario, context_lengths, max_seq_len=1)
     request = LlmRequest(
         request_id=0,
         max_new_tokens=1,
@@ -681,19 +679,20 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 
     compressed_kv = torch.empty([1, kv_lora_rank], dtype=dtype, device=device).uniform_(-1, 1)
     k_pe = torch.empty([1, qk_rope_head_dim], dtype=dtype, device=device).uniform_(-1, 1)
-    q_nope = torch.empty(
-        [1, local_num_heads, kv_lora_rank], dtype=dtype, device=device
-    ).uniform_(-1, 1)
-    q_pe = torch.empty(
-        [1, local_num_heads, qk_rope_head_dim], dtype=dtype, device=device
-    ).uniform_(-1, 1)
+    q_nope = torch.empty([1, local_num_heads, kv_lora_rank], dtype=dtype, device=device).uniform_(
+        -1, 1
+    )
+    q_pe = torch.empty([1, local_num_heads, qk_rope_head_dim], dtype=dtype, device=device).uniform_(
+        -1, 1
+    )
     fused_q = torch.cat([q_nope, q_pe], dim=-1).view(1, local_num_heads * head_dim)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
     simple_swa_pool = None
     if os.environ.get("DSV4_REPRO_SIMPLE_POOL"):
         simple_swa_pool = torch.empty(
-            (cache_manager.tokens_per_block, head_dim), dtype=dtype, device=device)
+            (cache_manager.tokens_per_block, head_dim), dtype=dtype, device=device
+        )
         simple_swa_pool.zero_()
         simple_swa_pool_ptr = simple_swa_pool.data_ptr()
         cache_manager.kv_cache_pool_pointers[0, 0] = simple_swa_pool_ptr
@@ -717,39 +716,47 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
         )
         torch.cuda.synchronize()
         print("DSV4_REPRO local_num_heads", local_num_heads)
-        print("DSV4_REPRO token_stride", get_token_bytes(
-            head_dim,
-            sparse_config.index_head_dim,
-            ratio,
-            DeepseekV4AttentionType.SWA,
-            False,
-        ))
+        print(
+            "DSV4_REPRO token_stride",
+            get_token_bytes(
+                head_dim,
+                sparse_config.index_head_dim,
+                ratio,
+                DeepseekV4AttentionType.SWA,
+                False,
+            ),
+        )
         print("DSV4_REPRO tokens_per_block", cache_manager.tokens_per_block)
         print("DSV4_REPRO max_blocks_per_seq", cache_manager.max_blocks_per_seq)
         print("DSV4_REPRO max_seq_len", cache_manager.max_seq_len)
         print("DSV4_REPRO metadata_max_seq_len", attn_metadata.max_seq_len)
-        print("DSV4_REPRO kv_lens_runtime",
-              attn_metadata.kv_lens_runtime[:1].cpu().tolist())
-        print("DSV4_REPRO host_total_kv_lens",
-              attn_metadata.host_total_kv_lens.cpu().tolist())
-        print("DSV4_REPRO prompt_lens_runtime",
-              attn_metadata.prompt_lens_cpu_runtime[:1].cpu().tolist())
+        print("DSV4_REPRO kv_lens_runtime", attn_metadata.kv_lens_runtime[:1].cpu().tolist())
+        print("DSV4_REPRO host_total_kv_lens", attn_metadata.host_total_kv_lens.cpu().tolist())
+        print(
+            "DSV4_REPRO prompt_lens_runtime",
+            attn_metadata.prompt_lens_cpu_runtime[:1].cpu().tolist(),
+        )
         print("DSV4_REPRO swa_pool_base_ptr", attn_metadata.sparse_mla_base_ptrs[1])
         print("DSV4_REPRO swa_buffer_ptr", attn_metadata.swa_buffer_ptrs[layer_idx])
-        print("DSV4_REPRO block_table_swa", attn_metadata.block_tables[
-            (1, DeepseekV4AttentionType.SWA)
-        ][:1, :4].cpu().tolist())
+        print(
+            "DSV4_REPRO block_table_swa",
+            attn_metadata.block_tables[(1, DeepseekV4AttentionType.SWA)][:1, :4].cpu().tolist(),
+        )
         print("DSV4_REPRO sparse_attn_indices", sparse_attn_indices.cpu().tolist())
         print("DSV4_REPRO sparse_attn_indices_dtype", sparse_attn_indices.dtype)
-        print("DSV4_REPRO sparse_mla_topk_lens",
-              attn_metadata.sparse_mla_topk_lens[ratio][:1].cpu().tolist())
-        print("DSV4_REPRO sparse_mla_topk_lens_dtype",
-              attn_metadata.sparse_mla_topk_lens[ratio].dtype)
+        print(
+            "DSV4_REPRO sparse_mla_topk_lens",
+            attn_metadata.sparse_mla_topk_lens[ratio][:1].cpu().tolist(),
+        )
+        print(
+            "DSV4_REPRO sparse_mla_topk_lens_dtype", attn_metadata.sparse_mla_topk_lens[ratio].dtype
+        )
 
     softmax_stats_tensor = None
     if os.environ.get("DSV4_REPRO_SOFTMAX_STATS"):
         softmax_stats_tensor = torch.empty(
-            (1, local_num_heads, 2), dtype=torch.float32, device=device)
+            (1, local_num_heads, 2), dtype=torch.float32, device=device
+        )
 
     result = layer.forward(
         fused_q.clone(),
