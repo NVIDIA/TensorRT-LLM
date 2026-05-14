@@ -342,17 +342,13 @@ To configure the nested level arguments like ``moe_config.backend``, the yaml fi
    moe_config:
        backend: CUTLASS
 
-For IDE validation and completion, TensorRT-LLM publishes a `trtllm-serve config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json>`_. Add the schema directive at the top of a config file when using the YAML language server:
+For IDE validation and completion, TensorRT-LLM publishes a `trtllm-serve config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json>`_. Add the schema directive at the top of a config file when using a YAML language server. For the AutoDeploy backend, use the `AutoDeploy config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-autodeploy-config.schema.json>`_ instead.
 
 .. code-block:: yaml
 
    # yaml-language-server: $schema=https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json
 
-   max_batch_size: 8
-   moe_config:
-       backend: CUTLASS
-
-The schema validates the static structure of the YAML file. Runtime validation remains authoritative for model-dependent checks, GPU-dependent checks, cross-field constraints, and file existence checks.
+The schema validates the static structure of the YAML file. Runtime validation remains authoritative for model-dependent checks, GPU-dependent checks, cross-field constraints, and file existence checks. Replace ``latest`` with a specific TensorRT-LLM version (e.g., ``1.3.0rc14``) to pin the schema to that release.
 
 Syntax
 ------

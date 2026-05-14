@@ -51,6 +51,8 @@ SCHEMA_GENERATOR = _load_module(
     REPO_ROOT / "scripts" / "generate_trtllm_serve_schemas.py",
 )
 SERVE_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.SERVE_CONFIG_SCHEMA_FILENAME
+AUTODEPLOY_CONFIG_SCHEMA_FILENAME = (
+    SCHEMA_GENERATOR.AUTODEPLOY_CONFIG_SCHEMA_FILENAME)
 VISUAL_GEN_CONFIG_SCHEMA_FILENAME = (
     SCHEMA_GENERATOR.VISUAL_GEN_CONFIG_SCHEMA_FILENAME)
 
@@ -63,6 +65,11 @@ def _validator(schema: dict) -> jsonschema.Draft202012Validator:
 @pytest.fixture(scope="module")
 def serve_config_validator() -> jsonschema.Draft202012Validator:
     return _validator(SCHEMA_GENERATOR.generate_serve_config_schema())
+
+
+@pytest.fixture(scope="module")
+def autodeploy_config_validator() -> jsonschema.Draft202012Validator:
+    return _validator(SCHEMA_GENERATOR.generate_autodeploy_config_schema())
 
 
 @pytest.fixture(scope="module")
@@ -87,6 +94,20 @@ def test_serve_config_schema_rejects_typo(serve_config_validator):
         serve_config_validator.validate({"max_batch_szie": 8})
 
 
+def test_serve_config_schema_accepts_unquoted_env_overrides_scalars(
+        serve_config_validator):
+    # env_overrides values are coerced to strings at runtime; the static schema
+    # must accept unquoted scalars so YAML configs like `TRTLLM_ENABLE_PDL: 1`
+    # don't trip the IDE.
+    serve_config_validator.validate({
+        "env_overrides": {
+            "TRTLLM_ENABLE_PDL": 1,
+            "NCCL_GRAPH_REGISTER": 0,
+            "SOME_FLAG": True,
+        }
+    })
+
+
 @pytest.mark.parametrize(
     "config_path",
     ALL_SERVE_CONFIGS,
@@ -95,6 +116,33 @@ def test_serve_config_schema_rejects_typo(serve_config_validator):
 def test_existing_serve_configs_validate_against_schema(
         serve_config_validator, config_path: Path):
     serve_config_validator.validate(load_yaml_dict(config_path))
+
+
+def test_autodeploy_config_schema_accepts_minimal_yaml(
+        autodeploy_config_validator):
+    autodeploy_config_validator.validate({
+        "world_size": 1,
+        "compile_backend": "torch-opt",
+    })
+
+
+def test_autodeploy_config_schema_accepts_backend_marker_and_aliases(
+        autodeploy_config_validator):
+    autodeploy_config_validator.validate({
+        "backend": "_autodeploy",
+        "hf_revision": "main",
+    })
+
+
+def test_autodeploy_config_schema_rejects_wrong_backend(
+        autodeploy_config_validator):
+    with pytest.raises(ValidationError):
+        autodeploy_config_validator.validate({"backend": "pytorch"})
+
+
+def test_autodeploy_config_schema_rejects_typo(autodeploy_config_validator):
+    with pytest.raises(ValidationError):
+        autodeploy_config_validator.validate({"compile_backennd": "torch-opt"})
 
 
 def test_visual_gen_config_schema_accepts_representative_yaml(
@@ -135,4 +183,5 @@ def test_docs_extension_writes_schema_assets(tmp_path):
 
     schema_dir = tmp_path / "_static" / "schemas"
     assert (schema_dir / SERVE_CONFIG_SCHEMA_FILENAME).is_file()
+    assert (schema_dir / AUTODEPLOY_CONFIG_SCHEMA_FILENAME).is_file()
     assert (schema_dir / VISUAL_GEN_CONFIG_SCHEMA_FILENAME).is_file()
