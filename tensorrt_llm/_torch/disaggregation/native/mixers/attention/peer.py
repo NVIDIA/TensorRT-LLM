@@ -400,7 +400,7 @@ class AttentionPolicy:
             return IdentityMapper()
 
         if head_match:
-            if mapper_kind == MapperKind.INDEXER:
+            if mapper_kind == MapperKind.FLAT:
                 block_size_per_layer = self_pool_slot_bytes // self_pool_num_layers
                 return IndexerKCacheHeadMatchMapper(
                     transfer_layers=transfer_layers,
@@ -426,7 +426,7 @@ class AttentionPolicy:
                 slot_size_per_layer=slot_size_per_layer,
             )
 
-        if mapper_kind == MapperKind.INDEXER:
+        if mapper_kind == MapperKind.FLAT:
             raise ValueError("IndexerKCacheHeadMatchMapper is not supported for head mismatch case")
 
         return HeadMismatchMapper(

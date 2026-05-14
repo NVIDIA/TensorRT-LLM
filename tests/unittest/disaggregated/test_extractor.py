@@ -153,7 +153,7 @@ def test_build_page_table():
     assert pool.num_slots == 50  # 3200 tokens / 64 tokens_per_block
     assert len(pv.buffer_entries) > 0
     assert pv.pool_role == frozenset({"key", "value"})
-    assert pv.mapper_kind == MapperKind.STANDARD
+    assert pv.mapper_kind == MapperKind.INDEXED
     assert len(get_global_layer_ids(lg)) > 0
 
     local_layer_id = list(get_unique_layers(pv))[0]

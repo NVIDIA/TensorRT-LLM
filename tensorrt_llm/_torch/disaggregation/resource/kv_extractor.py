@@ -199,7 +199,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
             pool_idx=0,
             buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
             pool_role=frozenset(kv_role_names),
-            mapper_kind=MapperKind.STANDARD,
+            mapper_kind=MapperKind.INDEXED,
         )
         physical_pools = [kv_physical]
         pool_views = [kv_view]
@@ -222,7 +222,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                 pool_idx=1,
                 buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE),
                 pool_role=frozenset({"indexer_k"}),
-                mapper_kind=MapperKind.INDEXER,
+                mapper_kind=MapperKind.FLAT,
             )
             physical_pools.append(indexer_physical)
             pool_views.append(indexer_view)
@@ -400,7 +400,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     pool_idx=pool_idx,
                     buffer_entries=np.array(buffers_info, dtype=BUFFER_ENTRY_DTYPE),
                     pool_role=frozenset(native_roles_by_pool[pool_key]),
-                    mapper_kind=MapperKind.STANDARD,
+                    mapper_kind=MapperKind.INDEXED,
                 )
             )
 

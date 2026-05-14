@@ -137,12 +137,15 @@ class PeerRegistrar:
             if not isinstance(self_lg, AttentionLayerGroup):
                 continue
             for self_pi, self_pv in enumerate(self_lg.pool_views):
-                # INDEXER pools have no per-buffer layer info; use group-level
-                # layer ids to seed the peer-LG lookup.
-                self_is_indexer = self_pv.mapper_kind == MapperKind.INDEXER
+                # The only place mapper_kind affects pool matching:
+                #   INDEXED → pool may cover a subset of the LG; read
+                #             buffer_entries to find the exact layer set.
+                #   FLAT    → pool covers the entire LG by convention;
+                #             use the LG's layer ids directly.
+                self_is_flat = self_pv.mapper_kind == MapperKind.FLAT
                 pv_global_ids = (
                     get_global_layer_ids(self_lg)
-                    if self_is_indexer
+                    if self_is_flat
                     else get_pool_view_global_layer_ids(self_pv, self_lg)
                 )
                 if not pv_global_ids:
@@ -160,6 +163,16 @@ class PeerRegistrar:
                 # Step 2: pick the first peer pool with the same pool_role
                 # whose layers overlap self's (zero-overlap pools cover
                 # disjoint layers — nothing to transfer).
+                #
+                # Uniqueness assumption: at most one peer pool can match on
+                # both ``pool_role`` (frozenset equality) and layer overlap.
+                # We do *not* assume ``pool_role`` is unique within a peer LG
+                # — V2 may split an LG into multiple same-role pools by
+                # buffer-size class (e.g. VSWA). What we rely on is that both
+                # peers run the same pool-grouping logic, so for every self_pv
+                # there is exactly one peer pool with the same role *and* an
+                # overlapping layer set; other same-role peer pools cover
+                # disjoint layers and fall out via the overlap filter.
                 self_layer_set = set(pv_global_ids)
                 matched_peer_pi = None
                 for peer_pi, peer_pv in enumerate(peer_lg.pool_views):
@@ -167,7 +180,7 @@ class PeerRegistrar:
                         continue
                     peer_global_ids = (
                         get_global_layer_ids(peer_lg)
-                        if peer_pv.mapper_kind == MapperKind.INDEXER
+                        if peer_pv.mapper_kind == MapperKind.FLAT
                         else get_pool_view_global_layer_ids(peer_pv, peer_lg)
                     )
                     if set(peer_global_ids) & self_layer_set:
@@ -211,14 +224,14 @@ class PeerRegistrar:
 
         assert self._ri.attention is not None
 
-        # INDEXER pools carry no per-buffer layer info, so layer ids and
+        # FLAT pools carry no per-buffer layer info, so layer ids and
         # layer count come from the layer_group itself.
         #
         # Sort by global_layer_id so that ``.index(first_overlap_layer)``
         # below returns the layer's slot position. This relies on the
         # convention that managers (V1 / V2 / DSv4) assign global_layer_id
         # monotonically with the layer's byte offset in the slot.
-        if self_pv.mapper_kind == MapperKind.INDEXER:
+        if self_pv.mapper_kind == MapperKind.FLAT:
             self_global_ids = sorted(get_global_layer_ids(self_lg))
             peer_global_ids = sorted(get_global_layer_ids(peer_lg))
             self_num_layers = get_layer_group_num_layers(self_lg)

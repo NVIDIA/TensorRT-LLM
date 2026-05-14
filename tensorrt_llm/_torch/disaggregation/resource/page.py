@@ -16,20 +16,31 @@ BUFFER_ENTRY_DTYPE = np.dtype(
 
 
 class MapperKind(IntEnum):
-    """Selects the byte-mover (Mapper) family for an attention pool.
+    """Slot metadata shape — selects how disagg derives the pool's layer set.
 
-    Closed set: a new value here is added together with a new Mapper class.
-    Runtime conditions like head-match or transfer_layers == num_layers are
-    *not* part of this enum — they are evaluated by ``build_kv_mapper``
-    when picking between mappers within the same kind.
+    INDEXED: PoolView.buffer_entries lists ``(local_layer_id, offset, size)``
+        per buffer. Disagg reads ``local_layer_id`` to know *which* layers
+        from the LG live in this pool (a pool may cover a subset when V2
+        splits an LG into multiple pools by buffer-size class). The
+        ``offset`` / ``size`` columns are carried for future use but are not
+        currently consumed at byte-transfer time.
+    FLAT:    PoolView.buffer_entries is empty. Disagg assumes the pool
+        covers *all* layers of the LG, packed equal-sized in
+        ``local_layers`` order. Used today by the DSA (DeepSeek Sparse
+        Attention, v3.2) indexer K cache pool, whose slot layout is a dense
+        ``(numLayers, kvFactor, blockSize)`` array.
+
+    Byte arithmetic is the same for both kinds: per-layer stride is
+    ``slot_bytes // num_layers``. The kind only affects how disagg discovers
+    the pool's layer set during pool matching.
 
     Mamba state pools do not use this enum: Mamba's transfer is dispatched
     through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
     bypasses the attention pool-matching path entirely.
     """
 
-    STANDARD = 0  # KV / block-scale: Identity / HeadMatch / HeadMismatch
-    INDEXER = 1  # DSv4 indexer K cache: IndexerKCacheHeadMatchMapper
+    INDEXED = 0
+    FLAT = 1
 
 
 @dataclass
@@ -109,7 +120,7 @@ class PoolView:
     pool_idx: int
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
     pool_role: FrozenSet[str] = field(default_factory=frozenset)
-    mapper_kind: MapperKind = MapperKind.STANDARD
+    mapper_kind: MapperKind = MapperKind.INDEXED
 
     def to_dict(self) -> dict:
         return {
@@ -130,8 +141,8 @@ class PoolView:
                 [tuple(row) for row in raw],
                 dtype=BUFFER_ENTRY_DTYPE,
             ),
-            pool_role=frozenset(data.get("pool_role", [])),
-            mapper_kind=MapperKind(int(data.get("mapper_kind", MapperKind.STANDARD))),
+            pool_role=frozenset(data["pool_role"]),
+            mapper_kind=MapperKind(int(data["mapper_kind"])),
         )
 
 

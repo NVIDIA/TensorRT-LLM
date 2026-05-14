@@ -965,10 +965,10 @@ class TestDeepseekV4CacheManager:
             for layer_group in page_table.layer_groups:
                 for pool_view in layer_group.pool_views:
                     saw_pool_view = True
-                    # All DSv4 pools dispatch through the standard mapper
-                    # family; INDEXER mapper is reserved for V1's separate
+                    # All DSv4 pools publish per-layer buffer_entries (INDEXED);
+                    # the FLAT layout is reserved for the DSA (DeepSeek v3.2)
                     # indexer K cache pool.
-                    assert pool_view.mapper_kind == MapperKind.STANDARD
+                    assert pool_view.mapper_kind == MapperKind.INDEXED
                     # pool_role carries the manager-native role-name strings,
                     # which are all DSv4 attention-type names like
                     # "deepseek_v4_swa", "deepseek_v4_compress", etc.

@@ -6,7 +6,7 @@ representative scenarios that the refactor must keep working:
   * single KV pool, full layer overlap (basic MHA)
   * MLA (kv_factor=1, KEY-only pool)
   * KV + block-scale pools coexisting in one LG
-  * KV + INDEXER pools coexisting in one LG (INDEXER has empty buffer_entries)
+  * KV + FLAT pools coexisting in one LG (FLAT has empty buffer_entries)
   * PP partial layer overlap (Step-1 LG match by global_layer_id)
   * Two pools with same role but different layer sets within a peer LG
     (DSv4 virtual-layer scenario, exercises ``best_overlap``)
@@ -53,7 +53,7 @@ def _entries(layer_role_pairs, per_buf_size=128):
     return np.array(rows, dtype=BUFFER_ENTRY_DTYPE)
 
 
-def _pool_view(pool_idx, layer_role_pairs, *, pool_role=None, mapper_kind=MapperKind.STANDARD):
+def _pool_view(pool_idx, layer_role_pairs, *, pool_role=None, mapper_kind=MapperKind.INDEXED):
     """A PoolView with buffer entries.
 
     ``pool_role`` defaults to the set of distinct role labels appearing in
@@ -70,12 +70,12 @@ def _pool_view(pool_idx, layer_role_pairs, *, pool_role=None, mapper_kind=Mapper
 
 
 def _empty_pool_view(pool_idx, *, pool_role=frozenset({"indexer_k"})):
-    """Pool view with no buffer entries — INDEXER pool convention."""
+    """Pool view with no buffer entries — FLAT pool convention."""
     return PoolView(
         pool_idx=pool_idx,
         buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE),
         pool_role=pool_role,
-        mapper_kind=MapperKind.INDEXER,
+        mapper_kind=MapperKind.FLAT,
     )
 
 
@@ -228,7 +228,7 @@ def test_kv_and_block_scale_in_same_lg():
 
 
 def test_kv_and_indexer_in_same_lg():
-    """KV pool + INDEXER pool. INDEXER has empty buffer_entries; matches by role."""
+    """KV pool + FLAT pool. FLAT has empty buffer_entries; matches by role."""
     self_lg = _attn_lg(
         0,
         [(0, 0), (1, 1)],
