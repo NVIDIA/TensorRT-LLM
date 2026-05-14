@@ -401,6 +401,30 @@ class BasePipeline(nn.Module):
         if not coefficients:
             return
         teacache_cfg = self.model_config.teacache
+
+        def apply_coeff_data(model_size: str, coeff_data: Any) -> None:
+            if isinstance(coeff_data, dict):
+                mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
+                if mode in coeff_data:
+                    teacache_cfg.coefficients = coeff_data[mode]
+                    logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                default_thresh = coeff_data.get("default_thresh")
+                if (
+                    default_thresh is not None
+                    and "teacache_thresh" not in teacache_cfg.model_fields_set
+                ):
+                    teacache_cfg.teacache_thresh = default_thresh
+                    logger.info(f"TeaCache: Using {model_size} default threshold {default_thresh}")
+            else:
+                teacache_cfg.coefficients = coeff_data
+                logger.info(f"TeaCache: Using {model_size} coefficients")
+
+        if isinstance(coefficients, dict) and (
+            "standard" in coefficients or "ret_steps" in coefficients
+        ):
+            apply_coeff_data(self.__class__.__name__, coefficients)
+            return
+
         checkpoint_path = (
             getattr(getattr(self.model_config, "pretrained_config", None), "_name_or_path", "")
             or ""
@@ -409,23 +433,7 @@ class BasePipeline(nn.Module):
         for model_size, coeff_data in coefficients.items():
             if model_size.lower() in checkpoint_path.lower():
                 matched = True
-                if isinstance(coeff_data, dict):
-                    mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
-                    if mode in coeff_data:
-                        teacache_cfg.coefficients = coeff_data[mode]
-                        logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
-                    default_thresh = coeff_data.get("default_thresh")
-                    if (
-                        default_thresh is not None
-                        and "teacache_thresh" not in teacache_cfg.model_fields_set
-                    ):
-                        teacache_cfg.teacache_thresh = default_thresh
-                        logger.info(
-                            f"TeaCache: Using {model_size} default threshold {default_thresh}"
-                        )
-                else:
-                    teacache_cfg.coefficients = coeff_data
-                    logger.info(f"TeaCache: Using {model_size} coefficients")
+                apply_coeff_data(model_size, coeff_data)
                 break
         if not matched:
             raise ValueError(

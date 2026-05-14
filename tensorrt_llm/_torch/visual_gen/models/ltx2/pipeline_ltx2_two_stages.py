@@ -801,6 +801,18 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 2: refinement denoising with distilled LoRA
         # ================================================================
+        # The current TeaCache coefficients are calibrated for stage 1 only.
+        # Stage 2 uses a short distilled schedule with different shapes, so run
+        # it uncached and re-arm TeaCache for the next request afterwards.
+        teacache_was_enabled = (
+            self.model_config.cache_backend == "teacache"
+            and getattr(self, "cache_accelerator", None) is not None
+            and self.cache_accelerator.is_enabled()
+        )
+        if teacache_was_enabled:
+            logger.info("TeaCache: disabling for LTX-2 stage 2 refinement")
+            self.cache_accelerator.unwrap()
+
         # For FP4 models (static-packed or dynamic), stage 2 always runs in
         # BF16: the quant_method is swapped to UnquantizedLinearMethod inside
         # _apply_lora_deltas and restored afterwards.  BF16 models are unaffected.
@@ -859,6 +871,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
                 )
             logger.info("Un-merged distilled LoRA after stage 2")
+            if teacache_was_enabled:
+                self.cache_accelerator.wrap(model=self.transformer)
 
         # ================================================================
         # Decode
