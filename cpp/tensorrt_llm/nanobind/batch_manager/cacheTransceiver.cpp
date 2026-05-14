@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -116,6 +116,23 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
         .value("MLA", executor::kv_cache::CacheState::AttentionType::kMLA);
 
+    nb::enum_<executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout>(m, "ConvSectionLayout")
+        .value("NONE", executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout::kNONE)
+        .value("NEMOTRON", executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout::kNEMOTRON)
+        .value("QWEN3_NEXT", executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout::kQWEN3_NEXT);
+
+    nb::class_<executor::kv_cache::CacheState::RnnModelConfig>(m, "RnnModelConfig")
+        .def(nb::init<>())
+        .def_rw("d_state", &executor::kv_cache::CacheState::RnnModelConfig::mDState)
+        .def_rw("d_conv", &executor::kv_cache::CacheState::RnnModelConfig::mDConv)
+        .def_rw("hidden_size", &executor::kv_cache::CacheState::RnnModelConfig::mHiddenSize)
+        .def_rw("head_dim", &executor::kv_cache::CacheState::RnnModelConfig::mHeadDim)
+        .def_rw("conv_dim_size", &executor::kv_cache::CacheState::RnnModelConfig::mConvDimSize)
+        .def_rw("n_groups", &executor::kv_cache::CacheState::RnnModelConfig::mNGroups)
+        .def_rw("num_layers", &executor::kv_cache::CacheState::RnnModelConfig::mNumLayers)
+        .def_rw("num_heads", &executor::kv_cache::CacheState::RnnModelConfig::mNumHeads)
+        .def_rw("conv_section_layout", &executor::kv_cache::CacheState::RnnModelConfig::mConvSectionLayout);
+
     nb::class_<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
                  runtime::WorldConfig, std::vector<SizeType32>, nvinfer1::DataType,
@@ -124,7 +141,9 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
             nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
-            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
+            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{})
+        .def("set_unified_pool_rnn_config", &tb::CacheTransceiver::setUnifiedPoolRnnConfig, nb::arg("rnn_model_config"),
+            nb::arg("rnn_layer_num_per_pp"), nb::arg("conv_state_dtype"), nb::arg("ssm_state_dtype"));
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

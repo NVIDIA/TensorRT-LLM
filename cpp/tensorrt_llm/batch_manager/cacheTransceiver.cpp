@@ -301,6 +301,31 @@ CacheTransceiver::~CacheTransceiver()
     }
 }
 
+void CacheTransceiver::setUnifiedPoolRnnConfig(executor::kv_cache::CacheState::RnnModelConfig const& rnnModelConfig,
+    std::vector<SizeType32> const& rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+    nvinfer1::DataType ssmStateDataType)
+{
+    TLLM_CHECK(mCacheState != nullptr);
+    mCacheState->setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
+
+    // Propagate to CacheSender/CacheReceiver which hold copies of the CacheState.
+    if (mCacheSender)
+    {
+        mCacheSender->setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
+    }
+    if (mCacheReceiver)
+    {
+        mCacheReceiver->setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
+    }
+
+    TLLM_LOG_INFO(
+        "Unified pool RNN config set: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
+        "convDimSize=%d, nGroups=%d, numLayers=%d, convSectionLayout=%d",
+        rnnModelConfig.mNumHeads, rnnModelConfig.mHeadDim, rnnModelConfig.mDState, rnnModelConfig.mDConv,
+        rnnModelConfig.mConvDimSize, rnnModelConfig.mNGroups, rnnModelConfig.mNumLayers,
+        static_cast<int>(rnnModelConfig.mConvSectionLayout));
+}
+
 void CacheTransceiver::initializeCommState()
 {
     mCommState = std::addressof(mCacheSender->getCommState());

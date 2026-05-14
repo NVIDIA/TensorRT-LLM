@@ -61,7 +61,7 @@ from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
-from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager, MixedMambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -3513,8 +3513,9 @@ class PyExecutor:
 
         num_fitting = scheduler_output.num_fitting_requests
         #TODO(TRTLLM-12359): remove the WAR when PythonMambaCacheManager is deprecated.
-        if isinstance(self.kv_cache_manager,
-                      MambaHybridCacheManager) and self.kv_cache_transceiver:
+        if isinstance(
+                self.kv_cache_manager,
+                MixedMambaHybridCacheManager) and self.kv_cache_transceiver:
             if len(scheduled_context_requests) > 0:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)

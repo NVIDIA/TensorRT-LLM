@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -951,6 +951,934 @@ void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& i
             destCacheState, selfCacheState, selfIdx, bufferManager);
         break;
     default: TLLM_THROW("concatRnnSsmStateDispatch: unsupported data type");
+    }
+}
+
+// ===========================================================================
+// Unified Pool Split/Concat Kernels
+// ===========================================================================
+// These kernels operate on the unified KV/recurrent pool layout used by
+// CppMambaHybridCacheManager:
+//   pool shape: {numLocalLayers, numBlocks, blockSize_bytes}
+//   block layout: [SSM_bytes | Conv_bytes]
+//     SSM portion: [numHeads, headDim, dState] — split by heads
+//     Conv portion: [section0_dim, section1_dim, ...] x [dConv-1] — section-aware split
+//
+// The input/output pointer arrays follow the same pattern as the existing
+// RnnStateManager kernels: input pointers → output pointers → prefixLayerNum.
+
+/**
+ * @brief Kernel to split SSM state from unified pool blocks to per-target buffers.
+ *
+ * Input:  Pool block pointers, each pointing to {blockSize_bytes} of data.
+ *         SSM data starts at offset 0, shaped [numHeads_local, headDim, dState].
+ * Output: Per-target SSM buffers, each [numBlocks, layersInPP, headsPerDomainTP, headDim, dState].
+ */
+template <typename T, int subWarpSize, int subWarpNumInGroup, int vecSizeByte>
+__global__ void splitUnifiedPoolSsmKernel(T const** __restrict__ inputPoolBlocks, T** __restrict__ outputCaches,
+    int numHeadsLocal, int headDim, int dState, int numLayers, int inputBlockNum, int domainPPSize, int headNumDomainTP,
+    int blockStrideElements, uint64_t* prefixLayerNumDevPtr)
+{
+    int const subWarpId = threadIdx.x / subWarpSize;
+    int const laneId = threadIdx.x % subWarpSize;
+    int const subWarpNum = blockDim.x / subWarpSize;
+    int const subWarpGroupId = subWarpId / subWarpNumInGroup;
+    int const subWarpGroupNum = subWarpNum / subWarpNumInGroup;
+    int const subWarpIdInGroup = subWarpId % subWarpNumInGroup;
+
+    static_assert(vecSizeByte >= sizeof(T));
+    int constexpr numElePerThread = vecSizeByte / sizeof(T);
+
+    int const headDimTimesDState = headDim * dState;
+
+#pragma unroll 1
+    for (int blockId = blockIdx.y; blockId < inputBlockNum; blockId += gridDim.y)
+    {
+#pragma unroll 1
+        for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
+        {
+            int layerIdInDomainPP{};
+            int rankInDomainPP{};
+            int layerNumInSpecPP{};
+            getLayerIdInDomainPPandRankInDomainPP(
+                layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
+
+#pragma unroll 1
+            for (int headId = subWarpGroupId; headId < numHeadsLocal; headId += subWarpGroupNum)
+            {
+                // Input: pool[layerId][blockIdx] at SSM offset, then index by head
+                T const* inputBlockPtr = inputPoolBlocks[blockId];
+                // Each layer's data is at layerId * blockStrideElements
+                T const* inputPtr
+                    = inputBlockPtr + static_cast<int64_t>(layerId) * blockStrideElements + headId * headDimTimesDState;
+
+                int outputCacheIdx = headId / headNumDomainTP * domainPPSize + rankInDomainPP;
+                T* outputCachePtr = outputCaches[outputCacheIdx];
+
+                int headIdInDomainTP = headId % headNumDomainTP;
+                T* outputPtr = outputCachePtr
+                    + static_cast<int64_t>(blockId) * (layerNumInSpecPP * headNumDomainTP * headDimTimesDState)
+                    + static_cast<int64_t>(layerIdInDomainPP) * headNumDomainTP * headDimTimesDState
+                    + static_cast<int64_t>(headIdInDomainTP) * headDimTimesDState;
+
+#pragma unroll 1
+                for (int elemId = subWarpIdInGroup * subWarpSize * numElePerThread + laneId * numElePerThread;
+                     elemId < headDimTimesDState; elemId += (subWarpNumInGroup * subWarpSize * numElePerThread))
+                {
+                    common::copy<vecSizeByte>(inputPtr + elemId, outputPtr + elemId);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Kernel to split conv state from unified pool blocks with section-aware splitting.
+ *
+ * Input:  Pool block pointers. Conv data starts at ssmBytesElements offset within each block.
+ *         Conv layout: [section0_dim_local | section1_dim_local | ...] x [dConv-1].
+ * Output: Per-target Conv buffers, each section independently split by TP.
+ *
+ * numConvSections: number of sections (e.g. 3 for [x|B|C] or [Q|K|V])
+ * convSectionDimsLocal: per-section local element counts (already TP-divided)
+ * convSectionDimsDomainTP: per-section element counts per domain TP rank
+ */
+template <typename T, int subWarpSize, int vecSizeByte>
+__global__ void splitUnifiedPoolConvKernel(T const** __restrict__ inputPoolBlocks, T** __restrict__ outputCaches,
+    int dConvMinus1, int numLayers, int inputBlockNum, int domainPPSize, int blockStrideElements, int ssmOffsetElements,
+    int numConvSections, int const* convSectionDimsLocal, int const* convSectionDimsDomainTP,
+    int const* convSectionOffsetsLocal, uint64_t* prefixLayerNumDevPtr)
+{
+    int const subWarpId = threadIdx.x / subWarpSize;
+    int const laneId = threadIdx.x % subWarpSize;
+    int const subWarpNum = blockDim.x / subWarpSize;
+
+    static_assert(vecSizeByte >= sizeof(T));
+    int constexpr numElePerThread = vecSizeByte / sizeof(T);
+
+    // Total conv dim across all sections (local)
+    int convDimLocal = 0;
+    for (int s = 0; s < numConvSections; ++s)
+    {
+        convDimLocal += convSectionDimsLocal[s];
+    }
+
+#pragma unroll 1
+    for (int blockId = blockIdx.y; blockId < inputBlockNum; blockId += gridDim.y)
+    {
+#pragma unroll 1
+        for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
+        {
+            int layerIdInDomainPP{};
+            int rankInDomainPP{};
+            int layerNumInSpecPP{};
+            getLayerIdInDomainPPandRankInDomainPP(
+                layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
+
+            // Input base for this layer+block's conv data
+            T const* inputBlockPtr = inputPoolBlocks[blockId];
+            T const* layerConvBase
+                = inputBlockPtr + static_cast<int64_t>(layerId) * blockStrideElements + ssmOffsetElements;
+
+            // Iterate over all conv dimension rows (across all sections)
+#pragma unroll 1
+            for (int convDimId = subWarpId; convDimId < convDimLocal; convDimId += subWarpNum)
+            {
+                // Determine which section this convDimId belongs to, and position within section
+                int sectionIdx = 0;
+                int posInSection = convDimId;
+                for (int s = 0; s < numConvSections; ++s)
+                {
+                    if (posInSection < convSectionDimsLocal[s])
+                    {
+                        sectionIdx = s;
+                        break;
+                    }
+                    posInSection -= convSectionDimsLocal[s];
+                }
+
+                T const* inputPtr = layerConvBase + static_cast<int64_t>(convDimId) * dConvMinus1;
+
+                // Map to output target based on section-specific TP split
+                int domainTPDim = convSectionDimsDomainTP[sectionIdx];
+                int tpIdx = posInSection / domainTPDim;
+                int posInDomainTP = posInSection % domainTPDim;
+
+                // Output target index: tpIdx * domainPPSize + ppRank
+                int outputCacheIdx = tpIdx * domainPPSize + rankInDomainPP;
+                T* outputCachePtr = outputCaches[outputCacheIdx];
+
+                // Calculate output conv dim for this section+TP rank
+                // Total output conv dim per domain TP rank = sum of all domainTP section dims
+                int outputConvDimTotal = 0;
+                for (int s = 0; s < numConvSections; ++s)
+                {
+                    outputConvDimTotal += convSectionDimsDomainTP[s];
+                }
+
+                // Output section offset = sum of preceding section domainTP dims
+                int outputSectionOffset = 0;
+                for (int s = 0; s < sectionIdx; ++s)
+                {
+                    outputSectionOffset += convSectionDimsDomainTP[s];
+                }
+
+                T* outputPtr = outputCachePtr
+                    + static_cast<int64_t>(blockId) * (layerNumInSpecPP * outputConvDimTotal * dConvMinus1)
+                    + static_cast<int64_t>(layerIdInDomainPP) * outputConvDimTotal * dConvMinus1
+                    + static_cast<int64_t>(outputSectionOffset + posInDomainTP) * dConvMinus1;
+
+#pragma unroll 1
+                for (int tempId = laneId * numElePerThread; tempId < dConvMinus1;
+                     tempId += (subWarpSize * numElePerThread))
+                {
+                    common::copy<vecSizeByte>(inputPtr + tempId, outputPtr + tempId);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Kernel to concat SSM state from per-source buffers into unified pool blocks.
+ */
+template <typename T, int subWarpSize, int subWarpNumInGroup, int vecSizeByte>
+__global__ void concatUnifiedPoolSsmKernel(T const** __restrict__ inputCaches, T** __restrict__ outputPoolBlocks,
+    int numHeadsLocal, int headDim, int dState, int numLayers, int outputBlockNum, int domainPPSize,
+    int headNumDomainTP, int blockStrideElements, uint64_t* prefixLayerNumDevPtr)
+{
+    int const subWarpId = threadIdx.x / subWarpSize;
+    int const laneId = threadIdx.x % subWarpSize;
+    int const subWarpNum = blockDim.x / subWarpSize;
+    int const subWarpGroupId = subWarpId / subWarpNumInGroup;
+    int const subWarpGroupNum = subWarpNum / subWarpNumInGroup;
+    int const subWarpIdInGroup = subWarpId % subWarpNumInGroup;
+
+    static_assert(vecSizeByte >= sizeof(T));
+    int constexpr numElePerThread = vecSizeByte / sizeof(T);
+
+    int const headDimTimesDState = headDim * dState;
+
+#pragma unroll 1
+    for (int blockId = blockIdx.y; blockId < outputBlockNum; blockId += gridDim.y)
+    {
+#pragma unroll 1
+        for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
+        {
+            int layerIdInDomainPP{};
+            int rankInDomainPP{};
+            int layerNumInSpecPP{};
+            getLayerIdInDomainPPandRankInDomainPP(
+                layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
+
+#pragma unroll 1
+            for (int headId = subWarpGroupId; headId < numHeadsLocal; headId += subWarpGroupNum)
+            {
+                // Output: pool[layerId][blockIdx] at SSM offset
+                T* outputBlockPtr = outputPoolBlocks[blockId];
+                T* outputPtr = outputBlockPtr + static_cast<int64_t>(layerId) * blockStrideElements
+                    + headId * headDimTimesDState;
+
+                int inputCacheIdx = headId / headNumDomainTP * domainPPSize + rankInDomainPP;
+                int headIdInDomainTP = headId % headNumDomainTP;
+
+                T const* inputCachePtr = inputCaches[inputCacheIdx];
+                T const* inputPtr = inputCachePtr
+                    + static_cast<int64_t>(blockId) * (layerNumInSpecPP * headNumDomainTP * headDimTimesDState)
+                    + static_cast<int64_t>(layerIdInDomainPP) * headNumDomainTP * headDimTimesDState
+                    + static_cast<int64_t>(headIdInDomainTP) * headDimTimesDState;
+
+#pragma unroll 1
+                for (int elemId = subWarpIdInGroup * subWarpSize * numElePerThread + laneId * numElePerThread;
+                     elemId < headDimTimesDState; elemId += (subWarpNumInGroup * subWarpSize * numElePerThread))
+                {
+                    common::copy<vecSizeByte>(inputPtr + elemId, outputPtr + elemId);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Kernel to concat conv state from per-source buffers into unified pool blocks (section-aware).
+ */
+template <typename T, int subWarpSize, int vecSizeByte>
+__global__ void concatUnifiedPoolConvKernel(T const** __restrict__ inputCaches, T** __restrict__ outputPoolBlocks,
+    int dConvMinus1, int numLayers, int outputBlockNum, int domainPPSize, int blockStrideElements,
+    int ssmOffsetElements, int numConvSections, int const* convSectionDimsLocal, int const* convSectionDimsDomainTP,
+    int const* convSectionOffsetsLocal, uint64_t* prefixLayerNumDevPtr)
+{
+    int const subWarpId = threadIdx.x / subWarpSize;
+    int const laneId = threadIdx.x % subWarpSize;
+    int const subWarpNum = blockDim.x / subWarpSize;
+
+    static_assert(vecSizeByte >= sizeof(T));
+    int constexpr numElePerThread = vecSizeByte / sizeof(T);
+
+    int convDimLocal = 0;
+    for (int s = 0; s < numConvSections; ++s)
+    {
+        convDimLocal += convSectionDimsLocal[s];
+    }
+
+#pragma unroll 1
+    for (int blockId = blockIdx.y; blockId < outputBlockNum; blockId += gridDim.y)
+    {
+#pragma unroll 1
+        for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
+        {
+            int layerIdInDomainPP{};
+            int rankInDomainPP{};
+            int layerNumInSpecPP{};
+            getLayerIdInDomainPPandRankInDomainPP(
+                layerId, domainPPSize, prefixLayerNumDevPtr, layerIdInDomainPP, rankInDomainPP, layerNumInSpecPP);
+
+            // Output base for this layer+block's conv data
+            T* outputBlockPtr = outputPoolBlocks[blockId];
+            T* layerConvBase = outputBlockPtr + static_cast<int64_t>(layerId) * blockStrideElements + ssmOffsetElements;
+
+#pragma unroll 1
+            for (int convDimId = subWarpId; convDimId < convDimLocal; convDimId += subWarpNum)
+            {
+                int sectionIdx = 0;
+                int posInSection = convDimId;
+                for (int s = 0; s < numConvSections; ++s)
+                {
+                    if (posInSection < convSectionDimsLocal[s])
+                    {
+                        sectionIdx = s;
+                        break;
+                    }
+                    posInSection -= convSectionDimsLocal[s];
+                }
+
+                T* outputPtr = layerConvBase + static_cast<int64_t>(convDimId) * dConvMinus1;
+
+                int domainTPDim = convSectionDimsDomainTP[sectionIdx];
+                int tpIdx = posInSection / domainTPDim;
+                int posInDomainTP = posInSection % domainTPDim;
+
+                int inputCacheIdx = tpIdx * domainPPSize + rankInDomainPP;
+
+                int outputConvDimTotal = 0;
+                for (int s = 0; s < numConvSections; ++s)
+                {
+                    outputConvDimTotal += convSectionDimsDomainTP[s];
+                }
+
+                int inputSectionOffset = 0;
+                for (int s = 0; s < sectionIdx; ++s)
+                {
+                    inputSectionOffset += convSectionDimsDomainTP[s];
+                }
+
+                T const* inputCachePtr = inputCaches[inputCacheIdx];
+                T const* inputPtr = inputCachePtr
+                    + static_cast<int64_t>(blockId) * (layerNumInSpecPP * outputConvDimTotal * dConvMinus1)
+                    + static_cast<int64_t>(layerIdInDomainPP) * outputConvDimTotal * dConvMinus1
+                    + static_cast<int64_t>(inputSectionOffset + posInDomainTP) * dConvMinus1;
+
+#pragma unroll 1
+                for (int tempId = laneId * numElePerThread; tempId < dConvMinus1;
+                     tempId += (subWarpSize * numElePerThread))
+                {
+                    common::copy<vecSizeByte>(inputPtr + tempId, outputPtr + tempId);
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Host dispatch functions for unified pool split/concat
+// ===========================================================================
+
+template <typename T>
+void splitUnifiedPoolSsm(runtime::ITensor::SharedPtr const& pool, std::vector<SizeType32> const& realBlockIndices,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes, size_t blockSizeBytes,
+    runtime::BufferManager const& bufferManager)
+{
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destCacheState, selfCacheState, selfIdx);
+    auto outputCacheNum = targetRankInfo.mIRanks.size() / targetRankInfo.mPeerDupHeadFactor;
+    TLLM_CHECK(outputCacheNum == outputSplitBlocks.size());
+
+    size_t inputBlockNum = realBlockIndices.size();
+    if (inputBlockNum == 0)
+        return;
+
+    auto const& selfParallelConfig = selfCacheState.getParallelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
+
+    int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+    int const selfPPRank = selfIdx / selfTPNum;
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
+    int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPSizePerDPGroup;
+    int const headDim = selfModelConfig.mHeadDim;
+    int const dState = selfModelConfig.mDState;
+
+    int const domainPPSize = targetRankInfo.mDomainPPSize;
+    int const domainTPSize = targetRankInfo.mDomainTPSize;
+    int const headNumDomainTP = numHeadsLocal / (domainTPSize / targetRankInfo.mPeerDupHeadFactor);
+
+    // Pool shape: {numLayers, numBlocks, blockSizeBytes}
+    // blockStrideElements = blockSizeBytes / sizeof(T) for the stride across the pool's block dimension
+    int const blockStrideElements = static_cast<int>(blockSizeBytes / sizeof(T));
+
+    // Build pointer arrays: input pool block pointers (pointing to SSM start), output buffers, prefixLayerNum
+    std::vector<uint64_t> allPtrs;
+    SizeType32 const numBlocks = pool->getShape().d[1];
+    size_t layerStrideBytes = static_cast<size_t>(numBlocks) * blockSizeBytes;
+    uint8_t* poolBase = static_cast<uint8_t*>(pool->data());
+
+    for (auto blockIdx : realBlockIndices)
+    {
+        // Point to {layer=0, blockIdx, offset=0} — SSM starts at offset 0
+        allPtrs.push_back(reinterpret_cast<uint64_t>(poolBase + static_cast<size_t>(blockIdx) * blockSizeBytes));
+    }
+    for (auto const& outputBlock : outputSplitBlocks)
+    {
+        allPtrs.push_back(reinterpret_cast<uint64_t>(outputBlock->data()));
+    }
+
+    std::vector<uint64_t> prefixLayerNum(domainPPSize + 1, 0);
+    for (int i = 0; i < domainPPSize; i++)
+    {
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
+    }
+    allPtrs.insert(allPtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
+
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
+    bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
+
+    T const** inputPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
+    T** outputPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data()) + inputBlockNum;
+    uint64_t* prefixLayerNumDevPtr = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + inputBlockNum + outputCacheNum;
+
+    constexpr int subWarpSize = 32;
+    constexpr int subWarpNumInGroup = 4;
+    constexpr int blockDimx = 128;
+    dim3 gridDim(numLayers, inputBlockNum);
+    dim3 blockDim(blockDimx);
+    int const remainder = (headDim * dState) * sizeof(T) % 16;
+
+    // Note: blockStrideElements is the stride in elements between layers for the same block
+    // In the pool layout {numLayers, numBlocks, blockSize}, the stride between layers for
+    // the same block = numBlocks * blockSizeElements
+    int const layerStrideElements = static_cast<int>(numBlocks) * blockStrideElements;
+
+    switch (remainder)
+    {
+    case 0:
+        splitUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 16>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                prefixLayerNumDevPtr);
+        break;
+    case 8:
+        splitUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 8>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                prefixLayerNumDevPtr);
+        break;
+    case 4:
+    case 12:
+        if constexpr (sizeof(T) <= 4)
+        {
+            splitUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 4>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                    headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                    prefixLayerNumDevPtr);
+            break;
+        }
+        [[fallthrough]];
+    default:
+        splitUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 8>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                headDim, dState, numLayers, inputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                prefixLayerNumDevPtr);
+        break;
+    }
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+void splitUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<SizeType32> const& realBlockIndices,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes, size_t blockSizeBytes,
+    runtime::BufferManager const& bufferManager)
+{
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(destCacheState, selfCacheState, selfIdx);
+    auto outputCacheNum = targetRankInfo.mIRanks.size() / targetRankInfo.mPeerDupHeadFactor;
+    TLLM_CHECK(outputCacheNum == outputSplitBlocks.size());
+
+    size_t inputBlockNum = realBlockIndices.size();
+    if (inputBlockNum == 0)
+        return;
+
+    auto const& selfParallelConfig = selfCacheState.getParallelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
+
+    int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+    int const selfPPRank = selfIdx / selfTPNum;
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
+    int const dConvMinus1 = selfModelConfig.mDConv - 1;
+
+    int const domainPPSize = targetRankInfo.mDomainPPSize;
+    int const domainTPSize = targetRankInfo.mDomainTPSize;
+    int const effectiveDomainTP = domainTPSize / targetRankInfo.mPeerDupHeadFactor;
+
+    TLLM_CHECK_WITH_INFO(
+        selfModelConfig.hasConvSections(), "splitUnifiedPoolConv requires conv section info (hasConvSections)");
+
+    static constexpr int numConvSections = kv_cache::CacheState::RnnModelConfig::kNumConvSections;
+    auto const globalSectionDims = selfModelConfig.getConvSectionDims();
+
+    // Compute section dims: global → local (TP-divided) and domainTP dims
+    std::array<int, numConvSections> sectionDimsLocal;
+    std::array<int, numConvSections> sectionDimsDomainTP;
+    std::array<int, numConvSections> sectionOffsetsLocal;
+    int localOffset = 0;
+    for (int s = 0; s < numConvSections; ++s)
+    {
+        int globalDim = globalSectionDims[s];
+        sectionDimsLocal[s] = globalDim / selfTPSizePerDPGroup;
+        sectionDimsDomainTP[s] = sectionDimsLocal[s] / effectiveDomainTP;
+        sectionOffsetsLocal[s] = localOffset;
+        localOffset += sectionDimsLocal[s];
+    }
+
+    SizeType32 const numBlocks = pool->getShape().d[1];
+    int const blockStrideElements = static_cast<int>(blockSizeBytes / sizeof(T));
+    int const layerStrideElements = static_cast<int>(numBlocks) * blockStrideElements;
+    int const ssmOffsetElements = static_cast<int>(ssmBytes / sizeof(T));
+
+    // Build pointer arrays
+    std::vector<uint64_t> allPtrs;
+    uint8_t* poolBase = static_cast<uint8_t*>(pool->data());
+
+    for (auto blockIdx : realBlockIndices)
+    {
+        allPtrs.push_back(reinterpret_cast<uint64_t>(poolBase + static_cast<size_t>(blockIdx) * blockSizeBytes));
+    }
+    for (auto const& outputBlock : outputSplitBlocks)
+    {
+        allPtrs.push_back(reinterpret_cast<uint64_t>(outputBlock->data()));
+    }
+
+    std::vector<uint64_t> prefixLayerNum(domainPPSize + 1, 0);
+    for (int i = 0; i < domainPPSize; i++)
+    {
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
+    }
+    allPtrs.insert(allPtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
+
+    // Also copy section dim arrays to device
+    std::vector<int> sectionInfo;
+    sectionInfo.insert(sectionInfo.end(), sectionDimsLocal.begin(), sectionDimsLocal.end());
+    sectionInfo.insert(sectionInfo.end(), sectionDimsDomainTP.begin(), sectionDimsDomainTP.end());
+    sectionInfo.insert(sectionInfo.end(), sectionOffsetsLocal.begin(), sectionOffsetsLocal.end());
+
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
+    bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
+
+    auto sectionInfoBuffer = bufferManager.gpu(sectionInfo.size(), nvinfer1::DataType::kINT32);
+    bufferManager.copy(sectionInfo.data(), *sectionInfoBuffer, runtime::MemoryType::kCPU);
+
+    T const** inputPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data());
+    T** outputPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data()) + inputBlockNum;
+    uint64_t* prefixLayerNumDevPtr = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + inputBlockNum + outputCacheNum;
+
+    int const* sectionDimsLocalDev = static_cast<int const*>(sectionInfoBuffer->data());
+    int const* sectionDimsDomainTPDev = sectionDimsLocalDev + numConvSections;
+    int const* sectionOffsetsLocalDev = sectionDimsDomainTPDev + numConvSections;
+
+    constexpr int subWarpSize = 32;
+    constexpr int blockDimx = 128;
+    dim3 gridDim(numLayers, inputBlockNum);
+    dim3 blockDim(blockDimx);
+
+    int const rowStrideBytes = dConvMinus1 * sizeof(T);
+    int vecSizeByte = 16;
+    while (vecSizeByte > static_cast<int>(sizeof(T)) && (rowStrideBytes % vecSizeByte) != 0)
+    {
+        vecSizeByte /= 2;
+    }
+
+    if (vecSizeByte == 16)
+    {
+        splitUnifiedPoolConvKernel<T, subWarpSize, 16>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                numLayers, inputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+    }
+    else if (vecSizeByte == 8)
+    {
+        splitUnifiedPoolConvKernel<T, subWarpSize, 8>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                numLayers, inputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+    }
+    else if constexpr (sizeof(T) <= 4)
+    {
+        if (vecSizeByte == 4)
+        {
+            splitUnifiedPoolConvKernel<T, subWarpSize, 4>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                    numLayers, inputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                    sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+        }
+        else if constexpr (sizeof(T) <= 2)
+        {
+            splitUnifiedPoolConvKernel<T, subWarpSize, 2>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                    numLayers, inputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                    sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+        }
+    }
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+void concatUnifiedPoolSsm(runtime::ITensor::SharedPtr const& pool, std::vector<SizeType32> const& realBlockIndices,
+    std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks, kv_cache::CacheState const& srcCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes, size_t blockSizeBytes,
+    runtime::BufferManager const& bufferManager)
+{
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(srcCacheState, selfCacheState, selfIdx);
+    auto inputCacheNum = targetRankInfo.mIRanks.size() / targetRankInfo.mPeerDupHeadFactor;
+    TLLM_CHECK(inputCacheNum == inputSplitBlocks.size());
+
+    size_t outputBlockNum = realBlockIndices.size();
+    if (outputBlockNum == 0)
+        return;
+
+    auto const& selfParallelConfig = selfCacheState.getParallelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
+
+    int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+    int const selfPPRank = selfIdx / selfTPNum;
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
+    int const numHeadsLocal = selfModelConfig.mNumHeads / selfTPSizePerDPGroup;
+    int const headDim = selfModelConfig.mHeadDim;
+    int const dState = selfModelConfig.mDState;
+
+    int const domainPPSize = targetRankInfo.mDomainPPSize;
+    int const domainTPSize = targetRankInfo.mDomainTPSize;
+    int const headNumDomainTP = numHeadsLocal / (domainTPSize / targetRankInfo.mPeerDupHeadFactor);
+
+    SizeType32 const numBlocks = pool->getShape().d[1];
+    int const blockStrideElements = static_cast<int>(blockSizeBytes / sizeof(T));
+    int const layerStrideElements = static_cast<int>(numBlocks) * blockStrideElements;
+
+    std::vector<uint64_t> allPtrs;
+    uint8_t* poolBase = static_cast<uint8_t*>(pool->data());
+
+    for (auto blockIdx : realBlockIndices)
+    {
+        allPtrs.push_back(reinterpret_cast<uint64_t>(poolBase + static_cast<size_t>(blockIdx) * blockSizeBytes));
+    }
+    for (auto const& inputBlock : inputSplitBlocks)
+    {
+        allPtrs.push_back(reinterpret_cast<uint64_t>(inputBlock->data()));
+    }
+
+    std::vector<uint64_t> prefixLayerNum(domainPPSize + 1, 0);
+    for (int i = 0; i < domainPPSize; i++)
+    {
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
+    }
+    allPtrs.insert(allPtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
+
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
+    bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
+
+    T** outputPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
+    T const** inputPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data()) + outputBlockNum;
+    uint64_t* prefixLayerNumDevPtr = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + outputBlockNum + inputCacheNum;
+
+    constexpr int subWarpSize = 32;
+    constexpr int subWarpNumInGroup = 4;
+    constexpr int blockDimx = 128;
+    dim3 gridDim(numLayers, outputBlockNum);
+    dim3 blockDim(blockDimx);
+    int const remainder = (headDim * dState) * sizeof(T) % 16;
+
+    switch (remainder)
+    {
+    case 0:
+        concatUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 16>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                prefixLayerNumDevPtr);
+        break;
+    case 8:
+        concatUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 8>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                prefixLayerNumDevPtr);
+        break;
+    case 4:
+    case 12:
+        if constexpr (sizeof(T) <= 4)
+        {
+            concatUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 4>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                    headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                    prefixLayerNumDevPtr);
+            break;
+        }
+        [[fallthrough]];
+    default:
+        concatUnifiedPoolSsmKernel<T, subWarpSize, subWarpNumInGroup, 8>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, numHeadsLocal,
+                headDim, dState, numLayers, outputBlockNum, domainPPSize, headNumDomainTP, layerStrideElements,
+                prefixLayerNumDevPtr);
+        break;
+    }
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+void concatUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<SizeType32> const& realBlockIndices,
+    std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks, kv_cache::CacheState const& srcCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes, size_t blockSizeBytes,
+    runtime::BufferManager const& bufferManager)
+{
+    auto targetRankInfo = executor::kv_cache::targetIRanksForRnn(srcCacheState, selfCacheState, selfIdx);
+    auto inputCacheNum = targetRankInfo.mIRanks.size() / targetRankInfo.mPeerDupHeadFactor;
+    TLLM_CHECK(inputCacheNum == inputSplitBlocks.size());
+
+    size_t outputBlockNum = realBlockIndices.size();
+    if (outputBlockNum == 0)
+        return;
+
+    auto const& selfParallelConfig = selfCacheState.getParallelConfig();
+    auto const& selfModelConfig = selfCacheState.getRnnModelConfig();
+
+    int const selfTPNum = selfParallelConfig.mTensorParallelism;
+    int const selfDPSize = selfParallelConfig.mDPsize;
+    int const selfTPSizePerDPGroup = selfParallelConfig.mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+    int const selfPPRank = selfIdx / selfTPNum;
+    int const numLayers = selfCacheState.getRnnCacheState().mLayerNumPerPP.at(selfPPRank);
+    int const dConvMinus1 = selfModelConfig.mDConv - 1;
+
+    int const domainPPSize = targetRankInfo.mDomainPPSize;
+    int const domainTPSize = targetRankInfo.mDomainTPSize;
+    int const effectiveDomainTP = domainTPSize / targetRankInfo.mPeerDupHeadFactor;
+
+    TLLM_CHECK_WITH_INFO(
+        selfModelConfig.hasConvSections(), "concatUnifiedPoolConv requires conv section info (hasConvSections)");
+
+    static constexpr int numConvSections = kv_cache::CacheState::RnnModelConfig::kNumConvSections;
+    auto const globalSectionDims = selfModelConfig.getConvSectionDims();
+
+    std::array<int, numConvSections> sectionDimsLocal;
+    std::array<int, numConvSections> sectionDimsDomainTP;
+    std::array<int, numConvSections> sectionOffsetsLocal;
+    int localOffset = 0;
+    for (int s = 0; s < numConvSections; ++s)
+    {
+        int globalDim = globalSectionDims[s];
+        sectionDimsLocal[s] = globalDim / selfTPSizePerDPGroup;
+        sectionDimsDomainTP[s] = sectionDimsLocal[s] / effectiveDomainTP;
+        sectionOffsetsLocal[s] = localOffset;
+        localOffset += sectionDimsLocal[s];
+    }
+
+    SizeType32 const numBlocks = pool->getShape().d[1];
+    int const blockStrideElements = static_cast<int>(blockSizeBytes / sizeof(T));
+    int const layerStrideElements = static_cast<int>(numBlocks) * blockStrideElements;
+    int const ssmOffsetElements = static_cast<int>(ssmBytes / sizeof(T));
+
+    std::vector<uint64_t> allPtrs;
+    uint8_t* poolBase = static_cast<uint8_t*>(pool->data());
+
+    for (auto blockIdx : realBlockIndices)
+    {
+        allPtrs.push_back(reinterpret_cast<uint64_t>(poolBase + static_cast<size_t>(blockIdx) * blockSizeBytes));
+    }
+    for (auto const& inputBlock : inputSplitBlocks)
+    {
+        allPtrs.push_back(reinterpret_cast<uint64_t>(inputBlock->data()));
+    }
+
+    std::vector<uint64_t> prefixLayerNum(domainPPSize + 1, 0);
+    for (int i = 0; i < domainPPSize; i++)
+    {
+        prefixLayerNum[i + 1] = prefixLayerNum[i] + targetRankInfo.mPeerLayerNumInDomainPP[i];
+    }
+    allPtrs.insert(allPtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
+
+    std::vector<int> sectionInfo;
+    sectionInfo.insert(sectionInfo.end(), sectionDimsLocal.begin(), sectionDimsLocal.end());
+    sectionInfo.insert(sectionInfo.end(), sectionDimsDomainTP.begin(), sectionDimsDomainTP.end());
+    sectionInfo.insert(sectionInfo.end(), sectionOffsetsLocal.begin(), sectionOffsetsLocal.end());
+
+    auto PtrsDeviceBuffer = bufferManager.gpu(allPtrs.size(), nvinfer1::DataType::kINT64);
+    bufferManager.copy(allPtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
+
+    auto sectionInfoBuffer = bufferManager.gpu(sectionInfo.size(), nvinfer1::DataType::kINT32);
+    bufferManager.copy(sectionInfo.data(), *sectionInfoBuffer, runtime::MemoryType::kCPU);
+
+    T** outputPtrsDev = static_cast<T**>(PtrsDeviceBuffer->data());
+    T const** inputPtrsDev = static_cast<T const**>(PtrsDeviceBuffer->data()) + outputBlockNum;
+    uint64_t* prefixLayerNumDevPtr = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + outputBlockNum + inputCacheNum;
+
+    int const* sectionDimsLocalDev = static_cast<int const*>(sectionInfoBuffer->data());
+    int const* sectionDimsDomainTPDev = sectionDimsLocalDev + numConvSections;
+    int const* sectionOffsetsLocalDev = sectionDimsDomainTPDev + numConvSections;
+
+    constexpr int subWarpSize = 32;
+    constexpr int blockDimx = 128;
+    dim3 gridDim(numLayers, outputBlockNum);
+    dim3 blockDim(blockDimx);
+
+    int const rowStrideBytes = dConvMinus1 * sizeof(T);
+    int vecSizeByte = 16;
+    while (vecSizeByte > static_cast<int>(sizeof(T)) && (rowStrideBytes % vecSizeByte) != 0)
+    {
+        vecSizeByte /= 2;
+    }
+
+    if (vecSizeByte == 16)
+    {
+        concatUnifiedPoolConvKernel<T, subWarpSize, 16>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                numLayers, outputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+    }
+    else if (vecSizeByte == 8)
+    {
+        concatUnifiedPoolConvKernel<T, subWarpSize, 8>
+            <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                numLayers, outputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+    }
+    else if constexpr (sizeof(T) <= 4)
+    {
+        if (vecSizeByte == 4)
+        {
+            concatUnifiedPoolConvKernel<T, subWarpSize, 4>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                    numLayers, outputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                    sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+        }
+        else if constexpr (sizeof(T) <= 2)
+        {
+            concatUnifiedPoolConvKernel<T, subWarpSize, 2>
+                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
+                    numLayers, outputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
+                    sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+        }
+    }
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+// ===========================================================================
+// Public dispatch functions for unified pool split/concat
+// ===========================================================================
+
+void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
+    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType ssmDataType, runtime::BufferManager const& bufferManager)
+{
+    auto dataSize = tensorrt_llm::common::getDTypeSize(ssmDataType);
+    switch (dataSize)
+    {
+    case 4:
+        splitUnifiedPoolSsm<int32_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 2:
+        splitUnifiedPoolSsm<int16_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 1:
+        splitUnifiedPoolSsm<int8_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    default: TLLM_THROW("splitUnifiedPoolSsmDispatch: unsupported SSM data type size %d", dataSize);
+    }
+}
+
+void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
+    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType convDataType,
+    runtime::BufferManager const& bufferManager)
+{
+    auto dataSize = tensorrt_llm::common::getDTypeSize(convDataType);
+    switch (dataSize)
+    {
+    case 4:
+        splitUnifiedPoolConv<int32_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState,
+            selfIdx, ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 2:
+        splitUnifiedPoolConv<int16_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState,
+            selfIdx, ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 1:
+        splitUnifiedPoolConv<int8_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    default: TLLM_THROW("splitUnifiedPoolConvDispatch: unsupported conv data type size %d", dataSize);
+    }
+}
+
+void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
+    size_t blockSizeBytes, nvinfer1::DataType ssmDataType, runtime::BufferManager const& bufferManager)
+{
+    auto dataSize = tensorrt_llm::common::getDTypeSize(ssmDataType);
+    switch (dataSize)
+    {
+    case 4:
+        concatUnifiedPoolSsm<int32_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 2:
+        concatUnifiedPoolSsm<int16_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 1:
+        concatUnifiedPoolSsm<int8_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    default: TLLM_THROW("concatUnifiedPoolSsmDispatch: unsupported SSM data type size %d", dataSize);
+    }
+}
+
+void concatUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
+    size_t blockSizeBytes, nvinfer1::DataType convDataType, runtime::BufferManager const& bufferManager)
+{
+    auto dataSize = tensorrt_llm::common::getDTypeSize(convDataType);
+    switch (dataSize)
+    {
+    case 4:
+        concatUnifiedPoolConv<int32_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 2:
+        concatUnifiedPoolConv<int16_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    case 1:
+        concatUnifiedPoolConv<int8_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
+            ssmBytes, blockSizeBytes, bufferManager);
+        break;
+    default: TLLM_THROW("concatUnifiedPoolConvDispatch: unsupported conv data type size %d", dataSize);
     }
 }
 

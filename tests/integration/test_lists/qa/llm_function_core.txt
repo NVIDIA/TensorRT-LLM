@@ -74,8 +74,9 @@ accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symm
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp1]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2]
-accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[use_py_transceiver=False]
-accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[use_py_transceiver=True]
+accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=False]
+accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=3-block_reuse=True-use_py_transceiver=False]
+accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=True]
 accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4
 accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2]

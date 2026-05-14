@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -268,6 +268,12 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(LlmRequest* llmRequest) override;
+
+    /// Set RNN model config on the CacheState for unified pool path (CppMambaHybridCacheManager).
+    /// This enables TP-mismatch split/concat for recurrent state transfer.
+    void setUnifiedPoolRnnConfig(executor::kv_cache::CacheState::RnnModelConfig const& rnnModelConfig,
+        std::vector<SizeType32> const& rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
 
 private:
     void initializeCommState();
