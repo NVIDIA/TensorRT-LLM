@@ -38,10 +38,7 @@ _HAS_GEMMA4 = Version(transformers.__version__) >= Version("5.5.0")
 
 pytestmark = pytest.mark.skipif(
     not _HAS_GEMMA4,
-    reason=(
-        f"Gemma4 requires transformers>=5.5.0 "
-        f"(installed: {transformers.__version__})"
-    ),
+    reason=(f"Gemma4 requires transformers>=5.5.0 (installed: {transformers.__version__})"),
 )
 
 if _HAS_GEMMA4:
