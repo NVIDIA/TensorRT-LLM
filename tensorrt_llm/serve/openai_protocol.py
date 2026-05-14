@@ -1448,14 +1448,14 @@ class VideoGenerationRequest(OpenAIBaseModel):
         description="Text describing what to avoid in the generated video.")
     seed: Optional[int] = Field(default=None,
                                 description="Random seed for reproducibility.")
-    output_format: Literal["mp4", "avi", "raw", "auto"] = Field(
+    output_format: Literal["mp4", "avi", "pt", "auto"] = Field(
         default="auto",
         description=(
             "Video encode format. "
             "'mp4' for H.264 encoding (requires ffmpeg installed on server), "
             "'avi' for MJPEG encoding (always available, no audio support), "
-            "'raw' for uncompressed uint8 RGB byte stream "
-            "(shape T*H*W*3, ~224 MB at 720x1280x81 — worst-case payload), "
+            "'pt' for the raw video tensor persisted via torch.save (no "
+            "encoding, no audio; for cross-framework deterministic reuse), "
             "'auto' to use best available (H.264 if ffmpeg installed, "
             "otherwise MJPEG)."))
     response_format: Literal["video_bytes", "video_path"] = Field(
