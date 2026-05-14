@@ -167,16 +167,19 @@ async def test_ctx_first_applies_router_token_lists_to_ctx_chat_request() -> Non
     service._gen_client = AsyncMock()
     prompt_token_ids = [11, 22, 33]
     service._ctx_router.get_next_server = AsyncMock(
-        return_value=("ctx:9000", {
-            "server_info": {},
-            "token_lists": [prompt_token_ids],
-        }))
-    service._gen_router.get_next_server = AsyncMock(
-        return_value=("gen:9001", {"server_info": {}}))
+        return_value=(
+            "ctx:9000",
+            {
+                "server_info": {},
+                "token_lists": [prompt_token_ids],
+            },
+        )
+    )
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
 
-    async def _ctx_response(request: ChatCompletionRequest,
-                            *_args: object,
-                            **_kwargs: object) -> CompletionResponse:
+    async def _ctx_response(
+        request: ChatCompletionRequest, *_args: object, **_kwargs: object
+    ) -> CompletionResponse:
         assert request.prompt_token_ids == prompt_token_ids
         response = _make_completion_response(
             "",
@@ -188,8 +191,7 @@ async def test_ctx_first_applies_router_token_lists_to_ctx_chat_request() -> Non
         response.prompt_token_ids = None
         return response
 
-    async def _gen_response(*_args: object,
-                            **_kwargs: object) -> CompletionResponse:
+    async def _gen_response(*_args: object, **_kwargs: object) -> CompletionResponse:
         return _make_completion_response(
             "done",
             finish_reason="stop",
@@ -200,11 +202,15 @@ async def test_ctx_first_applies_router_token_lists_to_ctx_chat_request() -> Non
     service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
     service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
 
-    request = ChatCompletionRequest(model="test-model",
-                                    messages=[{
-                                        "role": "user",
-                                        "content": "hello",
-                                    }])
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+    )
     await service._send_disagg_request(request)
 
     ctx_route_kwargs = service._ctx_router.get_next_server.call_args.kwargs

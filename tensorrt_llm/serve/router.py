@@ -911,6 +911,12 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if self._num_assigned_requests_by_server.get(server, 0) == 0
         ]
 
+    async def _register_assigned_request(self, server: str,
+                                         request: OpenAIRequest) -> None:
+        await self._register_request(server, request)
+        self._num_assigned_requests_by_server[server] = (
+            self._num_assigned_requests_by_server.get(server, 0) + 1)
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
@@ -929,7 +935,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if len(servers) == 1:
                 server = servers[0]
                 if not collect_routing_info:
-                    await self._register_request(server, request)
+                    await self._register_assigned_request(server, request)
                     return server, self._routing_info(
                         server,
                         routing_mode="single_server_fastpath",
@@ -946,17 +952,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             async with self._lock:
                 if single_server not in self._server_state:
                     raise ValueError(
-                        f"Selected server {single_server} is no longer available")
+                        f"Selected server {single_server} is no longer available"
+                    )
                 assignment_counts = [
-                    self._num_assigned_requests_by_server.get(
-                        single_server, 0)
+                    self._num_assigned_requests_by_server.get(single_server, 0)
                 ]
                 unused_context_servers = self._get_unused_context_servers(
                     [single_server])
-                await self._register_request(single_server, request)
-                self._num_assigned_requests_by_server[single_server] = (
-                    self._num_assigned_requests_by_server.get(
-                        single_server, 0) + 1)
+                await self._register_assigned_request(single_server, request)
             return single_server, self._routing_info(
                 single_server,
                 token_lists=token_lists,
@@ -992,10 +995,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             for server in servers
         ]
         # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-        matches = list(
-            await asyncio.gather(*(
-                self._server_state[server].matched_tokens(block_hashes)
-                for server in servers)))
+        matches = list(await asyncio.gather(
+            *(self._server_state[server].matched_tokens(block_hashes)
+              for server in servers)))
         scores = []
         for i in range(len(servers)):
             score = matches[i] / padded_tokens - workloads[
@@ -1012,9 +1014,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 tied_servers = [servers[i] for i in tied]
                 server = self._select_round_robin_tied(tied_servers)
                 selection_reason = "score"
-            await self._register_request(server, request)
-            self._num_assigned_requests_by_server[server] = (
-                self._num_assigned_requests_by_server.get(server, 0) + 1)
+            await self._register_assigned_request(server, request)
         return server, self._routing_info(
             server,
             token_lists=token_lists,
@@ -1427,8 +1427,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 if not collect_routing_info:
                     await self._register_request(server, request)
                     self._add_content_load(
-                        server, request,
-                        self._estimate_content_weight(request))
+                        server, request, self._estimate_content_weight(request))
                     conv_id = self._get_conversation_id(request)
                     if conv_id:
                         self._update_session(conv_id, server, [])
@@ -1445,11 +1444,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             async with self._lock:
                 if single_server not in self._server_state:
                     raise ValueError(
-                        f"Selected server {single_server} is no longer available")
+                        f"Selected server {single_server} is no longer available"
+                    )
                 await self._register_request(single_server, request)
-                self._add_content_load(
-                    single_server, request,
-                    self._estimate_content_weight(request))
+                self._add_content_load(single_server, request,
+                                       self._estimate_content_weight(request))
                 conv_id = self._get_conversation_id(request)
                 if conv_id:
                     self._update_session(conv_id, single_server, [])

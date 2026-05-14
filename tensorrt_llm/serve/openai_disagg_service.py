@@ -197,7 +197,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                 collect_routing_info=True,
             )
             ctx_prompt_token_ids = self._apply_prompt_token_ids_from_routing_info(
-                ctx_req, ctx_route_info)
+                ctx_req, ctx_route_info
+            )
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
@@ -263,13 +264,12 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     @staticmethod
     def _is_token_id_list(value: object) -> bool:
-        return isinstance(value, list) and (not value
-                                           or isinstance(value[0], int))
+        return isinstance(value, list) and all(isinstance(token_id, int) for token_id in value)
 
     @staticmethod
     def _apply_prompt_token_ids_from_routing_info(
-            request: UCompletionRequest,
-            routing_info: Optional[dict[str, Any]]) -> Optional[list[int]]:
+        request: UCompletionRequest, routing_info: Optional[dict[str, Any]]
+    ) -> Optional[list[int]]:
         if not routing_info:
             return None
         token_lists = routing_info.get("token_lists")
@@ -283,11 +283,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 request.prompt_token_ids = token_id_list
                 return token_id_list
         elif isinstance(request, CompletionRequest):
-            request.prompt = (token_lists
-                              if len(token_lists) > 1 else prompt_token_ids)
-            if (len(token_lists) == 1
-                    and OpenAIDisaggregatedService._is_token_id_list(
-                        prompt_token_ids)):
+            request.prompt = token_lists if len(token_lists) > 1 else prompt_token_ids
+            if len(token_lists) == 1 and OpenAIDisaggregatedService._is_token_id_list(
+                prompt_token_ids
+            ):
                 return cast(list[int], prompt_token_ids)
         return None
 
@@ -325,14 +324,17 @@ class OpenAIDisaggregatedService(OpenAIService):
             # Replace the string prompt with prompt_token_ids.  Chat CTX
             # responses may omit prompt_token_ids, so fall back to the router
             # tokenization result when it is available.
-            prompt_token_ids = (ctx_response.prompt_token_ids
-                                if ctx_response.prompt_token_ids is not None
-                                else ctx_prompt_token_ids)
+            prompt_token_ids = (
+                ctx_response.prompt_token_ids
+                if ctx_response.prompt_token_ids is not None
+                else ctx_prompt_token_ids
+            )
             if prompt_token_ids is not None:
                 if isinstance(request, CompletionRequest):
                     request.prompt = prompt_token_ids
-                elif (isinstance(request, ChatCompletionRequest)
-                      and self._is_token_id_list(prompt_token_ids)):
+                elif isinstance(request, ChatCompletionRequest) and self._is_token_id_list(
+                    prompt_token_ids
+                ):
                     request.prompt_token_ids = cast(list[int], prompt_token_ids)
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
@@ -363,13 +365,16 @@ class OpenAIDisaggregatedService(OpenAIService):
         request.disaggregated_params.disagg_request_id = disagg_request_id
         return request
 
-    async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
+    async def _check_conditional_disagg(
+        self, request: UCompletionRequest
+    ) -> tuple[Optional[str], bool]:
         if self.conditional_disagg_config:
             assert isinstance(self._gen_router, KvCacheAwareRouter)
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
             gen_server, info = await self._gen_router.get_next_server(
-                request, collect_routing_info=True)
+                request, collect_routing_info=True
+            )
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
             if (
@@ -528,9 +533,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
-                ctx_req, collect_routing_info=True)
+                ctx_req, collect_routing_info=True
+            )
             ctx_prompt_token_ids = self._apply_prompt_token_ids_from_routing_info(
-                ctx_req, ctx_server_info)
+                ctx_req, ctx_server_info
+            )
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,
