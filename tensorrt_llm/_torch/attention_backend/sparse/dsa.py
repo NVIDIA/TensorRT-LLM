@@ -69,26 +69,60 @@ except ImportError:
 _DG_SCHEDULE_BLOCK_KV = 64
 
 
-def _pick_fp4_dsl_expand(next_n: int) -> Tuple[int, int]:
-    """Pick (expand_factor, effective_next_n) for the DSL FP4 paged kernel.
+def _pick_dsl_expand(
+    next_n: int,
+    batch_size: int = 0,
+    max_ctx: int = 0,
+    num_sms: int = 148,
+    kernel_atoms: Tuple[int, ...] = (1, 2, 3)
+) -> Tuple[int, int]:
+    """Pick (expand_factor, effective_next_n) for the DSL paged kernel
+    using a wave-aware strategy. Used by both FP4 and FP8 DSL paths.
 
-    The CuTe DSL FP4 paged MQA logits kernel only supports
-    ``effective_next_n ∈ {1, 2, 3}``. For larger ``next_n`` we reshape
-    ``[B, next_n, ...]`` to ``[B * expand_factor, effective_next_n, ...]``
-    caller-side. To minimize HBM bandwidth we pick the smallest
-    ``expand_factor`` (== largest ``effective_next_n``) that divides
-    ``next_n`` cleanly.
+    The DSL kernel natively supports ``effective_next_n ∈ kernel_atoms``
+    (FP4: ``(1, 2, 3)``; FP8: ``(1, 2, 3, 4)``). For ``next_n`` not natively
+    supported or when SM utilization can be improved, reshape
+    ``[B, next_n, ...]`` -> ``[B * expand_factor, effective_next_n, ...]``
+    caller-side.
 
-    Examples:
-        next_n=4 -> (2, 2): two atoms of next_n=2 (DG's kNextNAtom=2 style)
-        next_n=5 -> (5, 1): only divisor; 5x HBM
-        next_n=6 -> (2, 3): two atoms of next_n=3 (prefer eff=3 over eff=2)
-        next_n=9 -> (3, 3): three atoms of next_n=3
+    Strategy: enumerate ``(expand_factor, effective_next_n)`` pairs with
+    ``expand_factor * effective_next_n == next_n`` and ``effective_next_n
+    in kernel_atoms``. Score each by ``(waves, -expand_factor)`` where
+    ``waves = ceil(B * expand_factor * ceil(max_ctx/256) / num_sms)``.
+    Pick min waves; on tie, prefer LARGER expand_factor (more SMs busy per
+    wave; pays HBM cost of expand_factor x KV re-reads).
+
+    When ``batch_size == 0`` or ``max_ctx == 0`` (workload unknown), fall
+    back to the legacy HBM-minimizing heuristic: largest effective_next_n
+    that divides next_n cleanly (still constrained to ``kernel_atoms``).
+
+    Examples (wave-aware, num_sms=148, SPLIT_KV=256 tokens):
+        FP4, next_n=4, B=1,  ctx=4096   -> (4, 1): ntask=64<148, 1 wave, max factor
+        FP4, next_n=4, B=32, ctx=4096   -> (2, 2): ntask=1024>148, multi-wave, min factor
+        FP4, next_n=2, B=1,  ctx=4096   -> (2, 1): wave-tie, larger factor
+        FP8, next_n=4, B=1,  ctx=4096   -> (4, 1): kernel_atoms incl. 4 doesn't change small-B pick
     """
-    for eff in (3, 2):
+    # Legacy fallback when workload is unknown.
+    if batch_size <= 0 or max_ctx <= 0:
+        for eff in sorted(kernel_atoms, reverse=True):
+            if next_n % eff == 0:
+                return next_n // eff, eff
+        return next_n, 1
+
+    SPLIT_KV_TOKENS = 256
+    cands = []
+    for eff in kernel_atoms:
         if next_n % eff == 0:
-            return next_n // eff, eff
-    return next_n, 1
+            factor = next_n // eff
+            ntask = batch_size * factor * (
+                (max_ctx + SPLIT_KV_TOKENS - 1) // SPLIT_KV_TOKENS)
+            waves = (ntask + num_sms - 1) // num_sms
+            cands.append((waves, factor, eff))
+    if not cands:
+        return next_n, 1
+    cands.sort(key=lambda x: (x[0], -x[1]))  # min waves, max factor
+    _, factor, eff = cands[0]
+    return factor, eff
 
 
 def _compute_slot_mappings(
@@ -374,11 +408,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     use_expanded_buffers_for_mtp: bool = False
     # Whether to reshape the DSL FP4 paged MQA logits Q tensor into
     # supported next_n ∈ {1, 2, 3} via caller-side atom-split (see
-    # `_pick_fp4_dsl_expand`). Reuses `kv_lens_expanded_cuda` /
+    # `_pick_dsl_expand`). Reuses `kv_lens_expanded_cuda` /
     # `block_table_expanded` / `scheduler_metadata_buffer_expanded`; runtime
     # mutually exclusive with `use_expanded_buffers_for_mtp` (the latter
     # requires `not _use_dsl`).
-    expand_for_dsl_fp4: bool = False
+    expand_for_dsl: bool = False
+    # Cached (expand_factor, atom) decision from the wave-aware picker. Set at
+    # `prepare()` time and read by forward call sites — avoids re-running the
+    # picker per call and guarantees prepare/forward use the SAME decision
+    # (otherwise the populated buffers would mismatch the kernel reshape).
+    dsl_expand_factor: int = 1
+    dsl_atom: int = 1
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -1023,39 +1063,68 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.block_table_expanded.clamp_(min=0)
 
         # CuTe DSL FP4 paged MQA logits kernel natively supports
-        # next_n ∈ {1, 2, 3} only. For next_n ≥ 4 we caller-side reshape
-        # [B, next_n, ...] -> [B * expand_factor, eff_next_n, ...] (see
-        # `_pick_fp4_dsl_expand`). The expanded buffers (`kv_lens_expanded_cuda`
-        # / `block_table_expanded` / `scheduler_metadata_buffer_expanded`,
-        # all sized for the worst-case `1+max_draft_tokens` factor) are
-        # reused: under `_use_dsl=True` the existing FP8 DG expand path
-        # never writes to them (it's gated on `not _use_dsl`), so there's
-        # no conflict.
-        self.expand_for_dsl_fp4 = (_use_dsl
-                                   and self.kv_cache_manager is not None
-                                   and self.kv_cache_manager.use_fp4
-                                   and self.max_draft_tokens >= 3)
-        if self.expand_for_dsl_fp4 and self.num_generations > 0:
+        # next_n ∈ {1, 2, 3} only. For next_n ≥ 4 atom-split is mandatory.
+        # For next_n ∈ {2, 3} atom-split is also beneficial when the wave-aware
+        # picker decides more SM utilization outweighs the (expand_factor)x
+        # HBM cost (e.g., low batch with idle SMs). The expanded buffers
+        # (`kv_lens_expanded_cuda` / `block_table_expanded` /
+        # `scheduler_metadata_buffer_expanded`, all sized for the worst-case
+        # `1+max_draft_tokens` factor) are reused: under `_use_dsl=True` the
+        # existing FP8 DG expand path never writes to them (gated on
+        # `not _use_dsl`), so there's no conflict.
+        # Trigger relaxed to `max_draft_tokens >= 1` (i.e., next_n >= 2) so the
+        # picker can choose to expand when waves vs HBM trade-off favors it.
+        # Trigger atom-split for both FP4 and FP8 DSL paths. FP4 kernel
+        # supports atom ∈ {1, 2, 3}; FP8 supports {1, 2, 3, 4}. Picker is
+        # given the appropriate kernel_atoms set so it only enumerates
+        # decompositions the kernel can handle.
+        self.expand_for_dsl = (_use_dsl and self.kv_cache_manager is not None
+                               and self.max_draft_tokens >= 1)
+        if self.expand_for_dsl and self.num_generations > 0:
             next_n = 1 + self.max_draft_tokens
-            expand_factor, _ = _pick_fp4_dsl_expand(next_n)
-            num_tokens = self.num_generations * expand_factor
+            kernel_atoms = (1, 2,
+                            3) if self.kv_cache_manager.use_fp4 else (1, 2, 3,
+                                                                      4)
+            # Wave-aware picker. max_ctx ≈ longest gen kv_len (decode iter
+            # upper-bound observed at this prepare). num_sms is hardware.
             gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
-            gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(expand_factor)
-            self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
-            self.kv_lens_expanded_cuda[:num_tokens].copy_(
-                self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
-            if self.kv_cache_manager is not None:
-                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
-                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
-                    self.num_contexts:self.num_seqs, :max_len]
-                expanded_blocks = gen_block_tensor.repeat_interleave(
-                    expand_factor, dim=0)
-                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                    expanded_blocks, non_blocking=True)
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens],
-                    non_blocking=True)
-                self.block_table_expanded.clamp_(min=0)
+            max_ctx = int(
+                gen_kv_lens.max().item()) if gen_kv_lens.numel() else 0
+            expand_factor, atom = _pick_dsl_expand(
+                next_n,
+                batch_size=self.num_generations,
+                max_ctx=max_ctx,
+                num_sms=self.num_sms,
+                kernel_atoms=kernel_atoms,
+            )
+            self.dsl_expand_factor = expand_factor
+            self.dsl_atom = atom
+            # Only populate when picker chose to actually split (factor > 1);
+            # factor=1 means kernel-native, no expansion needed.
+            if expand_factor > 1:
+                num_tokens = self.num_generations * expand_factor
+                gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(
+                    expand_factor)
+                self.kv_lens_expanded_host[:num_tokens].copy_(
+                    gen_kv_lens_expanded)
+                self.kv_lens_expanded_cuda[:num_tokens].copy_(
+                    self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
+                if self.kv_cache_manager is not None:
+                    max_len = self.host_indexer_k_cache_block_offsets.shape[1]
+                    gen_block_tensor = self.host_indexer_k_cache_block_offsets[
+                        self.num_contexts:self.num_seqs, :max_len]
+                    expanded_blocks = gen_block_tensor.repeat_interleave(
+                        expand_factor, dim=0)
+                    self.host_block_table_expanded[:num_tokens, :max_len].copy_(
+                        expanded_blocks, non_blocking=True)
+                    self.block_table_expanded[:num_tokens].copy_(
+                        self.host_block_table_expanded[:num_tokens],
+                        non_blocking=True)
+                    self.block_table_expanded.clamp_(min=0)
+        else:
+            # Reset cache; forward path uses kernel-native next_n.
+            self.dsl_expand_factor = 1
+            self.dsl_atom = 1 + self.max_draft_tokens
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
@@ -1609,16 +1678,15 @@ class Indexer(nn.Module):
                 metadata.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
 
-            # DSL FP4 atom-split schedule. The DSL kernel reshapes
-            # [B, next_n, ...] -> [B * factor, eff_next_n, ...] caller-side
-            # for next_n > 3 (kernel only supports {1, 2, 3} natively); the
-            # matching schedule is built from the doubled-batch shape so
-            # `num_next_n_atoms` keeps encoding the effective next_n. Runtime
-            # mutually exclusive with the `else` branch above (the latter
-            # requires `use_expanded_buffers_for_mtp` which is False under DSL).
-            if metadata.expand_for_dsl_fp4 and metadata.num_generations > 0:
-                expand_factor, _ = _pick_fp4_dsl_expand(
-                    1 + metadata.max_draft_tokens)
+            # DSL FP4 atom-split schedule. Picker decision was cached on
+            # `metadata.fp4_dsl_{expand_factor, atom}` at metadata prepare
+            # time; only build the expanded schedule when picker chose to
+            # split (factor > 1). Runtime mutually exclusive with the `else`
+            # branch above (latter requires `use_expanded_buffers_for_mtp`
+            # which is False under DSL).
+            if metadata.expand_for_dsl and metadata.num_generations > 0 \
+                    and metadata.dsl_expand_factor > 1:
+                expand_factor = metadata.dsl_expand_factor
                 num_tokens = metadata.num_generations * expand_factor
                 kv_lens_expanded_2d = metadata.kv_lens_expanded_cuda[:
                                                                      num_tokens].view(
@@ -2006,16 +2074,17 @@ class Indexer(nn.Module):
                     dsl_block_table = block_table
                     dsl_schedule_meta = metadata.scheduler_metadata_buffer
 
-                    # DSL FP4 kernel natively supports next_n ∈ {1, 2, 3}; for
-                    # larger next_n, reshape [B, next_n, ...] -> [B*factor,
-                    # eff_next_n, ...] (HBM-optimal — see
-                    # `_pick_fp4_dsl_expand`). Row layout of logits is
-                    # preserved by the reshape so no reassembly is needed at
-                    # the output side. The expanded metadata is populated
-                    # in DSAtrtllmAttentionMetadata.prepare /
-                    # Indexer.prepare under `expand_for_dsl_fp4`.
-                    if next_n > 3:
-                        factor, eff_next_n = _pick_fp4_dsl_expand(next_n)
+                    # DSL FP4 kernel natively supports next_n ∈ {1, 2, 3}.
+                    # The wave-aware picker in `_pick_dsl_expand` is run
+                    # once per metadata prepare and the result cached on
+                    # `metadata.fp4_dsl_{expand_factor, atom}`. Trigger expand
+                    # whenever the picker decided to split (factor > 1),
+                    # regardless of next_n — this lets next_n ∈ {2, 3} also
+                    # benefit from atom-split when low-batch leaves SMs idle,
+                    # in addition to the mandatory next_n=4 case.
+                    if metadata.dsl_expand_factor > 1:
+                        factor = metadata.dsl_expand_factor
+                        eff_next_n = metadata.dsl_atom
                         exp_B = num_generations * factor
                         dsl_q = dsl_q.reshape(exp_B, eff_next_n, self.n_heads,
                                               self.head_dim // 2)
@@ -2032,10 +2101,29 @@ class Indexer(nn.Module):
                         dsl_context_lens, dsl_block_table, dsl_schedule_meta,
                         max_seq_len)
                 else:
+                    # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
+                    # Apply wave-aware atom-split when the picker decided to
+                    # split (factor > 1) — typically benefits small-batch /
+                    # low-ntask configs by raising SM utilization at the cost
+                    # of factor× KV HBM re-reads. Picker decision was cached
+                    # on metadata.{dsl_expand_factor, dsl_atom} during prepare.
+                    dsl_q = q_decode
+                    fp8_ctx_lens = dsl_context_lens
+                    fp8_block_table = block_table
+                    fp8_schedule_meta = metadata.scheduler_metadata_buffer
+                    if metadata.dsl_expand_factor > 1:
+                        factor = metadata.dsl_expand_factor
+                        atom = metadata.dsl_atom
+                        exp_B = num_generations * factor
+                        dsl_q = q_decode.reshape(exp_B, atom, self.n_heads,
+                                                 self.head_dim)
+                        fp8_ctx_lens = metadata.kv_lens_expanded_cuda[:exp_B]
+                        fp8_block_table = metadata.block_table_expanded[:exp_B]
+                        fp8_schedule_meta = (
+                            metadata.scheduler_metadata_buffer_expanded)
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
-                        q_decode, k_cache, weights_decode, dsl_context_lens,
-                        block_table, metadata.scheduler_metadata_buffer,
-                        max_seq_len)
+                        dsl_q, k_cache, weights_decode, fp8_ctx_lens,
+                        fp8_block_table, fp8_schedule_meta, max_seq_len)
             else:
                 decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                          num_gen_tokens,
