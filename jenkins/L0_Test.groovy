@@ -43,6 +43,7 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
+LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.02-py3"
@@ -3211,14 +3212,17 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 }
 
 
-def checkPipInstall(pipeline, wheel_path)
+def checkPipInstall(pipeline, wheel_path, version_local)
 {
     def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT}/tests/unittest && python3 test_pip_install.py --wheel_path ${wheelArtifactLinks}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+        cd ${LLM_ROOT}/tests/unittest && \
+        python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "${version_local}"
+        """)
 }
 
 
-def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", version_local="", cpver="cp312")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -3247,6 +3251,18 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;103-real;120-real'"
+    }
+
+    if (version_local) {
+        sh """
+            cd tensorrt_llm
+            sed -i.bak 's/^__version__ = "\\(.*\\)"\$/__version__ = "\\1+${version_local}"/' tensorrt_llm/version.py
+            if diff tensorrt_llm/version.py.bak tensorrt_llm/version.py; then
+                echo "ERROR: failed to inject local version '+${version_local}' into tensorrt_llm/version.py" >&2
+                exit 1
+            fi
+            rm tensorrt_llm/version.py.bak
+        """
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
@@ -3967,13 +3983,14 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
 
     // Python version and OS for sanity check
+    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall]
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
+            LLM_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
-            "dlfw/",
+            true,
             DLFW_IMAGE,
             false,
         ],
@@ -3982,7 +3999,7 @@ def launchTestJobs(pipeline, testFilter)
             "A10",
             X86_64_TRIPLE,
             true,
-            "",
+            false,
             UBUNTU_22_04_IMAGE,
             true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
         ],
@@ -3991,22 +4008,19 @@ def launchTestJobs(pipeline, testFilter)
             "A100X",
             X86_64_TRIPLE,
             true,
-            "",
+            false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
     ]
 
     aarch64SanityCheckConfigs = [
-        // Workaround PyTorch 2.9.1 vs. 2.10.0a0 incompatibility issue. Once resolved, change back to:
-        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
-        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
-            LLM_DOCKER_IMAGE,
+            LLM_WHEEL_DOCKER_IMAGE,
             "GH200",
             AARCH64_TRIPLE,
             false,
-            "",
+            false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
@@ -4015,7 +4029,7 @@ def launchTestJobs(pipeline, testFilter)
             "GH200",
             AARCH64_TRIPLE,
             false,
-            "dlfw/",
+            true,
             DLFW_IMAGE,
             false,
         ],
@@ -4054,7 +4068,16 @@ def launchTestJobs(pipeline, testFilter)
             def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
             sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
-            def wheelPath = "${values[4]}"
+            def isDlfw = values[4]
+            def versionLocal = ""
+            if (isDlfw) {
+                // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
+                def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
+                if (!matcher.find()) {
+                    error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
+                }
+                versionLocal = "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
+            }
             def wheelName = ""
             def cpver = "cp312"
             def pyver = "3.12"
@@ -4064,18 +4087,11 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                def env = []
-                if (key.contains("manylinux")) {
-                    env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
-                }
-                withEnv(env) {
-                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver)
-                }
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver)
             }
 
-            def fullWheelPath = "${cpu_arch}/${wheelPath}${wheelName}"
-
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
+            // def fullWheelPath = "${cpu_arch}/${wheelName}"
             // sanityRunner("Sanity check") {
             //     runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
             // }
@@ -4137,7 +4153,7 @@ def launchTestJobs(pipeline, testFilter)
                             sh "env | sort"
                             trtllm_utils.llmRetry(1, "checkPipInstall", {
                                 timeout(time: 30, unit: 'MINUTES') {
-                                    checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                                    checkPipInstall(pipeline, "${cpu_arch}", versionLocal)
                                 }
                             })
                         }

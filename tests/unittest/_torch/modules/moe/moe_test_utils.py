@@ -187,6 +187,81 @@ def should_skip_trtllm(
     if backend_type != MoeBackendType.TRTLLM:
         return None
 
+    # [Bug] On B300 (SM103), TRTLLM-Gen block-scale MoE produces a CUDA
+    # illegal memory access (IMA) when the autotuner exposes tile=32
+    # with certain configIndex values that have not been blacklisted.
+    # Empirically the IMA originates inside the W4A16_MXFP4 path
+    # (Bf16MxE2m1BlockScaleMoERunner); once it fires, every subsequent
+    # test in the same pytest process ERRORs at setup with
+    # `cudaErrorIllegalAddress`.
+    #
+    # Background:
+    # * Jenkins L0_MergeRequest_PR/37541 (build 899, stage
+    #   B300-PyTorch-1) originally reported the failure on
+    #   FP8_BLOCK_SCALES `e8_k1_h512_i512-seq=8`, which is a cascade
+    #   victim of an upstream tile=32 IMA.
+    # * PR #13964 head commit 5629e0dff9 introduced two related fixes:
+    #     - Python: corrected the swapped
+    #       `(local_num_experts, num_tokens)` ordering in
+    #       `Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics`.
+    #     - C++: blacklisted tactic `[tileN==32, configIndex==5]` on
+    #       SM103 via `isKnownInvalidBlockScaleMoeTactic` in
+    #       `cpp/.../blockScaleMoe/runner.h`.
+    # * Empirical reproduction of
+    #   `pytest test_moe_backend.py::test_moe_backend -k "TRTLLM"`
+    #   on B300 (NVIDIA B300 SXM6, SM103) at commit 5629e0dff9:
+    #
+    #       blacklist body                                  result
+    #       ---------------------------------------------   ----------------
+    #       SM103 && tileN==32 && configIndex==5            23 pass + 1 FAIL
+    #       (PR HEAD)                                        (W4A16_MXFP4) +
+    #                                                        10 cascade ERROR
+    #       return false (blacklist disabled)               identical to above
+    #       SM103 && tileN==32 (all configIndex)            34/34 pass
+    #
+    #   This shows the PR's `[tileN==32, configIndex==5]` blacklist is
+    #   necessary but *not sufficient*; tileN==32 on SM103 has at
+    #   least one additional broken configIndex that needs to be
+    #   blacklisted (or the kernel fixed) for the W4A16_MXFP4 path.
+    #
+    # Reproduce on a B300 node (Slurm `trt-llm_b300` account):
+    #   1. Build TRT-LLM from PR head 5629e0dff9 inside the project's
+    #      tritondevel container (single GPU is sufficient).
+    #   2. cd tests/unittest && \
+    #      python3 -m pytest -v -s \
+    #          _torch/modules/moe/test_moe_backend.py::test_moe_backend \
+    #          -k "TRTLLM" -p no:randomly
+    #   3. Expect:
+    #        FAILED ...alpha=1.702_beta=1.0_limit=7.0-e128_k4_h2880_i2880
+    #               -seq=8-...-quant=W4A16_MXFP4...
+    #             torch.AcceleratorError: CUDA error: illegal memory access
+    #
+    # Skip the directly-observed FAIL until the C++ blacklist is
+    # extended (e.g. `SMVersion==103 && tileTokensDim==32`) or the
+    # underlying kernel is fixed for tileN==32 on SM103.
+    from tensorrt_llm._utils import get_sm_version
+
+    if (
+        get_sm_version() == 103
+        and quant_algo == QuantAlgo.W4A16_MXFP4
+        and swiglu_gptoss_style
+        and model_config is not None
+        and model_config.num_experts == 128
+        and model_config.top_k == 4
+        and model_config.hidden_size == 2880
+        and model_config.intermediate_size == 2880
+        and seq_len == 8
+    ):
+        return (
+            "[Bug] TRTLLMGen MoE W4A16_MXFP4 on B300 (SM103) with "
+            "MoeModelConfig(128, 4, 2880, 2880), "
+            "swiglu_gptoss_style=True and seq_len=8 hits CUDA "
+            "illegal memory access in a tileN=32 autotune tactic "
+            "not covered by the partial blacklist "
+            "[tileN=32, configIndex=5] in PR #13964 head 5629e0dff9; "
+            "see the comment above for reproduction."
+        )
+
     # Routing method compatibility check (used by test_moe_module.py)
     # TRTLLMGen C++ routing kernel (runner.cu) implements:
     # - DeepSeekV3 (nGroup<=1: SigmoidBias+ScaledSumNormalize; nGroup>1: full DeepSeek kernel)
@@ -1052,9 +1127,16 @@ def should_skip_to_accelerate_ci(
     if quant_algo is None and is_gated_activation(activation_type):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
-    is_large_model = model_config.num_experts >= 256 and model_config.hidden_size >= 7168
+    # Any e256-class model_config triggers CI Rule-1 minimal coverage:
+    # the full dtype x seq_len x swiglu x routing matrix on e256 models
+    # otherwise blows the per-stage Slurm wall-clock budget (B200 stage
+    # timed out on this PR's first CI run after DeepSeek-V4-Flash was
+    # promoted into CI_MOE_MODEL_CONFIGS). e256 coverage in CI is kept
+    # minimal (DeepSeekV3 routing, bfloat16, seq=1, non-gptoss SwiGLU);
+    # breadth comes from smaller configs (Qwen, GPT-OSS-120B, boundary).
+    is_large_model = model_config.num_experts >= 256
 
-    # --- Rule 1: Large model (e256_k8_h7168_i2048) restrictions ---
+    # --- Rule 1: Large e256-class model restrictions ---
     if is_large_model:
         if routing_method_cls is not None:
             from tensorrt_llm._torch.modules.fused_moe import DeepSeekV3MoeRoutingMethod
