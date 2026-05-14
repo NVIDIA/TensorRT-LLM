@@ -633,7 +633,7 @@ INST_DECODE_DTYPES(512, 128)
 // HD=128: ELEM_PER_BLOCK=128, smem = 3*4*128*4 = 6 KB.
 // HD=512 bf16: ELEM_PER_BLOCK=256, smem = 3*4*256*4 = 12 KB.
 // HD=512 fp32: ELEM_PER_BLOCK=128, smem = 3*4*128*4 = 6 KB.
-// NEXT_N=1 (single-token decode) and NEXT_N=2 (MTP speculative decode).
+// NEXT_N=1 (single-token decode), NEXT_N=2..4 (MTP speculative decode; MTP-3 → NEXT_N=4).
 INST_DECODE(128, 2, 2, 128, 1, 4)
 INST_DECODE(128, 2, 4, 128, 1, 4)
 INST_DECODE(128, 4, 2, 128, 1, 4)
@@ -642,6 +642,14 @@ INST_DECODE(128, 2, 2, 128, 2, 4)
 INST_DECODE(128, 2, 4, 128, 2, 4)
 INST_DECODE(128, 4, 2, 128, 2, 4)
 INST_DECODE(128, 4, 4, 128, 2, 4)
+INST_DECODE(128, 2, 2, 128, 3, 4)
+INST_DECODE(128, 2, 4, 128, 3, 4)
+INST_DECODE(128, 4, 2, 128, 3, 4)
+INST_DECODE(128, 4, 4, 128, 3, 4)
+INST_DECODE(128, 2, 2, 128, 4, 4)
+INST_DECODE(128, 2, 4, 128, 4, 4)
+INST_DECODE(128, 4, 2, 128, 4, 4)
+INST_DECODE(128, 4, 4, 128, 4, 4)
 INST_DECODE(512, 2, 2, 128, 1, 4)
 INST_DECODE(512, 2, 4, 128, 1, 4)
 INST_DECODE(512, 4, 2, 128, 1, 4)
@@ -650,6 +658,14 @@ INST_DECODE(512, 2, 2, 128, 2, 4)
 INST_DECODE(512, 2, 4, 128, 2, 4)
 INST_DECODE(512, 4, 2, 128, 2, 4)
 INST_DECODE(512, 4, 4, 128, 2, 4)
+INST_DECODE(512, 2, 2, 128, 3, 4)
+INST_DECODE(512, 2, 4, 128, 3, 4)
+INST_DECODE(512, 4, 2, 128, 3, 4)
+INST_DECODE(512, 4, 4, 128, 3, 4)
+INST_DECODE(512, 2, 2, 128, 4, 4)
+INST_DECODE(512, 2, 4, 128, 4, 4)
+INST_DECODE(512, 4, 2, 128, 4, 4)
+INST_DECODE(512, 4, 4, 128, 4, 4)
 
 #undef INST_DECODE_DTYPES
 #undef INST_DECODE_NN
@@ -692,7 +708,10 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
     // For large compress_ratio, use 4-warp parallel reduction to cut the serial
     // softmax loop from COMPRESS_RATIO iterations to COMPRESS_RATIO/4 per warp.
-    // Supported configs: CR=128, (HD=128 or HD=512), NEXT_N=1 or NEXT_N=2.
+    // Supported configs: CR=128, (HD=128 or HD=512), NEXT_N in 1..4.  NEXT_N>2
+    // is required for MTP-3 decode (each step accepts up to 4 tokens per request);
+    // without multi-warp the slow path is a single warp doing 128 serial paged
+    // loads, which is DRAM-latency-bound (no other warps to hide it).
     //
     // smem per block = 3 * MULTI_WARP * ELEM_PER_BLOCK * sizeof(float)
     //   where ELEM_PER_BLOCK = nthreads_inner * vec = HEAD_DIM / HEAD_BLOCKS.
@@ -700,7 +719,7 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     // HD=512 with max elem size 2 (vec=8, HEAD_BLOCKS=2): ELEM_PER_BLOCK=256 → 12 KB.
     // HD=512 with max elem size 4 (vec=4, HEAD_BLOCKS=4): ELEM_PER_BLOCK=128 →  6 KB.
     constexpr int MULTI_WARP = 4;
-    bool const use_multi_warp = (compress_ratio == 128 && next_n <= 2);
+    bool const use_multi_warp = (compress_ratio == 128 && next_n <= 4);
     int const num_red_warps = use_multi_warp ? MULTI_WARP : 1;
     int const nthreads = nthreads_inner * num_red_warps;
     int const elem_per_block = nthreads_inner * vec; // = HEAD_DIM / HEAD_BLOCKS
@@ -721,8 +740,10 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 #define DISPATCH_NN_MW(HD, KV_EB, STATE_EB, CR)                                                                        \
     switch (next_n)                                                                                                    \
     {                                                                                                                  \
+    case 1: LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, 1); break;                                                       \
     case 2: LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, 2); break;                                                       \
-    default: LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, 1); break;                                                      \
+    case 3: LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, 3); break;                                                       \
+    default: LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, 4); break;                                                      \
     }
 
 #define DISPATCH_NN(HD, KV_EB, STATE_EB, CR)                                                                           \
