@@ -365,7 +365,7 @@ def _get_attn_types_for_layer(
         types.extend(
             [
                 DeepseekV4AttentionType.COMPRESS,
-                DeepseekV4AttentionType.COMPRESSOR_STATE,
+                DeepseekV4AttentionType.COMPRESSOR_KV,
                 DeepseekV4AttentionType.COMPRESSOR_SCORE,
             ]
         )
@@ -373,7 +373,7 @@ def _get_attn_types_for_layer(
         types.extend(
             [
                 DeepseekV4AttentionType.INDEXER_COMPRESS,
-                DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+                DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
                 DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
             ]
         )
@@ -383,9 +383,9 @@ def _get_attn_types_for_layer(
 # Mirror transceiver.py windowed-block trim: only in-window blocks are transferred.
 _WINDOWED_ATTN_TYPES = {
     DeepseekV4AttentionType.SWA,
-    DeepseekV4AttentionType.COMPRESSOR_STATE,
+    DeepseekV4AttentionType.COMPRESSOR_KV,
     DeepseekV4AttentionType.COMPRESSOR_SCORE,
-    DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
     DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
 }
 
