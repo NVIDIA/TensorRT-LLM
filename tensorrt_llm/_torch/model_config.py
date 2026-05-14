@@ -768,6 +768,11 @@ class ModelConfig(Generic[TConfig]):
                     if checkpoint_window_size is None:
                         checkpoint_window_size = getattr(
                             pretrained_config, 'sliding_window', None)
+                    # Pull the FP4 indexer knob from the user-provided config;
+                    # default to FP8 when no override is set.
+                    indexer_k_dtype = getattr(
+                        sparse_attention_config, 'indexer_k_dtype',
+                        'fp8') if sparse_attention_config else 'fp8'
                     if sparse_attention_config:
                         compress_ratios = sparse_attention_config.compress_ratios
                         window_size = sparse_attention_config.window_size
@@ -811,6 +816,7 @@ class ModelConfig(Generic[TConfig]):
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
                             compress_ratios=compress_ratios,
                             window_size=window_size,
+                            indexer_k_dtype=indexer_k_dtype,
                             **indexer_config)
             else:
                 raise ValueError(

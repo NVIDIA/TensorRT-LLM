@@ -825,6 +825,8 @@ def test_indexer_k_cache_scatter_custom_op():
 
     # ========== Path 1: CUDA Kernel ==========
     print("\n=== Path 1: CUDA Kernel ===")
+    # The op signature now takes the original-dtype tensors (FP8 + float32)
+    # and an explicit num_tokens, reinterpreting bytes internally.
     torch.ops.trtllm.indexer_k_cache_scatter_op(
         k_fp8,
         k_scale,

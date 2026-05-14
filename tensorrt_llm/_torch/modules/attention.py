@@ -1068,6 +1068,7 @@ def _mla_dsa_proj_fake(
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
     num_tokens = hidden_states.shape[0]
     indexer = mla_layer.mqa.indexer
+    use_fp4 = getattr(indexer, "use_fp4", False)
     q = hidden_states.new_empty(
         [num_tokens, mla_layer.num_heads_tp * mla_layer.qk_head_dim])
     compressed_kv = hidden_states.new_empty(
@@ -2006,8 +2007,9 @@ class MLA(nn.Module):
         Returns [q, compressed_kv, k_pe, latent_cache] when short-MHA
         handles all tokens (eager only), or
         [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
-        weights] when the indexer runs.  Under torch compile
-        _should_use_short_mha returns False so it is always length 8.
+        weights, q_scale] when the indexer runs.  q_scale is unused on the
+        FP8 path but always present so CUDA graph capture sees a stable
+        9-tensor shape regardless of indexer dtype.
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
 

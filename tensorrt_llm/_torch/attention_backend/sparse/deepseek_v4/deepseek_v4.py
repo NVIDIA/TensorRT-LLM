@@ -116,7 +116,7 @@ def get_token_bytes(
     compress_ratio: int,
     attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
-    indexer_k_cache_dtype: str = "fp8_blockwise",
+    indexer_k_dtype: str = "fp8",
 ) -> int:
     """
     Get the token bytes for a specific layer and attention type.
@@ -127,9 +127,9 @@ def get_token_bytes(
         compress_ratio: The compress ratio
         attn_type: The attention type
         has_fp8_kv_cache: Whether the KV cache uses FP8 quantization
-        indexer_k_cache_dtype: Indexer compressor cache preset string
-            (controls INDEXER_COMPRESS dtype + scale layout independently
-            from has_fp8_kv_cache, which controls the main attention path).
+        indexer_k_dtype: Indexer K cache dtype ("fp8" / "fp4"). Controls
+            INDEXER_COMPRESS dtype + scale layout independently from
+            has_fp8_kv_cache, which controls the main attention path.
 
     Returns:
         The number of bytes per token, including scaling factor
@@ -152,19 +152,19 @@ def get_token_bytes(
     ]:
         dtype_bytes = 4  # (indexer) compressor state and score use float32
     # Indexer cache always packs data + per-block scales into one row.  Only
-    # FP8 blockwise and MXFP4 are valid here -- bf16 / fp8_pertensor
-    # are reserved for the main-attention compressor.
+    # the two indexer presets ("fp8" blockwise / "fp4" mxfp4) are valid
+    # here — bf16 / fp8_pertensor are reserved for the main-attention
+    # compressor.
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-        indexer_cache_dtype = resolve_kv_cache_dtype(indexer_k_cache_dtype)
-        if indexer_cache_dtype == KVCacheDtype.FP8_BLOCKWISE:
+        if indexer_k_dtype == "fp8":
             # 1 byte per value + 1 fp32 scale per 128 values.
             return attn_dim + index_head_dim // 128 * 4
-        if indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
+        if indexer_k_dtype == "fp4":
             # ½ byte per value + 1 ue8m0 byte per 32 values.
             return index_head_dim // 2 + index_head_dim // 32
         raise ValueError(
-            f"Unsupported indexer_k_cache_dtype {indexer_k_cache_dtype!r}; "
-            "expected 'fp8_blockwise' or 'mxfp4'."
+            f"Unsupported indexer_k_dtype {indexer_k_dtype!r}; "
+            "expected 'fp8' or 'fp4'."
         )
 
     return attn_dim * dtype_bytes
@@ -943,10 +943,16 @@ class DeepseekV4Indexer(Indexer):
             qk_rope_head_dim=mla_params.qk_rope_head_dim,
             qk_nope_head_dim=index_head_dim - mla_params.qk_rope_head_dim,
         )
-        self.indexer_k_cache_dtype = getattr(
-            sparse_attention_config, "indexer_k_cache_dtype", "fp8_blockwise"
+        # Map the user-facing FP4 knob ("fp8" / "fp4") onto the Compressor's
+        # cache layout preset string. The Compressor's preset namespace also
+        # covers main-attention layouts (bf16 / fp8_pertensor), which the
+        # indexer doesn't use, so the translation lives here at the
+        # boundary instead of leaking through the user-facing config.
+        self.indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+        compressor_preset = (
+            "mxfp4" if self.indexer_k_dtype == "fp4" else "fp8_blockwise"
         )
-        self.indexer_cache_dtype = resolve_kv_cache_dtype(self.indexer_k_cache_dtype)
+        self.indexer_cache_dtype = resolve_kv_cache_dtype(compressor_preset)
         self.compressor = Compressor(
             indexer_mla_params,
             layer_idx,
@@ -955,7 +961,7 @@ class DeepseekV4Indexer(Indexer):
             skip_create_weights_in_init,
             pos_embd_params,
             dtype=dtype,
-            kv_cache_dtype=self.indexer_k_cache_dtype,
+            kv_cache_dtype=compressor_preset,
             is_indexer=True,
             rotate_activation=HAS_FAST_HADAMARD,
         )
@@ -991,15 +997,44 @@ class DeepseekV4Indexer(Indexer):
         return q
 
     def _quantize_q(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Rotate + quantize (layout matches compressor K: [nope|pe]).
+        # Rotate + quantize (layout matches compressor K: [nope|pe]). After
+        # rotate_activation (Hadamard) the nope/rope split becomes a linear
+        # mix; treating the row as a (head_dim - rope_dim, rope_dim) split
+        # for fused_cat_fp4 is equivalent to a single per-token FP4 quantize
+        # because the kernel only cares about the concatenated row. K goes
+        # through the same rotation in compressor_postprocess_scatter so
+        # layouts match.
         q = rotate_activation(q)
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
-            q, use_ue8m0=self.scale_fmt == "ue8m0"
-        )
-        q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_heads, 1)
+        if self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
+            nope_dim = self.head_dim - self.rope_dim
+            q_nope, q_pe = q.split([nope_dim, self.rope_dim], dim=-1)
+            q_fp8, q_scale = torch.ops.trtllm.fused_cat_fp4(q_nope, q_pe)
+            # Two FP4 codes pack into one byte: trailing dim is head_dim // 2.
+            q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim // 2)
+            q_scale = q_scale.view(-1, self.n_heads, 1)
+        else:
+            q_fp8, q_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
+                q, use_ue8m0=self.scale_fmt == "ue8m0"
+            )
+            q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_heads, 1)
         return q_fp8, q_scale
+
+    def _apply_weight_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor:
+        # The DeepGEMM FP4 kernel applies per-block q_scale internally, so
+        # weights only carry softmax_scale * n_heads^-0.5. `weights_proj` is
+        # bf16 to match the V4 checkpoint, and the FP4 branch's only
+        # post-projection multiplier is a Python float (`bf16 * float` stays
+        # bf16). DeepGEMM's fp8_fp4_(paged_)mqa_logits asserts
+        # `weights.scalar_type() == kFloat`, so cast explicitly here. The FP8
+        # branch gets upcast for free via the fp32 `q_scale` multiply in
+        # `_weight_scale`, so no cast is needed there.
+        if self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
+            return weights.float() * self.weight_scale_factor
+        return self._weight_scale(weights, q_scale)
 
     def _update_k_cache_if_needed(
         self,
@@ -1008,6 +1043,12 @@ class DeepseekV4Indexer(Indexer):
         metadata: DeepseekV4TrtllmAttentionMetadata,
     ) -> None:
         if k_fp8 is None:
+            return
+
+        # The MXFP4 compressor's postprocess_scatter performs rotation +
+        # quantization + cache scatter in one fused op, so the cache row is
+        # already up to date by the time we get here.
+        if self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
             return
 
         assert k_scale is not None, "FP8 blockwise indexer cache update requires scale tensor"
@@ -1019,7 +1060,7 @@ class DeepseekV4Indexer(Indexer):
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
         """Prepare indexer inputs by splitting independent work across two streams.
 
         The current stream owns the Q path.  The auxiliary stream starts from
@@ -1061,10 +1102,10 @@ class DeepseekV4Indexer(Indexer):
         q_fp8, q_scale = self._quantize_q(q)
 
         self.weights_proj_event.wait()
-        weights = self._weight_scale(weights, q_scale)
+        weights = self._apply_weight_scale(weights, q_scale)
 
         self.k_cache_update_event.wait()
-        return q_fp8, k_fp8, k_scale, weights
+        return q_fp8, q_scale, k_fp8, k_scale, weights
 
     def _run_serial_indexer_prepare(
         self,
@@ -1072,18 +1113,18 @@ class DeepseekV4Indexer(Indexer):
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
         q = self._qk_projection_and_rope(qr, position_ids)
 
         q_fp8, q_scale = self._quantize_q(q)
 
         weights = self.weights_proj(hidden_states)
 
-        weights = self._weight_scale(weights, q_scale)
+        weights = self._apply_weight_scale(weights, q_scale)
 
         k_fp8, k_scale = self.compressor(hidden_states, metadata)
         self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
-        return q_fp8, k_fp8, k_scale, weights
+        return q_fp8, q_scale, k_fp8, k_scale, weights
 
     def forward(
         self,
@@ -1092,19 +1133,12 @@ class DeepseekV4Indexer(Indexer):
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
     ):
-        if self.indexer_cache_dtype != KVCacheDtype.FP8_BLOCKWISE:
-            raise NotImplementedError(
-                "DeepSeek-V4 indexer currently consumes FP8 blockwise K. "
-                f"Indexer cache preset {self.indexer_k_cache_dtype!r} needs matching "
-                "cache layout, cache update, and BMM paths before end-to-end indexer "
-                "execution can use it."
-            )
         if do_multi_stream() and self.aux_stream is not None:
-            q_fp8, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
+            q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
                 qr, hidden_states, metadata, position_ids
             )
         else:
-            q_fp8, k_fp8, k_scale, weights = self._run_serial_indexer_prepare(
+            q_fp8, q_scale, k_fp8, k_scale, weights = self._run_serial_indexer_prepare(
                 qr, hidden_states, metadata, position_ids
             )
 
@@ -1119,6 +1153,7 @@ class DeepseekV4Indexer(Indexer):
                 k_fp8,
                 k_scale,
                 weights,
+                q_scale=q_scale,
                 update_k_cache=False,
             )
         return topk_indices

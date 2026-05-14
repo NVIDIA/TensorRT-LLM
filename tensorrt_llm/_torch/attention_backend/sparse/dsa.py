@@ -32,10 +32,23 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
-                                    fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
-                                    fp8_paged_mqa_logits,
+from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
+
+# FP4 MQA logit kernels are only present in DeepGEMM tags that have the
+# upstream FP4 attention work merged in (e.g. deepseek-ai/DeepGEMM
+# c491439e or later). The DeepSeek-V4 branch currently pins a fork that
+# predates that work, so import them lazily; the FP4 dispatch in
+# Indexer._call_(paged_)mqa_logits raises a clear error if the user
+# enables MXFP4 without a DeepGEMM that ships these symbols.
+try:
+    from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
+                                        fp8_fp4_paged_mqa_logits)
+    _HAS_FP4_MQA_LOGITS_KERNELS = True
+except ImportError:
+    fp8_fp4_mqa_logits = None
+    fp8_fp4_paged_mqa_logits = None
+    _HAS_FP4_MQA_LOGITS_KERNELS = False
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -137,7 +150,7 @@ def _compute_slot_mappings(
     quant_block_size: int,
     data_bytes_per_token: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute flat byte indices for indexer K data and scales from global token positions.
+    """Compute flat byte indices for FP8/FP4 data and scales from global token positions.
 
     Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
     duplicating the slot mapping arithmetic.
@@ -146,14 +159,14 @@ def _compute_slot_mappings(
         global_positions: Per-token absolute position in the KV sequence.
         block_offsets: [num_seqs, max_blocks_per_seq] block offset table.
         req_indices: Per-token request index.
-        head_dim: Indexer head dimension (used for the scale-size formula).
+        head_dim: Indexer head dimension (logical element count).
         tokens_per_block: Tokens stored per cache block.
         quant_block_size: Quantization block size.
         data_bytes_per_token: Bytes of quantized data per token in the cache
-            pool. FP8 stores one byte per element (= head_dim). FP4 packs two
-            E2M1 codes per byte (= head_dim // 2). Defaults to ``head_dim``
-            when unset, preserving the FP8 layout for callers that haven't
-            threaded the FP4 dtype through.
+            (default: head_dim, i.e. one byte per FP8 value). For MXFP4 this
+            should be ``head_dim // 2`` since two E2M1 codes pack into one byte.
+            The scale layout is identical at head_dim=128: 4 bytes per token
+            (one float32 for FP8, four packed UE8M0 exponents for FP4).
 
     Returns:
         (fp8_indices, scale_indices): Flat byte offsets into the cache pool.
@@ -601,10 +614,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64) - seq_starts[req_indices]
 
             global_positions = start_positions[req_indices] + token_offsets
+            # Honor MXFP4 indexer K cache layout (½ byte per value vs FP8's
+            # 1 byte) when the cache manager exposes a use_fp4 flag.
             index_head_dim = self.kv_cache_manager.index_head_dim
-            data_bytes_per_token = (index_head_dim //
-                                    2 if self.kv_cache_manager.use_fp4 else
-                                    index_head_dim)
+            use_fp4 = getattr(self.kv_cache_manager, 'use_fp4', False)
+            data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
             fp8_indices, scale_indices = _compute_slot_mappings(
                 global_positions,
                 self.indexer_k_cache_block_offsets,
@@ -1332,6 +1346,9 @@ class IndexerParams:
     request_ids: List[int]
     num_past_tokens: List[int]
     seq_lens: torch.Tensor
+    # Bytes of quantized data per token in the indexer K cache; defaults to
+    # head_dim (one FP8 byte per element). For MXFP4 use head_dim // 2.
+    data_bytes_per_token: Optional[int] = None
 
     def __post_init__(self):
         # Pre-compute frequently used tensors once instead of on every property access
@@ -1344,9 +1361,11 @@ class IndexerParams:
                                num_past_tokens_tensor) // compress_ratio
         self._new_kv_tokens = self._all_kv_tokens - self._cached_kv_tokens
         self._kv_lens = self._all_kv_tokens
+        if self.data_bytes_per_token is None:
+            self.data_bytes_per_token = self.head_dim
         self._scale_size = self.head_dim // self.quant_block_size * 4
-        self._block_stride = self.tokens_per_block * (self.head_dim +
-                                                      self._scale_size)
+        self._block_stride = self.tokens_per_block * (
+            self.data_bytes_per_token + self._scale_size)
 
     @property
     def batch_size(self):
@@ -1446,13 +1465,14 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         # TODO: make it configurable from hf config
         self.scale_fmt = "ue8m0"
-        # indexer_k_dtype controls both Q and K precision. DeepGEMM's
-        # fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels only dispatch
-        # to FP4xFP4 or FP8xFP8 (no mixed-precision variant). The DeepGEMM
-        # kernel asserts SM100 + head_dim=128 at launch time under FP4.
-        self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        # `indexer_k_dtype` is the single user-facing FP4 knob; the V4
+        # config inherits this field from the DSA base config. DeepGEMM's
+        # fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels only
+        # dispatch to FP4xFP4 or FP8xFP8 (no mixed-precision variant) and
+        # assert SM100 + head_dim=128 at launch time under FP4.
+        self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
                                   and IS_CUTLASS_DSL_AVAILABLE)
         self.use_cute_dsl_paged_mqa_logits = (
@@ -1836,6 +1856,10 @@ class Indexer(nn.Module):
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         compress_ratio = _effective_compress_ratio_divisor(
             _select_indexer_compress_ratio(metadata.compress_ratios))
+        # MXFP4 indexer K cache packs two E2M1 codes per byte so the data
+        # footprint is half head_dim; FP8 keeps one byte per element.
+        use_fp4 = getattr(kv_cache_manager, 'use_fp4', False)
+        data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
 
         indexer_params = IndexerParams(
             num_contexts=num_contexts,
@@ -1848,6 +1872,7 @@ class Indexer(nn.Module):
             request_ids=request_ids,
             num_past_tokens=num_past_tokens,
             seq_lens=seq_lens,
+            data_bytes_per_token=data_bytes_per_token,
         )
         # Store compressed KV token count for context requests
         metadata.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:
@@ -1903,56 +1928,13 @@ class Indexer(nn.Module):
         # The C++ op reinterprets k_fp8 (FP8) and k_scale (float32) as raw
         # bytes internally and only reads the first num_tokens entries from
         # the slot mapping buffers, avoiding Python-side view/slice overhead.
+        if k_scale.element_size() == 1:
+            # The op expects 4 byte elements.
+            k_scale = k_scale.view(torch.int32)
         torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache,
                                                     metadata.slot_mapping_fp8,
                                                     metadata.slot_mapping_scale,
                                                     num_tokens)
-
-    def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
-                         k_scale: torch.Tensor, weights: torch.Tensor,
-                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
-                         q_scale: Optional[torch.Tensor]) -> torch.Tensor:
-        """Dispatch to fp8_mqa_logits or fp8_fp4_mqa_logits based on use_fp4.
-
-        For FP4 the gather output is typed as FP8 for historical reasons;
-        reinterpret the bytes as the expected int8 / int32 layouts. DeepGEMM
-        asserts kv_sf is 1D in both modes, so flatten the scale here.
-        """
-        if self.use_fp4:
-            k_fp4_bytes = k_fp8.view(torch.int8)
-            k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
-            # q_scale arrives here as (chunk_tokens, n_heads, 1) — fused_cat_fp4
-            # emits one int32 per (token, head) carrying four UE8M0 exponents,
-            # pre_indexer_proj reshapes back to (N, n_heads, 1), and
-            # sparse_attn_indexer chunk-slices on axis 0. The DeepGEMM FP4
-            # kernel asserts q_sf is 2D, so collapse the trailing unit axis.
-            q_scale_2d = q_scale.reshape(-1, self.n_heads)
-            return fp8_fp4_mqa_logits(
-                (q_fp8, q_scale_2d),
-                (k_fp4_bytes, k_scale_int32),
-                weights,
-                cu_seqlen_ks,
-                cu_seqlen_ke,
-            )
-        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)), weights,
-                              cu_seqlen_ks, cu_seqlen_ke)
-
-    def _call_paged_mqa_logits(self, q_decode: torch.Tensor,
-                               k_cache: torch.Tensor,
-                               weights_decode: torch.Tensor,
-                               context_lens: torch.Tensor,
-                               block_table: torch.Tensor,
-                               scheduler_metadata_buffer: torch.Tensor,
-                               max_seq_len: int,
-                               q_scale: Optional[torch.Tensor]) -> torch.Tensor:
-        """Dispatch to fp8_paged_mqa_logits or fp8_fp4_paged_mqa_logits."""
-        if self.use_fp4:
-            return fp8_fp4_paged_mqa_logits(
-                (q_decode, q_scale), k_cache, weights_decode, context_lens,
-                block_table, scheduler_metadata_buffer, max_seq_len)
-        return fp8_paged_mqa_logits(q_decode, k_cache, weights_decode,
-                                    context_lens, block_table,
-                                    scheduler_metadata_buffer, max_seq_len)
 
     def _gather_k_cache_for_chunk(
         self,
@@ -2020,6 +2002,66 @@ class Indexer(nn.Module):
 
         return k_fp8, k_scale
 
+    def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
+                         k_scale: torch.Tensor, weights: torch.Tensor,
+                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
+                         q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+        """Dispatch fp8_mqa_logits vs fp8_fp4_mqa_logits based on use_fp4.
+
+        For FP4 the gather output keeps the legacy float8_e4m3fn dtype for
+        API compatibility; reinterpret the bytes as the int8 / int32 layout
+        the DeepGEMM kernel expects. The scale tensor is collapsed to 1D for
+        the kv side and 2D for the q side per the kernel's asserts.
+        """
+        if self.use_fp4:
+            if not _HAS_FP4_MQA_LOGITS_KERNELS:
+                raise RuntimeError(
+                    "FP4 indexer requested (indexer_k_dtype='fp4') but the "
+                    "linked DeepGEMM build does not expose fp8_fp4_mqa_logits. "
+                    "Bump the DeepGEMM submodule to a tag that includes the "
+                    "FP4 attention kernels (e.g. deepseek-ai/DeepGEMM "
+                    "c491439e or later, rebased onto the TRT-LLM DeepGEMM "
+                    "fork).")
+            k_fp4_bytes = k_fp8.view(torch.int8)
+            k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
+            # q_scale arrives as (chunk_tokens, n_heads, 1); the FP4 kernel
+            # asserts q_sf is 2D so collapse the trailing unit axis.
+            q_scale_2d = q_scale.reshape(-1, self.n_heads)
+            return fp8_fp4_mqa_logits(
+                (q_fp8, q_scale_2d),
+                (k_fp4_bytes, k_scale_int32),
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+            )
+        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)), weights,
+                              cu_seqlen_ks, cu_seqlen_ke)
+
+    def _call_paged_mqa_logits(self, q_decode: torch.Tensor,
+                               k_cache: torch.Tensor,
+                               weights_decode: torch.Tensor,
+                               context_lens: torch.Tensor,
+                               block_table: torch.Tensor,
+                               scheduler_metadata_buffer: torch.Tensor,
+                               max_seq_len: int,
+                               q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+        """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits."""
+        if self.use_fp4:
+            if not _HAS_FP4_MQA_LOGITS_KERNELS:
+                raise RuntimeError(
+                    "FP4 indexer requested (indexer_k_dtype='fp4') but the "
+                    "linked DeepGEMM build does not expose "
+                    "fp8_fp4_paged_mqa_logits. Bump the DeepGEMM submodule "
+                    "to a tag that includes the FP4 attention kernels (e.g. "
+                    "deepseek-ai/DeepGEMM c491439e or later, rebased onto "
+                    "the TRT-LLM DeepGEMM fork).")
+            return fp8_fp4_paged_mqa_logits(
+                (q_decode, q_scale), k_cache, weights_decode, context_lens,
+                block_table, scheduler_metadata_buffer, max_seq_len)
+        return fp8_paged_mqa_logits(q_decode, k_cache, weights_decode,
+                                    context_lens, block_table,
+                                    scheduler_metadata_buffer, max_seq_len)
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -2036,12 +2078,12 @@ class Indexer(nn.Module):
 
         q_scale is only consumed by the FP4 dispatch; FP8 path ignores it.
         """
-        # DSACacheManager hardcodes quant_block_size=128 (see its __init__);
-        # FP4 uses per-block-32 UE8M0 scales but packs four of them into one
-        # int32 so the cache-layout contribution is the same 4 bytes/token as
-        # FP8 per-block-128 at head_dim=128.
+        # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
+        # 128 (FP8 path) or 32 (MXFP4 path); both round-trip to the same
+        # 4-byte scale word per token at index_head_dim=128, so the slot
+        # mapping arithmetic is unchanged in either mode.
         assert metadata.kv_cache_manager is None or \
-            metadata.kv_cache_manager.quant_block_size == 128, \
+            metadata.kv_cache_manager.quant_block_size in (32, 128), \
             f"Unexpected quant_block_size {metadata.kv_cache_manager.quant_block_size if metadata.kv_cache_manager else 'N/A'}"
         # Update the indexer k cache before prefill chunks gather from it.
         if update_k_cache:
@@ -2077,8 +2119,12 @@ class Indexer(nn.Module):
 
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                     self.layer_idx)
-
+                # FP4 packs two codes per byte so the gathered row holds half
+                # as many bytes as in the FP8 path. The scale (4 bytes) is the
+                # same in both modes because FP4 packs four UE8M0 exponents
+                # into one int32 to match FP8's float32 scale width.
                 gather_head_dim = self.head_dim // 2 if self.use_fp4 else self.head_dim
+
                 for chunk in metadata.indexer_prefill_chunks:
                     # Skip chunks with no compressed KV tokens (e.g., warmup
                     # sequences shorter than compress_ratio produce zero KV).
@@ -2248,7 +2294,8 @@ class Indexer(nn.Module):
             weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
                                      num_gen_tokens, ...]
 
-            # Get k cache and call fp8_paged_mqa_logits with prepared decode metadata
+            # Get k cache and call fp8_paged_mqa_logits / fp8_fp4_paged_mqa_logits
+            # with prepared decode metadata.
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
@@ -2423,7 +2470,7 @@ class Indexer(nn.Module):
                torch.Tensor]:
         """Pure token-wise projections (CUDA-graph-capturable).
 
-        Runs cublas_mm, qk_projection_and_rope, FP8 quantize, and weight
+        Runs cublas_mm, qk_projection_and_rope, FP8/FP4 quantize, and weight
         scaling.  Does NOT touch the k cache or any batch-specific metadata,
         so this can safely run inside a captured CUDA graph partition.
 
@@ -2467,7 +2514,14 @@ class Indexer(nn.Module):
             # internally, so weights carry only softmax_scale * n_heads^-0.5.
             q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim // 2)
             q_scale = q_scale.view(-1, self.n_heads, 1)
-            weights = weights * self.weight_scale_factor
+            # DeepGEMM's fp8_fp4_(paged_)mqa_logits asserts
+            # `weights.scalar_type() == kFloat`. Unlike the FP8 branch (whose
+            # `_weight_scale` multiplies by the fp32 `q_scale` tensor and so
+            # implicitly upcasts), this branch's only multiplier is a Python
+            # float — `bf16 * float` stays bf16 and trips the kernel assert.
+            # Cast explicitly so this path doesn't silently rely on an
+            # upstream `_to_float`.
+            weights = weights.float() * self.weight_scale_factor
         else:
             q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
             q_scale = q_scale.view(-1, self.n_heads, 1)
