@@ -491,14 +491,7 @@ def _score_video_files(
     reference_video_path: pathlib.Path,
     device: str,
 ) -> float:
-    helper_path = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "tests"
-        / "unittest"
-        / "_torch"
-        / "visual_gen"
-        / "lpips_video_utils.py"
-    )
+    helper_path = pathlib.Path(__file__).resolve().with_name("lpips_video_utils.py")
     if not helper_path.exists():
         raise RuntimeError(f"Video LPIPS helper does not exist: {helper_path}")
 

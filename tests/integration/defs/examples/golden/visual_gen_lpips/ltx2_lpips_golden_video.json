@@ -10,6 +10,7 @@
   "num_inference_steps": 8,
   "guidance_scale": 4.0,
   "seed": 42,
+  "frame_rate": 24.0,
   "lpips_net": "alex",
   "lpips_threshold": 0.05
 }

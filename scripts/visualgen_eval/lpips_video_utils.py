@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
-import shutil
-import subprocess
 from pathlib import Path
 
+import cv2
 import lpips
 import numpy as np
 import torch
@@ -40,77 +39,87 @@ def _video_tensor_to_lpips_batch(
     return batch.to(device=device, dtype=torch.float32) * 2.0 - 1.0
 
 
-def _probe_video_size(video_path: Path) -> tuple[int, int]:
-    if shutil.which("ffprobe") is None:
-        raise RuntimeError("ffprobe is required to inspect videos for LPIPS comparison")
-
-    command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height",
-        "-of",
-        "csv=p=0:s=x",
-        str(video_path),
-    ]
-    result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"Failed to inspect video {video_path}: {stderr}")
-
-    size_lines = result.stdout.decode("utf-8", errors="replace").strip().splitlines()
-    if not size_lines:
-        raise RuntimeError(f"Failed to inspect video size for {video_path}: empty ffprobe output")
-    size_text = size_lines[0]
-    try:
-        width_text, height_text = size_text.split("x")
-        width, height = int(width_text), int(height_text)
-    except (ValueError, IndexError) as exc:
-        raise RuntimeError(f"Failed to parse video size for {video_path}: {size_text!r}") from exc
-    if width <= 0 or height <= 0:
-        raise RuntimeError(f"Invalid video size for {video_path}: {width}x{height}")
-    return width, height
-
-
 def _decode_video_to_lpips_batch(
     video_path: Path,
     device: str,
 ) -> torch.Tensor:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg is required to decode golden videos for LPIPS comparison")
     if not video_path.exists():
         raise FileNotFoundError(f"Golden video not found: {video_path}")
 
-    width, height = _probe_video_size(video_path)
-    command = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-i",
-        str(video_path),
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "pipe:1",
-    ]
-    result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"Failed to decode golden video {video_path}: {stderr}")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video for LPIPS comparison: {video_path}")
 
-    frame_size = width * height * 3
-    if not result.stdout or len(result.stdout) % frame_size != 0:
-        raise ValueError(
-            f"Decoded video byte size {len(result.stdout)} is not a multiple of frame size {frame_size}"
-        )
+    frames = []
+    try:
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        cap.release()
 
-    frames = np.frombuffer(result.stdout, dtype=np.uint8).reshape(-1, height, width, 3)
+    if not frames:
+        raise ValueError(f"Decoded video contains no frames: {video_path}")
+
+    frames = np.stack(frames, axis=0)
     batch = torch.from_numpy(frames.copy()).permute(0, 3, 1, 2).float() / 255.0
     return batch.to(device=device, dtype=torch.float32) * 2.0 - 1.0
+
+
+def _video_tensor_to_uint8_frames(video: torch.Tensor) -> np.ndarray:
+    video = video.detach().cpu()
+    if video.dim() == 5:
+        video = video[0]
+    if video.dim() != 4:
+        raise ValueError(f"Expected 4D or 5D video tensor, got shape {tuple(video.shape)}")
+
+    if video.shape[-1] == 3:
+        frames = video
+    elif video.shape[1] == 3:
+        frames = video.permute(0, 2, 3, 1)
+    else:
+        raise ValueError(f"Expected RGB video frames, got shape {tuple(video.shape)}")
+
+    if frames.numel() == 0:
+        raise ValueError("Generated video contains no frames")
+    if frames.dtype != torch.uint8:
+        frames = frames.float()
+        if frames.min() < 0:
+            frames = (frames + 1.0) / 2.0
+        elif frames.max() > 2.0:
+            frames = frames / 255.0
+        frames = (frames.clamp(0, 1) * 255.0).round().to(torch.uint8)
+
+    return frames.contiguous().numpy()
+
+
+def save_video_mp4_for_lpips_comparison(
+    video: torch.Tensor,
+    output_path: Path,
+    frame_rate: float,
+) -> None:
+    frames = _video_tensor_to_uint8_frames(video)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _, height, width, _ = frames.shape
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        frame_rate,
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open MP4 writer for LPIPS video: {output_path}")
+
+    try:
+        for frame_rgb in frames:
+            writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"Failed to write MP4 video for LPIPS comparison: {output_path}")
 
 
 def _validate_paired_video_shapes(generated: torch.Tensor, golden: torch.Tensor) -> None:

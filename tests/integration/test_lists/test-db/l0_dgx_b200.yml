@@ -299,6 +299,11 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False]
   - examples/test_visual_gen.py::test_visual_gen_quickstart
   - examples/test_visual_gen.py::test_wan_t2v_example
+  - examples/test_visual_gen.py::test_flux1_lpips_against_golden
+  - examples/test_visual_gen.py::test_flux2_lpips_against_golden
+  - examples/test_visual_gen.py::test_ltx2_lpips_against_golden
+  - examples/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
+  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_fp8
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4

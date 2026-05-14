@@ -23,7 +23,6 @@ Override checkpoint path:
 
 import importlib
 import os
-import tempfile
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
@@ -35,7 +34,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
-from lpips_video_utils import assert_video_file_lpips_score_below_threshold
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -44,7 +42,6 @@ from tensorrt_llm._torch.visual_gen.config import (
     VisualGenArgs,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm.media.encoding import save_video
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -86,18 +83,6 @@ NEGATIVE_PROMPT = ""
 NUM_STEPS = 4
 SEED = 42
 COS_SIM_THRESHOLD = 0.99
-WAN22_LPIPS_PROMPT = PROMPT
-WAN22_LPIPS_NEGATIVE_PROMPT = NEGATIVE_PROMPT
-WAN22_LPIPS_HEIGHT = 480
-WAN22_LPIPS_WIDTH = 832
-WAN22_LPIPS_NUM_FRAMES = 9
-WAN22_LPIPS_NUM_INFERENCE_STEPS = NUM_STEPS
-WAN22_LPIPS_GUIDANCE_SCALE = 4.0
-WAN22_LPIPS_SEED = SEED
-WAN22_LPIPS_FRAME_RATE = 16.0
-WAN22_LPIPS_MAX_FRAMES = 8
-WAN22_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "wan22_t2v_lpips_golden_video.mp4"
-WAN22_LPIPS_THRESHOLD = 0.05
 
 
 # ============================================================================
@@ -287,60 +272,6 @@ class TestWan22_A14B_PipelineCorrectness:
             guidance_scale=4.0,
             model_label="Wan2.2-T2V-A14B",
         )
-
-
-# ============================================================================
-# LPIPS Regression Tests
-# ============================================================================
-
-
-@pytest.mark.integration
-@pytest.mark.wan_t2v
-class TestWan22T2VLPIPSRegression:
-    """End-to-end Wan 2.2 T2V video regression against a TRT-LLM golden video."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_wan22_t2v_lpips_against_golden(self):
-        if not os.path.exists(WAN22_A14B_PATH):
-            pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
-        if not WAN22_LPIPS_GOLDEN_PATH.exists():
-            pytest.skip(f"Missing Wan 2.2 LPIPS golden video: {WAN22_LPIPS_GOLDEN_PATH}")
-
-        pipeline = _load_trtllm_pipeline(WAN22_A14B_PATH)
-        try:
-            assert pipeline.transformer_2 is not None, "Expected Wan 2.2 two-stage transformer_2"
-            assert pipeline.boundary_ratio is not None, "Expected Wan 2.2 boundary_ratio"
-            with torch.no_grad():
-                result = pipeline.forward(
-                    prompt=WAN22_LPIPS_PROMPT,
-                    negative_prompt=WAN22_LPIPS_NEGATIVE_PROMPT,
-                    height=WAN22_LPIPS_HEIGHT,
-                    width=WAN22_LPIPS_WIDTH,
-                    num_frames=WAN22_LPIPS_NUM_FRAMES,
-                    num_inference_steps=WAN22_LPIPS_NUM_INFERENCE_STEPS,
-                    guidance_scale=WAN22_LPIPS_GUIDANCE_SCALE,
-                    seed=WAN22_LPIPS_SEED,
-                )
-            generated_video = result.video.detach().cpu()
-        finally:
-            del pipeline
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            generated_video_path = Path(tmp_dir) / "wan22_t2v_generated.mp4"
-            save_video(
-                generated_video,
-                generated_video_path,
-                frame_rate=WAN22_LPIPS_FRAME_RATE,
-            )
-            assert_video_file_lpips_score_below_threshold(
-                generated_video_path,
-                WAN22_LPIPS_GOLDEN_PATH,
-                WAN22_LPIPS_THRESHOLD,
-                "E2E Wan 2.2 T2V video LPIPS",
-                max_frames=WAN22_LPIPS_MAX_FRAMES,
-            )
 
 
 # ============================================================================
