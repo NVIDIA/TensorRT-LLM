@@ -3961,6 +3961,12 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
                             assert len(token_ids) > 0
                             assert not all(tid == 0 for tid in token_ids)
                         if should_cancel and chunks_received >= max_chunks_before_cancel:
+                            # Plain ``break`` only exits the async-for; the
+                            # underlying RequestOutput keeps generating in the
+                            # executor and holds KV slots. With
+                            # GUARANTEED_NO_EVICT this deadlocks subsequent
+                            # batches.
+                            async_gen.abort()
                             break
                 except Exception:
                     if not should_cancel:
@@ -4357,6 +4363,12 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                             assert len(token_ids) > 0
                             assert not all(tid == 0 for tid in token_ids)
                         if should_cancel and chunks_received >= max_chunks_before_cancel:
+                            # Plain ``break`` only exits the async-for; the
+                            # underlying RequestOutput keeps generating in the
+                            # executor and holds KV slots. With
+                            # GUARANTEED_NO_EVICT this deadlocks subsequent
+                            # batches.
+                            async_gen.abort()
                             break
                 except Exception:
                     if not should_cancel:
@@ -7740,6 +7752,12 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
                             assert len(token_ids) > 0
                             assert not all(tid == 0 for tid in token_ids)
                         if should_cancel and chunks_received >= max_chunks_before_cancel:
+                            # Plain ``break`` only exits the async-for; the
+                            # underlying RequestOutput keeps generating in the
+                            # executor and holds KV slots. With
+                            # GUARANTEED_NO_EVICT this deadlocks subsequent
+                            # batches.
+                            async_gen.abort()
                             break
                 except Exception:
                     if not should_cancel:
