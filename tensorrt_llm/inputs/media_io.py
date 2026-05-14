@@ -520,9 +520,7 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
         return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
 
     def load_file(self, url: str) -> Union[Image.Image, torch.Tensor]:
-        # Hand the parsed path (no unquoting) to PIL.
-        parsed = urlparse(url)
-        return self._postprocess(_load_and_convert_image(Path(parsed.path)))
+        return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
 
 
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
