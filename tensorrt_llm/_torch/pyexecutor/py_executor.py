@@ -474,6 +474,13 @@ class PyExecutor:
         # The scheduler will avoid scheduling requests that are already in flight.
         self.inflight_req_ids = ReqIdsSet()
 
+        # Synchronize all ranks before warmup. This prevents a PP
+        # communication deadlock when ranks on the last PP stage are delayed
+        # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
+        # creation) while earlier PP stages already start warmup forward
+        # passes that require matching pp_recv on the later stages.
+        self.dist.barrier()
+
         # During warmup, we don't enable the profiler
         # Run warmup on the execution_stream for proper synchronization with
         # KVCacheTransferManager's onboard/offload operations.
