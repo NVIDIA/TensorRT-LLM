@@ -1159,7 +1159,6 @@ class AsyncWorkerMixin:
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
-    DEFAULT_MAX_TOPK_LOGPROBS = MAX_TOP_LOGPROBS
     DEFAULT_MAX_STOP_WORD_LENGTH = 20
     DEFAULT_MAX_STOP_WORDS = 10
 
@@ -2157,7 +2156,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.max_tokens = args.max_total_draft_tokens + 1
         self.max_beam_width = args.max_beam_width
         # The current maximum number of topk logprobs which can be stored in the sampler's store
-        self.max_topk_logprobs = self.DEFAULT_MAX_TOPK_LOGPROBS
+        self.max_topk_logprobs = MAX_TOP_LOGPROBS
         # The maximum number of topk logprobs for the current batch of requests
         self.batch_max_topk_logprobs = 0
         if args.max_total_draft_tokens > 0 and args.max_beam_width > 1:
@@ -3376,7 +3375,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             default=0,
         )
         check_logprobs_limit(
-            "logprobs", self.batch_max_topk_logprobs, self.DEFAULT_MAX_TOPK_LOGPROBS
+            "batch_max_logprobs", self.batch_max_topk_logprobs, MAX_TOP_LOGPROBS
         )
         if self.max_topk_logprobs < self.batch_max_topk_logprobs:
             self.max_topk_logprobs = self.batch_max_topk_logprobs
