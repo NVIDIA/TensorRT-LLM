@@ -3537,29 +3537,55 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,indexer_k_fp4",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,indexer_k_fp4,use_cute_dsl",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False, False),
-            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False, False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True, False),
-            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False, False),
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, True),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False, False,
+             False),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False, False,
+             False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True, False,
+             False),
+            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False, False,
+             False),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, True,
+             False),
+            # DSL FP4 indexer paged path — exercises the CuTe DSL kernel.
+            # next_n in {1,2,3} go through the direct path; mtp_nextn=3
+            # (next_n=4) triggers the caller-side atom-split (factor=2,
+            # eff_next_n=2). All four cases together cover the full DSL FP4
+            # decode plumbing (`_pick_fp4_dsl_expand`, `expand_for_dsl_fp4`,
+            # the FP4 branch in sparse_attn_indexer).
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
+            (8, 1, 8, 2, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
+            (8, 1, 8, 3, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "disable_skip_indexer", "baseline_pp4_mtp1", "fp4_indexer"
+            "disable_skip_indexer", "baseline_pp4_mtp1", "fp4_indexer",
+            "fp4_indexer_dsl_mtp0", "fp4_indexer_dsl_mtp1",
+            "fp4_indexer_dsl_mtp2", "fp4_indexer_dsl_mtp3"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend, disable_skip_indexer,
-                              indexer_k_fp4):
+                              indexer_k_fp4, use_cute_dsl):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
         if indexer_k_fp4 and sm_version < 100:
             pytest.skip("indexer_k_dtype='fp4' requires SM>=100 (Blackwell)")
+        if use_cute_dsl and sm_version not in (100, 103):
+            pytest.skip("use_cute_dsl_paged_mqa_logits requires SM 100/103 "
+                        "(CuTe DSL FP4 paged MQA logits kernel target)")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
@@ -3584,6 +3610,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             # and index_head_dim==128; index_head_dim is filled in by
             # ModelConfig.from_pretrained so we only need to set the dtype.
             dsa_kwargs["indexer_k_dtype"] = "fp4"
+        if use_cute_dsl:
+            # Routes the indexer paged MQA logits decode through the
+            # CuTe DSL kernel (torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits
+            # when use_fp4, else torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits).
+            dsa_kwargs["use_cute_dsl_paged_mqa_logits"] = True
         dsa_config = (DeepSeekSparseAttentionConfig(
             **dsa_kwargs) if dsa_kwargs else None)
 
