@@ -3374,9 +3374,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             (req.py_num_logprobs or 0 for req in requests),
             default=0,
         )
-        check_logprobs_limit(
-            "batch_max_logprobs", self.batch_max_topk_logprobs, MAX_TOP_LOGPROBS
-        )
+        check_logprobs_limit("batch_max_logprobs", self.batch_max_topk_logprobs, MAX_TOP_LOGPROBS)
         if self.max_topk_logprobs < self.batch_max_topk_logprobs:
             self.max_topk_logprobs = self.batch_max_topk_logprobs
             self.TOPK_LOGPROBS_SHAPE = (
