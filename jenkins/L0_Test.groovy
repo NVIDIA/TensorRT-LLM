@@ -4210,6 +4210,17 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         echo "###### Run LLMAPI tests Start ######"
 
+                        // Resolve the real tensorrt_llm install location after pip install,
+                        // and expose UCX shared libraries shipped inside the wheel
+                        // (tensorrt_llm/libs/ucx/*.so and libtensorrt_llm_ucx_wrapper.so)
+                        // so dlopen can find them at test runtime.
+                        def trtllmLibsDir = sh(
+                            script: "python3 -c 'import os, tensorrt_llm; print(os.path.join(os.path.dirname(tensorrt_llm.__file__), \"libs\"))'",
+                            returnStdout: true,
+                        ).trim()
+                        libEnv += ["LD_LIBRARY_PATH+trtllm_ucx=${trtllmLibsDir}/ucx"]
+                        libEnv += ["LD_LIBRARY_PATH+trtllm_libs=${trtllmLibsDir}"]
+
                         def config = VANILLA_CONFIG
                         if (cpu_arch == AARCH64_TRIPLE) {
                             config = LINUX_AARCH64_CONFIG
