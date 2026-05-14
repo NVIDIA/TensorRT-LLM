@@ -7603,7 +7603,6 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             cuda_graph_config=None,
             enable_iter_perf_stats=True,
             guided_decoding_backend="xgrammar",
-            custom_tokenizer="glm_moe_dsa",
         )
 
     @pytest.mark.skip_less_device(8)
