@@ -102,7 +102,12 @@ class _VideoRoutesMixin:
                     }
                 )
 
-            media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
+            if actual_path.suffix == ".mp4":
+                media_type = "video/mp4"
+            elif actual_path.suffix == ".pt":
+                media_type = "application/octet-stream"
+            else:
+                media_type = "video/x-msvideo"
 
             return FileResponse(
                 actual_output_path,
@@ -152,7 +157,7 @@ class _VideoRoutesMixin:
                 raise ValueError("'prompt' is required")
 
             # Optional string fields
-            for field in ["model", "size", "negative_prompt", "output_format"]:
+            for field in ["model", "size", "negative_prompt", "output_format", "response_format"]:
                 if field in form and form[field]:
                     data[field] = form[field]
 
@@ -167,13 +172,15 @@ class _VideoRoutesMixin:
                 data["num_inference_steps"] = int(form["num_inference_steps"])
             if "guidance_scale" in form and form["guidance_scale"]:
                 data["guidance_scale"] = float(form["guidance_scale"])
-            if "guidance_scale_2" in form and form["guidance_scale_2"]:
+            # Numeric guards must preserve valid zero values
+            # (boundary_ratio explicitly allows 0.0).
+            if form.get("guidance_scale_2") not in (None, ""):
                 data["guidance_scale_2"] = float(form["guidance_scale_2"])
-            if "boundary_ratio" in form and form["boundary_ratio"]:
+            if form.get("boundary_ratio") not in (None, ""):
                 data["boundary_ratio"] = float(form["boundary_ratio"])
             if "guidance_rescale" in form and form["guidance_rescale"]:
                 data["guidance_rescale"] = float(form["guidance_rescale"])
-            if "num_frames" in form and form["num_frames"]:
+            if form.get("num_frames") not in (None, ""):
                 data["num_frames"] = int(form["num_frames"])
             if "seed" in form and form["seed"]:
                 data["seed"] = int(form["seed"])
