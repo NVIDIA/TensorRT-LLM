@@ -15,16 +15,14 @@ import json
 import os
 from pathlib import Path
 
-import lpips
 import pytest
 import torch
 import torch.nn.functional as F
-from lpips_video_utils import average_video_lpips_score
+from lpips_video_utils import assert_video_lpips_score_below_threshold
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
-    (
     AttentionConfig,
     CacheDiTConfig,
     DiffusionModelConfig,
@@ -32,8 +30,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     TorchCompileConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV,
-)
+from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
@@ -103,15 +100,17 @@ SKIP_COMPONENTS = [
 ]
 
 
-def _write_minimal_ltx2_diffusers_checkpoint(tmp_path):
-    checkpoint_path = tmp_path / "ltx2"
-    transformer_path = checkpoint_path / "transformer"
-    transformer_path.mkdir(parents=True)
-    (checkpoint_path / "model_index.json").write_text(
-        json.dumps({"transformer": ["tensorrt_llm", "LTX2Transformer"]})
+def _write_minimal_ltx2_native_checkpoint(tmp_path):
+    import safetensors.torch
+
+    checkpoint_path = tmp_path / "ltx-2-19b-dev.safetensors"
+    safetensors.torch.save_file(
+        {"__metadata_marker__": torch.zeros(1)},
+        str(checkpoint_path),
+        metadata={"config": json.dumps({"transformer": {"_class_name": "LTX2"}})},
     )
-    (transformer_path / "config.json").write_text(json.dumps({"_class_name": "LTX2"}))
     return checkpoint_path
+
 
 LTX2_LPIPS_PROMPT = (
     "A woman with long brown hair and light skin smiles at the camera while standing in a "
@@ -125,17 +124,9 @@ LTX2_LPIPS_NUM_FRAMES = 49
 LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
 LTX2_LPIPS_GUIDANCE_SCALE = 4.0
 LTX2_LPIPS_SEED = 42
-LTX2_LPIPS_IMAGE_SIZE = (256, 256)
 LTX2_LPIPS_MAX_FRAMES = 8
 LTX2_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "ltx2_lpips_golden_video.mp4"
 LTX2_LPIPS_THRESHOLD = 0.05
-
-
-def _load_lpips_model(device: str):
-    try:
-        return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
-    except Exception as exc:
-        pytest.fail(f"LPIPS model could not be loaded: {exc}")
 
 
 def _get_ltx2_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -577,24 +568,13 @@ class TestLTX2LPIPSRegression:
             gc.collect()
             torch.cuda.empty_cache()
 
-        lpips_model = _load_lpips_model("cuda")
-        lpips_score = average_video_lpips_score(
+        assert_video_lpips_score_below_threshold(
             generated_video,
             LTX2_LPIPS_GOLDEN_PATH,
-            lpips_model,
-            "cuda",
-            image_size=LTX2_LPIPS_IMAGE_SIZE,
+            LTX2_LPIPS_THRESHOLD,
+            "E2E LTX-2 video LPIPS",
             max_frames=LTX2_LPIPS_MAX_FRAMES,
         )
-
-        print(f"\n[E2E LTX-2 video LPIPS] mean score: {lpips_score:.6f}")
-        assert lpips_score < LTX2_LPIPS_THRESHOLD, (
-            f"Mean LPIPS too high: {lpips_score:.6f} (expected < {LTX2_LPIPS_THRESHOLD:.6f})"
-        )
-
-        del lpips_model
-        gc.collect()
-        torch.cuda.empty_cache()
 
 
 # ============================================================================
@@ -955,9 +935,9 @@ class TestLTX2ForceOneStageEnv:
         )
 
         monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
-        upsampler_path = checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-        lora_path = checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors"
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path.parent / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path.parent / "ltx-2-19b-distilled-lora-384.safetensors"
         upsampler_path.touch()
         lora_path.touch()
 
@@ -972,9 +952,9 @@ class TestLTX2ForceOneStageEnv:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
-        upsampler_path = checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-        lora_path = checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors"
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path.parent / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path.parent / "ltx-2-19b-distilled-lora-384.safetensors"
         upsampler_path.touch()
         lora_path.touch()
 
@@ -991,7 +971,7 @@ class TestLTX2ForceOneStageEnv:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
 
         args = VisualGenArgs(
             checkpoint_path=str(checkpoint_path),
@@ -1010,7 +990,7 @@ class TestLTX2ForceOneStageEnv:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
 
         args = VisualGenArgs(
             checkpoint_path=str(checkpoint_path),

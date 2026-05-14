@@ -26,13 +26,12 @@ from pathlib import Path
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
-import lpips
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
-from lpips_video_utils import average_video_lpips_score
+from lpips_video_utils import assert_video_lpips_score_below_threshold
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
@@ -92,7 +91,6 @@ WAN_LPIPS_NUM_FRAMES = 5
 WAN_LPIPS_NUM_INFERENCE_STEPS = 1
 WAN_LPIPS_GUIDANCE_SCALE = 5.0
 WAN_LPIPS_SEED = 42
-WAN_LPIPS_IMAGE_SIZE = (256, 256)
 WAN_LPIPS_MAX_FRAMES = 8
 WAN_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "wan21_t2v_lpips_golden_video.mp4"
 WAN_LPIPS_THRESHOLD = 0.05
@@ -189,13 +187,6 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a_flat = a.float().cpu().reshape(-1)
     b_flat = b.float().cpu().reshape(-1)
     return F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0)).clamp(-1.0, 1.0).item()
-
-
-def _load_lpips_model(device: str):
-    try:
-        return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
-    except Exception as exc:
-        pytest.fail(f"LPIPS model could not be loaded: {exc}")
 
 
 def _assert_pipeline_matches_hf(
@@ -330,24 +321,13 @@ class TestWan21T2VLPIPSRegression:
             gc.collect()
             torch.cuda.empty_cache()
 
-        lpips_model = _load_lpips_model("cuda")
-        lpips_score = average_video_lpips_score(
+        assert_video_lpips_score_below_threshold(
             generated_video,
             WAN_LPIPS_GOLDEN_PATH,
-            lpips_model,
-            "cuda",
-            image_size=WAN_LPIPS_IMAGE_SIZE,
+            WAN_LPIPS_THRESHOLD,
+            "E2E Wan 2.1 T2V video LPIPS",
             max_frames=WAN_LPIPS_MAX_FRAMES,
         )
-
-        print(f"\n[E2E Wan 2.1 T2V video LPIPS] mean score: {lpips_score:.6f}")
-        assert lpips_score < WAN_LPIPS_THRESHOLD, (
-            f"Mean LPIPS too high: {lpips_score:.6f} (expected < {WAN_LPIPS_THRESHOLD:.6f})"
-        )
-
-        del lpips_model
-        gc.collect()
-        torch.cuda.empty_cache()
 
 
 # =============================================================================
