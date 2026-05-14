@@ -41,8 +41,7 @@ def _read_trtllm_version() -> str:
     # (which would require the compiled bindings to be present).
     version_path = Path(__file__).resolve().parents[1] / "tensorrt_llm" / "version.py"
     try:
-        spec = importlib.util.spec_from_file_location(
-            "_trtllm_version", version_path)
+        spec = importlib.util.spec_from_file_location("_trtllm_version", version_path)
         if spec is None or spec.loader is None:
             return "latest"
         module = importlib.util.module_from_spec(spec)
@@ -55,12 +54,8 @@ def _read_trtllm_version() -> str:
 SCHEMA_BASE_URL = f"{_DOCS_BASE_URL}/{_read_trtllm_version()}/_static/schemas"
 
 SERVE_CONFIG_SCHEMA_FILENAME = "trtllm-serve-config.schema.json"
-AUTODEPLOY_CONFIG_SCHEMA_FILENAME = (
-    "trtllm-serve-autodeploy-config.schema.json"
-)
-VISUAL_GEN_CONFIG_SCHEMA_FILENAME = (
-    "trtllm-serve-visual-gen-config.schema.json"
-)
+AUTODEPLOY_CONFIG_SCHEMA_FILENAME = "trtllm-serve-autodeploy-config.schema.json"
+VISUAL_GEN_CONFIG_SCHEMA_FILENAME = "trtllm-serve-visual-gen-config.schema.json"
 
 _VALID_JSON_SCHEMA_TYPES = frozenset(
     {"string", "number", "integer", "boolean", "null", "array", "object"}
@@ -69,16 +64,13 @@ _VALID_JSON_SCHEMA_TYPES = frozenset(
 # env_overrides values are coerced to strings at runtime
 # (TorchLlmArgs.coerce_env_overrides_to_str); permit the same scalar shapes
 # in the static schema so unquoted YAML scalars validate.
-_ENV_OVERRIDES_VALUE_SCHEMA = {
-    "type": ["string", "integer", "number", "boolean"]
-}
+_ENV_OVERRIDES_VALUE_SCHEMA = {"type": ["string", "integer", "number", "boolean"]}
 
 
 class TRTLLMServeSchemaGenerator(GenerateJsonSchema):
     """Allow runtime-only Python types to remain permissive in IDE schemas."""
 
-    def handle_invalid_for_json_schema(self, schema: Any,
-                                       error_info: str) -> dict[str, Any]:
+    def handle_invalid_for_json_schema(self, schema: Any, error_info: str) -> dict[str, Any]:
         return {
             "description": (
                 "Accepted by TensorRT-LLM runtime validation; this field cannot "
@@ -295,7 +287,8 @@ def write_schemas(output_dir: Path) -> list[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate JSON Schemas for trtllm-serve YAML configs.")
+        description="Generate JSON Schemas for trtllm-serve YAML configs."
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,

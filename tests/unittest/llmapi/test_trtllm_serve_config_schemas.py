@@ -51,10 +51,8 @@ SCHEMA_GENERATOR = _load_module(
     REPO_ROOT / "scripts" / "generate_trtllm_serve_schemas.py",
 )
 SERVE_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.SERVE_CONFIG_SCHEMA_FILENAME
-AUTODEPLOY_CONFIG_SCHEMA_FILENAME = (
-    SCHEMA_GENERATOR.AUTODEPLOY_CONFIG_SCHEMA_FILENAME)
-VISUAL_GEN_CONFIG_SCHEMA_FILENAME = (
-    SCHEMA_GENERATOR.VISUAL_GEN_CONFIG_SCHEMA_FILENAME)
+AUTODEPLOY_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.AUTODEPLOY_CONFIG_SCHEMA_FILENAME
+VISUAL_GEN_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.VISUAL_GEN_CONFIG_SCHEMA_FILENAME
 
 
 def _validator(schema: dict) -> jsonschema.Draft202012Validator:
@@ -81,12 +79,13 @@ def test_serve_config_schema_accepts_minimal_yaml(serve_config_validator):
     serve_config_validator.validate({"max_batch_size": 8})
 
 
-def test_serve_config_schema_accepts_serve_loader_aliases(
-        serve_config_validator):
-    serve_config_validator.validate({
-        "backend": "pytorch",
-        "hf_revision": "main",
-    })
+def test_serve_config_schema_accepts_serve_loader_aliases(serve_config_validator):
+    serve_config_validator.validate(
+        {
+            "backend": "pytorch",
+            "hf_revision": "main",
+        }
+    )
 
 
 def test_serve_config_schema_rejects_typo(serve_config_validator):
@@ -94,18 +93,19 @@ def test_serve_config_schema_rejects_typo(serve_config_validator):
         serve_config_validator.validate({"max_batch_szie": 8})
 
 
-def test_serve_config_schema_accepts_unquoted_env_overrides_scalars(
-        serve_config_validator):
+def test_serve_config_schema_accepts_unquoted_env_overrides_scalars(serve_config_validator):
     # env_overrides values are coerced to strings at runtime; the static schema
     # must accept unquoted scalars so YAML configs like `TRTLLM_ENABLE_PDL: 1`
     # don't trip the IDE.
-    serve_config_validator.validate({
-        "env_overrides": {
-            "TRTLLM_ENABLE_PDL": 1,
-            "NCCL_GRAPH_REGISTER": 0,
-            "SOME_FLAG": True,
+    serve_config_validator.validate(
+        {
+            "env_overrides": {
+                "TRTLLM_ENABLE_PDL": 1,
+                "NCCL_GRAPH_REGISTER": 0,
+                "SOME_FLAG": True,
+            }
         }
-    })
+    )
 
 
 @pytest.mark.parametrize(
@@ -113,29 +113,29 @@ def test_serve_config_schema_accepts_unquoted_env_overrides_scalars(
     ALL_SERVE_CONFIGS,
     ids=lambda path: str(path.relative_to(CONFIG_ROOT)),
 )
-def test_existing_serve_configs_validate_against_schema(
-        serve_config_validator, config_path: Path):
+def test_existing_serve_configs_validate_against_schema(serve_config_validator, config_path: Path):
     serve_config_validator.validate(load_yaml_dict(config_path))
 
 
-def test_autodeploy_config_schema_accepts_minimal_yaml(
-        autodeploy_config_validator):
-    autodeploy_config_validator.validate({
-        "world_size": 1,
-        "compile_backend": "torch-opt",
-    })
+def test_autodeploy_config_schema_accepts_minimal_yaml(autodeploy_config_validator):
+    autodeploy_config_validator.validate(
+        {
+            "world_size": 1,
+            "compile_backend": "torch-opt",
+        }
+    )
 
 
-def test_autodeploy_config_schema_accepts_backend_marker_and_aliases(
-        autodeploy_config_validator):
-    autodeploy_config_validator.validate({
-        "backend": "_autodeploy",
-        "hf_revision": "main",
-    })
+def test_autodeploy_config_schema_accepts_backend_marker_and_aliases(autodeploy_config_validator):
+    autodeploy_config_validator.validate(
+        {
+            "backend": "_autodeploy",
+            "hf_revision": "main",
+        }
+    )
 
 
-def test_autodeploy_config_schema_rejects_wrong_backend(
-        autodeploy_config_validator):
+def test_autodeploy_config_schema_rejects_wrong_backend(autodeploy_config_validator):
     with pytest.raises(ValidationError):
         autodeploy_config_validator.validate({"backend": "pytorch"})
 
@@ -145,39 +145,39 @@ def test_autodeploy_config_schema_rejects_typo(autodeploy_config_validator):
         autodeploy_config_validator.validate({"compile_backennd": "torch-opt"})
 
 
-def test_visual_gen_config_schema_accepts_representative_yaml(
-        visual_gen_config_validator):
-    visual_gen_config_validator.validate({
-        "parallel": {
-            "dit_cfg_size": 1,
-            "dit_ulysses_size": 1,
-        },
-        "attention": {
-            "backend": "TRTLLM",
-        },
-    })
-
-
-def test_visual_gen_config_schema_rejects_nested_typo(
-        visual_gen_config_validator):
-    with pytest.raises(ValidationError):
-        visual_gen_config_validator.validate({
+def test_visual_gen_config_schema_accepts_representative_yaml(visual_gen_config_validator):
+    visual_gen_config_validator.validate(
+        {
             "parallel": {
-                "dit_cfg_szie": 1,
+                "dit_cfg_size": 1,
+                "dit_ulysses_size": 1,
+            },
+            "attention": {
+                "backend": "TRTLLM",
+            },
+        }
+    )
+
+
+def test_visual_gen_config_schema_rejects_nested_typo(visual_gen_config_validator):
+    with pytest.raises(ValidationError):
+        visual_gen_config_validator.validate(
+            {
+                "parallel": {
+                    "dit_cfg_szie": 1,
+                }
             }
-        })
+        )
 
 
 def _load_schema_assets_extension():
-    extension_path = REPO_ROOT / "docs" / "source" / "_ext" / (
-        "trtllm_schema_assets.py")
+    extension_path = REPO_ROOT / "docs" / "source" / "_ext" / ("trtllm_schema_assets.py")
     return _load_module("trtllm_schema_assets", extension_path)
 
 
 def test_docs_extension_writes_schema_assets(tmp_path):
     extension = _load_schema_assets_extension()
-    app = SimpleNamespace(
-        builder=SimpleNamespace(name="html", outdir=str(tmp_path)))
+    app = SimpleNamespace(builder=SimpleNamespace(name="html", outdir=str(tmp_path)))
 
     extension._write_schema_assets(app)
 
