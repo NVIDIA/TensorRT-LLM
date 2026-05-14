@@ -19,8 +19,8 @@ from tensorrt_llm._torch.modules.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
 from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
-from tensorrt_llm._torch.modules.fused_moe.routing import (
-    DeepSeekV3PerfectRouterPlanner, get_cached_perfect_router_logits)
+from tensorrt_llm._torch.modules.fused_moe.routing import \
+    get_cached_perfect_router_logits
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 
@@ -400,12 +400,14 @@ _DSV4_PRO_TOPK_GROUP = 4
 
 @pytest.mark.parametrize(
     "routing_cls", [DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod])
-def test_perfect_router_resolve_group_config(routing_cls):
-    """Unit regression: planner reads n_group/topk_group from V3 and V4 routing.
+def test_grouped_routing_exposes_n_group_topk_group(routing_cls):
+    """Unit regression: V3 and V4 routing both expose n_group/topk_group.
 
-    DeepSeekV3MoeRoutingMethod nests the settings on ``routing_impl``;
-    DeepSeekV4MoeRoutingMethod stores them directly on the outer object.
-    Both shapes must resolve to the same ``(n_group, topk_group)``.
+    The DeepSeekV3 perfect-router planner reads
+    ``routing_method.n_group`` and ``routing_method.topk_group`` directly.
+    DeepSeekV3MoeRoutingMethod nests the settings on ``routing_impl`` and
+    exposes them via @property; DeepSeekV4MoeRoutingMethod stores them
+    directly on the instance. Both layouts must surface the same values.
     """
     n_group, topk_group = _DSV4_PRO_N_GROUP, _DSV4_PRO_TOPK_GROUP
     num_experts = 64
@@ -421,8 +423,8 @@ def test_perfect_router_resolve_group_config(routing_cls):
                                    topk_group=topk_group,
                                    num_experts=num_experts)
 
-    planner = DeepSeekV3PerfectRouterPlanner()
-    assert planner._resolve_group_config(routing) == (n_group, topk_group)
+    assert routing.n_group == n_group
+    assert routing.topk_group == topk_group
 
 
 @pytest.mark.parametrize(
