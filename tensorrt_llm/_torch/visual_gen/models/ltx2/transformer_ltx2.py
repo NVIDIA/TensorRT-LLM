@@ -156,12 +156,10 @@ class LTX2Attention(Attention):
             H_kv = self.num_key_value_heads
             if H % U != 0 or H_kv % U != 0:
                 raise ValueError(
-                    f"UlyssesCrossAttention requires num_attention_heads ({H}) and "
+                    f"Ulysses cross-attn requires num_attention_heads ({H}) and "
                     f"num_key_value_heads ({H_kv}) divisible by ulysses_size ({U})"
                 )
-            from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
-                UlyssesCrossAttention,
-            )
+            from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
 
             self._plain_cross_attn = self.attn  # base-class built at full H
             inner = create_attention(
@@ -175,7 +173,11 @@ class LTX2Attention(Attention):
                 attention_config=config.attention,
                 attention_metadata_state=config.attention_metadata_state,
             )
-            self._ulysses_cross_attn = UlyssesCrossAttention(
+            # VanillaAttention.support_fused_qkv() is False, so UlyssesAttention
+            # takes the unfused path (Q + K + V independent 4D a2a + output).
+            # The unfused path handles S_q != S_kv correctly via the inner
+            # backend's seq_len / seq_len_kv kwargs.
+            self._ulysses_cross_attn = UlyssesAttention(
                 inner_backend=inner,
                 process_group=vgm.ulysses_group,
             )
@@ -798,12 +800,14 @@ class BasicAVTransformerBlock(nn.Module):
                 # Project-before-gather (video → audio direction). RoPE applied
                 # to K in project_kv on local shard; see audio→video branch above.
                 # Strict-Ulysses v2a: K/V (video, large) stay seq-sharded when
-                # ``_audio_is_sharded`` is True; the UlyssesCrossAttention
-                # wrapper inside ``video_to_audio_attn`` handles the Q a2a +
-                # fused K|V 5D a2a + output a2a. RoPE commutes with the a2a
-                # along the seq dim, so rotate-before-gather is value-preserving.
-                # No key_padding_mask — video K/V is unpadded; padded audio Q
-                # is stripped on exit by LTXModel.forward.
+                # ``_audio_is_sharded`` is True; the UlyssesAttention wrapper
+                # inside ``video_to_audio_attn`` handles the Q a2a + fused
+                # K|V 5D a2a (or independent 4D a2a when the underlying backend
+                # doesn't support fused QKV) + output a2a. RoPE commutes with
+                # the a2a along the seq dim, so rotate-before-gather is
+                # value-preserving. No key_padding_mask — video K/V is
+                # unpadded; padded audio Q is stripped on exit by
+                # LTXModel.forward.
                 # When _audio_is_sharded is False (no padding + non-divisible
                 # T_a), ``set_ulysses_active(False)`` switches v2a back to
                 # the plain backend, and we AG video K/V here.
