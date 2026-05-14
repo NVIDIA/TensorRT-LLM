@@ -23,7 +23,7 @@ from tensorrt_llm.mapping import Mapping
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _make_mgr(max_batch_size=4, max_draft_len=2):
+def _make_mgr(max_batch_size=4, max_draft_len=2, use_replay_state_update=False):
     # +1 headroom matches MixedMambaHybridCacheManager.pool_size.
     pool = max_batch_size + 1
     return PythonMambaCacheManager(
@@ -39,6 +39,7 @@ def _make_mgr(max_batch_size=4, max_draft_len=2):
         dtype=torch.float16,
         ssm_cache_dtype=torch.float16,
         speculative_num_draft_tokens=max_draft_len,
+        use_replay_state_update=use_replay_state_update,
     )
 
 
@@ -111,6 +112,48 @@ def test_padding_slot_is_permanent():
         assert shared not in mgr.mamba_cache_free_blocks
 
     assert mgr._padding_slot == shared
+
+
+@skip_no_cuda
+def test_replay_update_mamba_states_uses_history_window():
+    """Replay path appends PNAT until the layer kernels checkpointed."""
+    mgr = _make_mgr(max_batch_size=4, max_draft_len=5, use_replay_state_update=True)
+    assert mgr.replay_step_width == 6
+    assert mgr.replay_history_size == 16
+    assert mgr.mamba_cache.old_x.shape[2] == 16
+    assert mgr.mamba_cache.old_B.shape[3] == 16
+    assert mgr.mamba_cache.old_dt.shape[4] == 16
+    assert mgr.mamba_cache.old_dA_cumsum.shape[4] == 16
+
+    mgr._prepare_mamba_cache_blocks([100, 101])
+    slot_appended = mgr.mamba_cache_index[100]
+    slot_checkpointed = mgr.mamba_cache_index[101]
+
+    mgr.mamba_cache.prev_num_accepted_tokens[slot_appended] = 7
+    mgr.mamba_cache.prev_num_accepted_tokens[slot_checkpointed] = 13
+    mgr.mamba_cache.cache_buf_idx[slot_appended] = 0
+    mgr.mamba_cache.cache_buf_idx[slot_checkpointed] = 1
+    mgr.mamba_cache.conv.zero_()
+    mgr.mamba_cache.intermediate_conv_window.zero_()
+    mgr.mamba_cache.intermediate_conv_window[:, 0, 2] = 11.0
+    mgr.mamba_cache.intermediate_conv_window[:, 1, 2] = 13.0
+
+    state_indices = torch.tensor(
+        [slot_appended, slot_checkpointed], dtype=torch.int32, device="cuda"
+    )
+    attn = SimpleNamespace(num_seqs=2, num_contexts=0)
+    mgr.update_mamba_states(
+        attn,
+        torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+    )
+
+    assert mgr.mamba_cache.prev_num_accepted_tokens[slot_appended].item() == 10
+    assert mgr.mamba_cache.prev_num_accepted_tokens[slot_checkpointed].item() == 3
+    assert mgr.mamba_cache.cache_buf_idx[slot_appended].item() == 0
+    assert mgr.mamba_cache.cache_buf_idx[slot_checkpointed].item() == 0
+    assert torch.all(mgr.mamba_cache.conv[:, slot_appended] == 11.0)
+    assert torch.all(mgr.mamba_cache.conv[:, slot_checkpointed] == 13.0)
 
 
 @skip_no_cuda
