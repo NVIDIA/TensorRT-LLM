@@ -205,8 +205,7 @@ Qwen/Qwen3.5-4B:
     kv_cache_quant_algo: FP8
     accuracy: 80.5
 Qwen/Qwen3.5-35B-A3B:
-  - dtype: bfloat16
-    accuracy: 89.196
+  - accuracy: 89.196
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88.32
 Qwen/Qwen3.5-397B-A17B:
