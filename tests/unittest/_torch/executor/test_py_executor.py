@@ -371,8 +371,7 @@ class TestComputeScheduledTokens:
         gen = [_make_gen_request(3), _make_gen_request(0)]
         assert PyExecutor._compute_scheduled_tokens([], gen) == (1 + 3) + (1 + 0)
 
-    def test_disagg_trans_complete_draft_tokens_are_scheduler_visible(
-            self) -> None:
+    def test_disagg_trans_complete_draft_tokens_are_scheduler_visible(self) -> None:
         gen = [_make_gen_request(3) for _ in range(127)]
         trans_complete = _make_disagg_trans_complete_request([11, 12, 13])
         gen.append(trans_complete)
@@ -386,17 +385,14 @@ class TestComputeScheduledTokens:
         assert trans_complete.py_draft_pages_allocated == 3
         assert PyExecutor._compute_scheduled_tokens([], gen) == 128 * 4
 
-    def test_disagg_trans_complete_missing_draft_tokens_are_scheduler_visible(
-            self) -> None:
+    def test_disagg_trans_complete_missing_draft_tokens_are_scheduler_visible(self) -> None:
         trans_complete = _make_disagg_trans_complete_request(None)
-        PyExecutor._sync_disagg_generation_trans_complete_draft_tokens(
-            [trans_complete])
+        PyExecutor._sync_disagg_generation_trans_complete_draft_tokens([trans_complete])
 
         assert trans_complete.py_draft_tokens == []
         assert trans_complete.draft_tokens == []
         assert trans_complete.py_draft_pages_allocated == 0
-        assert PyExecutor._compute_scheduled_tokens([],
-                                                    [trans_complete]) == 1
+        assert PyExecutor._compute_scheduled_tokens([], [trans_complete]) == 1
 
     def test_mixed_context_and_generation(self):
         """Combined context (with chunk-shift) and generation tokens."""
