@@ -1874,7 +1874,9 @@ class TestMultimodalAwareChunkingV2:
 
     @staticmethod
     def _build_cumsum(prompt_len, mm_runs):
-        """Build the int64 [P+1] embed-mask cumsum tensor.
+        """Build the int64 [P] embed-mask cumsum tensor (INCLUSIVE convention,
+        matching ``inputs/registry.py:embed_mask.cumsum(0)`` and
+        ``MultimodalRuntimeData``).
 
         ``mm_runs`` is a list of half-open ``(start, end)`` ranges marking
         embed_mask=1 positions.
@@ -1884,9 +1886,7 @@ class TestMultimodalAwareChunkingV2:
         mask = torch.zeros(prompt_len, dtype=torch.int64)
         for start, end in mm_runs:
             mask[start:end] = 1
-        cumsum = torch.zeros(prompt_len + 1, dtype=torch.int64)
-        cumsum[1:] = torch.cumsum(mask, dim=0)
-        return cumsum
+        return mask.cumsum(0, dtype=torch.int64)
 
     def _make_mm_req(self, request_id, context_remaining, mm_runs, *, bidirectional=True):
         req = make_ctx_request(

@@ -562,35 +562,55 @@ class KVCacheV2Scheduler(RequestScheduler):
         if end_abs >= prompt_len or end_abs <= 0:
             return chunk_size
 
-        # Three-cumsum boundary-in-block detection: positions hi-1 and hi are
-        # both MM iff cumsum[hi]-cumsum[hi-1]==1 and cumsum[hi+1]-cumsum[hi]==1.
+        # Cumsum is INCLUSIVE [P] (length prompt_len) with
+        # cumsum[i] = sum(mask[0..i]). So mask[i] = cumsum[i]-cumsum[i-1] for
+        # i>=1, and mask[0] = cumsum[0]. Aligned with inputs/registry.py
+        # (``embed_mask.cumsum(0)``) and MultimodalRuntimeData.
+        #
+        # Three-cumsum boundary-in-block detection: positions end_abs-1 and
+        # end_abs are both MM iff mask[end_abs-1]==1 AND mask[end_abs]==1.
         # Gemma4's HF processor wraps every soft-token run with non-MM
         # specials (boi/eoi/boa/eoa, embed_mask=0), so two consecutive
         # embed_mask=1 positions always belong to the same block.
         cs_prev = int(cumsum[end_abs - 1].item())
         cs_cur = int(cumsum[end_abs].item())
-        cs_next = int(cumsum[end_abs + 1].item())
-        if (cs_cur - cs_prev) != 1 or (cs_next - cs_cur) != 1:
-            return chunk_size
+        if (cs_cur - cs_prev) != 1:
+            return chunk_size  # mask[end_abs] != 1
+        if end_abs == 1:
+            if cs_prev != 1:
+                return chunk_size  # mask[0] != 1
+        else:
+            if (cs_prev - int(cumsum[end_abs - 2].item())) != 1:
+                return chunk_size  # mask[end_abs - 1] != 1
 
         # --- compute block extent (forward + backward walks from end_abs) ---
-        # Forward walk: block_end_abs becomes the first non-MM position after
-        # the block (exclusive end). Backward walk uses ``> 0`` (not ``> lo``)
-        # so block_size below reflects the TRUE block size — important for
-        # the impossibility check, which must not be undercounted if a prior
-        # iteration somehow advanced into a block (would otherwise mask a
-        # real config error).
+        # Forward walk: advance while position block_end_abs is MM
+        # (mask[block_end_abs] == cumsum[block_end_abs]-cumsum[block_end_abs-1]).
+        # Final block_end_abs is the first non-MM position (exclusive end),
+        # or prompt_len if the block extends through EOS.
+        # Backward walk uses ``> 0`` (not ``> lo``) so block_size below
+        # reflects the TRUE block size — important for the impossibility
+        # check, which must not be undercounted if a prior iteration somehow
+        # advanced into a block (would otherwise mask a real config error).
         block_end_abs = end_abs
         while block_end_abs < prompt_len:
-            if (int(cumsum[block_end_abs + 1].item()) - int(cumsum[block_end_abs].item())) != 1:
+            if (int(cumsum[block_end_abs].item()) - int(cumsum[block_end_abs - 1].item())) != 1:
                 break
             block_end_abs += 1
 
+        # Backward walk: decrement while position (block_start_abs - 1) is MM.
+        # Final block_start_abs is the first MM position (inclusive start),
+        # or 0 if the block extends to BOS.
         block_start_abs = end_abs
-        while block_start_abs > 0:
-            if (int(cumsum[block_start_abs].item()) - int(cumsum[block_start_abs - 1].item())) != 1:
+        while block_start_abs > 1:
+            if (
+                int(cumsum[block_start_abs - 1].item()) - int(cumsum[block_start_abs - 2].item())
+            ) != 1:
                 break
             block_start_abs -= 1
+        # Position 0: mask[0] == cumsum[0]; no cumsum[-1] sentinel.
+        if block_start_abs == 1 and int(cumsum[0].item()) == 1:
+            block_start_abs = 0
 
         # --- impossibility check ---
         # If the block itself exceeds max_context_length, no chunk size can
