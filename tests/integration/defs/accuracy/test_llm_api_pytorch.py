@@ -7627,7 +7627,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
         target_len = 49152
 
         with LLM(self.MODEL_PATH, **self._llm_kwargs_stress()) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
             tokenizer = llm.tokenizer
             dataset_path = (f"{llm_models_root()}/datasets/Crystalcareai/"
@@ -7707,7 +7707,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
         target_len = 49152
 
         with LLM(self.MODEL_PATH, **self._llm_kwargs_stress()) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
             tokenizer = llm.tokenizer
             dataset_path = (f"{llm_models_root()}/datasets/Crystalcareai/"
