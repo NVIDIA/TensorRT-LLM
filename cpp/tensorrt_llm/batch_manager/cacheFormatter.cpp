@@ -589,12 +589,20 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         }
         catch (...)
         {
-            if (agentConnection != nullptr)
+            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
             {
                 // AgentConnection::send can throw on cancel/error after the
                 // backend transfer has seen this send buffer. release() is
                 // not a quiescence proof, so do not return the slot to the
                 // pool; poison it and let Python restart the process.
+                //
+                // Gated on TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL: poison the
+                // buffer only when the operator has explicitly opted in to
+                // the mid-flight cancellation surface. When opt-in is off
+                // the cancel chain is dormant by design (Python skips
+                // cancel_request), so this catch block can still execute
+                // from non-cancel exceptions but should not poison the
+                // buffer pool / drive Layer 5's fail-closed in py_executor.
                 sendHolder.poison();
             }
             throw;

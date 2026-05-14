@@ -400,8 +400,15 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         }
         catch (...)
         {
-            if (agentConnection != nullptr)
+            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
             {
+                // Symmetric with cacheFormatter.cpp catch: AgentConnection::send
+                // can throw on cancel/error after the backend transfer has seen
+                // this send buffer; poison the holder so Layer 5 fail-closed
+                // takes the pod out of service rather than reusing a
+                // possibly-still-pinned buffer.
+                // Gated on TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL: see
+                // cacheFormatter.cpp for the full rationale.
                 sendHolder.poison();
             }
             throw;

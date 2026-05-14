@@ -18,6 +18,44 @@ AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
+# Opt-in for the PR #13713 disagg mid-flight cancellation surface
+# (Layer 1 cancel propagation + Layer 2b sendHolder.poison() + Layer 5
+# fail-closed). Setting ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`` arms the
+# defensive surface: Python propagates cancel for timed-out transfers, the
+# C++ poll loop unwinds workers on cancel, and the poisoned-buffer signal
+# drives a graceful PyExecutor shutdown when transport quiescence cannot be
+# proved. Defaults to "0" (cancel chain dormant; behavior matches the
+# pre-PR-13713 baseline). The orthogonal fixes (BufferIndexHolder RAII,
+# shared_ptr<LlmRequest> async lifetime, recv-side idempotency) remain
+# always-on because they close baseline races that exist regardless of
+# mid-flight cancellation. See the NVBug 6104831 investigation report
+# section 10 for the empirical case for enabling this surface.
+_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL"
+_disagg_inflight_cancel_enabled_cache: Optional[bool] = None
+
+
+def is_disagg_inflight_cancel_enabled() -> bool:
+    """Return True iff the disagg mid-flight cancellation surface is opted
+    into via ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1``. Read once and
+    cached; logs a one-shot WARNING on the first call when the knob is set
+    so the operating mode is visible in logs. Defaults to False (cancel
+    chain dormant; behavior matches the pre-PR-13713 baseline).
+    """
+    global _disagg_inflight_cancel_enabled_cache
+    if _disagg_inflight_cancel_enabled_cache is None:
+        _disagg_inflight_cancel_enabled_cache = (getenv(
+            _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0") == "1")
+        if _disagg_inflight_cancel_enabled_cache:
+            logger.warning(
+                f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1: disagg KV transfer "
+                "mid-flight cancellation and fail-closed memory-safety policy "
+                "are ENABLED. Timed-out transfers will be cancelled at the "
+                "C++ layer; on cancel-with-unknown-quiescence the PyExecutor "
+                "will be shut down via the fail-closed policy and the "
+                "orchestrator should restart the pod. See the NVBug 6104831 "
+                "investigation report section 10 for the rationale.")
+    return _disagg_inflight_cancel_enabled_cache
+
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
@@ -206,9 +244,23 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         return self.impl.check_gen_transfer_complete()
 
     def cancel_request(self, req: LlmRequest):
+        # When TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL is not set (the default),
+        # the C++ cancel surface stays dormant — Python returns False so
+        # callers skip the "cancelled, waiting for C++ to surface final
+        # cleanup" dedup-set entry and the natural-completion path takes
+        # over. This matches the pre-PR-13713 baseline behavior; see
+        # is_disagg_inflight_cancel_enabled() for the opt-in details.
+        if not is_disagg_inflight_cancel_enabled():
+            return False
         return self.impl.cancel_request(req)
 
     def has_poisoned_transfer_buffer(self) -> bool:
+        # Layer 5 fail-closed is gated by the same opt-in: when the cancel
+        # surface is not enabled no poison signal is ever set by Layer 2b
+        # (the C++ catch-block call is also gated), so reporting False
+        # unconditionally here is consistent + defensive.
+        if not is_disagg_inflight_cancel_enabled():
+            return False
         return self.impl.has_poisoned_transfer_buffer()
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
