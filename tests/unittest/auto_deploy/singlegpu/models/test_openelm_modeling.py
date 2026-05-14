@@ -260,7 +260,7 @@ class _HFOpenELMForCausalLM(nn.Module):
 @torch.no_grad()
 def test_openelm_layer_structure_and_forward():
     config = _create_small_config()
-    model = OpenELMForCausalLM(config).eval()
+    model = OpenELMForCausalLM(config).cuda().eval()
 
     assert len(model.transformer.layers) == 3
     assert model.lm_head is None  # shared embeddings
@@ -272,8 +272,8 @@ def test_openelm_layer_structure_and_forward():
 
     # Verify forward produces valid output
     B, S = 2, 8
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     out = model(input_ids=input_ids, position_ids=position_ids)
     assert out.logits.shape == (B, S, config.vocab_size)
     assert torch.isfinite(out.logits).all()
@@ -282,7 +282,7 @@ def test_openelm_layer_structure_and_forward():
 @torch.no_grad()
 def test_openelm_weight_keys_match_checkpoint():
     config = _create_small_config()
-    model = OpenELMForCausalLM(config).eval()
+    model = OpenELMForCausalLM(config).cuda().eval()
     keys = set(model.state_dict().keys())
 
     # Check fused QKV proj
@@ -296,8 +296,8 @@ def test_openelm_weight_keys_match_checkpoint():
 
     # Verify forward produces valid output with these weights
     B, S = 1, 4
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     out = model(input_ids=input_ids, position_ids=position_ids)
     assert out.logits.shape == (B, S, config.vocab_size)
     assert torch.isfinite(out.logits).all()
@@ -312,7 +312,7 @@ def test_openelm_weight_keys_match_checkpoint():
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_openelm_ffn_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
 
     hf_ffn = _HFFFN(config, 0).to(device=device, dtype=dtype).eval()
@@ -328,7 +328,7 @@ def test_openelm_ffn_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_openelm_attention_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
     layer_idx = 0
 
@@ -358,7 +358,7 @@ def test_openelm_attention_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_openelm_decoder_layer_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
     layer_idx = 0
 
@@ -385,7 +385,7 @@ def test_openelm_decoder_layer_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_openelm_full_model_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
 
     hf_model = _HFOpenELMForCausalLM(config).to(device=device, dtype=dtype).eval()

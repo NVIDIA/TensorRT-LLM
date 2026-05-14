@@ -159,7 +159,7 @@ def _create_small_config():
 class TestDeepSeekV2RMSNorm:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -189,7 +189,7 @@ class TestDeepSeekV2RMSNorm:
 class TestDeepSeekV2RotaryEmbedding:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -230,7 +230,7 @@ class TestDeepSeekV2RotaryEmbedding:
 class TestDeepSeekV2MLP:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -252,7 +252,7 @@ class TestDeepSeekV2MLP:
 class TestDeepSeekV2MoEGate:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -301,7 +301,7 @@ class TestDeepSeekV2MoEGate:
 class TestDeepSeekV2MoE:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -369,7 +369,7 @@ class TestDeepSeekV2MoE:
 class TestDeepSeekV2Attention:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -436,7 +436,7 @@ class TestDeepSeekV2Attention:
 class TestDeepSeekV2DecoderLayer:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -475,7 +475,7 @@ class TestDeepSeekV2DecoderLayer:
 class TestDeepSeekV2ForCausalLM:
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 

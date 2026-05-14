@@ -233,19 +233,19 @@ def test_mlp_equivalence(B, S, dtype):
 
     hf_config = _create_small_hf_config()
 
-    hf_mlp = HFMLPCls(hf_config).to(dtype=dtype)
+    hf_mlp = HFMLPCls(hf_config).to(device="cuda", dtype=dtype)
     hf_mlp.eval()
 
     custom_mlp = HunYuanDenseMLP(
         hidden_size=hf_config.hidden_size,
         intermediate_size=hf_config.intermediate_size,
         hidden_act=hf_config.hidden_act,
-    ).to(dtype=dtype)
+    ).to(device="cuda", dtype=dtype)
     custom_mlp.eval()
 
     _transfer_mlp_weights(hf_mlp, custom_mlp)
 
-    x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype)
+    x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype, device="cuda")
     hf_out = hf_mlp(x)
     custom_out = custom_mlp(x)
 
@@ -267,14 +267,14 @@ def test_rmsnorm_equivalence(B, S, dtype):
     hidden_size = 64
     eps = 1e-5
 
-    hf_norm = HFRMSNorm(hidden_size, eps=eps).to(dtype=dtype)
+    hf_norm = HFRMSNorm(hidden_size, eps=eps).to(device="cuda", dtype=dtype)
     hf_norm.eval()
 
-    custom_norm = HunYuanDenseRMSNorm(hidden_size, eps=eps).to(dtype=dtype)
+    custom_norm = HunYuanDenseRMSNorm(hidden_size, eps=eps).to(device="cuda", dtype=dtype)
     custom_norm.eval()
     custom_norm.weight.data.copy_(hf_norm.weight.data)
 
-    x = torch.randn(B, S, hidden_size, dtype=dtype)
+    x = torch.randn(B, S, hidden_size, dtype=dtype, device="cuda")
     hf_out = hf_norm(x)
     custom_out = custom_norm(x)
 
@@ -294,7 +294,7 @@ def test_attention_equivalence(B, S, dtype):
     hf_config = _create_small_hf_config()
 
     # HF attention
-    hf_attn = HFAttnCls(hf_config, layer_idx=0).to(dtype=dtype)
+    hf_attn = HFAttnCls(hf_config, layer_idx=0).to(device="cuda", dtype=dtype)
     hf_attn.eval()
 
     # Custom attention
@@ -306,20 +306,20 @@ def test_attention_equivalence(B, S, dtype):
         rms_norm_eps=hf_config.rms_norm_eps,
         attention_bias=hf_config.attention_bias,
         layer_idx=0,
-    ).to(dtype=dtype)
+    ).to(device="cuda", dtype=dtype)
     custom_attn.eval()
 
     _transfer_attention_weights(hf_attn, custom_attn)
 
     # Create inputs
-    x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype)
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype, device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # HF reference — pass causal mask to match custom model's is_causal=True
-    hf_rope = HFRopeCls(hf_config).to(dtype=dtype)
+    hf_rope = HFRopeCls(hf_config).to(device="cuda", dtype=dtype)
     hf_cos, hf_sin = hf_rope(x, position_ids)
     # Causal additive mask: 0 for attended, -inf for masked (future) positions
-    causal_mask = torch.full((S, S), float("-inf"), dtype=torch.float32)
+    causal_mask = torch.full((S, S), float("-inf"), dtype=torch.float32, device="cuda")
     causal_mask = torch.triu(causal_mask, diagonal=1)  # upper-tri = -inf
     causal_mask = causal_mask[None, None, :, :].expand(B, 1, -1, -1)  # [B, 1, S, S]
     hf_out, _ = hf_attn(
@@ -334,7 +334,7 @@ def test_attention_equivalence(B, S, dtype):
         max_position_embeddings=hf_config.max_position_embeddings,
         base=get_rope_theta(hf_config),
         rope_scaling=getattr(hf_config, "rope_scaling", None),
-    ).to(dtype=dtype)
+    ).to(device="cuda", dtype=dtype)
     custom_position_embeddings = custom_rope(x)
     custom_out = custom_attn(x, position_ids, custom_position_embeddings)
 
@@ -359,23 +359,25 @@ def test_decoder_layer_equivalence(B, S, dtype):
     hf_config = _create_small_hf_config()
     custom_config = _create_small_custom_config()
 
-    hf_layer = HFLayerCls(hf_config, layer_idx=0).to(dtype=dtype)
+    hf_layer = HFLayerCls(hf_config, layer_idx=0).to(device="cuda", dtype=dtype)
     hf_layer.eval()
 
-    custom_layer = HunYuanDenseDecoderLayer(custom_config, layer_idx=0).to(dtype=dtype)
+    custom_layer = HunYuanDenseDecoderLayer(custom_config, layer_idx=0).to(
+        device="cuda", dtype=dtype
+    )
     custom_layer.eval()
 
     _transfer_decoder_layer_weights(hf_layer, custom_layer)
 
     # Create inputs
-    x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype)
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    x = torch.randn(B, S, hf_config.hidden_size, dtype=dtype, device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # HF reference — pass causal mask to match custom model's is_causal=True
-    hf_rope = HFRopeCls(hf_config).to(dtype=dtype)
+    hf_rope = HFRopeCls(hf_config).to(device="cuda", dtype=dtype)
     hf_cos, hf_sin = hf_rope(x, position_ids)
     # Causal additive mask: 0 for attended, -inf for masked (future) positions
-    causal_mask = torch.full((S, S), float("-inf"), dtype=torch.float32)
+    causal_mask = torch.full((S, S), float("-inf"), dtype=torch.float32, device="cuda")
     causal_mask = torch.triu(causal_mask, diagonal=1)
     causal_mask = causal_mask[None, None, :, :].expand(B, 1, -1, -1)  # [B, 1, S, S]
     # HF decoder layer returns a tuple; unpack the hidden states
@@ -394,7 +396,7 @@ def test_decoder_layer_equivalence(B, S, dtype):
         max_position_embeddings=custom_config.max_position_embeddings,
         base=get_rope_theta(custom_config),
         rope_scaling=getattr(custom_config, "rope_scaling", None),
-    ).to(dtype=dtype)
+    ).to(device="cuda", dtype=dtype)
     custom_position_embeddings = custom_rope(x)
     custom_out = custom_layer(x, position_ids, custom_position_embeddings)
 
@@ -418,16 +420,16 @@ def test_full_model_equivalence(B, S, dtype):
     hf_config = _create_small_hf_config()
     custom_config = _create_small_custom_config()
 
-    hf_model = HFModelCls(hf_config).to(dtype=dtype)
+    hf_model = HFModelCls(hf_config).to(device="cuda", dtype=dtype)
     hf_model.eval()
 
-    custom_model = HunYuanDenseForCausalLM(custom_config).to(dtype=dtype)
+    custom_model = HunYuanDenseForCausalLM(custom_config).to(device="cuda", dtype=dtype)
     custom_model.eval()
 
     _transfer_full_model_weights(hf_model, custom_model)
 
-    input_ids = torch.randint(0, custom_config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, custom_config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     hf_out = hf_model(input_ids=input_ids, position_ids=position_ids)
     custom_out = custom_model(input_ids=input_ids, position_ids=position_ids)
@@ -440,7 +442,7 @@ def test_full_model_equivalence(B, S, dtype):
 # ===========================================================================
 
 
-@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("device", ["cuda"])
 @torch.no_grad()
 def test_model_can_be_exported(device):
     """Test that the custom model can be exported with torch_export_to_gm.

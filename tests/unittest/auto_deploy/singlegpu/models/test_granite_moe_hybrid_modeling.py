@@ -257,7 +257,7 @@ def test_granite_moe_hybrid_mlp_equivalence(B, S, dtype):
     if HFMLP is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridMLP")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
 
     # Create HF MLP
@@ -289,7 +289,7 @@ def test_granite_moe_hybrid_attention_equivalence(B, S, dtype):
     if HFAttention is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridAttention")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
 
     # Create HF attention
@@ -342,7 +342,7 @@ def test_granite_moe_hybrid_attention_nope_equivalence(B, S, dtype):
     if HFAttention is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridAttention")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_hybrid_config()
 
     hf_attn = HFAttention(config, layer_idx=3)
@@ -380,7 +380,7 @@ def test_granite_moe_hybrid_mamba_equivalence(B, S, dtype):
     if HFMambaLayer is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridMambaLayer")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_hybrid_config()
 
     hf_mamba = HFMambaLayer(config, layer_idx=0)
@@ -410,7 +410,7 @@ def test_granite_moe_hybrid_moe_equivalence(B, S, dtype):
     if HFMoE is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridMoE")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_hybrid_config()
 
     hf_moe = HFMoE(config)
@@ -452,7 +452,7 @@ def test_granite_moe_hybrid_decoder_layer_equivalence(B, S, dtype):
     if HFDecoderLayer is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridDecoderLayer")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
 
     # Create HF decoder layer
@@ -505,7 +505,7 @@ def test_granite_moe_hybrid_mamba_decoder_layer_equivalence(B, S, dtype):
     if HFDecoderLayer is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridDecoderLayer")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_hybrid_config()
 
     # Layer 0 is a mamba layer
@@ -542,7 +542,7 @@ def test_granite_moe_hybrid_attention_decoder_layer_nope_equivalence(B, S, dtype
     if HFDecoderLayer is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridDecoderLayer")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_hybrid_config()
 
     # Layer 3 is an attention layer
@@ -590,7 +590,7 @@ def test_granite_moe_hybrid_full_model_equivalence(B, S, dtype):
     if HFModel is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridForCausalLM")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
 
     # Create HF model
@@ -624,7 +624,7 @@ def test_granite_moe_hybrid_full_model_hybrid_equivalence(B, S, dtype):
     if HFModel is None:
         pytest.skip("transformers doesn't have GraniteMoeHybridForCausalLM")
 
-    device = "cpu"
+    device = "cuda"
     config = _create_small_hybrid_config()
 
     hf_model = HFModel(config)
@@ -655,7 +655,7 @@ def test_granite_moe_hybrid_full_model_hybrid_equivalence(B, S, dtype):
 
 def test_granite_moe_hybrid_model_can_be_exported():
     """Test that the attention-only model can be exported with torch_export_to_gm."""
-    device = "cpu"
+    device = "cuda"
     dtype = torch.bfloat16
     config = _create_small_config()
 
@@ -717,7 +717,7 @@ def test_granite_moe_hybrid_model_can_be_exported():
 
 def test_granite_moe_hybrid_model_hybrid_can_be_exported():
     """Test that the hybrid Mamba+Attention+MoE model can be exported."""
-    device = "cpu"
+    device = "cuda"
     dtype = torch.bfloat16
     config = _create_small_hybrid_config()
 

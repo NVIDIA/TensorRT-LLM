@@ -453,7 +453,7 @@ def test_cohere2_decoder_layer_equivalence(B, S, dtype, layer_idx):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cuda"])
 @torch.no_grad()
 def test_cohere_full_model_equivalence(B, S, dtype, device):
     """Test full Cohere v1 model produces numerically equivalent output to HF."""
@@ -497,7 +497,7 @@ def test_cohere_full_model_equivalence(B, S, dtype, device):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cuda"])
 @torch.no_grad()
 def test_cohere2_full_model_equivalence(B, S, dtype, device):
     """Test full Cohere2 model produces numerically equivalent output to HF."""

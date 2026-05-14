@@ -377,7 +377,7 @@ def test_olmo3_decoder_layer_equivalence(B, S, dtype, layer_idx, rope_type):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cuda"])
 @pytest.mark.parametrize("rope_type", ["default", "yarn"])
 @torch.no_grad()
 def test_olmo3_full_model_equivalence(B, S, dtype, device, rope_type):

@@ -188,7 +188,7 @@ def _convert_hf_to_custom_state_dict(hf_state_dict):
 @torch.no_grad()
 def test_skywork_r1v2_rmsnorm_equivalence(B, S, dtype):
     """Test RMSNorm produces numerically equivalent output to HF Qwen2 RMSNorm."""
-    device = "cpu"
+    device = "cuda"
     config = _create_small_llm_config()
 
     hf_norm = (
@@ -211,7 +211,7 @@ def test_skywork_r1v2_rmsnorm_equivalence(B, S, dtype):
 @torch.no_grad()
 def test_skywork_r1v2_mlp_equivalence(B, S, dtype):
     """Test MLP layer produces numerically equivalent output to HF Qwen2 MLP."""
-    device = "cpu"
+    device = "cuda"
     config = _create_small_llm_config()
 
     hf_mlp = Qwen2MLP(config).to(device=device, dtype=dtype).eval()
@@ -325,7 +325,7 @@ def test_skywork_r1v2_decoder_layer_equivalence(B, S, dtype):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cpu"])
+@pytest.mark.parametrize("device", ["cuda"])
 @torch.no_grad()
 def test_skywork_r1v2_full_model_equivalence(B, S, dtype, device):
     """Test full model produces numerically equivalent output to HF Qwen2ForCausalLM."""

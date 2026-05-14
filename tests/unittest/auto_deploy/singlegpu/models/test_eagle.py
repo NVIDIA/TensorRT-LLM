@@ -236,7 +236,7 @@ def test_eagle_model_torch_export():
     eagle_path = Path(eagle_model_path)
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     dtype = torch.float16
 
     # Create model via EagleDrafterFactory (creates EagleDrafterForCausalLM)

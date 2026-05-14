@@ -282,13 +282,17 @@ def test_torch_gated_delta_rule_op():
     k_head_dim = 16
     v_head_dim = 16
 
-    q_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
-    k_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
-    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.float32)
-    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
-    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
-    A_log = torch.randn(num_heads, dtype=torch.float32)
-    dt_bias = torch.randn(num_heads, dtype=torch.float32)
+    q_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32, device="cuda"
+    )
+    k_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32, device="cuda"
+    )
+    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.float32, device="cuda")
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32, device="cuda")
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32, device="cuda")
+    A_log = torch.randn(num_heads, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(num_heads, dtype=torch.float32, device="cuda")
 
     q_norm = _l2norm(q_raw.float())
     k_norm = _l2norm(k_raw.float())
@@ -318,13 +322,17 @@ def test_torch_gated_delta_rule_op_bfloat16():
     k_head_dim = 8
     v_head_dim = 8
 
-    q_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
-    k_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
-    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.bfloat16)
-    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
-    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
-    A_log = torch.randn(num_heads, dtype=torch.bfloat16)
-    dt_bias = torch.randn(num_heads, dtype=torch.bfloat16)
+    q_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.randn(num_heads, dtype=torch.bfloat16, device="cuda")
+    dt_bias = torch.randn(num_heads, dtype=torch.bfloat16, device="cuda")
 
     q_norm = _l2norm(q_raw.float()).to(torch.bfloat16)
     k_norm = _l2norm(k_raw.float()).to(torch.bfloat16)
@@ -355,14 +363,14 @@ def test_qwen3_next_gdn_patch():
 
     module, config = _load_qwen3_next_gdn_layer()
     _force_torch_fallbacks(module)
-    module = module.to(torch.bfloat16)
+    module = module.to(torch.bfloat16).cuda()
 
-    inputs = torch.randn(2, 16, 32, dtype=torch.bfloat16)
+    inputs = torch.randn(2, 16, 32, dtype=torch.bfloat16, device="cuda")
 
     with torch.no_grad():
         ref_output = type(module).forward(module, inputs)
 
-    custom_gdn = Qwen3NextGatedDeltaNet(config, layer_idx=0).to(torch.bfloat16)
+    custom_gdn = Qwen3NextGatedDeltaNet(config, layer_idx=0).to(torch.bfloat16).cuda()
     custom_gdn.load_state_dict(module.state_dict())
     custom_gdn.eval()
 
@@ -378,14 +386,14 @@ def test_qwen3_next_gdn_patch_float32():
 
     module, config = _load_qwen3_next_gdn_layer()
     _force_torch_fallbacks(module)
-    module = module.to(torch.float32)
+    module = module.to(torch.float32).cuda()
 
-    inputs = torch.randn(2, 16, 32, dtype=torch.float32)
+    inputs = torch.randn(2, 16, 32, dtype=torch.float32, device="cuda")
 
     with torch.no_grad():
         ref_output = type(module).forward(module, inputs)
 
-    custom_gdn = Qwen3NextGatedDeltaNet(config, layer_idx=0).to(torch.float32)
+    custom_gdn = Qwen3NextGatedDeltaNet(config, layer_idx=0).to(torch.float32).cuda()
     custom_gdn.load_state_dict(module.state_dict())
     custom_gdn.eval()
 
@@ -799,7 +807,7 @@ def test_qwen3_next_full_model_numerical_equivalence(B, S, dtype):
 
 def test_qwen3_next_model_can_be_exported():
     """Test that the custom model can be exported with torch_export_to_gm."""
-    device = "cpu"
+    device = "cuda"
     dtype = torch.bfloat16
     config = _create_small_config()
 

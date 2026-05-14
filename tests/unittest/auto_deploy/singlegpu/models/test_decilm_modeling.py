@@ -366,7 +366,7 @@ def test_decilm_weight_keys_match_checkpoint():
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_decilm_mlp_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
     ffn_mult = 2.625
     intermediate_size = _ffn_mult_to_intermediate_size(ffn_mult, config.hidden_size)
@@ -384,7 +384,7 @@ def test_decilm_mlp_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_decilm_attention_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
     n_heads_in_group = 2
 
@@ -410,7 +410,7 @@ def test_decilm_attention_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_decilm_decoder_layer_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
     layer_idx = 0
 
@@ -436,7 +436,7 @@ def test_decilm_decoder_layer_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_decilm_ffn_only_layer_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
     layer_idx = 1  # FFN-only
 
@@ -461,7 +461,7 @@ def test_decilm_ffn_only_layer_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
 def test_decilm_full_model_equivalence(B, S, dtype):
-    device = "cpu"
+    device = "cuda"
     config = _create_small_config()
 
     hf_model = _HFDeciLMForCausalLM(config).to(device=device, dtype=dtype).eval()
