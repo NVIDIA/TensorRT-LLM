@@ -32,7 +32,6 @@ public:
         , mCacheTransBufferManagers{cacheTransBufferManagers}
     {
         TLLM_CHECK(mCacheManager);
-        checkZeroCopyDisabledForCancellableDisaggTransfers();
     }
 
     void format(tensorrt_llm::batch_manager::TransferSession& session) override;

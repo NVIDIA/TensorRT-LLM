@@ -232,14 +232,6 @@ public:
     virtual ~BaseCacheFormatter() = default;
 };
 
-inline void checkZeroCopyDisabledForCancellableDisaggTransfers()
-{
-    TLLM_CHECK_WITH_INFO(!common::getEnvTryZCopyForKVCacheTransfer(),
-        "Zero-copy cache transfer sends/receives directly from request-owned blocks. It is disabled for cancellable "
-        "disaggregated transfers until KV-block leases can prove the peer has stopped accessing those blocks before "
-        "the request is freed.");
-}
-
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
 // parallel topology is completely identical, making it the preferred method.
 class CacheFormatter final : public BaseCacheFormatter
@@ -251,7 +243,6 @@ public:
     {
         TLLM_CHECK(mCacheManager);
         TLLM_CHECK(mCacheTransBufferManager);
-        checkZeroCopyDisabledForCancellableDisaggTransfers();
     }
 
     void format(tensorrt_llm::batch_manager::TransferSession& session) override;

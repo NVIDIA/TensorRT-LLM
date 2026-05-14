@@ -122,9 +122,6 @@ class KvCacheTransceiver(ABC):
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
 
-    def has_poisoned_transfer_buffer(self) -> bool:
-        return False
-
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):
         """
@@ -207,9 +204,6 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
-
-    def has_poisoned_transfer_buffer(self) -> bool:
-        return self.impl.has_poisoned_transfer_buffer()
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally

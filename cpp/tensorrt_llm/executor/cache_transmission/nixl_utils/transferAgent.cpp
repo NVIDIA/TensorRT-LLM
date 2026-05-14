@@ -324,14 +324,6 @@ NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
     TLLM_CHECK(mHandle);
 }
 
-NixlTransferStatus::~NixlTransferStatus()
-{
-    if (!release())
-    {
-        TLLM_LOG_WARNING("NIXL transfer handle release failed during destruction; backend handle may remain active");
-    }
-}
-
 [[nodiscard]] MemoryDescs NixlHelper::coalesceMemoryDescs(MemoryDescs const& descs)
 {
     auto const& descVec = descs.getDescs();
@@ -493,17 +485,10 @@ NixlTransferStatus::~NixlTransferStatus()
 TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 {
     auto startTime = std::chrono::steady_clock::now();
+
     while (true)
     {
-        nixl_status_t status;
-        {
-            std::lock_guard<std::mutex> lock(mHandleMutex);
-            if (mHandle == nullptr)
-            {
-                return TransferState::kFAILURE;
-            }
-            status = mRawAgent->getXferStatus(mHandle);
-        }
+        auto status = mRawAgent->getXferStatus(mHandle);
         if (status == NIXL_SUCCESS)
         {
             return TransferState::kSUCCESS;
@@ -535,31 +520,7 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
-    std::lock_guard<std::mutex> lock(mHandleMutex);
-    if (mHandle == nullptr)
-    {
-        return false;
-    }
     return mRawAgent->getXferStatus(mHandle) == NIXL_SUCCESS;
-}
-
-[[nodiscard]] bool NixlTransferStatus::release()
-{
-    std::lock_guard<std::mutex> lock(mHandleMutex);
-    if (mHandle == nullptr)
-    {
-        return true;
-    }
-
-    auto status = mRawAgent->releaseXferReq(mHandle);
-    if (status == NIXL_SUCCESS)
-    {
-        mHandle = nullptr;
-        return true;
-    }
-
-    TLLM_LOG_WARNING("NIXL releaseXferReq failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-    return false;
 }
 
 [[nodiscard]] MemoryDescs NixlHelper::splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize)

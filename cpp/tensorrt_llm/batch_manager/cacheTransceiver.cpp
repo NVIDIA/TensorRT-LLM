@@ -347,7 +347,7 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         return;
     }
     setContextState(llmRequest.get());
-    auto future = mCacheSender->sendAsync(llmRequest);
+    auto future = mCacheSender->sendAsync(*llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
@@ -363,7 +363,7 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mCacheSender->sendAsync(llmRequest);
+        auto future = mCacheSender->sendAsync(*llmRequest);
         mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
 }
@@ -372,7 +372,7 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mCacheReceiver->receiveAsync(llmRequest);
+        auto future = mCacheReceiver->receiveAsync(*llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
@@ -400,7 +400,7 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     // valid transfer start time" and is overwritten by requestSync() with a
     // slightly later time — harmless for the deadline check.
     llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
-    auto future = mCacheReceiver->receiveAsync(llmRequest);
+    auto future = mCacheReceiver->receiveAsync(*llmRequest);
     // Order: setKvCacheTransferStart -> receiveAsync -> setState -> emplace.
     // setState is intentionally moved AFTER receiveAsync (the original code
     // set it before). This is safe today because the async worker spawned
@@ -1033,12 +1033,6 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
 bool CacheTransceiver::checkGenTransferComplete() const
 {
     return mRequesterFutures.empty();
-}
-
-bool CacheTransceiver::hasPoisonedTransferBuffer() const
-{
-    return std::any_of(mCacheTransBufferManagerPtrs.begin(), mCacheTransBufferManagerPtrs.end(),
-        [](BaseTransBufferManager const* manager) { return manager != nullptr && manager->hasPoisonedBuffer(); });
 }
 
 bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)

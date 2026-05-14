@@ -348,11 +348,11 @@ protected:
                     TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
                 }
             }
-            mFutures.emplace_back(mSender->sendAsync(llmRequest));
+            mFutures.emplace_back(mSender->sendAsync(*llmRequest));
         }
         else
         {
-            auto future = mRequester->receiveAsync(llmRequest);
+            auto future = mRequester->receiveAsync(*llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -468,12 +468,12 @@ struct CPMetaData
 
 struct WrappedLlmRequest
 {
-    std::shared_ptr<LlmRequest> mLlmRequest;
+    std::unique_ptr<LlmRequest> mLlmRequest;
     std::optional<CPMetaData> mCPMetaData;
 
     using RequestIdType = LlmRequest::RequestIdType;
 
-    WrappedLlmRequest(std::shared_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
+    WrappedLlmRequest(std::unique_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
         : mLlmRequest(std::move(llmRequest))
         , mCPMetaData(std::move(cpMetaData))
     {
@@ -887,7 +887,7 @@ protected:
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
 
-        auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
+        auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -919,7 +919,7 @@ protected:
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        auto llmRequestPtr = std::make_shared<LlmRequest>(requestId, std::move(request));
+        auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
 
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
@@ -973,7 +973,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mSender->sendAsync(llmRequest);
+        auto future = mSender->sendAsync(*llmRequest);
         return future;
     }
 
@@ -984,7 +984,7 @@ protected:
         auto& llmRequest = request->mLlmRequest;
         mManager->addSequenceBatch(
             {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
-        return mRequester->receiveAsync(llmRequest);
+        return mRequester->receiveAsync(*llmRequest);
     }
 
     void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)

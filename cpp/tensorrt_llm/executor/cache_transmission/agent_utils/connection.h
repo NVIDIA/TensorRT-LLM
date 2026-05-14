@@ -259,31 +259,14 @@ public:
         std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager);
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
-    // `perRequestCancel` is an optional pointer to a per-request cancel
-    // atomic (matches the flag registry in CacheReceiver::Impl). When
-    // non-null and flipped true before notifySyncMessage runs, the function
-    // throws so requestSync can unwind instead of blocking inside a NIXL
-    // backend notify call with no visibility into cancellation.
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
-        std::atomic<bool> const* perRequestCancel = nullptr);
+        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
-    /// @brief Wait for the peer's ready signal. Returns the peer's ready
-    ///        bit, collapsing cancel/no-signal into `false`. Callers that
-    ///        need to distinguish "peer said not-ready" from "wait was
-    ///        cancelled" must use `recvReadySignalWithStatus`.
     bool recvReadySignal(DataContext const& ctx) const;
-    /// @brief Tri-state variant of `recvReadySignal`. Returns the peer's
-    ///        ready bit when a signal arrived, or `std::nullopt` if the
-    ///        wait unwound without a notification (e.g. the per-request
-    ///        cancel flag flipped before the peer sent ready). Callers
-    ///        treat `std::nullopt` as "transport quiescence is unknown"
-    ///        and must fail closed (poison receive buffers, etc.).
-    std::optional<bool> recvReadySignalWithStatus(DataContext const& ctx) const;
 
     void activateBuffer(uint8_t kind) const override;
     [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const override;
@@ -337,11 +320,11 @@ public:
     [[nodiscard]] std::string const& getAgentName() const;
 
     template <typename NotificationType>
-    [[nodiscard]] bool waitForNotification(
+    void waitForNotification(
         std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag);
-    [[nodiscard]] bool waitForSyncInfo(
+    void waitForSyncInfo(
         std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag);
-    [[nodiscard]] bool waitForReadySignal(
+    void waitForReadySignal(
         std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] bool isRunning() const override;
 

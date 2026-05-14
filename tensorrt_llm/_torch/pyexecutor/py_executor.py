@@ -3620,15 +3620,9 @@ class PyExecutor:
         """Common helper to check for and handle cache transfer errors."""
         error_requests = self._get_disagg_reqs_in_error_state()
         if error_requests:
-            poisoned_transfer_buffer = (
-                self.kv_cache_transceiver is not None
-                and self.kv_cache_transceiver.has_poisoned_transfer_buffer())
             self._handle_errors(
-                f"Error in kv cache transfer for {error_msg_prefix}" +
-                ("; unrecoverable poisoned transfer buffer requires process restart"
-                 if poisoned_transfer_buffer else ""),
-                requests=error_requests,
-                charge_budget=poisoned_transfer_buffer)
+                f"Error in kv cache transfer for {error_msg_prefix}",
+                requests=error_requests)
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):

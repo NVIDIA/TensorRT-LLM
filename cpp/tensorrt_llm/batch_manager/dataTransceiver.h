@@ -257,12 +257,9 @@ public:
 
     /// @brief Asynchronously respond to the request and send data.
     /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
-    /// should remain valid until future synchronization. Passed as shared_ptr
-    /// so the async worker keeps the LlmRequest alive past any Python-side
-    /// _terminate_request; see CacheTransceiver::mSenderFutures for the full
-    /// lifetime invariant.
+    /// should remain valid until future synchronization.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
@@ -317,12 +314,9 @@ public:
 
     /// @brief Asynchronously send a request to receive data.
     /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization. Passed as shared_ptr so the
-    /// async worker keeps the LlmRequest alive past any Python-side
-    /// _terminate_request; see CacheTransceiver::mSenderFutures for the full
-    /// lifetime invariant.
+    /// data for this request should remain intact only after future synchronization.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 

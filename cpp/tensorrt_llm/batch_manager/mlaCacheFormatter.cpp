@@ -30,7 +30,6 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -254,21 +253,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
-        // sendHolder.release() after the send loop returns. If the send
-        // loop exits through an exception while an AgentConnection (NIXL)
-        // is active, transport quiescence is unknown and the catch block
-        // below poisons the held slot instead of returning it to the pool;
-        // on the direct-UCX path (no AgentConnection) the holder's
-        // destructor falls back to release. The send-pool CV wait inside
-        // assignBufferIndexForSend observes the session's per-request
-        // cancel flag and throws on cancel (parity with the recv side).
-        auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
-        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(
-            sendCancelFlag, kBufferAcquireSliceMs, sendReqIdForLog);
-        BufferIndexHolder sendHolder(
-            *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
+        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -352,62 +337,50 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             session.appendMeasure(startTime, endTime, outputSplitCaches.at(cacheIdx)->getSizeInBytes());
         };
 
-        try
+        if (pickUpConnections.size() > 1)
         {
-            if (pickUpConnections.size() > 1)
+            if (!common::getEnvEnableReceiveKVCacheParallel())
             {
-                if (!common::getEnvEnableReceiveKVCacheParallel())
+                TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
+                for (size_t i = 0; i < pickUpConnections.size(); i++)
                 {
-                    TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
-                    for (size_t i = 0; i < pickUpConnections.size(); i++)
-                    {
-                        sendBufferFun(deviceId, pickUpConnections[i]);
-                    }
-                }
-                else
-                {
-                    // concurrency num
-                    auto concurrencyNum
-                        = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
-
-                    auto remainSendNum = pickUpConnections.size();
-
-                    while (remainSendNum > 0)
-                    {
-                        auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
-                        std::vector<std::future<void>> futures;
-                        futures.reserve(sendConcurrencyNum);
-                        for (size_t i = 0; i < sendConcurrencyNum; i++)
-                        {
-                            size_t idx = i + (pickUpConnections.size() - remainSendNum);
-                            size_t connIdx = pickUpConnections[idx];
-                            TLLM_CHECK(idx < pickUpConnections.size());
-                            TLLM_CHECK(connIdx < session.getConnections().size());
-                            futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
-                        }
-                        for (auto& future : futures)
-                        {
-                            future.get();
-                        }
-                        remainSendNum -= sendConcurrencyNum;
-                    }
+                    sendBufferFun(deviceId, pickUpConnections[i]);
                 }
             }
             else
             {
-                sendBufferFun(deviceId, pickUpConnections[0]);
+                // concurrency num
+                auto concurrencyNum
+                    = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
+
+                auto remainSendNum = pickUpConnections.size();
+
+                while (remainSendNum > 0)
+                {
+                    auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
+                    std::vector<std::future<void>> futures;
+                    futures.reserve(sendConcurrencyNum);
+                    for (size_t i = 0; i < sendConcurrencyNum; i++)
+                    {
+                        size_t idx = i + (pickUpConnections.size() - remainSendNum);
+                        size_t connIdx = pickUpConnections[idx];
+                        TLLM_CHECK(idx < pickUpConnections.size());
+                        TLLM_CHECK(connIdx < session.getConnections().size());
+                        futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
+                    }
+                    for (auto& future : futures)
+                    {
+                        future.get();
+                    }
+                    remainSendNum -= sendConcurrencyNum;
+                }
             }
         }
-        catch (...)
+        else
         {
-            if (agentConnection != nullptr)
-            {
-                sendHolder.poison();
-            }
-            throw;
+            sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        // Atomic happy-path release — silent free + disarm in one noexcept call.
-        sendHolder.release();
+        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
