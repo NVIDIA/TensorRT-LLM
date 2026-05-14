@@ -1,13 +1,7 @@
 import argparse
 import os
 import sys
-
-# defusedxml hardens the standard library's ElementTree against XXE and
-# billion-laughs-style entity expansion attacks. The JUnit XML files we parse
-# come from Artifactory and are produced by trusted pipelines, but defending
-# at the parser layer is cheap and protects us if an attacker ever gains
-# write access to the artifact store.
-import defusedxml.ElementTree as ET
+import xml.etree.ElementTree as ET
 
 
 def parse_name(classname, name, filename):

@@ -32,9 +32,6 @@ pytest-rerunfailures
 ruff==0.9.4
 lm_eval[api]==0.4.10
 docstring_parser
-# Hardened XML parser for JUnit results processed by jenkins/scripts/test_rerun.py.
-# CI-only -- not a runtime dep of the TRT-LLM package.
-defusedxml
 genai-perf==0.0.13
 opentelemetry-sdk>=1.26.0
 opentelemetry-api>=1.26.0
