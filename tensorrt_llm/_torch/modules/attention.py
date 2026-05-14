@@ -2195,7 +2195,7 @@ class MLA(nn.Module):
         # with q_b_proj + q_b_layernorm. The indexer is launched on a
         # dedicated stream and still uses a different aux stream for its
         # internal q-proj/weights-proj split.
-        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "0")
+        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1")
                              == "1" and self.compressor is not None
                              and self.aux_stream is not None)
 
