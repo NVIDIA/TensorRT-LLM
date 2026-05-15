@@ -1983,7 +1983,9 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
-        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
+        cache_tiers: List[CacheTierConfig] = [
+            GpuCacheTierConfig(quota=int(quota))
+        ]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
             host_quota = kv_cache_config.host_cache_size
         else:
@@ -2005,7 +2007,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if host_quota <= 0:
                 host_quota = quota
         if host_quota > 0:
-            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
+            cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
@@ -3050,7 +3052,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.context_remaining_length == 0:
                     kv_cache.stop_committing()
             else:
-                success = kv_cache.resize(None, req.context_current_position)
+                success = kv_cache.resize(kv_cache.capacity,
+                                          req.context_current_position)
                 if not success:
                     raise ValueError(
                         f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
@@ -3099,7 +3102,7 @@ class KVCacheManagerV2(BaseResourceManager):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         kv_cache = self.impl.create_kv_cache(lora_task_id,
                                              input_tokens,
-                                             cache_salt_id=cache_salt_id)
+                                             id=cache_salt_id)
         self.kv_cache_map[request_id] = kv_cache
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):
