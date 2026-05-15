@@ -459,11 +459,8 @@ class MetricsCollector:
             labelnames=self.labels.keys())
         self.histogram_prefill_batch_tokens = Histogram(
             name=self.metric_prefix + "prefill_batch_tokens",
-            documentation=
-            "Histogram of total context tokens per iteration.",
-            buckets=[
-                64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
-            ],
+            documentation="Histogram of total context tokens per iteration.",
+            buckets=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
             labelnames=self.labels.keys())
 
         # HTTP error counter

@@ -4410,15 +4410,14 @@ class PyExecutor:
             request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
-            py_num_accepted = getattr(request,
-                                      'py_num_accepted_draft_tokens', 0)
+            py_num_accepted = getattr(request, 'py_num_accepted_draft_tokens',
+                                      0)
             draft_len = get_draft_token_length(request)
             if draft_len > 0:
-                for pos in range(
-                        min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
+                for pos in range(min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
                     request.py_per_pos_drafted[pos] += 1
-                for pos in range(
-                        min(py_num_accepted, MAX_SPEC_DECODE_POSITIONS)):
+                for pos in range(min(py_num_accepted,
+                                     MAX_SPEC_DECODE_POSITIONS)):
                     request.py_per_pos_accepted[pos] += 1
 
             self.perf_manager.append_step_metrics(

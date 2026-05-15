@@ -930,9 +930,9 @@ class TestPromptCacheMetrics:
         }
         collector.log_request_metrics_dict(metrics)
         assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 1
-        assert _get_histogram_sum(
-            collector, "histogram_tokens_cached_prompt"
-        ) == pytest.approx(256.0)
+        assert _get_histogram_sum(collector, "histogram_tokens_cached_prompt") == pytest.approx(
+            256.0
+        )
 
     def test_zero_cached_tokens_histogram_but_not_counter(self, collector):
         """Zero cache hits must reach the histogram (cache-miss bucket) without bumping the counter."""
@@ -943,9 +943,7 @@ class TestPromptCacheMetrics:
         collector.log_request_metrics_dict(metrics)
         assert _get_counter_value(collector, "counter_tokens_cached_prompt") == 0
         assert _get_histogram_count(collector, "histogram_tokens_cached_prompt") == 1
-        assert _get_histogram_sum(
-            collector, "histogram_tokens_cached_prompt"
-        ) == pytest.approx(0.0)
+        assert _get_histogram_sum(collector, "histogram_tokens_cached_prompt") == pytest.approx(0.0)
 
     def test_cached_tokens_accumulate(self, collector):
         metrics = {
@@ -1028,12 +1026,12 @@ class TestPerPositionSpecDecodeMetrics:
         }
         collector.log_request_metrics_dict(metrics)
         labels0 = {**collector.labels, "token_position": "0"}
-        assert _counter_value_with_labels(
-            collector.counter_tokens_drafted_per_position, labels0
-        ) == 10
-        assert _counter_value_with_labels(
-            collector.counter_tokens_accepted_per_position, labels0
-        ) == 7
+        assert (
+            _counter_value_with_labels(collector.counter_tokens_drafted_per_position, labels0) == 10
+        )
+        assert (
+            _counter_value_with_labels(collector.counter_tokens_accepted_per_position, labels0) == 7
+        )
 
     def test_absent_arrays_no_error(self, collector):
         metrics = {MetricsCollector.labelname_finish_reason: "end_id"}
@@ -1066,9 +1064,7 @@ class TestPerplexityHistograms:
         }
         collector.log_request_metrics_dict(metrics)
         assert _get_histogram_count(collector, "histogram_prefill_perplexity") == 1
-        assert _get_histogram_sum(
-            collector, "histogram_prefill_perplexity"
-        ) == pytest.approx(5.5)
+        assert _get_histogram_sum(collector, "histogram_prefill_perplexity") == pytest.approx(5.5)
 
     def test_generation_perplexity_observed(self, collector):
         metrics = {
@@ -1077,9 +1073,9 @@ class TestPerplexityHistograms:
         }
         collector.log_request_metrics_dict(metrics)
         assert _get_histogram_count(collector, "histogram_generation_perplexity") == 1
-        assert _get_histogram_sum(
-            collector, "histogram_generation_perplexity"
-        ) == pytest.approx(12.3)
+        assert _get_histogram_sum(collector, "histogram_generation_perplexity") == pytest.approx(
+            12.3
+        )
 
     def test_perplexity_absent_no_observation(self, collector):
         metrics = {
@@ -1092,7 +1088,7 @@ class TestPerplexityHistograms:
 
     @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
     def test_non_finite_perplexity_dropped(self, collector, value):
-        """inf / -inf / NaN values must be filtered out by math.isfinite guard."""
+        """Non-finite values (inf / -inf / NaN) must be filtered out by math.isfinite guard."""
         metrics = {
             MetricsCollector.labelname_finish_reason: "end_id",
             MetricNames.PREFILL_PERPLEXITY: value,
@@ -1118,17 +1114,15 @@ class TestPrefillBatchOccupancy:
     def test_occupancy_computed(self, collector):
         # numContextRequests=2 / maxNumActiveRequests=10 = 0.2
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
-        assert _get_gauge_value(
-            collector, "gauge_prefill_batch_occupancy"
-        ) == pytest.approx(0.2)
+        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == pytest.approx(0.2)
 
     def test_prefill_batch_tokens_histogram(self, collector):
         # numCtxTokens=256 observed once
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
         assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 1
-        assert _get_histogram_sum(
-            collector, "histogram_prefill_batch_tokens"
-        ) == pytest.approx(256.0)
+        assert _get_histogram_sum(collector, "histogram_prefill_batch_tokens") == pytest.approx(
+            256.0
+        )
 
     def test_zero_ctx_tokens_no_histogram_observation(self, collector):
         stats = {
@@ -1149,7 +1143,7 @@ class TestPrefillBatchOccupancy:
         assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == 0
 
     def test_occupancy_full(self, collector):
-        """numContextRequests == maxNumActiveRequests → occupancy = 1.0."""
+        """When numContextRequests == maxNumActiveRequests, occupancy = 1.0."""
         stats = {
             **SAMPLE_ITERATION_STATS,
             "maxNumActiveRequests": 4,
@@ -1159,15 +1153,11 @@ class TestPrefillBatchOccupancy:
             },
         }
         collector.log_iteration_stats(stats)
-        assert _get_gauge_value(
-            collector, "gauge_prefill_batch_occupancy"
-        ) == pytest.approx(1.0)
+        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == pytest.approx(1.0)
 
     def test_missing_ifb_stats_no_error(self, collector):
         """No inflightBatchingStats → no histogram observation and no gauge update."""
-        stats = {
-            k: v for k, v in SAMPLE_ITERATION_STATS.items() if k != "inflightBatchingStats"
-        }
+        stats = {k: v for k, v in SAMPLE_ITERATION_STATS.items() if k != "inflightBatchingStats"}
         collector.log_iteration_stats(stats)
         assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 0
 
@@ -1186,12 +1176,8 @@ class TestRequestErrorCounter:
         collector.log_request_error(http_code=500)
         labels_400 = {**collector.labels, "http_code": "400"}
         labels_500 = {**collector.labels, "http_code": "500"}
-        assert _counter_value_with_labels(
-            collector.counter_request_error, labels_400
-        ) == 2
-        assert _counter_value_with_labels(
-            collector.counter_request_error, labels_500
-        ) == 1
+        assert _counter_value_with_labels(collector.counter_request_error, labels_400) == 2
+        assert _counter_value_with_labels(collector.counter_request_error, labels_500) == 1
 
     def test_error_counter_accepts_string_code(self, collector):
         """log_request_error stringifies the code, so int and str arguments produce the same series."""

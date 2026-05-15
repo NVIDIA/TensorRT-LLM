@@ -490,8 +490,8 @@ class GenerationResultBase:
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
             self.per_pos_drafted = getattr(response_result, 'per_pos_drafted',
                                            None)
-            self.per_pos_accepted = getattr(response_result,
-                                            'per_pos_accepted', None)
+            self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
+                                            None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
@@ -668,15 +668,14 @@ class GenerationResultBase:
         if output.finish_reason and num_gen_tokens > 0:
             gen_ppl = None
             if output.cumulative_logprob is not None:
-                gen_ppl = math.exp(
-                    -output.cumulative_logprob / num_gen_tokens)
+                gen_ppl = math.exp(-output.cumulative_logprob / num_gen_tokens)
             elif output.logprobs:
                 try:
                     gen_lps = []
                     for i, entry in enumerate(output.logprobs):
                         if isinstance(entry, dict):
-                            token_id = output.token_ids[
-                                i] if i < len(output.token_ids) else None
+                            token_id = output.token_ids[i] if i < len(
+                                output.token_ids) else None
                             if token_id is not None and token_id in entry:
                                 lp_obj = entry[token_id]
                                 lp = lp_obj.logprob if hasattr(

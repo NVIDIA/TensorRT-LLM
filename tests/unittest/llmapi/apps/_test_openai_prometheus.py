@@ -215,7 +215,8 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
     assert METRIC_PREFIX + "kv_cache_iter_reuse_rate" in data
 
 
-def _wait_for_metric_line(server: RemoteOpenAIServer, line_prefix: str,
+def _wait_for_metric_line(server: RemoteOpenAIServer,
+                          line_prefix: str,
                           timeout: float = 10.0,
                           poll_interval: float = 0.5) -> str:
     """Poll /prometheus/metrics until a line starting with ``line_prefix`` appears.
@@ -281,8 +282,9 @@ def test_new_metrics_exposed(server: RemoteOpenAIServer):
 
     # Wait for the background iteration stats loop to populate prefill_batch_*.
     # Looking for the histogram count line so we know an iteration scrape happened.
-    data = _wait_for_metric_line(
-        server, METRIC_PREFIX + "prefill_batch_tokens_count", timeout=15.0)
+    data = _wait_for_metric_line(server,
+                                 METRIC_PREFIX + "prefill_batch_tokens_count",
+                                 timeout=15.0)
 
     # Per-request metrics added by this PR
     assert METRIC_PREFIX + "prompt_cached_tokens_total" in data, \
@@ -299,8 +301,7 @@ def test_new_metrics_exposed(server: RemoteOpenAIServer):
     # Request-error counter (HTTP 400 series should exist after the bogus request)
     error_total_400 = re.search(
         r'^' + re.escape(METRIC_PREFIX + "request_error_total") +
-        r'\{[^}]*http_code="400"[^}]*\}\s+(\S+)',
-        data, re.MULTILINE)
+        r'\{[^}]*http_code="400"[^}]*\}\s+(\S+)', data, re.MULTILINE)
     assert error_total_400 is not None, \
         f"missing {METRIC_PREFIX}request_error_total{{http_code=\"400\"}} in metrics"
     assert float(error_total_400.group(1)) >= 1.0, \
