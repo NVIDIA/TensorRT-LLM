@@ -48,6 +48,8 @@ from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from tensorrt_llm.plugin import PluginConfig
 
+from utils.util import force_ampere
+
 from .test_llm import llama_model_path
 
 
@@ -381,8 +383,9 @@ def test_SleepConfig_restore_modes_normalized_from_defaultdict():
         ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
 
 
+@force_ampere
 def test_SleepConfig_is_picklable():
-    """SleepConfig must survive a pickle round-trip.
+    """SleepConfig with default construction must survive a pickle round-trip.
 
     MPI worker initialisation serialises llm_args (including SleepConfig) via
     pickle to distribute configuration to each rank.  The defaultdict inside
@@ -391,7 +394,6 @@ def test_SleepConfig_is_picklable():
     """
     import pickle
 
-    # Default construction
     cfg_default = SleepConfig()
     rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
     assert rt.restore_modes == cfg_default.restore_modes
@@ -400,7 +402,12 @@ def test_SleepConfig_is_picklable():
     missing_key = ExecutorMemoryType.SAMPLER
     assert isinstance(rt.restore_modes[missing_key], RestoreMode)
 
-    # Construction with explicit per-key overrides
+
+@force_ampere
+def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
+    """SleepConfig with explicit per-key overrides must survive a pickle round-trip."""
+    import pickle
+
     cfg_custom = SleepConfig(
         restore_modes={
             ExecutorMemoryType.KV_CACHE.value: "NONE",

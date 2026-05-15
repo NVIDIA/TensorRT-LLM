@@ -96,7 +96,8 @@ class TestBaseWorkerSleepGuards:
     def test_multirank_raises(self, method):
         """world_size > 1 must raise before control_action() is entered."""
         w = _make_worker(world_size=2)
-        with pytest.raises(NotImplementedError, match="model_world_size == 1"):
+        with pytest.raises(NotImplementedError,
+                           match="parallel_config.world_size == 1"):
             getattr(w, method)(["kv_cache"])
 
     def test_backend_checked_before_sleep_config(self, method):

@@ -18,6 +18,7 @@ from typing import List, Optional, Union
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.utils import logger_debug, print_colored
+from .proxy import _check_collective_rpc_guard
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
@@ -225,14 +226,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             NotImplementedError: If ``model_world_size > 1``, or if
                 ``unique_reply_rank`` or ``target_ranks`` are provided.
         """
-        if self.model_world_size > 1:
-            raise NotImplementedError(
-                "MPI collective_rpc only supports model_world_size == 1; "
-                "use the Ray executor for multi-rank deployments.")
-        if unique_reply_rank is not None or target_ranks is not None:
-            raise NotImplementedError(
-                "unique_reply_rank and target_ranks are not supported; "
-                "this shim only reaches rank-0.")
+        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
+                                    target_ranks)
         kwargs = kwargs or {}
         remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
         if non_block:

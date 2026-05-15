@@ -683,6 +683,37 @@ class BaseWorker(GenerationExecutor):
 
         return result
 
+    def _check_sleep_wakeup_preconditions(self, method: str) -> None:
+        """Validate preconditions shared by sleep() and wakeup().
+
+        Args:
+            method: Name of the calling method (``"sleep"`` or ``"wakeup"``)
+                used in error messages.
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+            NotImplementedError: If ``parallel_config.world_size > 1``.
+        """
+        # _autodeploy is intentionally excluded: its allocations are not tagged
+        # under sleep_config VMM scopes, so release_with_tag would silently
+        # no-op instead of actually freeing GPU memory.  Use _backend directly
+        # rather than _is_pytorch_backend, which also covers _autodeploy.
+        if self._backend != "pytorch":
+            raise ValueError(
+                f"{method}() is only available for the PyTorch (TorchLLM) "
+                "backend.")
+        if self.llm_args is None or self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in "
+                "the LLM arguments.")
+        # Non-rank-0 processes block on their local control_action_done
+        # threading.Event with no Python caller to release it — deadlock.
+        if self.llm_args.parallel_config.world_size > 1:
+            raise NotImplementedError(
+                f"{method}() requires parallel_config.world_size == 1; "
+                "use the Ray executor for multi-rank deployments.")
+
     def sleep(self, sleep_tags: List[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
@@ -712,23 +743,7 @@ class BaseWorker(GenerationExecutor):
                 ``sleep_config`` is not set.
             NotImplementedError: If ``parallel_config.world_size > 1``.
         """
-        # _autodeploy is intentionally excluded: its allocations are not tagged
-        # under sleep_config VMM scopes, so release_with_tag would silently
-        # no-op instead of actually freeing GPU memory.  Use _backend directly
-        # rather than _is_pytorch_backend, which also covers _autodeploy.
-        if self._backend != "pytorch":
-            raise ValueError(
-                "sleep() is only available for the PyTorch (TorchLLM) backend.")
-        if self.llm_args is None or self.llm_args.sleep_config is None:
-            raise ValueError(
-                "Sleep feature is not enabled, please set sleep_config in "
-                "the LLM arguments.")
-        # Non-rank-0 processes block on their local control_action_done
-        # threading.Event with no Python caller to release it — deadlock.
-        if self.llm_args.parallel_config.world_size > 1:
-            raise NotImplementedError(
-                "sleep() requires model_world_size == 1; "
-                "use the Ray executor for multi-rank deployments.")
+        self._check_sleep_wakeup_preconditions("sleep")
 
         from tensorrt_llm._torch.virtual_memory import release_with_tag
 
@@ -738,8 +753,8 @@ class BaseWorker(GenerationExecutor):
             torch.cuda.synchronize()
             release_with_tag(*tags)
             torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def wakeup(self, wakeup_tags: List[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
@@ -762,19 +777,7 @@ class BaseWorker(GenerationExecutor):
                 ``sleep_config`` is not set.
             NotImplementedError: If ``parallel_config.world_size > 1``.
         """
-        # See sleep() for the reasoning behind the _backend != "pytorch" guard
-        if self._backend != "pytorch":
-            raise ValueError(
-                "wakeup() is only available for the PyTorch (TorchLLM) backend."
-            )
-        if self.llm_args is None or self.llm_args.sleep_config is None:
-            raise ValueError(
-                "Sleep feature is not enabled, please set sleep_config in "
-                "the LLM arguments.")
-        if self.llm_args.parallel_config.world_size > 1:
-            raise NotImplementedError(
-                "wakeup() requires model_world_size == 1; "
-                "use the Ray executor for multi-rank deployments.")
+        self._check_sleep_wakeup_preconditions("wakeup")
 
         from tensorrt_llm._torch.virtual_memory import materialize_with_tag
 
