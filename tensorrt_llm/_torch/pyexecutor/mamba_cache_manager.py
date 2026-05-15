@@ -60,7 +60,32 @@ def use_cpp_mamba_cache_manager() -> bool:
     Returns True if TRTLLM_USE_CPP_MAMBA='1' is set, False otherwise.
     By default, PythonMambaCacheManager is used.
     """
-    return os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    cpp = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    py = os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
+    if cpp and py:
+        raise ValueError(
+            "TRTLLM_USE_CPP_MAMBA=1 and TRTLLM_USE_PY_MAMBA=1 are mutually "
+            "exclusive; unset one of them.")
+    return cpp
+
+
+def use_py_mamba_cache_manager() -> bool:
+    """Check if PythonMambaCacheManager should be forced (agg mode override).
+
+    Returns True if TRTLLM_USE_PY_MAMBA='1' is set, False otherwise.
+
+    Agg-mode-only override: forces the V1-route MixedMambaHybridCacheManager
+    with PythonMambaCacheManager inside instead of the default unified-pool
+    CppMambaHybridCacheManager. Disagg mode is unaffected — it already picks
+    PythonMambaCacheManager when transceiver_runtime='PYTHON'.
+    """
+    cpp = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    py = os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
+    if cpp and py:
+        raise ValueError(
+            "TRTLLM_USE_CPP_MAMBA=1 and TRTLLM_USE_PY_MAMBA=1 are mutually "
+            "exclusive; unset one of them.")
+    return py
 
 
 class BaseMambaCacheManager(ABC):
