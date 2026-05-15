@@ -1774,8 +1774,7 @@ def test_llm_context_only_timed_out(transceiver_runtime):
             break
         time.sleep(1)
     else:
-        pytest.fail(
-            f"KV cache blocks not released after {max_retries} retries")
+        pytest.fail(f"KV cache blocks not released after {max_retries} retries")
     results = all_results
 
     final_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
