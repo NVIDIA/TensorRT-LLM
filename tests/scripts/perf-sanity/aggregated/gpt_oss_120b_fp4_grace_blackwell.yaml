@@ -26,6 +26,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
+      use_kv_cache_manager_v2: true
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -57,6 +58,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
+      use_kv_cache_manager_v2: true
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -86,6 +88,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
+      use_kv_cache_manager_v2: true
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -115,6 +118,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
+      use_kv_cache_manager_v2: true
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -144,6 +148,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
+      use_kv_cache_manager_v2: true
     speculative_config:
       decoding_type: 'Eagle'
       eagle3_layers_to_capture: [-1]
@@ -179,6 +184,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
+      use_kv_cache_manager_v2: true
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -209,6 +215,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
+      use_kv_cache_manager_v2: true
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -239,6 +246,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
+      use_kv_cache_manager_v2: true
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
