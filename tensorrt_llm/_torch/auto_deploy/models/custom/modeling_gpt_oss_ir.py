@@ -50,6 +50,8 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from tensorrt_llm._utils import get_hf_rope_theta
+
 from ... import custom_ops  # noqa: F401 -- ensure all custom ops are registered
 from ..hf import AutoModelForCausalLMFactory
 
@@ -475,7 +477,9 @@ class GptOssModel(GptOssPreTrainedModel):
         self.rotary_emb = GptOssRotaryEmbedding(
             head_dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            rope_theta=float(getattr(config, "rope_theta", 10000.0)),
+            # FIX: transformers 5.x moved rope_theta to config.rope_scaling['rope_theta'].
+            # Use get_hf_rope_theta() helper (same as PT modeling).
+            rope_theta=get_hf_rope_theta(config, 10000.0),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
 
