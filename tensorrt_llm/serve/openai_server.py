@@ -227,6 +227,14 @@ class OpenAIServer(_VideoRoutesMixin):
         # Energy monitoring
         self.energy_monitor = None
 
+        # Strong references to fire-and-forget disconnect-watcher tasks.
+        # asyncio's event loop only keeps weak refs to tasks, so a task that
+        # isn't held elsewhere can be GC'd mid-execution and its closure
+        # (raw_request, promise) released abruptly.  See cpython issues
+        # gh-91887, gh-128627.  We keep the task in a set and discard via
+        # done callback so memory does not creep over long-running serves.
+        self._disconnect_watcher_tasks: set[asyncio.Task] = set()
+
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
@@ -527,6 +535,15 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(
                 f"{raw_request.client} is disconnected, abort {promise.request_id}"
             )
+
+    def _spawn_disconnect_watcher(self, raw_request: Request,
+                                  promise) -> asyncio.Task:
+        # Strong-ref the task so the event loop's weak set cannot drop it,
+        # and remove it on completion so the set does not grow unbounded.
+        task = asyncio.create_task(self.await_disconnected(raw_request, promise))
+        self._disconnect_watcher_tasks.add(task)
+        task.add_done_callback(self._disconnect_watcher_tasks.discard)
+        return task
 
     @property
     def postproc_worker_enabled(self) -> bool:
@@ -1233,7 +1250,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 trace_headers=trace_headers,
                 scheduling_params=scheduling_params,
             )
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._spawn_disconnect_watcher(raw_request, promise)
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -1343,7 +1360,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt["multi_modal_data"] = mm_data
 
             promise = self.generator.generate_async(inputs=prompt, )
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._spawn_disconnect_watcher(raw_request, promise)
 
             response = await create_mm_embedding_response(promise)
             return JSONResponse(content=response.model_dump())
@@ -1519,8 +1536,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
                     trace_headers=trace_headers)
-                asyncio.create_task(
-                    self.await_disconnected(raw_request, promise))
+                self._spawn_disconnect_watcher(raw_request, promise)
                 if not self.postproc_worker_enabled:
                     postproc_args.tokenizer = self.tokenizer
                     postproc_args.num_prompt_tokens = len(
@@ -1643,7 +1659,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             # Disconnect cancellation
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._spawn_disconnect_watcher(raw_request, promise)
 
             # Handle streaming
             if request.stream:
@@ -1779,7 +1795,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.warning(
                     "Postproc workers are enabled, request will not be stored!")
 
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
+            self._spawn_disconnect_watcher(raw_request, promise)
 
             if request.stream:
                 return StreamingResponse(content=create_streaming_generator(
