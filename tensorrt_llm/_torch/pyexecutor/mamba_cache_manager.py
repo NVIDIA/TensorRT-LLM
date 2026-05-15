@@ -1000,6 +1000,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         layer_mask: Optional[
             List[bool]] = None,  # this is the full attention layer mask
         is_estimating_kv_cache: bool = False,
+        is_draft: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -1059,6 +1060,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 spec_config=spec_config,
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
+                is_draft=is_draft,
             )
             return
 
@@ -1147,6 +1149,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
+            is_draft=is_draft,
             linear_attention_metadata=self.linear_attention_metadata,
         )
 
@@ -1300,9 +1303,17 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.requests = scheduled_batch.context_requests + \
             scheduled_batch.generation_requests
+        # Issue all async block onboards; defer the syncTransfers() (refresh_blocks)
+        # until just before forward so the CPU-side prep (attn metadata, input
+        # tensor assembly, draft model prep, etc.) can overlap with the in-flight
+        # cudaMemcpyAsync calls instead of being serialized behind them.
+        # copy_linear_attention_block returns True iff it actually issued a copy;
+        # we skip refresh_blocks entirely when nothing was scheduled.
+        copied_any = False
         for req in self.requests:
-            self.impl.copy_linear_attention_block(req)
-        self.impl.refresh_blocks()
+            if self.impl.copy_linear_attention_block(req):
+                copied_any = True
+        self._pending_state_transfers = copied_any
         self._setup_state_indices()
         # Reset replay double-buffer state for fresh context blocks. A reused
         # block (prefix-cache hit or block recycled across requests) may carry
@@ -1321,6 +1332,16 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self.local_num_mamba_layers == 0:
             return
         self._prepare_resources(scheduled_batch)
+
+    @nvtx_range("hybrid_flush_state_transfers")
+    def flush_state_transfers(self) -> None:
+        """Complete any deferred state-block onboards scheduled by
+        prepare_resources(). Must be called before forward() reads recurrent
+        state blocks. Cheap no-op when nothing was scheduled.
+        """
+        if getattr(self, "_pending_state_transfers", False):
+            self.impl.refresh_blocks()
+            self._pending_state_transfers = False
 
     def is_speculative(self) -> bool:
         return self.spec_config is not None

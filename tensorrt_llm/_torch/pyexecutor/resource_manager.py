@@ -336,6 +336,7 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        self.spec_config = spec_config
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
             mapping,
@@ -1555,10 +1556,15 @@ class KVCacheManager(BaseResourceManager):
         # Recurrent state slot count: live state per concurrent request, with
         # extra room for one regular snapshot per snapshot interval over the
         # full token budget when block reuse is enabled.
-        max_snapshots = self.max_batch_size
+        # +1 is for cuda graph padding
+        max_snapshots = self.max_batch_size + 1
+        if self.spec_config is not None:
+            # cuda graph has different request ids for different draft len (CUDAGraphRunner::_get_padded_batch)
+            # TODO: we can use a same slot for all these
+            max_snapshots += self.spec_config.max_draft_len
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            max_snapshots = max_tokens // interval
+            max_snapshots = max(max_tokens // interval, max_snapshots)
 
         secondary_snapshots = int(max_snapshots *
                                   (self._secondary_pool_memory_bytes /
