@@ -665,6 +665,12 @@ _CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL = 10
 _CUPTI_ACTIVITY_ATTR_ZEROED_OUT_ACTIVITY_BUFFER = 5
 _CUPTI_HOST_BUFFER_BYTES = 1024 * 1024
 _CUPTI_HOST_BUFFER_COUNT = 16
+
+# Multiprocessing start method for compile-warmup + CUPTI parser children.
+# Set in __main__ from --mp-start-method.  "spawn" (default) is robust; each
+# child re-imports torch/triton/etc (~15s).  "forkserver" preloads once and
+# forks cheaply (~1s/child) — see __main__ block for the preload setup.
+_MP_START_METHOD = "spawn"
 _DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE = 1
 _DEFAULT_CUDA_GRAPH_GROUP_ITERS_MIX = 4
 
@@ -947,7 +953,7 @@ class CuptiKernelTimer:
         self._last_start_timing: dict[str, float] = {}
         self._last_stop_timing: dict[str, float] = {}
         self._current_flush_period_ms = 0
-        self._mp_ctx = mp.get_context("spawn")
+        self._mp_ctx = mp.get_context(_MP_START_METHOD)
         # Retry parser-process spawn: concurrent bench instances on the same
         # node race on POSIX named semaphores in /dev/shm — child can die in
         # pickle.load with FileNotFoundError in SemLock._rebuild before
@@ -2273,10 +2279,10 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
           f"({n_outer_used} outer × {n_groups} cell-groups "
           f"covering {n_total_cells} cells, CPS-grouped"
           + (", per-cell outer" if cell_set else "")
-          + f") across {max_workers} processes (ProcessPoolExecutor, spawn start)")
+          + f") across {max_workers} processes (ProcessPoolExecutor, {_MP_START_METHOD} start)")
     t0 = time.perf_counter()
 
-    ctx = multiprocessing.get_context("spawn")
+    ctx = multiprocessing.get_context(_MP_START_METHOD)
     errors = []
     _cw("about to create ProcessPoolExecutor")
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
@@ -4218,6 +4224,19 @@ def _parse_args() -> argparse.Namespace:
         "the sequential timed phase.  0 disables the phase.  Default 64.",
     )
     parser.add_argument(
+        "--mp-start-method",
+        choices=("spawn", "forkserver"),
+        default="spawn",
+        help="multiprocessing start method for compile-warmup workers AND "
+        "the CUPTI parser child process.  'spawn' (default) is robust but "
+        "each child re-imports the bench module (~15s torch+triton import "
+        "cost).  'forkserver' starts a server once, preloads the bench "
+        "module ONCE, then forks children cheaply (~1s each).  When 4 "
+        "benches run concurrently with --compile-threads 26 each, spawn "
+        "still incurs 4*26=104 imports per round; forkserver cuts this to "
+        "4 (one per server).",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Wrap timed region in cudaProfilerStart/Stop (for ncu --target-processes all)",
@@ -4859,6 +4878,24 @@ class _Tee:
 
 if __name__ == "__main__":
     _args = _parse_args()
+
+    # Configure multiprocessing start method early — must be before any
+    # mp.get_context() that uses the chosen method.  For forkserver, also
+    # add this file's dir to sys.path so the forkserver can import this
+    # module by basename for preload (otherwise it tries to import
+    # __main__, which is a different beast across processes).
+    if _args.mp_start_method == "forkserver":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        mp.set_start_method("forkserver", force=True)
+        try:
+            mp.set_forkserver_preload([
+                "benchmark_replay_selective_state_update",
+            ])
+        except Exception as _e:
+            print(f"[warn] set_forkserver_preload failed: {_e!r}; "
+                  f"forks will still work but pay full import cost",
+                  file=sys.stderr)
+    _MP_START_METHOD = _args.mp_start_method
 
     _out_path = None
     if _args.output != "-":
