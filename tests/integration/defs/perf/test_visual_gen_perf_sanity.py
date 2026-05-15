@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import subprocess
 import sys
@@ -177,6 +178,9 @@ class VisualGenPerfSanityTestConfig:
 
         self.config_file, self.select_pattern, self.upload_to_db = parse_test_case_name(
             test_case_name
+        )
+        self.upload_to_db = self.upload_to_db and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
         )
         self.raw_gpu_type, self.gpu_type = get_gpu_types()
         self.config_dir = get_config_dir()
@@ -513,9 +517,12 @@ class VisualGenPerfSanityTestConfig:
             "num_gpus",
             "request_throughput",
             "per_gpu_throughput",
-            "mean_e2e_latency_ms",
-            "median_e2e_latency_ms",
-            "percentiles_e2e_latency_ms",
+            "mean_latency",
+            "median_latency",
+            "percentiles_latency",
+            "mean_generation",
+            "median_generation",
+            "percentiles_generation",
         ]
         missing_keys = [key for key in required_keys if key not in result_data]
         if missing_keys:
@@ -547,12 +554,18 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
-        percentiles = result_data.get("percentiles_e2e_latency_ms", {})
-        for percentile in ("p90", "p99"):
-            if percentile not in percentiles:
-                raise ValueError(
-                    f"Missing {percentile} E2E latency in benchmark result {result_path}"
-                )
+        for metric_name in ("latency", "generation"):
+            percentiles = result_data.get(f"percentiles_{metric_name}", {})
+            for percentile in ("p90", "p99"):
+                if percentile not in percentiles:
+                    raise ValueError(
+                        f"Missing {percentile} {metric_name} in benchmark result {result_path}"
+                    )
+
+        for generation_metric in ("mean_generation", "median_generation"):
+            generation_value = float(result_data[generation_metric])
+            if not math.isfinite(generation_value) or generation_value <= 0:
+                raise ValueError(f"Invalid {generation_metric} in benchmark result {result_path}")
 
     def _load_benchmark_result(
         self,

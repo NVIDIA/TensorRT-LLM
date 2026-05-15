@@ -29,8 +29,13 @@ shared perf regression pipeline. It is responsible for:
 | List | Contents |
 |------|----------|
 | `MAXIMIZE_METRICS` | `d_request_throughput`, `d_per_gpu_throughput` |
-| `MINIMIZE_METRICS` | `d_mean_e2e_latency`, `d_median_e2e_latency`, `d_p90_e2e_latency`, `d_p99_e2e_latency` |
-| `REGRESSION_METRICS` | `d_mean_e2e_latency` |
+| `MINIMIZE_METRICS` | `d_mean_latency`, `d_median_latency`, `d_p90_latency`, `d_p99_latency`, `d_mean_generation`, `d_median_generation`, `d_p90_generation`, `d_p99_generation` |
+| `REGRESSION_METRICS` | `d_median_generation` |
+
+Latency and generation metrics are read from the VisualGen benchmark JSON in
+seconds. Latency includes media encoding and persistence overhead, while
+median generation tracks the typical engine-side generation time used for
+regression checks.
 
 ## Match Keys
 
