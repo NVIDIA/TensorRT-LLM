@@ -202,12 +202,26 @@ class TestExaone4_5(TestModelingMultimodal):
 
     def get_scenarios(self) -> List[TestExaone4_5Scenario]:
         scenarios: List[TestExaone4_5Scenario] = [
+            # ==== Modality sanity checks ====
             TestExaone4_5Scenario(
                 modality="image",
                 use_cuda_graph=False,
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
+            TestExaone4_5Scenario(
+                modality="video",
+                use_cuda_graph=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
+            TestExaone4_5Scenario(
+                modality="multiple_image",
+                use_cuda_graph=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
+            # ==== CUDA graph ====
             TestExaone4_5Scenario(
                 modality="image",
                 use_cuda_graph=True,
