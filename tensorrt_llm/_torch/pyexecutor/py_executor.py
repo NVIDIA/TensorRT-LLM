@@ -184,11 +184,6 @@ class PyExecutor:
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
-        # When using TRTLLMSampler, beam search logits processing is handled
-        # by the sampler with coherent per-beam token histories from parentIds
-        # tracing. Tell model_engine to skip its own beam search logits processing.
-        if isinstance(sampler, TRTLLMSampler):
-            model_engine.skip_beam_search_logits_processing = True
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
@@ -1891,6 +1886,51 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+            return
+
+        # Build coherent per-beam token histories for logits processors.
+        # request.get_tokens(beam) returns incoherent slot-accumulated
+        # histories after beam reassignment.  We trace parentIds from
+        # DecoderState to recover the true ancestral token path per beam.
+        # These are stored on the request and used by model_engine's
+        # _execute_logit_post_processors on the NEXT iteration.
+        if isinstance(self.sampler, TRTLLMSampler):
+            try:
+                decoder_state = self.sampler.store["decoder_state"]
+                # parentIds shape: [maxNumSequences, maxBeamWidth, maxSequenceLength]
+                parent_ids_gpu = decoder_state.parent_ids
+                for req in (sample_state.scheduled_requests.generation_requests
+                            if sample_state.scheduled_requests else []):
+                    bw = req.sampling_config.beam_width
+                    if bw <= 1 or req.py_seq_slot is None:
+                        continue
+                    slot = req.py_seq_slot
+                    prompt_len = req.py_orig_prompt_len
+                    tokens = [req.get_tokens(b) for b in range(bw)]
+                    num_gen = len(tokens[0]) - prompt_len
+                    if num_gen <= 1:
+                        # First step — no beam reassignment yet.
+                        continue
+                    # D2H copy of this slot's parentIds: [beamWidth, maxSeqLen]
+                    pid_host = parent_ids_gpu[slot, :bw, :].cpu()
+                    # Trace backward per beam to build coherent histories.
+                    coherent = []
+                    for b in range(bw):
+                        beam_gen = len(tokens[b]) - prompt_len
+                        slot_at_step = [0] * beam_gen
+                        s = b
+                        for g in range(beam_gen - 1, -1, -1):
+                            slot_at_step[g] = s
+                            if g > 0:
+                                s = int(pid_host[s, prompt_len + g].item())
+                        path = list(tokens[0][:prompt_len])  # shared prompt
+                        for g in range(beam_gen):
+                            path.append(tokens[slot_at_step[g]][prompt_len + g])
+                        coherent.append(path)
+                    req.py_coherent_beam_tokens = coherent
+            except Exception:
+                # Non-fatal: fall back to incoherent histories.
+                pass
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,

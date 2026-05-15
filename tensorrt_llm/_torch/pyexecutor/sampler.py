@@ -1988,54 +1988,6 @@ class TRTLLMSampler(Sampler):
     def get_cache_indirection(self) -> torch.Tensor | None:
         return self.store["decoder_state"].cache_indirection_output
 
-    def _apply_logits_post_processors_for_beams(
-        self,
-        decoder_input_buffers,
-    ) -> None:
-        """Apply per-request LogitsProcessor callbacks with beam-aware token histories.
-
-        For beam search (beam_width > 1), uses gatheredBeamTokensForCallback
-        (populated by build_gathered_beam_tokens_for_callback) to provide each
-        beam's coherent token path.  For beam_width == 1, falls back to the
-        request's regular token history.
-
-        Modifies decoder_input_buffers.logits in-place.
-        """
-        import inspect
-
-        gathered = decoder_input_buffers.gathered_beam_tokens_for_callback
-
-        for batch_idx, llm_req in enumerate(decoder_input_buffers.decoder_requests):
-            logits_processors = getattr(llm_req, "py_logits_post_processors", None)
-            if not logits_processors:
-                continue
-
-            # Pick coherent token histories: gathered (if available) or mTokens.
-            if batch_idx < len(gathered) and gathered[batch_idx] is not None:
-                tokens_for_callback = gathered[batch_idx]
-            else:
-                tokens_for_callback = llm_req.get_tokens()  # all beams
-
-            logits_tensor = decoder_input_buffers.logits[batch_idx]
-            # logits_tensor shape: [1, beamWidth, vocabSizePadded] on GPU
-            # The callback interface expects token_ids as List[List[int]]
-            # (one inner list per beam).
-            stream_ptr = None  # PyTorch backend doesn't use the stream param
-
-            for lp in logits_processors:
-                lp_params = inspect.signature(lp).parameters
-                assert 4 <= len(lp_params) <= 5, (
-                    "Logit post processor signature must match the LogitsProcessor "
-                    "interface defined in tensorrt_llm.sampling_params."
-                )
-                lp(
-                    llm_req.py_request_id,
-                    logits_tensor,
-                    tokens_for_callback,
-                    stream_ptr,
-                    getattr(llm_req, 'py_client_id', None),
-                )
-
     def _update_cache_indirection_buffer(self,
                                          scheduled_requests: ScheduledRequests):
         # Copy cache indirection output to input
@@ -2078,26 +2030,6 @@ class TRTLLMSampler(Sampler):
                 beam_width, num_context_logits_prefix_sum,
                 self.store["decoder_input_buffers"][self.micro_batch_idx],
                 self.store["decoder_state"], self.store["buffer_manager"])
-
-        # Build coherent per-beam token histories and apply logits post-processing.
-        # This replicates the TRT backend's decoderStepAsync sequence:
-        #   buildGatheredBeamTokensForCallback → LogitsPostProcessor
-        # so that per-request LogitsProcessor callbacks see correct per-beam
-        # token paths (not the slot-accumulated mTokens which are incoherent
-        # after beam reassignment).
-        decoder_input_buffers = self.store["decoder_input_buffers"][self.micro_batch_idx]
-        if beam_width > 1:
-            from tensorrt_llm.bindings.internal.algorithms import (
-                build_gathered_beam_tokens_for_callback,
-            )
-            build_gathered_beam_tokens_for_callback(
-                decoder_input_buffers,
-                self.store["decoder_state"],
-                self.store["buffer_manager"],
-            )
-
-        self._apply_logits_post_processors_for_beams(
-            decoder_input_buffers)
 
         self.algs.decoder.forward_async(
             self.store["decoder_state"],

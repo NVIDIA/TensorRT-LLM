@@ -149,9 +149,7 @@ class PyTorchModelEngine(ModelEngine):
     ):
         self.forward_pass_callable = None
         self.ub_buffers = None
-        # Set to True by PyExecutor when TRTLLMSampler handles beam search
-        # logits processing with coherent per-beam token histories.
-        self.skip_beam_search_logits_processing = False
+
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
@@ -2333,8 +2331,7 @@ class PyTorchModelEngine(ModelEngine):
                 self.forward_pass_callable()
 
             self._execute_logit_post_processors(
-                scheduled_requests, outputs,
-                skip_beam_search=self.skip_beam_search_logits_processing)
+                scheduled_requests, outputs)
 
             return outputs
 
@@ -2460,8 +2457,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
-                                       outputs: dict,
-                                       skip_beam_search: bool = False):
+                                       outputs: dict):
         """Apply logit post processors (in-place modify outputs Tensors) if any.
 
         For beam search (beam_width > 1), iterates over all beams for each
@@ -2469,15 +2465,9 @@ class PyTorchModelEngine(ModelEngine):
         The logits tensor has ``beam_width`` rows per generation request, laid
         out as ``[ctx_0, ..., gen_0_beam_0, gen_0_beam_1, ..., gen_1_beam_0, ...]``.
 
-        On 1.2.x, beam search requests are handled by TRTLLMSampler which
-        provides coherent per-beam token histories via C++ parentIds tracing
-        (buildGatheredBeamTokensForCallback).  The skip_beam_search flag
-        ensures those requests bypass this method entirely.
-
-        Args:
-            skip_beam_search: When True, skip requests with beam_width > 1.
-                These are handled by TRTLLMSampler._apply_logits_post_processors_for_beams
-                which provides coherent per-beam token histories via parentIds tracing.
+        On 1.2.x this must run BEFORE make_decoding_batch_input so the
+        decoder sees the modified logits (forward_async reads from
+        decoding_input, not decoder_input_buffers).
         """
 
         if not (self.mapping.is_last_pp_rank()):
@@ -2501,13 +2491,6 @@ class PyTorchModelEngine(ModelEngine):
             logits_processors = getattr(request, "py_logits_post_processors",
                                         None)
             if not logits_processors:
-                logit_row += beam_width
-                continue
-
-            # When using TRTLLMSampler with beam search, skip beam search
-            # requests here — they are handled by the sampler with coherent
-            # per-beam token histories from parentIds tracing.
-            if skip_beam_search and beam_width > 1:
                 logit_row += beam_width
                 continue
 
@@ -2540,15 +2523,18 @@ class PyTorchModelEngine(ModelEngine):
                 # Shape: [1, beam_width, vocab] to match TRT backend convention.
                 logits_block_3d = logits_block.view(1, beam_width, vocab_size)
 
-                # Note: on 1.2.x this path is not reached for beam search
-                # because TRTLLMSampler sets skip_beam_search=True and
-                # handles logits processing with coherent histories via
-                # the C++ buildGatheredBeamTokensForCallback path.
-                # This fallback uses raw slot histories which may be
-                # incoherent after beam reassignment.
-                all_beam_token_ids = [
-                    request.get_tokens(beam) for beam in range(beam_width)
-                ]
+                # Use coherent per-beam token histories if available.
+                # Built by PyExecutor._update_requests using parentIds
+                # tracing from the previous sampling step.
+                # Falls back to raw slot histories for the first step
+                # (before any beam reassignment has occurred).
+                coherent = getattr(request, 'py_coherent_beam_tokens', None)
+                if coherent is not None and len(coherent) == beam_width:
+                    all_beam_token_ids = coherent
+                else:
+                    all_beam_token_ids = [
+                        request.get_tokens(beam) for beam in range(beam_width)
+                    ]
 
                 for lp in logits_processors:
                     lp_params = inspect.signature(lp).parameters
