@@ -394,7 +394,12 @@ def _unfuse_mixtral_for_modelopt(model: nn.Module) -> None:
         if mlp is None or not isinstance(getattr(mlp, "experts", None),
                                          MixtralExperts):
             continue
-        layer.mlp = _MixtralSparseMoeBlockCompat(mlp)
+        # nn.Module() defaults to training=True; mirror the original mlp's
+        # mode so a prior model.eval() is preserved (avoids re-enabling the
+        # router-input jitter during calibration/export).
+        compat_mlp = _MixtralSparseMoeBlockCompat(mlp)
+        compat_mlp.train(mlp.training)
+        layer.mlp = compat_mlp
 
 
 def _get_llava_qwen_model(model_dir, dtype, device):
