@@ -290,7 +290,7 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.SEPARATE_QKV,
+            qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
             eps=eps,
             fuse_qk_norm_rope=True,
@@ -472,8 +472,6 @@ class WanTransformer3DModel(nn.Module):
         self.model_config = model_config
 
         vgm = model_config.visual_gen_mapping
-        if vgm is not None and vgm.tp_size > 1:
-            logger.info(f"WAN tensor parallelism is a WIP. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
         attn2d_row_size = vgm.attn2d_row_size if vgm else 1
