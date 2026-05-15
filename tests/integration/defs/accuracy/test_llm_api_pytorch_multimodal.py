@@ -544,6 +544,10 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+# Skip for B300 / GB300:
+# * B300 coverage does not meaningfully extend what we test via B200.
+# * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide CI errors.
+@skip_post_blackwell_ultra
 class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     # The score here may be lower than VLMEvalKitMcore (official) runs. This path uses
     # lm_eval's MMMU task, prompt formatting, and scoring, while VLMEvalKitMcore
@@ -644,14 +648,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 128,
                 QuantAlgo.MIXED_PRECISION,
                 (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
-                marks=(
-                    skip_pre_blackwell,
-                    # Skip for B300 / GB300:
-                    # * B300 coverage does not meaningfully extend what we test via B200.
-                    # * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide
-                    #   CI errors.
-                    skip_post_blackwell_ultra,
-                ),
+                marks=(skip_pre_blackwell,),
                 id="nvfp4",
             ),
         ],
