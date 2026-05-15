@@ -29,6 +29,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
         sparse_attention_config = SimpleNamespace(
             index_head_dim=128,
             compress_ratios=[1, 4, 1, 128],
+            indexer_k_dtype="fp8",
         )
         pretrained_config = SimpleNamespace(
             kv_lora_rank=512,
