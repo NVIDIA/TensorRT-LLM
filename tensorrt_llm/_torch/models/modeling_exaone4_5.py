@@ -147,10 +147,7 @@ class Exaone4_5InputProcessor(Qwen2VLInputProcessorBase):
 
 
 class Exaone4_5_VisionModel(Qwen2VisionModelBase):
-    def __init__(
-        self, model_config: ModelConfig[PretrainedConfig], model_class: type[Qwen2_5_VisionModel]
-    ):
-        super().__init__(model_config, model_class=model_class)
+    pass
 
 
 @register_vision_encoder(Exaone4_5_VisionModel, vlm_base_model=Qwen2_5_VisionModel)
@@ -179,6 +176,16 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         config = model_config.pretrained_config
 
         self._supports_sdpa = True
+        # Deliberately bypass `Qwen2VLModelBase.__init__` (the natural `super()`
+        # call) because, unlike Qwen2/2.5-VL, EXAONE 4.5:
+        #   1. uses standard llama3-style RoPE — not mrope — so we must not run
+        #      the mrope-specific setup (`rope_scaling['type'] = 'mrope'`,
+        #      `init_mrope_embedding`, `disable_fuse_rope` plumbing);
+        #   2. ships its own causal LM (`Exaone4ForCausalLM`, read from
+        #      `text_config.architectures`) and must not be forced to
+        #      `["Qwen2ForCausalLM"]`;
+        # We still need the `PreTrainedModel` machinery (config wiring,
+        # `_supports_*` flags, weight-loading hooks), so we call it directly.
         PreTrainedModel.__init__(self, config)
 
         self.model_config = model_config

@@ -623,9 +623,7 @@ def pos_embed_interpolate_native(
     Returns a tensor of shape ``(t * h * w, hidden_dim)`` with the
     bilinearly-interpolated position embeddings in spatial-merge order.
     """
-    assert h % m_size == 0 and w % m_size == 0, (
-        f"h={h} and w={w} must be divisible by m_size={m_size}"
-    )
+    assert h % m_size == 0 and w % m_size == 0, f"{h=} and {w=} must be divisible by {m_size=}"
     hidden_dim = embed_weight.shape[1]
     device = embed_weight.device
 

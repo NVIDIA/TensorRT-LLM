@@ -43,11 +43,11 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
-# Guarded module-level import: ``flashinfer_apply_rope_with_cos_sin_cache_inplace``
-# is only exported from ``custom_ops`` when FlashInfer is installed (see
-# ``_torch/custom_ops/__init__.py``). Unconditional import would break loading
+# Guarded module-level import: `flashinfer_apply_rope_with_cos_sin_cache_inplace`
+# is only exported from `custom_ops` when FlashInfer is installed (see
+# `_torch/custom_ops/__init__.py`). Unconditional import would break loading
 # this module in FlashInfer-less environments; importing inside the guard mirrors
-# the pattern used in ``custom_ops`` itself.
+# the pattern used in `custom_ops` itself.
 if IS_FLASHINFER_AVAILABLE:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
 from ..modules.gated_mlp import GatedMLP
@@ -430,13 +430,13 @@ class Qwen2VisionModelBase(nn.Module):
     def _split_fused_vision_qkv_tensor(
         self, tensor: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split HF fused ``attn.qkv`` along output dim (dim 0 for Linear).
+        """Split HF fused `attn.qkv` along output dim (dim 0 for Linear).
 
-        Qwen2.5-VL vision is **MHA** (``num_key_value_heads == num_heads``): Q, K, and V
-        each occupy ``num_heads * head_dim`` — three equal blocks.
+        Qwen2.5-VL vision is **MHA** (`num_key_value_heads == num_heads`): Q, K, and V
+        each occupy `num_heads * head_dim` — three equal blocks.
 
-        EXAONE-4.5 vision is **GQA**: Q uses ``num_heads * head_dim``, K and V each use
-        ``num_key_value_heads * head_dim`` (asymmetric split).
+        EXAONE-4.5 vision is **GQA**: Q uses `num_heads * head_dim`, K and V each use
+        `num_key_value_heads * head_dim` (asymmetric split).
         """
         cfg = self.config
         num_heads = cfg.num_heads
@@ -459,7 +459,7 @@ class Qwen2VisionModelBase(nn.Module):
                     tensor[q_dim + kv_dim:])
         if num_kv_heads == num_heads and leading_dim % 3 == 0:
             # MHA (e.g. Qwen2.5-VL vision): three equal Q/K/V blocks; used if fused
-            # leading dim is a triple split but does not match ``fused_out_features``.
+            # leading dim is a triple split but does not match `fused_out_features`.
             dim_shape = leading_dim // 3
             return (tensor[:dim_shape], tensor[dim_shape:2 * dim_shape],
                     tensor[2 * dim_shape:])
@@ -585,7 +585,7 @@ class Qwen2_5_VLVisionAttention(Attention):
 
         config = model_config.pretrained_config.vision_config
         # Composite VLM configs (transformers 5.x strict mode) keep
-        # ``max_position_embeddings`` inside ``text_config`` rather than at
+        # `max_position_embeddings` inside `text_config` rather than at
         # the top level; fall back to it when the parent doesn't expose it.
         max_position_embeddings = getattr(model_config.pretrained_config,
                                           "max_position_embeddings", None)
@@ -597,9 +597,8 @@ class Qwen2_5_VLVisionAttention(Attention):
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_heads,
-            num_key_value_heads=config.num_key_value_heads if getattr(
-                config, "num_key_value_heads", None) is not None else
-            config.num_heads,
+            num_key_value_heads=getattr(config, "num_key_value_heads", None)
+            or config.num_heads,
             max_position_embeddings=max_position_embeddings,
             bias=True,
             pos_embd_params=None,
@@ -810,19 +809,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             embed_dim=self.config.hidden_size,
         )
 
-        # The vision RoPE indexes per-axis image grid coordinates (from
-        # ``grid_thw``), not text tokens, so it does not have a natural
-        # "max sequence length" to read off the model config. Per-image
-        # grid sizes are bounded by the total token budget for one
-        # inference step, so we size the table to
-        # ``TorchLlmArgs.max_num_tokens`` (default 8192) -- which acts as
-        # a practical upper bound on ``max(h, w)`` for any realistic image.
-        # The LLM-side RoPE table instead uses ``max_position_embeddings``
-        # since text positions can span the full context length.
-        # TODO: read this from ``TorchLlmArgs.max_num_tokens`` directly
-        # once it is plumbed through to the model-level config, instead of
-        # hard-coding the default.
-        self.config.max_position_embeddings = 8192
+        text_config = getattr(model_config.pretrained_config, "text_config",
+                              model_config.pretrained_config)
+        self.config.max_position_embeddings = text_config.max_position_embeddings
         self.config.partial_rotary_factor = 0.5
         self.head_dim = self.config.hidden_size // self.config.num_heads
         self.pos_embd_params = PositionalEmbeddingParams(
@@ -919,7 +908,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     def get_rope_and_window_index_by_thw(
         self, t: int, h: int, w: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int, ...]]:
-        """CPU (cos, sin, window_idx, seqlens) in window order; cached per ``(t, h, w)``."""
+        """CPU (cos, sin, window_idx, seqlens) in window order; cached per `(t, h, w)`."""
         hpos_ids = torch.arange(h, dtype=torch.long).unsqueeze(1).expand(-1, w)
         wpos_ids = torch.arange(w, dtype=torch.long).unsqueeze(0).expand(h, -1)
         hpos_ids = (hpos_ids.reshape(h // self.spatial_merge_size,
@@ -987,7 +976,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         rope_position_ids = torch.arange(seq_len,
                                          dtype=torch.int32,
                                          pin_memory=prefer_pinned())
-        grid_rows = grid_thw.detach().cpu().tolist()
+        grid_rows = grid_thw.tolist()
 
         (rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
          window_seq_lens) = self.get_rotary_pos_emb_window_data(grid_rows)

@@ -107,16 +107,6 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         return False
 
     @property
-    def skip_test(self) -> bool:
-        """Return whether to skip the entire test class (e.g. missing local weights)."""
-        return False
-
-    @property
-    def skip_test_reason(self) -> str:
-        """Message passed to unittest.skipTest when skip_test is True."""
-        return "skip_test is True for this class (see skip_test property)."
-
-    @property
     def skip_hf_inference(self) -> bool:
         """Return whether to skip HuggingFace inference."""
         # There are some cases which we want to skip HF inference:
@@ -700,9 +690,6 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
 
     def setUp(self):
         """Initialize models and configurations for testing."""
-        if self.skip_test:
-            self.skipTest(self.skip_test_reason)
-
         torch.random.manual_seed(0)
 
         # TODO: Add multi-GPU support

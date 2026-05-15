@@ -5,8 +5,10 @@ import os
 from dataclasses import dataclass
 from typing import List
 
+import pytest
 import torch
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
+from transformers import AutoProcessor
 from utils.llm_data import llm_models_root
 
 try:
@@ -101,9 +103,11 @@ EXAONE_4_5_TEST_CONFIG = {
     "vision_token_id": 67,
     "vocab_size": 153600,
     # Source of tokenizer / image processor / video processor files at runtime.
-    # Resolved against ``LLM_MODELS_ROOT`` (defaults to ``/code/llm-models``).
+    # Resolved against `LLM_MODELS_ROOT` (defaults to `/code/llm-models`).
     "_name_or_path": str(os.path.join(llm_models_root(), "EXAONE-4.5-33B")),
 }
+
+_EXAONE_4_5_ASSET_PATH = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
 
 
 @dataclass(repr=False)
@@ -113,6 +117,15 @@ class TestExaone4_5Scenario(MultimodalScenario):
     pass
 
 
+# Skip the whole class when local weights/processor assets are missing on
+# disk so the test doesn't fail in environments that don't have them mirrored.
+@pytest.mark.skipif(
+    not _EXAONE_4_5_ASSET_PATH or not os.path.exists(_EXAONE_4_5_ASSET_PATH),
+    reason=(
+        "Exaone4.5 multimodal test requires weights / processor assets at "
+        f"config _name_or_path (missing or not found): {_EXAONE_4_5_ASSET_PATH!r}"
+    ),
+)
 class TestExaone4_5(TestModelingMultimodal):
     """Smoke tests for Exaone4.5 multimodal modeling.
 
@@ -126,21 +139,6 @@ class TestExaone4_5(TestModelingMultimodal):
         return HFExaone4_5ForConditionalGeneration is None
 
     @property
-    def skip_test(self) -> bool:
-        # Skip when local weights/processor assets are missing on disk so the
-        # test doesn't fail in environments that don't have them mirrored.
-        path = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
-        return not path or not os.path.exists(path)
-
-    @property
-    def skip_test_reason(self) -> str:
-        path = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
-        return (
-            "Exaone4.5 multimodal test requires weights / processor assets at "
-            f"config _name_or_path (missing or not found): {path!r}"
-        )
-
-    @property
     def trust_remote_code(self) -> bool:
         return True
 
@@ -148,12 +146,12 @@ class TestExaone4_5(TestModelingMultimodal):
         return EXAONE_4_5_TEST_CONFIG
 
     def create_hf_config(self):
-        # Production builds the model_config via ``ModelConfig.from_pretrained``
-        # which (1) derives ``torch_dtype`` from the (possibly nested) ``dtype``
+        # Production builds the model_config via `ModelConfig.from_pretrained`
+        # which (1) derives `torch_dtype` from the (possibly nested) `dtype`
         # field and (2) mirrors text-side fields onto the parent VLM config.
         # The test constructs ModelConfig directly, so replicate both steps
-        # here to keep top-level accessors (``torch_dtype``,
-        # ``max_position_embeddings``, ...) working.
+        # here to keep top-level accessors (`torch_dtype`,
+        # `max_position_embeddings`, ...) working.
         hf_config = super().create_hf_config()
         dtype = getattr(hf_config, "dtype", None)
         if dtype is None:
@@ -181,13 +179,12 @@ class TestExaone4_5(TestModelingMultimodal):
 
     def get_hf_inputs(self, modality: str, prompt: List[str], media: List[str]):
         # On transformers < 5.8 there is no native EXAONE 4.5 processor, so
-        # ``AutoProcessor.from_pretrained`` returns a ``TokenizersBackend``
-        # (itself a ``PreTrainedTokenizerBase`` subclass) without a
-        # ``.tokenizer`` attribute. Monkey-patch ``AutoProcessor.from_pretrained``
+        # `AutoProcessor.from_pretrained` returns a `TokenizersBackend`
+        # (itself a `PreTrainedTokenizerBase` subclass) without a
+        # `.tokenizer` attribute. Monkey-patch `AutoProcessor.from_pretrained`
         # for the duration of the base implementation so it surfaces the
         # backend as its own tokenizer. On transformers >= 5.8 the native
-        # processor already exposes ``.tokenizer`` and this is a no-op.
-        from transformers import AutoProcessor
+        # processor already exposes `.tokenizer` and this is a no-op.
 
         original_from_pretrained = AutoProcessor.from_pretrained
 
