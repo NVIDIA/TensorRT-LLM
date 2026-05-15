@@ -21,7 +21,9 @@ This module provides:
   Eagle speculative decoding.
 """
 
+import os
 import operator
+import re
 import types
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
@@ -29,6 +31,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
+from safetensors import safe_open
 from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
@@ -74,6 +77,8 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
         super().__init__(model=model, **kwargs)
         self._config_model = config_model
 
+    _NATIVE_LAYER_KEY_RE = re.compile(r"^layers\.(\d+)\.")
+
     def _get_model_config(self):
         # Prefetch Eagle checkpoint so weights are available for later loading.
         self.prefetch_checkpoint(skip_loading_weights=True)
@@ -113,8 +118,57 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
                 and getattr(model_config, "torch_dtype", None) is None
             ):
                 model_config.dtype = outer_dtype
+        native_num_layers = self._infer_native_checkpoint_num_hidden_layers()
+        if native_num_layers is not None:
+            requested_num_layers = self.model_kwargs.get("num_hidden_layers")
+            if (
+                requested_num_layers is not None
+                and requested_num_layers != native_num_layers
+                and not self.skip_loading_weights
+            ):
+                raise ValueError(
+                    "Eagle checkpoint layer-count mismatch: "
+                    f"checkpoint contains {native_num_layers} layers but "
+                    f"model_kwargs requested num_hidden_layers={requested_num_layers}."
+                )
+            config_num_layers = getattr(model_config, "num_hidden_layers", None)
+            if config_num_layers != native_num_layers:
+                ad_logger.info(
+                    "EagleDrafterFactory: native checkpoint contains "
+                    f"{native_num_layers} layers; overriding target config "
+                    f"num_hidden_layers={config_num_layers} for drafter construction."
+                )
+                model_config.num_hidden_layers = native_num_layers
         model_config, nested = self._recursive_update_config(model_config, self.model_kwargs or {})
         return model_config, deep_merge_dicts(unused, nested)
+
+    @classmethod
+    def _is_native_checkpoint_file(cls, checkpoint_file: str) -> bool:
+        return os.path.basename(str(checkpoint_file)) == "consolidated.safetensors"
+
+    def _infer_native_checkpoint_num_hidden_layers(self) -> Optional[int]:
+        checkpoint_file = self._get_checkpoint_file(self.model)
+        if not self._is_native_checkpoint_file(str(checkpoint_file)):
+            return None
+
+        with safe_open(checkpoint_file, framework="pt", device="cpu") as f:
+            layer_ids = sorted(
+                {
+                    int(match.group(1))
+                    for key in f.keys()
+                    if (match := self._NATIVE_LAYER_KEY_RE.match(key))
+                }
+            )
+        if not layer_ids:
+            return None
+
+        expected_layer_ids = list(range(layer_ids[-1] + 1))
+        if layer_ids != expected_layer_ids:
+            raise ValueError(
+                "Eagle checkpoint layer ids must be contiguous starting from 0; "
+                f"found {layer_ids}."
+            )
+        return len(layer_ids)
 
     def _get_checkpoint_file(self, checkpoint):
         """Extend the standard checkpoint file search to include native Mistral format.
@@ -135,6 +189,56 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
                 )
                 return consolidated
             raise
+
+    @staticmethod
+    def _is_derived_quant_scale_missing_key(key: str) -> bool:
+        return key.endswith(".input_scale") or key.endswith(".weight_scale")
+
+    def _load_checkpoint_with_preload(
+        self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
+    ):
+        all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
+
+        ad_logger.info(f"Loading weights into model (device: {device})...")
+        incompatible = model.load_state_dict(all_weights, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            ad_logger.warning(
+                "Checkpoint load completed with "
+                f"{len(incompatible.missing_keys)} missing and "
+                f"{len(incompatible.unexpected_keys)} unexpected keys"
+            )
+            if incompatible.missing_keys:
+                ad_logger.warning(
+                    "Sample missing keys: " + ", ".join(sorted(incompatible.missing_keys)[:20])
+                )
+            if incompatible.unexpected_keys:
+                ad_logger.warning(
+                    "Sample unexpected keys: "
+                    + ", ".join(sorted(incompatible.unexpected_keys)[:20])
+                )
+
+        if self._is_native_checkpoint_file(str(ckpt_file)):
+            disallowed_missing = [
+                key
+                for key in incompatible.missing_keys
+                if not self._is_derived_quant_scale_missing_key(key)
+            ]
+            if disallowed_missing or incompatible.unexpected_keys:
+                raise ValueError(
+                    "Native Eagle checkpoint did not load cleanly: "
+                    f"{len(disallowed_missing)} non-derived missing keys and "
+                    f"{len(incompatible.unexpected_keys)} unexpected keys. "
+                    f"Sample missing={sorted(disallowed_missing)[:20]}, "
+                    f"sample unexpected={sorted(incompatible.unexpected_keys)[:20]}"
+                )
+            if incompatible.missing_keys:
+                ad_logger.info(
+                    "Native Eagle checkpoint load matched all model weights; "
+                    f"{len(incompatible.missing_keys)} derived quant scale buffers "
+                    "were initialized by the quantization path."
+                )
+
+        ad_logger.info("Checkpoint loading completed")
 
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         model_config, unused_kwargs = self._get_model_config()

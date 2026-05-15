@@ -1061,6 +1061,7 @@ def get_all_layer_subgraphs(
             terminating_indices,
             embd=embd,
             residuals=residuals,
+            is_draft=getattr(gm, "is_draft", False),
             in_eagle_drafter=in_eagle_drafter,
         )
 
@@ -1157,6 +1158,39 @@ def _is_eagle_draft_topology(linear_nodes: List[Node], embd: int) -> bool:
         return False
 
     return True
+
+
+def _is_draft_prologue_projection(linear_nodes: List[Node], index: int, embd: int) -> bool:
+    """Match draft start projections that fuse token embeddings with hidden states."""
+
+    if index + 1 >= len(linear_nodes):
+        return False
+
+    shape = linear_nodes[index].meta.get("lin_node_shape")
+    if shape is None:
+        shape = get_weight_shape(linear_nodes[index])
+    if shape is None or len(shape) < 2:
+        return False
+    if shape[0] != embd or shape[-1] != 2 * embd:
+        return False
+
+    next_shape = linear_nodes[index + 1].meta.get("lin_node_shape")
+    if next_shape is None:
+        next_shape = get_weight_shape(linear_nodes[index + 1])
+    if next_shape is None or len(next_shape) < 2:
+        return False
+    if next_shape[-1] != embd:
+        return False
+
+    input_node = _get_linear_input_node(linear_nodes[index])
+    if input_node is None:
+        return False
+    cat_node, _ = bfs(
+        input_node,
+        target=lambda n: is_op(n, ops=[torch.ops.aten.cat]),
+        attr_next="args",
+    )
+    return cat_node is not None
 
 
 def bfs(
@@ -1472,6 +1506,7 @@ def get_layer_after_linear_node(
     residuals: List[Node],
     match_on_shapes: bool = True,
     enforce_strict_linear_history: bool = True,
+    is_draft: bool = False,
     in_eagle_drafter: bool = False,
 ) -> LayerSubgraph:
     """
@@ -1557,6 +1592,16 @@ def get_layer_after_linear_node(
     lin_nodes_in_subgraph = []
     start_lin_index = terminating_indices[-1] + 1
 
+    if is_draft and _is_draft_prologue_projection(linear_nodes, start_lin_index, embd):
+        prologue_node = linear_nodes[start_lin_index]
+        terminating_indices.append(start_lin_index)
+        return LayerSubgraph(
+            opening_nodes=[prologue_node],
+            subgraph_nodes=[],
+            terminating_node=prologue_node,
+            layer_type=LayerType.UNKNOWN,
+        )
+
     while len(lin_nodes_in_subgraph) != 1:
         if start_lin_index >= len(linear_nodes):
             terminating_indices.append(len(linear_nodes))
@@ -1617,6 +1662,8 @@ def get_layer_after_linear_node(
         opening_linear_nodes = [
             n for n in opening_linear_nodes if linear_nodes.index(n) > last_terminating_index
         ]
+    else:
+        last_terminating_index = -1
 
     # subgraph_nodes should not include opening nodes.
     # the entire layer =  opening_nodes + subgraph_nodes + terminating_node,
@@ -1625,6 +1672,11 @@ def get_layer_after_linear_node(
         n
         for n in set(backward_subgraph).union(forward_subgraph)
         if n not in set(opening_linear_nodes).union([terminating_linear_node])
+        and (
+            not enforce_strict_linear_history
+            or not is_any_lin_op(n)
+            or linear_nodes.index(n) > last_terminating_index
+        )
     ]
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
     delta_nodes = list(filtered_nodes(interior_nodes, is_any_delta_op))
@@ -1712,9 +1764,10 @@ def get_layer_after_linear_node(
         layer_type=layer_type,
         min_local_shape=head_size,
     )
-    assert linear_nodes[start_lin_index] in opening_linear_nodes, (
+    start_linear_node = linear_nodes[start_lin_index]
+    assert start_linear_node in opening_linear_nodes, (
         f"Start linear node (index {start_lin_index}) not found in opening linear nodes - "
-        f"start_linear node: {linear_nodes[start_lin_index].name}, "
+        f"start_linear node: {start_linear_node.name}, "
         f"opening_linear_nodes: {[n.name for n in opening_linear_nodes]}, "
         f"terminating_linear_node:{terminating_linear_node.name}, "
     )

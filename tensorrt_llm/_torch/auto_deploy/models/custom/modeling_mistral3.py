@@ -784,6 +784,7 @@ class ADMistralSmall4Tokenizer(PreTrainedTokenizerFast):
         tokenizer = cls(
             tokenizer_object=Tokenizer.from_file(tokenizer_file),
             name_or_path=str(pretrained_model_name_or_path),
+            is_local=Path(pretrained_model_name_or_path).exists(),
             bos_token=config.get("bos_token"),
             eos_token=config.get("eos_token"),
             unk_token=config.get("unk_token"),

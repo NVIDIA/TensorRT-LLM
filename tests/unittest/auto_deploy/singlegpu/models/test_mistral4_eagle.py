@@ -281,6 +281,10 @@ def test_build_ad_mistral4_eagle(register_mock_mistral4_eagle_factory):
     experiment_config["args"]["world_size"] = 0
     experiment_config["args"]["tokenizer"] = str(target_path)
     experiment_config["args"]["skip_loading_weights"] = True
+    experiment_config["args"]["max_seq_len"] = 128
+    experiment_config["args"]["max_batch_size"] = 2
+    experiment_config["args"]["max_num_tokens"] = 64
+    experiment_config["args"]["cuda_graph_config"] = {"max_batch_size": 2}
 
     # config_model is consumed by MockMistral4EagleDrafterFactory.__init__ via **kwargs
     # passed through ModelFactoryRegistry.  We inject it via a monkey-patch on the factory
@@ -340,7 +344,10 @@ def _run_mistral4_eagle_one_model_smoke(num_hidden_layers: int):
         speculative_model_kwargs=dict(small_dims),
         disable_overlap_scheduler=True,
         compile_backend="torch-simple",
-        max_num_tokens=256,
+        max_seq_len=128,
+        max_batch_size=2,
+        max_num_tokens=64,
+        cuda_graph_config={"max_batch_size": 2},
         world_size=1,
     ) as llm:
         outputs = llm.generate(

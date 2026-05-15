@@ -173,9 +173,12 @@ class LLM(_TorchLLM):
         # AutoDeploy derives it from factory._prefetched_model_path instead.
         pass
 
-    def _create_input_processor(self) -> ADInputProcessor:
+    def _create_input_processor(
+        self, tokenizer: Optional[TokenizerBase] = None
+    ) -> ADInputProcessor:
+        tokenizer = tokenizer if tokenizer is not None else self.tokenizer
         processor = self.factory.init_processor()
-        base = ADInputProcessor(self.tokenizer, processor)
+        base = ADInputProcessor(tokenizer, processor)
         if hasattr(self.factory, "init_input_processor"):
             return self.factory.init_input_processor(base)
         return base
@@ -198,9 +201,12 @@ class LLM(_TorchLLM):
         super()._build_model()
 
         # now correct input processor
-        assert isinstance(self.input_processor, DefaultInputProcessor)
-        assert self.tokenizer is None or isinstance(self.tokenizer, TransformersTokenizer)
-        self.input_processor = self._create_input_processor()
+        tokenizer = self.tokenizer
+        if tokenizer is not None:
+            tokenizer = tokenizer_factory(tokenizer)
+            self._tokenizer = tokenizer
+        assert tokenizer is None or isinstance(tokenizer, TransformersTokenizer)
+        self.input_processor = self._create_input_processor(tokenizer)
 
 
 class DemoLLM(LLM):

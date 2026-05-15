@@ -15,12 +15,14 @@ comparison.
 import math
 
 import pytest
+import safetensors.torch
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleConfig,
     EagleDrafterForCausalLM,
@@ -31,6 +33,11 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_mistral3 import (
     Mistral4EagleMLP,
     Mistral4RMSNorm,
     Mistral4TextConfig,
+)
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    LayerType,
+    get_all_layer_subgraphs,
+    is_any_lin_op,
 )
 
 # =============================================================================
@@ -94,9 +101,42 @@ def _small_eagle_text_config() -> Mistral4TextConfig:
     )
 
 
+def _write_native_eagle_checkpoint(tmp_path, layer_ids: list[int]) -> str:
+    checkpoint_dir = tmp_path / "native_eagle"
+    checkpoint_dir.mkdir()
+    tensors = {
+        "eagle_linear.weight": torch.ones(2, 4),
+        "norm.weight": torch.ones(2),
+    }
+    for layer_id in layer_ids:
+        tensors[f"layers.{layer_id}.attention_norm.weight"] = torch.ones(2)
+    safetensors.torch.save_file(tensors, checkpoint_dir / "consolidated.safetensors")
+    return str(checkpoint_dir)
+
+
 @pytest.fixture(autouse=True)
 def set_seed():
     torch.manual_seed(42)
+
+
+# =============================================================================
+# Factory checkpoint sanity
+# =============================================================================
+
+
+def test_native_eagle_checkpoint_layer_count_is_inferred(tmp_path):
+    checkpoint_dir = _write_native_eagle_checkpoint(tmp_path, [0, 1])
+    factory = EagleDrafterFactory(model=checkpoint_dir)
+
+    assert factory._infer_native_checkpoint_num_hidden_layers() == 2
+
+
+def test_native_eagle_checkpoint_layer_count_requires_contiguous_ids(tmp_path):
+    checkpoint_dir = _write_native_eagle_checkpoint(tmp_path, [0, 2])
+    factory = EagleDrafterFactory(model=checkpoint_dir)
+
+    with pytest.raises(ValueError, match="contiguous starting from 0"):
+        factory._infer_native_checkpoint_num_hidden_layers()
 
 
 # =============================================================================
@@ -622,3 +662,41 @@ def test_mistral4_eagle_drafter_export():
     assert out.norm_hidden_state is not None
     assert torch.isfinite(out.norm_hidden_state).all()
     assert out.norm_hidden_state.shape == (batch, seq, hidden_size)
+
+
+def test_mistral4_eagle_drafter_layer_subgraphs_include_eagle_proj():
+    """Layer-subgraph detection treats the first Eagle projection as a draft prologue."""
+    if not torch.cuda.is_available():
+        pytest.skip("torch_mla requires CUDA.")
+    device = "cuda"
+    dtype = torch.bfloat16
+    config = _make_eagle_config(_small_eagle_text_config())
+    model = EagleDrafterForCausalLM(config).to(device=device, dtype=dtype)
+    model.eval()
+
+    batch, seq = 1, 8
+    hidden_size = config.hidden_size
+    inputs_embeds = torch.randn(batch, seq, hidden_size, device=device, dtype=dtype)
+    position_ids = torch.arange(seq, device=device).unsqueeze(0)
+    hidden_states = torch.randn(batch, seq, hidden_size, device=device, dtype=dtype)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(inputs_embeds, position_ids),
+        kwargs={"hidden_states": hidden_states},
+    )
+    gm.is_draft = True
+
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
+
+    assert len(layer_subgraphs) >= config.num_hidden_layers
+    assert any("eagle_proj" in node.name for node in layer_subgraphs[0].opening_nodes)
+    assert "eagle_proj" in layer_subgraphs[0].terminating_node.name
+    assert layer_subgraphs[0].layer_type == LayerType.UNKNOWN
+    assert layer_subgraphs[1].layer_type == LayerType.MLA
+    assert not any(
+        "eagle_proj" in node.name
+        for node in layer_subgraphs[1].subgraph_nodes
+        if is_any_lin_op(node)
+    )
+    assert not any("eagle_proj" in node.name for node in unprocessed_linear_nodes)
