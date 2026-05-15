@@ -1240,6 +1240,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _trtllm_nvfp4_trtllm_gen_moe_impl(
         x,
@@ -1264,6 +1265,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         mapping_config=mapping_config,
         max_num_tokens=max_num_tokens,
         apply_routing_on_input=apply_routing_on_input,
+        batch_info_host=batch_info_host,
     )
 
 
