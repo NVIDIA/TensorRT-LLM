@@ -508,6 +508,8 @@ class TestAudioInputProcessor:
         result = NanoV2VLInputProcessor._resample_audios([audio], target_sr=16000)
         np.testing.assert_array_equal(result[0], audio)
 
+    # `torch.compile` uses a thread pool to compile.
+    @pytest.mark.threadleak(enabled=False)
     def test_process_audio_returns_expected_keys(self):
         proc = _make_audio_processor()
         audio = np.random.randn(16000).astype(np.float32)
