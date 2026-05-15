@@ -2782,7 +2782,8 @@ def _bench_config(
                 use_tma_replay_nowrite_load_values,
                 use_tma_replay_write_store_values,
             )
-        # Iteration source: when --cell-list is active, iterate the cell set
+        # Iteration source: when --cell-list is active AND this is the main
+        # timing path (not a compile-warmup worker), iterate the cell set
         # DIRECTLY (one yield per cell).  The earlier design iterated the
         # full inner cartesian and filtered each iteration via membership in
         # args._cell_list_set — that's O(cartesian) which blows up to
@@ -2790,7 +2791,15 @@ def _bench_config(
         # values (CPS, LS, M, W, S each contributing a Wx*Wnw factor on top
         # of TMA flags), producing 50+ min of CPU spin per bench call before
         # any actual timing.  Direct iteration is O(|cell_list|).
-        if getattr(args, "_cell_list_set", None):
+        #
+        # IMPORTANT exception for workers (warmup_only=True): _warm_one_config
+        # clamps args.*_write/_nowrite via inner_overrides to single values,
+        # making the cartesian 1×1×...×1 = 1 iter, which is exactly the one
+        # cell that worker was given.  If we used cell-list-direct iteration
+        # here, every worker would iterate ALL 2884 cells instead of just
+        # its assigned one — turning compile-warmup into 28-way duplication.
+        # (Observed: 256 tasks in 233s under that bug vs ~18s correct.)
+        if getattr(args, "_cell_list_set", None) and not warmup_only:
             def _gen_from_cell_list():
                 keys = args._cell_list_keys
                 for tup in args._cell_list_set:
