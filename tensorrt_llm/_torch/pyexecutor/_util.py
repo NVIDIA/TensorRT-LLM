@@ -1268,6 +1268,8 @@ def _create_kv_cache_manager(
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False
 
+        # !!! We will not use replay for MTP, to avoid the accuracy drop issue.
+        use_replay = False
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
