@@ -68,6 +68,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_libfabric_efa.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_aws_ofi_nccl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
