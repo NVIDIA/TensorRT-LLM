@@ -35,6 +35,7 @@ from tensorrt_llm.logger import logger
 from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .transformer_cosmos3 import Cosmos3VFMTransformer
+from .sound_tokenizer import LatentAutoEncoderV2
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
     "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
@@ -66,6 +67,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):
         super().__init__(pipeline_config)
 
+        self.sound_gen = False
+        self.action_gen = False
+        if model_config.pretrained_config.sound_gen:
+            logger.info("Initializing Cosmos3OmniMoTPipeline with sound generation.")
+            self.sound_gen = True
+
+        if model_config.pretrained_config.action_gen:
+            logger.info("Initializing Cosmos3OmniMoTPipeline with action generation.")
+            self.action_gen = True
+
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
         self.transformer = Cosmos3VFMTransformer(self.pipeline_config.model_configs["transformer"])
@@ -80,6 +91,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
         skip_components = skip_components or []
+        
+        if self.sound_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
+            logger.info("Loading sound tokenizer...")
+            self.sound_tokenizer = LatentAutoEncoderV2.from_pretrained(
+                checkpoint_dir,
+                subfolder=PipelineComponent.SOUND_TOKENIZER,
+            )
 
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
@@ -433,6 +451,39 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         video = self.vae.decode(latents, return_dict=False)[0]
         video = postprocess_video_tensor(video)
         return video
+
+    # =========================================================================
+    # Sound generation
+    # =========================================================================
+
+    def encode_sound(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Encode audio waveform into latent tokens.
+
+        Args:
+            waveform: Audio tensor of shape (C, N). A batch dim is added/removed
+                      internally since AVAE expects (B, C, N).
+                      Mono audio is duplicated to stereo if the tokenizer expects 2 channels.
+        """
+        # Ensure correct number of channels (AVAE typically expects stereo)
+        expected_channels = self.sound_tokenizer.audio_channels
+        if waveform.shape[0] == 1 and expected_channels == 2:
+            waveform = waveform.repeat(2, 1)  # mono → stereo
+        elif waveform.shape[0] > expected_channels:
+            waveform = waveform[:expected_channels]
+        # AVAE expects (B, C, N)
+        latent = self.sound_tokenizer.encode(waveform.unsqueeze(0))  # [1,sound_channels,T_sound]
+        return latent.squeeze(0)  # [sound_channels,T_sound]
+
+    def decode_sound(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode sound latent tokens back to waveform.
+
+        Args:
+            latent: Sound latent tensor of shape (C, T). A batch dim is added/removed
+                    internally since AVAE expects (B, C, T).
+        """
+        # AVAE expects (B, C, T)
+        waveform = self.sound_tokenizer.decode(latent.unsqueeze(0))  # [1,audio_channels,N_samples]
+        return waveform.squeeze(0)  # [audio_channels,N_samples]
 
     # =========================================================================
     # Forward (main generation entry point)
