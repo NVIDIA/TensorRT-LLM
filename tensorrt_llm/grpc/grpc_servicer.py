@@ -92,6 +92,10 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
 
             prompt_token_ids = list(request.tokenized.input_token_ids)
 
+            vocab_size = None
+            if self.request_manager is not None:
+                vocab_size = self.request_manager.get_model_config().get("vocab_size") or None
+
             # Build sampling params with detokenize=False (key optimization!)
             sampling_params = create_sampling_params_from_proto(
                 proto_config=request.sampling_config,
@@ -105,7 +109,8 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 guided_decoding=request.guided_decoding
                 if request.HasField("guided_decoding")
                 else None,
-                embedding_bias=list(request.embedding_bias) if request.embedding_bias else None,
+                embedding_bias=request.embedding_bias if request.embedding_bias else None,
+                vocab_size=vocab_size,
                 include_stop_token_in_output=request.include_stop_token_in_output,
             )
 
