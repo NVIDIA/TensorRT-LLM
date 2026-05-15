@@ -948,16 +948,46 @@ class CuptiKernelTimer:
         self._last_stop_timing: dict[str, float] = {}
         self._current_flush_period_ms = 0
         self._mp_ctx = mp.get_context("spawn")
-        self._parse_input_queue = self._mp_ctx.Queue()
-        self._parse_output_queue = self._mp_ctx.Queue()
-        ready_event = self._mp_ctx.Event()
-        self._parse_process = self._mp_ctx.Process(
-            target=_cupti_parser_worker,
-            args=(self._parse_input_queue, self._parse_output_queue, ready_event),
-        )
-        self._parse_process.start()
-        if not ready_event.wait(timeout=10.0):
-            raise RuntimeError("CUPTI parser process did not initialize")
+        # Retry parser-process spawn: concurrent bench instances on the same
+        # node race on POSIX named semaphores in /dev/shm — child can die in
+        # pickle.load with FileNotFoundError in SemLock._rebuild before
+        # signalling ready_event.  Detect early-dead child via is_alive() so
+        # we don't waste the full timeout, and retry up to 3x with jitter.
+        last_err = None
+        for _spawn_attempt in range(3):
+            self._parse_input_queue = self._mp_ctx.Queue()
+            self._parse_output_queue = self._mp_ctx.Queue()
+            ready_event = self._mp_ctx.Event()
+            self._parse_process = self._mp_ctx.Process(
+                target=_cupti_parser_worker,
+                args=(self._parse_input_queue, self._parse_output_queue, ready_event),
+            )
+            self._parse_process.start()
+            deadline = time.time() + 30.0
+            spawn_ok = False
+            while time.time() < deadline:
+                if ready_event.wait(timeout=0.5):
+                    spawn_ok = True
+                    break
+                if not self._parse_process.is_alive():
+                    break
+            if spawn_ok:
+                last_err = None
+                break
+            last_err = (f"attempt {_spawn_attempt + 1}: "
+                        f"alive={self._parse_process.is_alive()}, "
+                        f"exitcode={self._parse_process.exitcode}")
+            try:
+                if self._parse_process.is_alive():
+                    self._parse_process.terminate()
+                self._parse_process.join(timeout=2.0)
+            except Exception:
+                pass
+            time.sleep(0.5 + 0.5 * _spawn_attempt)
+        if last_err is not None:
+            raise RuntimeError(
+                f"CUPTI parser process did not initialize after 3 attempts: {last_err}"
+            )
 
         self._set_zeroed_host_buffer_attr()
         for _ in range(_CUPTI_HOST_BUFFER_COUNT):
