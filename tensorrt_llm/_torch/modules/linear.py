@@ -1863,6 +1863,8 @@ class NVFP4LinearMethod(LinearMethodBase):
 
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
 
+    CUDA_CORE_MAX_M: ClassVar[int] = 16
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         module.scaling_vector_size = 16
@@ -1899,8 +1901,65 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
         else:
             module.register_parameter("bias", None)
 
+    def _process_weights_without_static_activation_scale(
+            self, module: Linear, process_fn):
+        original_input_scale = module.input_scale
+        original_inv_input_scale = module.inv_input_scale
+        original_alpha = module.alpha
+        had_scalar_alpha = hasattr(module, "scalar_alpha")
+        original_scalar_alpha = getattr(module, "scalar_alpha", None)
+
+        device = module.weight_scale_2.device
+        module.input_scale = Parameter(torch.empty([1],
+                                                   dtype=torch.float32,
+                                                   device=device),
+                                       requires_grad=False)
+        module.inv_input_scale = Parameter(torch.empty([1],
+                                                       dtype=torch.float32,
+                                                       device=device),
+                                           requires_grad=False)
+        module.alpha = Parameter(torch.empty([1],
+                                             dtype=torch.float32,
+                                             device=device),
+                                 requires_grad=False)
+        try:
+            process_fn(module)
+        finally:
+            module.input_scale = original_input_scale
+            module.inv_input_scale = original_inv_input_scale
+            module.alpha = original_alpha
+            if had_scalar_alpha:
+                module.scalar_alpha = original_scalar_alpha
+            elif hasattr(module, "scalar_alpha"):
+                delattr(module, "scalar_alpha")
+
+    def process_weights_after_loading_vanilla(self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_vanilla)
+
+    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_fused_qkv_linear)
+
+    def process_weights_after_loading_fused_gate_up_linear(
+            self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_fused_gate_up_linear)
+
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        if input.dim() == 1:
+            m = 1
+        elif input.dim() > 2:
+            m = math.prod(input.shape[:-1])
+        else:
+            m = input.shape[0]
+        if m > self.CUDA_CORE_MAX_M:
+            return super().apply(module, input, bias)
+
         original_shape = None
         if input.dim() > 2:
             original_shape = input.shape

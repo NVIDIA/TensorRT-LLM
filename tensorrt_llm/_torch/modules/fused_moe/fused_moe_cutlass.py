@@ -368,6 +368,7 @@ class CutlassFusedMoE(MoE):
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if not (self.quant_config.quant_mode.has_nvfp4()
+                    | self.quant_config.quant_mode.has_w4a16_nvfp4()
                     | self.quant_config.quant_mode.has_fp8_block_scales()
                     | self.quant_config.quant_mode.has_fp8_qdq()
                     | self.quant_config.quant_mode.is_weight_only()
@@ -531,7 +532,8 @@ class CutlassFusedMoE(MoE):
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.has_nvfp4():
+            elif (self.quant_config.layer_quant_mode.has_nvfp4()
+                  or self.quant_config.layer_quant_mode.has_w4a16_nvfp4()):
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):

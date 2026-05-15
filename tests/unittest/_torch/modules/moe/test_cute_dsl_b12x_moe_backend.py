@@ -55,6 +55,14 @@ def test_can_implement_accepts_supported_sm_with_nvfp4(sm_version):
     assert reason is None
 
 
+@pytest.mark.parametrize("sm_version", sorted(FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS))
+def test_can_implement_accepts_supported_sm_with_w4a16_nvfp4(sm_version):
+    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
+        ok, reason = FlashInferNvfp4Sm12xFusedMoE.can_implement(QuantAlgo.W4A16_NVFP4)
+    assert ok
+    assert reason is None
+
+
 @pytest.mark.parametrize(
     "quant_algo",
     [
@@ -160,6 +168,15 @@ def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing
     with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
         cls = get_moe_cls(cfg)
     assert cls is CuteDslFusedMoE
+
+
+def test_get_moe_cls_returns_flashinfer_for_w4a16_nvfp4_on_supported_sm():
+    cfg = ModelConfig()
+    cfg.moe_backend = "FLASHINFER_NVFP4SM12X"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
+        cls = get_moe_cls(cfg)
+    assert cls is FlashInferNvfp4Sm12xFusedMoE
 
 
 # --------------------------------------------------------------------------

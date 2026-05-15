@@ -168,7 +168,8 @@ def _get_nemotron_h_moe_model_config(
 
     quant_config = model_config.quant_config
     if (quant_config is not None and quant_config.quant_algo
-            in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4")):
+            in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4")
+            and model_config.moe_backend.upper() != "FLASHINFER_NVFP4SM12X"):
         moe_quant_config = quant_config.model_copy(deep=True)
         moe_quant_config.quant_algo = QuantAlgo.NVFP4
         moe_quant_config.__dict__.pop("quant_mode", None)
@@ -1103,14 +1104,20 @@ class NemotronHMTP(nn.Module):
 
             sublayer_quant_config = self._get_mtp_sublayer_quant_config(
                 model_config, self.layer_idx)
+            sublayer_moe_backend = model_config.moe_backend
+            if (sublayer_quant_config is None
+                    or sublayer_quant_config.quant_algo is None):
+                sublayer_moe_backend = "CUTLASS"
 
             # Create a model_config copy with quant_config overridden and
             # spec_config cleared. All other fields (use_cuda_graph,
-            # moe_backend, moe_max_num_tokens, etc.) must be inherited
-            # so MoE layers are configured correctly for CUDA graph
-            # capture and communication (e.g., DeepEP).
+            # moe_max_num_tokens, etc.) must be inherited so MoE layers are
+            # configured correctly for CUDA graph capture and communication
+            # (e.g., DeepEP). BF16 MTP body layers cannot use the NVFP4-only
+            # FlashInfer MoE backend, so route those sublayers to CUTLASS.
             sublayer_model_config = replace(model_config,
                                             quant_config=sublayer_quant_config,
+                                            moe_backend=sublayer_moe_backend,
                                             spec_config=None)
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(

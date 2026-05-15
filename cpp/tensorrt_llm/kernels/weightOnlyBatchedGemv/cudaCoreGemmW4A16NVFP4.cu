@@ -211,6 +211,7 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
         reinterpret_cast<ActType const*>(params.act), reinterpret_cast<__nv_fp4_e2m1 const*>(params.weight),
         reinterpret_cast<ScaleType const*>(params.weightScale), params.weightGlobalScale,
         reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+    TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
 template <typename ActType, typename OutputType, typename ScaleType, int kTileM, int kTileN, int kBlockSize>
@@ -233,7 +234,18 @@ bool cudaCoreGemmTemplateCaller(Params const& params, cudaStream_t stream)
 template <typename ActType, typename OutputType, typename ScaleType = __nv_fp8_e4m3>
 bool cudaCoreGemmLauncher(Params const& params, cudaStream_t stream)
 {
-    return cudaCoreGemmTemplateCaller<ActType, OutputType, ScaleType, 1, 2, 128>(params, stream);
+    constexpr int kDefaultTileN = 2;
+    constexpr int kWideTileN = 4;
+    constexpr int kMaxGridDimY = 65535;
+    if (params.n / kDefaultTileN <= kMaxGridDimY)
+    {
+        return cudaCoreGemmTemplateCaller<ActType, OutputType, ScaleType, 1, kDefaultTileN, 128>(params, stream);
+    }
+    if (params.n % kWideTileN == 0 && params.n / kWideTileN <= kMaxGridDimY)
+    {
+        return cudaCoreGemmTemplateCaller<ActType, OutputType, ScaleType, 1, kWideTileN, 128>(params, stream);
+    }
+    return false;
 }
 
 template <typename ActType>

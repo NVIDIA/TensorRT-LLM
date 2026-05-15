@@ -55,10 +55,16 @@ def test_nemotron_h_mapper_canonicalizes_w4a16_nvfp4_checkpoint_keys():
     assert "lm_head.weight" in mapped
     assert "lm_head.weight_scale" in mapped
     assert "lm_head.weight_scale_2" in mapped
+    assert "lm_head.input_scale" in mapped
     assert "lm_head.weight_packed" not in mapped
     assert "lm_head.weight_global_scale" not in mapped
     assert mapped["lm_head.weight"] is weights["lm_head.weight_packed"]
-    assert mapped["lm_head.weight_scale_2"] is weights["lm_head.weight_global_scale"]
+    torch.testing.assert_close(
+        mapped["lm_head.weight_scale_2"], torch.tensor(4.0, dtype=torch.float32)
+    )
+    torch.testing.assert_close(
+        mapped["lm_head.input_scale"], torch.tensor([1.0], dtype=torch.float32)
+    )
 
 
 def test_nemotron_h_mapper_handles_scalar_w4a16_nvfp4_moe_global_scales():

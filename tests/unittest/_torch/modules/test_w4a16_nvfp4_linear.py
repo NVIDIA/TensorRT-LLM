@@ -97,6 +97,96 @@ def test_w4a16_nvfp4_linear_restores_high_rank_input_shape():
     assert output.shape == (2, 3, 5)
 
 
+def test_w4a16_nvfp4_linear_falls_back_to_w4a4_nvfp4_for_large_m():
+    method = W4A16NVFP4LinearMethod()
+    input_tensor = torch.ones((17, 16), dtype=torch.bfloat16)
+    module = SimpleNamespace(
+        weight=torch.empty((5, 8), dtype=torch.uint8),
+        weight_scale=torch.empty((128 * 4,), dtype=torch.uint8),
+        weight_scale_2=torch.tensor([0.5], dtype=torch.float32),
+        dtype=torch.bfloat16,
+        out_features=3,
+        pre_quant_scale=None,
+        input_scale=None,
+        alpha=None,
+        force_dynamic_quantization=False,
+        scaling_vector_size=16,
+        nvfp4_allowed_backends=["cuda_core"],
+        all_reduce=None,
+        mapping=None,
+    )
+    captured = {}
+
+    def fail_w4a16_gemm(*args, **kwargs):
+        raise AssertionError("large-M dense fallback must not call w4a16_nvfp4_gemm")
+
+    def fake_fp4_quantize(input_arg, input_scale, scaling_vector_size, is_sf_swizzled):
+        captured["quant_input"] = input_arg
+        captured["input_scale"] = input_scale
+        captured["scaling_vector_size"] = scaling_vector_size
+        captured["is_sf_swizzled"] = is_sf_swizzled
+        return torch.empty(
+            (input_arg.shape[0], input_arg.shape[1] // 2), dtype=torch.uint8
+        ), torch.empty((input_arg.shape[0], 4), dtype=torch.uint8)
+
+    def fake_nvfp4_gemm(
+        act_fp4,
+        weight,
+        act_sf,
+        weight_scale,
+        alpha,
+        out_dtype,
+        output_buffer_kind=0,
+        allowed_backends="",
+        group=None,
+    ):
+        captured["act_fp4"] = act_fp4
+        captured["weight"] = weight
+        captured["act_sf"] = act_sf
+        captured["weight_scale"] = weight_scale
+        captured["alpha"] = alpha
+        captured["out_dtype"] = out_dtype
+        captured["allowed_backends"] = allowed_backends
+        captured["group"] = group
+        return torch.ones((act_fp4.shape[0], weight.shape[0]), dtype=out_dtype)
+
+    with patch("torch.ops.trtllm.w4a16_nvfp4_gemm", side_effect=fail_w4a16_gemm, create=True):
+        with patch("torch.ops.trtllm.fp4_quantize", side_effect=fake_fp4_quantize, create=True):
+            with patch("torch.ops.trtllm.nvfp4_gemm", side_effect=fake_nvfp4_gemm, create=True):
+                output = method.apply(module, input_tensor, bias=None)
+
+    assert captured["quant_input"] is input_tensor
+    assert captured["scaling_vector_size"] == 16
+    assert captured["is_sf_swizzled"] is False
+    assert captured["weight"] is module.weight
+    assert captured["weight_scale"] is module.weight_scale
+    assert captured["out_dtype"] is torch.bfloat16
+    assert captured["allowed_backends"] == "cuda_core"
+    assert captured["group"] is None
+    assert output.shape == (17, 3)
+
+
+def test_w4a16_nvfp4_post_load_ignores_checkpoint_activation_scale():
+    method = W4A16NVFP4LinearMethod()
+    module = SimpleNamespace(
+        input_scale=None,
+        inv_input_scale=None,
+        alpha=None,
+        weight_scale_2=torch.empty([1], dtype=torch.float32),
+        tmp_nvfp4_input_scales_list=[torch.tensor(1.0, dtype=torch.float32)],
+        tmp_nvfp4_weight_scale_2_list=[torch.tensor(0.25, dtype=torch.float32)],
+    )
+
+    method.process_weights_after_loading_vanilla(module)
+
+    assert module.input_scale is None
+    assert module.inv_input_scale is None
+    assert module.alpha is None
+    torch.testing.assert_close(module.weight_scale_2, torch.tensor([0.25], dtype=torch.float32))
+    assert not hasattr(module, "tmp_nvfp4_input_scales_list")
+    assert not hasattr(module, "tmp_nvfp4_weight_scale_2_list")
+
+
 def test_lm_head_uses_w4a16_nvfp4_quant_method_for_packed_lm_head():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
 
