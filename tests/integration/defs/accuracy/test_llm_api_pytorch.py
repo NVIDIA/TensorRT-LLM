@@ -3402,7 +3402,10 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+            # MTP layers consume extra memory; reduce KV cache fraction to
+            # avoid OOM during forward pass on Blackwell (NVBug 5955792).
+            fraction = 0.55 if mtp_nextn > 0 else 0.6
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=fraction)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
