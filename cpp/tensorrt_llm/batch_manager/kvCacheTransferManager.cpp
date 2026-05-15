@@ -125,18 +125,26 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 auto const srcBlockIdx = static_cast<size_t>(src->getMemoryPoolBlockIndex());
                 auto const dstBlockIdx = static_cast<size_t>(dst->getMemoryPoolBlockIndex());
 
-                auto const& poolShape = pool.primaryPtr->getShape();
-                TLLM_CHECK_WITH_INFO(poolShape.nbDims >= 2,
-                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", poolShape.nbDims);
-                auto const numBlocks = static_cast<size_t>(poolShape.d[1]);
-                auto const layerStrideBytes = pool.primaryPtr->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
-                auto const rowBytes = layerStrideBytes / numBlocks;
+                // Compute pitches from each pool independently: primary and secondary pools
+                // may have different block counts (mNumPrimaryBlocks vs mNumSecondaryBlocks),
+                // so their per-layer strides differ. Using the primary shape for both pitches
+                // would corrupt host-offloaded recurrent state on CPU<->GPU transfers.
+                auto const& srcShape = srcPool->getShape();
+                auto const& dstShape = dstPool->getShape();
+                TLLM_CHECK_WITH_INFO(srcShape.nbDims >= 2,
+                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", srcShape.nbDims);
+                TLLM_CHECK_WITH_INFO(dstShape.nbDims >= 2,
+                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", dstShape.nbDims);
+                auto const srcLayerStrideBytes = srcPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
+                auto const dstLayerStrideBytes = dstPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
+                // rowBytes is the per-block per-layer payload — identical for primary and secondary.
+                auto const rowBytes = srcLayerStrideBytes / static_cast<size_t>(srcShape.d[1]);
 
                 auto* srcBase = static_cast<char*>(srcPool->data()) + srcBlockIdx * rowBytes;
                 auto* dstBase = static_cast<char*>(dstPool->data()) + dstBlockIdx * rowBytes;
 
                 auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
-                TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstBase, layerStrideBytes, srcBase, layerStrideBytes, rowBytes,
+                TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstBase, dstLayerStrideBytes, srcBase, srcLayerStrideBytes, rowBytes,
                     static_cast<size_t>(pool.numLayers), cudaMemcpyDefault, stream));
                 continue;
             }
