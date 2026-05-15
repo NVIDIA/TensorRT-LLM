@@ -393,7 +393,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                 disaggregated_params=DisaggregatedParams(
                     request_type="context_only"))
             ctx_server, ctx_info = await self.ctx_router.get_next_server(
-                openai_request)
+                openai_request, collect_routing_info=True)
             prompt_str = request["prompt"]
             request["prompt"] = ctx_info["token_lists"][0]
             openai_request.disaggregated_params.request_type = "generation_only"
@@ -467,7 +467,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             # the dummy request can be reused
             openai_request = CompletionRequest(model=self.model_name,
                                                prompt=dummy_request["prompt"])
-            server, info = await self.gen_router.get_next_server(openai_request)
+            server, info = await self.gen_router.get_next_server(
+                openai_request, collect_routing_info=True)
             first_match = info["matches"][0]
             logger.info(f"Matched blocks: {first_match}")
             assert first_match > 0
@@ -497,7 +498,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             assert has_evicted
 
             # the dummy request's reusable length decreases after eviction
-            server, info = await self.gen_router.get_next_server(openai_request)
+            server, info = await self.gen_router.get_next_server(
+                openai_request, collect_routing_info=True)
             logger.info(
                 f"Matched blocks: {first_match} -> {info['matches'][0]}")
             assert info["matches"][0] < first_match

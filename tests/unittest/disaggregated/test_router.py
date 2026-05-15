@@ -430,6 +430,94 @@ async def test_kv_cache_aware_router_generation_keeps_score_priority() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kv_cache_aware_router_single_server_fast_path_skips_hashing(
+) -> None:
+    router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=1)
+    request = CompletionRequest(model="TinyLlama", prompt=list(range(101)))
+
+    with mock.patch.object(router,
+                           "_tokenize_and_compute_block_hashes",
+                           side_effect=AssertionError("should not hash")):
+        server, info = await router.get_next_server(request)
+
+    assert server == "server1"
+    assert info["routing_mode"] == "single_server_fastpath"
+    assert info["selected_server"] == "server1"
+    assert info["candidate_servers"] == ["server1"]
+    assert id(request) in router._req_routing_table
+    assert router._num_assigned_requests_by_server["server1"] == 1
+
+    await router.finish_request(request)
+    assert id(request) not in router._req_routing_table
+
+    await router.add_server("server2")
+    followup = CompletionRequest(model="TinyLlama", prompt=list(range(101)))
+    server, followup_info = await router.get_next_server(followup)
+    try:
+        assert server == "server2"
+        assert followup_info["unused_context_servers"] == ["server2"]
+        assert followup_info["selection_reason"] == "unused_context_server"
+    finally:
+        await router.finish_request(followup)
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_single_server_collects_route_info(
+) -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=1)
+    router._server_state["server1"].matched_tokens = mock.AsyncMock(
+        return_value=50)
+    request = CompletionRequest(model="TinyLlama", prompt=list(range(101)))
+
+    server, info = await router.get_next_server(request,
+                                                collect_routing_info=True)
+
+    assert server == "server1"
+    assert info["token_lists"] == [list(range(101))]
+    assert info["matches"] == [50]
+    assert info["unused_context_servers"] == []
+    assert info["selection_reason"] == "score"
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_single_server_collects_token_lists() -> None:
+    router = ConversationRouter(server_role=None,
+                                servers=["server1"],
+                                use_token_ids=False)
+    request = ChatCompletionRequest(model="TinyLlama",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello",
+                                    }])
+
+    def fake_tokenize(req: ChatCompletionRequest) -> list[list[int]]:
+        req.prompt_token_ids = [10, 20, 30]
+        return [[10, 20, 30]]
+
+    with mock.patch.object(router, "_request_to_block_hashes") as hash_mock, \
+            mock.patch.object(router, "_tokenize",
+                              side_effect=fake_tokenize) as tokenize_mock:
+        server, info = await router.get_next_server(request,
+                                                    collect_routing_info=True)
+
+    assert server == "server1"
+    assert request.prompt_token_ids == [10, 20, 30]
+    assert info["routing_mode"] == "single_server_topology"
+    assert info["token_lists"] == [[10, 20, 30]]
+    hash_mock.assert_not_called()
+    tokenize_mock.assert_called_once_with(request)
+    await router.finish_request(request)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("api_type", ["completion", "chat"])
 async def test_kv_cache_aware_router_multi_turn_conversation(
         api_type, mock_aiohttp_session):
@@ -777,6 +865,29 @@ async def test_conversation_router_session_affinity_and_fallbacks():
     s, _ = await router.get_next_server(req)
     assert s != orig and s in router.servers
     await router.finish_request(req)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_single_server_fast_path_preserves_explicit_session(
+) -> None:
+    router = ConversationRouter(server_role=None, servers=["server1"])
+    request = _make_request(conversation_id="sess-A")
+
+    with mock.patch.object(router,
+                           "_request_to_block_hashes",
+                           side_effect=AssertionError("should not hash")):
+        server, info = await router.get_next_server(request)
+
+    assert server == "server1"
+    assert info["routing_mode"] == "single_server_fastpath"
+    assert router._session_table["sess-A"][0] == "server1"
+    await router.finish_request(request)
+
+    await router.add_server("server2")
+    followup = _make_request(conversation_id="sess-A")
+    server, _ = await router.get_next_server(followup)
+
+    assert server == "server1"
 
 
 @pytest.mark.asyncio

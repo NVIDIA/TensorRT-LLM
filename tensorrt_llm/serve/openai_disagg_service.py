@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 import asyncio
 import json
 import os
-from typing import Any, AsyncGenerator, Callable, Dict, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Optional, cast
 
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
@@ -191,14 +191,24 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
-            ctx_server, _ = await self._ctx_router.get_next_server(
-                ctx_req, exclude_server=gen_server
+            ctx_server, ctx_route_info = await self._ctx_router.get_next_server(
+                ctx_req,
+                exclude_server=gen_server,
+                collect_routing_info=True,
+            )
+            ctx_prompt_token_ids = self._apply_prompt_token_ids_from_routing_info(
+                ctx_req, ctx_route_info
             )
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
-            gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+            gen_req = self._get_gen_request(
+                request,
+                ctx_response,
+                disagg_request_id,
+                ctx_prompt_token_ids=ctx_prompt_token_ids,
+            )
         else:
             # Clear synthetic disaggregated_params that may have been
             # injected by _extract_conversation_id (e.g. from the
@@ -252,6 +262,34 @@ class OpenAIDisaggregatedService(OpenAIService):
             return request.disaggregated_params.conversation_id
         return None
 
+    @staticmethod
+    def _is_token_id_list(value: object) -> bool:
+        return isinstance(value, list) and all(isinstance(token_id, int) for token_id in value)
+
+    @staticmethod
+    def _apply_prompt_token_ids_from_routing_info(
+        request: UCompletionRequest, routing_info: Optional[dict[str, Any]]
+    ) -> Optional[list[int]]:
+        if not routing_info:
+            return None
+        token_lists = routing_info.get("token_lists")
+        if not isinstance(token_lists, list) or not token_lists:
+            return None
+
+        prompt_token_ids = token_lists[0]
+        if isinstance(request, ChatCompletionRequest):
+            if OpenAIDisaggregatedService._is_token_id_list(prompt_token_ids):
+                token_id_list = cast(list[int], prompt_token_ids)
+                request.prompt_token_ids = token_id_list
+                return token_id_list
+        elif isinstance(request, CompletionRequest):
+            request.prompt = token_lists if len(token_lists) > 1 else prompt_token_ids
+            if len(token_lists) == 1 and OpenAIDisaggregatedService._is_token_id_list(
+                prompt_token_ids
+            ):
+                return cast(list[int], prompt_token_ids)
+        return None
+
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
@@ -275,6 +313,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_response: Optional[UCompletionResponse],
         disagg_request_id: Optional[int],
         ctx_server_info: Optional[dict] = None,
+        ctx_prompt_token_ids: Optional[list[int]] = None,
     ) -> UCompletionRequest:
         conversation_id = self._get_conversation_id(request)
         if ctx_response:
@@ -282,11 +321,21 @@ class OpenAIDisaggregatedService(OpenAIService):
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.conversation_id = conversation_id
-            # Replace the string prompt with prompt_tokens_ids
-            if isinstance(request, CompletionRequest):
-                request.prompt = ctx_response.prompt_token_ids
-            elif isinstance(request, ChatCompletionRequest):
-                request.prompt_token_ids = ctx_response.prompt_token_ids
+            # Replace the string prompt with prompt_token_ids.  Chat CTX
+            # responses may omit prompt_token_ids, so fall back to the router
+            # tokenization result when it is available.
+            prompt_token_ids = (
+                ctx_response.prompt_token_ids
+                if ctx_response.prompt_token_ids is not None
+                else ctx_prompt_token_ids
+            )
+            if prompt_token_ids is not None:
+                if isinstance(request, CompletionRequest):
+                    request.prompt = prompt_token_ids
+                elif isinstance(request, ChatCompletionRequest) and self._is_token_id_list(
+                    prompt_token_ids
+                ):
+                    request.prompt_token_ids = cast(list[int], prompt_token_ids)
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
@@ -296,6 +345,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                 schedule_style=self._schedule_style,
                 conversation_id=conversation_id,
             )
+            if ctx_prompt_token_ids is not None:
+                if isinstance(request, CompletionRequest):
+                    request.prompt = ctx_prompt_token_ids
+                elif isinstance(request, ChatCompletionRequest):
+                    request.prompt_token_ids = ctx_prompt_token_ids
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
             if disaggregated_params:
@@ -311,12 +365,16 @@ class OpenAIDisaggregatedService(OpenAIService):
         request.disaggregated_params.disagg_request_id = disagg_request_id
         return request
 
-    async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
+    async def _check_conditional_disagg(
+        self, request: UCompletionRequest
+    ) -> tuple[Optional[str], bool]:
         if self.conditional_disagg_config:
             assert isinstance(self._gen_router, KvCacheAwareRouter)
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
-            gen_server, info = await self._gen_router.get_next_server(request)
+            gen_server, info = await self._gen_router.get_next_server(
+                request, collect_routing_info=True
+            )
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
             if (
@@ -469,16 +527,23 @@ class OpenAIDisaggregatedService(OpenAIService):
         need_ctx = not (await self._check_gen_only_disagg(request))
         ctx_server, gen_server = None, None
         ctx_server_info = None
+        ctx_prompt_token_ids = None
         ctx_req, gen_req = None, None
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
         if need_ctx:
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                ctx_req, collect_routing_info=True
+            )
+            ctx_prompt_token_ids = self._apply_prompt_token_ids_from_routing_info(
+                ctx_req, ctx_server_info
+            )
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,
             disagg_request_id=disagg_request_id,
             ctx_server_info=ctx_server_info,
+            ctx_prompt_token_ids=ctx_prompt_token_ids,
         )
 
         if request.stream and need_ctx:
