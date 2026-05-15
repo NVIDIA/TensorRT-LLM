@@ -94,6 +94,8 @@ class Eagle3Attention(Attention):
                 fused_weight_shard_indices_mapping=qkv_shard_indices_mapping,
             )
 
+        self.sliding_window = getattr(config, "sliding_window", None)
+
 
 class Eagle3MLAttention(MLA):
     """
@@ -191,6 +193,11 @@ class Eagle3DecoderLayer(DecoderLayer):
             self.self_attn = Eagle3Attention(model_config, layer_idx,
                                              self._next_layer_regular)
 
+        attention_window_size = getattr(self.self_attn, "sliding_window", None)
+        self._attn_kwargs = {}
+        if attention_window_size is not None:
+            self._attn_kwargs["attention_window_size"] = attention_window_size
+
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp
         else:
@@ -244,6 +251,7 @@ class Eagle3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            **self._attn_kwargs,
         )
 
         hidden_states, residual = self.post_attention_layernorm(
