@@ -555,6 +555,18 @@ def get_model_yaml_config(model_label: str,
             moe_config = base_config.setdefault('moe_config', {})
             moe_config.setdefault('backend', 'DEEPGEMM')
 
+    # RTX PRO 6000 Blackwell desktop / Server Edition (SM120/121) lacks the
+    # NVSwitch fabric that healthy MNNVL/NVLink-allreduce paths assume. With
+    # enable_attention_dp=True the qwen3_235b_a22b_fp8 ep:8 case falls back
+    # to a DeepEP-LowLatency all-to-all that stalls / runs slow enough to hit
+    # the perf-test timeout on this hardware. H100/H200/B200 run the same
+    # config fine, so only override on SM120/121.
+    label_lower = model_label.lower()
+    if (_get_sm_version_safe() in (120, 121)
+            and 'qwen3_235b_a22b_fp8' in label_lower and 'ep:8' in label_lower
+            and 'gpus:8' in label_lower):
+        base_config['enable_attention_dp'] = False
+
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
         # Derive the requested number of adapters from model_label (segment like "loras:X")
