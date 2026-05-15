@@ -272,7 +272,7 @@ def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
 # ---------------------------------------------------------------------------
 
 
-def _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=4):
+def _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=4, enable_block_reuse=False):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
     linear-attention pool sizing path."""
@@ -280,11 +280,8 @@ def _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=4):
     mamba_mask = [True, False]
     attn_mask = [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
-    # Disable block reuse: our fix's +1/+max_draft_len addition lives on the
-    # non-reuse branch; when block reuse is on, max_snapshots is overridden
-    # to max_tokens // mamba_state_cache_interval. Cap max_tokens to keep
-    # the real C++ pool allocation tiny.
-    kv_cache_config = KvCacheConfig(max_tokens=512, enable_block_reuse=False)
+    # Cap max_tokens to keep the real C++ pool allocation tiny.
+    kv_cache_config = KvCacheConfig(max_tokens=512, enable_block_reuse=enable_block_reuse)
     return CppMambaHybridCacheManager(
         mamba_d_state=8,
         mamba_d_conv=4,
@@ -340,6 +337,27 @@ def test_cpp_hybrid_recurrent_pool_reserves_draft_len_sentinel_slots():
         f"recurrent-state pool has {recurrent_primary} slots, "
         f"need >= max_batch_size + 1 + max_draft_len = {expected_min} so "
         f"per-draft-len sentinels don't collide with live state"
+    )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
+    """With block reuse enabled, the block-reuse branch must not drop the
+    live-state + CUDA-graph-padding floor.
+
+    With max_batch_size=4, mamba_state_cache_interval=256, max_tokens=512:
+      naive: max_snapshots = 512 // 256 = 2  (drops live-state floor!)
+      fixed: max_snapshots = max(2, 4 + 1) = 5
+    """
+    max_batch_size = 4
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=None, max_batch_size=max_batch_size, enable_block_reuse=True
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    assert recurrent_primary >= max_batch_size + 1, (
+        f"recurrent-state pool has {recurrent_primary} slots with block reuse enabled, "
+        f"need >= max_batch_size + 1 = {max_batch_size + 1} to prevent the padding "
+        f"sentinel from evicting live recurrent state"
     )
 
 
