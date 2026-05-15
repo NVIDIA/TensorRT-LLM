@@ -710,7 +710,10 @@ def main():
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
-                f'export pytestCommandDisaggServer="{ucx_tls_cmd} $SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
+                (
+                    f'export pytestCommandDisaggServer="{ucx_tls_cmd}'
+                    ' $SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"'
+                ),
                 (
                     f'export pytestCommandBenchmark="{ucx_tls_cmd} $BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
