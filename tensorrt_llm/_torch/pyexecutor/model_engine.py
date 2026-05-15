@@ -1046,7 +1046,35 @@ class PyTorchModelEngine(ModelEngine):
                 logger.warning(
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
+                # If the OOM aborted the forward between dispatch() and
+                # combine(), the MoE A2A state machines are stuck in
+                # ``dispatched`` and the next warmup will hit
+                # ``dispatch called twice``. Reset them before retrying a
+                # smaller shape.
+                self._reset_moe_alltoall_state()
                 torch.cuda.empty_cache()
+
+    def _reset_moe_alltoall_state(self) -> None:
+        """Reset all MoE all-to-all state machines reachable from ``self.model``.
+
+        Each MoE backend keeps a small dispatch/combine phase state per layer
+        (``MoeAlltoAll`` or ``NVLinkOneSided``). A forward that calls
+        ``dispatch`` but raises before reaching ``combine`` (e.g., a warmup
+        OOM mid-MoE) leaves that state in ``dispatched``, which fails the
+        invariant on the next ``dispatch`` call. This helper walks the model
+        and resets any A2A state found, so subsequent forwards start clean.
+        """
+        for module in self.model.modules():
+            for attr_name in ("moe_a2a", "comm"):
+                obj = getattr(module, attr_name, None)
+                reset = getattr(obj, "reset_state", None)
+                if callable(reset):
+                    try:
+                        reset()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            f"Failed to reset MoE A2A state on {type(module).__name__}.{attr_name}: {e}"
+                        )
 
     def _run_attention_warmup(self,
                               resource_manager: ResourceManager,
