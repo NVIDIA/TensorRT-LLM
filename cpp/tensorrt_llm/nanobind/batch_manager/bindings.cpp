@@ -407,9 +407,7 @@ void initBindings(nb::module_& m)
         .def_rw("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_rw("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
         .def_rw("logits", &tb::DecoderInputBuffers::logits)
-        .def_rw("decoder_requests", &tb::DecoderInputBuffers::decoderRequests)
-        .def_rw("gathered_beam_tokens_for_callback",
-            &tb::DecoderInputBuffers::gatheredBeamTokensForCallback);
+        .def_rw("decoder_requests", &tb::DecoderInputBuffers::decoderRequests);
 
     nb::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
         .def_rw("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)

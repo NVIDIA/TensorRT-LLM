@@ -22,7 +22,6 @@
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/batch_manager/gatherBeamTokens.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
@@ -122,12 +121,4 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             nb::arg("logits_type"), nb::arg("decoder_input_buffers"), nb::arg("decoder_state"),
             nb::arg("runtime_stream"), nb::arg("decoder_stream"), nb::arg("max_sequence_length"), nb::arg("beam_width"))
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
-
-    m.def("build_gathered_beam_tokens_for_callback",
-        &buildGatheredBeamTokensForCallback,
-        nb::arg("input_buffers"),
-        nb::arg("decoder_state"),
-        nb::arg("buffer_manager"),
-        nb::call_guard<nb::gil_scoped_release>(),
-        "Reconstruct coherent per-beam token histories by tracing parentIds.");
 }

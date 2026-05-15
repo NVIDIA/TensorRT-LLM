@@ -54,8 +54,7 @@ set(SRCS
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp
-    cacheTransBuffer.cpp
-    gatherBeamTokens.cpp)
+    cacheTransBuffer.cpp)
 
 file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
