@@ -27,6 +27,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
+from tensorrt_llm import commands
 from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
 
@@ -677,7 +678,22 @@ class AggrTestCmds(NamedTuple):
 
     def get_server_logs(self, server_idx) -> List[str]:
         server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
-        return [server_file_path]
+        server_logs = [server_file_path]
+        # Include the SLURM-level aggregated server log (written by slurm_launch_draft.sh)
+        aggr_server_log = os.path.join(self.output_dir, "aggr_server.log")
+        server_logs.append(aggr_server_log)
+        return server_logs
+
+    def collect_logs(self) -> None:
+        """Copy SLURM-level logs from output_dir to test_output_dir for artifact collection."""
+        log_files = [os.path.join(self.output_dir, "aggr_server.log")]
+        log_files.append(os.path.join(self.output_dir, "job-output.log"))
+        log_files.extend(glob.glob(os.path.join(self.output_dir, "slurm-*.out")))
+        for src in log_files:
+            if os.path.exists(src):
+                dst = os.path.join(self.test_output_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                print_info(f"Collected log: {src} -> {dst}")
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs."""
@@ -878,6 +894,20 @@ class DisaggTestCmds(NamedTuple):
         server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
         return server_logs
 
+    def collect_logs(self) -> None:
+        """Copy SLURM-level logs from output_dir to test_output_dir for artifact collection."""
+        log_files = []
+        for i in range(self.num_ctx_servers):
+            log_files.append(os.path.join(self.output_dir, f"ctx_server_{i}.log"))
+        for i in range(self.num_gen_servers):
+            log_files.append(os.path.join(self.output_dir, f"gen_server_{i}.log"))
+        log_files.append(os.path.join(self.output_dir, "disagg_server.log"))
+        for src in log_files:
+            if os.path.exists(src):
+                dst = os.path.join(self.test_output_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                print_info(f"Collected log: {src} -> {dst}")
+
     @staticmethod
     def _wait_for_config_file(config_path: str, timeout: int = 600) -> None:
         """Wait for a config file to be written by the primary (_0) worker."""
@@ -919,9 +949,11 @@ class DisaggTestCmds(NamedTuple):
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
                 with open(server_file_path, "w") as server_ctx:
+                    server_env = copy.deepcopy(os.environ)
+                    server_env["TLLM_WORKER_LOG_FILE"] = server_file_path
                     server_proc = subprocess.Popen(
                         server_cmd,
-                        env=copy.deepcopy(os.environ),
+                        env=server_env,
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
                     )
@@ -940,9 +972,11 @@ class DisaggTestCmds(NamedTuple):
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
                 with open(disagg_server_file_path, "w") as disagg_server_ctx:
+                    disagg_env = copy.deepcopy(os.environ)
+                    disagg_env["TLLM_WORKER_LOG_FILE"] = disagg_server_file_path
                     disagg_server_proc = subprocess.Popen(
                         disagg_cmd,
-                        env=copy.deepcopy(os.environ),
+                        env=disagg_env,
                         stdout=disagg_server_ctx,
                         stderr=subprocess.STDOUT,
                     )
@@ -1577,6 +1611,9 @@ class PerfSanityTestConfig:
                     error_msg=e,
                     log_files=commands.get_server_logs(server_idx),
                 )
+            finally:
+                # Copy SLURM-level logs to test_output_dir for artifact collection
+                commands.collect_logs()
 
         return outputs
 

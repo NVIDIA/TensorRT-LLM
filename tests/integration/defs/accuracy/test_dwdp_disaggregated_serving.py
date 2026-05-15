@@ -204,7 +204,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "max_batch_size": 16,
             "max_num_tokens": 8192,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4,
+                "free_gpu_memory_fraction": 0.23,
                 "enable_block_reuse": False,
                 "enable_partial_reuse": False,
                 "tokens_per_block": 32,
@@ -236,7 +236,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "max_batch_size": 128,
             "max_num_tokens": 1024,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
+                "free_gpu_memory_fraction": 0.33,
                 "enable_block_reuse": False,
                 "enable_partial_reuse": False,
                 "tokens_per_block": 32,
