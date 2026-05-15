@@ -345,6 +345,7 @@ class Attention(nn.Module):
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
+        logits_soft_cap: Optional[float] = None,
     ):
         """
         Initialize the Attention module.
@@ -404,6 +405,7 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+        self.logits_soft_cap = logits_soft_cap
         self.attn_output_gate = attn_output_gate
 
         if self.attn_output_gate:
@@ -538,6 +540,15 @@ class Attention(nn.Module):
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
+
+        # Only the FlashInfer backend currently wires logits_soft_cap into the
+        # attention kernel call; other backends would silently drop the value.
+        if (self.logits_soft_cap is not None
+                and self.attn_backend != "FLASHINFER"):
+            logger.warning_once(
+                f"logits_soft_cap is set but attention backend is {self.attn_backend!r}; "
+                "only FLASHINFER currently honors logits_soft_cap. The value will be ignored.",
+                key="logits_soft_cap_unsupported_backend")
 
         # Resolve target_sparsity → threshold_scale_factor if needed
         sparse_attn_cfg = config.sparse_attention_config
@@ -752,6 +763,7 @@ class Attention(nn.Module):
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
+                    logits_soft_cap=self.logits_soft_cap,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -791,6 +803,7 @@ class Attention(nn.Module):
                 output=output[:num_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
+                logits_soft_cap=self.logits_soft_cap,
             ))
         if isinstance(attn_output, tuple):
             assert len(

@@ -46,6 +46,7 @@ class PlanParams:
     attention_mask_data: Optional[torch.Tensor] = None
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
+    logits_soft_cap: Optional[float] = None
 
 
 @dataclass(kw_only=True)
@@ -378,6 +379,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             max_sequence_kv=max_key_value_tokens_per_sequence,
             v_indptr=key_value_element_indptr,
             o_indptr=query_output_element_indptr,
+            logits_soft_cap=plan_params.logits_soft_cap or 0.0,
         )
 
     def prepare(self) -> None:
@@ -627,7 +629,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
              q_scaling: Optional[float] = None,
              attention_window_size: Optional[int] = None,
              attention_mask_data: Optional[torch.Tensor] = None,
-             flashinfer_backend: str = "fa2") -> PlanParams:
+             flashinfer_backend: str = "fa2",
+             logits_soft_cap: Optional[float] = None) -> PlanParams:
 
         sm_scale = None
         if q_scaling is not None:
@@ -643,7 +646,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             window_left=attention_window_size
             if attention_window_size is not None else -1,
             attention_mask_type=AttentionMaskType(attention_mask_type),
-            attention_mask_data=attention_mask_data)
+            attention_mask_data=attention_mask_data,
+            logits_soft_cap=logits_soft_cap)
         return self._plan_with_params(plan_params, flashinfer_backend)
 
     def _use_tensor_cores(self, plan_params: PlanParams):
@@ -735,6 +739,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 kv_data_type=plan_params.kv_dtype,
                 o_data_type=o_dtype,
                 custom_mask=plan_params.attention_mask_data,
+                logits_soft_cap=plan_params.logits_soft_cap or 0.0,
             )
 
         if plan_params in self._plan_params_to_wrappers:
@@ -778,6 +783,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 o_data_type=o_dtype,
+                logits_soft_cap=plan_params.logits_soft_cap or 0.0,
             )
 
         # Must sync after append_paged_kv_cache and before plan.
@@ -837,6 +843,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         output: torch.Tensor,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_window_size: Optional[int] = None,
+        logits_soft_cap: Optional[float] = None,
     ) -> None:
         # Query
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -861,6 +868,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_window_size=attention_window_size,
                 attention_mask_type=attention_mask_type,
                 attention_mask_data=attention_mask_data,
+                logits_soft_cap=logits_soft_cap,
             )
             wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
             # cuDNN's ragged prefill kernel assumes contiguous NHD tensors.
@@ -971,7 +979,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     attention_window_size=None,
                     attention_mask_type=int(AttentionMaskType.causal),
                     attention_mask_data=None,
-                    flashinfer_backend=self.flashinfer_backend)
+                    flashinfer_backend=self.flashinfer_backend,
+                    logits_soft_cap=logits_soft_cap)
                 decode_forward(decode_plan_params, output[num_ctx_tokens:, :])
 
         else:
@@ -995,7 +1004,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_window_size=attention_window_size,
                 attention_mask_type=effective_mask_type,
                 attention_mask_data=effective_mask_data,
-                flashinfer_backend=self.flashinfer_backend)
+                flashinfer_backend=self.flashinfer_backend,
+                logits_soft_cap=logits_soft_cap)
 
             if num_contexts == 0:
                 decode_forward(plan_params, output)
@@ -1013,6 +1023,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        logits_soft_cap = forward_args.logits_soft_cap
 
         attention_mask_data = forward_args.attention_mask_data
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
@@ -1046,5 +1057,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                           attention_mask_type=attention_mask_type,
                           attention_mask_data=attention_mask_data,
                           attention_window_size=attention_window_size,
+                          logits_soft_cap=logits_soft_cap,
                           output=output)
         return output

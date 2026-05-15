@@ -730,6 +730,8 @@ class AttentionForwardArgs:
     topk_indices: Optional[torch.Tensor] = None
     is_generation: bool = False
 
+    logits_soft_cap: Optional[float] = None
+
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
     AttentionForwardArgs.__dataclass_fields__)
