@@ -45,7 +45,7 @@ class MetricsCollector:
             trtllm_prompt_tokens_total
             trtllm_generation_tokens_total
             trtllm_prompt_cached_tokens_total
-            trtllm_prompt_cached_tokens
+            trtllm_prompt_cached_tokens_per_request
             trtllm_spec_decode_drafted_tokens_total
             trtllm_spec_decode_accepted_tokens_total
             trtllm_prefill_perplexity
@@ -418,7 +418,7 @@ class MetricsCollector:
             documentation="Total prompt tokens served from KV cache.",
             labelnames=self.labels.keys())
         self.histogram_tokens_cached_prompt = Histogram(
-            name=self.metric_prefix + "prompt_cached_tokens",
+            name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
             buckets=[0, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
             labelnames=self.labels.keys())
