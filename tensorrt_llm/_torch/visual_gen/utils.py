@@ -96,7 +96,7 @@ class SequenceSharder:
 
         size = vgm.seq_size
         rank = vgm.seq_rank
-        group = vgm.seq_group
+        group = vgm.seq_group()
 
         if size > 1 and group is None:
             raise ValueError(
@@ -204,23 +204,25 @@ class SequenceSharder:
         self,
         rope: Optional[Tuple[torch.Tensor, torch.Tensor]],
         seq_len: int,
+        *,
+        seq_dim: int,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Shard a ``(cos, sin)`` RoPE pair along whichever axis equals ``seq_len``.
+        """Shard a ``(cos, sin)`` RoPE pair along its sequence axis.
 
-        Handles both ``[B, S, D]`` (dim 1) and ``[B, H, S, D]`` (dim 2)
-        RoPE layouts that occur across visual_gen models.  Returns the
-        pair unchanged when the seq axis cannot be inferred unambiguously
-        (e.g. ``seq_len == head_dim``); callers can fall back to explicit
-        ``shard(..., dim=...)`` calls in that case.
+        Callers must pass ``seq_dim`` explicitly based on the known RoPE
+        layout at the call site.
         """
         if rope is None or not self.is_active:
             return rope
 
         cos, sin = rope
-        candidates = [d for d, n in enumerate(cos.shape) if n == seq_len]
-        if len(candidates) != 1:
-            return rope
-        d = candidates[0]
+        d = seq_dim if seq_dim >= 0 else cos.ndim + seq_dim
+        if d < 0 or d >= cos.ndim:
+            raise ValueError(f"seq_dim ({seq_dim}) is out of range for RoPE ndim ({cos.ndim}).")
+        if cos.shape[d] != seq_len:
+            raise ValueError(
+                f"RoPE seq_dim ({d}) has size {cos.shape[d]}, expected seq_len ({seq_len})."
+            )
         return (self.shard(cos, dim=d), self.shard(sin, dim=d))
 
     # ------------------------------------------------------------------

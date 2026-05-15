@@ -150,7 +150,18 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     # ------------------------------------------------------------------
     def build_mesh(self):
         cls = DeviceMeshTopologyImpl
+        expected_shape = tuple(self._dim_sizes[d] for d in self._dim_names)
         if cls.device_mesh is not None:
+            cached_dim_names = tuple(cls.device_mesh.mesh_dim_names)
+            cached_shape = tuple(int(x) for x in cls.device_mesh.mesh.shape)
+            if cached_dim_names != self._dim_names or cached_shape != expected_shape:
+                raise RuntimeError(
+                    "VisualGenMapping.build_mesh reusing incompatible cached device_mesh: "
+                    f"cached dims={cached_dim_names}, shape={cached_shape}; "
+                    f"requested dims={self._dim_names}, shape={expected_shape}. "
+                    "Create a mesh cache keyed by (dim_names, dim_sizes) or reset "
+                    "DeviceMeshTopologyImpl.device_mesh before constructing a different topology."
+                )
             return
 
         shape = tuple(self._dim_sizes[d] for d in self._dim_names)
@@ -391,7 +402,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     @property
     def vae_adj_groups(self) -> list[Optional[ProcessGroup]]:
         return self._vae_adj_groups
-    
+
     def seq_group(self) -> Optional[ProcessGroup]:
         """Process group spanning (cp × ulysses) for combined sequence-axis sharding."""
         cls = DeviceMeshTopologyImpl

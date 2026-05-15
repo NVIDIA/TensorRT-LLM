@@ -215,10 +215,12 @@ class ParallelConfig(StrictBaseModel):
         """
         attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
         if attn2d_size > 1:
-            return attn2d_size
-        if self.dit_ring_size > 1:
-            return self.dit_ring_size
-        return self.dit_ulysses_size
+            cp_size = attn2d_size
+        elif self.dit_ring_size > 1:
+            cp_size = self.dit_ring_size
+        else:
+            cp_size = 1
+        return cp_size * self.dit_ulysses_size
 
     @property
     def n_workers(self) -> int:

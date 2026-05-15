@@ -106,6 +106,8 @@ class PipelineLoader:
         if self.args is not None:
             ws = dist.get_world_size() if dist.is_initialized() else 1
             rk = dist.get_rank() if dist.is_initialized() else 0
+            # NOTE: Might need to instantiate multiple VisualGenMapping in the future to
+            # handle different parallelism strategies for different models/pipelines.
             vgm = VisualGenMapping(
                 ws,
                 rk,

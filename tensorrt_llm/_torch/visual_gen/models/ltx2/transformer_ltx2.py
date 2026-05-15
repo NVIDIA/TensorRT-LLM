@@ -833,6 +833,8 @@ class LTXModel(nn.Module):
             vgm,
             num_attention_heads=num_attention_heads if model_type.is_video_enabled() else None,
         )
+        self._cp_size = vgm.cp_size if vgm is not None else 1
+        self._ulysses_size = vgm.ulysses_size if vgm is not None else 1
         if (
             self._sharder.is_active
             and vgm is not None
@@ -1147,14 +1149,27 @@ class LTXModel(nn.Module):
         """
         seq_len = args.x.shape[1]
         sh = self._sharder
+        pe_seq_dim = (
+            2
+            if args.positional_embeddings is not None and args.positional_embeddings[0].ndim == 4
+            else 1
+        )
+        cross_pe_seq_dim = (
+            2
+            if args.cross_positional_embeddings is not None
+            and args.cross_positional_embeddings[0].ndim == 4
+            else 1
+        )
         return replace(
             args,
             x=sh.shard(args.x, dim=1),
             timesteps=sh.shard(args.timesteps, dim=1, expected_seq_len=seq_len),
             embedded_timestep=sh.shard(args.embedded_timestep, dim=1, expected_seq_len=seq_len),
-            positional_embeddings=sh.shard_rope(args.positional_embeddings, seq_len=seq_len),
+            positional_embeddings=sh.shard_rope(
+                args.positional_embeddings, seq_len=seq_len, seq_dim=pe_seq_dim
+            ),
             cross_positional_embeddings=sh.shard_rope(
-                args.cross_positional_embeddings, seq_len=seq_len
+                args.cross_positional_embeddings, seq_len=seq_len, seq_dim=cross_pe_seq_dim
             ),
             cross_scale_shift_timestep=sh.shard(
                 args.cross_scale_shift_timestep, dim=1, expected_seq_len=seq_len
@@ -1177,7 +1192,15 @@ class LTXModel(nn.Module):
             self._audio_is_sharded = False
             return
 
-        self._audio_is_sharded = audio_seq_len % self._sharder.size == 0
+        is_divisible = (audio_seq_len % self._sharder.size) == 0
+        if not is_divisible and self._cp_size > 1 and self._ulysses_size == 1:
+            raise ValueError(
+                f"audio_seq_len ({audio_seq_len}) must be divisible by seq_size "
+                f"({self._sharder.size}) when CP is active without Ulysses "
+                "(Ring/Attention2D has no plain-attention fallback)."
+            )
+
+        self._audio_is_sharded = is_divisible
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
             target._audio_is_sharded = self._audio_is_sharded

@@ -121,7 +121,7 @@ class TestConstruction:
     def test_parallel_vae_size_cannot_exceed_world_size(self):
         with pytest.raises(ValueError, match="cannot exceed world_size"):
             VisualGenMapping(world_size=1, rank=0, parallel_vae_size=2)
-    
+
     def test_internal_dim_order(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
         assert vgm._dim_names == ("cfg", "tp", "cp", "ulysses")
@@ -390,6 +390,70 @@ def _logic_vae_group_full_world_cfg2_ulysses2(rank, world_size):
     )
 
 
+def _logic_cfg2_ring2_ulysses2(rank, world_size):
+    """Validate combined CFG+Ring+Ulysses topology on 8 GPUs.
+
+    Layout (cfg-tp-cp-ulysses) with cfg=2, tp=1, cp(ring)=2, ulysses=2:
+        rank = cfg * 4 + cp * 2 + ulysses
+    """
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    DeviceMeshTopologyImpl.device_mesh = None
+    VisualGenMapping.seq_mesh = None
+
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        cfg_size=2,
+        ring_size=2,
+        ulysses_size=2,
+    )
+
+    assert world_size == 8
+    expected_cfg_rank = rank // 4
+    expected_cp_rank = (rank // 2) % 2
+    expected_ulysses_rank = rank % 2
+    expected_seq_rank = expected_cp_rank * 2 + expected_ulysses_rank
+
+    assert vgm.cfg_rank == expected_cfg_rank
+    assert vgm.cp_rank == expected_cp_rank
+    assert vgm.ring_rank == expected_cp_rank
+    assert vgm.ulysses_rank == expected_ulysses_rank
+    assert vgm.seq_rank == expected_seq_rank
+    assert vgm.seq_size == 4
+
+    assert vgm.cfg_group is not None
+    assert vgm.cp_group is not None
+    assert vgm.ring_group is not None
+    assert vgm.ulysses_group is not None
+    assert vgm.seq_group() is not None
+
+    assert dist.get_world_size(vgm.cfg_group) == 2
+    assert dist.get_world_size(vgm.cp_group) == 2
+    assert dist.get_world_size(vgm.ring_group) == 2
+    assert dist.get_world_size(vgm.ulysses_group) == 2
+    assert dist.get_world_size(vgm.seq_group()) == 4
+
+    device = torch.device(f"cuda:{rank}")
+    one = torch.ones(1, device=device)
+
+    x = one.clone()
+    dist.all_reduce(x, group=vgm.cfg_group)
+    assert x.item() == 2.0, f"Rank {rank}: cfg all_reduce expected 2, got {x.item()}"
+
+    x = one.clone()
+    dist.all_reduce(x, group=vgm.cp_group)
+    assert x.item() == 2.0, f"Rank {rank}: cp all_reduce expected 2, got {x.item()}"
+
+    x = one.clone()
+    dist.all_reduce(x, group=vgm.ulysses_group)
+    assert x.item() == 2.0, f"Rank {rank}: ulysses all_reduce expected 2, got {x.item()}"
+
+    x = one.clone()
+    dist.all_reduce(x, group=vgm.seq_group())
+    assert x.item() == 4.0, f"Rank {rank}: seq all_reduce expected 4, got {x.item()}"
+
+
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
@@ -407,3 +471,6 @@ class TestMultiGPU:
 
     def test_vae_group_full_world_cfg2_ulysses2(self):
         _run_multi_gpu(4, _logic_vae_group_full_world_cfg2_ulysses2)
+
+    def test_cfg2_ring2_ulysses2(self):
+        _run_multi_gpu(8, _logic_cfg2_ring2_ulysses2)

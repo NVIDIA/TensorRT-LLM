@@ -531,7 +531,9 @@ class RingAttention(AttentionBackend):
         if key == self._buf_key:
             return
         self._kv_bufs = k.new_empty(2, 2, B, S, H_kv, D)
-        self._out_buf = q.new_empty(B, S, H, D)
+        # Accumulate ring blocks in fp32 to avoid repeated bf16<->fp32 rounding
+        # across online-softmax merges
+        self._out_buf = q.new_empty(B, S, H, D, dtype=torch.float32)
         self._lse_buf = q.new_empty(B, S, H, dtype=torch.float32)
         self._buf_key = key
 
@@ -593,6 +595,8 @@ class RingAttention(AttentionBackend):
                 self._update_out_and_lse(out, lse, block_out, block_lse)
             if step < self.world_size - 1:
                 self._ring_wait()
+        if out.dtype != q.dtype:
+            return out.to(dtype=q.dtype)
         return out
 
     @property

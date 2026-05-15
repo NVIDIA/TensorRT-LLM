@@ -646,7 +646,7 @@ class WanTransformer3DModel(nn.Module):
         # Shard sequence + matching RoPE across ranks (no-op when sharder is inactive).
         seq_len = x.shape[1]
         x = self.sharder.shard(x, dim=1)
-        rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len)
+        rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
         if rope is not None:
             freqs_cos, freqs_sin = rope
 
