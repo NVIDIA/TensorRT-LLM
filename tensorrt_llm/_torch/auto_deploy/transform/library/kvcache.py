@@ -345,14 +345,6 @@ class _InsertCachedOperator(BaseTransform):
 class InsertCachedAttention(_InsertCachedOperator):
     """A transform to insert cached attention into the graph module."""
 
-    def _apply(self, *args, **kwargs):
-        if self.config.backend == "triton":
-            self._log_warning(
-                "'triton' backend only supports GREEDY sampling (top_k=1). "
-                "Please set top_k=1 in the sampling parameters to ensure cohesive output."
-            )
-        return super()._apply(*args, **kwargs)
-
 
 @TransformRegistry.register("insert_cached_mla_attention")
 class InsertCachedMLAAttention(_InsertCachedOperator):

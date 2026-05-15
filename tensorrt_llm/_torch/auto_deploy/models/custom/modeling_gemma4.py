@@ -244,7 +244,7 @@ SemanticMaskRegistry.register(
     torch.ops.auto_deploy.gemma4_multimodal_mask, "torch", _GEMMA4_MASK_SPEC
 )
 SemanticMaskRegistry.register(
-    torch.ops.auto_deploy.gemma4_multimodal_mask, "triton_paged", _GEMMA4_MASK_SPEC
+    torch.ops.auto_deploy.gemma4_multimodal_mask, "triton", _GEMMA4_MASK_SPEC
 )
 
 
