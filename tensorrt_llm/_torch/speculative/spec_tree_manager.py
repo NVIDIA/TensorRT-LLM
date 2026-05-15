@@ -234,6 +234,8 @@ class SpecTreeManager:
             return
         # index_fill_: graph-capture-safe (no fancy indexing).
         self.slot_has_tree.index_fill_(0, slot_ids[:count], True)
+        # CUDA graph padding may use the dummy slot; it must never carry a real tree.
+        self.slot_has_tree.narrow(0, self._dummy_slot_id, 1).fill_(False)
 
     def mark_tree_invalid(self, slot_id):
         """Clear validity when a slot is freed."""

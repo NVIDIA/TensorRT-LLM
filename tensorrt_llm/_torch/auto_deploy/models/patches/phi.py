@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Patch RotaryEmbedding implementations in Phi3/Phi4 models for torch.export compatibility.
 
@@ -17,6 +31,7 @@ to always use the `short_factor` path (removing dynamic updates).
 import math
 import re
 import types
+from collections.abc import Mapping
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -146,12 +161,25 @@ def _ensure_rope_scaling_type_key(config):
     Transformers 5.x uses ``"rope_type"`` instead of ``"type"`` in the
     rope_scaling / rope_parameters dict.  Copy ``rope_type`` → ``type``
     so both old and new code can read the dict.
+
+    On transformers>=5.5 ``rope_scaling`` may be a ``RopeParameters`` typed
+    mapping rather than a plain ``dict``; accept any ``Mapping`` so the
+    backfill still runs.
     """
     rope_scaling = getattr(config, "rope_scaling", None)
-    if isinstance(rope_scaling, dict) and "type" not in rope_scaling:
+    if isinstance(rope_scaling, Mapping) and "type" not in rope_scaling:
         rope_type = rope_scaling.get("rope_type")
         if rope_type is not None:
-            rope_scaling["type"] = rope_type
+            try:
+                rope_scaling["type"] = rope_type
+            except (TypeError, AttributeError):
+                # Immutable typed mapping; copy to a plain dict so callers can read "type".
+                new_scaling = dict(rope_scaling)
+                new_scaling["type"] = rope_type
+                try:
+                    config.rope_scaling = new_scaling
+                except (AttributeError, TypeError):
+                    pass
 
 
 def _clear_default_rope_scaling_for_custom_models(config):
@@ -170,6 +198,14 @@ def _clear_default_rope_scaling_for_custom_models(config):
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
         if rope_type == "default":
             config.rope_scaling = None
+            # transformers>=5.5 also exposes ``rope_parameters`` which aliases
+            # ``rope_scaling``; clear both so the model's ``_init_rope`` takes
+            # the non-scaling branch.
+            if hasattr(config, "rope_parameters"):
+                try:
+                    config.rope_parameters = None
+                except (AttributeError, TypeError):
+                    pass
 
 
 def get_model_from_config_patched(config, **kwargs):
