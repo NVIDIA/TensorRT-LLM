@@ -441,7 +441,7 @@ class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
 
-    def test_auto_dtype(self):
+    def test_auto_dtype(self) -> None:
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,

@@ -27,7 +27,7 @@ def _coerce_torch_dtype(dtype):
 
     HF configs may store dtype fields as torch dtypes, strings, or the sentinel
     value "auto". Returning None for "auto" lets the caller keep its normal
-    fallback path instead of treating "auto" as a concrete cache dtype.
+    fallback path instead of treating "auto" as a concrete dtype.
     """
     if isinstance(dtype, torch.dtype):
         return dtype
@@ -43,12 +43,14 @@ def resolve_hf_torch_dtype(config):
 
     Transformers has used both dtype and torch_dtype across versions and model
     families. This helper checks both names and coerces whichever one is present
-    into the form expected by TRT-LLM runtime code.
+    into the form expected by TRT-LLM runtime code. An "auto" value in any
+    field is treated the same as missing, so scanning continues to the next
+    field instead of stopping with None.
     """
     for attr in ("dtype", "torch_dtype"):
-        dtype = getattr(config, attr, None)
-        if dtype is not None:
-            return _coerce_torch_dtype(dtype)
+        coerced = _coerce_torch_dtype(getattr(config, attr, None))
+        if coerced is not None:
+            return coerced
     return None
 
 
@@ -58,7 +60,8 @@ def resolve_mamba_ssm_cache_dtype(config):
     Qwen3.5-style configs may store this field on the top-level config or the
     nested text_config, and may call it either mamba_ssm_cache_dtype or
     mamba_ssm_dtype. This helper centralizes that lookup so cache creation does
-    not fail later with a missing dtype.
+    not fail later with a missing dtype. An "auto" value in any field is
+    treated the same as missing.
     """
     configs = [config]
     text_config = getattr(config, "text_config", None)
@@ -67,9 +70,9 @@ def resolve_mamba_ssm_cache_dtype(config):
 
     for candidate_config in configs:
         for attr in ("mamba_ssm_cache_dtype", "mamba_ssm_dtype"):
-            dtype = getattr(candidate_config, attr, None)
-            if dtype is not None:
-                return _coerce_torch_dtype(dtype)
+            coerced = _coerce_torch_dtype(getattr(candidate_config, attr, None))
+            if coerced is not None:
+                return coerced
     return None
 
 
@@ -301,11 +304,11 @@ def extract_mamba_kv_cache_params(
             full_attn_mask.extend([True] * num_spec_layers)
             mamba_mask.extend([False] * num_spec_layers)
 
-    mamba_ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
-                             if quant_config is not None else None)
-    if mamba_ssm_cache_dtype is not None:
-        mamba_ssm_cache_dtype = _coerce_torch_dtype(mamba_ssm_cache_dtype)
-    else:
+    mamba_ssm_cache_dtype = None
+    if quant_config is not None:
+        mamba_ssm_cache_dtype = _coerce_torch_dtype(
+            quant_config.mamba_ssm_cache_dtype)
+    if mamba_ssm_cache_dtype is None:
         mamba_ssm_cache_dtype = (resolve_mamba_ssm_cache_dtype(config)
                                  or resolve_hf_torch_dtype(config)
                                  or torch.bfloat16)
