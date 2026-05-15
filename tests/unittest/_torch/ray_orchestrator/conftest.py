@@ -46,12 +46,18 @@ def _install_finegrained_fp8_stub():
         )
         x_grouped = x.reshape(-1, K // block_size, block_size).to(torch.float32)
         s = (x_grouped.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
-        qx = (x_grouped / s.unsqueeze(-1)).clamp(_FP8_MIN, _FP8_MAX).to(_FP8_DTYPE)
+        qx = (x_grouped / s.unsqueeze(-1)).clamp(_FP8_MIN,
+                                                 _FP8_MAX).to(_FP8_DTYPE)
         qx = qx.reshape(orig_shape)
         s = s.reshape(*orig_shape[:-1], K // block_size)
         return qx, s
 
-    def w8a8_fp8_matmul(A, B, As, Bs, block_size=None, output_dtype=torch.float32):
+    def w8a8_fp8_matmul(A,
+                        B,
+                        As,
+                        Bs,
+                        block_size=None,
+                        output_dtype=torch.float32):
         orig_A_shape = A.shape
         K = orig_A_shape[-1]
         N = B.shape[0]
@@ -66,7 +72,9 @@ def _install_finegrained_fp8_stub():
             block_n, block_k = block_size
             As_flat = As.reshape(M, K // block_k)
             Af = Af * As_flat.repeat_interleave(block_k, dim=-1)
-            Bs_exp = Bs.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=-1)
+            Bs_exp = Bs.repeat_interleave(block_n,
+                                          dim=0).repeat_interleave(block_k,
+                                                                   dim=-1)
             Bf = Bf * Bs_exp[:N, :K]
         else:
             As_t = As if torch.is_tensor(As) else torch.tensor(float(As))
@@ -85,8 +93,12 @@ def _install_finegrained_fp8_stub():
         C = Af @ Bf.t()
         return C.reshape(*orig_A_shape[:-1], N).to(output_dtype)
 
-    def w8a8_fp8_matmul_batched(input, weights, weight_scale_inv,
-                                block_size=None, expert_ids=None, output_dtype=None):
+    def w8a8_fp8_matmul_batched(input,
+                                weights,
+                                weight_scale_inv,
+                                block_size=None,
+                                expert_ids=None,
+                                output_dtype=None):
         output_dtype = output_dtype or input.dtype
         S, K = input.shape
         E, N, _ = weights.shape
@@ -95,22 +107,28 @@ def _install_finegrained_fp8_stub():
         selected_ws = weight_scale_inv[expert_ids]
         if block_size is not None:
             block_n, block_k = block_size
-            ws_exp = selected_ws.repeat_interleave(block_n, dim=-2).repeat_interleave(
-                block_k, dim=-1)
+            ws_exp = selected_ws.repeat_interleave(
+                block_n, dim=-2).repeat_interleave(block_k, dim=-1)
             selected_w = selected_w * ws_exp[:, :N, :K]
         else:
             if selected_ws.numel() == S:
-                selected_w = selected_w * selected_ws.reshape(S, 1, 1).to(torch.float32)
+                selected_w = selected_w * selected_ws.reshape(S, 1, 1).to(
+                    torch.float32)
             elif selected_ws.ndim == 3:
                 selected_w = selected_w * selected_ws.to(torch.float32)
             else:
                 selected_w = selected_w * float(selected_ws.flatten()[0])
-        out = torch.bmm(input_f.unsqueeze(1), selected_w.transpose(-1, -2)).squeeze(1)
+        out = torch.bmm(input_f.unsqueeze(1),
+                        selected_w.transpose(-1, -2)).squeeze(1)
         return out.to(output_dtype)
 
-    def w8a8_fp8_matmul_grouped(input, weights, weight_scale_inv,
-                                tokens_per_expert=None, block_size=None,
-                                offsets=None, output_dtype=None):
+    def w8a8_fp8_matmul_grouped(input,
+                                weights,
+                                weight_scale_inv,
+                                tokens_per_expert=None,
+                                block_size=None,
+                                offsets=None,
+                                output_dtype=None):
         output_dtype = output_dtype or input.dtype
         S, K = input.shape
         E, N, _ = weights.shape
@@ -157,8 +175,7 @@ def _install_finegrained_fp8_stub():
     # by raising ImportError up-front.
     def _patched_load_deepgemm_kernel():
         fg_fp8._deepgemm_available = False
-        raise ImportError(
-            "deepgemm disabled by ray_orchestrator conftest stub")
+        raise ImportError("deepgemm disabled by ray_orchestrator conftest stub")
 
     fg_fp8._load_triton_kernel = _patched_load_triton_kernel
     fg_fp8._load_deepgemm_kernel = _patched_load_deepgemm_kernel

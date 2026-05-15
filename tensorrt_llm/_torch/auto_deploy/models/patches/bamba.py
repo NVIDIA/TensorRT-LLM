@@ -157,9 +157,7 @@ def _bamba_mixer_torch_forward(
         # which is illegal at gm execution. Pre-allocate the host buffer on CPU
         # without pinning so the captured op is well-formed.
         _batch_info = BatchInfo(
-            batch_info_host=torch.zeros(
-                BatchInfo._NUM_ELEMENTS, dtype=torch.int, device="cpu"
-            )
+            batch_info_host=torch.zeros(BatchInfo._NUM_ELEMENTS, dtype=torch.int, device="cpu")
         )
         if seq_len == 1:
             _batch_info.update([0, 0, 0, 0, batch_size, batch_size])

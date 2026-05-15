@@ -15,9 +15,7 @@ from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 # requires updating the patch to mirror the upstream rewrite. Export + run +
 # state-dict validation still succeed on 5.5+; only the final numeric compare
 # is skipped pending follow-up.
-_TRANSFORMERS_PRE_5_5 = tuple(
-    int(x) for x in transformers.__version__.split(".")[:2]
-) < (5, 5)
+_TRANSFORMERS_PRE_5_5 = tuple(int(x) for x in transformers.__version__.split(".")[:2]) < (5, 5)
 
 # NOTE: find example inputs with the same tokenization length to avoid seq concat.
 EXAMPLE_INPUT = "Mamba is a snake with the following properties:"
