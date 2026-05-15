@@ -105,70 +105,15 @@ REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"
 // GPU types that don't support dynamic driver flashing
 REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
-// Infrastructure failure patterns that warrant automatic Slurm job retry.
-// Matched case-insensitively against exception toString() messages (including cause chain).
-SLURM_INFRA_FAILURE_PATTERNS = [
-    // Jenkins remoting channel failures
-    "channel is closing down or has closed down",
-    "ChannelClosedException",
-    "ClosedChannelException",
-    "RequestAbortedException",
-    "Connection was broken",
-    "marked offline",
-    // Jenkins agent startup failures (durable-task plugin)
-    "process apparently never started",
-    "wrapper script does not seem to be touching the log file",
-    // Slurm job externally killed (from SlurmConfig.checkJobStatus)
-    "job is no longer active",
-    // Network/SSH failures (also in SLURM_INFRA_SINGLE_RETRY_PATTERNS for retry cap)
-    "No route to host",
-    "Permission denied, please try again",
-    // K8s pod eviction (matches "Reason: Evicted" from kubelet message)
-    "Reason: Evicted",
-]
-
-// Patterns that should retry at most once (not the full SLURM_INFRA_RETRY_MAX).
-// These may indicate persistent problems where multiple retries waste resources.
-// NOTE: Entries here must also appear in SLURM_INFRA_FAILURE_PATTERNS to be
-// detected as infrastructure failures in the first place.
-SLURM_INFRA_SINGLE_RETRY_PATTERNS = [
-    "CANCELLED",
-    "DUE TO TIME LIMIT",
-    "Permission denied, please try again",
-]
-
-// Maximum number of retries for infrastructure failures (total attempts = SLURM_INFRA_RETRY_MAX + 1)
+// Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
+// Recognised failure patterns are tagged with scope=SLURM or BOTH in the
+// shared-lib PATTERN_CATALOG.
 SLURM_INFRA_RETRY_MAX = 2
 
-// Infrastructure failure patterns specific to K8s test pods (the path that does
-// not go through SLURM). Passed as `extraInfraPatterns` to classifyInfraFailure
-// from the runLLMTestlistOnPlatform retry loop. SLURM_INFRA_FAILURE_PATTERNS
-// already covers shared symptoms (ChannelClosedException, marked offline,
-// Reason: Evicted, etc.) and is always checked first.
-K8S_INFRA_FAILURE_PATTERNS = [
-    // Image pull / pod startup
-    "ImagePullBackOff",
-    "ErrImagePull",
-    // Container runtime hiccups
-    "OCI runtime exec failed",
-    // Pod / node lifecycle
-    "OOMKilled",
-    "node status is not ready",
-    // JNLP agent disconnect (trailing space narrows the match)
-    "Cannot contact ",
-    // JNLP / HTTP-handshake transient (broad string -- single-retry-only below)
-    "Connection failed",
-]
-
-// K8s patterns capped at a single retry. Mirrors the SLURM list's caveat:
-// every entry here must also appear in K8S_INFRA_FAILURE_PATTERNS.
-K8S_INFRA_SINGLE_RETRY_PATTERNS = [
-    "OOMKilled",        // resource shortage; multi-retry rarely helps
-    "Connection failed", // short string; cap to bound false-positive cost
-]
-
+// Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
-// independently as production telemetry comes in.
+// independently as production telemetry comes in. Patterns tagged scope=K8S
+// or BOTH in the shared-lib PATTERN_CATALOG.
 K8S_INFRA_RETRY_MAX = 2
 
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
@@ -187,61 +132,6 @@ ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
-
-/**
- * Checks if an exception represents a transient infrastructure failure
- * that warrants retrying.
- *
- * Walks the exception cause chain to catch wrapped exceptions (e.g.,
- * AbortException wrapping ChannelClosedException).
- *
- * Callers may pass additional pattern lists (e.g., K8S_INFRA_FAILURE_PATTERNS)
- * to extend classification for path-specific symptoms without disturbing the
- * SLURM defaults.
- *
- * @param ex The caught exception
- * @param extraInfraPatterns Additional patterns appended to the infra-failure list
- * @param extraSingleRetryPatterns Additional patterns appended to the single-retry list
- * @return A map with keys:
- *   - isInfraFailure (boolean): true if this is a retryable infra failure
- *   - isSingleRetryOnly (boolean): true if this pattern should only retry once
- *   - matchedPattern (String): the pattern that matched, for logging
- */
-def classifyInfraFailure(Exception ex, List extraInfraPatterns=[], List extraSingleRetryPatterns=[]) {
-    def result = [isInfraFailure: false, isSingleRetryOnly: false, matchedPattern: ""]
-
-    // Build the full exception text by walking the cause chain
-    def exceptionText = ""
-    def current = ex
-    while (current != null) {
-        exceptionText += " " + current.toString()
-        current = current.cause
-    }
-    def lowerText = exceptionText.toLowerCase()
-
-    // Check against infrastructure failure patterns (SLURM defaults + caller extras)
-    for (pattern in (SLURM_INFRA_FAILURE_PATTERNS + extraInfraPatterns)) {
-        if (lowerText.contains(pattern.toLowerCase())) {
-            result.isInfraFailure = true
-            result.matchedPattern = pattern
-            break
-        }
-    }
-
-    if (!result.isInfraFailure) {
-        return result
-    }
-
-    // Check if this is a single-retry-only pattern
-    for (pattern in (SLURM_INFRA_SINGLE_RETRY_PATTERNS + extraSingleRetryPatterns)) {
-        if (lowerText.contains(pattern.toLowerCase())) {
-            result.isSingleRetryOnly = true
-            break
-        }
-    }
-
-    return result
-}
 
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
@@ -3600,11 +3490,11 @@ def runInKubernetes(pipeline, podSpec, containerName)
     }
 }
 
-// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification,
-// budget, and backoff (K8S_INFRA_RETRY_MAX, K8S_INFRA_FAILURE_PATTERNS,
-// K8S_INFRA_SINGLE_RETRY_PATTERNS), but operates at the pod-launch level so
-// transient pod failures (ImagePullBackOff, eviction, OOMKilled, JNLP
-// disconnect, node NotReady) get a fresh pod on each retry rather than
+// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification
+// (classify(ex, InfraFailure.K8S)), budget (K8S_INFRA_RETRY_MAX), and backoff,
+// but operates at the pod-launch level so transient pod failures
+// (ImagePullBackOff, eviction, OOMKilled, JNLP disconnect, node NotReady) get
+// a fresh pod on each retry rather than
 // retrying the test body inside a dying pod.
 //
 // `runner` is invoked with `(attemptTag, isFinalAttempt)`. Callers append
