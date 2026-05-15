@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -1273,6 +1274,15 @@ TEST(RefCheck, mla)
     runTest<1>(112, 2158, false, true);
 }
 
+TEST(RefCheck, mlaSeparateReduce)
+{
+    setenv("XQA_MLA_SEPARATE_REDUCE", "1", 1);
+    setenv("XQA_NB_SUB_SEQ", "4", 1);
+    runTest<1>(1, 2048, false, true, true, true);
+    unsetenv("XQA_NB_SUB_SEQ");
+    unsetenv("XQA_MLA_SEPARATE_REDUCE");
+}
+
 TEST(Perf, mla)
 {
 #ifndef NDEBUG
@@ -1542,6 +1552,12 @@ TEST(NVRTC, compile)
             CUfunction function;
             CU_RUN(cuModuleGetFunction(&function, module, "kernel_mha"));
             ASSERT_NE(function, nullptr);
+            if (source_file == tensorrt_llm::kernels::mla_sm120_cu_content)
+            {
+                CUfunction reduceFunction;
+                CU_RUN(cuModuleGetFunction(&reduceFunction, module, "reduce_mla_flash_decode_partials"));
+                ASSERT_NE(reduceFunction, nullptr);
+            }
             CUdeviceptr shmem_dev_ptr;
             CU_RUN(cuModuleGetGlobal(&shmem_dev_ptr, nullptr, module, "smemSize"));
             unsigned int shmem_bytes = 0;
