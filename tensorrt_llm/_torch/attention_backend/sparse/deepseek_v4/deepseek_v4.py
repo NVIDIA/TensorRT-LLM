@@ -1018,9 +1018,7 @@ class DeepseekV4Indexer(Indexer):
             q_scale = q_scale.view(-1, self.n_heads, 1)
         return q_fp8, q_scale
 
-    def _apply_weight_scale(
-        self, weights: torch.Tensor, q_scale: torch.Tensor
-    ) -> torch.Tensor:
+    def _apply_weight_scale(self, weights: torch.Tensor, q_scale: torch.Tensor) -> torch.Tensor:
         # The DeepGEMM FP4 kernel applies per-block q_scale internally, so
         # weights only carry softmax_scale * n_heads^-0.5. `weights_proj` is
         # bf16 to match the V4 checkpoint, and the FP4 branch's only
@@ -1057,7 +1055,9 @@ class DeepseekV4Indexer(Indexer):
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
+    ]:
         """Prepare indexer inputs by splitting independent work across two streams.
 
         The current stream owns the Q path.  The auxiliary stream starts from
@@ -1110,7 +1110,9 @@ class DeepseekV4Indexer(Indexer):
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
+    ]:
         q = self._qk_projection_and_rope(qr, position_ids)
 
         q_fp8, q_scale = self._quantize_q(q)
