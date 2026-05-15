@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Installation Guide &#8212; TensorRT LLM</title>
+    <title>Installing on Linux via pip &#8212; TensorRT LLM</title>
   
   
   
@@ -59,11 +59,11 @@
     <script src="../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'installation/installation-guide';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'installation/linux';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc14';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Build from Source" href="build-from-source.html" />
-    <link rel="prev" title="Installation" href="index.html" />
+    <link rel="next" title="Building from Source Code on Linux" href="build-from-source-linux.html" />
+    <link rel="prev" title="Pre-built release container images on NGC" href="containers.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc14" />
+  <meta name="docsearch:version" content="1.3.0rc12.post1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -232,10 +232,6 @@
   
 
   
-    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
-      <span class="fa-solid fa-outdent"></span>
-    </button>
-  
 </div>
 
     </header>
@@ -338,9 +334,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Installation</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Installation Guide</a></li>
-<li class="toctree-l2"><a class="reference internal" href="build-from-source.html">Build from Source</a></li>
-<li class="toctree-l2"><a class="reference internal" href="containers.html">Container Images</a></li>
+<li class="toctree-l2"><a class="reference internal" href="containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
@@ -459,8 +455,6 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -533,7 +527,7 @@
     
     <li class="breadcrumb-item"><a href="index.html" class="nav-link">Installation</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Installation Guide</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></span></li>
   </ul>
 </nav>
 </div>
@@ -550,40 +544,11 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="containers">
-<span id="installation-guide"></span><span id="id1"></span><h1>Installation Guide<a class="headerlink" href="#containers" title="Link to this heading">#</a></h1>
-<p>There are multiple ways to install and run TensorRT LLM. The options below are ordered from simplest to most involved. Before installing, check the <a class="reference internal" href="../supported-hardware.html"><span class="doc std std-doc">Supported Hardware</span></a> page to ensure your GPU is compatible.</p>
-<p><strong>This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.</strong></p>
-<section id="option-1-pre-built-release-container">
-<h2>Option 1: Pre-built Release Container<a class="headerlink" href="#option-1-pre-built-release-container" title="Link to this heading">#</a></h2>
-<p>Pre-built TensorRT LLM releases are available as <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release">container images on NGC</a>. This is the simplest way to obtain TensorRT LLM.</p>
-<p>Replace <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> with the desired version tag. Browse the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">available tags on NGC</a> to find the latest release.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14
-
-docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14
-</pre></div>
-</div>
-<div class="dropdown note admonition">
-<p class="admonition-title">Container image tags</p>
-<p>In the example shell commands, <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> corresponds to the TensorRT-LLM container
-version to use. If omitted, <code class="docutils literal notranslate"><span class="pre">IMAGE_TAG</span></code> will default to <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.__version__</span></code>
-(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.3.0rc14</span></code> source tree).
-If this does not work, e.g., because a container for the version you are
-currently working with has not been released yet, you can try using a
-container published for a previous
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">GitHub pre-release or release</a>
-(see also <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Catalog</a>).</p>
-</div>
-<p>Sanity check the installation by running the following inside the container:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import tensorrt_llm&quot;</span>
-</pre></div>
-</div>
-</section>
-<section id="option-2-install-on-linux-via-pip">
-<span id="linux"></span><h2>Option 2: Install on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code><a class="headerlink" href="#option-2-install-on-linux-via-pip" title="Link to this heading">#</a></h2>
-<p>Tested on Ubuntu 24.04.</p>
-<section id="install-prerequisites">
-<h3>Install prerequisites<a class="headerlink" href="#install-prerequisites" title="Link to this heading">#</a></h3>
+  <section class="tex2jax_ignore mathjax_ignore" id="installing-on-linux-via-pip">
+<span id="linux"></span><h1>Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code><a class="headerlink" href="#installing-on-linux-via-pip" title="Link to this heading">#</a></h1>
+<ol class="arabic">
+<li><p>Install TensorRT LLM (tested on Ubuntu 24.04).</p>
+<p class="rubric" id="install-prerequisites">Install prerequisites</p>
 <p>Before the pre-built Python wheel can be installed via <code class="docutils literal notranslate"><span class="pre">pip</span></code>, a few
 prerequisites must be put into place:</p>
 <p>Install CUDA Toolkit 13.1 following the <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-installation-guide-linux/">CUDA Installation Guide for Linux</a>
@@ -604,11 +569,9 @@ sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </
 <p>Instead of manually installing the prerequisites as described
 above, it is also possible to use the pre-built <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel">TensorRT LLM Develop container
 image hosted on NGC</a>
-(see <a class="reference internal" href="#containers"><span class="std std-ref">here</span></a> for information on container tags).</p>
+(see <a class="reference internal" href="containers.html#containers"><span class="std std-ref">here</span></a> for information on container tags).</p>
 </div>
-</section>
-<section id="install-pre-built-tensorrt-llm-wheel">
-<h3>Install pre-built TensorRT LLM wheel<a class="headerlink" href="#install-pre-built-tensorrt-llm-wheel" title="Link to this heading">#</a></h3>
+<p class="rubric" id="install-pre-built-tensorrt-llm-wheel">Install pre-built TensorRT LLM wheel</p>
 <p>Once all prerequisites are in place, TensorRT LLM can be installed as follows:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<span class="w"> </span>pip<span class="w"> </span>setuptools<span class="w"> </span>wheel<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm
 </pre></div>
@@ -616,9 +579,9 @@ image hosted on NGC</a>
 <blockquote>
 <div><p><strong>Note:</strong> The TensorRT LLM wheel on PyPI is built with PyTorch 2.10.0. This version may be incompatible with the NVIDIA NGC PyTorch 25.12 container, which uses a more recent PyTorch build from the main branch. If you are using this container or a similar environment, please install the pre-built wheel located at <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm</span></code> inside the TensorRT LLM NGC Release container instead.</p>
 </div></blockquote>
-</section>
-<section id="sanity-check">
-<h3>Sanity check<a class="headerlink" href="#sanity-check" title="Link to this heading">#</a></h3>
+<p><strong>This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.</strong></p>
+</li>
+<li><p>Sanity check the installation by running the following in Python (tested on Python 3.12):</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="linenos"> 2</span>
 <span class="linenos"> 3</span>
@@ -654,18 +617,18 @@ image hosted on NGC</a>
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-</section>
-<section id="known-limitations">
-<h3>Known limitations<a class="headerlink" href="#known-limitations" title="Link to this heading">#</a></h3>
-<p>There are some known limitations when you pip install the pre-built TensorRT LLM wheel package.</p>
+</li>
+</ol>
+<p><strong>Known limitations</strong></p>
+<p>There are some known limitations when you pip install pre-built TensorRT LLM wheel package.</p>
 <ol class="arabic">
 <li><p>MPI in the Slurm environment</p>
 <p>If you encounter an error while running TensorRT LLM in a Slurm-managed cluster, you need to reconfigure the MPI installation to work with Slurm.
 The setup method depends on your Slurm configuration, please check with your admin. This is not TensorRT LLM specific, but rather a general MPI+Slurm issue.</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>The application appears to have been direct launched using &quot;srun&quot;,
-but OMPI was not built with SLURM support. This usually happens
-when OMPI was not configured --with-slurm and we weren&#39;t able
-to discover a SLURM installation in the usual places.
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">The</span> <span class="n">application</span> <span class="n">appears</span> <span class="n">to</span> <span class="n">have</span> <span class="n">been</span> <span class="n">direct</span> <span class="n">launched</span> <span class="n">using</span> <span class="s2">&quot;srun&quot;</span><span class="p">,</span>
+<span class="n">but</span> <span class="n">OMPI</span> <span class="n">was</span> <span class="ow">not</span> <span class="n">built</span> <span class="k">with</span> <span class="n">SLURM</span> <span class="n">support</span><span class="o">.</span> <span class="n">This</span> <span class="n">usually</span> <span class="n">happens</span>
+<span class="n">when</span> <span class="n">OMPI</span> <span class="n">was</span> <span class="ow">not</span> <span class="n">configured</span> <span class="o">--</span><span class="k">with</span><span class="o">-</span><span class="n">slurm</span> <span class="ow">and</span> <span class="n">we</span> <span class="n">weren</span><span class="s1">&#39;t able</span>
+<span class="n">to</span> <span class="n">discover</span> <span class="n">a</span> <span class="n">SLURM</span> <span class="n">installation</span> <span class="ow">in</span> <span class="n">the</span> <span class="n">usual</span> <span class="n">places</span><span class="o">.</span>
 </pre></div>
 </div>
 </li>
@@ -680,12 +643,6 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
 </li>
 </ol>
 </section>
-</section>
-<section id="option-3-build-from-source">
-<h2>Option 3: Build from Source<a class="headerlink" href="#option-3-build-from-source" title="Link to this heading">#</a></h2>
-<p>For developers who wish to modify, customize, or contribute to TensorRT LLM, see <a class="reference internal" href="build-from-source.html#build-from-source"><span class="std std-ref">Build from Source</span></a>.</p>
-</section>
-</section>
 
 
                 </article>
@@ -698,20 +655,20 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="index.html"
+       href="containers.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Installation</p>
+        <p class="prev-next-title">Pre-built release container images on NGC</p>
       </div>
     </a>
     <a class="right-next"
-       href="build-from-source.html"
+       href="build-from-source-linux.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Build from Source</p>
+        <p class="prev-next-title">Building from Source Code on Linux</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -722,33 +679,9 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
             
             
 
-
-              
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
-                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+<div class="bd-sidebar-secondary"></div>
 
 
-  <div class="sidebar-secondary-item">
-<div
-    id="pst-page-navigation-heading-2"
-    class="page-toc tocsection onthispage">
-    <i class="fa-solid fa-list"></i> On this page
-  </div>
-  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
-    <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#option-1-pre-built-release-container">Option 1: Pre-built Release Container</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#option-2-install-on-linux-via-pip">Option 2: Install on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#install-prerequisites">Install prerequisites</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#install-pre-built-tensorrt-llm-wheel">Install pre-built TensorRT LLM wheel</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sanity-check">Sanity check</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#known-limitations">Known limitations</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#option-3-build-from-source">Option 3: Build from Source</a></li>
-</ul>
-  </nav></div>
-
-</div></div>
               
             
 
@@ -836,9 +769,9 @@ pip3<span class="w"> </span>install<span class="w"> </span>--ignore-installed<sp
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 06, 2026.</p>
+  <p>Last updated on May 15, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/93cb651">93cb651</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
   
 </div></div>
       
