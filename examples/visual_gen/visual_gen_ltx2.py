@@ -361,6 +361,10 @@ def _build_diffusion_args(args) -> VisualGenArgs:
             "enable_autotune": not args.disable_autotune,
         },
         cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
+        compilation={
+            "resolutions": [(args.height, args.width)],
+            "num_frames": [args.num_frames],
+        },
         pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },

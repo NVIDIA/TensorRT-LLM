@@ -68,8 +68,12 @@ class TrtllmAttentionMetadata:
             )
         self._metadata_state = attention_metadata_state
 
-        # Lazily created BaseTrtllmAttentionMetadata
-        self._metadata: Optional[BaseTrtllmAttentionMetadata] = self._metadata_state["metadata"]
+        # Lazily created BaseTrtllmAttentionMetadata objects. Diffusion blocks
+        # can launch video and audio attention back-to-back with different
+        # sequence lengths, so keep separate metadata buffers per shape instead
+        # of mutating one shared object while kernels may still be in flight.
+        self._metadata_cache = self._metadata_state.setdefault("metadata_cache", {})
+        self._metadata: Optional[BaseTrtllmAttentionMetadata] = None
 
         # Track prepared state
         self._cached_seq_lens: Optional[torch.Tensor] = None
@@ -77,13 +81,7 @@ class TrtllmAttentionMetadata:
 
     def _needs_new_metadata(self, batch_size: int, max_seq_len: int) -> bool:
         """Check if we need to create new metadata (capacity change)."""
-        metadata = self._metadata_state["metadata"]
-        allocated_batch_size, allocated_max_seq_len = self._metadata_state["capacity"]
-        return (
-            metadata is None
-            or batch_size > allocated_batch_size
-            or max_seq_len > allocated_max_seq_len
-        )
+        return self._metadata is None
 
     def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
         """Check if we need to call prepare() (current request seq_lens or shared metadata object seq_lens changed).
@@ -104,7 +102,7 @@ class TrtllmAttentionMetadata:
         if not torch.equal(self._cached_seq_lens[:batch_size], seq_lens):
             return True
 
-        metadata = self._metadata_state["metadata"]
+        metadata = self._metadata
         if metadata is None:
             return True
         if getattr(metadata, "num_contexts", None) != batch_size:
@@ -124,19 +122,14 @@ class TrtllmAttentionMetadata:
 
     def _create_metadata(self, batch_size: int, max_seq_len: int) -> None:
         """Create new metadata with given capacity."""
-        prev_batch, prev_seq = self._metadata_state["capacity"]
-        alloc_batch = max(batch_size, prev_batch)
-        alloc_seq_len = max(max_seq_len, prev_seq)
         self._metadata = BaseTrtllmAttentionMetadata(
-            max_num_requests=alloc_batch,
-            max_num_tokens=alloc_batch * alloc_seq_len,
-            max_num_sequences=alloc_batch,
+            max_num_requests=batch_size,
+            max_num_tokens=batch_size * max_seq_len,
+            max_num_sequences=batch_size,
             kv_cache_manager=None,  # No KV cache for diffusion
             mapping=Mapping(),
             runtime_features=AttentionRuntimeFeatures(),
         )
-        self._metadata_state["metadata"] = self._metadata
-        self._metadata_state["capacity"] = (alloc_batch, alloc_seq_len)
         self._prepared = False  # Reset prepare state on new metadata
 
     def prepare(
@@ -156,11 +149,21 @@ class TrtllmAttentionMetadata:
         else:
             seq_lens_tensor = seq_lens.to(dtype=torch.int32)
         max_seq_len = seq_lens_tensor.max().item()
+        cache_key = (batch_size, tuple(int(x) for x in seq_lens_tensor.tolist()))
 
-        if self._needs_new_metadata(batch_size, max_seq_len):
+        cached = self._metadata_cache.get(cache_key)
+        if cached is None:
             self._create_metadata(batch_size, max_seq_len)
+            cached = {
+                "metadata": self._metadata,
+                "prepared": False,
+                "seq_lens": None,
+            }
+            self._metadata_cache[cache_key] = cached
         else:
-            self._metadata = self._metadata_state["metadata"]
+            self._metadata = cached["metadata"]
+            self._prepared = cached["prepared"]
+            self._cached_seq_lens = cached["seq_lens"]
 
         if self._needs_prepare(batch_size, seq_lens_tensor):
             self._metadata.seq_lens = seq_lens_tensor
@@ -175,6 +178,8 @@ class TrtllmAttentionMetadata:
             else:
                 self._cached_seq_lens[:batch_size].copy_(seq_lens_tensor)
             self._prepared = True
+            cached["prepared"] = True
+            cached["seq_lens"] = self._cached_seq_lens
 
         return self._metadata
 

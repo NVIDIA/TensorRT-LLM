@@ -467,8 +467,11 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
 
         graph = torch.cuda.CUDAGraph()
         for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
+            # Keep outputs alive until kernels have completed. The compiled
+            # NVFP4 path can otherwise race output destruction during warmup.
+            warmup_output = fn(*static_args, **static_kwargs)
             torch.cuda.synchronize()
+            del warmup_output
             gc.collect()
             torch.cuda.empty_cache()
 
