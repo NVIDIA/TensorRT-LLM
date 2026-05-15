@@ -345,7 +345,7 @@ class DeepseekV3WeightLoader:
             if spec_config is not None and hasattr(
                     spec_config, 'spec_dec_mode'
             ) and spec_config.spec_dec_mode.is_mtp_one_model():
-                model_nextn = spec_config.num_nextn_predict_layers
+                model_nextn = spec_config.num_nextn_predict_layers or 0
             else:
                 model_nextn = 0
             return model_nextn > ckpt_nextn > 0
