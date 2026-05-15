@@ -1,7 +1,10 @@
 import copy
+import functools
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Generator
 
@@ -33,6 +36,97 @@ _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 
 _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
 _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
+_MAX_MODEL_INIT_WORKERS = 3
+
+
+def _instantiate_models(*initializers):
+    if not initializers:
+        return ()
+    # Any test in this file builds at most a prefill LLM, a decode LLM, and a multimodal encoder, so cap workers at 3.
+    with ThreadPoolExecutor(max_workers=min(_MAX_MODEL_INIT_WORKERS,
+                                            len(initializers))) as executor:
+        futures = [executor.submit(init) for init in initializers]
+    # ThreadPoolExecutor.__exit__ waits for every future; all are done by here.
+    if all(f.exception() is None for f in futures):
+        return tuple(f.result() for f in futures)
+    # One or more constructors failed: release any already-built LLM workers before surfacing the error.
+    for f in futures:
+        if f.exception() is not None:
+            continue
+        shutdown = getattr(f.result(), "shutdown", None)
+        if shutdown is not None:
+            with suppress(Exception):
+                shutdown()
+    raise next(f.exception() for f in futures if f.exception() is not None)
+
+
+def _create_llm(
+    model_dir: Path,
+    pd_disagg: bool,
+    disable_overlap_scheduler: bool = False,
+) -> LLM:
+    cache_transceiver_cfg = CacheTransceiverConfig(
+        backend="DEFAULT", max_tokens_in_buffer=10240) if pd_disagg else None
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,  # Disable for output 1:1 matching check
+        free_gpu_memory_fraction=0.2,
+    )
+    return LLM(
+        model=model_dir,
+        backend='pytorch',
+        kv_cache_config=kv_cache_config,
+        moe_config=_get_moe_config_for_blackwell(),
+        trust_remote_code=True,
+        cache_transceiver_config=cache_transceiver_cfg,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        max_batch_size=1,  # fix batch size to reduce non-determinism in tests
+        **_get_fake_checkpoint_kwargs(model_dir),
+    )
+
+
+def _create_llm_initializers(model_dir: Path, pd_disagg: bool):
+    initializers = [
+        functools.partial(_create_llm,
+                          model_dir,
+                          pd_disagg,
+                          disable_overlap_scheduler=pd_disagg)
+    ]
+    if pd_disagg:
+        initializers.append(functools.partial(_create_llm, model_dir,
+                                              pd_disagg))
+    return initializers
+
+
+def _create_mm_disagg_llm(
+    model_dir: Path,
+    enable_block_reuse: bool,
+    disable_overlap_scheduler: bool = False,
+) -> LLM:
+    kv_cache_kwargs = {
+        "enable_block_reuse": enable_block_reuse,
+        "free_gpu_memory_fraction": 0.2,
+    }
+    if enable_block_reuse:
+        kv_cache_kwargs["event_buffer_max_size"] = 1024
+
+    kv_cache_config = KvCacheConfig(**kv_cache_kwargs)
+    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
+                                                   max_tokens_in_buffer=10240)
+    return LLM(model=model_dir,
+               kv_cache_config=kv_cache_config,
+               trust_remote_code=True,
+               cache_transceiver_config=cache_transceiver_cfg,
+               disable_overlap_scheduler=disable_overlap_scheduler,
+               max_batch_size=1)
+
+
+def _get_encoder_max_batch_size(model_dir: Path) -> int:
+    # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
+    # The test only passes with this set to 1.
+    if (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR]
+            or _is_fake_checkpoint(model_dir)):
+        return 1
+    return 3
 
 
 # Unlike the other models, we cannot fit a multimodal encoder + 2 copies of the LLM on a single
@@ -41,7 +135,8 @@ _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
 def _get_fake_qwen3_vl_30b_a3b_config() -> dict:
     config_path = _QWEN_3_VL_30B_A3B_FP8_DIR / "config.json"
     if not config_path.exists():
-        pytest.skip(f"Qwen3-VL-30B-A3B config not found: {config_path}")
+        raise FileNotFoundError(
+            f"Qwen3-VL-30B-A3B config not found: {config_path}")
     with open(config_path, "r") as f:
         config = json.load(f)
     config = copy.deepcopy(config)
@@ -54,7 +149,7 @@ def _create_fake_qwen3_vl_30b_a3b_fp8_dir(
     assets_dir: Path,
 ) -> Path:
     if not assets_dir.exists():
-        pytest.skip(f"Base model dir not found: {assets_dir}")
+        raise FileNotFoundError(f"Base model dir not found: {assets_dir}")
 
     fake_dir = tmp_path_factory.mktemp("qwen3_vl_30b_a3b_fp8_fake")
 
@@ -536,7 +631,11 @@ def test_kv_event_mm_keys_with_very_long_uuid():
             f"found {len(matching)} times in {mm_key_hashes}")
 
 
-@pytest.fixture(scope="module", params=[False, True])
+@pytest.fixture(scope="module",
+                params=[
+                    pytest.param(False, id="no_pd_disagg"),
+                    pytest.param(True, id="pd_disagg"),
+                ])
 def pd_disagg(request) -> bool:
     return request.param
 
@@ -545,47 +644,78 @@ def pd_disagg(request) -> bool:
 def llms(model_dir: Path,
          pd_disagg: bool) -> Generator[tuple[LLM, LLM | None], None, None]:
     """Get LLM for prefill and, if disagg, separate LLM for decode."""
-    free_gpu_memory_fraction = 0.2
-    disable_overlap_scheduler = pd_disagg
-    # NOTE: if the number of tokens that need to pass from P -> D exceeds `max_tokens_in_buffer`,
-    # one may see the following error:
-    # >>> tensorrt_llm.executor.utils.RequestError: Error in kv cache transfer for generation
-    #     requests.
-    cache_transceiver_cfg = CacheTransceiverConfig(
-        backend="DEFAULT", max_tokens_in_buffer=10240) if pd_disagg else None
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,  # Disable for output 1:1 matching check
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
+    instances = _instantiate_models(
+        *_create_llm_initializers(model_dir, pd_disagg))
+    llm = instances[0]
+    llm_decode = instances[1] if pd_disagg else None
+    with ExitStack() as stack:
+        stack.enter_context(llm)
+        if llm_decode is not None:
+            stack.enter_context(llm_decode)
+        yield (llm, llm_decode)
+
+
+@pytest.fixture(scope="module")
+def llms_and_encoder(
+    model_dir: Path,
+    pd_disagg: bool,
+) -> Generator[tuple[tuple[LLM, LLM | None], MultimodalEncoder], None, None]:
+    """Get LLM instances and a multimodal encoder, initialized in parallel."""
+    # Several tests need these instances live together; building them as one fixture lets setup overlap.
+    encoder_max_batch_size = _get_encoder_max_batch_size(model_dir)
+    initializers = _create_llm_initializers(model_dir, pd_disagg)
+    initializers.append(
+        functools.partial(
+            MultimodalEncoder,
+            model=model_dir,
+            max_batch_size=encoder_max_batch_size,
+            **_get_fake_checkpoint_kwargs(model_dir),
+        ))
+    instances = _instantiate_models(*initializers)
+    llm = instances[0]
+    llm_decode = instances[1] if pd_disagg else None
+    encoder = instances[-1]
+
+    with ExitStack() as stack:
+        stack.enter_context(llm)
+        if llm_decode is not None:
+            stack.enter_context(llm_decode)
+        stack.enter_context(encoder)
+        yield (llm, llm_decode), encoder
+
+
+@pytest.fixture(scope="module")
+def llm_and_chunked_llm(
+    model_dir: Path,
+    pd_disagg: bool,
+) -> Generator[tuple[LLM, LLM], None, None]:
+    """Get the baseline LLM and a chunked-prefill LLM, initialized in parallel."""
+    assert not pd_disagg
+
+    # Use a separate engine so chunked-prefill settings cannot affect the baseline reference LLM.
+    create_chunked_llm = functools.partial(
+        LLM,
+        model=model_dir,
+        backend="pytorch",
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.2,
+        ),
+        moe_config=_get_moe_config_for_blackwell(),
+        trust_remote_code=True,
+        max_batch_size=1,
+        enable_chunked_prefill=True,
+        max_num_tokens=256,
+        **_get_fake_checkpoint_kwargs(model_dir),
     )
 
-    load_kwargs = _get_fake_checkpoint_kwargs(model_dir)
-    moe_config = _get_moe_config_for_blackwell()
-    llm = LLM(
-        model=model_dir,
-        backend='pytorch',
-        kv_cache_config=kv_cache_config,
-        moe_config=moe_config,
-        trust_remote_code=True,
-        cache_transceiver_config=cache_transceiver_cfg,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        max_batch_size=1,  # fix batch size to reduce non-determinism in tests
-        **load_kwargs,
+    llm, chunked_llm = _instantiate_models(
+        _create_llm_initializers(model_dir, pd_disagg)[0],
+        create_chunked_llm,
     )
-    with llm:
-        if pd_disagg:
-            llm_decode = LLM(
-                model=model_dir,
-                backend='pytorch',
-                kv_cache_config=kv_cache_config,
-                moe_config=moe_config,
-                trust_remote_code=True,
-                cache_transceiver_config=cache_transceiver_cfg,
-                **load_kwargs,
-            )
-            with llm_decode:
-                yield (llm, llm_decode)
-        else:
-            yield (llm, None)
+
+    with llm, chunked_llm:
+        yield llm, chunked_llm
 
 
 def _load_inputs(llm: LLM, prompts, media, mm_embeddings=None):
@@ -651,19 +781,17 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
 @pytest.mark.threadleak(enabled=False)
 def test_single_request_chat_multiple_images(
     pd_disagg: bool,
-    model_dir: Path,
-    llms: tuple[LLM, LLM | None],
+    llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
 ):
     """Test processing a single request with multiple images.
 
     This test verifies that encoder (pass mm_embeddings) + LLM API produces identical
     results to standard llm generation (pass raw image) by comparing outputs.
     """
-    llm, llm_decode = llms
+    (llm, llm_decode), encoder = llms_and_encoder
 
     # Test configuration
     max_tokens = 64
-    max_batch_size = 1
 
     # Test data - OpenAI chat completion format
     prompts = ["Compare these 2 images."]
@@ -690,43 +818,39 @@ def test_single_request_chat_multiple_images(
 
     # Prepare inputs for llm (pass mm_embeddings)
     # Process multimodal data using encoder (pass mm_embeddings)
-    encoder = MultimodalEncoder(model=model_dir,
-                                max_batch_size=max_batch_size,
-                                **_get_fake_checkpoint_kwargs(model_dir))
-    with encoder:
-        encoder_outputs = encoder.generate(inputs)
+    encoder_outputs = encoder.generate(inputs)
 
-        # Generate output using llm (pass mm_embeddings)
-        ep_disaggregated_params = encoder_outputs[0].disaggregated_params
+    # Generate output using llm (pass mm_embeddings)
+    ep_disaggregated_params = encoder_outputs[0].disaggregated_params
 
-        assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
-        ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
+    assert ep_disaggregated_params is not None, "Encoder output disaggregated params is None"
+    ep_disaggregated_params.request_type = "context_and_generation" if not pd_disagg else "context_only"
 
-        outputs = llm.generate(inputs,
-                               sampling_params=sampling_params,
-                               disaggregated_params=ep_disaggregated_params)
+    outputs = llm.generate(inputs,
+                           sampling_params=sampling_params,
+                           disaggregated_params=ep_disaggregated_params)
 
-        if pd_disagg:
-            # Generation using llm_decode
-            assert len(outputs) == 1
-            pd_disaggregated_params = outputs[0].disaggregated_params
+    if pd_disagg:
+        # Generation using llm_decode
+        assert len(outputs) == 1
+        pd_disaggregated_params = outputs[0].disaggregated_params
 
-            ep_handle = ep_disaggregated_params.mrope_position_ids_handle
-            pd_handle = pd_disaggregated_params.mrope_position_ids_handle
-            assert type(ep_handle) is type(pd_handle)
-            if ep_handle is not None:
-                _assert_handles_are_different(ep_handle, pd_handle)
-            pd_disaggregated_params.request_type = "generation_only"
-            sampling_params = SamplingParams(max_tokens=max_tokens)
-            # remove multimodal data from input as decoder worker doesn't need it
-            inputs[0]['multi_modal_data'] = None
-            # use prompt token ids from encoder output
-            inputs[0]['prompt_token_ids'] = outputs[0].prompt_token_ids
+        ep_handle = ep_disaggregated_params.mrope_position_ids_handle
+        pd_handle = pd_disaggregated_params.mrope_position_ids_handle
+        assert type(ep_handle) is type(pd_handle)
+        if ep_handle is not None:
+            _assert_handles_are_different(ep_handle, pd_handle)
+        pd_disaggregated_params.request_type = "generation_only"
+        sampling_params = SamplingParams(max_tokens=max_tokens)
+        # remove multimodal data from input as decoder worker doesn't need it
+        inputs[0]['multi_modal_data'] = None
+        # use prompt token ids from encoder output
+        inputs[0]['prompt_token_ids'] = outputs[0].prompt_token_ids
 
-            outputs = llm_decode.generate(
-                inputs,
-                sampling_params=sampling_params,
-                disaggregated_params=pd_disaggregated_params)
+        outputs = llm_decode.generate(
+            inputs,
+            sampling_params=sampling_params,
+            disaggregated_params=pd_disaggregated_params)
 
     # Validate outputs
     assert len(outputs) == len(
@@ -766,7 +890,8 @@ def test_single_request_chat_multiple_images(
                     f"Log probabilities don't match for output {i}, generation {j}"
 
 
-@pytest.mark.parametrize("model_dir", [_QWEN_3_VL_DIR], indirect=True)
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
 @pytest.mark.parametrize("pd_disagg", [True], indirect=True)
 @pytest.mark.threadleak(enabled=False)
 def test_pd_disagg_with_image_input(
@@ -818,18 +943,30 @@ def test_pd_disagg_with_image_input(
                 f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
 
 
-# Explicit combinations instead of product([False, True], [False, True]) to avoid
-# having to call `pytest.skip` within the test code itself. This saves on CI time, since `llms`
-# take a long time to instantiate.
-@pytest.mark.parametrize("use_mm_embeddings,pass_embeddings_through_loader", [
-    (False, False),
-    (True, False),
-    (True, True),
-])
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.parametrize(
+    "model_dir,use_mm_embeddings,pass_embeddings_through_loader",
+    [
+        # Reference path: raw multimodal inputs go through the standard pipeline.
+        pytest.param(_LLAVA_DIR, False, False, id="llava_7b-raw_inputs"),
+        # Encoder produces embeddings; LLM consumes them via multi_modal_embeddings.
+        pytest.param(_LLAVA_DIR, True, False, id="llava_7b-encoder_embeddings"),
+        # Encoder embeddings routed back through default_multimodal_input_loader.
+        pytest.param(_LLAVA_DIR, True, True, id="llava_7b-loader_embeddings"),
+        # Qwen models don't implement attach_multimodal_embeddings, so only the raw path is exercised.
+        pytest.param(_QWEN_2_5_VL_DIR, False, False,
+                     id="qwen2.5_3b-raw_inputs"),
+        pytest.param(_QWEN_3_VL_DIR, False, False, id="qwen3_2b-raw_inputs"),
+        pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
+                     False,
+                     False,
+                     id="qwen3_30b_a3b_fp8-raw_inputs"),
+    ],
+    indirect=["model_dir"])
 @pytest.mark.threadleak(enabled=False)
 def test_multi_request_batch_chat(
     model_dir: Path,
-    llms: tuple[LLM, LLM | None],
+    llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
     use_mm_embeddings: bool,
     pass_embeddings_through_loader: bool,
 ):
@@ -839,23 +976,9 @@ def test_multi_request_batch_chat(
     embeddings alongside the prompt ("multi_modal_embeddings"), as well as the embedding
     handling within default_multimodal_input_loader.
     """
-    if use_mm_embeddings and (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]
-                              or _is_fake_checkpoint(model_dir)):
-        pytest.skip("Qwen does not implement attach_multimodal_embeddings")
-
-    # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
-    # The test only passes with this set to 1.
-    encoder_max_batch_size = (
-        1 if model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR]
-        or _is_fake_checkpoint(model_dir) else 3)
-
-    llm, llm_decode = llms
-    if llm_decode is not None:
-        pytest.skip("Disagg support not implemented in test case")
-
-    # Guard against accidental reintroduction of invalid parameter combinations.
-    if pass_embeddings_through_loader and not use_mm_embeddings:
-        pytest.skip("Redundant test configuration")
+    (llm, llm_decode), encoder = llms_and_encoder
+    assert llm_decode is None, "Disagg support not implemented in test case"
+    assert use_mm_embeddings or not pass_embeddings_through_loader
 
     max_tokens = 64
 
@@ -878,86 +1001,79 @@ def test_multi_request_batch_chat(
             output.outputs
         ) > 0, f"Reference generation has no output text for input {i}"
 
-    encoder = MultimodalEncoder(model=model_dir,
-                                max_batch_size=encoder_max_batch_size,
-                                **_get_fake_checkpoint_kwargs(model_dir))
-    with encoder:
-        # Encoder path
-        encoder_outputs = encoder.generate(inputs)
-        if use_mm_embeddings:
-            for input, encoder_output in zip(inputs, encoder_outputs):
-                disagg_params = encoder_output.disaggregated_params
-                assert disagg_params is not None
-                mm_embed_handles = disagg_params.multimodal_embedding_handles
-                assert mm_embed_handles is not None
-                # `mm_embed_handles` is list of handles (one per multimodal item).
-                # Reconstruct and concatenate all embeddings for this request.
-                mm_embeds = [
-                    SharedTensorContainer.from_dict(handle).get_local_view()
-                    for handle in mm_embed_handles
-                ]
-                mm_embed = torch.cat(
-                    mm_embeds, dim=0) if len(mm_embeds) > 1 else mm_embeds[0]
-                input["multi_modal_embeddings"] = {"image": mm_embed}
+    # Encoder path
+    encoder_outputs = encoder.generate(inputs)
+    if use_mm_embeddings:
+        for input, encoder_output in zip(inputs, encoder_outputs):
+            disagg_params = encoder_output.disaggregated_params
+            assert disagg_params is not None
+            mm_embed_handles = disagg_params.multimodal_embedding_handles
+            assert mm_embed_handles is not None
+            # `mm_embed_handles` is list of handles (one per multimodal item).
+            # Reconstruct and concatenate all embeddings for this request.
+            mm_embeds = [
+                SharedTensorContainer.from_dict(handle).get_local_view()
+                for handle in mm_embed_handles
+            ]
+            mm_embed = torch.cat(mm_embeds,
+                                 dim=0) if len(mm_embeds) > 1 else mm_embeds[0]
+            input["multi_modal_embeddings"] = {"image": mm_embed}
 
-            if pass_embeddings_through_loader:
-                # Test embedding support in default_multimodal_input_loader
-                inputs_with_embeddings = _load_inputs(
-                    llm,
-                    prompts,
-                    media=None,
-                    mm_embeddings=[
-                        input["multi_modal_embeddings"]["image"]
-                        for input in inputs
-                    ],
-                )
-                for input, input_with_embedding in zip(inputs,
-                                                       inputs_with_embeddings):
-                    assert isinstance(input, dict)
-                    assert isinstance(input_with_embedding, dict)
-                    assert list(
-                        set(input.keys())
-                        ^ set(input_with_embedding.keys())) == [
-                            "multi_modal_data"
-                        ]
-                    assert set(input_with_embedding.keys()) == set(
-                        ["prompt", "multi_modal_embeddings"])
-                    assert input["prompt"] == input_with_embedding["prompt"]
-                    assert list(
-                        input["multi_modal_embeddings"].keys()) == ["image"]
-                    assert list(input_with_embedding["multi_modal_embeddings"].
-                                keys()) == ["image"]
-                    mm_embed, = input_with_embedding["multi_modal_embeddings"][
-                        "image"]
-                    torch.testing.assert_close(
-                        mm_embed, input["multi_modal_embeddings"]["image"])
-                inputs = inputs_with_embeddings  # perform inference with embeddings returned by input loader
+        if pass_embeddings_through_loader:
+            # Test embedding support in default_multimodal_input_loader
+            inputs_with_embeddings = _load_inputs(
+                llm,
+                prompts,
+                media=None,
+                mm_embeddings=[
+                    input["multi_modal_embeddings"]["image"] for input in inputs
+                ],
+            )
+            for input, input_with_embedding in zip(inputs,
+                                                   inputs_with_embeddings):
+                assert isinstance(input, dict)
+                assert isinstance(input_with_embedding, dict)
+                assert list(
+                    set(input.keys())
+                    ^ set(input_with_embedding.keys())) == ["multi_modal_data"]
+                assert set(input_with_embedding.keys()) == set(
+                    ["prompt", "multi_modal_embeddings"])
+                assert input["prompt"] == input_with_embedding["prompt"]
+                assert list(input["multi_modal_embeddings"].keys()) == ["image"]
+                assert list(
+                    input_with_embedding["multi_modal_embeddings"].keys()) == [
+                        "image"
+                    ]
+                mm_embed, = input_with_embedding["multi_modal_embeddings"][
+                    "image"]
+                torch.testing.assert_close(
+                    mm_embed, input["multi_modal_embeddings"]["image"])
+            inputs = inputs_with_embeddings  # perform inference with embeddings returned by input loader
 
-            extra_kwargs = {}
-        else:
-            for eo in encoder_outputs:
-                eo.disaggregated_params.request_type = "context_and_generation"
-            extra_kwargs = dict(disaggregated_params=[
-                eo.disaggregated_params for eo in encoder_outputs
-            ])
-        outputs = llm.generate(inputs,
-                               sampling_params=sampling_params,
-                               **extra_kwargs)
+        extra_kwargs = {}
+    else:
+        for eo in encoder_outputs:
+            eo.disaggregated_params.request_type = "context_and_generation"
+        extra_kwargs = dict(disaggregated_params=[
+            eo.disaggregated_params for eo in encoder_outputs
+        ])
+    outputs = llm.generate(inputs,
+                           sampling_params=sampling_params,
+                           **extra_kwargs)
 
-        assert len(outputs) == len(prompts)
-        for i, output in enumerate(outputs):
-            assert len(output.outputs
-                       ) > 0, f"generation has no output text for input {i}"
+    assert len(outputs) == len(prompts)
+    for i, output in enumerate(outputs):
+        assert len(
+            output.outputs) > 0, f"generation has no output text for input {i}"
 
-        # Compare
-        for i, (ref_output, test_output) in enumerate(zip(outputs_ref,
-                                                          outputs)):
-            assert len(ref_output.outputs) == len(test_output.outputs), \
-                f"Number of generated outputs don't match for output {i}: {len(ref_output.outputs)} vs {len(test_output.outputs)}"
-            for j, (ref_gen, test_gen) in enumerate(
-                    zip(ref_output.outputs, test_output.outputs)):
-                assert ref_gen.text == test_gen.text, \
-                    f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
+    # Compare
+    for i, (ref_output, test_output) in enumerate(zip(outputs_ref, outputs)):
+        assert len(ref_output.outputs) == len(test_output.outputs), \
+            f"Number of generated outputs don't match for output {i}: {len(ref_output.outputs)} vs {len(test_output.outputs)}"
+        for j, (ref_gen, test_gen) in enumerate(
+                zip(ref_output.outputs, test_output.outputs)):
+            assert ref_gen.text == test_gen.text, \
+                f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -972,82 +1088,68 @@ def test_pd_disagg_multimodal_with_block_reuse():
     prompts = ["Describe the image."]
     media = [example_images[0]]
     sampling_params = SamplingParams(max_tokens=16, temperature=0)
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True,
-        free_gpu_memory_fraction=0.2,
-        event_buffer_max_size=1024,
-    )
-    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
-                                                   max_tokens_in_buffer=10240)
 
-    llm_prefill = LLM(model=model_dir,
-                      kv_cache_config=kv_cache_config,
-                      trust_remote_code=True,
-                      cache_transceiver_config=cache_transceiver_cfg,
-                      disable_overlap_scheduler=True,
-                      max_batch_size=1)
+    create_llm = functools.partial(_create_mm_disagg_llm,
+                                   model_dir,
+                                   enable_block_reuse=True)
+
+    llm_prefill, llm_decode = _instantiate_models(
+        functools.partial(create_llm, disable_overlap_scheduler=True),
+        create_llm,
+    )
 
     inputs = _load_inputs(llm_prefill, prompts, media)
 
-    with llm_prefill:
-        llm_decode = LLM(model=model_dir,
-                         kv_cache_config=kv_cache_config,
-                         trust_remote_code=True,
-                         cache_transceiver_config=cache_transceiver_cfg,
-                         max_batch_size=1)
-        with llm_decode:
-            # P: prefill (context_only) with raw multimodal input
-            prefill_params = DisaggregatedParams(request_type="context_only")
-            outputs = llm_prefill.generate(inputs,
-                                           sampling_params=SamplingParams(
-                                               max_tokens=0, temperature=0),
-                                           disaggregated_params=prefill_params)
-            assert len(outputs) == 1
+    with llm_prefill, llm_decode:
+        # P: prefill (context_only) with raw multimodal input
+        prefill_params = DisaggregatedParams(request_type="context_only")
+        outputs = llm_prefill.generate(inputs,
+                                       sampling_params=SamplingParams(
+                                           max_tokens=0, temperature=0),
+                                       disaggregated_params=prefill_params)
+        assert len(outputs) == 1
 
-            # D: decode (generation_only)
-            pd_params = outputs[0].disaggregated_params
-            pd_params.request_type = "generation_only"
-            decode_inputs = [{
-                "prompt": inputs[0]["prompt"],
-                "multi_modal_data": None,
-                "prompt_token_ids": outputs[0].prompt_token_ids,
-            }]
-            decode_outputs = llm_decode.generate(
-                decode_inputs,
-                sampling_params=sampling_params,
-                disaggregated_params=pd_params)
-            assert len(decode_outputs) == 1
-            assert len(decode_outputs[0].outputs) > 0
+        # D: decode (generation_only)
+        pd_params = outputs[0].disaggregated_params
+        pd_params.request_type = "generation_only"
+        decode_inputs = [{
+            "prompt": inputs[0]["prompt"],
+            "multi_modal_data": None,
+            "prompt_token_ids": outputs[0].prompt_token_ids,
+        }]
+        decode_outputs = llm_decode.generate(decode_inputs,
+                                             sampling_params=sampling_params,
+                                             disaggregated_params=pd_params)
+        assert len(decode_outputs) == 1
+        assert len(decode_outputs[0].outputs) > 0
 
-            # Second request (same image) — triggers reuse tree lookup
-            prefill_params2 = DisaggregatedParams(request_type="context_only")
-            outputs2 = llm_prefill.generate(
-                inputs,
-                sampling_params=SamplingParams(max_tokens=0, temperature=0),
-                disaggregated_params=prefill_params2)
-            assert len(outputs2) == 1
+        # Second request (same image) — triggers reuse tree lookup
+        prefill_params2 = DisaggregatedParams(request_type="context_only")
+        outputs2 = llm_prefill.generate(inputs,
+                                        sampling_params=SamplingParams(
+                                            max_tokens=0, temperature=0),
+                                        disaggregated_params=prefill_params2)
+        assert len(outputs2) == 1
 
-            pd_params2 = outputs2[0].disaggregated_params
-            pd_params2.request_type = "generation_only"
-            decode_inputs2 = [{
-                "prompt": inputs[0]["prompt"],
-                "multi_modal_data": None,
-                "prompt_token_ids": outputs2[0].prompt_token_ids,
-            }]
-            decode_outputs2 = llm_decode.generate(
-                decode_inputs2,
-                sampling_params=sampling_params,
-                disaggregated_params=pd_params2)
-            assert len(decode_outputs2) == 1
-            assert len(decode_outputs2[0].outputs) > 0
+        pd_params2 = outputs2[0].disaggregated_params
+        pd_params2.request_type = "generation_only"
+        decode_inputs2 = [{
+            "prompt": inputs[0]["prompt"],
+            "multi_modal_data": None,
+            "prompt_token_ids": outputs2[0].prompt_token_ids,
+        }]
+        decode_outputs2 = llm_decode.generate(decode_inputs2,
+                                              sampling_params=sampling_params,
+                                              disaggregated_params=pd_params2)
+        assert len(decode_outputs2) == 1
+        assert len(decode_outputs2[0].outputs) > 0
 
-            time.sleep(0.5)
-            events = llm_prefill.get_kv_cache_events(50)
-            stored = [
-                e for e in events
-                if e and e.get("data", {}).get("type") == "stored"
-            ]
-            assert len(stored) > 0
+        time.sleep(0.5)
+        events = llm_prefill.get_kv_cache_events(50)
+        stored = [
+            e for e in events if e and e.get("data", {}).get("type") == "stored"
+        ]
+        assert len(stored) > 0
 
 
 @pytest.mark.parametrize(
@@ -1083,79 +1185,67 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
-    free_gpu_memory_fraction = 0.2
     media = [example_images[0]] * len(prompts)
 
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True,
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
-        event_buffer_max_size=1024,
-    )
-    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
-                                                   max_tokens_in_buffer=10240)
+    create_llm = functools.partial(_create_mm_disagg_llm,
+                                   encoder_model_dir,
+                                   enable_block_reuse=True)
 
-    llm_prefill = LLM(model=encoder_model_dir,
-                      kv_cache_config=kv_cache_config,
-                      trust_remote_code=True,
-                      cache_transceiver_config=cache_transceiver_cfg,
-                      disable_overlap_scheduler=True,
-                      max_batch_size=1)
+    llm_prefill, encoder, llm_decode = _instantiate_models(
+        functools.partial(create_llm, disable_overlap_scheduler=True),
+        functools.partial(MultimodalEncoder,
+                          model=encoder_model_dir,
+                          max_batch_size=1),
+        create_llm,
+    )
 
     inputs = _load_inputs(llm_prefill, prompts, media)
 
-    encoder = MultimodalEncoder(model=encoder_model_dir, max_batch_size=1)
+    with llm_prefill, encoder, llm_decode:
+        all_ep_hashes = []
+        for inp in inputs:
+            # E: encode
+            encoder_outputs = encoder.generate([inp])
+            ep_params = encoder_outputs[0].disaggregated_params
+            assert ep_params is not None, "Encoder should produce disaggregated_params"
+            assert ep_params.multimodal_embedding_handles is not None
+            assert ep_params.multimodal_hashes is not None
+            all_ep_hashes.append(ep_params.multimodal_hashes)
 
-    with llm_prefill, encoder:
-        llm_decode = LLM(model=encoder_model_dir,
-                         kv_cache_config=kv_cache_config,
-                         trust_remote_code=True,
-                         cache_transceiver_config=cache_transceiver_cfg,
-                         max_batch_size=1)
-        with llm_decode:
-            all_ep_hashes = []
-            for req_idx, inp in enumerate(inputs):
-                # E: encode
-                encoder_outputs = encoder.generate([inp])
-                ep_params = encoder_outputs[0].disaggregated_params
-                assert ep_params is not None, "Encoder should produce disaggregated_params"
-                assert ep_params.multimodal_embedding_handles is not None
-                assert ep_params.multimodal_hashes is not None
-                all_ep_hashes.append(ep_params.multimodal_hashes)
+            # P: prefill (context_only)
+            ep_params.request_type = "context_only"
+            prefill_outputs = llm_prefill.generate(
+                [inp],
+                sampling_params=SamplingParams(max_tokens=0),
+                disaggregated_params=ep_params)
+            assert len(prefill_outputs) == 1
 
-                # P: prefill (context_only)
-                ep_params.request_type = "context_only"
-                prefill_outputs = llm_prefill.generate(
-                    [inp],
-                    sampling_params=SamplingParams(max_tokens=0),
-                    disaggregated_params=ep_params)
-                assert len(prefill_outputs) == 1
+            # D: decode (generation_only)
+            pd_params = prefill_outputs[0].disaggregated_params
+            pd_params.request_type = "generation_only"
+            decode_inputs = [{
+                "prompt":
+                inp["prompt"],
+                "multi_modal_data":
+                None,
+                "prompt_token_ids":
+                prefill_outputs[0].prompt_token_ids,
+            }]
+            decode_outputs = llm_decode.generate(
+                decode_inputs,
+                sampling_params=SamplingParams(max_tokens=max_tokens),
+                disaggregated_params=pd_params)
+            assert len(decode_outputs) == 1
+            assert len(decode_outputs[0].outputs) > 0
 
-                # D: decode (generation_only)
-                pd_params = prefill_outputs[0].disaggregated_params
-                pd_params.request_type = "generation_only"
-                decode_inputs = [{
-                    "prompt":
-                    inp["prompt"],
-                    "multi_modal_data":
-                    None,
-                    "prompt_token_ids":
-                    prefill_outputs[0].prompt_token_ids,
-                }]
-                decode_outputs = llm_decode.generate(
-                    decode_inputs,
-                    sampling_params=SamplingParams(max_tokens=max_tokens),
-                    disaggregated_params=pd_params)
-                assert len(decode_outputs) == 1
-                assert len(decode_outputs[0].outputs) > 0
+        # Same image should yield identical hashes across requests
+        for h in all_ep_hashes[1:]:
+            assert h == all_ep_hashes[0], (
+                f"Same image should produce identical mm_hashes, "
+                f"got {all_ep_hashes}")
 
-            # Same image should yield identical hashes across requests
-            for h in all_ep_hashes[1:]:
-                assert h == all_ep_hashes[0], (
-                    f"Same image should produce identical mm_hashes, "
-                    f"got {all_ep_hashes}")
-
-            time.sleep(0.5)
-            events = llm_prefill.get_kv_cache_events(50)
+        time.sleep(0.5)
+        events = llm_prefill.get_kv_cache_events(50)
 
     stored_events = [
         e for e in events if e and e.get("data", {}).get("type") == "stored"
@@ -1178,13 +1268,14 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
         f"Offsets: {mm_keys_offsets}")
 
 
-@pytest.mark.parametrize("model_dir", [_QWEN_3_VL_DIR], indirect=True)
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
 @pytest.mark.parametrize("pd_disagg", [False], indirect=True)
 @pytest.mark.threadleak(enabled=False)
 def test_chunked_prefill_multimodal_smoke(
     model_dir: Path,
     pd_disagg: bool,
-    llms: tuple[LLM, LLM | None],
+    llm_and_chunked_llm: tuple[LLM, LLM],
 ):
     """Smoke-test chunked prefill with a Qwen VL model.
 
@@ -1200,7 +1291,7 @@ def test_chunked_prefill_multimodal_smoke(
     (different chunking boundaries shift floating-point accumulation order).
     The goal here is only to verify that the engine does not crash.
     """
-    llm, _ = llms
+    llm, chunked_llm = llm_and_chunked_llm
 
     prompts = [
         "Describe the natural environment in the image.",
@@ -1210,27 +1301,7 @@ def test_chunked_prefill_multimodal_smoke(
     sampling_params = SamplingParams(max_tokens=64)
     inputs = _load_inputs(llm, prompts, media)
 
-    # Build a separate LLM with chunked prefill enabled so we don't affect
-    # the shared `llms` fixture used by determinism-sensitive tests.
-    load_kwargs = _get_fake_checkpoint_kwargs(model_dir)
-    moe_config = _get_moe_config_for_blackwell()
-    load_kwargs["enable_chunked_prefill"] = True
-    load_kwargs["max_num_tokens"] = 256
-
-    chunked_llm = LLM(
-        model=model_dir,
-        backend="pytorch",
-        kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
-            free_gpu_memory_fraction=0.2,
-        ),
-        moe_config=moe_config,
-        trust_remote_code=True,
-        max_batch_size=1,
-        **load_kwargs,
-    )
-    with chunked_llm:
-        outputs = chunked_llm.generate(inputs, sampling_params=sampling_params)
+    outputs = chunked_llm.generate(inputs, sampling_params=sampling_params)
 
     # Verify the engine produced output without crashing.
     assert outputs is not None, "Generation returned None"
@@ -1254,53 +1325,39 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
     prompts = ["Describe the image."]
     media = [example_images[0]]
     sampling_params = SamplingParams(max_tokens=16, temperature=0)
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        free_gpu_memory_fraction=0.2,
-    )
-    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
-                                                   max_tokens_in_buffer=10240)
 
-    llm_prefill = LLM(model=model_dir,
-                      kv_cache_config=kv_cache_config,
-                      trust_remote_code=True,
-                      cache_transceiver_config=cache_transceiver_cfg,
-                      disable_overlap_scheduler=True,
-                      max_batch_size=1)
+    create_llm = functools.partial(_create_mm_disagg_llm,
+                                   model_dir,
+                                   enable_block_reuse=False)
+
+    llm_prefill, llm_decode = _instantiate_models(
+        functools.partial(create_llm, disable_overlap_scheduler=True),
+        create_llm,
+    )
 
     inputs = _load_inputs(llm_prefill, prompts, media)
 
-    with llm_prefill:
-        llm_decode = LLM(model=model_dir,
-                         kv_cache_config=kv_cache_config,
-                         trust_remote_code=True,
-                         cache_transceiver_config=cache_transceiver_cfg,
-                         max_batch_size=1)
-        with llm_decode:
-            for req_num in range(2):
-                prefill_params = DisaggregatedParams(
-                    request_type="context_only")
-                outputs = llm_prefill.generate(
-                    inputs,
-                    sampling_params=SamplingParams(max_tokens=0, temperature=0),
-                    disaggregated_params=prefill_params)
-                assert len(outputs) == 1
+    with llm_prefill, llm_decode:
+        for req_num in range(2):
+            prefill_params = DisaggregatedParams(request_type="context_only")
+            outputs = llm_prefill.generate(inputs,
+                                           sampling_params=SamplingParams(
+                                               max_tokens=0, temperature=0),
+                                           disaggregated_params=prefill_params)
+            assert len(outputs) == 1
 
-                pd_params = outputs[0].disaggregated_params
-                pd_params.request_type = "generation_only"
-                decode_inputs = [{
-                    "prompt":
-                    inputs[0]["prompt"],
-                    "multi_modal_data":
-                    None,
-                    "prompt_token_ids":
-                    outputs[0].prompt_token_ids,
-                }]
-                decode_outputs = llm_decode.generate(
-                    decode_inputs,
-                    sampling_params=sampling_params,
-                    disaggregated_params=pd_params)
-                assert len(decode_outputs) == 1
-                assert len(decode_outputs[0].outputs) > 0
-                text = decode_outputs[0].outputs[0].text
-                assert len(text) > 0, f"[req {req_num}] empty output"
+            pd_params = outputs[0].disaggregated_params
+            pd_params.request_type = "generation_only"
+            decode_inputs = [{
+                "prompt": inputs[0]["prompt"],
+                "multi_modal_data": None,
+                "prompt_token_ids": outputs[0].prompt_token_ids,
+            }]
+            decode_outputs = llm_decode.generate(
+                decode_inputs,
+                sampling_params=sampling_params,
+                disaggregated_params=pd_params)
+            assert len(decode_outputs) == 1
+            assert len(decode_outputs[0].outputs) > 0
+            text = decode_outputs[0].outputs[0].text
+            assert len(text) > 0, f"[req {req_num}] empty output"
