@@ -69,11 +69,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         self.sound_gen = False
         self.action_gen = False
-        if model_config.pretrained_config.sound_gen:
+        if getattr(model_config.pretrained_config, "sound_gen", False):
             logger.info("Initializing Cosmos3OmniMoTPipeline with sound generation.")
             self.sound_gen = True
 
-        if model_config.pretrained_config.action_gen:
+        if getattr(model_config.pretrained_config, "action_gen", False):
             logger.info("Initializing Cosmos3OmniMoTPipeline with action generation.")
             self.action_gen = True
 
@@ -94,9 +94,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         
         if self.sound_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading sound tokenizer...")
-            self.sound_tokenizer = LatentAutoEncoderV2.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.SOUND_TOKENIZER,
+            self.sound_tokenizer = (
+                LatentAutoEncoderV2.from_pretrained(
+                    checkpoint_dir,
+                    subfolder=PipelineComponent.SOUND_TOKENIZER,
+                )
+                .to(device)
+                .to(self.dtype)
+                .eval()
             )
 
         if PipelineComponent.TOKENIZER not in skip_components:

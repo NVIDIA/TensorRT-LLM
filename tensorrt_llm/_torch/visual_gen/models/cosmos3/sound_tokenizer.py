@@ -25,6 +25,8 @@ from torch import Tensor, nn
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
 
+from tensorrt_llm.logger import logger
+
 from .modules import (
     ConvNeXtBlock,
     SConv1d,
@@ -406,19 +408,11 @@ class OobleckDecoder(nn.Module):
         return x
 
     def remove_weight_norm(self: "OobleckDecoder") -> None:
-        print("INFO: Removing all weight norm from OobleckDecoder")
         for module in self.modules():
             if hasattr(
                 module, "parametrizations"
             ):  # for new WN implementation using parameterizations
-                try:
-                    remove_parametrizations(module, "weight")
-                except ValueError:
-                    msg = (
-                        f"[WARNING] No weight norm found in {module} with parameterizations. "
-                        "You can ignore this if you know that this module does not apply weight norm."
-                    )
-                    print(msg)
+                remove_parametrizations(module, "weight")
             elif hasattr(module, "weight"):
                 try:
                     remove_weight_norm(module)
@@ -664,18 +658,11 @@ class SpectrogramConvNeXtEncoder(nn.Module):
         return output.transpose(1, 2)  # [B, T, C]
 
     def remove_weight_norm(self: "SpectrogramConvNeXtEncoder") -> None:
-        print("INFO: Removing all weight norm from SpectrogramConvNeXtEncoder")
         for module in self.modules():
             if hasattr(
                 module, "parametrizations"
             ):  # for new WN implementation using parameterizations
-                try:
-                    remove_parametrizations(module, "weight")
-                except ValueError:
-                    print(
-                        f"[WARNING] No weight norm found in {module} with parameterizations. "
-                        "You can ignore this if you know that this module does not apply weight norm."
-                    )
+                remove_parametrizations(module, "weight")
             elif hasattr(module, "weight"):
                 try:
                     remove_weight_norm(module)
@@ -704,19 +691,15 @@ class LatentAutoEncoderV2(nn.Module):
         # Determine input type
         self.input_type = None
         if model_config.get("use_wav_as_input", False):
-            print("INFO: Encoder's input feature is waveform")
             self.input_type = "waveform"
             model_config["input_channels"] = 1
         elif model_config.get("use_linear_spec_as_input", False):
-            print("INFO: Encoder's input feature is linear")
             self.input_type = "linear"
             model_config["input_channels"] = model_config["num_linears"]
         elif model_config.get("use_discrete_code_as_input", False):
-            print("INFO: Encoder's input feature is discrete_code")
             self.input_type = "discrete_code"
             model_config["input_channels"] = 1
         else:
-            print("INFO: Encoder's input feature is mel")
             self.input_type = "mel"
             model_config["input_channels"] = model_config["num_mels"]
 
@@ -725,7 +708,6 @@ class LatentAutoEncoderV2(nn.Module):
 
         # Initialize encoder
         self.enc_type = model_config.get("enc_type", "convnext")
-        print(f"INFO: Using {self.enc_type} as encoder")
 
         # Define encoder (only spec_convnext supported in cleaned version)
         if self.enc_type == "spec_convnext":
@@ -740,7 +722,6 @@ class LatentAutoEncoderV2(nn.Module):
 
         if "bottleneck" in model_config:
             self.bottleneck = VAEBottleneck()
-            print(f"INFO: Created bottleneck of type {model_config['bottleneck']['type']}")
         else:
             raise ValueError("Bottleneck configuration must be specified")
 
@@ -750,7 +731,6 @@ class LatentAutoEncoderV2(nn.Module):
         if not self.encoder_only:
             # Initialize decoder
             self.dec_type = model_config.get("dec_type", "oobleck")
-            print(f"INFO: Using {self.dec_type} as decoder")
             if self.dec_type == "oobleck":
                 self.decoder = OobleckDecoder(model_config)
             else:
@@ -760,16 +740,6 @@ class LatentAutoEncoderV2(nn.Module):
         else:
             # Skip decoder initialization
             self.decoder = None
-            print("INFO: Running in encoder-only mode, decoder is set to None")
-
-        # Whether to freeze encoder
-        self.freeze_encoder = model_config.get("freeze_encoder", False)
-        if self.freeze_encoder:
-            print(
-                "WARNING: freeze_encoder set to true. The encoder will not be updated during training!"
-            )
-            for param in self.encoder.parameters():
-                param.requires_grad = False
 
         # Optional latent normalisation (from cosmos3-internal AVAEModel)
         self.latent_mean = model_config.get("latent_mean", None)
@@ -822,9 +792,9 @@ class LatentAutoEncoderV2(nn.Module):
 
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
-            print(f"[WARNING] Missing keys when loading sound tokenizer: {missing}")
+            logger.warning(f"Missing keys when loading sound tokenizer: {missing}")
         if unexpected:
-            print(f"[WARNING] Unexpected keys when loading sound tokenizer: {unexpected}")
+            logger.warning(f"Unexpected keys when loading sound tokenizer: {unexpected}")
 
         # Must remove weight norm AFTER loading the weight_g / weight_v parameters
         model.remove_weight_norm()
