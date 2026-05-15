@@ -2109,19 +2109,65 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
         return [(a, b) for a in w for b in nw]
 
     _cw(f"built {len(configs)} outer configs")
-    # Build per-cell inner-overrides dicts.
     cell_set = getattr(args, "_cell_list_set", set())
     cell_keys = getattr(args, "_cell_list_keys", ())
+    # CPS keys are runtime ints (kernel value-specializes on `div_by_16`);
+    # cells differing only on CPS values can SHARE a worker so the second
+    # CPS value in a div_by_16 bucket hits the in-process Triton cache.
+    _cps_keys = ("cta_per_sm_write", "cta_per_sm_nowrite", "cta_per_sm")
+
     if cell_set:
-        inner_dicts = []
+        # ============== CELL-LIST PATH ==============
+        # Build tasks DIRECTLY from cells.  Each cell carries its OWN
+        # outer-axis values (RECT, MODE, SR, WC, SORT, REVN, HSORT) so we
+        # pair each cell with its specific outer config — NOT the union-
+        # cartesian of all cells' outer values.  Previously the OUTER ×
+        # CELL cartesian doubled task count when a cell-list spanned both
+        # RECT=0 and RECT=1 (or any other outer-axis split); half the
+        # tasks then failed the cell-list filter inside the worker and
+        # wasted dispatch overhead.  This path is O(|unique cell groups|).
+        from collections import defaultdict as _dd
+        cell_groups: dict = _dd(list)
         for tup in cell_set:
             d = dict(zip(cell_keys, tup))
+            cell_outer = (
+                "SR" if d.get("SR", 0) else "RN",       # sr_mode
+                bool(d.get("RECT", 0)),                  # rect
+                bool(d.get("WC", 1)),                    # write_ckpt
+                d.get("MODE", "monolithic"),             # mode
+                bool(d.get("SORT", 0)),                  # sort_slots
+                bool(d.get("REVN", 0)),                  # reverse_nowrite
+                bool(d.get("HSORT", 0)),                 # hardcode_sort
+            )
             inner = {}
             for k, v in d.items():
                 if k in _CELL_LIST_KEY_TO_ARG:
                     inner[_CELL_LIST_KEY_TO_ARG[k]] = str(v)
-            inner_dicts.append(inner)
+            non_cps_sig = tuple(sorted((k, v) for k, v in inner.items() if k not in _cps_keys))
+            cell_groups[(cell_outer, non_cps_sig)].append(inner)
+
+        # CLI-runtime axes (batch/mtp/dtype) are NOT in cell-list — they
+        # come from CLI args and cartesian here (typically just 1 combo).
+        cli_outers = []
+        for _b in _compile_batches:
+            for _m in mtp_lengths:
+                _pk = _resolve_prev_ks(args, _m)
+                for _sd in state_dtypes:
+                    for _ad in act_dtypes:
+                        cli_outers.append((_b, _m, _pk, _sd, _ad))
+
+        tasks = []
+        for cli_outer in cli_outers:
+            for (cell_outer, _sig), inner_list in cell_groups.items():
+                outer_cfg = (*cli_outer, *cell_outer)
+                tasks.append((outer_cfg, inner_list))
+        n_groups = len(cell_groups)
+        n_total_cells = sum(len(g) for g in cell_groups.values())
+        n_outer_used = len(cli_outers)
     else:
+        # ============== SWEEP-ARGS PATH ==============
+        # Build inner_dicts via cartesian over knob axes, then cross with
+        # the `configs` outer cartesian.  Existing behavior.
         m_pairs   = _split_or_pair("block_size_m",     "block_size_m_write",     "block_size_m_nowrite")
         w_pairs   = _split_or_pair("num_warps",        "num_warps_write",        "num_warps_nowrite")
         ns_pairs  = _split_or_pair("num_stages",       "num_stages_write",       "num_stages_nowrite")
@@ -2175,33 +2221,29 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                     d[k] = str(v)
             inner_dicts.append(d)
 
-    # Group by non-CPS signature.  All inner_dicts that match on every
-    # key except CPSw/CPSnw/cta_per_sm land in the same worker task; the
-    # worker will compile them in sequence, sharing Triton's in-process
-    # kernel cache across the divides bucket boundary at most once per
-    # bucket (CPS in {1,2} vs {4,8}).
-    _cps_keys = ("cta_per_sm_write", "cta_per_sm_nowrite", "cta_per_sm")
-    groups: dict = {}
-    for d in inner_dicts:
-        sig = tuple(sorted((k, v) for k, v in d.items() if k not in _cps_keys))
-        groups.setdefault(sig, []).append(d)
+        groups: dict = {}
+        for d in inner_dicts:
+            sig = tuple(sorted((k, v) for k, v in d.items() if k not in _cps_keys))
+            groups.setdefault(sig, []).append(d)
+        tasks = []
+        for outer in configs:
+            for sig, group in groups.items():
+                tasks.append((outer, group))
+        n_groups = len(groups)
+        n_total_cells = sum(len(g) for g in groups.values())
+        n_outer_used = len(configs)
 
-    tasks = []
-    for outer in configs:
-        for sig, group in groups.items():
-            tasks.append((outer, group))
-
-    # Shuffle ACROSS groups (not within — within-group order is the
-    # CPS sequence that benefits from in-process cache adjacency).
+    # Shuffle ACROSS tasks (preserve within-group CPS sequence for in-process
+    # cache adjacency — within-group order is intentional, not shuffled).
     import random as _r
     _r.shuffle(tasks)
 
-    n_total_cells = sum(len(g) for g in groups.values())
-    _cw(f"built {len(tasks)} tasks covering {n_total_cells} cells in {len(groups)} groups")
+    _cw(f"built {len(tasks)} tasks covering {n_total_cells} cells in {n_groups} groups")
     print(f"[compile-warmup] {len(tasks)} compile tasks "
-          f"({len(configs)} outer × {len(groups)} cell-groups "
-          f"covering {n_total_cells} cells, CPS-grouped) "
-          f"across {max_workers} processes (ProcessPoolExecutor, spawn start)")
+          f"({n_outer_used} outer × {n_groups} cell-groups "
+          f"covering {n_total_cells} cells, CPS-grouped"
+          + (", per-cell outer" if cell_set else "")
+          + f") across {max_workers} processes (ProcessPoolExecutor, spawn start)")
     t0 = time.perf_counter()
 
     ctx = multiprocessing.get_context("spawn")
