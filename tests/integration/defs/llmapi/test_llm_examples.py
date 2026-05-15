@@ -40,8 +40,12 @@ def test_llmapi_server_example(llm_root, llm_venv):
 
 
 ### LLMAPI examples
-def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
-                        *args):
+def _run_llmapi_example(llm_root,
+                        engine_dir,
+                        llm_venv,
+                        script_name: str,
+                        *args,
+                        env=None):
     example_root = Path(llm_root) / "examples" / "llm-api"
     engine_dir = Path(engine_dir) / "llmapi"
     if not engine_dir.exists():
@@ -87,7 +91,7 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
                    cnn_dailymail_dst,
                    target_is_directory=True)
 
-    venv_check_call(llm_venv, run_command)
+    venv_check_call(llm_venv, run_command, env=env)
 
 
 def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
@@ -147,15 +151,26 @@ def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_mtp(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_speculative_decoding.py", "MTP", "--model",
-                        f"{llm_models_root()}/DeepSeek-V3-Lite/bf16")
+    env = {"TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION": "1"}
+    _run_llmapi_example(llm_root,
+                        engine_dir,
+                        llm_venv,
+                        "llm_speculative_decoding.py",
+                        "MTP",
+                        "--model",
+                        f"{llm_models_root()}/DeepSeek-V3-Lite/bf16",
+                        env=env)
 
 
 @pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_speculative_decoding_eagle3(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_speculative_decoding.py", "EAGLE3")
+    env = {"TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION": "1"}
+    _run_llmapi_example(llm_root,
+                        engine_dir,
+                        llm_venv,
+                        "llm_speculative_decoding.py",
+                        "EAGLE3",
+                        env=env)
 
 
 @pytest.mark.skip_less_device_memory(80000)

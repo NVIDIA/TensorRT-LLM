@@ -48,6 +48,19 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
+def set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path: str):
+    enabled = attention_path == "trtllm_gen"
+    env_vars = {"TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION": "1" if enabled else "0"}
+    monkeypatch.setenv("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION",
+                       env_vars["TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION"])
+    patch_mpi_pool_session_for_env(mocker, env_vars)
+
+    from tensorrt_llm._torch.attention_backend import \
+        trtllm as trtllm_attention_backend
+    mocker.patch.object(trtllm_attention_backend,
+                        "_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", enabled)
+
+
 from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
@@ -71,6 +84,11 @@ from ..conftest import (get_device_count, get_device_memory, llm_models_root,
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2)
+
+TRTLLM_GEN_ATTENTION_PATHS = [
+    "thop_attention",
+    pytest.param("trtllm_gen", marks=skip_pre_blackwell)
+]
 
 
 def _get_default_torch_compile_config(torch_compile):
@@ -1726,9 +1744,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, True, True), (True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn", [0, 2])
+    @pytest.mark.parametrize("attention_path", TRTLLM_GEN_ATTENTION_PATHS)
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile, enable_chunked_prefill,
-                      v2_kv_cache):
+                      v2_kv_cache, attention_path, mocker, monkeypatch):
+        set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path)
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
             use_kv_cache_manager_v2=v2_kv_cache,
@@ -4894,9 +4914,10 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency", "ep2", "ep4"])
     @pytest.mark.parametrize("activation_dtype", ["static_fp8", "mxfp8"],
                              ids=["fp8", "mxfp8"])
+    @pytest.mark.parametrize("attention_path", TRTLLM_GEN_ATTENTION_PATHS)
     def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
                         attention_dp, cuda_graph, overlap_scheduler,
-                        activation_dtype):
+                        activation_dtype, attention_path, mocker, monkeypatch):
         if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
             pytest.skip(
                 "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
@@ -4905,6 +4926,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ]:
             pytest.skip(
                 "Mxfp8 is only supported for TRTLLM or CUTLASS moe backend.")
+        set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -5417,10 +5439,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     ])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
+    @pytest.mark.parametrize("attention_path", TRTLLM_GEN_ATTENTION_PATHS)
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
-                     overlap_scheduler, mocker, v2_kv_cache):
+                     overlap_scheduler, mocker, monkeypatch, v2_kv_cache,
+                     attention_path):
         if (moe_backend == "TRITON" and is_h20_gpu()):
             pytest.skip("nvbugs/5446119")
+
+        set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path)
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -5546,12 +5572,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "v2_kv_cache,kv_cache_reuse", [(True, True), (False, True),
                                        (True, False)],
         ids=["v2_kv_cache", "v1_kv_cache", "v2_kv_cache_no_reuse"])
+    @pytest.mark.parametrize("attention_path", TRTLLM_GEN_ATTENTION_PATHS)
     def test_w4_4gpus(self, v2_kv_cache, kv_cache_reuse, kv_cache_dtype,
                       moe_backend, tp_size, pp_size, ep_size, attention_dp,
-                      cuda_graph, overlap_scheduler, mocker):
+                      cuda_graph, overlap_scheduler, mocker, monkeypatch,
+                      attention_path):
         if (moe_backend == "TRITON" and is_h20_gpu()):
             pytest.skip("nvbugs/5446119")
-
+        set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path)
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5620,9 +5648,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (4, 1, 4, True, True, True),
         ],
         ids=["dp4"])
+    @pytest.mark.parametrize("attention_path", TRTLLM_GEN_ATTENTION_PATHS)
     def test_w4a16(self, kv_cache_dtype, tp_size, pp_size, ep_size,
                    attention_dp, cuda_graph, overlap_scheduler, monkeypatch,
-                   mocker):
+                   mocker, attention_path):
+        set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path)
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -5663,9 +5693,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (2, 1, 2, True, True, True),
         ],
         ids=["tp2", "ep2", "dp2"])
+    @pytest.mark.parametrize("attention_path", TRTLLM_GEN_ATTENTION_PATHS)
     def test_w4_2gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
-                      mocker):
+                      mocker, monkeypatch, attention_path):
+        set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
@@ -5702,7 +5734,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    def test_w4_chunked_prefill(self, kv_cache_dtype, moe_backend, mocker):
+    @pytest.mark.parametrize("attention_path", TRTLLM_GEN_ATTENTION_PATHS)
+    def test_w4_chunked_prefill(self, kv_cache_dtype, moe_backend, mocker,
+                                monkeypatch, attention_path):
+        set_trtllm_gen_attention_path(mocker, monkeypatch, attention_path)
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
