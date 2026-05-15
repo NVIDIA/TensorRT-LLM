@@ -2782,6 +2782,36 @@ def _bench_config(
                 use_tma_replay_nowrite_load_values,
                 use_tma_replay_write_store_values,
             )
+        # Iteration source: when --cell-list is active, iterate the cell set
+        # DIRECTLY (one yield per cell).  The earlier design iterated the
+        # full inner cartesian and filtered each iteration via membership in
+        # args._cell_list_set — that's O(cartesian) which blows up to
+        # billions of iterations when the cell-list spans wide split-knob
+        # values (CPS, LS, M, W, S each contributing a Wx*Wnw factor on top
+        # of TMA flags), producing 50+ min of CPU spin per bench call before
+        # any actual timing.  Direct iteration is O(|cell_list|).
+        if getattr(args, "_cell_list_set", None):
+            def _gen_from_cell_list():
+                keys = args._cell_list_keys
+                for tup in args._cell_list_set:
+                    d = dict(zip(keys, tup))
+                    yield (
+                        d.get("Mw"), d.get("Mnw"),
+                        d.get("Ww"), d.get("Wnw"),
+                        d.get("Sw"), d.get("Snw"),
+                        d.get("pW"), d.get("pS"),
+                        d.get("H"),
+                        d.get("R"), d.get("CT"),
+                        d.get("CPSw"), d.get("CPSnw"),
+                        d.get("LSw"), d.get("LSnw"),
+                        d.get("FL"), d.get("WS"),
+                        d.get("TMARL"), d.get("TMAWL"),
+                        d.get("TMANL"), d.get("TMAWS"),
+                    )
+            _iter_source = _gen_from_cell_list()
+        else:
+            _iter_source = itertools.product(*_iter_axes)
+
         for (
             block_size_m_w,
             block_size_m_nw,
@@ -2804,7 +2834,7 @@ def _bench_config(
             use_tma_replay_write_load,
             use_tma_replay_nowrite_load,
             use_tma_replay_write_store,
-        ) in itertools.product(*_iter_axes):
+        ) in _iter_source:
             # When tied, _nw values were placeholder None; fill from _w (the
             # shared value).  When split, _w and _nw came from independent lists.
             if not _any_split:
