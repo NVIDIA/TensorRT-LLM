@@ -47,6 +47,7 @@ QWEN3_VL_30B_A3B_CONFIG = {
             "rope_type": "default",
         },
         "rope_theta": 5000000,
+        "tie_word_embeddings": False,
         "use_cache": True,
         "vocab_size": 151936,
     },

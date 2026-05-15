@@ -42,6 +42,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.sampling_params import check_logprobs_limit
 from tensorrt_llm.scheduling_params import AgentHierarchy
 
 
@@ -402,9 +403,22 @@ class CompletionRequest(OpenAIBaseModel):
                            vocab_size: Optional[int] = None,
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
+        sampling_logprobs = None
+        return_log_probs = False
+        if self.logprobs:
+            if backend == "pytorch" or gather_generation_logits:
+                sampling_logprobs = self.logprobs
+            elif self.logprobs > 1:
+                raise ValueError(
+                    "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
+                )
+            else:
+                return_log_probs = True
+
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
+            logprobs=sampling_logprobs,
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -442,25 +456,14 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if self.logprobs:
-            if backend == "pytorch":
-                sampling_params.logprobs = self.logprobs
-            else:
-                if gather_generation_logits:
-                    sampling_params.logprobs = self.logprobs
-                elif self.logprobs > 1:
-                    raise ValueError(
-                        "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
-                    )
-                else:
-                    sampling_params._return_log_probs = True
+        if return_log_probs:
+            sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if (logprobs := data.get("logprobs")) is not None and logprobs < 0:
-            raise ValueError("logprobs must be positive or zero")
+        check_logprobs_limit("logprobs", data.get("logprobs"))
         return data
 
     @model_validator(mode="before")
@@ -782,8 +785,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
+        sampling_logprobs = None
+        return_log_probs = False
+        if self.logprobs:
+            logprobs = 1 if not self.top_logprobs else self.top_logprobs
+            if backend == "pytorch" or gather_generation_logits:
+                sampling_logprobs = logprobs
+            elif self.top_logprobs:
+                raise ValueError(
+                    "`gather_generation_logits` must be `True` to use `top_logprobs`"
+                )
+            else:
+                return_log_probs = True
+
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
+            logprobs=sampling_logprobs,
             max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -820,19 +837,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if self.logprobs:
-            logprobs = 1 if not self.top_logprobs else self.top_logprobs
-            if backend == "pytorch":
-                sampling_params.logprobs = logprobs
-            else:
-                if gather_generation_logits:
-                    sampling_params.logprobs = logprobs
-                elif self.top_logprobs:
-                    raise ValueError(
-                        "`gather_generation_logits` must be `True` to use `top_logprobs`"
-                    )
-                else:
-                    sampling_params._return_log_probs = True
+        if return_log_probs:
+            sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode='before')
@@ -858,8 +864,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @classmethod
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
-            if top_logprobs < 0:
-                raise ValueError("top_logprobs must be positive or zero")
+            check_logprobs_limit("top_logprobs", top_logprobs)
             if not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")

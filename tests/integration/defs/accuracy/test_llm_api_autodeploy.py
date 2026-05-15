@@ -58,6 +58,10 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
             if "world_size_" in cfg_name and cfg_name.endswith(".yaml"):
                 world_size = int(
                     cfg_name.replace("world_size_", "").replace(".yaml", ""))
+            with open(config_dir / cfg) as config_file:
+                config = yaml.safe_load(config_file) or {}
+            if "world_size" in config:
+                world_size = int(config["world_size"])
         return paths, world_size
     raise ValueError(f"Model '{model_name}' not found in model registry")
 
@@ -1190,6 +1194,62 @@ class TestKimiK2_5(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestGPTOSS(LlmapiAccuracyTestHarness):
+    """GSM8K accuracy coverage for GPT-OSS via AutoDeploy."""
+
+    EXTRA_EVALUATOR_KWARGS = {
+        "fewshot_as_multiturn": True,
+        "apply_chat_template": True,
+        "chat_template_kwargs": {
+            "reasoning_effort": "low",
+        },
+    }
+    GSM8K_MAX_OUTPUT_LEN = 512
+    MODEL_PATHS = {
+        "20b": f"{llm_models_root()}/gpt_oss/gpt-oss-20b",
+        "120b": f"{llm_models_root()}/gpt_oss/gpt-oss-120b",
+    }
+
+    MODEL_PARAMS = [
+        pytest.param(
+            "20b",
+            "openai/gpt-oss-20b",
+            marks=pytest.mark.skip_less_device(2),
+            id="20b",
+        ),
+        pytest.param(
+            "120b",
+            "openai/gpt-oss-120b",
+            marks=pytest.mark.skip_less_device(4),
+            id="120b",
+        ),
+    ]
+
+    @pytest.mark.parametrize("model_id,model_name", MODEL_PARAMS)
+    def test_mxfp4_gsm8k(self, model_id, model_name, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
+        if get_device_count() < registry_world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+
+        model_path = self.MODEL_PATHS[model_id]
+        with AutoDeployLLM(
+                model=model_path,
+                tokenizer=model_path,
+                world_size=registry_world_size,
+                yaml_extra=yaml_paths,
+                max_seq_len=GSM8K.MAX_INPUT_LEN + self.GSM8K_MAX_OUTPUT_LEN,
+        ) as llm:
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestGemma4MoE(LlmapiAccuracyTestHarness):
