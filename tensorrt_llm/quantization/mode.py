@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -481,3 +481,44 @@ class GroupwiseQuantAlgo:
     PRE_QUANT_SCALE = 4
     W4A8_ALPHA = 8
     INT8_WEIGHT = 16
+
+
+def get_sm_version_from_torch() -> Optional[int]:
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+
+    major, minor = torch.cuda.get_device_capability(torch.device("cuda:0"))
+    return major * 10 + minor
+
+
+def is_mxfp4_supported(sm, quant_mode):
+    if quant_mode is None or sm is None:
+        return True
+
+    if hasattr(quant_mode,
+               "has_w4a8_mxfp4_fp8") and quant_mode.has_w4a8_mxfp4_fp8():
+        return sm in (100, 103)
+    if hasattr(
+            quant_mode,
+            "has_w4a8_mxfp4_mxfp8") and quant_mode.has_w4a8_mxfp4_mxfp8():
+        return sm in (100, 103)
+    if hasattr(quant_mode,
+               "has_w4a16_mxfp4") and quant_mode.has_w4a16_mxfp4():
+        return sm == 90
+    if hasattr(quant_mode,
+               "has_w4a8_nvfp4_fp8") and quant_mode.has_w4a8_nvfp4_fp8():
+        return sm in (100, 103, 120, 121)
+    if hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4():
+        return sm in (100, 103, 120, 121)
+
+    return True
+
+
+def get_mxfp4_support_error_message(sm, quant_mode):
+    sm_str = f"SM{sm}" if sm is not None else "unknown GPU"
+    return f"{quant_mode} is not supported on {sm_str}. Supported on newer architectures only."
