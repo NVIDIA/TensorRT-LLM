@@ -30,6 +30,12 @@ kv_cache_config:
 transforms:
   quantize_mxfp4_moe_trtllm_gen:
     enabled: true
+    # MXFP8 input activation: pre-quantize activations to E4M3 + UE8M0 block
+    # scales and dispatch to ``trtllm_mxfp4_w4a8_moe_fused`` (MXFP4 weights ×
+    # MXFP8 activations). Matches PT's ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod``
+    # path; the C++ runner uses the ``bmm_MxE4m3_MxE2m1MxE4m3`` cubin family
+    # which has bigger TileN candidates available than the bf16 fallback.
+    quant_act: mxfp8
   # Fold RoPE into the trtllm attention kernel call so the kernel applies
   # RoPE internally (same path as the PyTorch backend). When RoPE is applied
   # externally in modeling code and only Q/K post-RoPE are passed to the
