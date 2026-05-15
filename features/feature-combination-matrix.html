@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc14';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc14" />
+  <meta name="docsearch:version" content="1.3.0rc12.post1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -334,9 +334,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
@@ -455,8 +455,6 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -558,8 +556,7 @@
 <th class="head"><p>Disaggregated Serving</p></th>
 <th class="head"><p>Chunked Prefill</p></th>
 <th class="head"><p>MTP</p></th>
-<th class="head"><p>EAGLE-3(One Model Engine) — Linear</p></th>
-<th class="head"><p>EAGLE-3(One Model Engine) — Dynamic</p></th>
+<th class="head"><p>EAGLE-3(One Model Engine)</p></th>
 <th class="head"><p>EAGLE-3(Two Model Engine)</p></th>
 <th class="head"><p>Torch Sampler</p></th>
 <th class="head"><p>TLLM C++ Sampler</p></th>
@@ -573,7 +570,6 @@
 <tbody>
 <tr class="row-even"><td><p>Overlap Scheduler</p></td>
 <td><p>—</p></td>
-<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -613,13 +609,11 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Tensor Parallelism</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
-<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -657,7 +651,6 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Expert Parallelism</p></td>
 <td><p>Yes</p></td>
@@ -665,7 +658,6 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
-<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -701,7 +693,6 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Attention Data Parallelism</p></td>
 <td><p>Yes</p></td>
@@ -711,7 +702,6 @@
 <td><p>Yes</p></td>
 <td><p>Known issues</p></td>
 <td><p>—</p></td>
-<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -745,7 +735,6 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Chunked Prefill</p></td>
 <td><p>Yes</p></td>
@@ -757,7 +746,6 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
-<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -789,9 +777,8 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>EAGLE-3(One Model Engine) — Linear</p></td>
+<tr class="row-even"><td><p>EAGLE-3(One Model Engine)</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -811,9 +798,8 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>EAGLE-3(One Model Engine) — Dynamic</p></td>
+<tr class="row-odd"><td><p>EAGLE-3(Two Model Engine)</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -833,32 +819,8 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
-<td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>EAGLE-3(Two Model Engine)</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>—</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p>Torch Sampler</p></td>
-<td><p>Yes</p></td>
+<tr class="row-even"><td><p>Torch Sampler</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -879,7 +841,7 @@
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>TLLM C++ Sampler</p></td>
+<tr class="row-odd"><td><p>TLLM C++ Sampler</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -889,7 +851,6 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -901,8 +862,7 @@
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>KV Cache Reuse</p></td>
-<td><p>Yes</p></td>
+<tr class="row-even"><td><p>KV Cache Reuse</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -923,7 +883,7 @@
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>Sliding Window Attention</p></td>
+<tr class="row-odd"><td><p>Sliding Window Attention</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -939,13 +899,12 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes</p></td>
 <td><p>—</p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>Logits Post Processor</p></td>
+<tr class="row-even"><td><p>Logits Post Processor</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -955,7 +914,6 @@
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -967,8 +925,7 @@
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>Guided Decoding</p></td>
-<td><p>Yes</p></td>
+<tr class="row-odd"><td><p>Guided Decoding</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -989,7 +946,7 @@
 <td><p>—</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>LoRA</p></td>
+<tr class="row-even"><td><p>LoRA</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -999,7 +956,6 @@
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>Yes</p></td>
-<td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
@@ -1141,9 +1097,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 06, 2026.</p>
+  <p>Last updated on May 15, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/93cb651">93cb651</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
   
 </div></div>
       

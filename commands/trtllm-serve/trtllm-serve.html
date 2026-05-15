@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc14';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc14" />
+  <meta name="docsearch:version" content="1.3.0rc12.post1" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -338,9 +338,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
@@ -459,8 +459,6 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -1354,7 +1352,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for reasoning models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3 | deepseek-r1 | nano-v3 | gemma4 | kimi_k2</p>
+<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3 | deepseek-r1 | nano-v3 | kimi_k2</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1365,7 +1363,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for tool models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | deepseek_v3 | deepseek_v31 | deepseek_v32 | glm4 | glm47 | minimax_m2 | gemma4</p>
+<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | deepseek_v3 | deepseek_v31 | deepseek_v32 | glm4 | glm47 | minimax_m2</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1434,12 +1432,6 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-chat_template">
 <span class="sig-name descname"><span class="pre">--chat_template</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;chat_template&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-chat_template" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify a custom chat template. Can be a file path or one-liner template string</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-middleware">
-<span class="sig-name descname"><span class="pre">--middleware</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;middleware&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-middleware" title="Link to this definition">#</a></dt>
-<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> FastAPI middleware import path to add to the server app. Can be specified multiple times. Each value must point to either a middleware class or an async HTTP middleware function.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -1639,9 +1631,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 06, 2026.</p>
+  <p>Last updated on May 15, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/93cb651">93cb651</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
   
 </div></div>
       

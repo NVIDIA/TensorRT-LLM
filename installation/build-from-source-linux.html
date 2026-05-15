@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=55c26ed414f5f8a31ebb"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'installation/build-from-source-linux';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12" />
+  <meta name="docsearch:version" content="1.3.0rc12.post1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -102,7 +102,9 @@
   
   <button type="button" class="btn rounded-pill" id="pst-back-to-top">
     <i class="fa-solid fa-arrow-up"></i>Back to top</button>
-
+  
+  
+  
   
   <dialog id="pst-search-dialog">
     
@@ -670,7 +672,7 @@ make<span class="w"> </span>-C<span class="w"> </span>enroot<span class="w"> </s
 <section id="advanced-topics">
 <h3>Advanced topics<a class="headerlink" href="#advanced-topics" title="Link to this heading">#</a></h3>
 <p>For more information on building and running various TensorRT LLM container images,
-check <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker">https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker</a>.</p>
+check <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker">NVIDIA/TensorRT-LLM</a>.</p>
 </section>
 </section>
 <section id="build-tensorrt-llm">
@@ -703,7 +705,7 @@ example:</p>
 python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--cuda_architectures<span class="w"> </span><span class="s2">&quot;80-real;86-real&quot;</span>
 </pre></div>
 </div>
-<p>To use the C++ benchmark scripts under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21/benchmarks/cpp/">benchmark/cpp</a>, for example <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark.cpp</span></code>, add the <code class="docutils literal notranslate"><span class="pre">--benchmarks</span></code> option:</p>
+<p>To use the C++ benchmark scripts under <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd/benchmarks/cpp/">benchmark/cpp</a>, for example <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark.cpp</span></code>, add the <code class="docutils literal notranslate"><span class="pre">--benchmarks</span></code> option:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--benchmarks
 </pre></div>
 </div>
@@ -854,8 +856,8 @@ pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb"></script>
 
 
   <footer class="bd-footer">
@@ -927,9 +929,9 @@ pip<span class="w"> </span>install<span class="w"> </span>./build/tensorrt_llm*.
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 16, 2026.</p>
+  <p>Last updated on May 15, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21">61cef21</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
   
 </div></div>
       
