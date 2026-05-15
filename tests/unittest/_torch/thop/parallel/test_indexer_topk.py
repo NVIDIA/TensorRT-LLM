@@ -365,12 +365,24 @@ def test_indexer_topk_decode_multi_pass_radix_via_legacy_api(batch_size, num_tok
     _run_opt_in_decode(batch_size, num_tokens, dtype=dtype, done_counter=done_counter, scratch=None)
 
 
-@skip_pre_hopper
-@pytest.mark.parametrize("batch_size", _PREFILL_BATCH_SIZES)
-@pytest.mark.parametrize("index_topk", [2048, 128])
-@pytest.mark.parametrize("num_tokens", _PREFILL_NUM_TOKENS)
-def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
-    """Verify indexer_topk_prefill output matches torch.topk for variable-length rows."""
+# Covers the device-aware single-block / multi-block path transition around
+# the GPU's SM count. Lower batch sizes keep the single-block-per-row path;
+# near-SM-count batches route to the multi-block split-and-merge path with
+# bp = 2 to avoid the wave-scheduling cliff that the single-block radix kernel
+# hits once gridDim.x approaches smCount on B200.
+@pytest.mark.parametrize("batch_size", [1, 64, 100, 132, 148, 256])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 16384, 32768])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode_launch_policy_transitions(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
+
+
+def _run_indexer_topk_prefill_check(batch_size, index_topk, num_tokens):
+    """Run the prefill equivalence check against torch.topk."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
@@ -400,6 +412,15 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     assert compare_top_k_results(
         logits, indices, torch_indices, row_starts, row_ends, index_topk
     ), "CUDA top_k_per_row results don't match torch.topk"
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("batch_size", _PREFILL_BATCH_SIZES)
+@pytest.mark.parametrize("index_topk", [2048, 128])
+@pytest.mark.parametrize("num_tokens", _PREFILL_NUM_TOKENS)
+def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
+    """Verify indexer_topk_prefill output matches torch.topk for variable-length rows."""
+    _run_indexer_topk_prefill_check(batch_size, index_topk, num_tokens)
 
 
 # ============================================================================
