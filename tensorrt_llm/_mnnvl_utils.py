@@ -29,7 +29,7 @@ except ImportError:
     from cuda import cuda
 
 from ._dlpack_utils import pack_strided_memory
-from ._utils import mpi_comm
+from ._utils import get_sm_version, mpi_comm
 from .logger import logger
 from .mapping import Mapping
 
@@ -382,6 +382,13 @@ class MnnvlMemory:
         # We check if it has all NVLink up now.
         # But it is not equivalent to MNNVL support.
         # May need better support check.
+        # SM120/121 (RTX PRO 6000 Blackwell desktop / Server Edition) lack the
+        # NVSwitch fabric required for MNNVL all-to-all; even with a local
+        # NVLink bridge up, the MNNVL kernels hang on these parts. Exclude them
+        # so callers (e.g. MoE CommunicationFactory) fall back to a non-MNNVL
+        # path such as AllGather + ReduceScatter.
+        if get_sm_version() in (120, 121):
+            return False
         dev_id = torch.cuda.current_device()
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
