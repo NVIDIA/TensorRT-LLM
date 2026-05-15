@@ -1270,23 +1270,38 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "120b": f"{llm_models_root()}/gpt_oss/gpt-oss-120b",
     }
 
+    # Each entry: (model_id, model_name, world_size_override).
+    # ``world_size_override=None`` keeps the per-model yaml's ``world_size``
+    # (TP=1 for both 20b and 120b). A non-None value overrides the yaml so we
+    # can exercise the TP > 1 path with the same accuracy bar.
     MODEL_PARAMS = [
         pytest.param(
             "20b",
             "openai/gpt-oss-20b",
+            None,
             marks=pytest.mark.skip_less_device(2),
             id="20b",
         ),
         pytest.param(
             "120b",
             "openai/gpt-oss-120b",
+            None,
             # marks=pytest.mark.skip_less_device(4),
             id="120b",
         ),
+        pytest.param(
+            "120b",
+            "openai/gpt-oss-120b",
+            2,
+            marks=pytest.mark.skip_less_device(2),
+            id="120b-tp2",
+        ),
     ]
 
-    @pytest.mark.parametrize("model_id,model_name", MODEL_PARAMS)
-    def test_mxfp4_gsm8k(self, model_id, model_name, mocker):
+    @pytest.mark.parametrize("model_id,model_name,world_size_override",
+                             MODEL_PARAMS)
+    def test_mxfp4_gsm8k(self, model_id, model_name, world_size_override,
+                         mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
         # DEBUG: limit samples for fast bisect
         mocker.patch.object(GSM8K, "NUM_SAMPLES", 50)
@@ -1294,14 +1309,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           {"scores_filter": "exact_match,flexible-extract"})
 
         yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
-        if get_device_count() < registry_world_size:
+        world_size = (world_size_override if world_size_override is not None
+                      else registry_world_size)
+        if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
         model_path = self.MODEL_PATHS[model_id]
         with AutoDeployLLM(
                 model=model_path,
                 tokenizer=model_path,
-                world_size=registry_world_size,
+                world_size=world_size,
                 yaml_extra=yaml_paths,
                 max_seq_len=GSM8K.MAX_INPUT_LEN + self.GSM8K_MAX_OUTPUT_LEN,
         ) as llm:
