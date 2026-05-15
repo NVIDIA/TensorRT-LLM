@@ -92,8 +92,8 @@ models:
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: bigcode/starcoder2-7b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: bigcode/starcoder2-15b
   config_id: attn_backend_triton
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'attn_backend_triton.yaml']
@@ -155,8 +155,8 @@ models:
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: openai/gpt-oss-20b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: gpt_oss_20b
+  yaml_extra: ['gpt_oss_20b.yaml']
 - name: ibm-granite/granite-3.0-8b-instruct
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -267,7 +267,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-30B-A3B
   config_id: simple_shard_only
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-235B-A22B
   config_id: simple_shard_only
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
@@ -293,8 +293,8 @@ models:
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
 - name: openai/gpt-oss-120b
-  config_id: num_hidden_layers_5
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+  config_id: gpt_oss_120b
+  yaml_extra: ['gpt_oss_120b.yaml']
 - name: meta-llama/Llama-4-Scout-17B-16E-Instruct
   config_id: multimodal__llama4_scout
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']

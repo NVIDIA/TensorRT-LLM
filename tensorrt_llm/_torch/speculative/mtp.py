@@ -41,7 +41,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
                  max_num_requests: int,
                  sa_manager=None):
         self.dtype = dtype
-        self.num_nextn_predict_layers = config.num_nextn_predict_layers
+        self.num_draft_slots = config.max_draft_len
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
@@ -54,12 +54,12 @@ class MTPHiddenStatesManager(BaseResourceManager):
 
         # Since golden token's hidden state will always be generated after target model
         self.mtp_past_hidden_states_pool = torch.zeros(
-            (slot_pool_size, self.num_nextn_predict_layers, self.hidden_size),
+            (slot_pool_size, self.num_draft_slots, self.hidden_size),
             device='cuda',
             dtype=self.dtype,
         )
         self.mtp_past_tokens_pool = torch.zeros(
-            (slot_pool_size, self.num_nextn_predict_layers),
+            (slot_pool_size, self.num_draft_slots),
             device='cuda',
             dtype=torch.int,
         )
@@ -279,7 +279,7 @@ class MTPWorker(SpecWorkerBase):
 
     @property
     def max_draft_len(self) -> int:
-        return self.spec_config.num_nextn_predict_layers
+        return self.spec_config.max_draft_len
 
     def forward(
         self,
@@ -599,7 +599,7 @@ class MTPWorker(SpecWorkerBase):
         seq_lens_cpu = attn_metadata.seq_lens
         hidden_size = hidden_states.shape[-1]
         runtime_draft_len = spec_metadata.runtime_draft_len
-        max_draft_len = self.spec_config.num_nextn_predict_layers
+        max_draft_len = self.spec_config.max_draft_len
 
         if self.is_thop:
             _, _ = torch.ops.trtllm.mtp_update_hidden_states_op(
@@ -1137,7 +1137,7 @@ class MTPEagleWorker(MTPWorker):
                  use_separate_draft_kv_cache: bool = False):
         super().__init__(spec_config, model_config, use_separate_draft_kv_cache)
         self.model_config = model_config
-        self.mtp_num_modules = spec_config.num_nextn_predict_layers
+        self.mtp_num_modules = spec_config.max_draft_len
         self._is_mamba_hybrid_cache = None
 
     @torch.compile(options={"max-autotune": True})

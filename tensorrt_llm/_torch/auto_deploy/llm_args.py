@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Type, Union
@@ -6,15 +20,15 @@ import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from tensorrt_llm.mapping import Mapping
-
-from ...llmapi.llm_args import (
+from tensorrt_llm.llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
+
+from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.dist_config import DistConfig
@@ -110,34 +124,56 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return _check_for_default_value_only(cls, value, info, msg)
 
     @model_validator(mode="after")
+    def validate_supported_speculative_config(self):
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return self
+
+        if isinstance(spec_config, MTPDecodingConfig):
+            if not spec_config.mtp_eagle_one_model or spec_config.use_mtp_vanilla:
+                raise ValueError(
+                    "AutoDeploy only supports MTP speculative decoding with "
+                    "mtp_eagle_one_model=True and use_mtp_vanilla=False "
+                    f"(got mtp_eagle_one_model={spec_config.mtp_eagle_one_model}, "
+                    f"use_mtp_vanilla={spec_config.use_mtp_vanilla})."
+                )
+        elif isinstance(spec_config, EagleDecodingConfig):
+            if not spec_config.eagle3_one_model:
+                raise ValueError(
+                    "AutoDeploy only supports Eagle speculative decoding with "
+                    f"eagle3_one_model=True (got eagle3_one_model={spec_config.eagle3_one_model})."
+                )
+        else:
+            raise ValueError(
+                "AutoDeploy only supports speculative decoding via "
+                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
+                "EagleDecodingConfig(eagle3_one_model=True)."
+            )
+
+        self.model_factory = "eagle_one_model"
+        return self
+
+    @model_validator(mode="after")
     def setup_hidden_state_capture(self):
         spec_config = self.speculative_config
         if spec_config is None:
             return self
 
         if isinstance(spec_config, MTPDecodingConfig):
-            if not spec_config.mtp_eagle_one_model:
-                return self
-            if spec_config.use_mtp_vanilla:
-                raise ValueError("mtp_eagle_one_model and use_mtp_vanilla cannot both be enabled")
             if spec_config.max_draft_len is None:
                 raise ValueError(
                     "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
                     "enabled. Ensure num_nextn_predict_layers is set in the model config."
                 )
             capture_layers = {-1}
-            self.model_factory = "eagle_one_model"
-        elif isinstance(spec_config, EagleDecodingConfig):
+        else:
+            assert isinstance(spec_config, EagleDecodingConfig)
             if spec_config.max_draft_len is None:
                 raise ValueError(
                     "EagleDecodingConfig.max_draft_len must not be None. "
                     "Provide a positive integer for max_draft_len."
                 )
             capture_layers = spec_config.eagle3_layers_to_capture
-            if spec_config.eagle3_one_model:
-                self.model_factory = "eagle_one_model"
-        else:
-            return self
 
         self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
@@ -222,11 +258,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
-
-    draft_checkpoint_loader: Optional[object] = Field(
-        default=None,
-        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
-    )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
     mode: Literal["graph", "transformers"] = Field(
@@ -421,45 +452,39 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         sharding_config = (
             ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
         )
-        dist_mapping_config = sharding_config.get("dist_mapping", {})
+        dist_mapping = sharding_config.get("dist_mapping", {})
         enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
 
         if enable_attention_dp:
-            moe_ep_size = self.world_size
-            moe_tp_size = 1
+            # Attention-DP forces EP-only MoE topology regardless of YAML moe_tp/moe_ep.
+            dist_mapping = {**dist_mapping, "moe_ep": self.world_size, "moe_tp": 1}
             ad_logger.info(
-                f"Attention-DP with EP-only MoE: moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+                f"Attention-DP with EP-only MoE: moe_ep_size={self.world_size}, moe_tp_size=1"
             )
-        else:
-            moe_tp_size = dist_mapping_config.get("moe_tp", 1)
-            moe_ep_size = dist_mapping_config.get("moe_ep", self.world_size)
+
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
 
         try:
-            dc = DistConfig(
-                world_size=world_size,
+            dc = DistConfig.from_sharding_params(
                 rank=rank,
-                tp_size=dist_mapping_config.get("tp", self.world_size),
-                moe_tp_size=moe_tp_size,
-                moe_ep_size=moe_ep_size,
-                moe_cluster_size=dist_mapping_config.get("moe_cluster", 1),
+                world_size=world_size,
+                dist_mapping=dist_mapping,
                 enable_attention_dp=enable_attention_dp,
+                allreduce_strategy=allreduce_strategy,
             )
         except ValueError as e:
             raise ValueError(
                 f"Invalid parallel grid config: {e}. "
-                f"Please check your dist_mapping configuration: {dist_mapping_config}"
+                f"Please check your dist_mapping configuration: {dist_mapping}"
             ) from e
 
         return dc
 
-    def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
-        """Build a Mapping for external APIs that still require it."""
-        return self.init_dist_config(rank, world_size).to_mapping()
-
     ### PRIVATE METHODS ############################################################################
     @classmethod
     def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
-        config_path = files("tensorrt_llm._torch.auto_deploy.config")
+        config_path = files(_ad_config_pkg)
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),

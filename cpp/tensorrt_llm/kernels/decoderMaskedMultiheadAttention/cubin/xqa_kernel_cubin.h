@@ -34,7 +34,7 @@ struct XQAKernelMetaInfo
     bool mPagedKVCache;
     bool mMultiQueryTokens;
     unsigned int mSM;
-    const unsigned long long* mCubin;
+    const unsigned char* mCubin;
     unsigned int mCubinSize;
     char const* mFuncName;
 };

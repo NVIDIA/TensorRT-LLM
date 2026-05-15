@@ -53,7 +53,13 @@ llm_spark_func:
   - test_e2e.py::test_openai_reasoning[pytorch]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_trtllm_benchmark_serving[llama-3.1-model/Meta-Llama-3.1-8B]
-  - examples/serve/test_serve.py::test_nemotron_super_nvfp4
+  - examples/serve/test_serve.py::test_nemotron3_super_120b_nvfp4
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_on]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_off]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_streaming]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[tool_calling]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[image]
+  - examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[video]
   - examples/serve/test_serve_negative.py::test_invalid_max_tokens
   - examples/serve/test_serve_negative.py::test_invalid_temperature
   - examples/serve/test_serve_negative.py::test_invalid_top_p[-0.1]

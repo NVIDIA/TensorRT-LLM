@@ -19,6 +19,7 @@ from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  add_multimodal_placeholders, async_load_audio,
                                  async_load_image, async_load_video,
                                  load_base64_image_embeds)
+from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import interleave_mm_placeholders
@@ -91,6 +92,24 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
     }
 
 
+def resolve_media_io_kwargs(
+    server_config: Optional[MultimodalServerConfig],
+    request_kwargs: Optional[Dict[str, Dict[str, Any]]],
+    modality: str,
+) -> Dict[str, Any]:
+    """Resolve the effective loader kwargs for one modality on one request.
+
+    Delegates to `MediaIO.merge_kwargs` (see `inputs/media_io.py`); the
+    default rule is a shallow merge with request keys winning. Unknown
+    kwargs surface as a `TypeError` from the loader at request time.
+    """
+    server_kwargs = server_config.media_io_kwargs if server_config else None
+    default_kwargs = (server_kwargs or {}).get(modality, {})
+    runtime_kwargs = (request_kwargs or {}).get(modality, {})
+    media_io_cls = MEDIA_IO_REGISTRY.get(modality, BaseMediaIO)
+    return media_io_cls.merge_kwargs(default_kwargs, runtime_kwargs)
+
+
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
 ) -> tuple[str, Union[str, dict[str, str], None]]:
@@ -128,9 +147,10 @@ def parse_chat_message_content_part(
 
     if part_type == "image_url":
         str_content = cast(str, content)
-        image_kwargs = (
-            mm_data_tracker._multimodal_server_config.media_io_kwargs
-            or {}).get("image", {})
+        image_kwargs = resolve_media_io_kwargs(
+            mm_data_tracker._multimodal_server_config,
+            mm_data_tracker.request_media_io_kwargs, "image")
+        logger.debug("effective image_kwargs keys: %s", sorted(image_kwargs))
         return MultimodalData(modality="image",
                               data=async_load_image(str_content,
                                                     **image_kwargs),
@@ -148,9 +168,10 @@ def parse_chat_message_content_part(
 
     if part_type == "video_url":
         str_content = cast(str, content)
-        video_kwargs = (
-            mm_data_tracker._multimodal_server_config.media_io_kwargs
-            or {}).get("video", {})
+        video_kwargs = resolve_media_io_kwargs(
+            mm_data_tracker._multimodal_server_config,
+            mm_data_tracker.request_media_io_kwargs, "video")
+        logger.debug("effective video_kwargs keys: %s", sorted(video_kwargs))
         return MultimodalData(modality="video",
                               data=async_load_video(str_content,
                                                     **video_kwargs),
@@ -158,9 +179,10 @@ def parse_chat_message_content_part(
 
     if part_type == "audio_url":
         str_content = cast(str, content)
-        audio_kwargs = (
-            mm_data_tracker._multimodal_server_config.media_io_kwargs
-            or {}).get("audio", {})
+        audio_kwargs = resolve_media_io_kwargs(
+            mm_data_tracker._multimodal_server_config,
+            mm_data_tracker.request_media_io_kwargs, "audio")
+        logger.debug("effective audio_kwargs keys: %s", sorted(audio_kwargs))
         return MultimodalData(modality="audio",
                               data=async_load_audio(str_content,
                                                     **audio_kwargs),
@@ -289,18 +311,55 @@ def _parse_tool_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def resolve_top_level_model_type(model_config: AutoConfig) -> str:
+    """Return the top-level HF model_type for a loaded config.
+
+    Newer composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
+    attribute to `text_config`, returning e.g. "qwen2_5_vl_text" instead of the
+    top-level "qwen2_5_vl" used as the AutoConfig/registry key. The class-level
+    attribute is unaffected by this delegation, so prefer it.
+    """
+    return getattr(type(model_config), "model_type", None) or getattr(
+        model_config, "model_type", "")
+
+
 def parse_chat_messages_coroutines(
     messages: List[ChatCompletionMessageParam],
     model_config: AutoConfig,
-    multimodal_server_config: Optional[MultimodalServerConfig] = None
+    multimodal_server_config: Optional[MultimodalServerConfig] = None,
+    request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
-    """Parse multiple chat messages and return conversation and coroutine."""
+    """Parse multiple chat messages and return conversation and coroutine.
+
+    Multimodal items across all messages share one
+    `MultimodalDataTracker` so they fetch and decode concurrently when
+    the coroutine is awaited.
+
+    Args:
+        messages: Chat messages with text or multimodal parts.
+        model_config: HF `AutoConfig`; selects the model's placeholder
+            strategy via `MULTIMODAL_PLACEHOLDER_REGISTRY`.
+        multimodal_server_config: Server-level multimodal config
+            (e.g. `--media_io_kwargs`); defaults to empty.
+        request_media_io_kwargs: Per-request override merged per
+            modality with the server default via
+            `resolve_media_io_kwargs`.
+
+    Returns:
+        `(conversation, mm_coroutine, mm_placeholder_counts)` where
+        `mm_coroutine` yields `(mm_data, mm_embeddings)` when awaited
+        and `mm_placeholder_counts` has one entry per message mapping
+        placeholder string -> count.
+    """
     conversation = []
     mm_placeholder_counts = []
-    mm_data_tracker = MultimodalDataTracker(model_config.model_type,
-                                            multimodal_server_config)
+    model_type = resolve_top_level_model_type(model_config)
+    mm_data_tracker = MultimodalDataTracker(
+        model_type,
+        multimodal_server_config,
+        request_media_io_kwargs=request_media_io_kwargs)
 
     # Determine content format to decide placeholder strategy.
     #
@@ -315,7 +374,6 @@ def parse_chat_messages_coroutines(
     #    path calls `_build_openai_content`, which reconstructs `conv["content"]` from
     #    `content_parts` - overwriting any STRING-style placeholders inserted here.
     # See also: `_resolve_content_format` (inputs/utils.py) for the full resolution used downstream.
-    model_type = model_config.model_type
     registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
         model_type)
     if registry_format is not None:

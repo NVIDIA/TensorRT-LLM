@@ -35,6 +35,67 @@ class ExtraParamSchema(StrictBaseModel):
     )
 
 
+def _parse_profile_range():
+    """Parse ``TLLM_PROFILE_VISUAL_GEN_START_STOP`` for CUDA profiler scoping.
+
+    Visual-gen-specific env var (separate from the LLM path's
+    ``TLLM_PROFILE_START_STOP``). Use with ``nsys profile -c cudaProfilerApi ...``.
+
+    Supported formats:
+
+    * ``A-B``            – profile denoise steps A through B
+    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
+    * ``A,B,...``        – individual steps treated as single-step ranges
+    * ``predenoise``     – profile the per-request pre-loop work inside
+                           ``denoise()`` (CFG config setup, scheduler refresh,
+                           TeaCache reset) up to the first denoise step.
+                           Single-shot.
+    * ``postdenoise``    – profile from the end of the last denoise step to
+                           pipeline cleanup, covering VAE decode. Single-shot.
+    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
+    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
+
+    Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
+    ``"postdenoise"`` for keyword modes, or ``(frozenset(starts), frozenset(stops))``
+    for numeric ranges.
+
+    .. note::
+       Step indices are **per-request**: each ``denoise()`` call resets the
+       loop counter to 0, so e.g. ``0-4`` profiles steps 0-4 of *every*
+       request. This differs from the LLM path's ``TLLM_PROFILE_START_STOP``
+       which indexes a global executor iteration counter (one forward pass
+       services all in-flight requests, so there is no "per request" index).
+
+       ``predenoise`` and ``postdenoise`` are **single-shot per process**:
+       they fire once around the first user request after warmup and do not
+       re-arm on subsequent requests. Pair ``predenoise`` with
+       ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
+       collection ends). ``postdenoise`` ends collection at process exit, so
+       either ``stop`` or ``stop-shutdown`` works. For multi-request capture,
+       use a numeric range with ``--capture-range-end=repeat:N``.
+    """
+    val = os.environ.get("TLLM_PROFILE_VISUAL_GEN_START_STOP")
+    if not val:
+        return None
+    val = val.strip()
+    if val.lower() in ("all", "predenoise", "postdenoise"):
+        return val.lower()
+    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
+    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
+    starts, stops = [], []
+    for span in val.split(","):
+        span = span.strip()
+        if "-" in span:
+            start, stop = span.split("-", 1)
+            starts.append(int(start))
+            stops.append(int(stop))
+        else:
+            v = int(span)
+            starts.append(v)
+            stops.append(v)
+    return frozenset(starts), frozenset(stops)
+
+
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionModelConfig
@@ -74,6 +135,15 @@ class BasePipeline(nn.Module):
         self.text_encoder: Optional[nn.Module] = None
         self.tokenizer: Optional[Any] = None
         self.scheduler: Optional[Any] = None
+        self._is_warmup: bool = False
+
+        # CUDA profiler scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
+        self._profile_range = _parse_profile_range()
+        self._profiling_active: bool = False
+        # Single-shot guards for predenoise/postdenoise modes — fire once
+        # around the first non-warmup denoise() invocation, then disarm.
+        self._predenoise_pending: bool = self._profile_range == "predenoise"
+        self._postdenoise_pending: bool = self._profile_range == "postdenoise"
 
         # Initialize transformer
         self._init_transformer()
@@ -82,6 +152,22 @@ class BasePipeline(nn.Module):
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
+
+    def _cuda_profiler_start(self):
+        """Start CUDA profiler if configured and not already active."""
+        if self._profile_range is not None and not self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStart()
+            self._profiling_active = True
+            if self.rank == 0:
+                logger.info("CUDA profiler started")
+
+    def _cuda_profiler_stop(self):
+        """Stop CUDA profiler if currently active."""
+        if self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStop()
+            self._profiling_active = False
+            if self.rank == 0:
+                logger.info("CUDA profiler stopped")
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
@@ -382,35 +468,55 @@ class BasePipeline(nn.Module):
             self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
-        if not self.model_config.enable_parallel_vae:
-            return
-        if not dist.is_initialized() or dist.get_world_size() <= 1:
-            return
-        if self.vae is None:
+        """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
+
+        ``self._parallel_vae_enabled`` is a *global* mode flag: it is computed
+        from inputs that are identical on every rank (config + mapping +
+        deterministic capability check), so every rank agrees on whether
+        parallel-VAE decode ownership applies. The actual ``ParallelVAEFactory``
+        wrap is a local side effect that only runs on ranks in ``vae_ranks``.
+        """
+        parallel_cfg = self.model_config.parallel
+        vgm = self.model_config.visual_gen_mapping
+
+        # Global preconditions — evaluate identically on every rank.
+        self._parallel_vae_enabled = (
+            parallel_cfg.parallel_vae_size > 1
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and self.vae is not None
+            and vgm is not None
+            and ParallelVAEFactory.supports(type(self.vae))
+        )
+        if not self._parallel_vae_enabled:
+            # Quick check to see if it wasn't enabled due to missing support.
+            if (
+                parallel_cfg.parallel_vae_size > 1
+                and self.vae is not None
+                and not ParallelVAEFactory.supports(type(self.vae))
+            ):
+                logger.warning(
+                    f"Parallel VAE not supported for {self.__class__.__name__} "
+                    f"(VAE type: {type(self.vae).__name__}). "
+                    "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
+                    "parallel VAE for this VAE type."
+                )
             return
 
-        # Uses all ranks today; replace with a subset to dedicate specific ranks to VAE.
-        pg = dist.new_group(list(range(dist.get_world_size())))
-        try:
-            self.vae = ParallelVAEFactory.from_vae(
-                self.vae,
-                split_dim=self.model_config.parallel_vae_split_dim,
-                pg=pg,
-            )
-        except ValueError:
-            logger.warning(
-                f"Parallel VAE not supported for {self.__class__.__name__} "
-                f"(VAE type: {type(self.vae).__name__}). "
-                "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
-                "parallel VAE for this VAE type."
-            )
+        # Local side effect: only ranks in the VAE group wrap the VAE module.
+        if self.rank not in vgm.vae_ranks or vgm.vae_group is None:
             return
 
-        self._parallel_vae_enabled = True
+        self.vae = ParallelVAEFactory.from_vae(
+            self.vae,
+            split_dim=parallel_cfg.parallel_vae_split_dim,
+            pg=vgm.vae_group,
+            adj_groups=vgm.vae_adj_groups,
+        )
         logger.info(
             f"Parallel VAE enabled: {type(self.vae).__name__}, "
-            f"split_dim={self.model_config.parallel_vae_split_dim}, "
-            f"world_size={dist.get_world_size(pg)}"
+            f"split_dim={parallel_cfg.parallel_vae_split_dim}, "
+            f"world_size={dist.get_world_size(vgm.vae_group)}"
         )
 
     def torch_compile(self) -> None:
@@ -502,10 +608,12 @@ class BasePipeline(nn.Module):
         )
         warmup_start = time.time()
 
+        self._is_warmup = True
         for height, width, num_frames in shapes:
             logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
             self._run_warmup(height, width, num_frames, steps)
             torch.cuda.synchronize()
+        self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
@@ -533,40 +641,40 @@ class BasePipeline(nn.Module):
         decode_fn: Callable[[torch.Tensor], Any],
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
-        """Execute VAE decoding. Only rank 0 performs decoding.
-        If parallel VAE is enabled, all processes perform decoding.
+        """Execute VAE decoding.
+
+        Decode ownership is decided from the global ``_parallel_vae_enabled``
+        flag set by ``setup_parallel_vae``:
+
+        - parallel-VAE mode on: ranks in ``vgm.vae_ranks`` decode collectively.
+        - parallel-VAE mode off: only rank 0 decodes.
+
+        Non-decoding ranks return ``None`` placeholders.
 
         Args:
-            latents: Primary latents to decode (e.g., video)
-            decode_fn: Decoder function for primary latents
+            latents: Primary latents to decode (e.g., video).
+            decode_fn: Decoder function for primary latents.
             extra_latents: Optional dict of additional latents to decode.
-                          Format: {name: (latents_tensor, decode_fn)}
-                          Example: {"audio": (audio_latents, audio_decode_fn)}
+                Format: ``{name: (latents_tensor, decode_fn)}``.
+                Example: ``{"audio": (audio_latents, audio_decode_fn)}``.
 
         Returns:
-            Single result if no extra_latents, tuple of results if extra_latents provided.
-            Non-rank-0 processes return None placeholders.
+            Single result if no ``extra_latents``, else a tuple of results.
+            Non-decoding ranks return ``None`` (or a tuple of ``None``).
         """
-
         if self._parallel_vae_enabled:
+            vgm = self.model_config.visual_gen_mapping
+            decode_ranks = set(vgm.vae_ranks)
+        else:
+            decode_ranks = {0}
+
+        if self.rank in decode_ranks:
             primary_result = decode_fn(latents)
             if extra_latents:
                 extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
                 return (primary_result,) + tuple(extra_results)
             return primary_result
 
-        if self.rank == 0:
-            primary_result = decode_fn(latents)
-
-            if extra_latents:
-                extra_results = []
-                for name, (extra_latent, extra_decode_fn) in extra_latents.items():
-                    extra_results.append(extra_decode_fn(extra_latent))
-                return (primary_result,) + tuple(extra_results)
-
-            return primary_result
-
-        # Return None placeholders for non-rank-0 processes
         n_results = 1 + (len(extra_latents) if extra_latents else 0)
         return (None,) * n_results if n_results > 1 else None
 
@@ -598,6 +706,10 @@ class BasePipeline(nn.Module):
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_size = attn2d_row_size * attn2d_col_size
+        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
 
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
@@ -607,7 +719,13 @@ class BasePipeline(nn.Module):
 
         if do_cfg_parallel:
             if self.rank == 0:
-                logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
+                if attn2d_row_size * attn2d_col_size > 1:
+                    logger.info(
+                        f"CFG Parallel: cfg_size={cfg_size}, "
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}"
+                    )
+                else:
+                    logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
 
             # Split main embeddings
             if is_split_embeds:
@@ -639,9 +757,7 @@ class BasePipeline(nn.Module):
 
         return {
             "enabled": do_cfg_parallel,
-            "cfg_size": cfg_size,
-            "ulysses_size": ulysses_size,
-            "cfg_rank": vgm.cfg_rank if vgm else 0,
+            "seq_parallel_size": seq_parallel_size,
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
@@ -656,7 +772,7 @@ class BasePipeline(nn.Module):
         forward_fn,
         guidance_scale,
         guidance_rescale,
-        ulysses_size,
+        seq_parallel_size,
         local_extras,
     ):
         """Execute single denoising step with CFG parallel."""
@@ -816,6 +932,7 @@ class BasePipeline(nn.Module):
         extra_streams: Optional[Dict[str, Tuple[torch.Tensor, Any]]] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_timestep: Optional[float] = None,
+        post_step_fn: Optional[Callable] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -842,11 +959,22 @@ class BasePipeline(nn.Module):
                              to guidance_scale_2 when timestep < boundary_timestep.
             boundary_timestep: Optional timestep boundary for two-stage denoising.
                               Switches guidance scale when crossing this threshold.
+            post_step_fn: Optional callable applied to latents after each scheduler step.
+                         Signature: post_step_fn(latents) -> latents
+                         Use for constraints that must hold throughout denoising.
 
         Returns:
             Single latents if no extra_streams
             Tuple (primary_latents, extra_streams_dict) if extra_streams provided
         """
+        # ``predenoise`` mode: arm the profiler at the very start of denoise()
+        # so the per-request pre-loop work (CFG config, scheduler refresh,
+        # TeaCache reset) is captured. The window closes at the first step.
+        # Note: hooked here (not at warmup() exit) to avoid leaving the profiler
+        # on across the worker's IPC idle, which can interact badly with CUPTI.
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+
         if timesteps is None:
             timesteps = scheduler.timesteps
 
@@ -883,7 +1011,23 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
+        # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
+        # step ranges start/stop at specific indices. See _parse_profile_range().
+        prof = self._profile_range
+        if prof == "all" and not self._is_warmup:
+            self._cuda_profiler_start()
+        # ``predenoise`` was started in warmup() exit; close the window now,
+        # before the first denoise step kernels run. Single-shot: disarm.
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_stop()
+            self._predenoise_pending = False
+        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
+        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
+
         for i, t in enumerate(timesteps):
+            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
+                self._cuda_profiler_start()
+
             step_start = time.time()
 
             # Two-stage denoising: switch guidance scale at boundary
@@ -905,7 +1049,7 @@ class BasePipeline(nn.Module):
                         forward_fn,
                         current_guidance_scale,
                         guidance_rescale,
-                        cfg_config["ulysses_size"],
+                        cfg_config["seq_parallel_size"],
                         local_extras,
                     )
                 else:
@@ -931,6 +1075,9 @@ class BasePipeline(nn.Module):
                 extra_stream_schedulers,
             )
 
+            if post_step_fn is not None:
+                latents = post_step_fn(latents)
+
             # Logging
             if self.rank == 0:
                 step_time = time.time() - step_start
@@ -941,6 +1088,16 @@ class BasePipeline(nn.Module):
                     f"(trans={t_trans:.2f}s cfg={t_cfg:.3f}s sched={t_sched:.3f}s) | "
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
+
+            # Step-level profiler stop
+            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
+                self._cuda_profiler_stop()
+
+        # ``postdenoise`` mode: arm the profiler now so the VAE decode (and
+        # any post-denoise host work) is captured up to cleanup(). Single-shot.
+        if self._postdenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+            self._postdenoise_pending = False
 
         if self.rank == 0:
             total_time = time.time() - start_time
@@ -965,6 +1122,8 @@ class BasePipeline(nn.Module):
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
+        self._cuda_profiler_stop()
+
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

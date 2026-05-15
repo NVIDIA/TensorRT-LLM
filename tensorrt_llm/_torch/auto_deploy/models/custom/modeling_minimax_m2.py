@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -33,8 +33,9 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
+
+from ..hf import AutoModelForCausalLMFactory
 
 # ---------------------------------------------------------------------------
 # Output dataclasses

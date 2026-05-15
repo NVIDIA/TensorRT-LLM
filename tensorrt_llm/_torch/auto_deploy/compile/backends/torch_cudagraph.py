@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Compile backend with cudagraph.
 
 1. Monolithic CUDA graph: captures entire model as one graph for decode-only.
@@ -348,6 +362,7 @@ class PiecewiseCapturedGraph(nn.Module):
         self.split_gm: Optional[GraphModule] = None
         self._is_prepared = False
         self._wrapped_dynamic_indices: Set[int] = set()
+        self._static_runners: Dict[int, ADPiecewiseRunner] = {}
         # Pre-allocated static buffers for kwargs whose addresses change between
         # calls.  Allocated during warmup_and_capture, used at runtime to ensure
         # CUDA graph replay sees stable addresses.
@@ -441,6 +456,7 @@ class PiecewiseCapturedGraph(nn.Module):
             )
             setattr(self.split_gm, submod_name, runner)
             runner_by_idx[idx] = runner
+            self._static_runners[idx] = runner
             num_wrapped_static += 1
 
         # Phase 2: wrap dynamic ops.
@@ -518,7 +534,8 @@ class PiecewiseCapturedGraph(nn.Module):
             f"PiecewiseCapturedGraph: prepared with {self.split_info.num_submodules} submodules "
             f"({num_wrapped_static} static runners, {num_skipped_static} trivial skipped, "
             f"{num_wrapped_dynamic} dynamic wrapped, {num_metadata_wrapped} metadata wrapped, "
-            f"{num_dynamic_eager} dynamic eager), piecewise_num_tokens={self.piecewise_num_tokens}"
+            f"{num_dynamic_eager} dynamic eager), "
+            f"piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
     def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, OutputInfo]:
@@ -686,7 +703,11 @@ class PiecewiseCapturedGraph(nn.Module):
 
                 # Capture phase
                 ADPiecewiseRunner.set_current_phase("capture")
-                self.split_gm(*args, **kwargs)
+                try:
+                    self.split_gm(*args, **kwargs)
+                finally:
+                    for runner in self._static_runners.values():
+                        runner.finalize_capture(nt)
 
             ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
 
@@ -711,7 +732,12 @@ class PiecewiseCapturedGraph(nn.Module):
             )
             return result
 
-    def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
+    def forward(
+        self,
+        *args,
+        num_tokens: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
         if self.split_gm is not None:
             self._copy_to_static_buffers(kwargs)
@@ -866,7 +892,11 @@ class DualModeCapturedGraph(nn.Module):
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
             try:
-                result = self.piecewise(*args, num_tokens=bucket, **kwargs)
+                result = self.piecewise(
+                    *args,
+                    num_tokens=bucket,
+                    **kwargs,
+                )
             finally:
                 ADPiecewiseRunner.set_current_num_tokens(None)
             if bucket > num_tokens:

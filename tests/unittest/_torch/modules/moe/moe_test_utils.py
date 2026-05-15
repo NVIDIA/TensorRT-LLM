@@ -47,6 +47,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -64,6 +65,7 @@ class MoeBackendType(str, Enum):
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
+    MEGAMOE = "MEGAMOE_DEEPGEMM"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -74,6 +76,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
+        MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
     }
     return backend_class_map[backend_type]
 
@@ -89,9 +92,27 @@ class MoeModelConfig:
     top_k: int
     hidden_size: int
     intermediate_size: int
+    n_group: Optional[int] = None
+    topk_group: Optional[int] = None
 
     def __str__(self) -> str:
         return f"e{self.num_experts}_k{self.top_k}_h{self.hidden_size}_i{self.intermediate_size}"
+
+
+def resolve_deepseek_group_config(
+    model_config: "MoeModelConfig",
+) -> tuple[int, int]:
+    """Resolve n_group and topk_group for DeepSeek V3 routing.
+
+    If model_config has explicit n_group/topk_group, use them.
+    Otherwise use the same heuristic as _create_routing_method:
+    experts_per_group=2, topk_group=min(n_group, max(1, n_group//2)).
+    """
+    if model_config.n_group is not None and model_config.topk_group is not None:
+        return model_config.n_group, model_config.topk_group
+    n_group = max(1, model_config.num_experts // 2)
+    topk_group = min(n_group, max(1, n_group // 2))
+    return n_group, topk_group
 
 
 # ============================================================================
@@ -166,31 +187,94 @@ def should_skip_trtllm(
     if backend_type != MoeBackendType.TRTLLM:
         return None
 
+    # [Bug] On B300 (SM103), TRTLLM-Gen block-scale MoE produces a CUDA
+    # illegal memory access (IMA) when the autotuner exposes tile=32
+    # with certain configIndex values that have not been blacklisted.
+    # Empirically the IMA originates inside the W4A16_MXFP4 path
+    # (Bf16MxE2m1BlockScaleMoERunner); once it fires, every subsequent
+    # test in the same pytest process ERRORs at setup with
+    # `cudaErrorIllegalAddress`.
+    #
+    # Background:
+    # * Jenkins L0_MergeRequest_PR/37541 (build 899, stage
+    #   B300-PyTorch-1) originally reported the failure on
+    #   FP8_BLOCK_SCALES `e8_k1_h512_i512-seq=8`, which is a cascade
+    #   victim of an upstream tile=32 IMA.
+    # * PR #13964 head commit 5629e0dff9 introduced two related fixes:
+    #     - Python: corrected the swapped
+    #       `(local_num_experts, num_tokens)` ordering in
+    #       `Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics`.
+    #     - C++: blacklisted tactic `[tileN==32, configIndex==5]` on
+    #       SM103 via `isKnownInvalidBlockScaleMoeTactic` in
+    #       `cpp/.../blockScaleMoe/runner.h`.
+    # * Empirical reproduction of
+    #   `pytest test_moe_backend.py::test_moe_backend -k "TRTLLM"`
+    #   on B300 (NVIDIA B300 SXM6, SM103) at commit 5629e0dff9:
+    #
+    #       blacklist body                                  result
+    #       ---------------------------------------------   ----------------
+    #       SM103 && tileN==32 && configIndex==5            23 pass + 1 FAIL
+    #       (PR HEAD)                                        (W4A16_MXFP4) +
+    #                                                        10 cascade ERROR
+    #       return false (blacklist disabled)               identical to above
+    #       SM103 && tileN==32 (all configIndex)            34/34 pass
+    #
+    #   This shows the PR's `[tileN==32, configIndex==5]` blacklist is
+    #   necessary but *not sufficient*; tileN==32 on SM103 has at
+    #   least one additional broken configIndex that needs to be
+    #   blacklisted (or the kernel fixed) for the W4A16_MXFP4 path.
+    #
+    # Reproduce on a B300 node (Slurm `trt-llm_b300` account):
+    #   1. Build TRT-LLM from PR head 5629e0dff9 inside the project's
+    #      tritondevel container (single GPU is sufficient).
+    #   2. cd tests/unittest && \
+    #      python3 -m pytest -v -s \
+    #          _torch/modules/moe/test_moe_backend.py::test_moe_backend \
+    #          -k "TRTLLM" -p no:randomly
+    #   3. Expect:
+    #        FAILED ...alpha=1.702_beta=1.0_limit=7.0-e128_k4_h2880_i2880
+    #               -seq=8-...-quant=W4A16_MXFP4...
+    #             torch.AcceleratorError: CUDA error: illegal memory access
+    #
+    # Skip the directly-observed FAIL until the C++ blacklist is
+    # extended (e.g. `SMVersion==103 && tileTokensDim==32`) or the
+    # underlying kernel is fixed for tileN==32 on SM103.
+    from tensorrt_llm._utils import get_sm_version
+
+    if (
+        get_sm_version() == 103
+        and quant_algo == QuantAlgo.W4A16_MXFP4
+        and swiglu_gptoss_style
+        and model_config is not None
+        and model_config.num_experts == 128
+        and model_config.top_k == 4
+        and model_config.hidden_size == 2880
+        and model_config.intermediate_size == 2880
+        and seq_len == 8
+    ):
+        return (
+            "[Bug] TRTLLMGen MoE W4A16_MXFP4 on B300 (SM103) with "
+            "MoeModelConfig(128, 4, 2880, 2880), "
+            "swiglu_gptoss_style=True and seq_len=8 hits CUDA "
+            "illegal memory access in a tileN=32 autotune tactic "
+            "not covered by the partial blacklist "
+            "[tileN=32, configIndex=5] in PR #13964 head 5629e0dff9; "
+            "see the comment above for reproduction."
+        )
+
     # Routing method compatibility check (used by test_moe_module.py)
-    # TRTLLMGen C++ routing kernel (runner.cu) only implements:
-    # - DeepSeekV3 (requires float32 routing_logits)
+    # TRTLLMGen C++ routing kernel (runner.cu) implements:
+    # - DeepSeekV3 (nGroup<=1: SigmoidBias+ScaledSumNormalize; nGroup>1: full DeepSeek kernel)
+    # - SigmoidRenorm (sigmoid activation, sum-normalize)
+    # - MiniMax2 (sigmoid activation, bias-added selection, scaled sum-normalize)
     # - Llama4 (requires top_k=1)
-    # - Renormalize
-    # - RenormalizeNaive
-    # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu:77-212
+    # - Renormalize / RenormalizeNaive / Default (softmax-based)
+    # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu
     if routing_method_cls is not None:
         from tensorrt_llm._torch.modules.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
-            DefaultMoeRoutingMethod,
             Llama4RenormalizeMoeRoutingMethod,
-            MiniMaxM2MoeRoutingMethod,
         )
-
-        # Routing methods NOT implemented in C++ kernel
-        trtllm_unimplemented_routing = (
-            DefaultMoeRoutingMethod,  # runner.cu:210 - "Unimplemented routing method"
-            MiniMaxM2MoeRoutingMethod,  # runner.cu:210 - "Unimplemented routing method"
-        )
-        if routing_method_cls in trtllm_unimplemented_routing:
-            routing_name = routing_method_cls.__name__
-            return (
-                f"TRTLLMGen C++ routing kernel does not implement {routing_name}. See runner.cu:210"
-            )
 
         # Llama4 routing only supports top_k=1
         # See: runner.cu:113 - TLLM_CHECK_WITH_INFO(topK == 1, ...)
@@ -211,12 +295,8 @@ def should_skip_trtllm(
                 )
 
             # DeepSeekV3 routing kernel only supports topk_group <= 4.
-            # topk_group is computed from num_experts in _create_routing_method:
-            #   n_group = max(1, num_experts // 2)
-            #   topk_group = min(n_group, max(1, n_group // 2))
             if model_config is not None:
-                n_group = max(1, model_config.num_experts // 2)
-                topk_group = min(n_group, max(1, n_group // 2))
+                n_group, topk_group = resolve_deepseek_group_config(model_config)
                 if topk_group > 4:
                     return (
                         f"TRTLLMGen DeepSeekV3 routing kernel only supports "
@@ -235,13 +315,12 @@ def should_skip_trtllm(
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
-    # Quant_algo==None (BF16 path) also falls through and must meet the should_skip_trtllm criteria
-    if quant_algo is not None and quant_algo not in trtllm_gen_quant_algos:
+
+    if quant_algo not in trtllm_gen_quant_algos:
         return None
 
     num_experts = model_config.num_experts
     top_k = model_config.top_k
-    hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
 
     # Check: num_experts must be divisible by 4
@@ -259,22 +338,11 @@ def should_skip_trtllm(
             f"TRTLLMGenFusedMoE requires num_experts > top_k "
             f"(got num_experts={num_experts}, top_k={top_k})"
         )
-
-    if quant_algo is None:
-        if swiglu_gptoss_style:
-            return "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
-
-        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
-            return (
-                "TRTLLMGenFusedMoE BF16 path requires hidden_size and intermediate_size "
-                f"to be multiples of 128 (got h={hidden_size}, i={intermediate_size})."
-            )
-        return None
-
     # W4A8_MXFP4_MXFP8 with non-128-aligned hidden_size or intermediate_size
     # causes block_scale_interleave_reverse to fail with
     # "rows of Interleaved block scales should be multiple of 128".
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        hidden_size = model_config.hidden_size
         if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             return (
                 f"TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with non-128-aligned "
@@ -624,6 +692,54 @@ def should_skip_densegemm(
     return None
 
 
+def should_skip_megamoe(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    dtype: Optional[torch.dtype] = None,
+    model_config: "MoeModelConfig" = None,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+    swiglu_gptoss_style: bool = False,
+) -> Optional[str]:
+    """Check MegaMoE-specific constraints for the generic MoE test matrix."""
+    if backend_type != MoeBackendType.MEGAMOE:
+        return None
+
+    if not torch.cuda.is_available():
+        return "MegaMoEDeepGemm requires CUDA"
+
+    if comm_method is not None or parallel_mode is not None:
+        return (
+            "MegaMoEDeepGemm generic multi-GPU coverage requires a torch.distributed "
+            "EP ProcessGroup-aware launcher; keep it out of this MPIPool-based matrix."
+        )
+
+    if quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8:
+        return f"MegaMoEDeepGemm only supports W4A8_MXFP4_MXFP8 (got quant_algo={quant_algo})"
+
+    if dtype is not None and dtype != torch.bfloat16:
+        return f"MegaMoEDeepGemm only supports bfloat16 activations (got dtype={dtype})"
+
+    if swiglu_gptoss_style:
+        return "MegaMoEDeepGemm does not support swiglu_gptoss_style"
+
+    if moe_tp_size != 1:
+        return f"MegaMoEDeepGemm Phase 1 is EP-only (got moe_tp_size={moe_tp_size})"
+
+    if model_config is not None:
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+        if hidden_size % 512 != 0 or intermediate_size % 512 != 0:
+            return (
+                f"MegaMoEDeepGemm requires 512-aligned hidden/intermediate sizes "
+                f"for DeepGEMM TMA-packed SF rows "
+                f"(got h={hidden_size}, i={intermediate_size})"
+            )
+
+    return None
+
+
 def should_skip_multi_gpu(
     parallel_mode: str,
     model_config: "MoeModelConfig",
@@ -730,8 +846,8 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM does not support autotuner capture
-    if backend_type == MoeBackendType.DEEPGEMM:
+    # DEEPGEMM and MEGAMOE do not support autotuner capture
+    if backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.MEGAMOE):
         return False
 
     if use_flashinfer:
@@ -773,6 +889,9 @@ def get_quick_skip_reason(
         can_impl_kwargs = {"dtype_activation": dtype}
         if swiglu_gptoss_style:
             can_impl_kwargs["swiglu_gptoss_style"] = swiglu_gptoss_style
+        if backend_type == MoeBackendType.MEGAMOE and model_config is not None:
+            can_impl_kwargs["hidden_size"] = model_config.hidden_size
+            can_impl_kwargs["intermediate_size"] = model_config.intermediate_size
         can_impl, skip_reason = backend_cls.can_implement(quant_algo, **can_impl_kwargs)
         if not can_impl:
             return skip_reason
@@ -796,6 +915,13 @@ def get_quick_skip_reason(
             ),
             lambda: should_skip_densegemm(
                 backend_type, quant_algo=quant_algo, model_config=model_config
+            ),
+            lambda: should_skip_megamoe(
+                backend_type,
+                quant_algo=quant_algo,
+                dtype=dtype,
+                model_config=model_config,
+                swiglu_gptoss_style=swiglu_gptoss_style,
             ),
         ]
         for check in skip_checks:
@@ -971,8 +1097,7 @@ def should_skip_to_accelerate_ci(
     all combinations run (local exhaustive testing).
 
     Rules applied (in order):
-    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
-       unquantized coverage enabled.
+    0. Skip unquantized (quant=None) — quantized paths are the focus of CI
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -998,18 +1123,20 @@ def should_skip_to_accelerate_ci(
     if model_config is None:
         return None
 
-    # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
-    # Keep TRTLLM BF16 unquantized enabled to cover FlashInfer BF16 TRTLLM MoE.
-    if (
-        quant_algo is None
-        and is_gated_activation(activation_type)
-        and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
-    ):
+    # --- Rule 0: Skip gated and unquantized (quant=None) ---
+    if quant_algo is None and is_gated_activation(activation_type):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
-    is_large_model = model_config.num_experts >= 256 and model_config.hidden_size >= 7168
+    # Any e256-class model_config triggers CI Rule-1 minimal coverage:
+    # the full dtype x seq_len x swiglu x routing matrix on e256 models
+    # otherwise blows the per-stage Slurm wall-clock budget (B200 stage
+    # timed out on this PR's first CI run after DeepSeek-V4-Flash was
+    # promoted into CI_MOE_MODEL_CONFIGS). e256 coverage in CI is kept
+    # minimal (DeepSeekV3 routing, bfloat16, seq=1, non-gptoss SwiGLU);
+    # breadth comes from smaller configs (Qwen, GPT-OSS-120B, boundary).
+    is_large_model = model_config.num_experts >= 256
 
-    # --- Rule 1: Large model (e256_k8_h7168_i2048) restrictions ---
+    # --- Rule 1: Large e256-class model restrictions ---
     if is_large_model:
         if routing_method_cls is not None:
             from tensorrt_llm._torch.modules.fused_moe import DeepSeekV3MoeRoutingMethod

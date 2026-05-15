@@ -149,9 +149,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.draft_kv_cache_manager = draft_kv_cache_manager
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
-                "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, got %s, setting to MAX_UTILIZATION",
-                scheduler_policy,
+                "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
+                f"got {scheduler_policy.name}, setting to MAX_UTILIZATION"
             )
+            scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
         self.policy = scheduler_policy
         self.peft_cache_manager = peft_cache_manager
 
@@ -160,12 +161,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.chunk_unit_size = 0
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
+        draft_mgr_name = (
+            type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
+        )
         logger.info(
-            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, max_batch_size=%s, draft_mgr=%s",
-            self.tokens_per_block,
-            max_num_tokens,
-            max_batch_size,
-            type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None",
+            f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
+            f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
+            f"draft_mgr={draft_mgr_name}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -388,7 +390,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
         )
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for encoder request %s", req.py_request_id)
+            logger.debug(f"prepare_context failed for encoder request {req.py_request_id}")
             return ScheduleAction.STOP, 0
         if not self.kv_cache_manager.resize_context(req, req_tokens):
             return ScheduleAction.STOP, 0
@@ -416,7 +418,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare first so block reuse updates context_remaining_length
         # before budget check.
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for context request %s", req.py_request_id)
+            logger.debug(f"prepare_context failed for context request {req.py_request_id}")
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -456,7 +458,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for chunked context request %s", req.py_request_id)
+            logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -541,9 +543,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # that frees no pages.
         if self.kv_cache_manager.is_request_active(req.py_request_id):
             logger.debug(
-                "[V2Scheduler] Self-evicting request %s (state=%s) to free GPU pages",
-                req.py_request_id,
-                req.state,
+                f"[V2Scheduler] Self-evicting request {req.py_request_id} "
+                f"(state={req.state.name}) to free GPU pages"
             )
             self._suspend_request(req)
             evicted.append(req)
@@ -570,9 +571,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         remains "active" on device, which could cause ensure_batch to
         fail if it needs to load a different adapter into a full cache.
         """
+        self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)
+
+    def _clear_request_runtime_state(self, req: LlmRequest) -> None:
+        req.py_batch_idx = None
 
     def _is_evictable(self, req: LlmRequest) -> bool:
         """A started request whose KV cache is still active on GPU.
@@ -611,10 +616,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             victim = requests_list[victim_idx]
             logger.debug(
-                "[V2Scheduler] Evicting request %s (state=%s) to free pages for request %s",
-                victim.py_request_id,
-                victim.state,
-                req.py_request_id,
+                f"[V2Scheduler] Evicting request {victim.py_request_id} "
+                f"(state={victim.state.name}) to free pages for request {req.py_request_id}"
             )
             self._suspend_request(victim)
             evicted.append(victim)

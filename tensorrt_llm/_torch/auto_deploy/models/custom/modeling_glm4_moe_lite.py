@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Slimmed down PyTorch GLM4 MoE Lite model implementation for auto_deploy export.
 
@@ -784,7 +785,7 @@ class Glm4MoeLiteModel(Glm4MoeLitePreTrainedModel):
 class Glm4MoeLiteForCausalLM(Glm4MoeLitePreTrainedModel, GenerationMixin):
     """GLM4 MoE Lite model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

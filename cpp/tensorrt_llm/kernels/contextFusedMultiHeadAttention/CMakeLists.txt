@@ -24,7 +24,6 @@ add_library(context_attention_src OBJECT)
 filter_source_cuda_architectures(
   SOURCE_LIST SRC_CPP
   ARCHS 80 86 89 90 100 120
-  TARGET context_attention_src
   IMPLICIT_FAMILY)
 
 target_sources(context_attention_src PRIVATE ${SRC_CPP} ${SRC_CU})
@@ -33,6 +32,18 @@ target_compile_definitions(context_attention_src PRIVATE USE_DEMO_BERT_PARAMS=1
 set_target_properties(
   context_attention_src PROPERTIES POSITION_INDEPENDENT_CODE ON
                                    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Embed cubins via INCBIN. Replaces the bin2c-style hex-array .cpp stubs that
+# previously lived under cubin/. Symbol convention is cubin_<stem>_cu_cubin
+# because the generator (cpp/kernels/fmha_v2/setup.py) builds names from
+# `<fname>.replace('.', '_')` where `<fname>` includes the trailing `.cu`.
+include(tllm_cubin_archive)
+tllm_add_cubin_archive_sources(
+  context_attention_src "${CMAKE_CURRENT_SOURCE_DIR}/cubin"
+  SYMBOL_PREFIX cubin_
+  SYMBOL_SUFFIX _cu_cubin
+  ARCHS 80 86 89 90 100 120
+  IMPLICIT_FAMILY)
 
 foreach(arch IN ITEMS 80 86 89 90 100 120)
   set(ARCH_ENABLED FALSE)

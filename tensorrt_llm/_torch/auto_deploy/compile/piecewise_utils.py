@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Utilities for piecewise CUDA graph: dynamic op registry, classification, and graph splitting.
 
 This module provides the logic to:
@@ -61,7 +75,6 @@ _METADATA_PREP_OPS = [
     "auto_deploy::flashinfer_attention_prepare_metadata",
     "auto_deploy::flashinfer_mla_prepare_metadata",
     "auto_deploy::triton_paged_prepare_metadata",
-    "auto_deploy::trtllm_mla_prepare_metadata",
     "auto_deploy::mamba_ssm_prepare_metadata",
 ]
 
@@ -77,6 +90,7 @@ _LOGITS_GATHER_OPS = [
 # DynamicOpWrapper (no fresh allocation, returns persistent buffer directly).
 _PERSISTENT_BUFFER_OPS = [
     "auto_deploy::trtllm_attention_prepare_metadata",
+    "auto_deploy::trtllm_mla_prepare_metadata",
 ]
 
 # Inplace dynamic ops: these ops mutate their input tensor and return None,

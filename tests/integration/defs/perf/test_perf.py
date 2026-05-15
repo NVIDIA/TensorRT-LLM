@@ -27,6 +27,8 @@ import yaml
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+
 from ..conftest import (get_device_count, get_llm_root, llm_models_root,
                         trt_environment)
 from .pytorch_model_config import get_model_yaml_config
@@ -182,9 +184,14 @@ MODEL_PATH_DICT = {
     "nemotron_3_super_120b_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "nemotron_3_super_120b_nvfp4_mtp":
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    # Nemotron-3-Nano-Omni-30B (text + image multimodal)
+    "nemotron_3_nano_omni_nvfp4":
+    "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+    "nemotron_3_nano_omni_nvfp4_image":
+    "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
     "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
-    # MiniMax M2.5 (BF16, ~230B MoE)
-    "minimax_m2.5": "MiniMax-M2.5",
+    # MiniMax M2.5 (FP8 block-scale, ~230B MoE)
+    "minimax_m2.5_fp8": "MiniMax-M2.5",
     # Qwen3.5 dense + MoE
     "qwen3.5_9b": "Qwen3.5-9B",
     "qwen3.5_27b": "Qwen3.5-27B",
@@ -261,6 +268,8 @@ TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 NEMOTRON_SUPER_MODELS = {
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
@@ -271,6 +280,22 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "kimi_k2_nvfp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "glm_5_fp8",
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
+}
+
+# Models that use random_image dataset in serve mode benchmarks.
+# Maps model name to (width, height, num_images) tuple.
+SERVE_IMAGE_MODELS = {
+    "nemotron_3_nano_omni_nvfp4_image": (1526, 1024, 1),
+}
+
+# Models that require openai-chat backend for benchmark_serving
+# (e.g., reasoning / multimodal models that use chat completions API).
+OPENAI_CHAT_BACKEND_MODELS = {
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
 }
 
 # Spec-dec models real dataset in serve perf tests.
@@ -1008,13 +1033,28 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
+        # Mirror the skip_less_mpi_world_size fixture: when mpi_world_size == 1
+        # we are on a single node (workers spawn within the test) so use the
+        # local device count; otherwise the launcher already sized the world
+        # across nodes, so trust mpi_world_size as the cluster total.
         try:
-            available_gpus = get_device_count()
+            mpi_world_size = get_mpi_world_size()
         except Exception:
-            available_gpus = None
-        if available_gpus is not None and self.num_gpus > available_gpus:
+            mpi_world_size = 1
+        try:
+            device_count = get_device_count()
+        except Exception:
+            device_count = None
+
+        if mpi_world_size == 1:
+            total_gpus = device_count
+        else:
+            total_gpus = mpi_world_size
+
+        if total_gpus is not None and self.num_gpus > total_gpus:
             pytest.skip(
-                f"Test requires {self.num_gpus} GPUs but only {available_gpus} available"
+                f"Test requires {self.num_gpus} GPUs but only {total_gpus} available "
+                f"(mpi_world_size={mpi_world_size}, device_count={device_count})"
             )
 
     def get_model_family(self) -> str:
@@ -1567,12 +1607,34 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        if self._config.model_name in OPENAI_CHAT_BACKEND_MODELS:
+            client_cmd += ["--backend", "openai-chat"]
         if real_dataset_path:
             client_cmd += [
                 "--dataset-name",
                 "trtllm_custom",
                 "--dataset-path",
                 real_dataset_path,
+            ]
+        elif self._config.model_name in SERVE_IMAGE_MODELS:
+            width, height, num_images = SERVE_IMAGE_MODELS[
+                self._config.model_name]
+            client_cmd += [
+                "--dataset-name",
+                "random_image",
+                "--random-ids",
+                "--random-input-len",
+                str(input_len),
+                "--random-output-len",
+                str(output_len),
+                "--random-range-ratio",
+                "0.0",
+                "--random-image-width",
+                str(width),
+                "--random-image-height",
+                str(height),
+                "--random-num-images",
+                str(num_images),
             ]
         else:
             client_cmd += [

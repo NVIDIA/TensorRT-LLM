@@ -833,7 +833,6 @@ class DeepseekV3Gate(nn.Module):
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
-
         self.e_score_correction_bias = nn.Parameter(torch.empty(
             (num_experts), dtype=bias_dtype),
                                                     requires_grad=False)
@@ -1836,7 +1835,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         self.model_nextn = 0
         if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
@@ -1903,47 +1902,3 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
-
-
-@register_auto_model("KimiK25ForConditionalGeneration")
-class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
-    """Kimi-K2.5 multimodal model (text-only path).
-
-    Extracts the DeepSeek-V3 text backbone from the composite config
-    and strips the ``language_model.`` weight prefix so that the
-    standard DeepseekV3ForCausalLM loading path works unchanged.
-
-    NOTE: Kimi-K2.5's text backbone sets ``num_nextn_predict_layers = 0``,
-    so MTP-based speculative decoding is not applicable to this model.
-    """
-
-    _LANG_PREFIX = "language_model."
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        model_config = copy.copy(model_config)
-        assert hasattr(model_config.pretrained_config, 'text_config'), \
-            "Kimi K2.5 config must have text_config"
-        model_config._frozen = False
-        model_config.pretrained_config = model_config.pretrained_config.text_config
-        if model_config.quant_config.exclude_modules:
-            model_config.quant_config = copy.copy(model_config.quant_config)
-            p = self._LANG_PREFIX
-            mapped = []
-            for m in model_config.quant_config.exclude_modules:
-                if m.startswith(p):
-                    rest = m[len(p):]
-                    if rest.startswith('layers.'):
-                        rest = 'model.' + rest
-                    mapped.append(rest)
-                else:
-                    mapped.append(m)
-            model_config.quant_config.exclude_modules = mapped
-        model_config._frozen = True
-        super().__init__(model_config)
-
-    def load_weights(self, weights: ConsumableWeightsDict):
-        has_prefix = any(k.startswith("language_model.") for k in weights)
-        if has_prefix:
-            weights = filter_weights("language_model", weights)
-            weights = ConsumableWeightsDict(weights)
-        super().load_weights(weights)

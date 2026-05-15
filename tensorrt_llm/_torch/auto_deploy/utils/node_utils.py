@@ -1,5 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Common utils for torch fx graph transformation."""
 
+import functools
 import operator
 from dataclasses import dataclass
 from enum import Enum
@@ -729,17 +744,40 @@ def is_bmm_op(node: Node) -> bool:
     return is_op(node, bmm_ops)
 
 
+@functools.cache
+def all_gather_ops() -> frozenset:
+    """All AllGather custom op packets recognized by AutoDeploy.
+
+    Wrapped in a cache so the lookup happens lazily — these ops are
+    registered as a side effect of importing the distributed custom_ops
+    package, which may not have happened yet at the time this module is
+    first imported.
+
+    Strategy (AUTO/SYMM_MEM) and workspace_id (for symm-mem ProcessGroup
+    selection) flow through as op arguments, not as separate op identities.
+    """
+    return frozenset(
+        {
+            torch.ops.auto_deploy.trtllm_dist_all_gather,
+            torch.ops.auto_deploy.torch_dist_all_gather,
+        }
+    )
+
+
+@functools.cache
+def all_reduce_ops() -> frozenset:
+    """All AllReduce custom op packets recognized by AutoDeploy."""
+    return frozenset(
+        {
+            torch.ops.auto_deploy.trtllm_dist_all_reduce,
+            torch.ops.auto_deploy.torch_dist_all_reduce,
+        }
+    )
+
+
 def is_dist_op(node: Node) -> bool:
     """Check if the node is a distributed op (torch or trtllm backend)."""
-    dist_ops = {
-        # PyTorch backend ops
-        torch.ops.auto_deploy.torch_dist_all_gather,
-        torch.ops.auto_deploy.torch_dist_all_reduce,
-        # TRT-LLM backend ops
-        torch.ops.auto_deploy.trtllm_dist_all_gather,
-        torch.ops.auto_deploy.trtllm_dist_all_reduce,
-    }
-    return is_op(node, dist_ops)
+    return is_op(node, all_gather_ops() | all_reduce_ops())
 
 
 def is_weight_node(node: Node) -> bool:

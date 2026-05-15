@@ -70,6 +70,7 @@ class Mamba2Mixer(nn.Module):
         rms_norm_eps: float = 1e-5,
         dtype: torch.dtype | None = None,
         config: ModelConfig | None = None,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
 
@@ -132,7 +133,9 @@ class Mamba2Mixer(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            lora=self.in_proj_lora)
+            lora=self.in_proj_lora,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+        )
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -154,13 +157,10 @@ class Mamba2Mixer(nn.Module):
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        # TODO: Update head_dims and head_group_ratios once flashinfer is updated.
+        # TODO: Update head_dims once flashinfer is updated.
+        # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        supported_head_group_ratios = [1, 8, 16]
-        head_group_ratio = (self.tp_nheads //
-                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
-        self._use_flashinfer = (head_dim in supported_head_dims and
-                                head_group_ratio in supported_head_group_ratios)
+        self._use_flashinfer = head_dim in supported_head_dims
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
@@ -244,7 +244,9 @@ class Mamba2Mixer(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            lora=self.out_proj_lora)
+            lora=self.out_proj_lora,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+        )
 
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]

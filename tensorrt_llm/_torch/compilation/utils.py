@@ -62,6 +62,10 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
+        torch.ops.trtllm.flashinfer_fused_add_rmsnorm_quant.default: {
+            1: "out",
+            2: "residual"
+        },
         torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
             2: "output_sf"
@@ -76,6 +80,9 @@ def inplace_info():
             1: "qkv"
         },
         torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
+            1: "qkv"
+        },
+        torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope.default: {
             1: "qkv"
         },
         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:

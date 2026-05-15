@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -103,7 +103,7 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
     }
 }
 
-bool LRUEvictionPolicy::verifyQueueIntegrity()
+bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
     static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
     static const std::function<bool(BlockPtr const&)> levelValidators[]
@@ -172,6 +172,14 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     TLLM_CHECK_WITH_INFO(
         block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
         "Attempted to release the cached-blocks root into the eviction queue");
+    // SWA on-demand placeholders are transient sentinels created by createPlaceholder() and
+    // are not part of the pooled placeholder free queues. Skip re-inserting only those
+    // sentinels; pooled linear-attention placeholders must fall through and return to the
+    // placeholder queue at kPlaceholderLevel.
+    if (block->isPlaceholder() && block->getBlockId() == KVCacheBlock::kPlaceholderBlockId)
+    {
+        return;
+    }
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 

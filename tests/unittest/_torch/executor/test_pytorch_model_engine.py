@@ -340,6 +340,139 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def test_warmup_caps_token_count(self):
+        """All warmup forward passes (general, autotuner, max-shape) cap the
+        per-rank token count at ``model_engine.max_warmup_tokens``.
+
+        Regression test for an autotuner-warmup crash discovered with
+        ``max_num_tokens=16384`` and ``enable_attention_dp=True`` on TP=8:
+        the post-allgather MoE input was ``16384 * dp_size`` tokens, and
+        the TRT-LLM-Gen activation kernel overflowed int32 in
+        ``permutedIdx * innerDim`` during the warmup forward pass. The cap
+        is set to 8192 to match ``MAX_PROFILE_BUCKET`` in the tunable ops
+        in ``trtllm_gen_custom_ops.py``, so warmup forwards never exceed
+        the bucket size the autotuner has actually validated.
+
+        Single-GPU regression: configure ``max_num_tokens > 8192`` so the
+        cap is the binding bound, then run the full ``warmup()`` end-to-end
+        (which internally invokes ``_run_autotuner_warmup`` with the real
+        ``autotune()`` context). A wrapper around ``_create_warmup_request``
+        records every per-rank token count the engine asked for; the test
+        asserts none of them exceed the cap.
+        """
+        max_num_tokens = 16384  # > the cap; the regression configuration
+        max_seq_len = 2048
+        max_batch_size = 16
+        # max_seq_len * max_batch_size = 32752, kept above max_num_tokens
+        # so PyTorchModelEngine._init_max_num_tokens does not clamp
+        # max_num_tokens back below the cap.
+        llm_args = TorchLlmArgs(
+            model="dummy",
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
+            enable_autotuner=True,
+            cuda_graph_config=None,
+        )
+        model_engine = DummyModelEngine(llm_args, torch.half)
+        # Pin the cap value so a future change forces the author to
+        # revisit the relationship with MAX_PROFILE_BUCKET.
+        self.assertEqual(
+            model_engine.max_warmup_tokens, 8192,
+            "max_warmup_tokens regression: changing the cap without "
+            "coordinating with MAX_PROFILE_BUCKET in "
+            "trtllm_gen_custom_ops.py may re-introduce the "
+            "autotuner-warmup MoE crash.")
+        # The cap must actually be the binding bound under this
+        # configuration; otherwise the test could pass even if the cap
+        # were silently removed.
+        self.assertGreater(
+            model_engine.max_num_tokens, model_engine.max_warmup_tokens,
+            "Test setup must keep max_num_tokens above the cap.")
+        self.assertGreater(
+            model_engine.batch_size * (model_engine.max_seq_len - 1),
+            model_engine.max_warmup_tokens,
+            "Test setup must keep batch_size*(max_seq_len-1) above the cap.")
+
+        # KV cache sized strictly above max_num_tokens so that, without the
+        # cap, ``_get_max_shape_warmup_requests`` and ``_run_autotuner_warmup``
+        # would compute curr_max_num_tokens == max_num_tokens (16384), not a
+        # KV-bounded smaller value. ``max_seq_len * max_batch_size`` (32 768)
+        # is the natural ceiling for a single-rank dummy KV; matching it
+        # gives us free_blocks well above max_num_tokens after extras. If
+        # this is too small, the test would pass even against the unpatched
+        # code because the KV cache (rather than the cap) becomes the
+        # binding bound -- the sanity assertion below detects exactly that.
+        kv_max_tokens = max_seq_len * max_batch_size
+        kv_cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=kv_max_tokens),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=model_engine.model.config.num_key_value_heads,
+            head_dim=model_engine.model.config.head_dim,
+            tokens_per_block=1,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=tensorrt_llm.bindings.DataType.HALF,
+        )
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        # If the cap were silently removed, ``_get_max_shape_warmup_requests``
+        # would compute curr_max_num_tokens via this exact expression. Assert
+        # that it would exceed the cap, otherwise the KV cache (not the cap)
+        # is the binding bound and the test would pass even without the fix.
+        unpatched_upper = min(
+            model_engine.max_num_tokens,
+            model_engine.batch_size * (model_engine.max_seq_len - 1),
+        )
+        unpatched_curr = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=unpatched_upper, max_num_draft_tokens=0)
+        self.assertGreater(
+            unpatched_curr, model_engine.max_warmup_tokens,
+            f"Test setup is too small to discriminate: without the cap, "
+            f"curr_max_num_tokens would be {unpatched_curr}, which is not "
+            f"above max_warmup_tokens={model_engine.max_warmup_tokens}. "
+            "Increase kv_max_tokens (e.g., via larger max_seq_len or "
+            "max_batch_size) so the KV cache stops being the bottleneck.")
+
+        # Wrap _create_warmup_request to RECORD num_tokens, then delegate
+        # to the original. Every warmup callsite (full general warmup,
+        # post-CUDA-graph max-shape warmup, and autotuner warmup) funnels
+        # through this method, so this single hook covers them all without
+        # short-circuiting the actual forward passes.
+        requested_num_tokens = []
+        original_create = model_engine._create_warmup_request
+
+        def recording_wrapper(resource_manager, num_tokens, num_gen_requests,
+                              **kwargs):
+            requested_num_tokens.append(num_tokens)
+            return original_create(resource_manager, num_tokens,
+                                   num_gen_requests, **kwargs)
+
+        model_engine._create_warmup_request = recording_wrapper
+        try:
+            model_engine.warmup(resource_manager)
+        finally:
+            model_engine._create_warmup_request = original_create
+            kv_cache_manager.shutdown()
+
+        self.assertGreater(
+            len(requested_num_tokens), 0,
+            "warmup() did not exercise _create_warmup_request at all; "
+            "the test setup no longer reaches the regression point.")
+        over_cap = [
+            n for n in requested_num_tokens
+            if n > model_engine.max_warmup_tokens
+        ]
+        self.assertEqual(
+            over_cap, [], f"warmup() requested {over_cap} tokens, exceeding "
+            f"max_warmup_tokens={model_engine.max_warmup_tokens}. "
+            "The cap was bypassed at one or more warmup callsites; this "
+            "regression crashed the TRT-LLM-Gen MoE "
+            "activation kernel during autotuner warmup with attention_dp.")
+
     def test_layerwise_nvtx_marker(self):
         llm_args = TorchLlmArgs(
             model="dummy",

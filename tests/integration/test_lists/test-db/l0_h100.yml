@@ -43,9 +43,10 @@ l0_h100:
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
-  - unittest/_torch/speculative -k "eagle3"
-  - unittest/_torch/speculative -k "not eagle3"
+  - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/thop/parallel
+  - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/thop/serial
   # Only key models in H100: llama/mixtral/gemma3/gpt-oss
   - unittest/_torch/modeling -k "modeling_llama"
@@ -119,6 +120,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_dummy_load_format
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma3_27BInstruct::test_fp8_prequantized
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]
@@ -134,6 +136,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=0]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_fp8
@@ -169,6 +172,15 @@ l0_h100:
   - test_e2e.py::test_openai_responses
   - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
   - test_e2e.py::test_trtllm_benchmark_serving[llama-3.1-model/Meta-Llama-3.1-8B]
+  # ------------- Prefix-aware scheduling E2E tests ---------------
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[guaranteed-chunked]
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[max-util-chunked]
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[python-scheduler]
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[swa-chunked]
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[no-overlap-chunked]
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[offload-chunked]
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[offload-no-chunked]
 - condition:
     ranges:
       system_gpu_count:
@@ -512,3 +524,5 @@ l0_h100:
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]
   - examples/test_ad_speculative_decoding.py::test_nemotron_mtp_model_with_weights
   - examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json
+  # ------------- AutoDeploy Perf Sanity ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-llama3_1_8b_fp8_ad_hopper-llama3_1_8b_ad_ws1_1k1k] TIMEOUT (120)

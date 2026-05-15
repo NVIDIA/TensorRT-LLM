@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -21,17 +21,25 @@ class ParallelVaeAttentionBlock(torch.nn.Module):
         world_size: Total ranks in the VAE parallel group.
     """
 
-    def __init__(self, module: nn.Module, chunk_dim: int, rank: int, world_size: int) -> None:
+    def __init__(
+        self,
+        module: nn.Module,
+        chunk_dim: int,
+        rank: int,
+        world_size: int,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> None:
         super().__init__()
         self.module = module
         self.rank = rank
         self.world_size = world_size
         self.chunk_dim = chunk_dim
+        self.pg = pg
 
     def forward(self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         gathered_tensors = [torch.zeros_like(hidden_states) for _ in range(self.world_size)]
 
-        dist.all_gather(gathered_tensors, hidden_states.contiguous())
+        dist.all_gather(gathered_tensors, hidden_states.contiguous(), group=self.pg)
         combined_tensor = torch.cat(gathered_tensors, dim=self.chunk_dim)
 
         # Not passing additional args/kwargs to the module since it's not expected to be used.

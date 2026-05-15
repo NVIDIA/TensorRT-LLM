@@ -216,7 +216,7 @@ ubuntu22_%: BASE_TAG = 13.1.1-devel-ubuntu22.04
 # For x86_64 and aarch64
 ubuntu24_%: STAGE = tritondevel
 ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu24_%: BASE_TAG = 13.1.0-devel-ubuntu24.04
+ubuntu24_%: BASE_TAG = 13.1.1-devel-ubuntu24.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

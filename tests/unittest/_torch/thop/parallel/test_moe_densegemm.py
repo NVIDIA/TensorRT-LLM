@@ -179,7 +179,7 @@ def test_nvfp4_dense_gemm_swiglu_blackwell(
     )
 
     # Call the kernel with fp4 output
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell(
         a,
         b_interleaved,
         a_sf,
