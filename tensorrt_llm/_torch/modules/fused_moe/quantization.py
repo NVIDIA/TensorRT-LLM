@@ -4971,6 +4971,29 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
                f"sf {tuple(module._t_l1[1].shape)}/"
                f"{module._t_l1[1].dtype})")
 
+        # DG's transform copies w3_w1_weight and both SF tensors into
+        # fresh storage but lets w2_weight pass through as _t_l2[0], so
+        # the other three Parameters are dead duplicates (~24 GiB/rank
+        # on V4-Flash @ EP=4). Reseat their .data to an empty tensor to
+        # release the storage while keeping the Parameter objects (and
+        # therefore state_dict keys) registered. The asserts below
+        # guard against a future DG version that view-passes any of
+        # them — that would dangle the forward-time weight.
+        assert module._t_l1[0].data_ptr() != module.w3_w1_weight.data_ptr(), (
+            "MegaMoE dedup invariant broken: DG returned a view of "
+            "w3_w1_weight as _t_l1[0]; releasing the raw param would "
+            "dangle the forward-time L1 weight.")
+        assert module._t_l1[1].data_ptr() != module.w3_w1_weight_scale.data_ptr(
+        ), ("MegaMoE dedup invariant broken: _t_l1[1] aliases w3_w1_weight_scale."
+            )
+        assert module._t_l2[1].data_ptr() != module.w2_weight_scale.data_ptr(
+        ), ("MegaMoE dedup invariant broken: _t_l2[1] aliases w2_weight_scale.")
+        for _redundant in (module.w3_w1_weight, module.w3_w1_weight_scale,
+                           module.w2_weight_scale):
+            _redundant.data = torch.empty(0,
+                                          dtype=_redundant.dtype,
+                                          device=_redundant.device)
+
     def _setup_shared_weights_for_eplb(self, module: torch.nn.Module) -> None:
         """Transform & register host-side shared weights for dynamic EPLB.
 

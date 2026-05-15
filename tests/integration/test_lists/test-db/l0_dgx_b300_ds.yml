@@ -58,6 +58,8 @@ l0_dgx_b300_ds:
   # references/gsm8k.yaml; reference was captured at TP=8 / 8x B200, may
   # drift slightly at TP=4 / 4x B300 — re-measure if hypothesis test flaps).
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] TIMEOUT (120)
+  # Same TP=4 EP=4 ADP layout with DG's fused fp8_fp4_mega_moe backend.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=MEGAMOE_DEEPGEMM] TIMEOUT (120)
   # Known issues (uncomment when unblocked):
   # * V4-Flash-Base FP8 + EPLB hits CUBLAS_STATUS_EXECUTION_FAILED in
   #   forward pass with WIDEEP backend (memory pressure aside).

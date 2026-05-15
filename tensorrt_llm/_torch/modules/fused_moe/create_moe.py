@@ -231,8 +231,13 @@ def create_moe_backend(
     if swiglu_limit is not None or swiglu_limit_scalar is not None:
         assert moe_cls in [
             CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
-            DeepGemmFusedMoE
+            DeepGemmFusedMoE, MegaMoEDeepGemm
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
+        if moe_cls is MegaMoEDeepGemm and swiglu_limit is not None:
+            raise NotImplementedError(
+                "MegaMoEDeepGemm supports swiglu_limit_scalar (uniform "
+                "clamp) only; per-expert swiglu_limit tensor is not "
+                "supported. Set swiglu_limit=None.")
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -402,6 +407,7 @@ def create_moe_backend(
                 init_load_balancer=init_load_balancer,
                 without_comm=without_comm,
                 activation_type=activation_type,
+                swiglu_limit_scalar=swiglu_limit_scalar,
             )
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
 

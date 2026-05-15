@@ -32,7 +32,7 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, maybe_compiled_cat,
                      maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
-from .multi_stream_utils import maybe_execute_in_parallel
+from .multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
@@ -1478,6 +1478,19 @@ class MLA(nn.Module):
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
 
+        self.has_dsv4_indexer = (
+            self.is_deepseek_v4 and layer_idx is not None
+            and config.sparse_attention_config is not None
+            and config.sparse_attention_config.compress_ratios[layer_idx] == 4)
+        self.indexer_stream = None
+        self.indexer_aux_stream = None
+        if self.has_dsv4_indexer and aux_stream is not None:
+            self.indexer_stream = torch.cuda.Stream(device=aux_stream.device)
+            self.indexer_aux_stream = torch.cuda.Stream(
+                device=aux_stream.device)
+        mqa_aux_stream = (self.indexer_aux_stream if self.indexer_aux_stream
+                          is not None else aux_stream)
+
         self.mqa = create_attention(
             config.attn_backend,
             self.layer_idx,
@@ -1499,7 +1512,7 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             sparse_attention_config=config.sparse_attention_config,
             dtype=dtype,
-            aux_stream=aux_stream,
+            aux_stream=mqa_aux_stream,
             rope_append=not self.is_deepseek_v4,
         )
 
@@ -1507,6 +1520,9 @@ class MLA(nn.Module):
 
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.dsv4_overlap_start_event = torch.cuda.Event()
+        self.dsv4_compressor_event = torch.cuda.Event()
+        self.dsv4_indexer_event = torch.cuda.Event()
 
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
@@ -2175,57 +2191,72 @@ class MLA(nn.Module):
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
         # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
-        # outer compressor (writes its own KV-cache slot, only reads
-        # hidden_states) executes on the auxiliary CUDA stream concurrently
-        # with q_b_proj + q_b_layernorm on the default stream.  Both branches
-        # are entirely independent (no shared inputs and disjoint writes),
-        # so this is a pure dependency-aware reorder.  Falls back to the
-        # serial schedule when the env-var is unset, when the aux stream is
-        # unavailable, or when multi-stream mode is off.
+        # outer compressor and the ratio-4 indexer can execute concurrently
+        # with q_b_proj + q_b_layernorm. The indexer is launched on a
+        # dedicated stream and still uses a different aux stream for its
+        # internal q-proj/weights-proj split.
         _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "0")
                              == "1" and self.compressor is not None
                              and self.aux_stream is not None)
 
-        if _v4_extra_overlap:
+        def _q_branch():
+            q_proj = self.q_b_proj(q)
+            # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm
+            # reduces per-head.
+            return self.q_b_layernorm(q_proj.view(
+                -1, self.qk_head_dim)).view_as(q_proj)
 
-            def _q_branch():
-                q_proj = self.q_b_proj(q)
-                # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm
-                # reduces per-head.
-                return self.q_b_layernorm(q_proj.view(
-                    -1, self.qk_head_dim)).view_as(q_proj)
+        def _compressor_branch():
+            self.compressor(hidden_states, attn_metadata)
+            return None
 
-            def _compressor_branch():
-                self.compressor(hidden_states, attn_metadata)
-                return None
-
-            q, _ = maybe_execute_in_parallel(
-                _q_branch,
-                _compressor_branch,
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
-        else:
-            q = self.q_b_proj(q)
-            # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm reduces per-head.
-            q = self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)
-            if self.compressor is not None:
-                self.compressor(hidden_states, attn_metadata)
-
-        # Indexer is independent of both q_b_proj and the compressor's KV-cache
-        # write, so it runs after either schedule.  Kept serial because it
-        # internally reuses self.aux_stream for its own multi-stream q-proj ||
-        # weights-proj split; running it concurrently with q_b_proj would
-        # create a stream-aliasing hazard.
-        topk_indices = None
-        if self.indexer is not None:
-            topk_indices = self.indexer(
+        def _indexer_branch():
+            return self.indexer(
                 qr,
                 hidden_states,
                 attn_metadata,
                 position_ids,
             )
+
+        topk_indices = None
+        indexer_ran = False
+        if _v4_extra_overlap:
+            use_indexer_overlap = (do_multi_stream()
+                                   and self.indexer is not None
+                                   and self.indexer_stream is not None)
+            if use_indexer_overlap:
+                self.dsv4_overlap_start_event.record()
+
+                with torch.cuda.stream(self.aux_stream):
+                    self.dsv4_overlap_start_event.wait()
+                    _compressor_branch()
+                    self.dsv4_compressor_event.record()
+
+                with torch.cuda.stream(self.indexer_stream):
+                    self.dsv4_overlap_start_event.wait()
+                    topk_indices = _indexer_branch()
+                    indexer_ran = True
+                    self.dsv4_indexer_event.record()
+
+                q = _q_branch()
+                self.dsv4_compressor_event.wait()
+                self.dsv4_indexer_event.wait()
+            else:
+                q, _ = maybe_execute_in_parallel(
+                    _q_branch,
+                    _compressor_branch,
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    self.aux_stream,
+                )
+        else:
+            q = _q_branch()
+            if self.compressor is not None:
+                self.compressor(hidden_states, attn_metadata)
+
+        if self.indexer is not None:
+            if not indexer_ran:
+                topk_indices = _indexer_branch()
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"

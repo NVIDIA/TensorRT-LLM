@@ -497,6 +497,14 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         return self.routing_impl.top_k
 
     @property
+    def n_group(self) -> int:
+        return self.routing_impl.n_group
+
+    @property
+    def topk_group(self) -> int:
+        return self.routing_impl.topk_group
+
+    @property
     def routing_method_type(self):
         return RoutingMethodType.DeepSeekV3
 
@@ -946,8 +954,14 @@ class BasePerfectRouterPlanner:
         the learned bias must be masked out before those logits are consumed.
         This helper mutates the routing-method instance so subsequent routing
         calls observe the zero-bias callable.
+
+        Routing methods that don't carry a learned bias (e.g.
+        ``DeepSeekV4MoeRoutingMethod`` with ``is_hashed=True`` returns ``None``
+        from its bias callable) have nothing to mask, so this becomes a no-op.
         """
         bias = routing_method.e_score_correction_bias
+        if bias is None:
+            return
         zero_bias = torch.zeros_like(bias, device=device)
         routing_method.callable_e_score_correction_bias = lambda zero_bias=zero_bias: zero_bias
 
@@ -1174,10 +1188,8 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
         self, routing_method: BaseMoeRoutingMethod
     ) -> tuple[RoutingMethodType, Optional[int], Optional[int]]:
         """Include the effective group configuration in the cache signature."""
-        actual_n_group, actual_topk_group = self._resolve_group_config(
-            routing_method)
-        return (routing_method.routing_method_type, actual_n_group,
-                actual_topk_group)
+        return (routing_method.routing_method_type, routing_method.n_group,
+                routing_method.topk_group)
 
     def prepare_routing_method_in_place(self,
                                         routing_method: BaseMoeRoutingMethod,
@@ -1187,9 +1199,13 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
 
     def create_logits(self, routing_method: BaseMoeRoutingMethod,
                       request: PerfectRouterRequest) -> torch.Tensor:
-        """Create ranked logits that survive DeepSeekV3 group selection."""
-        actual_n_group, actual_topk_group = self._resolve_group_config(
-            routing_method)
+        """Create ranked logits that survive DeepSeekV3 group selection.
+
+        ``routing_method.n_group`` and ``routing_method.topk_group`` are read
+        directly: each routing-method class (V3 nested on ``routing_impl``,
+        V4 stored directly) exposes them as attributes/properties, so the
+        planner does not need to introspect the storage layout.
+        """
         target_experts, target_values = self._project_targets(
             num_tokens=request.num_tokens,
             num_experts=request.num_experts,
@@ -1197,31 +1213,12 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
             moe_ep_size=request.moe_ep_size,
             ep_rank=request.ep_rank,
             device=request.device,
-            n_group=actual_n_group,
-            topk_group=actual_topk_group)
+            n_group=routing_method.n_group,
+            topk_group=routing_method.topk_group)
         return self._create_ranked_topk_logits(target_experts, target_values,
                                                request.num_experts,
                                                request.device, request.dtype,
                                                -10.0)
-
-    def _resolve_group_config(
-        self,
-        routing_method: BaseMoeRoutingMethod,
-    ) -> tuple[int, int]:
-        """Resolve DeepSeekV3 group settings from the routing method.
-
-        Example:
-            If ``routing_method.routing_impl`` stores ``n_group=8`` and
-            ``topk_group=4``, this helper returns ``(8, 4)``.
-        """
-        routing_impl = getattr(routing_method, "routing_impl", None)
-        if routing_impl is None or not hasattr(routing_impl,
-                                               "n_group") or not hasattr(
-                                                   routing_impl, "topk_group"):
-            raise ValueError(
-                "DeepSeekV3 perfect-router planning requires routing_method.routing_impl "
-                "to provide n_group and topk_group")
-        return routing_impl.n_group, routing_impl.topk_group
 
     def _project_targets(
         self,
