@@ -665,6 +665,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
         pretrained_config = model_config.pretrained_config
+        self.sound_gen = getattr(pretrained_config, "sound_gen", False)
+        self.action_gen = getattr(pretrained_config, "action_gen", False)
 
         self.hidden_size = pretrained_config.hidden_size
         self.num_hidden_layers = pretrained_config.num_hidden_layers
@@ -683,6 +685,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.num_attention_heads = pretrained_config.num_attention_heads
         self.num_kv_heads = pretrained_config.num_key_value_heads
         self.enable_fps_modulation = pretrained_config.enable_fps_modulation
+
+        if self.sound_gen:
+            self.sound_dim = pretrained_config.sound_dim
+            self.sound_latent_fps = pretrained_config.sound_latent_fps
+            self.temporal_compression_factor_sound = (
+                pretrained_config.temporal_compression_factor_sound
+            )
 
         if pretrained_config.position_embedding_type != "unified_3d_mrope":
             raise ValueError(
