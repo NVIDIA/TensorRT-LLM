@@ -3317,6 +3317,11 @@ class PyExecutor:
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
 
+                # Need to wait for the copy of previous iteration before modifying any host memory copied to GPU,
+                # and for scheduler V2, it will modify the host page table, so wait before scheduling.
+                # This wait is also needed for legacy scheduler, but it can be pushed later, e.g. before model_engine._prepare_inputs().
+                self.model_engine.wait_for_input_copy()
+
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
