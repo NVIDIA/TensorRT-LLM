@@ -620,6 +620,17 @@ class KVCacheManager(BaseResourceManager):
                                        1) if spec_config is not None else 0
         self.linear_attention_metadata = linear_attention_metadata
 
+        # Dynamic-tree draft manager reserves K*max_draft_len KV slots (the draft
+        # loop can write that many even if max_total_draft_tokens is smaller).
+        # Target manager keeps max_total_draft_tokens exactly.
+        self._kv_reserve_draft_tokens = self.max_total_draft_tokens
+        if (self.is_draft and spec_config is not None
+                and getattr(spec_config, 'use_dynamic_tree', False)
+                and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 0):
+            draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
+            self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
+                                                draft_loop_tokens)
+
         self.max_attention_window_vec = self._resolve_max_attention_window_vec(
             kv_cache_config=kv_cache_config,
             max_seq_len=max_seq_len,
@@ -960,6 +971,12 @@ class KVCacheManager(BaseResourceManager):
                 self.impl.add_token(req.py_request_id)
                 for _ in range(draft_len):
                     self.impl.add_token(req.py_request_id)
+                # Top up to _kv_reserve_draft_tokens (see __init__): on
+                # dynamic-tree draft manager this exceeds draft_len; otherwise
+                # only nonzero when scheduler truncated py_draft_tokens.
+                reserve_slack = self._kv_reserve_draft_tokens - draft_len
+                for _ in range(max(0, reserve_slack)):
+                    self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             self.impl.refresh_blocks()
@@ -993,6 +1010,9 @@ class KVCacheManager(BaseResourceManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        # Override of py_draft_tokens length for KV reserve (e.g. dynamic-tree
+        # draft loop). Falls back to max_num_draft_tokens when None.
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         # For capturable drafting loops. During normal inference, the draft model always
@@ -1002,6 +1022,7 @@ class KVCacheManager(BaseResourceManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ):
+        _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
         if available_blocks < 1:
@@ -1099,10 +1120,10 @@ class KVCacheManager(BaseResourceManager):
                         req.py_decoding_iter = 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    for _ in range(max_num_draft_tokens):
+                    for _ in range(_kv_draft):
                         self.impl.add_token(req.request_id)
                     if draft_kv_cache_manager is not None:
-                        for _ in range(max_num_draft_tokens):
+                        for _ in range(_kv_draft):
                             draft_kv_cache_manager.impl.add_token(
                                 req.request_id)
 
@@ -1124,6 +1145,17 @@ class KVCacheManager(BaseResourceManager):
                 continue
             if request.py_rewind_len > 0:
                 self.rewind_kv_cache(request, request.py_rewind_len)
+            # Symmetric companion to prepare_resources's reserve_slack
+            # add_token loop: when _kv_reserve_draft_tokens (e.g. dynamic
+            # tree's K*max_draft_len) exceeds the runtime draft length,
+            # those extra slots must also be rewound, otherwise the draft
+            # KV cache leaks reserve_slack tokens per generation iteration
+            # and eventually overflows mCacheBlockIndices.
+            runtime_draft_len = (request.py_rewind_len +
+                                 request.py_num_accepted_draft_tokens)
+            extra_rewind = self._kv_reserve_draft_tokens - runtime_draft_len
+            if extra_rewind > 0:
+                self.rewind_kv_cache(request, extra_rewind)
 
         # For context requests, store completed context blocks for KV cache reuse.
         # We wait until context_remaining_length == 0 (all chunks processed) before
@@ -2083,6 +2115,15 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
+        # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
+        self._kv_reserve_draft_tokens = self.max_total_draft_tokens
+        if (self.is_draft and spec_config is not None
+                and getattr(spec_config, 'use_dynamic_tree', False)
+                and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 0):
+            draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
+            self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
+                                                draft_loop_tokens)
+
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
         assert self.event_buffer_max_size == 0, "event_buffer_max_size must be 0"
@@ -2278,14 +2319,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # stay int.
             self.max_seq_len = int(max_num_tokens)
 
-        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel.
-        # Computed after max_seq_len clamping, but account for extra tokens
-        # (num_extra_kv_tokens + max_total_draft_tokens) so the host
-        # page-index buffer is large enough for the maximum capacity a single
-        # sequence can reach during warmup or normal operation.
-        # The +1 accounts for the base decode token that
-        # _required_gen_capacity adds on top of draft tokens.
-        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self.max_total_draft_tokens + 1
+        # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
+        # Account for max single-sequence capacity = seq_len + extra KV tokens +
+        # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
+        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block -
                                    1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
@@ -2799,6 +2836,12 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
+                # Pad the resize up to _kv_reserve_draft_tokens (see __init__);
+                # no-op when reserve == draft_token_length.
+                reserve_slack = (self._kv_reserve_draft_tokens -
+                                 get_draft_token_length(req))
+                if reserve_slack > 0:
+                    new_cap += reserve_slack
                 if not kv_cache.resize(new_cap):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
@@ -2885,10 +2928,12 @@ class KVCacheManagerV2(BaseResourceManager):
             is_gen: bool = False,
             prepare_resource: bool = True,
             max_num_draft_tokens: int = 0,
+            kv_reserve_draft_tokens: Optional[int] = None,
             use_mrope: bool = False,
             max_beam_width: int = 1,
             num_extra_decoding_steps: int = 0,
             draft_kv_cache_manager: Optional['BaseResourceManager'] = None):
+        _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
 
         beam_width = max_beam_width
         requests = []
@@ -2972,7 +3017,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
+                    new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity,
                                               history_length=history_hint)
                     if not success:

@@ -55,20 +55,16 @@ class DynamicTreeOpsConverter:
         self.K = dynamic_tree_max_topK
         self.depth = max_draft_len
 
-        # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_op
-        N = max_total_draft_tokens + 1  # tokens_per_gen_step (includes root)
+        # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_packed_op
         max_path_len = max_draft_len + 1
-        self._verify_predicts_buf = torch.zeros(
-            max_batch_size * N, dtype=torch.int64, device=device
-        )
         self._verify_accept_index_buf = torch.zeros(
-            max_batch_size, max_path_len, dtype=torch.int64, device=device
+            max_batch_size, max_path_len, dtype=torch.int32, device=device
         )
         self._verify_accept_token_num_buf = torch.zeros(
-            max_batch_size, dtype=torch.int64, device=device
+            max_batch_size, dtype=torch.int32, device=device
         )
         self._verify_accept_token_buf = torch.zeros(
-            max_batch_size, max_path_len, dtype=torch.int64, device=device
+            max_batch_size, max_path_len, dtype=torch.int32, device=device
         )
 
         # Pre-allocated output buffers for verify_dynamic_tree_rejection_out
@@ -142,9 +138,14 @@ class DynamicTreeOpsConverter:
         # +1 because num_draft_tokens includes root node in SGLang's convention
         num_draft_tokens = topk_score_indices.shape[1] + 1
         tree_mask_mode = 2 if use_packed_mask else 1  # QLEN_ONLY_BITPACKING / QLEN_ONLY
-        # Packed layout: last dim is int32 row stride (may exceed ceil(N/32) if padded).
-        # Non-packed path ignores this (bool [bs,N,N] still has a last dim).
-        num_int32_per_row = tree_mask.shape[-1]
+
+        # Actual buffer row stride (int32s); kernel otherwise computes ceil(num_draft_tokens / 32).
+        num_int32_per_row = tree_mask.shape[-1] if use_packed_mask else 0
+
+        # CUDA kernel indexes as ptr[bid * draftTokenNum + tid], so dim1 must equal num_draft_tokens.
+        assert positions.shape[-1] == num_draft_tokens, (
+            f"positions dim1 ({positions.shape[-1]}) != num_draft_tokens ({num_draft_tokens})"
+        )
 
         # The CUDA builder writes only active tree links/bits. Clear the reused
         # work buffers first so stale slot/tree state cannot leak into this tree.
@@ -177,38 +178,17 @@ class DynamicTreeOpsConverter:
                 f"num_draft_tokens={num_draft_tokens}"
             ) from e
 
-    def verify_dynamic_tree_greedy_out(
+    def verify_dynamic_tree_greedy_out_packed(
         self,
         candidates: torch.Tensor,
-        retrieve_index: torch.Tensor,
-        retrieve_next_token: torch.Tensor,
-        retrieve_next_sibling: torch.Tensor,
+        retrieve_packed: torch.Tensor,
         target_predict: torch.Tensor,
         num_gens: int,
         num_spec_step: int,
         tree_valid: torch.Tensor = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        In-place verify using pre-allocated output buffers (CUDA graph friendly).
-
-        Args:
-            candidates: [num_gens, N] int64 candidate tokens.
-            retrieve_index: [num_gens, N] int32 retrieval indices.
-            retrieve_next_token: [num_gens, N] int32 next token indices.
-            retrieve_next_sibling: [num_gens, N] int32 next sibling indices.
-            target_predict: [num_gens, N] int64 target predictions.
-            num_gens: Number of generation requests.
-            num_spec_step: Number of speculative steps.
-            tree_valid: [num_gens] bool per-request flag.  When False the
-                kernel early-returns with acceptTokenNum=0 (first-gen /
-                dummy requests).  None means all trees are valid.
-
-        Returns:
-            Tuple of (predicts, accept_index, accept_token_num, accept_token)
-            as slices of pre-allocated buffers.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """In-place verify with int32 token tensors and packed int32 retrieve layout."""
         N = candidates.size(1)
-        predicts = self._verify_predicts_buf[: num_gens * N]
         accept_index = self._verify_accept_index_buf[:num_gens]
         accept_token_num = self._verify_accept_token_num_buf[:num_gens]
         accept_token = self._verify_accept_token_buf[:num_gens]
@@ -216,14 +196,12 @@ class DynamicTreeOpsConverter:
         if tree_valid is None:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
 
+        retrieve_packed_contig = retrieve_packed[:, :N, :].contiguous()
         try:
-            torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
+            torch.ops.trtllm.verify_dynamic_tree_greedy_out_packed_op(
                 candidates,
-                retrieve_index,
-                retrieve_next_token,
-                retrieve_next_sibling,
+                retrieve_packed_contig,
                 target_predict,
-                predicts,
                 accept_index,
                 accept_token_num,
                 accept_token,
@@ -232,12 +210,11 @@ class DynamicTreeOpsConverter:
             )
         except Exception as e:
             raise RuntimeError(
-                f"verify_dynamic_tree_greedy_out_op failed: {e}\n"
-                f"Inputs: num_gens={num_gens}, N={N}, "
-                f"num_spec_step={num_spec_step}"
+                f"verify_dynamic_tree_greedy_out_packed_op failed: {e}\n"
+                f"Inputs: num_gens={num_gens}, N={N}, num_spec_step={num_spec_step}"
             ) from e
 
-        return predicts, accept_index, accept_token_num, accept_token
+        return accept_index, accept_token_num, accept_token
 
     def verify_dynamic_tree_rejection_from_logits_out(
         self,

@@ -89,6 +89,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
 
+    # Per-request token count: becomes the second dim of the 2-D
+    # position_offsets tensor passed to C++ (sizes()[1]), which is mapped to
+    # mPackedMaskMaxSeqLenQ — the packed-mask row stride consumed by XQA /
+    # trtllm-gen. Set in eagle3_dynamic_tree._apply_spec_metadata each step.
+    position_offsets_query_len: int = 0
+
     # parameters required for spec-dec mode
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
@@ -769,6 +775,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
+        num_contexts: int = 0,
     ) -> None:
         '''
         Update the spec-dec parameters for the TRTLLM attention layer.
@@ -782,6 +789,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
             spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
+            num_contexts: int = 0, the number of context (prefill) requests in the
+                batch.  The slot-storage layout is ``[ctx | gen]``; dynamic-tree
+                metadata only describes the gen rows, so we must source from
+                ``[num_contexts:batch_size]`` rather than ``[:batch_size]``.
         '''
 
         # Disable spec decoding on Blackwell (sm100+). The trtllmGen FMHA
@@ -850,25 +861,36 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if self.is_spec_dec_dynamic_tree:
                 assert spec_tree_manager is not None, "spec_tree_manager is required for dynamic tree"
                 n_dt = spec_tree_manager.max_total_draft_tokens + 1
-                mask_width = spec_tree_manager.spec_dec_packed_mask.shape[-1]
+                buf_dim = spec_tree_manager._internal_buf_dim
 
-                self.spec_decoding_position_offsets[:batch_size * n_dt].view(
-                    batch_size,
-                    n_dt).copy_(spec_tree_manager.
-                                spec_dec_position_offsets[:batch_size],
-                                non_blocking=True)
+                assert buf_dim >= n_dt, (
+                    f"Dynamic-tree copy requires buf_dim >= n_dt; got "
+                    f"buf_dim={buf_dim}, n_dt={n_dt}.")
 
-                if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-                    self.spec_decoding_packed_mask[:batch_size].zero_()
-                    self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[:batch_size],
-                        non_blocking=True)
-                else:
-                    total = batch_size * n_dt * mask_width
+                slot_storage = spec_tree_manager.slot_storage
+
+                num_gens = batch_size - num_contexts
+                if num_gens > 0:
+                    slot_ids = slot_storage.all_ids_buf[num_contexts:batch_size]
+
+                    pos_src = torch.index_select(slot_storage.position_offsets,
+                                                 0, slot_ids)[:, :n_dt]
+                    pos_dst = self.spec_decoding_position_offsets[:num_gens *
+                                                                  n_dt].view(
+                                                                      num_gens,
+                                                                      n_dt)
+                    pos_dst.copy_(pos_src, non_blocking=True)
+                    self.position_offsets_query_len = n_dt
+
+                    actual_mask_width = math.ceil(n_dt / 32)
+                    mask_src = torch.index_select(
+                        slot_storage.packed_mask, 0,
+                        slot_ids)[:, :, :actual_mask_width]
+                    total = num_gens * n_dt * actual_mask_width
                     self.spec_decoding_packed_mask.view(-1)[:total].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[:batch_size].
-                        reshape(-1),
-                        non_blocking=True)
+                        mask_src.reshape(-1), non_blocking=True)
+                else:
+                    self.position_offsets_query_len = n_dt
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
 
@@ -883,6 +905,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 # Case 2: static tree and target model
                 if is_target_model:
                     # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
+                    self.position_offsets_query_len = 0
                     self.spec_decoding_position_offsets[:batch_size, :].copy_(
                         spec_tree_manager.spec_dec_position_offsets[0, :],
                         non_blocking=True)
@@ -900,6 +923,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     # Considering that these spec-dec params are accessed consecutively (without padding) in the attention Op,
                     # we need to write them consecutively when setting them.
                     # For the next drafter layers, we will prepare these spec-dec params in the drafting loops.
+
                     # position_offsets
                     position_offset = torch.arange(
                         max_draft_len + 1,
@@ -920,6 +944,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                             spec_decoding_packed_mask, non_blocking=True)
                     self.generate_spec_decoding_generation_length(
                         runtime_draft_len=max_draft_len)
+                    if (self.spec_decoding_position_offsets is not None
+                            and self.spec_decoding_position_offsets.dim() == 1):
+                        self.position_offsets_query_len = max_draft_len + 1
+                    else:
+                        self.position_offsets_query_len = 0
 
             # Case 4: linear tree
             else:
@@ -936,6 +965,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.max_num_requests, runtime_draft_len)
                 self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
                     self.max_num_requests, runtime_draft_len)
+                self.position_offsets_query_len = 0
 
     def generate_spec_decoding_generation_length(self, runtime_draft_len):
         self.spec_decoding_generation_lengths[:self.max_num_requests].fill_(
@@ -1291,11 +1321,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.is_spec_decoding_enabled, metadata.use_spec_decoding,
             metadata.is_spec_dec_tree
         ]
-        position_offsets_for_cpp = metadata.spec_decoding_position_offsets
-        if (metadata.spec_decoding_position_offsets is not None
-                and metadata.spec_decoding_position_offsets.dim() == 1):
-            position_offsets_for_cpp = metadata.spec_decoding_position_offsets.view(
-                metadata.max_num_requests, -1)
+        position_offsets_for_cpp = self._reshape_position_offsets_for_cpp(
+            metadata)
 
         spec_decoding_tensor_params = [
             metadata.spec_decoding_generation_lengths, position_offsets_for_cpp,
@@ -1557,6 +1584,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 print(
                     f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
                     f" = {skipped_blocks / total_blocks * 100: .2f}%")
+
+    @staticmethod
+    def _reshape_position_offsets_for_cpp(metadata):
+        """Reshape 1D spec-dec position offsets to (num_requests, query_len) for C++."""
+        offsets = metadata.spec_decoding_position_offsets
+        if offsets is None or offsets.dim() != 1:
+            return offsets
+        num_requests = metadata.max_num_requests
+        query_len = metadata.position_offsets_query_len
+        if num_requests > 0 and query_len > 0:
+            return offsets[:num_requests * query_len].view(
+                num_requests, query_len)
+        return offsets
 
     def forward(
         self,
