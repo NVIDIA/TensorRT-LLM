@@ -208,7 +208,7 @@ COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/nul
  *   - matchedPattern (String): the pattern that matched, for logging
  */
 def classifyInfraFailure(Exception ex, List extraInfraPatterns=[], List extraSingleRetryPatterns=[]) {
-    def result = [isInfraFailure: false, isSingleRetryOnly: false, matchedPattern: ""]
+    def result = [isInfraFailure: true, isSingleRetryOnly: false, matchedPattern: ""]
 
     // Build the full exception text by walking the cause chain
     def exceptionText = ""
