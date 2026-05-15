@@ -14,6 +14,11 @@ from .request_utils import get_num_child_requests
 
 SHUTDOWN_REQUEST_ID = -1
 CONTROL_REQUEST_ID = -2
+# Sentinel request ids for profiling control. Rank 0 enqueues these
+# items; ``RequestBroadcaster`` copies them to every TP/PP rank so the
+# profile window applies on every PyExecutor, not just the leader.
+PROFILE_START_REQUEST_ID = -3
+PROFILE_STOP_REQUEST_ID = -4
 
 
 @dataclasses.dataclass
@@ -24,6 +29,11 @@ class RequestQueueItem:
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
+    # Payload for profile-control items. Populated only when
+    # ``is_profile_start_request`` is true; contains the ``output_dir``,
+    # ``num_steps``, ``start_step``, and ``activities`` that every rank
+    # applies when the broadcast reaches them.
+    profile_config: Optional[dict] = None
 
     @property
     def is_shutdown_request(self):
@@ -32,11 +42,20 @@ class RequestQueueItem:
     @property
     def is_normal_request(self):
         return not (self.is_shutdown_request or self.is_canceled_request
-                    or self.is_control_request)
+                    or self.is_control_request or self.is_profile_start_request
+                    or self.is_profile_stop_request)
 
     @property
     def is_control_request(self):
         return self.id == CONTROL_REQUEST_ID
+
+    @property
+    def is_profile_start_request(self):
+        return self.id == PROFILE_START_REQUEST_ID
+
+    @property
+    def is_profile_stop_request(self):
+        return self.id == PROFILE_STOP_REQUEST_ID
 
 
 class ExecutorRequestQueue:
@@ -129,6 +148,20 @@ class ExecutorRequestQueue:
     def enqueue_control_request(self):
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(id=CONTROL_REQUEST_ID))
+
+    def enqueue_profile_start_request(self, profile_config: dict):
+        """Enqueue a profile-start control item that is broadcasted to
+        every TP/PP rank via ``RequestBroadcaster`` so all PyExecutor
+        instances apply the window in lockstep (not just the leader)."""
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(id=PROFILE_START_REQUEST_ID,
+                                 profile_config=profile_config))
+
+    def enqueue_profile_stop_request(self):
+        """Enqueue a profile-stop control item. Broadcasted to every rank."""
+        with self.enqueue_lock:
+            self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:

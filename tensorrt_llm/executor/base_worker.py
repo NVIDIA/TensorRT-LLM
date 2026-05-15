@@ -805,6 +805,42 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Forward profiling request to the underlying PyExecutor engine.
+
+        No-op (with a warning) for legacy TensorRT-backend engines which
+        do not expose this API.
+        """
+        if self.engine is None:
+            logger.warning(
+                "start_profile called but engine is not initialized.")
+            return
+        start_fn = getattr(self.engine, "start_profile", None)
+        if start_fn is None:
+            logger.warning("Current engine does not support start_profile; "
+                           "this API requires the PyTorch PyExecutor backend.")
+            return
+        start_fn(output_dir=output_dir,
+                 num_steps=num_steps,
+                 start_step=start_step,
+                 activities=activities)
+
+    def stop_profile(self) -> None:
+        """Forward stop_profile request to the underlying PyExecutor engine."""
+        if self.engine is None:
+            logger.warning("stop_profile called but engine is not initialized.")
+            return
+        stop_fn = getattr(self.engine, "stop_profile", None)
+        if stop_fn is None:
+            logger.warning("Current engine does not support stop_profile; "
+                           "this API requires the PyTorch PyExecutor backend.")
+            return
+        stop_fn()
+
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:

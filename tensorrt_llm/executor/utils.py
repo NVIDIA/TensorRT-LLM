@@ -154,6 +154,13 @@ class WorkerCommIpcAddrs(NamedTuple):
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
     resource_governor_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
+    # Worker -> proxy ack channel for synchronous control requests
+    # (currently: StartProfileRequest, StopProfileRequest). Lets the
+    # HTTP /start_profile and /stop_profile handlers wait for the worker
+    # to actually finish processing the request before returning, so the
+    # documented "trace is on disk by the time /stop_profile returns
+    # 200" contract holds in the IPC-proxy deployment too.
+    profile_ack_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
 
 
 def is_llm_response(instance):
