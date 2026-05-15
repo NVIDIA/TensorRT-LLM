@@ -406,6 +406,7 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_topk_4-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined SKIP (https://nvbugs/6199854)
 unittest/bindings/test_transfer_agent_bindings.py::TestNixlFunctionalTransfer::test_nixl_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6260897)
+unittest/disaggregated/test_kv_transfer.py SKIP (https://nvbugs/6179426)
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
