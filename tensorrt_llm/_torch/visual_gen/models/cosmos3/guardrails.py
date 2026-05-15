@@ -82,6 +82,7 @@ def _pixelate_face(face_img: np.ndarray, blocks: int = 5) -> np.ndarray:
 # ---------------------------------------------------------------------------
 def download_guardrail_checkpoint() -> str:
     from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import GatedRepoError
 
     try:
         return snapshot_download(
@@ -93,10 +94,15 @@ def download_guardrail_checkpoint() -> str:
         logger.warning(
             f"Guardrail checkpoint not found, downloading from {GUARDRAIL_HF_REPO} {GUARDRAIL_HF_REVISION}"
         )
-        return snapshot_download(
-            GUARDRAIL_HF_REPO,
-            revision=GUARDRAIL_HF_REVISION,
-        )
+        try:
+            return snapshot_download(
+                GUARDRAIL_HF_REPO,
+                revision=GUARDRAIL_HF_REVISION,
+            )
+        except GatedRepoError:
+            raise ValueError(
+                f"{GUARDRAIL_HF_REPO} requires an approved HF_TOKEN. Please set HF_TOKEN and try again."
+            )
 
 
 def build_text_guardrail(guardrail_ckpt_dir: str) -> TextGuardrailFn:
