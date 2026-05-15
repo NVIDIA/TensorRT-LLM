@@ -620,7 +620,7 @@ struct Producer
             asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(nbRegsForMathWarps));
             compute();
         }
-        if (nbSubSeq > 1)
+        if (nbSubSeq > 1 && args.semaphores != nullptr)
         {
             mergePartialOutputs(args.semaphores[idxInputTokenGlobal],
                 reinterpret_cast<Vec<OutputHead, PartialResult::nbRowsPerChunk>&>(
@@ -1280,7 +1280,7 @@ struct Consumer
             asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(nbRegsForMathWarps));
             compute();
         }
-        if (nbSubSeq > 1)
+        if (nbSubSeq > 1 && args.semaphores != nullptr)
         {
             mergePartialOutputs(args.semaphores[idxInputTokenGlobal],
                 reinterpret_cast<Vec<OutputHead, PartialResult::nbRowsPerChunk>&>(
@@ -1851,6 +1851,85 @@ CUBIN_EXPORT __global__ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSiz
     }
 }
 
+// Flash-decoding-style global-memory combine. The main kernel writes one normalized
+// partial output plus (rowMax,rowSum) per KV subsequence; this kernel applies the
+// online-softmax correction across subsequences and writes the final normalized O.
+CUBIN_EXPORT __global__ __launch_bounds__(256, 1) void reduce_mla_flash_decode_partials(
+    OutputHead* __restrict__ const output, PartialResult const* __restrict__ const partialResults,
+    uint32_t const* __restrict__ const seqLenList, uint32_t const maxNbSubSeq, uint32_t const inputSeqLen)
+{
+    static_assert(validElemsPerVHead == 512);
+    static_assert(PartialResult::nbChunks == 4);
+    constexpr uint32_t colTileElems = 128;
+    constexpr uint32_t nbColTiles = exactDiv(validElemsPerVHead, colTileElems);
+    static_assert(nbColTiles == 4);
+
+    uint32_t const idxColTile = blockIdx.x;
+    uint32_t const idxChunk = blockIdx.y;
+    uint32_t const idxInputTokenGlobal = blockIdx.z;
+    uint32_t const idxReq = idxInputTokenGlobal / inputSeqLen;
+    uint32_t const reqIdxInputToken = idxInputTokenGlobal - idxReq * inputSeqLen;
+
+    uint32_t const cacheSeqLen = seqLenList[idxReq] - (inputSeqLen - 1) + reqIdxInputToken;
+    uint32_t const nbTiles = divUp(cacheSeqLen, tokensPerTile);
+    bool const isMultiBlockMode = (maxNbSubSeq > 1 && nbTiles >= multiBlockMinNbTiles);
+    uint32_t const nbSubSeq = isMultiBlockMode ? mha::min(nbTiles / multiBlockMinNbTilesPerCta, maxNbSubSeq) : 1;
+    if (nbSubSeq <= 1)
+    {
+        return;
+    }
+
+    __shared__ float finalRowMax[PartialResult::nbRowsPerChunk];
+    __shared__ float finalRowSum[PartialResult::nbRowsPerChunk];
+
+    uint32_t const tid = threadIdx.x;
+    if (tid < PartialResult::nbRowsPerChunk)
+    {
+        float rowMax = safeInitRowMax;
+#pragma unroll 1
+        for (uint32_t idxSubSeq = 0; idxSubSeq < nbSubSeq; idxSubSeq++)
+        {
+            PartialResult::Chunk const& chunk
+                = partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[idxChunk];
+            rowMax = fmaxf(rowMax, chunk.rowMaxLog2e[tid]);
+        }
+
+        float rowSum = 0.F;
+#pragma unroll 1
+        for (uint32_t idxSubSeq = 0; idxSubSeq < nbSubSeq; idxSubSeq++)
+        {
+            PartialResult::Chunk const& chunk
+                = partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[idxChunk];
+            rowSum += chunk.rowSum[tid] * exp2f(chunk.rowMaxLog2e[tid] - rowMax);
+        }
+        finalRowMax[tid] = rowMax;
+        finalRowSum[tid] = rowSum;
+    }
+    __syncthreads();
+
+    uint32_t constexpr elemsPerBlock = PartialResult::nbRowsPerChunk * colTileElems;
+    uint32_t const colBase = idxColTile * colTileElems;
+#pragma unroll 1
+    for (uint32_t elem = tid; elem < elemsPerBlock; elem += blockDim.x)
+    {
+        uint32_t const row = elem / colTileElems;
+        uint32_t const col = colBase + elem - row * colTileElems;
+        float const rowMax = finalRowMax[row];
+        float const rowSum = finalRowSum[row];
+        float acc = 0.F;
+#pragma unroll 1
+        for (uint32_t idxSubSeq = 0; idxSubSeq < nbSubSeq; idxSubSeq++)
+        {
+            PartialResult::Chunk const& chunk
+                = partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[idxChunk];
+            float const weight = chunk.rowSum[row] * exp2f(chunk.rowMaxLog2e[row] - rowMax);
+            acc += static_cast<float>(chunk.data[row][col]) * weight;
+        }
+        OutputHead& dst = output[headGrpSize * idxInputTokenGlobal + idxChunk * PartialResult::nbRowsPerChunk + row];
+        dst[col] = __float2bfloat16_rn(acc / fmaxf(rowSum, 1e-20F));
+    }
+}
+
 __constant__ constexpr uint32_t smemSize = mha::max(sizeof(SharedMemA), sizeof(SharedMemB));
 static_assert(smemSize <= 99 * 1024, "Shared memory size exceeded");
 #endif // is_MLA
@@ -1932,6 +2011,11 @@ void launchMLA(cudaDeviceProp const& prop,
             mha::max<uint32_t>(1U, (uint32_t) round(prop.multiProcessorCount / 4 / (batchSize * nbKHeads) * factor)),
             divUp(maxSeqLen, tokensPerTile * 2));
     }();
+    bool const useSeparateReduce = []() -> bool
+    {
+        auto const env = std::getenv("XQA_MLA_SEPARATE_REDUCE");
+        return env != nullptr && std::stoi(env) != 0;
+    }();
     // printf("nbSubSeqPerSeq = %u\n", nbSubSeqPerSeq);
     // gridDim.z == nbKHeads * batchSize && gridDim.y == nbSubSeqPerSeq && gridDim.x == nbInputSeqSplit
     dim3 const dimGrid{4 * inputSeqLen, nbSubSeqPerSeq, nbKHeads * batchSize};
@@ -1978,8 +2062,18 @@ void launchMLA(cudaDeviceProp const& prop,
     uint32_t const nbCgas = exactDiv(dimGrid.x, 4) * dimGrid.y * dimGrid.z;
     auto const cgaXBuf = static_cast<Vec<CgaXBuffer, nbProducerCtasPerCga>*>(scratch);
     auto const partialResults = reinterpret_cast<PartialResult*>(cgaXBuf + nbCgas);
+    // A null semaphore pointer tells kernel_mha to leave split-KV partials in global memory.
+    // The follow-up kernel then performs the numerically stable partial reduction.
     cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, qScale,
-        output, cacheList, batchSize, kvCacheScale, cgaXBuf, semaphores, partialResults);
+        output, cacheList, batchSize, kvCacheScale, cgaXBuf, useSeparateReduce ? nullptr : semaphores, partialResults);
+    checkCuda(err);
+    if (useSeparateReduce && nbSubSeqPerSeq > 1)
+    {
+        dim3 const reduceGrid{4, PartialResult::nbChunks, inputSeqLen * batchSize};
+        reduce_mla_flash_decode_partials<<<reduceGrid, 256, 0, stream>>>(
+            output, partialResults, seqLen, nbSubSeqPerSeq, inputSeqLen);
+        checkCuda(cudaPeekAtLastError());
+    }
 #else
     KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
     static_assert(!usePagedKVCache);
