@@ -1102,7 +1102,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             if k.startswith(skip_prefixes):
                 continue
 
-            if k.startswith(("vae2llm.", "llm2vae.")):
+            if k.startswith(
+                ("vae2llm.", "llm2vae.", "sound2llm.", "llm2sound.", "sound_modality_embed")
+            ):
                 remapped[k] = value
                 continue
 
@@ -1242,6 +1244,11 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.language_model.embed_tokens.to(target_dtype)
         self.vae2llm.to(target_dtype)
         self.llm2vae.to(target_dtype)
+
+        if self.sound_gen:
+            self.sound2llm.to(target_dtype)
+            self.llm2sound.to(target_dtype)
+            self.sound_modality_embed.data = self.sound_modality_embed.data.to(target_dtype)
 
         for _, module in self.named_modules():
             if isinstance(module, Linear) or isinstance(module, Qwen3VLTextRMSNorm):

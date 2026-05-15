@@ -208,9 +208,7 @@ class BasePipeline(nn.Module):
 
     @property
     def dtype(self):
-        if hasattr(self, "transformer"):
-            return next(self.transformer.parameters()).dtype
-        return torch.float32
+        return self.model_config.torch_dtype
 
     @property
     def device(self):
