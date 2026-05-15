@@ -1391,15 +1391,9 @@ def trtllm_mxfp4_w4a16_moe_fused(
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 
-    # Top-k routing — match PT's RenormalizeMoeRoutingMethod which casts to
-    # fp32 for the softmax to keep numerical precision (then casts back to
-    # the activation dtype for the kernel call). bf16 softmax over close
-    # logits can produce degenerate probabilities (all close to 1/k or
-    # extremely skewed), which translates to bad expert mixing and
-    # garbage-looking generation even when shapes/layouts are correct.
+    # Top-k routing is done inside the trtllm-gen kernel — we just compute
+    # router_logits and hand them off. PT's MoE path does the same.
     router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
-    topk_vals, topk_ids = torch.topk(router_logits.to(torch.float32), top_k, dim=-1)
-    topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
     # The kernel reads `expected_hidden = fc1_weights.shape[-1] * 2` bytes of input.
@@ -1415,9 +1409,18 @@ def trtllm_mxfp4_w4a16_moe_fused(
     # intermediate_size_padded = (2 * I_pad) // 2 = I_pad
     intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
 
+    # FIX: pass router_logits (non-None) directly to the kernel. The kernel
+    # then does fused topk + softmax internally (matches source commit
+    # 7719712a5f's `AD_W4A8_FUSED_ROUTING=1` path and PT's invocation
+    # pattern). Main routing refactor (#13328) silently breaks the
+    # precomputed-topk path (router_logits=None), so for the post-refactor
+    # main snapshot this becomes a correctness fix, not a perf opt.
+    # NOTE: routing_bias is None — the linear-layer bias was already added
+    # in F.linear above. The kernel's routing_bias arg is a separate
+    # per-expert bias term that gpt-oss does not have.
     result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
-        None,  # routing_logits (using pre-computed topk)
-        None,  # routing_bias
+        router_logits,  # routing_logits — raw, no dtype cast
+        None,  # routing_bias — already folded into router_logits via F.linear
         x2d,  # hidden_states (bf16)
         fc1_weights_mxfp4,  # gemm1_weights
         fc1_weights_scale_ue8m0,  # gemm1_weights_scale
@@ -1440,8 +1443,7 @@ def trtllm_mxfp4_w4a16_moe_fused(
         None,  # routed_scaling_factor
         routing_method_type,
         0,  # act_type = SwiGlu
-        topk_weights=topk_weights.to(torch.bfloat16),
-        topk_ids=topk_ids.to(torch.int32),
+        # topk_weights/topk_ids omitted — kernel routes from router_logits.
     )
     if result.shape[-1] > valid_hidden_size:
         result = result[..., :valid_hidden_size].contiguous()
