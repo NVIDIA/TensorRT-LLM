@@ -24,17 +24,21 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import transformers
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
 from utils.util import (skip_blackwell, skip_num_gpus_less_than,
                         skip_pre_blackwell)
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import mapping as mapping_lib
+from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention.backends.trtllm import \
     TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.models.modeling_speculative import Eagle3DecoderLayer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor._util import (
     _derive_draft_max_attention_window,
@@ -620,6 +624,59 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
     if mock_draft_manager is not None:
         draft_kwargs = mock_draft_manager.copy_batch_block_offsets.call_args.kwargs
         assert draft_kwargs["max_blocks"] is None
+
+
+@pytest.mark.parametrize("sliding_window", [None, 64])
+def test_eagle3_sliding_window_wiring(sliding_window):
+    """Verify Eagle3 forwards ``config.sliding_window`` to Attention as
+    ``attention_window_size``.
+
+    The Eagle3 SWA wiring lives in two places in
+    ``tensorrt_llm/_torch/models/modeling_speculative.py``:
+
+    1. ``Eagle3Attention.__init__`` reads ``sliding_window`` from the
+       pretrained config and stores it on the module.
+    2. ``Eagle3DecoderLayer.__init__`` copies it into ``self._attn_kwargs``
+       so it is forwarded as ``attention_window_size`` via ``**kwargs`` to
+       ``self.self_attn(...)`` on every forward.
+
+    This is a focused unit test (no GPU / no model weights). It mirrors
+    ``test_mistral_attention_swa_wiring`` in
+    ``tests/unittest/_torch/modeling/test_modeling_mistral.py``.
+    """
+    config = transformers.LlamaConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=256,
+        max_position_embeddings=2048,
+        rms_norm_eps=1e-5,
+        attention_bias=False,
+        sliding_window=sliding_window,
+    )
+    config.torch_dtype = torch.bfloat16
+
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+        skip_create_weights_in_init=True,
+    )
+
+    layer = Eagle3DecoderLayer(mc,
+                               layer_idx=0,
+                               is_first_layer=True,
+                               use_mla=False)
+
+    # (1) Eagle3Attention picks up sliding_window from the pretrained config.
+    assert layer.self_attn.sliding_window == sliding_window
+
+    # (2) Eagle3DecoderLayer only injects attention_window_size when it is set,
+    # otherwise the kwargs dict is empty so the parent Attention.forward
+    # receives its default (None).
+    expected_kwargs = ({
+        "attention_window_size": sliding_window
+    } if sliding_window is not None else {})
+    assert layer._attn_kwargs == expected_kwargs
 
 
 @pytest.mark.parametrize(
