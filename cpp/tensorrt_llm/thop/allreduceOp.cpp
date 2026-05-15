@@ -1090,7 +1090,7 @@ private:
             return info;
         }
 
-        // Check NVLink links are active (similar to Python support_nvlink(True))
+        // Check NVLink links are active (similar to Python support_nvlink(device_id, True))
         unsigned int activeLinks = 0;
         unsigned int availableLinks = 0;
 
