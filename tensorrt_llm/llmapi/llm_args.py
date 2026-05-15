@@ -2002,6 +2002,17 @@ class ExecutorMemoryType(StrEnum):
     MODEL_WEIGHTS_DRAFT = "draft_model_weights"
 
 
+@dataclass
+class _SleepConfigDefaultFactory:
+    """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict.
+    """
+
+    default_mode: Any
+
+    def __call__(self) -> Any:
+        return self.default_mode
+
+
 class SleepConfig(StrictBaseModel):
     """Configuration for the LLM sleep/wakeup feature.
     """
@@ -2074,7 +2085,8 @@ class SleepConfig(StrictBaseModel):
             cls._normalize_restore_mode(value)
             for key, value in cases.items()
         }
-        return defaultdict(lambda: default_mode, normalized_cases)
+        factory = _SleepConfigDefaultFactory(default_mode)
+        return defaultdict(factory, normalized_cases)
 
     @field_validator('restore_modes', mode='plain')
     @classmethod
