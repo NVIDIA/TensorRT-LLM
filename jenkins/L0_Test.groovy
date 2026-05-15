@@ -2887,8 +2887,8 @@ def periodicUploadProgress(stageName, sentinelPath, intervalSec = PROGRESS_UPLOA
                 echo "[PROGRESS-UPLOAD] ${stageName}: uploaded checkpoint (mtime=${mtime})"
             } catch (InterruptedException ie) {
                 throw ie
-            } catch (Exception ue) {
-                echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal): ${ue.message}"
+            } catch (Exception ex) {
+                echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal): ${ex.message}"
             }
         }
         echo "[PROGRESS-UPLOAD] ${stageName}: pytest done, watcher exiting"
@@ -2950,8 +2950,8 @@ def periodicUploadProgressSlurm(pipeline, Map remote, String jobUID, String stag
                 echo "[PROGRESS-UPLOAD] ${stageName}: uploaded sbatch checkpoint (mtime=${mtime})"
             } catch (InterruptedException ie) {
                 throw ie
-            } catch (Exception ue) {
-                echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal): ${ue.message}"
+            } catch (Exception ex) {
+                echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal): ${ex.message}"
             }
         }
         echo "[PROGRESS-UPLOAD] ${stageName}: track done, watcher exiting"
