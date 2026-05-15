@@ -304,7 +304,13 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             if tid is not None:
                 ids.append(int(tid))
         if not ids:
-            return super().get_mm_token_ids()
+            raise RuntimeError(
+                "Gemma4 config missing image_token_id/audio_token_id/video_token_id "
+                "at the top level. Falling back to the base-class "
+                "`input_ids >= vocab_size` heuristic would mark zero MM positions "
+                "(soft-token IDs live inside text_config.vocab_size), silently "
+                "dropping every MM embedding row in chunked prefill."
+            )
         return torch.tensor(ids, dtype=torch.int32)
 
     def get_num_tokens_per_audio(self, *, audio, **kwargs) -> int:
