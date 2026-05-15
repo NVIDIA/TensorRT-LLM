@@ -1565,3 +1565,23 @@ class VideoJobList(OpenAIBaseModel):
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
 UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
+
+
+class StartProfileRequest(OpenAIBaseModel):
+    """Request body for the POST /start_profile endpoint."""
+    output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory where chrome traces are written. Defaults "
+        "to the TLLM_TORCH_PROFILER_DIR environment variable, "
+        "then /tmp.")
+    num_steps: Optional[int] = Field(
+        default=None,
+        description="Number of iterations to profile. If omitted, "
+        "profiling runs until /stop_profile is called.")
+    start_step: int = Field(
+        default=0,
+        description="Skip this many iterations before profiling begins.")
+    activities: List[str] = Field(
+        default_factory=lambda: ["CPU", "GPU"],
+        description="Which activities to trace. Supported values: "
+        "'CPU', 'GPU', 'CUDA_PROFILER'.")

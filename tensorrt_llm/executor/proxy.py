@@ -36,7 +36,8 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+                      StopProfileRequest)
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
@@ -289,6 +290,15 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._resource_governor_queue = IpcQueue(
             is_server=True, name="proxy_resource_governor_queue"
         ) if self._enable_resource_governor else None
+        # Worker -> proxy ack channel for synchronous control requests
+        # (start_profile / stop_profile). Worker pushes a tuple
+        # ``(kind, error_msg)`` after it has finished processing the
+        # corresponding request; ``error_msg`` is non-None when
+        # ``PyExecutor`` rejected the call (e.g. RequestError "already
+        # in progress") so the proxy can re-raise. PAIR socket is fine
+        # because the worker leader is the sole producer.
+        self.profile_ack_queue = IpcQueue(is_server=True,
+                                          name="proxy_profile_ack_queue")
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
@@ -296,6 +306,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             result_queue_addr=self.result_queue.address,
             resource_governor_queue_addr=self._resource_governor_queue.address
             if self._resource_governor_queue is not None else None,
+            profile_ack_queue_addr=self.profile_ack_queue.address,
         )
 
     @property
@@ -312,6 +323,75 @@ class GenerationExecutorProxy(GenerationExecutor):
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
         self.request_queue.put(CancellingRequest(request_id))
+
+    # Per-call timeouts for the synchronous worker round-trip. The stop
+    # path can take up to 30s because PyExecutor.stop_profile itself
+    # polls ``_profile_enabled`` for that long while the executor loop
+    # flushes the chrome trace; we add a small safety margin.
+    _START_PROFILE_ACK_TIMEOUT_S = 60.0
+    _STOP_PROFILE_ACK_TIMEOUT_S = 35.0
+
+    def _wait_profile_ack(self, expected_kind: str, timeout: float) -> None:
+        """Block on the worker's ack queue for a profile control request.
+
+        Waits for the worker to push an ack on ``profile_ack_queue``
+        matching ``expected_kind`` ("start" or "stop"), or until
+        ``timeout`` elapses.
+
+        If the worker reports a rejection (non-empty error message),
+        re-raise as ``RuntimeError`` so the HTTP layer can map "already
+        in progress" / "pending" to 409. On timeout we log a warning
+        and return — the chrome trace may still be flushing on the
+        backend, but blocking the FastAPI event loop indefinitely is
+        worse than a possibly-stale 200.
+        """
+        try:
+            ack = self.profile_ack_queue.get(timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"{expected_kind}_profile: timed out waiting for worker "
+                f"ack after {timeout:.1f}s ({e}). The chrome trace may "
+                "not be on disk yet.")
+            return
+        kind, error_msg = ack
+        if kind != expected_kind:
+            # Out-of-order ack from a previous call; log and ignore.
+            logger.warning(
+                f"profile ack kind mismatch (expected {expected_kind!r}, "
+                f"got {kind!r}); proceeding anyway.")
+        if error_msg:
+            raise RuntimeError(error_msg)
+
+    def start_profile(self,
+                      output_dir=None,
+                      num_steps=None,
+                      start_step: int = 0,
+                      activities=None) -> None:
+        """Forward runtime profiling start to the IPC worker process.
+
+        Blocks until the worker has processed the request, then
+        raises ``RuntimeError`` if ``PyExecutor`` rejected the start
+        (e.g. a profile window is already active or pending) so the
+        HTTP /start_profile endpoint can return 409.
+        """
+        self.request_queue.put(
+            StartProfileRequest(output_dir=output_dir,
+                                num_steps=num_steps,
+                                start_step=start_step,
+                                activities=activities))
+        self._wait_profile_ack("start", self._START_PROFILE_ACK_TIMEOUT_S)
+
+    def stop_profile(self) -> None:
+        """Forward runtime profiling stop to the IPC worker process.
+
+        Blocks until the worker has finished flushing the chrome
+        trace. This makes the IPC-proxy path match the in-process and
+        RPC-proxy paths: by the time this method returns the trace
+        file is on disk, so HTTP callers can reliably read it
+        immediately after /stop_profile returns 200.
+        """
+        self.request_queue.put(StopProfileRequest())
+        self._wait_profile_ack("stop", self._STOP_PROFILE_ACK_TIMEOUT_S)
 
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
@@ -529,10 +609,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult
-            which can be waited.
-            Forwards the request to the workers through the request queue.
+        """Low-level API to the executor.
+
+        Returns a "future" GenerationResult which can be waited.
+        Forwards the request to the workers through the request queue.
         """
 
         self._start_dispatch_threads()

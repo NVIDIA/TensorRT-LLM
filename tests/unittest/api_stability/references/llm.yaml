@@ -405,6 +405,26 @@ methods:
     parameters: {}
     return_annotation: None
     status: beta
+  start_profile:
+    parameters:
+      output_dir:
+        annotation: Optional[str]
+        default: null
+      num_steps:
+        annotation: Optional[int]
+        default: null
+      start_step:
+        annotation: int
+        default: 0
+      activities:
+        annotation: Optional[List[str]]
+        default: null
+    return_annotation: None
+    status: prototype
+  stop_profile:
+    parameters: {}
+    return_annotation: None
+    status: prototype
 properties:
   llm_id:
     annotation: str

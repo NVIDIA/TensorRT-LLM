@@ -196,6 +196,89 @@ $$
 
 To get more detailed metrics besides the key metrics above, there is an [experimental tool](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/serve/scripts/time_breakdown) for request time breakdown.
 
+## Profile a server with HTTP API endpoints
+
+> **Beta.** PyTorch backend only. No-op on the TensorRT backend.
+
+`trtllm-serve` exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime — no restart and no env vars required:
+
+* `POST /start_profile` — start a window, optionally bounded by `num_steps`.
+* `POST /stop_profile` — flush the window. Only needed if `/start_profile` was called without `num_steps`.
+
+Under TP/PP > 1 both endpoints broadcast to every rank, so each rank writes its own chrome trace with a matching `profile_id` and a `rank-<N>` suffix. Unlike a synthetic warmup request, the underlying wake mechanism does **not** run a forward pass, so the captured trace contains only real workload events.
+
+For the full request body schema and response codes (including the `409` for double-start), see [Runtime Profiling Endpoints](./trtllm-serve.rst#runtime-profiling-endpoints).
+
+### Typical workflow: capture steady-state decode
+
+1. **Start the server** as usual (e.g. `trtllm-serve $MODEL --tp_size 2 ...`). The endpoints are registered automatically.
+2. **Warm up and ramp to steady state** — send enough concurrent requests that the engine is consistently at or near `max_batch_size`. A short burst from `benchmark_serving.py` works well:
+
+   ```bash
+   python -m tensorrt_llm.serve.scripts.benchmark_serving \
+       --model $MODEL --host 127.0.0.1 --port 8000 \
+       --dataset-name random --num-prompts 200 \
+       --random-input-len 512 --random-output-len 128 \
+       --max-concurrency 32 &
+   ```
+
+3. **Fire `/start_profile`** once the server is in steady state. Bound the window so you don't need to call `/stop_profile`:
+
+   ```bash
+   curl -s -X POST http://127.0.0.1:8000/start_profile \
+       -H "Content-Type: application/json" \
+       -d '{"output_dir": "/tmp/traces", "num_steps": 50, "start_step": 0}'
+   # {"message":"Profiling started"}
+   ```
+
+4. **Wait for the load to finish**, then list the traces:
+
+   ```bash
+   wait
+   ls /tmp/traces/
+   # trtllm-trace-1778480665-7993d824-rank-0.json
+   # trtllm-trace-1778480665-7993d824-rank-1.json   (TP=2)
+   ```
+
+5. **Open the traces** in [ui.perfetto.dev](https://ui.perfetto.dev/) or `chrome://tracing`. Each captured iteration is wrapped in an sglang-compatible `step[EXTEND bs=N toks=M]` / `step[DECODE bs=N]` scope.
+
+### Open-ended window (manual stop)
+
+Omit `num_steps` if you want to profile "from now until I say stop". You must call `/stop_profile` to flush the trace:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/start_profile \
+    -H "Content-Type: application/json" \
+    -d '{"output_dir": "/tmp/traces"}'
+
+# ... drive load ...
+
+curl -s -X POST http://127.0.0.1:8000/stop_profile
+# {"message":"Profiling stopped"}   (returns only after the trace is on disk)
+```
+
+### Compose with `nsys profile`
+
+Set `activities` to `["CUDA_PROFILER"]` to suppress `torch.profiler` entirely so only `cudaProfilerStart`/`cudaProfilerStop` brackets fire. This composes cleanly with `nsys profile -c cudaProfilerApi`:
+
+```bash
+nsys profile -c cudaProfilerApi -o trtllm_serve \
+    trtllm-serve $MODEL --tp_size 2 ...
+
+# In another terminal:
+curl -s -X POST http://127.0.0.1:8000/start_profile \
+    -H "Content-Type: application/json" \
+    -d '{"activities": ["CUDA_PROFILER"], "num_steps": 100}'
+```
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+| --- | --- |
+| `/start_profile` returns **409** | A profile window is already active or pending. Call `/stop_profile` first or wait for `num_steps` to elapse. |
+| `/stop_profile` returns 200 but takes up to ~30 s | The engine was idle and the wake had to cycle the executor loop to reach the flush point. Send any small completion to keep the loop warm, or pass `num_steps` so the engine self-terminates. |
+| Trace file missing on non-zero ranks | The engine is not running the PyTorch backend, or you built the server with `--disable-overlap-scheduler` against an older code path that lacks the broadcast plumbing. Verify with `POST /version` and with the server log line `_apply_profile_start_config[rank=N]:` appearing on every rank when `TLLM_LOG_LEVEL=info`. |
+
 ## About `--config`
 
 ```{eval-rst}
