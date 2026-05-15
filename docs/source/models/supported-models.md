@@ -18,7 +18,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^6]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
-| `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-120b`                        |
+| `GptOssForCausalLM` [^12]            | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
@@ -68,6 +68,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^9]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/minimax_m2.7.yaml).
 [^10]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
 [^11]: Audio modality only supported on E2B/E4B variants.
+[^12]: Also supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend (native PyTorch backend support is unchanged). See AD configs for [20B](../../../examples/auto_deploy/model_registry/configs/gpt_oss_20b.yaml) and [120B](../../../examples/auto_deploy/model_registry/configs/gpt_oss_120b.yaml).
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)

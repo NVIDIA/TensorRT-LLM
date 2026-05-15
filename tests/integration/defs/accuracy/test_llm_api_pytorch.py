@@ -187,6 +187,54 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                             ids=["no_dynamic_tree", "dynamic_tree"])
+    def test_eagle3_rejection_dynamic_tree_smoke(self, use_dynamic_tree,
+                                                 mocker):
+        """Smoke-test one-model Eagle3 rejection sampling with both tree modes."""
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 128)
+
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
+        spec_config_kwargs = dict(
+            max_draft_len=4,
+            speculative_model=eagle_model_dir,
+            eagle3_one_model=True,
+            allow_advanced_sampling=True,
+            use_rejection_sampling=True,
+        )
+        max_batch_size = 1
+        if use_dynamic_tree:
+            spec_config_kwargs.update(
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=4,
+                max_total_draft_tokens=16,
+            )
+
+        llm = LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            attn_backend="TRTLLM",
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                          dtype="auto"),
+            max_seq_len=4096,
+            max_batch_size=max_batch_size,
+            speculative_config=Eagle3DecodingConfig(**spec_config_kwargs),
+        )
+
+        with llm:
+            task = GSM8K(self.MODEL_NAME)
+            sampling_params = SamplingParams(temperature=1.0,
+                                             top_p=1.0,
+                                             max_tokens=128,
+                                             truncate_prompt_tokens=2048)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True),
+                          is_integration_test=True)
+
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
@@ -1714,7 +1762,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                        cuda_graph, overlap_scheduler,
                                        enable_chunked_prefill):
         scheduler_config = SchedulerConfig(use_python_scheduler=True)
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -3354,7 +3402,10 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+            # MTP layers consume extra memory; reduce KV cache fraction to
+            # avoid OOM during forward pass on Blackwell (NVBug 5955792).
+            fraction = 0.55 if mtp_nextn > 0 else 0.6
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=fraction)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
@@ -3537,29 +3588,55 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,indexer_k_fp4",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,indexer_k_fp4,use_cute_dsl",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False, False),
-            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False, False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True, False),
-            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False, False),
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, True),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False, False,
+             False),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False, False,
+             False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True, False,
+             False),
+            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False, False,
+             False),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, True,
+             False),
+            # DSL FP4 indexer paged path — exercises the CuTe DSL kernel.
+            # next_n in {1,2,3} go through the direct path; mtp_nextn=3
+            # (next_n=4) triggers the caller-side atom-split (factor=2,
+            # eff_next_n=2). All four cases together cover the full DSL FP4
+            # decode plumbing (`_pick_fp4_dsl_expand`, `expand_for_dsl_fp4`,
+            # the FP4 branch in sparse_attn_indexer).
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
+            (8, 1, 8, 2, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
+            (8, 1, 8, 3, False, True, True, True, 24, "CUTLASS", False, True,
+             True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "disable_skip_indexer", "baseline_pp4_mtp1", "fp4_indexer"
+            "disable_skip_indexer", "baseline_pp4_mtp1", "fp4_indexer",
+            "fp4_indexer_dsl_mtp0", "fp4_indexer_dsl_mtp1",
+            "fp4_indexer_dsl_mtp2", "fp4_indexer_dsl_mtp3"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
                               max_batch_size, moe_backend, disable_skip_indexer,
-                              indexer_k_fp4):
+                              indexer_k_fp4, use_cute_dsl):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
         if indexer_k_fp4 and sm_version < 100:
             pytest.skip("indexer_k_dtype='fp4' requires SM>=100 (Blackwell)")
+        if use_cute_dsl and sm_version not in (100, 103):
+            pytest.skip("use_cute_dsl_paged_mqa_logits requires SM 100/103 "
+                        "(CuTe DSL FP4 paged MQA logits kernel target)")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
@@ -3584,6 +3661,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             # and index_head_dim==128; index_head_dim is filled in by
             # ModelConfig.from_pretrained so we only need to set the dtype.
             dsa_kwargs["indexer_k_dtype"] = "fp4"
+        if use_cute_dsl:
+            # Routes the indexer paged MQA logits decode through the
+            # CuTe DSL kernel (torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits
+            # when use_fp4, else torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits).
+            dsa_kwargs["use_cute_dsl_paged_mqa_logits"] = True
         dsa_config = (DeepSeekSparseAttentionConfig(
             **dsa_kwargs) if dsa_kwargs else None)
 
@@ -6235,6 +6317,22 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                  max_batch_size=128,
                  kv_cache_config=self.kv_cache_config,
                  cuda_graph_config=self.cuda_graph_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    def test_dflash(self):
+        target_model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+        dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
+        spec_config = DFlashDecodingConfig(max_draft_len=4,
+                                           speculative_model=dflash_model_path)
+        with LLM(target_model_path,
+                 max_seq_len=4096,
+                 max_batch_size=8,
+                 kv_cache_config=self.kv_cache_config,
+                 cuda_graph_config=self.cuda_graph_config,
+                 speculative_config=spec_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)

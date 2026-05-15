@@ -72,17 +72,31 @@ def bypass_processor_output_validation():
     argument 'video_grid_thw'`` even when no caller passes such keys.
 
     Patches ``validate_typed_dict`` in *all* transformers modules that bind
-    it (``processing_utils``, ``image_processing_utils_fast``,
-    ``video_processing_utils``) — each has its own ``from
-    huggingface_hub.dataclasses import validate_typed_dict``, so patching
-    only one is insufficient to cover sub-processor validation paths. The
-    originals are restored on exit.
+    it — each module has its own ``from huggingface_hub.dataclasses import
+    validate_typed_dict``, so patching only one is insufficient to cover
+    sub-processor validation paths. The set of binder modules differs
+    across transformers versions (5.3.x re-binds it on
+    ``image_processing_utils_fast``; 5.5.x dropped that module and re-binds
+    it on ``image_processing_utils`` instead), so we discover the binders
+    by ``hasattr`` rather than hard-coding the list. The originals are
+    restored on exit.
     """
-    import transformers.image_processing_utils_fast as _ipuf
     import transformers.processing_utils as _pu
     import transformers.video_processing_utils as _vpu
 
-    binders = (_pu, _ipuf, _vpu)
+    _candidate_binders = [_pu, _vpu]
+    for _name in ("transformers.image_processing_utils",
+                  "transformers.image_processing_utils_fast"):
+        try:
+            _candidate_binders.append(__import__(_name, fromlist=[""]))
+        except ImportError:
+            pass
+    binders = tuple(b for b in _candidate_binders
+                    if hasattr(b, "validate_typed_dict"))
+    if not binders:
+        raise RuntimeError(
+            "No transformers module exposes validate_typed_dict; "
+            "cannot patch processor output validation.")
     originals = {b: b.validate_typed_dict for b in binders}
     base_orig = next(iter(originals.values()))
 

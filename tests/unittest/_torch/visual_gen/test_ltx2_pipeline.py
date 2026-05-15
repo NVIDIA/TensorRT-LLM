@@ -11,6 +11,7 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 """
 
 import gc
+import json
 import os
 
 import pytest
@@ -19,7 +20,14 @@ import torch.nn.functional as F
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, PipelineComponent, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    CacheDiTConfig,
+    DiffusionModelConfig,
+    PipelineComponent,
+    VisualGenArgs,
+)
+from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
@@ -46,6 +54,17 @@ SKIP_COMPONENTS = [
     PipelineComponent.VAE,
     PipelineComponent.SCHEDULER,
 ]
+
+
+def _write_minimal_ltx2_diffusers_checkpoint(tmp_path):
+    checkpoint_path = tmp_path / "ltx2"
+    transformer_path = checkpoint_path / "transformer"
+    transformer_path.mkdir(parents=True)
+    (checkpoint_path / "model_index.json").write_text(
+        json.dumps({"transformer": ["tensorrt_llm", "LTX2Transformer"]})
+    )
+    (transformer_path / "config.json").write_text(json.dumps({"_class_name": "LTX2"}))
+    return checkpoint_path
 
 
 def _get_ltx2_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -714,8 +733,9 @@ class TestTwoStageLoRAFileLoading:
 class TestTwoStagePipelineVariantResolution:
     """Test that LTX2Pipeline.resolve_variant selects the correct class."""
 
-    def test_resolve_variant_returns_two_stage_when_configured(self):
+    def test_resolve_variant_returns_two_stage_when_configured(self, monkeypatch):
         """When both upsampler and LoRA paths are set, resolve_variant returns TwoStages."""
+        monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
         from unittest.mock import MagicMock
 
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
@@ -724,6 +744,7 @@ class TestTwoStagePipelineVariantResolution:
         )
 
         config = MagicMock()
+        config.pretrained_config._name_or_path = ""
         config.extra_attrs = {
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
@@ -732,6 +753,23 @@ class TestTwoStagePipelineVariantResolution:
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2TwoStagesPipeline
 
+    def test_resolve_variant_honors_force_one_stage_env(self, monkeypatch):
+        """The env knob should prevent promotion even when two-stage paths exist."""
+        from unittest.mock import MagicMock
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
+        config = MagicMock()
+        config.pretrained_config._name_or_path = ""
+        config.extra_attrs = {
+            "spatial_upsampler_path": "/fake/upsampler.safetensors",
+            "distilled_lora_path": "/fake/lora.safetensors",
+        }
+
+        result = LTX2Pipeline.resolve_variant(config)
+        assert result is LTX2Pipeline
+
     def test_resolve_variant_returns_base_without_two_stage_config(self):
         """Without upsampler/LoRA paths, resolve_variant returns base LTX2Pipeline."""
         from unittest.mock import MagicMock
@@ -739,6 +777,7 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
+        config.pretrained_config._name_or_path = ""
         config.extra_attrs = {}
 
         result = LTX2Pipeline.resolve_variant(config)
@@ -751,10 +790,92 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
+        config.pretrained_config._name_or_path = ""
         config.extra_attrs = {"spatial_upsampler_path": "/fake/upsampler.safetensors"}
 
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2Pipeline
+
+
+class TestLTX2ForceOneStageEnv:
+    """Test force-one-stage env-var behavior during LTX2 variant selection."""
+
+    def test_two_stage_auxiliary_paths_are_discovered_by_default(self, tmp_path, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            LTX2TwoStagesPipeline,
+        )
+
+        monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
+        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors"
+        upsampler_path.touch()
+        lora_path.touch()
+
+        args = VisualGenArgs(checkpoint_path=str(checkpoint_path))
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert LTX2Pipeline.resolve_variant(config) is LTX2TwoStagesPipeline
+        assert config.extra_attrs["spatial_upsampler_path"] == str(upsampler_path)
+        assert config.extra_attrs["distilled_lora_path"] == str(lora_path)
+
+    def test_force_one_stage_env_skips_auto_discovery(self, tmp_path, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
+        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors"
+        upsampler_path.touch()
+        lora_path.touch()
+
+        args = VisualGenArgs(checkpoint_path=str(checkpoint_path))
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
+        assert "spatial_upsampler_path" not in config.extra_attrs
+        assert "distilled_lora_path" not in config.extra_attrs
+
+    def test_force_one_stage_env_prevents_promotion_with_explicit_auxiliary_paths(
+        self, tmp_path, monkeypatch
+    ):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
+        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+
+        args = VisualGenArgs(
+            checkpoint_path=str(checkpoint_path),
+            spatial_upsampler_path="/fake/upsampler.safetensors",
+            distilled_lora_path="/fake/lora.safetensors",
+        )
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"
+        assert config.extra_attrs["distilled_lora_path"] == "/fake/lora.safetensors"
+        assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
+
+    def test_cache_dit_config_prevents_promotion_with_explicit_auxiliary_paths(
+        self, tmp_path, monkeypatch
+    ):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
+        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+
+        args = VisualGenArgs(
+            checkpoint_path=str(checkpoint_path),
+            cache=CacheDiTConfig(),
+            spatial_upsampler_path="/fake/upsampler.safetensors",
+            distilled_lora_path="/fake/lora.safetensors",
+        )
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert config.cache_backend == "cache_dit"
+        assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"
+        assert config.extra_attrs["distilled_lora_path"] == "/fake/lora.safetensors"
+        assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
 
 
 class TestTwoStageUpsamplerBuildingBlocks:

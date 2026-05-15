@@ -458,6 +458,22 @@ def load_pretrained_config(model_name_or_path: str,
                             )):
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
+    elif (model_type == "exaone4" and config_dict.get("sliding_window") is None
+          and config_dict.get("layer_types") is None):
+        # transformers 5.5.x Exaone4Config.__post_init__ first forces
+        # `sliding_window_pattern = 0` when `sliding_window is None`, then
+        # synthesizes `layer_types` via `(i + 1) % sliding_window_pattern`,
+        # which raises ZeroDivisionError. The released EXAONE-4.0 ckpts
+        # publish both fields as `null`. Inject layer_types directly into
+        # the config dict (all full attention, since sliding_window is null
+        # means no sliding) and bypass AutoConfig.from_pretrained's kwargs
+        # filtering by going through CONFIG_MAPPING + from_dict.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        n_layers = config_dict.get("num_hidden_layers") or 32
+        patched_dict = {
+            **config_dict, "layer_types": ["full_attention"] * n_layers
+        }
+        model_config = CONFIG_MAPPING[model_type].from_dict(patched_dict)
     else:
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)

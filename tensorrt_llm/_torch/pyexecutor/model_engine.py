@@ -561,6 +561,13 @@ class PyTorchModelEngine(ModelEngine):
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
 
+        # Upper bound on the per-rank token count used for warmup forward passes
+        # (both the max-shape general warmup and the autotuner warmup). Each
+        # tunable op currently generates tuning buckets only up to 8192 (see
+        # MAX_PROFILE_BUCKET in trtllm_gen_custom_ops.py and related files), so
+        # warmup shapes larger than this do not improve tuning quality.
+        self.max_warmup_tokens = 8192
+
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
@@ -741,7 +748,8 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
+                                    self.batch_size * (self.max_seq_len - 1),
+                                    self.max_warmup_tokens)
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -890,7 +898,8 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
+                                    self.batch_size * (self.max_seq_len - 1),
+                                    self.max_warmup_tokens)
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -1638,8 +1647,14 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] += (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
@@ -1679,8 +1694,14 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] -= (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
@@ -2970,9 +2991,8 @@ class PyTorchModelEngine(ModelEngine):
                     )
                 if segment.shape[0] != 3 and segment.shape[-1] == 3:
                     logger.warning(
-                        "Transposing unexpected mrope_position_ids shape from %s",
-                        tuple(segment.shape),
-                    )
+                        "Transposing unexpected mrope_position_ids shape from "
+                        f"{tuple(segment.shape)}")
                     segment = segment.transpose(0, 2).contiguous()
                 if segment.shape[:2] != (3, 1):
                     raise RuntimeError(

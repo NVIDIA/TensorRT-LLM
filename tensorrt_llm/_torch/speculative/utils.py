@@ -40,6 +40,9 @@ def get_spec_metadata(spec_config,
                       spec_resource_manager=None,
                       is_draft_model=False,
                       max_seq_len=262144):
+    use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
+                                     False)
+    vocab_size = getattr(model_config, "vocab_size", 0)
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -95,6 +98,8 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=spec_config.use_dynamic_tree,
             eagle_choices=spec_config.eagle_choices,

@@ -43,6 +43,7 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
+LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.02-py3"
@@ -104,70 +105,15 @@ REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"
 // GPU types that don't support dynamic driver flashing
 REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
-// Infrastructure failure patterns that warrant automatic Slurm job retry.
-// Matched case-insensitively against exception toString() messages (including cause chain).
-SLURM_INFRA_FAILURE_PATTERNS = [
-    // Jenkins remoting channel failures
-    "channel is closing down or has closed down",
-    "ChannelClosedException",
-    "ClosedChannelException",
-    "RequestAbortedException",
-    "Connection was broken",
-    "marked offline",
-    // Jenkins agent startup failures (durable-task plugin)
-    "process apparently never started",
-    "wrapper script does not seem to be touching the log file",
-    // Slurm job externally killed (from SlurmConfig.checkJobStatus)
-    "job is no longer active",
-    // Network/SSH failures (also in SLURM_INFRA_SINGLE_RETRY_PATTERNS for retry cap)
-    "No route to host",
-    "Permission denied, please try again",
-    // K8s pod eviction (matches "Reason: Evicted" from kubelet message)
-    "Reason: Evicted",
-]
-
-// Patterns that should retry at most once (not the full SLURM_INFRA_RETRY_MAX).
-// These may indicate persistent problems where multiple retries waste resources.
-// NOTE: Entries here must also appear in SLURM_INFRA_FAILURE_PATTERNS to be
-// detected as infrastructure failures in the first place.
-SLURM_INFRA_SINGLE_RETRY_PATTERNS = [
-    "CANCELLED",
-    "DUE TO TIME LIMIT",
-    "Permission denied, please try again",
-]
-
-// Maximum number of retries for infrastructure failures (total attempts = SLURM_INFRA_RETRY_MAX + 1)
+// Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
+// Recognised failure patterns are tagged with scope=SLURM or BOTH in the
+// shared-lib PATTERN_CATALOG.
 SLURM_INFRA_RETRY_MAX = 2
 
-// Infrastructure failure patterns specific to K8s test pods (the path that does
-// not go through SLURM). Passed as `extraInfraPatterns` to classifyInfraFailure
-// from the runLLMTestlistOnPlatform retry loop. SLURM_INFRA_FAILURE_PATTERNS
-// already covers shared symptoms (ChannelClosedException, marked offline,
-// Reason: Evicted, etc.) and is always checked first.
-K8S_INFRA_FAILURE_PATTERNS = [
-    // Image pull / pod startup
-    "ImagePullBackOff",
-    "ErrImagePull",
-    // Container runtime hiccups
-    "OCI runtime exec failed",
-    // Pod / node lifecycle
-    "OOMKilled",
-    "node status is not ready",
-    // JNLP agent disconnect (trailing space narrows the match)
-    "Cannot contact ",
-    // JNLP / HTTP-handshake transient (broad string -- single-retry-only below)
-    "Connection failed",
-]
-
-// K8s patterns capped at a single retry. Mirrors the SLURM list's caveat:
-// every entry here must also appear in K8S_INFRA_FAILURE_PATTERNS.
-K8S_INFRA_SINGLE_RETRY_PATTERNS = [
-    "OOMKilled",        // resource shortage; multi-retry rarely helps
-    "Connection failed", // short string; cap to bound false-positive cost
-]
-
+// Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
-// independently as production telemetry comes in.
+// independently as production telemetry comes in. Patterns tagged scope=K8S
+// or BOTH in the shared-lib PATTERN_CATALOG.
 K8S_INFRA_RETRY_MAX = 2
 
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
@@ -186,61 +132,6 @@ ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
-
-/**
- * Checks if an exception represents a transient infrastructure failure
- * that warrants retrying.
- *
- * Walks the exception cause chain to catch wrapped exceptions (e.g.,
- * AbortException wrapping ChannelClosedException).
- *
- * Callers may pass additional pattern lists (e.g., K8S_INFRA_FAILURE_PATTERNS)
- * to extend classification for path-specific symptoms without disturbing the
- * SLURM defaults.
- *
- * @param ex The caught exception
- * @param extraInfraPatterns Additional patterns appended to the infra-failure list
- * @param extraSingleRetryPatterns Additional patterns appended to the single-retry list
- * @return A map with keys:
- *   - isInfraFailure (boolean): true if this is a retryable infra failure
- *   - isSingleRetryOnly (boolean): true if this pattern should only retry once
- *   - matchedPattern (String): the pattern that matched, for logging
- */
-def classifyInfraFailure(Exception ex, List extraInfraPatterns=[], List extraSingleRetryPatterns=[]) {
-    def result = [isInfraFailure: false, isSingleRetryOnly: false, matchedPattern: ""]
-
-    // Build the full exception text by walking the cause chain
-    def exceptionText = ""
-    def current = ex
-    while (current != null) {
-        exceptionText += " " + current.toString()
-        current = current.cause
-    }
-    def lowerText = exceptionText.toLowerCase()
-
-    // Check against infrastructure failure patterns (SLURM defaults + caller extras)
-    for (pattern in (SLURM_INFRA_FAILURE_PATTERNS + extraInfraPatterns)) {
-        if (lowerText.contains(pattern.toLowerCase())) {
-            result.isInfraFailure = true
-            result.matchedPattern = pattern
-            break
-        }
-    }
-
-    if (!result.isInfraFailure) {
-        return result
-    }
-
-    // Check if this is a single-retry-only pattern
-    for (pattern in (SLURM_INFRA_SINGLE_RETRY_PATTERNS + extraSingleRetryPatterns)) {
-        if (lowerText.contains(pattern.toLowerCase())) {
-            result.isSingleRetryOnly = true
-            break
-        }
-    }
-
-    return result
-}
 
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
@@ -761,9 +652,33 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // If the exception is about job being inactive, enrich it with log path
-                        if (e.message.contains("is no longer active")) {
-                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}")
+                        // If the exception is about job being inactive, throw a typed
+                        // InfraFailure(SLURM) so downstream consumers route via instanceof
+                        // rather than substring matching the catalog. The "<typed:..."
+                        // marker keeps the [INFRA-RETRY] log line distinguishable from
+                        // catalog-matched fallbacks.
+                        //
+                        // Critical for nested-retry correctness: the SLURM-scoped typed
+                        // throw is rejected by classify() at the OUTER K8s pod-launch
+                        // retry's scope guard (see classify() scope-mismatch branch).
+                        // That prevents the K8s outer from re-running a budget that the
+                        // inner SLURM retry already exhausted. End-to-end trace:
+                        //   1. SLURM job goes inactive while running.
+                        //   2. SlurmConfig.checkJobStatus() throws plain Exception with
+                        //      message "...is no longer active...".
+                        //   3. This catch wraps it as InfraFailure(TRANSIENT, SLURM).
+                        //   4. Inner runLLMTestlistOnSlurm retry catches, classifies via
+                        //      classify(scope=SLURM): instanceof InfraFailure with scope=SLURM
+                        //      passes through; consumer retries up to SLURM_INFRA_RETRY_MAX.
+                        //   5. If exhausted, the typed InfraFailure(SLURM) bubbles out of
+                        //      the inner SLURM retry into the outer K8s pod-launch retry.
+                        //   6. Outer classify(scope=K8S) sees typed InfraFailure with
+                        //      scope=SLURM != K8S, wraps as UserFailure -> outer rethrows
+                        //      without retry. No double-budget consumption.
+                        if (e.message?.contains("is no longer active")) {
+                            throw new InfraFailure(
+                                "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>")
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
@@ -861,7 +776,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(stageName, {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag)
         }, {
             // If the execution test list is null, remove the test result xml
             sh """
@@ -1116,7 +1031,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Add passed test list from previous pipeline run to the waives.txt
                 if (testFilter[(REUSE_TEST)] != false) {
-                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt")
+                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt", postTag)
                 }
 
                 Utils.copyFileToRemoteHost(
@@ -1316,7 +1231,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         --install-sh ${scriptInstallPathNode} \\
                         --script-prefix ${scriptLaunchPrefixPathLocal} \\
                         --srun-args ${scriptLaunchSrunArgsPathLocal} \\
-                        --split-group ${splitId}
+                        --split-group ${splitId} \\
+                        --stage-name ${stageName}
                     """
                 } else {
                     if(nodeCount > 1) {
@@ -2549,22 +2465,19 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    def testListCmd = testCmdLine.find { it.contains("--test-list=") }
+    def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
+    def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+    def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}'
+        --fail-signatures='${failSignaturesList}' \
+        ${testListArg} \
+        ${unfinishedTestArg}
     """
-
-    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
-    // fail the stage immediately without attempting any reruns
-    def rerunTestList = "${rerunDir}/rerun_0.txt"
-    if (fileExists(rerunTestList)) {
-        sh "cat ${rerunTestList}"
-        echo "There are some failed tests that cannot be rerun, skip the rerun step."
-        return true
-    }
 
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
@@ -2578,13 +2491,6 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
             validLineCount += count
         }
-    }
-    if (validLineCount > 5) {
-        echo "There are more than 5 failed ${testType} tests, skip the rerun step."
-        return true
-    } else if (validLineCount == 0) {
-        echo "No failed ${testType} tests need to be rerun, skip the rerun step."
-        return true
     }
 
     // Rerun tests
@@ -2782,23 +2688,110 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
     }
 }
 
-def reusePassedTestResults(llmSrc, stageName, waivesTxt) {
+/**
+ * Append passes that previously succeeded for this commit + stage to the
+ * stage's waives.txt as SKIPs, so the upcoming pytest run skips them.
+ *
+ * Two sources are merged:
+ *
+ *  1. OpenSearch records of prior pipeline runs for the same commit and
+ *     stage (the historical mechanism). Populated only after a pipeline
+ *     completes -- has nothing to say about the current run.
+ *
+ *  2. Tarballs uploaded by earlier attempts of the *current* build, when
+ *     the infra-failure retry loop has fired. The current run's attempt 1
+ *     uploads its (partial) results before the retry kicks off; this
+ *     function downloads them and extracts passes via test_rerun.py's
+ *     extract_passed_tests mode. Closes the gap where a retry would
+ *     otherwise re-run every test that already passed pre-failure.
+ *
+ * @param llmSrc      Local TRT-LLM source root.
+ * @param stageName   Stage name; both the OpenSearch query key and the
+ *                    Artifactory artifact prefix (`results-${stageName}*`).
+ * @param waivesTxt   Path to the stage's waives.txt; passes are appended
+ *                    here with reason "SKIP (Reused from previous pipeline)".
+ * @param postTag     This attempt's full tar suffix (e.g. ""
+ *                    on attempt 1, "-attempt-2" on the first retry,
+ *                    "-SubJob-RunTest-attempt-2" for a retried sub-job).
+ *                    Used by priorAttemptTags() to enumerate earlier
+ *                    attempts in this build.
+ */
+def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
     try {
-        // Get passed test list from open search
-        def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
+        def reusedTests = []
+        def workDir = "${WORKSPACE}/${stageName}"
+        sh "mkdir -p ${workDir}"
+
+        // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
+        //    for this commit + stage.
+        def passedTestListFile = "${workDir}/passed_test_list.txt"
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
             --stage-name ${stageName} \
             --output-file ${passedTestListFile}
         """
+        if (fileExists(passedTestListFile)) {
+            reusedTests += readFile(file: passedTestListFile).readLines().collect { it.trim() }.findAll { it }
+        }
 
-        def passedTestList = readFile(file: passedTestListFile).readLines()
-        def reusedTests = passedTestList.collect { test -> test.trim() }
+        // 2. Prior-attempt recovery -- tests that PASSED in an earlier attempt
+        //    of THIS pipeline run before infra retry fired. Only runs if postTag
+        //    decodes as a retry attempt (matches "...-attempt-N").
+        def priorTags = priorAttemptTags(postTag)
+        if (!priorTags.isEmpty()) {
+            def priorXmls = []
+            priorTags.each { priorTag ->
+                def tarName = "results-${stageName}${priorTag}.tar.gz"
+                def tarUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${tarName}"
+                def priorDir = "${workDir}/prior${priorTag.replace('-', '_')}"
+                sh "mkdir -p ${priorDir}"
+                // Probe with HEAD so we can distinguish "this prior attempt never
+                // uploaded a tarball" (HTTP 404, expected when an attempt died
+                // before its finally block ran) from real errors (auth, 5xx,
+                // network). Only 404 is benign; anything else fails the build
+                // so silent skips don't mask a configuration regression.
+                def httpStatus = sh(returnStdout: true,
+                                    script: "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 '${tarUrl}'").trim()
+                if (httpStatus == '404') {
+                    echo "Prior attempt artifact ${tarName} not present (HTTP 404); skipping"
+                    return
+                }
+                if (httpStatus != '200') {
+                    error "Probing prior attempt artifact ${tarName} returned HTTP ${httpStatus} (expected 200 or 404)"
+                }
+                sh "cd ${priorDir} && wget -nv -nc '${tarUrl}'"
+                sh "cd ${priorDir} && tar -xzf ${tarName}"
+                // results.xml may live at ${stageName}/results.xml inside the
+                // tar, or at the tar's root depending on how it was packaged.
+                // Scan both.
+                def xmlFiles = sh(returnStdout: true,
+                                  script: "find ${priorDir} -maxdepth 4 -name 'results*.xml' 2>/dev/null | tr '\\n' ',' | sed 's/,\$//'").trim()
+                if (xmlFiles) {
+                    priorXmls += xmlFiles.split(',') as List
+                }
+            }
+            if (!priorXmls.isEmpty()) {
+                def priorPassedFile = "${workDir}/prior_attempt_passed.txt"
+                sh """
+                    python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
+                    extract_passed_tests \
+                    --output-file ${priorPassedFile} \
+                    --input-files ${priorXmls.join(',')}
+                """
+                if (fileExists(priorPassedFile)) {
+                    def priorPasses = readFile(file: priorPassedFile).readLines().collect { it.trim() }.findAll { it }
+                    if (!priorPasses.isEmpty()) {
+                        echo "Reusing ${priorPasses.size()} passed test(s) from prior attempt(s): ${priorTags}"
+                    }
+                    reusedTests += priorPasses
+                }
+            }
+        }
 
-        // Append reused tests to waives.txt
+        // 3. Dedupe and append everything to waives.txt as SKIPs.
+        reusedTests = reusedTests.unique()
         if (reusedTests.size() > 0) {
-            // Build the content to append
             def reusedTestsContent = reusedTests.collect { test ->
                 "${test} SKIP (Reused from previous pipeline)"
             }.join('\n')
@@ -2821,7 +2814,47 @@ REUSED_TESTS_EOF
     }
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false)
+/**
+ * Decode a postTag into the postTags used by prior attempts of the same
+ * stage in this build.
+ *
+ * The retry runner (runKubernetesPodWithInfraRetry, runLLMTestlistOnSlurm)
+ * composes postTag as ``${callerSuppliedBase}-attempt-${N}`` for retries
+ * (and the bare base for attempt 1, e.g. ``""`` or ``"-SubJob-RunTest"``).
+ * This function inverts that composition to enumerate the postTags of
+ * earlier attempts so reusePassedTestResults() can locate their uploaded
+ * tarballs.
+ *
+ * Returns an empty list when ``postTag`` does not encode a retry — either
+ * attempt 1 (``postTag == ""``), or a caller-supplied tag that never went
+ * through the retry loop (e.g. ``"-SubJob-RunTest"``).
+ *
+ * Examples:
+ *
+ *   ""                            -> []
+ *   "-attempt-2"                  -> [""]
+ *   "-attempt-3"                  -> ["", "-attempt-2"]
+ *   "-SubJob-RunTest-attempt-2"   -> ["-SubJob-RunTest"]
+ *   "-SubJob-RunTest"             -> []
+ *
+ * @param postTag the current attempt's full tar suffix.
+ * @return List of postTag strings, ordered oldest-attempt-first.
+ */
+@NonCPS
+def priorAttemptTags(String postTag) {
+    if (!postTag) return []
+    def m = postTag =~ /^(.*)-attempt-(\d+)$/
+    if (!m.matches()) return []
+    String base = m[0][1]
+    int currentAttempt = (m[0][2] as Integer)
+    def priors = [base]   // attempt 1 used the caller's base tag, e.g. "" or "-SubJob-RunTest"
+    for (int n = 2; n < currentAttempt; n++) {
+        priors << "${base}-attempt-${n}"
+    }
+    return priors
+}
+
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="")
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -2978,7 +3011,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Add passed test list from previous pipeline run to the waives.txt
         if (testFilter[(REUSE_TEST)] != false) {
-            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
+            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
         }
 
         // Process shard test list and create separate files for regular and isolate tests
@@ -3179,7 +3212,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
     splitId = collapse.splitId
 
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -3220,14 +3253,17 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 }
 
 
-def checkPipInstall(pipeline, wheel_path)
+def checkPipInstall(pipeline, wheel_path, version_local)
 {
     def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT}/tests/unittest && python3 test_pip_install.py --wheel_path ${wheelArtifactLinks}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+        cd ${LLM_ROOT}/tests/unittest && \
+        python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "${version_local}"
+        """)
 }
 
 
-def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", version_local="", cpver="cp312")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -3256,6 +3292,18 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;103-real;120-real'"
+    }
+
+    if (version_local) {
+        sh """
+            cd tensorrt_llm
+            sed -i.bak 's/^__version__ = "\\(.*\\)"\$/__version__ = "\\1+${version_local}"/' tensorrt_llm/version.py
+            if diff tensorrt_llm/version.py.bak tensorrt_llm/version.py; then
+                echo "ERROR: failed to inject local version '+${version_local}' into tensorrt_llm/version.py" >&2
+                exit 1
+            fi
+            rm tensorrt_llm/version.py.bak
+        """
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
@@ -3442,11 +3490,11 @@ def runInKubernetes(pipeline, podSpec, containerName)
     }
 }
 
-// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification,
-// budget, and backoff (K8S_INFRA_RETRY_MAX, K8S_INFRA_FAILURE_PATTERNS,
-// K8S_INFRA_SINGLE_RETRY_PATTERNS), but operates at the pod-launch level so
-// transient pod failures (ImagePullBackOff, eviction, OOMKilled, JNLP
-// disconnect, node NotReady) get a fresh pod on each retry rather than
+// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification
+// (classify(ex, InfraFailure.K8S)), budget (K8S_INFRA_RETRY_MAX), and backoff,
+// but operates at the pod-launch level so transient pod failures
+// (ImagePullBackOff, eviction, OOMKilled, JNLP disconnect, node NotReady) get
+// a fresh pod on each retry rather than
 // retrying the test body inside a dying pod.
 //
 // `runner` is invoked with `(attemptTag, isFinalAttempt)`. Callers append
@@ -3879,42 +3927,42 @@ def launchTestJobs(pipeline, testFilter)
         2
     )
     // GB300 PerfSanity post-merge disaggregated
-    // // 2 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-    //     2,
-    //     8,
-    //     2
-    // )
-    // // 3 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-    //     2,
-    //     12,
-    //     3
-    // )
-    // // 5 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-    //     2,
-    //     20,
-    //     5
-    // )
-    // // 9 Nodes
-    // multiNodesSBSAConfigs += buildStageConfigs(
-    //     "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-    //     "auto:gb300-flex",
-    //     "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-    //     2,
-    //     36,
-    //     9
-    // )
+    // 2 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        4,
+        8,
+        2
+    )
+    // 3 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
+        4,
+        12,
+        3
+    )
+    // 5 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
+        4,
+        20,
+        5
+    )
+    // 9 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
+        4,
+        36,
+        9
+    )
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
@@ -3976,13 +4024,14 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
 
     // Python version and OS for sanity check
+    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall]
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
+            LLM_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
-            "dlfw/",
+            true,
             DLFW_IMAGE,
             false,
         ],
@@ -3991,7 +4040,7 @@ def launchTestJobs(pipeline, testFilter)
             "A10",
             X86_64_TRIPLE,
             true,
-            "",
+            false,
             UBUNTU_22_04_IMAGE,
             true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
         ],
@@ -4000,22 +4049,19 @@ def launchTestJobs(pipeline, testFilter)
             "A100X",
             X86_64_TRIPLE,
             true,
-            "",
+            false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
     ]
 
     aarch64SanityCheckConfigs = [
-        // Workaround PyTorch 2.9.1 vs. 2.10.0a0 incompatibility issue. Once resolved, change back to:
-        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
-        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
-            LLM_DOCKER_IMAGE,
+            LLM_WHEEL_DOCKER_IMAGE,
             "GH200",
             AARCH64_TRIPLE,
             false,
-            "",
+            false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
@@ -4024,7 +4070,7 @@ def launchTestJobs(pipeline, testFilter)
             "GH200",
             AARCH64_TRIPLE,
             false,
-            "dlfw/",
+            true,
             DLFW_IMAGE,
             false,
         ],
@@ -4063,7 +4109,16 @@ def launchTestJobs(pipeline, testFilter)
             def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
             sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
-            def wheelPath = "${values[4]}"
+            def isDlfw = values[4]
+            def versionLocal = ""
+            if (isDlfw) {
+                // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
+                def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
+                if (!matcher.find()) {
+                    error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
+                }
+                versionLocal = "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
+            }
             def wheelName = ""
             def cpver = "cp312"
             def pyver = "3.12"
@@ -4073,18 +4128,11 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                def env = []
-                if (key.contains("manylinux")) {
-                    env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
-                }
-                withEnv(env) {
-                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver)
-                }
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver)
             }
 
-            def fullWheelPath = "${cpu_arch}/${wheelPath}${wheelName}"
-
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
+            // def fullWheelPath = "${cpu_arch}/${wheelName}"
             // sanityRunner("Sanity check") {
             //     runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
             // }
@@ -4146,7 +4194,7 @@ def launchTestJobs(pipeline, testFilter)
                             sh "env | sort"
                             trtllm_utils.llmRetry(1, "checkPipInstall", {
                                 timeout(time: 30, unit: 'MINUTES') {
-                                    checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                                    checkPipInstall(pipeline, "${cpu_arch}", versionLocal)
                                 }
                             })
                         }

@@ -494,7 +494,9 @@ def main(*,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
+         configure_only: bool = False,
          use_ccache: bool = False,
+         use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
          install: bool = False,
@@ -633,6 +635,20 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
+    # FetchContent bare-repo cache (see 3rdparty/CMakeLists.txt).  Forwarded
+    # as -D vars so the configuration is reproducible from CMakeCache.txt
+    # alone and doesn't depend on the caller's env.  The env var hand-off
+    # lets a wrapping agent point at a shared cache without patching
+    # build_wheel.py.
+    if use_3rdparty_cache:
+        cache_dir = os.environ.get("TRTLLM_FETCHCONTENT_CACHE") or str(
+            project_dir / "3rdparty" / ".cache_3rdparty")
+        cmake_def_args.append(f"-DTRTLLM_FETCHCONTENT_CACHE={cache_dir}")
+        update_cmd = os.environ.get("TRTLLM_FETCHCONTENT_UPDATE_CMD", "")
+        if update_cmd:
+            cmake_def_args.append(
+                f"-DTRTLLM_FETCHCONTENT_UPDATE_CMD={update_cmd}")
+
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
@@ -686,7 +702,7 @@ def main(*,
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
-        if clean or first_build or configure_cmake:
+        if clean or first_build or configure_cmake or configure_only:
             build_run(
                 f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
@@ -708,6 +724,9 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+
+        if configure_only:
+            return
 
         maybe_keep_depfile = " -- -d keepdepfile" if generator == "Ninja" else ""
         cmake_build_command = (
@@ -1166,10 +1185,21 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--configure_cmake",
                         action="store_true",
                         help="Always configure cmake before building")
+    parser.add_argument(
+        "--configure-only",
+        action="store_true",
+        help="Run cmake configure and exit, skipping build and wheel packaging")
     parser.add_argument("--use_ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
+    parser.add_argument(
+        "--use-3rdparty-cache",
+        default=False,
+        action="store_true",
+        help="Accelerate FetchContent git clones via bare reference "
+        "repos under $TRTLLM_FETCHCONTENT_CACHE "
+        "(default: <project>/3rdparty/.cache_3rdparty).")
     parser.add_argument(
         "--fast_build",
         "-f",

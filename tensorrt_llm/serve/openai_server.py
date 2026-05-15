@@ -45,7 +45,8 @@ from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -213,6 +214,13 @@ class OpenAIServer(_VideoRoutesMixin):
         self.perf_metrics_lock = None
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
+        # Bounded snapshot of iteration stats for the GET /metrics handler.
+        # When the background Prometheus collector loop is active, it is the
+        # sole consumer of the engine's stats queue and appends each drained
+        # stat here; /metrics then serves from this buffer instead of racing
+        # the loop for the queue. Created lazily when the loop starts.
+        # See nvbug 6102381.
+        self._iteration_stats_buffer: Optional[deque] = None
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
@@ -274,6 +282,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 # tensorrt backend does not have this attribute but it always has iter stats enabled.
                 if self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
+                    # The background loop becomes the sole consumer of the
+                    # engine stats queue; /metrics reads from a tee buffer
+                    # bounded by iter_stats_max_iterations to avoid racing
+                    # the loop for the queue (nvbug 6102381).
+                    max_buf = getattr(self.generator.args,
+                                      "iter_stats_max_iterations", 1000) or 1000
+                    self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
                     logger.info(
@@ -820,6 +835,18 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
+        # When the background collector loop is active it is the sole
+        # consumer of the engine stats queue; serve /metrics from the tee
+        # buffer it populates so we do not race it for queue items. Racing
+        # caused >80% iteration loss and ~2s per-call latency (nvbug 6102381).
+        # The caller receives the stats accumulated since the previous /metrics
+        # call (up to iter_stats_max_iterations) and the buffer is cleared.
+        if self._iteration_stats_buffer is not None:
+            stats = list(self._iteration_stats_buffer)
+            self._iteration_stats_buffer.clear()
+            return JSONResponse(content=stats)
+
+        # Legacy path: no background collector -> read the queue directly.
         stats = []
         async for stat in self.generator.get_stats_async(2):
             stats.append(stat)
@@ -1038,6 +1065,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     async for llm_stat in self.generator.get_stats_async(
                             timeout=0.5):
                         self.metrics_collector.log_iteration_stats(llm_stat)
+                        # Tee into the /metrics snapshot buffer so the HTTP
+                        # handler can serve without competing for the engine
+                        # queue (nvbug 6102381).
+                        if self._iteration_stats_buffer is not None:
+                            self._iteration_stats_buffer.append(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -1141,7 +1173,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1291,7 +1323,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,

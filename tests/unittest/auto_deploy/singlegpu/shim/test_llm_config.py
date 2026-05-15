@@ -188,6 +188,41 @@ def test_parallel_config_validation(parallel_field, invalid_value):
 
 
 # ================================
+# Speculative Config Validation
+# ================================
+
+
+class TestSpeculativeConfigValidation:
+    """AutoDeploy only supports Eagle3 one-model and MTP-Eagle one-model speculative decoding.
+
+    Verify that supported speculative modes are accepted and configured before executor setup.
+    """
+
+    def test_accepts_eagle_one_model(self):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+        # Should not raise.
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        assert args.model_factory == "eagle_one_model"
+
+    def test_accepts_mtp_eagle_one_model(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+        # Should not raise.
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        assert args.model_factory == "eagle_one_model"
+
+
+# ================================
 # CUDA Graph Batch Sizes Tests
 # ================================
 

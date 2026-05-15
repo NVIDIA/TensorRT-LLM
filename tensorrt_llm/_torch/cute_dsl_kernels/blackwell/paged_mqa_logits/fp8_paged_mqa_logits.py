@@ -69,6 +69,13 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+# Compat across CuTe DSL versions:
+#   4.4.x              : nvvm.RoundingModeKind.RN (enum, accepted by cute.arch.*)
+#   4.5.0+ / internal  : nvvm.RoundingModeKind removed; cute.arch.* strictly require
+#                        the string literal 'rn' (passing FPRoundingMode.RN enum
+#                        raises TypeError per nvvm_wrappers.from_str).
+_RND_RN = getattr(getattr(nvvm, "RoundingModeKind", None), "RN", None) or "rn"
+
 
 @dsl_user_op
 def pack_f16x2(
@@ -1409,10 +1416,10 @@ class FP8MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                             # SMEM-path: weights from shared mem
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1448,10 +1455,10 @@ class FP8MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)
@@ -1625,10 +1632,10 @@ class FP8MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                             # SMEM-path
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1664,10 +1671,10 @@ class FP8MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)

@@ -71,7 +71,12 @@ from tensorrt_llm.bindings.internal.runtime import (
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import LogprobMode, SamplingParams
+from tensorrt_llm.sampling_params import (
+    MAX_TOP_LOGPROBS,
+    LogprobMode,
+    SamplingParams,
+    check_logprobs_limit,
+)
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
@@ -1154,7 +1159,6 @@ class AsyncWorkerMixin:
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
-    DEFAULT_MAX_TOPK_LOGPROBS = 20
     DEFAULT_MAX_STOP_WORD_LENGTH = 20
     DEFAULT_MAX_STOP_WORDS = 10
 
@@ -2152,7 +2156,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.max_tokens = args.max_total_draft_tokens + 1
         self.max_beam_width = args.max_beam_width
         # The current maximum number of topk logprobs which can be stored in the sampler's store
-        self.max_topk_logprobs = self.DEFAULT_MAX_TOPK_LOGPROBS
+        self.max_topk_logprobs = MAX_TOP_LOGPROBS
         # The maximum number of topk logprobs for the current batch of requests
         self.batch_max_topk_logprobs = 0
         if args.max_total_draft_tokens > 0 and args.max_beam_width > 1:
@@ -3370,6 +3374,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             (req.py_num_logprobs or 0 for req in requests),
             default=0,
         )
+        check_logprobs_limit("batch_max_logprobs", self.batch_max_topk_logprobs, MAX_TOP_LOGPROBS)
         if self.max_topk_logprobs < self.batch_max_topk_logprobs:
             self.max_topk_logprobs = self.batch_max_topk_logprobs
             self.TOPK_LOGPROBS_SHAPE = (
