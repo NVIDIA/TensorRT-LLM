@@ -14,7 +14,8 @@
 # limitations under the License.
 
 import math
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,23 @@ class Qwen3VLTextRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         output = self.weight * hidden_states.to(input_dtype)
         return output
+
+
+@dataclass
+class TransformerOutput:
+    """Velocity predictions from Cosmos3VFMTransformer.forward()."""
+
+    video: torch.Tensor
+    """[B, C, T, H, W] video (or image when T=1) velocity prediction."""
+
+    image: torch.Tensor
+    """[B, C, 1, H, W] alias of video for image generation (same tensor)."""
+
+    sound: Optional[torch.Tensor] = None
+    """[B, sound_dim, T_sound] sound velocity prediction, or None."""
+
+    action: Optional[torch.Tensor] = None
+    """[B, T_action, action_dim] action velocity prediction, or None."""
 
 
 def compute_mrope_position_ids_text(
@@ -712,6 +730,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.vae2llm = nn.Linear(self.patch_latent_dim, self.hidden_size)
         self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
 
+        if self.sound_gen:
+            # Projections for sound modality (mirrors cosmos3-internal Cosmos3VFMNetwork)
+            self.sound2llm = nn.Linear(self.sound_dim, self.hidden_size)
+            self.llm2sound = nn.Linear(self.hidden_size, self.sound_dim)
+            self.sound_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
+
         # try timestep embedder in float32 if acc loss
         self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=torch.bfloat16)
 
@@ -848,6 +872,59 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         freqs_gen = (cos_gen.unsqueeze(2), sin_gen.unsqueeze(2))
         return freqs_und, freqs_gen
 
+    # -------------------------------------------------------------------------
+    # Sound helpers
+    # -------------------------------------------------------------------------
+
+    def _compute_sound_rope_freqs(
+        self,
+        T_sound: int,
+        text_mask: torch.Tensor,
+        fps_sound: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute mRoPE cos/sin for sound tokens.
+
+        Sound tokens use a 1×1 spatial grid (H=W=1) aligned with the vision
+        temporal axis at the sound latent rate.  This mirrors the cosmos3-internal
+        ``sequence_packing.py`` treatment where sound mRoPE uses
+        ``get_3d_mrope_ids_vae_tokens(grid_h=1, grid_w=1, tcf=1)``.
+        """
+        B = text_mask.shape[0]
+        text_lengths = text_mask.sum(dim=1).long()
+
+        sound_pos_list = []
+        for b in range(B):
+            real_len = int(text_lengths[b].item())
+            _, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
+            # Sound tokens share the vision temporal space; use modality margin offset.
+            s_pos, _ = compute_mrope_position_ids_vision(
+                T_sound,
+                1,  # grid_h
+                1,  # grid_w
+                temporal_offset=t_offset + self.unified_3d_mrope_temporal_modality_margin,
+                fps=fps_sound,
+                base_fps=self.base_fps,
+                temporal_compression_factor=1,  # sound latent is already at sound_latent_fps
+                enable_fps_modulation=self.enable_fps_modulation,
+            )
+            sound_pos_list.append(s_pos)
+
+        sound_pos_ids = torch.stack(sound_pos_list, dim=1).to(device)  # [3, B, T_sound]
+        rotary_emb = self.language_model.rotary_emb
+        _dummy = torch.tensor([], dtype=dtype, device=device)
+        cos_s, sin_s = rotary_emb(_dummy, position_ids=sound_pos_ids)
+        return cos_s.unsqueeze(2), sin_s.unsqueeze(2)  # [B, T_sound, 1, head_dim]
+
+    def pack_sound_latents(self, sound_latents: torch.Tensor) -> torch.Tensor:
+        """[B, sound_dim, T_sound] → [B, T_sound, sound_dim]."""
+        return sound_latents.permute(0, 2, 1)
+
+    def unpack_sound_latents(self, hidden_sound: torch.Tensor) -> torch.Tensor:
+        """[B, T_sound, sound_dim] → [B, sound_dim, T_sound]."""
+        return hidden_sound.permute(0, 2, 1)
+
     def reset_cache(self):
         self.cached_kv = None
         self.cached_freqs_gen = None
@@ -861,8 +938,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         video_shape: Tuple[int, int, int],
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
+        sound_latents: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> "TransformerOutput":
         """
         Forward pass for parallel denoising.
 
@@ -878,9 +956,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 timestep embedding, predict velocity) and 0=conditioned (clean
                 context, skip timestep embedding).  None means all frames noisy
                 (T2V mode).
+            sound_latents: Optional [B, sound_dim, T_sound] noisy sound latents.
+                When provided, sound tokens are appended to the generation
+                sequence and a sound velocity is returned alongside the video
+                velocity.  Requires ``sound_gen=True`` in the pretrained config.
 
         Returns:
-            [B, C, T, H, W] velocity prediction
+            TransformerOutput with video (and image alias) always set.
+            sound is set to the predicted sound velocity when sound_latents is
+            provided; otherwise None.  action is always None for now.
         """
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
@@ -938,9 +1022,35 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             else:
                 self.cached_kv = cached_kv_full
 
+        # --- Sound token injection -------------------------------------------------
+        T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
+        T_sound = 0
+        if sound_latents is not None and self.sound_gen:
+            T_sound = sound_latents.shape[2]
+            hidden_sound = self.pack_sound_latents(sound_latents).to(hidden_gen.dtype)
+            hidden_sound = self.sound2llm(hidden_sound) + self.sound_modality_embed
+            hidden_sound = hidden_sound + time_embed.unsqueeze(1)
+            cos_s, sin_s = self._compute_sound_rope_freqs(
+                T_sound,
+                text_mask,
+                float(self.sound_latent_fps),
+                hidden_states.device,
+                hidden_gen.dtype,
+            )
+            # [B, T_vid+T_sound, hidden_size]
+            hidden_gen = torch.cat([hidden_gen, hidden_sound], dim=1)
+            cos_v, sin_v = self.cached_freqs_gen
+            freqs_gen_combined = (
+                torch.cat([cos_v, cos_s], dim=1),
+                torch.cat([sin_v, sin_s], dim=1),
+            )
+        else:
+            freqs_gen_combined = self.cached_freqs_gen
+        # --------------------------------------------------------------------------
+
         S_gen = hidden_gen.shape[1]
         hidden_gen = self.sharder.shard(hidden_gen, dim=1, pad_to_multiple=True)
-        cos, sin = self.cached_freqs_gen
+        cos, sin = freqs_gen_combined
         cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         freqs_gen = (cos, sin)
@@ -955,7 +1065,20 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        return self.unpatchify(self.llm2vae(hidden_gen), T, H, W)
+
+        # --- Decode video velocity ------------------------------------------------
+        video_vel = self.unpatchify(self.llm2vae(hidden_gen[:, :T_vid_tokens]), T, H, W)
+
+        # --- Decode sound velocity (if requested) ---------------------------------
+        sound_vel = None
+        if T_sound > 0 and sound_latents is not None and self.sound_gen:
+            # hidden_gen[:, T_vid_tokens:] → [B, T_sound, hidden_size]
+            # → llm2sound → [B, T_sound, sound_dim] → unpack → [B, sound_dim, T_sound]
+            sound_vel = self.unpack_sound_latents(
+                self.llm2sound(hidden_gen[:, T_vid_tokens : T_vid_tokens + T_sound])
+            )
+
+        return TransformerOutput(video=video_vel, image=video_vel, sound=sound_vel)
 
     def load_weights(self, weights: dict) -> None:
         """Load weights with key remapping from Cosmos3-Nano / Diffusers checkpoints.

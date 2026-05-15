@@ -132,6 +132,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 checkpoint_dir,
                 subfolder=PipelineComponent.SCHEDULER,
             )
+            if self.sound_gen:
+                # Separate instance so video and sound scheduler states don't collide
+                # (UniPC mutates internal correction buffers on every .step() call).
+                self.sound_scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
 
         # Re-check the env var in case it was changed after initialization like in unit tests.
         guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
@@ -478,12 +482,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """Decode sound latent tokens back to waveform.
 
         Args:
-            latent: Sound latent tensor of shape (C, T). A batch dim is added/removed
-                    internally since AVAE expects (B, C, T).
+            latent: Sound latent tensor of shape (B, C, T).
+
+        Returns:
+            Waveform tensor of shape (B, audio_channels, N_samples).
         """
-        # AVAE expects (B, C, T)
-        waveform = self.sound_tokenizer.decode(latent.unsqueeze(0))  # [1,audio_channels,N_samples]
-        return waveform.squeeze(0)  # [audio_channels,N_samples]
+        return self.sound_tokenizer.decode(latent)  # [B, audio_channels, N_samples]
 
     # =========================================================================
     # Forward (main generation entry point)
@@ -621,6 +625,27 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # 3. Set up scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
+        # 3b. Sound noise init
+        # T_sound = ceil(duration_s * sound_latent_fps / temporal_compression_factor_sound)
+        # Duration derived from num_frames / frame_rate; matches cosmos3-internal.
+        do_sound = self.sound_gen and hasattr(self, "sound_tokenizer")
+        sound_latents = None
+        if do_sound:
+            duration_s = num_frames / frame_rate
+            T_sound = math.ceil(
+                duration_s
+                * self.transformer.sound_latent_fps
+                / self.transformer.temporal_compression_factor_sound
+            )
+            sound_latents = randn_tensor(
+                (1, self.transformer.sound_dim, T_sound),
+                generator=generator,
+                device=self.device,
+                dtype=latents.dtype,
+            )
+            # Sound uses the same scheduler type/config as video.
+            self.sound_scheduler.set_timesteps(num_inference_steps, device=self.device)
+
         # 4. Build forward_fn for the denoise loop
         def forward_fn(
             latent_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
@@ -630,7 +655,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             Since Cosmos3 embeds text internally, we pass token IDs via extra_tensors
             rather than through encoder_hidden_states.
             """
-            noise_pred = self.transformer(
+            current_sound = extra_stream_latents.get("sound") if extra_stream_latents else None
+
+            result = self.transformer(
                 hidden_states=latent_input,
                 timestep=timestep,
                 text_ids=extra_tensors["text_ids"],
@@ -638,10 +665,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video_shape=video_shape,
                 fps=frame_rate,
                 noisy_frame_mask=velocity_mask,
+                sound_latents=current_sound,
             )
+
+            video_noise_pred = result.video
+            sound_noise_pred = result.sound
+
             if velocity_mask is not None:
-                noise_pred = noise_pred * velocity_mask
-            return noise_pred
+                video_noise_pred = video_noise_pred * velocity_mask
+
+            if sound_noise_pred is not None:
+                return video_noise_pred, {"sound": sound_noise_pred}
+            return video_noise_pred
 
         # 5. Build CFG tensors — text_ids and text_mask need to be split for CFG
         #    BasePipeline.denoise batches [uncond, cond] when guidance_scale > 1
@@ -655,7 +690,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 6. Denoise
         timer.mark_denoise_start()
-        latents = self.denoise(
+        extra_streams = {"sound": (sound_latents, self.sound_scheduler)} if do_sound else None
+        denoise_result = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
             prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
@@ -663,10 +699,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             guidance_scale=guidance_scale,
             forward_fn=forward_fn,
             extra_cfg_tensors=extra_cfg_tensors,
+            extra_streams=extra_streams,
         )
+
+        if extra_streams is not None:
+            latents, extra_latents = denoise_result
+            sound_latents = extra_latents.get("sound")
+        else:
+            latents = denoise_result
+            sound_latents = None
+
         timer.mark_post_start()
 
-        # 7. Decode
+        # 7. Decode video
         logger.info("Decoding video...")
         decode_start = time.time()
 
@@ -676,7 +721,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         video = self.decode_latents(latents, self._decode_latents)
 
-        # Video guardrails
+        # 7b. Decode sound
+        waveform = None
+        if do_sound and sound_latents is not None:
+            logger.info("Decoding sound...")
+            waveform = self.decode_sound(sound_latents)  # [B, audio_channels, N_samples]
+
+        # Video guardrail
         if self.rank == 0:
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
@@ -685,4 +736,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video = check_video_safety(video, self.safety_checker)
 
         timer.mark_end()
-        return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                frame_rate=frame_rate,
+                audio=waveform,
+                audio_sample_rate=self.sound_tokenizer.model_config["sampling_rate"]
+                if waveform is not None
+                else None,
+            )
+        )
