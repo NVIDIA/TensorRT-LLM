@@ -307,6 +307,11 @@ class ModelConfig(Generic[TConfig]):
                                              "FP8_BLOCK_SCALES")
         if is_fp8_block_scales and is_sm_100f():
             return "TRTLLM"
+        # CUTLASS FP8_BLOCK_SCALES path uses DeepGEMM JIT which only supports
+        # Hopper (SM90). On Blackwell (SM100/103), use DEEPGEMM backend which
+        # natively supports these architectures.
+        if is_sm_100f():
+            return "DEEPGEMM"
 
         return "CUTLASS"
 
