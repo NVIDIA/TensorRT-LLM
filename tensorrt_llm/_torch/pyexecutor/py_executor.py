@@ -51,7 +51,7 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
 from .resource_manager import ResourceManager
-from .sampler import Sampler, SampleState, SampleStateTensors
+from .sampler import Sampler, SampleState, SampleStateTensors, TRTLLMSampler
 from .scheduler import RequestScheduler, ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -184,6 +184,11 @@ class PyExecutor:
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
+        # When using TRTLLMSampler, beam search logits processing is handled
+        # by the sampler with coherent per-beam token histories from parentIds
+        # tracing. Tell model_engine to skip its own beam search logits processing.
+        if isinstance(sampler, TRTLLMSampler):
+            model_engine.skip_beam_search_logits_processing = True
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
