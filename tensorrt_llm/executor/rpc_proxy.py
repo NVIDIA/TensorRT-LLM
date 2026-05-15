@@ -18,10 +18,10 @@ from typing import List, Optional, Union
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.utils import logger_debug, print_colored
-from .proxy import _check_collective_rpc_guard
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
+from .proxy import _check_collective_rpc_guard
 from .result import IterationResult
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
