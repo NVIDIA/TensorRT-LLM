@@ -138,6 +138,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
+    ctx_usage: Optional[UsageInfo] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -1233,6 +1234,9 @@ def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
         return None
+    ctx_usage = tllm_disagg_params.ctx_usage
+    if ctx_usage is not None and not isinstance(ctx_usage, UsageInfo):
+        ctx_usage = UsageInfo.model_validate(ctx_usage)
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
@@ -1248,6 +1252,7 @@ def to_disaggregated_params(
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
+        ctx_usage=ctx_usage,
     )
 
 
@@ -1255,6 +1260,7 @@ def to_llm_disaggregated_params(
         disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
     if disaggregated_params is None:
         return None
+    ctx_usage = disaggregated_params.ctx_usage
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
@@ -1270,6 +1276,7 @@ def to_llm_disaggregated_params(
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
+        ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
     )
 
 
