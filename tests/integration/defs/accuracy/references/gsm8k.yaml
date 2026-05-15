@@ -310,6 +310,10 @@ microsoft/phi-4:
     accuracy: 90.64
 mistralai/Codestral-22B-v0.1:
   - accuracy: 67.10
+openai/gpt-oss-120b:
+  - accuracy: 10.0 # TODO: update this when the perf is good.
+openai/gpt-oss-20b:
+  - accuracy: 85.823
 GPT-OSS/120B-MXFP4:
   - accuracy: 90.3
   - spec_dec_algo: Eagle
