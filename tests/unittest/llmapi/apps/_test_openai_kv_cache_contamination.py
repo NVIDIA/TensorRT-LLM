@@ -89,6 +89,21 @@ _NUMBER_SYSTEM_UNIT = (
 NUMBER_SYSTEM_PROMPT = _NUMBER_SYSTEM_UNIT * 80
 
 TAG_RE = re.compile(r"TAG_(\d{%d})" % TAG_DIGITS)
+_ALL_SAME_RE = re.compile(r"ALL_SAME\s*:\s*(-?\d+)", re.IGNORECASE)
+_UNIQUE_RE = re.compile(r"UNIQUE\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+
+
+def _normalize_model_text(text: str) -> str:
+    """Strip fences and leading chatter so format checks work on chatty models."""
+    normalized = text.strip()
+    if normalized.startswith("```"):
+        lines = normalized.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        normalized = "\n".join(lines).strip()
+    return normalized
 
 
 def _parse_integers(text: str) -> list[int]:
@@ -109,27 +124,31 @@ def _evaluate_number_set_response(
     if response_content is None:
         return ("weak_invalid", "empty_response", [])
 
-    normalized = response_content.strip()
-    if normalized.startswith("ALL_SAME:"):
-        values = _parse_integers(normalized)
-        if not values:
-            return ("weak_invalid", "all_same_parse_failed", [])
-        common = values[0]
+    normalized = _normalize_model_text(response_content)
+
+    all_same = _ALL_SAME_RE.search(normalized)
+    if all_same:
+        common = int(all_same.group(1))
         if common == number_value:
             return ("valid", None, [])
         return ("cross_contamination", "wrong_common_number", [common])
 
-    if normalized.startswith("UNIQUE:"):
-        unique_values = sorted(set(_parse_integers(normalized)))
-        matched = [value for value in unique_values if value in number_pool]
-        if matched:
-            return ("cross_contamination", "unique_numbers_intersect_pool", matched)
+    unique = _UNIQUE_RE.search(normalized)
+    if unique:
+        unique_values = sorted(set(_parse_integers(unique.group(1))))
+        foreign = [
+            value for value in unique_values if value in number_pool and value != number_value
+        ]
+        if foreign:
+            return ("cross_contamination", "unique_numbers_intersect_pool", foreign)
         return ("hallucination_ok", None, [])
 
     parsed = _parse_integers(normalized)
-    matched = [value for value in parsed if value in number_pool]
-    if matched:
-        return ("cross_contamination", "freeform_numbers_intersect_pool", matched)
+    foreign = [value for value in parsed if value in number_pool and value != number_value]
+    if foreign:
+        return ("cross_contamination", "freeform_numbers_intersect_pool", foreign)
+    if number_value in parsed:
+        return ("valid", None, [])
     return ("weak_invalid", "unexpected_format", [])
 
 
@@ -223,7 +242,14 @@ def _make_number_set_messages(number_value: int, repeated_count: int) -> list:
     ]
 
 
-async def _send_one(client, model: str, messages: list, cancel_after_s):
+async def _send_one(
+    client,
+    model: str,
+    messages: list,
+    cancel_after_s,
+    *,
+    max_tokens: int = 64,
+):
     """Send one request. If ``cancel_after_s`` is not None, cancel it
     after that many seconds via ``asyncio.Task.cancel`` — which closes the
     underlying HTTPX connection; ``trtllm-serve`` treats this as a client
@@ -234,7 +260,7 @@ async def _send_one(client, model: str, messages: list, cancel_after_s):
             resp = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=64,
+                max_tokens=max_tokens,
                 temperature=0.0,
             )
             return resp.choices[0].message.content
@@ -243,7 +269,7 @@ async def _send_one(client, model: str, messages: list, cancel_after_s):
             client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=64,
+                max_tokens=max_tokens,
                 temperature=0.0,
             )
         )
@@ -381,6 +407,7 @@ async def test_no_kv_cache_contamination_number_set_probe(
                     model_name,
                     messages,
                     CANCEL_AFTER_S if i in cancel_indices else None,
+                    max_tokens=128,
                 )
             )
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -466,3 +493,21 @@ def test_evaluate_number_set_weak_invalid_empty():
     verdict, reason, matched = _evaluate_number_set_response(1, None, {1})
     assert verdict == "weak_invalid"
     assert reason == "empty_response"
+
+
+def test_evaluate_number_set_all_same_markdown_fence():
+    pool = {42, 99}
+    verdict, reason, matched = _evaluate_number_set_response(
+        42, "Here is the result:\n```\nALL_SAME:42\n```", pool
+    )
+    assert verdict == "valid"
+    assert reason is None
+    assert matched == []
+
+
+def test_evaluate_number_set_freeform_correct_number_only():
+    pool = {111, 222}
+    verdict, reason, matched = _evaluate_number_set_response(222, "The common value is 222.", pool)
+    assert verdict == "valid"
+    assert reason is None
+    assert matched == []
