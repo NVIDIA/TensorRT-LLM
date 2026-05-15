@@ -26,8 +26,6 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    is_swizzling_supported
 
 # isort: off
 from tensorrt_llm.llmapi import (
@@ -42,8 +40,9 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
-                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray)
+                        skip_no_mxfp4_swizzle, skip_post_blackwell,
+                        skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
+                        skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2)
@@ -5408,7 +5407,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_pre_blackwell),
-        pytest.param("TRITON", marks=skip_no_hopper)
+        pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
@@ -5418,8 +5417,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
                      overlap_scheduler, mocker, v2_kv_cache):
-        if (moe_backend == "TRITON" and not is_swizzling_supported()):
-            pytest.skip("nvbugs/5446119")
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -5448,14 +5445,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     @skip_no_hopper
+    @skip_no_mxfp4_swizzle
     def test_w4_1gpu_piecewise_cuda_graph(self, mocker):
         # Regression test for https://nvbugs/5880745. GPT-OSS with TRITON MoE
         # backend + fullgraph torch.compile + piecewise CUDA graph requires
         # layer_idx to propagate into MoE so MoE.forward dispatches through
         # the torch.library.custom_op path instead of tracing the Triton
         # kernel call (which Dynamo cannot lift).
-        if not is_swizzling_supported():
-            pytest.skip("nvbugs/5446119")
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -5531,7 +5527,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_pre_blackwell),
-        pytest.param("TRITON", marks=skip_no_hopper)
+        pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
     @pytest.mark.parametrize(
@@ -5548,9 +5544,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_4gpus(self, v2_kv_cache, kv_cache_reuse, kv_cache_dtype,
                       moe_backend, tp_size, pp_size, ep_size, attention_dp,
                       cuda_graph, overlap_scheduler, mocker):
-        if (moe_backend == "TRITON" and not is_swizzling_supported()):
-            pytest.skip("nvbugs/5446119")
-
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 

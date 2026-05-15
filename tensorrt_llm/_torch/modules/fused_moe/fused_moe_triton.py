@@ -1140,8 +1140,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         new_weight, new_scale = swizzle_weight_and_scale(
             weight_data, scale_data)
         replacement_storage_ptrs = {
-            new_weight.storage.data.untyped_storage().data_ptr(),
-            new_scale.storage.data.untyped_storage().data_ptr(),
+            new_weight.data.untyped_storage().data_ptr(),
+            new_scale.data.untyped_storage().data_ptr(),
         }
         for name in (weight_name, scale_name):
             old_param = module._parameters.pop(name, None)
