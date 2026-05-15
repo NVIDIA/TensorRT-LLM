@@ -15,8 +15,9 @@
 """Gemma4 multimodal model: multimodal embedder, input processor,
 and the Gemma4ForConditionalGeneration wrapper.
 
-Vision and audio towers use native transformers models via
-AutoModel.from_config() (requires transformers>=5.5.0).
+Vision tower is native TRT-LLM (``modeling_gemma4_vision.py``); audio tower
+still uses ``AutoModel.from_config()`` pending its own migration
+(requires transformers>=5.5.0).
 """
 
 import copy
@@ -48,6 +49,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
+from .modeling_gemma4_audio import Gemma4AudioModel
+from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -634,9 +637,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         llm_model_config = self.get_sub_model_config(model_config_cp, "text_config")
         self.llm = Gemma4ForCausalLM(llm_model_config)
 
-        # --- Vision tower (native transformers, eager mode) ---
+        # --- Vision tower (native TRT-LLM, see modeling_gemma4_vision.py) ---
         if config.vision_config is not None:
-            self.vision_tower = AutoModel.from_config(config.vision_config).eval().to(self._device)
+            vision_model_config = self.get_sub_model_config(model_config_cp, "vision_config")
+            self.vision_tower = (
+                Gemma4VisionModel(vision_model_config).eval().to(self._device)
+            )
             vision_hidden = config.vision_config.hidden_size
             text_hidden = config.text_config.hidden_size
             vision_eps = config.vision_config.rms_norm_eps
@@ -723,8 +729,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         if self.vision_tower is not None:
             vit_weights = filter_weights("vision_tower", stripped)
-            # Native transformers models use load_state_dict, not load_weights
-            self.vision_tower.load_state_dict(vit_weights, strict=False)
+            self.vision_tower.load_weights(vit_weights)
 
         if self.embed_vision is not None:
             embed_v_weights = filter_weights("embed_vision", stripped)
