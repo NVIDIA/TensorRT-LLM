@@ -2387,9 +2387,9 @@ TEST_F(CapacitySchedulerTest, EncoderInitMaxUtilizationAdmits)
     EXPECT_EQ(fittingRequests.front()->mRequestId, 1u);
 }
 
-// Without a enc_dec_kv_cache_manager, an encoder-init request cannot honour the
-// dual-pool contract and must be skipped — for both policies.
-TEST_F(CapacitySchedulerTest, EncoderInitWithoutCrossManagerSkipped)
+// Without an enc_dec_kv_cache_manager, an encoder-init request cannot honour the
+// dual-pool contract and must fail fast for both policies.
+TEST_F(CapacitySchedulerTest, EncoderInitWithoutCrossManagerThrows)
 {
     SizeType32 const maxNumRequests = 4;
     SizeType32 const tokensPerBlock = 10;
@@ -2409,11 +2409,10 @@ TEST_F(CapacitySchedulerTest, EncoderInitWithoutCrossManagerSkipped)
             createEncoderInitRequest(/*promptLen=*/10, /*maxNewTokens=*/40, encoderInputLen, /*id=*/1));
 
         // No cross manager passed.
-        auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
-            = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, /*crossKvCacheManager=*/std::nullopt);
-
-        EXPECT_EQ(fittingRequests.size(), 0u) << "policy=" << static_cast<int>(policy);
-        EXPECT_EQ(pausedRequests.size(), 0u) << "policy=" << static_cast<int>(policy);
+        EXPECT_THROW((void) capacityScheduler(
+                         activeRequests, kvCacheManager, peftCacheManager, /*crossKvCacheManager=*/std::nullopt),
+            tc::TllmException)
+            << "policy=" << static_cast<int>(policy);
     }
 }
 

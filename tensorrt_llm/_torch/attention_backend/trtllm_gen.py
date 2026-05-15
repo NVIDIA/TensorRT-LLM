@@ -24,10 +24,8 @@ Example:
         Fallback to thop.attention()
 """
 
-import inspect
 import math
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import torch
@@ -54,53 +52,6 @@ from tensorrt_llm.quantization.mode import QuantMode
 # Default KV layout for flashinfer
 # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
 DEFAULT_KV_LAYOUT = "HND"
-_RELATIVE_ATTENTION_BIAS_KWARGS = (
-    "relative_attention_bias",
-    "relative_attention_max_distance",
-)
-
-
-@lru_cache(maxsize=None)
-def _flashinfer_supports_relative_attention_bias(phase: str = "both") -> bool:
-    if not IS_FLASHINFER_AVAILABLE:
-        return False
-
-    try:
-        context_params = inspect.signature(
-            flashinfer.prefill.trtllm_batch_context_with_kv_cache
-        ).parameters
-        decode_params = inspect.signature(
-            flashinfer.decode.trtllm_batch_decode_with_kv_cache
-        ).parameters
-    except (TypeError, ValueError):
-        return False
-
-    context_supported = all(name in context_params for name in _RELATIVE_ATTENTION_BIAS_KWARGS)
-    decode_supported = all(name in decode_params for name in _RELATIVE_ATTENTION_BIAS_KWARGS)
-    if phase == "context":
-        return context_supported
-    if phase == "generation":
-        return decode_supported
-    return context_supported and decode_supported
-
-
-def _relative_attention_bias_kwargs(
-    relative_attention_bias: Optional[torch.Tensor],
-    relative_attention_max_distance: int,
-    phase: str,
-) -> dict:
-    if relative_attention_bias is None:
-        return {}
-
-    if not _flashinfer_supports_relative_attention_bias(phase):
-        raise NotImplementedError(
-            "Relative attention bias is not supported by current flashinfer trtllm-gen kernels."
-        )
-
-    return {
-        "relative_attention_bias": relative_attention_bias,
-        "relative_attention_max_distance": relative_attention_max_distance,
-    }
 
 
 class TrtllmGenSupportChecker:
@@ -205,10 +156,10 @@ class TrtllmGenSupportChecker:
                 "Skip-softmax attention is not supported by trtllm-gen backend.",
             )
 
-        if has_relative_attention_bias and not _flashinfer_supports_relative_attention_bias(phase):
+        if has_relative_attention_bias:
             return (
                 False,
-                "Relative attention bias is not supported by current flashinfer trtllm-gen kernels.",
+                "Relative attention bias is not supported by trtllm-gen backend.",
             )
 
         has_sparse_kv = sparse_kv_indices is not None and sparse_kv_indices.numel() > 0
@@ -1215,11 +1166,10 @@ class FlashInferTrtllmGenAttention:
             q_size = params.num_heads * params.head_size
             q_processed = params.qkv_input[:, :q_size].view(-1, params.num_heads, params.head_size)
         ctx_ws.trtllm_gen_workspace.zero_()
-        relative_attention_bias_kwargs = _relative_attention_bias_kwargs(
-            params.relative_attention_bias,
-            params.relative_attention_max_distance,
-            "context",
-        )
+        if params.relative_attention_bias is not None:
+            raise NotImplementedError(
+                "Relative attention bias is not supported by trtllm-gen backend."
+            )
 
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
@@ -1240,7 +1190,6 @@ class FlashInferTrtllmGenAttention:
             out=params.context_buf,
             kv_layout=self._layout,
             sinks=params.attention_sinks,
-            **relative_attention_bias_kwargs,
         )
 
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
@@ -1392,11 +1341,10 @@ class FlashInferTrtllmGenAttention:
 
         q_processed = gen_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
         gen_ws.trtllm_gen_workspace.zero_()
-        relative_attention_bias_kwargs = _relative_attention_bias_kwargs(
-            params.relative_attention_bias,
-            params.relative_attention_max_distance,
-            "generation",
-        )
+        if params.relative_attention_bias is not None:
+            raise NotImplementedError(
+                "Relative attention bias is not supported by trtllm-gen backend."
+            )
 
         # FlashInfer's trtllm-gen decode kernel needs to know the actual
         # number of query tokens per request to correctly derive batch_size
@@ -1442,7 +1390,6 @@ class FlashInferTrtllmGenAttention:
                 q_len_per_req=None,
                 max_q_len=params.input_seq_length,
                 cum_seq_lens_q=cu_seqlens,
-                **relative_attention_bias_kwargs,
             )
         else:
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1461,7 +1408,6 @@ class FlashInferTrtllmGenAttention:
                 kv_layout=self._layout,
                 sinks=params.attention_sinks,
                 q_len_per_req=params.input_seq_length,
-                **relative_attention_bias_kwargs,
             )
 
     def run_mla_generation(self, params: EnqueueGenerationParams) -> None:

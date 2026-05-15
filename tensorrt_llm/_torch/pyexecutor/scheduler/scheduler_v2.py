@@ -405,12 +405,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # loudly rather than silently routing to the self pool, which would
         # corrupt the dual-pool contract.
         if self.enc_dec_kv_cache_manager is None:
-            logger.warning(
-                "Encoder-init request %s scheduled without a enc_dec_kv_cache_manager; "
-                "cannot satisfy the later decoder cross-KV step. Skipping.",
-                req.py_request_id,
+            raise RuntimeError(
+                f"Encoder-init request {req.py_request_id} requires an enc_dec_kv_cache_manager."
             )
-            return ScheduleAction.STOP, 0
 
         req_tokens = req.encoder_output_len
         if not budget.can_fit_tokens(req_tokens):
@@ -418,11 +415,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         assert self.max_context_length is None or req_tokens <= self.max_context_length, (
             f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
         )
-        if not self.kv_cache_manager.prepare_context(req):
-            logger.debug(f"prepare_context failed for encoder request {req.py_request_id}")
-            return ScheduleAction.STOP, 0
-        if not self.kv_cache_manager.resize_context(req, req_tokens):
-            return ScheduleAction.STOP, 0
         return ScheduleAction.SCHEDULED, req_tokens
 
     def _try_schedule_context(

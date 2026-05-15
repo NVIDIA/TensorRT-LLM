@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 from unittest.mock import Mock
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ChunkingPolicy,
@@ -2474,13 +2476,13 @@ class TestPyCapacitySchedulerEncoderInit:
         fitting, disagg, paused = scheduler.schedule_request(requests)
         assert {r.request_id for r in fitting} == {0, 1}
 
-    def test_guaranteed_no_evict_skips_encoder_without_cross_pool(self):
-        """No cross manager → misconfigured enc-dec request is skipped."""
+    def test_guaranteed_no_evict_raises_encoder_without_cross_pool(self):
+        """No cross manager -> misconfigured enc-dec request is a hard error."""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
         scheduler = self._make_scheduler(kv, None, CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
         requests = [make_encoder_request(0, encoder_output_len=10)]
-        fitting, disagg, paused = scheduler.schedule_request(requests)
-        assert len(fitting) == 0
+        with pytest.raises(RuntimeError, match="requires an enc_dec_kv_cache_manager"):
+            scheduler.schedule_request(requests)
 
     def test_guaranteed_no_evict_encoder_does_not_consume_self_pool(self):
         """Self pool stays available for decoder context even when encoders
@@ -2515,13 +2517,13 @@ class TestPyCapacitySchedulerEncoderInit:
         assert {r.request_id for r in fitting} == {0, 1}
         assert len(paused) == 0
 
-    def test_max_utilization_skips_encoder_without_cross_pool(self):
-        """MaxUtilization without a cross manager refuses enc-dec admission."""
+    def test_max_utilization_raises_encoder_without_cross_pool(self):
+        """MaxUtilization without a cross manager fails enc-dec admission."""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
         scheduler = self._make_scheduler(kv, None, CapacitySchedulerPolicy.MAX_UTILIZATION)
         requests = [make_encoder_request(0, encoder_output_len=10)]
-        fitting, disagg, paused = scheduler.schedule_request(requests)
-        assert len(fitting) == 0
+        with pytest.raises(RuntimeError, match="requires an enc_dec_kv_cache_manager"):
+            scheduler.schedule_request(requests)
 
     def test_max_utilization_encoder_not_evictable_victim(self):
         """Encoder-init has no started self-pool blocks → never an eviction

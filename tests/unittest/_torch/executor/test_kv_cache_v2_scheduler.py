@@ -1045,11 +1045,11 @@ class TestEncoder:
         enc_dec_mgr.resize_context.assert_not_called()
         enc_dec_mgr.try_allocate_generation.assert_not_called()
 
-    def test_encoder_without_cross_manager_is_skipped(self):
-        """No enc_dec_kv_cache_manager → encoder request cannot be admitted.
+    def test_encoder_without_cross_manager_raises(self):
+        """No enc_dec_kv_cache_manager -> encoder request cannot be admitted.
 
         The dual-pool contract requires a cross manager.  Without one
-        the scheduler stops early rather than silently routing to the
+        the scheduler errors rather than silently routing to the
         self pool (which would corrupt self-pool sizing).
         """
         from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -1068,8 +1068,8 @@ class TestEncoder:
                 no_schedule_until_state=LlmRequestState.ENCODER_INIT,
             )
         reqs = [make_encoder_request(0, encoder_output_len=100)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        with pytest.raises(RuntimeError, match="requires an enc_dec_kv_cache_manager"):
+            sched.schedule_request(reqs, set())
         # Self pool must not be touched.
         mgr.prepare_context.assert_not_called()
 

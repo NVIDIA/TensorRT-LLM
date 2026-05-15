@@ -44,7 +44,6 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.cross_attention import CrossAttention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.encoder_decoder_layer import EncoderDecoderLayer, EncoderLayer
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
@@ -119,10 +118,16 @@ def _t5_gated_act_fn(config: T5Config):
 
 
 def _clamp_fp16_infs(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Match Hugging Face T5's fp16 overflow guard after residual adds."""
     if hidden_states.dtype != torch.float16:
         return hidden_states
 
-    return torch.clamp(hidden_states, min=-64000.0, max=64000.0)
+    clamp_value = torch.where(
+        torch.isinf(hidden_states).any(),
+        torch.finfo(hidden_states.dtype).max - 1000,
+        torch.finfo(hidden_states.dtype).max,
+    )
+    return torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
 
 
 def _t5_encoder_num_layers(config: T5Config) -> int:
@@ -427,7 +432,7 @@ class T5CrossAttention(CrossAttention):
 # ---------------------------------------------------------------------------
 
 
-class T5EncoderLayer(EncoderLayer):
+class T5EncoderLayer(nn.Module):
     """T5 encoder layer: pre-norm self-attention + pre-norm MLP."""
 
     def __init__(
@@ -512,7 +517,7 @@ class T5EncoderLayer(EncoderLayer):
 # ---------------------------------------------------------------------------
 
 
-class T5DecoderLayer(EncoderDecoderLayer):
+class T5DecoderLayer(nn.Module):
     """T5 decoder layer: pre-norm self-attention + pre-norm cross-attention +
     pre-norm MLP."""
 

@@ -39,7 +39,6 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.cross_attention import CrossAttention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.encoder_decoder_layer import EncoderDecoderLayer, EncoderLayer
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
@@ -151,7 +150,7 @@ class BartCrossAttention(CrossAttention):
 # ---------------------------------------------------------------------------
 
 
-class BartEncoderLayer(EncoderLayer):
+class BartEncoderLayer(nn.Module):
     """BART encoder layer: self-attention → add+LN → MLP → add+LN (post-norm)."""
 
     def __init__(
@@ -221,7 +220,7 @@ class BartEncoderLayer(EncoderLayer):
 # ---------------------------------------------------------------------------
 
 
-class BartDecoderLayer(EncoderDecoderLayer):
+class BartDecoderLayer(nn.Module):
     """BART decoder layer: self-attn → add+LN → cross-attn → add+LN → MLP → add+LN."""
 
     def __init__(

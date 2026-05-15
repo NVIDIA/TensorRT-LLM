@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
@@ -318,6 +319,15 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                     crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                 }
+                if (isEncoderInit)
+                {
+                    // Encoder admission does not reserve self- or cross-pool
+                    // blocks. Without a cross manager the dual-pool contract
+                    // cannot be satisfied later by decoder context, so fail
+                    // fast instead of admitting a request that cannot complete.
+                    TLLM_CHECK_WITH_INFO(reservedCrossBlocks.has_value(),
+                        "Encoder-init request %lu requires an enc_dec_kv_cache_manager.", req->mRequestId);
+                }
 
                 // Beneficial-to-skip check using the cached summary
                 if (!StaticBatchScheduling && skippingIsRelevant && (isFirstChunkContext || isEncoderInit)
@@ -334,19 +344,6 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 
                 if (isEncoderInit)
                 {
-                    // Encoder admission does not reserve self- or cross-pool
-                    // blocks.  Without a cross manager the dual-pool contract
-                    // cannot be satisfied later by decoder context, so surface
-                    // this and skip rather than silently admitting a request
-                    // that cannot complete.
-                    if (!reservedCrossBlocks)
-                    {
-                        TLLM_LOG_WARNING(
-                            "Encoder-init request %lu scheduled without a enc_dec_kv_cache_manager; skipping.",
-                            req->mRequestId);
-                        continue;
-                    }
-
                     bool enoughCrossBlocks = reservedCrossBlocks->enoughAvailableBlocks(*req, crossSummary);
                     bool reqHasLora = req->getLoraTaskId().has_value();
                     bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
@@ -565,16 +562,11 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
 
         if (req->isEncoderInitState())
         {
-            // Encoder admission does not reserve KV blocks.  Without a cross
+            // Encoder admission does not reserve KV blocks. Without a cross
             // manager we cannot honour the dual-pool contract at the later
-            // decoder-context admission — surface this and refuse admission
-            // rather than silently routing through self.
-            if (!crossBlocksManager)
-            {
-                TLLM_LOG_WARNING("Encoder-init request %lu scheduled without a enc_dec_kv_cache_manager; skipping.",
-                    req->mRequestId);
-                return false;
-            }
+            // decoder-context admission, so fail before running encoder work.
+            TLLM_CHECK_WITH_INFO(crossBlocksManager.has_value(),
+                "Encoder-init request %lu requires an enc_dec_kv_cache_manager.", req->mRequestId);
             auto const crossScheduledIfFits = crossBlocksManager->prepareNewNumberOfBlocksIfWeEndUpScheduling(*req);
             if (crossScheduledIfFits && fitsPeft)
             {

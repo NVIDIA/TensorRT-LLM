@@ -1051,6 +1051,12 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
             for requests in [pending_dis_gen_init_requests, pending_requests]:
                 for req in requests:
+                    if req.is_encoder_init_state and reserved_cross_blocks is None:
+                        raise RuntimeError(
+                            f"Encoder-init request {req.request_id} requires "
+                            "an enc_dec_kv_cache_manager."
+                        )
+
                     if (
                         not self.static_batch
                         and skipping_is_relevant
@@ -1081,17 +1087,10 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                     if req.is_encoder_init_state:
                         # Encoder admission only admits encoder compute.
                         # KV block budgeting happens when the request is
-                        # scheduled as decoder CONTEXT_INIT.  Without a cross
+                        # scheduled as decoder CONTEXT_INIT. Without a cross
                         # manager, the later decoder context cannot satisfy
-                        # the dual-pool contract, so skip the request here.
-                        if reserved_cross_blocks is None:
-                            logger.warning(
-                                "Encoder-init request %s scheduled without "
-                                "a enc_dec_kv_cache_manager; skipping.",
-                                req.request_id,
-                            )
-                            continue
-
+                        # the dual-pool contract, so fail before running
+                        # encoder work.
                         if not reserved_cross_blocks.enough_available_blocks(
                             req, cached_summary=cached_cross_summary
                         ):
@@ -1217,6 +1216,11 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 req_it += 1
                 continue
 
+            if req.is_encoder_init_state and scheduled_cross_blocks_manager is None:
+                raise RuntimeError(
+                    f"Encoder-init request {req.request_id} requires an enc_dec_kv_cache_manager."
+                )
+
             if skipping_is_relevant and scheduler._beneficial_to_skip(
                 req,
                 newly_contributed_context_blocks,
@@ -1282,12 +1286,6 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         # context admission. Still require the cross manager so a
         # misconfigured enc-dec runtime fails before running encoder work.
         if req.is_encoder_init_state:
-            if scheduled_cross_blocks_manager is None:
-                logger.warning(
-                    "Encoder-init request %s scheduled without a enc_dec_kv_cache_manager; skipping.",
-                    req.request_id,
-                )
-                return False, num_scheduled_peft_pages
             cross_blocks_if_scheduled = (
                 scheduled_cross_blocks_manager.prepare_blocks_if_schedulable(req)
             )
