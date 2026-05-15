@@ -131,7 +131,9 @@ def _evaluate_number_set_response(
         common = int(all_same.group(1))
         if common == number_value:
             return ("valid", None, [])
-        return ("cross_contamination", "wrong_common_number", [common])
+        if common in number_pool:
+            return ("cross_contamination", "wrong_common_number", [common])
+        return ("hallucination_ok", None, [])
 
     unique = _UNIQUE_RE.search(normalized)
     if unique:
@@ -255,33 +257,30 @@ async def _send_one(
     underlying HTTPX connection; ``trtllm-serve`` treats this as a client
     disconnect and aborts the in-flight request.
     """
-    try:
-        if cancel_after_s is None:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.0,
-            )
-            return resp.choices[0].message.content
-
-        task = asyncio.create_task(
-            client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.0,
-            )
+    if cancel_after_s is None:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.0,
         )
-        await asyncio.sleep(cancel_after_s)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        return resp.choices[0].message.content
+
+    task = asyncio.create_task(
+        client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+    )
+    await asyncio.sleep(cancel_after_s)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
         return None
-    except (asyncio.CancelledError, Exception):
-        return None
+    return None
 
 
 @skip_pre_blackwell
@@ -327,9 +326,14 @@ async def test_no_kv_cache_contamination_under_cancel(server: RemoteOpenAIServer
             return_exceptions=True,
         )
 
-        for sent_tag, body in zip(sent, results):
-            if not isinstance(body, str):
+        for i, (sent_tag, body) in enumerate(zip(sent, results)):
+            if i in cancel_indices:
                 continue
+            if isinstance(body, BaseException):
+                raise body
+            assert isinstance(body, str), (
+                f"round {round_idx} request {i}: expected completion, got {body!r}"
+            )
             completed_count += 1
             if sent_tag in body:
                 correct_echo_count += 1
@@ -412,9 +416,14 @@ async def test_no_kv_cache_contamination_number_set_probe(
             )
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for sent_value, body in zip(sent_values, results):
-            if not isinstance(body, str):
+        for i, (sent_value, body) in enumerate(zip(sent_values, results)):
+            if i in cancel_indices:
                 continue
+            if isinstance(body, BaseException):
+                raise body
+            assert isinstance(body, str), (
+                f"round {round_idx} request {i}: expected completion, got {body!r}"
+            )
             completed_count += 1
             verdict, reason, matched = _evaluate_number_set_response(sent_value, body, number_pool)
             if verdict in ("valid", "hallucination_ok"):
@@ -465,6 +474,14 @@ def test_evaluate_number_set_all_same_wrong_common():
     assert verdict == "cross_contamination"
     assert reason == "wrong_common_number"
     assert matched == [99]
+
+
+def test_evaluate_number_set_all_same_wrong_not_in_pool():
+    pool = {10, 99}
+    verdict, reason, matched = _evaluate_number_set_response(10, "ALL_SAME:999888777", pool)
+    assert verdict == "hallucination_ok"
+    assert reason is None
+    assert matched == []
 
 
 def test_evaluate_number_set_unique_intersects_pool():
