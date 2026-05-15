@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
@@ -12,7 +15,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.linear import Linear  # noqa: E402  (avoid cycle)
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
@@ -956,6 +959,9 @@ class DeepseekV4Indexer(Indexer):
             is_indexer=True,
             rotate_activation=HAS_FAST_HADAMARD,
         )
+        self.indexer_start_event = torch.cuda.Event()
+        self.weights_proj_event = torch.cuda.Event()
+        self.k_cache_update_event = torch.cuda.Event()
 
     def post_load_weights(self):
         # V4 does not use the V3 fused fp32 wk+weights_proj GEMM, and the
@@ -984,6 +990,101 @@ class DeepseekV4Indexer(Indexer):
         )
         return q
 
+    def _quantize_q(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Rotate + quantize (layout matches compressor K: [nope|pe]).
+        q = rotate_activation(q)
+        q = q.view(-1, self.head_dim)
+        q_fp8, q_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
+            q, use_ue8m0=self.scale_fmt == "ue8m0"
+        )
+        q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
+        q_scale = q_scale.view(-1, self.n_heads, 1)
+        return q_fp8, q_scale
+
+    def _update_k_cache_if_needed(
+        self,
+        k_fp8: Optional[torch.Tensor],
+        k_scale: Optional[torch.Tensor],
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+    ) -> None:
+        if k_fp8 is None:
+            return
+
+        assert k_scale is not None, "FP8 blockwise indexer cache update requires scale tensor"
+        self._update_k_cache(k_fp8, k_scale, metadata)
+
+    def _run_overlapped_indexer_prepare(
+        self,
+        qr: torch.Tensor,
+        hidden_states: torch.Tensor,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+        """Prepare indexer inputs by splitting independent work across two streams.
+
+        The current stream owns the Q path.  The auxiliary stream starts from
+        the recorded launch point and owns weights projection, compressor, and
+        the K-cache update.
+
+        Timeline:
+            current stream:
+                record indexer_start_event
+                q_proj + RoPE -> quant_q
+                wait weights_proj_event -> weight_scale
+                wait k_cache_update_event -> return
+
+            aux_stream:
+                wait indexer_start_event
+                weights_proj -> record weights_proj_event
+                compressor -> update_k_cache -> record k_cache_update_event
+
+        Dependency graph:
+            q_proj + RoPE -> quant_q -- q_scale --.
+                                                   v
+            weights_proj --------------------> weight_scale
+            compressor -> update_k_cache ----> final wait
+        """
+        self.indexer_start_event.record()
+
+        q = self._qk_projection_and_rope(qr, position_ids)
+
+        with torch.cuda.stream(self.aux_stream):
+            self.indexer_start_event.wait()
+
+            weights = self.weights_proj(hidden_states)
+            self.weights_proj_event.record()
+
+            k_fp8, k_scale = self.compressor(hidden_states, metadata)
+            self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
+            self.k_cache_update_event.record()
+
+        q_fp8, q_scale = self._quantize_q(q)
+
+        self.weights_proj_event.wait()
+        weights = self._weight_scale(weights, q_scale)
+
+        self.k_cache_update_event.wait()
+        return q_fp8, k_fp8, k_scale, weights
+
+    def _run_serial_indexer_prepare(
+        self,
+        qr: torch.Tensor,
+        hidden_states: torch.Tensor,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+        position_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+        q = self._qk_projection_and_rope(qr, position_ids)
+
+        q_fp8, q_scale = self._quantize_q(q)
+
+        weights = self.weights_proj(hidden_states)
+
+        weights = self._weight_scale(weights, q_scale)
+
+        k_fp8, k_scale = self.compressor(hidden_states, metadata)
+        self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
+        return q_fp8, k_fp8, k_scale, weights
+
     def forward(
         self,
         qr: torch.Tensor,
@@ -998,36 +1099,27 @@ class DeepseekV4Indexer(Indexer):
                 "cache layout, cache update, and BMM paths before end-to-end indexer "
                 "execution can use it."
             )
-        # compress k
-        k_fp8, k_scale = self.compressor(hidden_states, metadata)
-
-        # multi-stream q proj/rope and weights proj
-        q, weights = maybe_execute_in_parallel(
-            lambda: self._qk_projection_and_rope(qr, position_ids),
-            lambda: self.weights_proj(hidden_states),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-
-        # Rotate + quantize (layout matches compressor K: [nope|pe])
-        q = rotate_activation(q)
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
-            q, use_ue8m0=self.scale_fmt == "ue8m0"
-        )
-        q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_heads, 1)
-
-        # weights scale
-        weights = self._weight_scale(weights, q_scale)
+        if do_multi_stream() and self.aux_stream is not None:
+            q_fp8, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
+                qr, hidden_states, metadata, position_ids
+            )
+        else:
+            q_fp8, k_fp8, k_scale, weights = self._run_serial_indexer_prepare(
+                qr, hidden_states, metadata, position_ids
+            )
 
         # If there are no compressed tokens, return an topk indices buffer with all -1s in the tensor.
         if k_fp8 is None:
             topk_indices = metadata.empty_topk_indices_buffer[: hidden_states.shape[0]]
         else:
             topk_indices = self.sparse_attn_indexer(
-                metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
+                metadata,
+                hidden_states,
+                q_fp8,
+                k_fp8,
+                k_scale,
+                weights,
+                update_k_cache=False,
             )
         return topk_indices
 
