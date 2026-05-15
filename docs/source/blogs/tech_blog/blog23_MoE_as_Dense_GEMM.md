@@ -19,7 +19,7 @@ limited latency impact, while the denser GEMM shapes improve hardware utilizatio
 The implementation in TensorRT-LLM is staged. The current backend applies this dense formulation to the
 routed experts first, while shared experts and Router/TopK scheduling remain outside the dense backend.
 On a DeepSeek-V3-style B200 profile, this current routed-expert implementation is best in the
-`num_tokens = 48-256` range, reaching up to 1.20x speedup over the TRTLLM-Gen grouped-GEMM path in the
+`num_tokens = 64-208` range, reaching up to 1.12x speedup over the TRTLLM-Gen grouped-GEMM path in the
 measured TP8 MoE module benchmark.
 
 <p align="center">
@@ -71,13 +71,14 @@ main claims should be read with the following scope:
 - **Performance numbers** refer to the current routed-expert implementation, not the full target
   workflow. The benchmark uses TP8 with `TRTLLM_MOE_FUSED_FC2_ALPHA=1` and reports per-rank MoE module
   compute latency. The two tensor-parallel AllReduces that flank the MoE module are excluded.
-- The practical sweet spot in the measured B200 DeepSeek-V3-style profile is `num_tokens = 48-256`.
-  Below that range, TRTLLM-Gen is faster; above it, DENSEGEMM's redundant compute starts to cost latency.
+- The practical sweet spot in the measured B200 DeepSeek-V3-style profile is `num_tokens = 64-208`.
+  Below that range, TRTLLM-Gen is faster; above it, DENSEGEMM returns to parity and then falls behind
+  once redundant compute and tactic changes start to cost latency.
 
 The core idea is therefore narrow but useful: when routed expert GEMMs are memory-bound, it can be
 faster to issue one dense, well-shaped GEMM over all routed experts than many small grouped GEMMs over
 only the selected experts. The target workflow extends that idea to the rest of the MoE FFN once the
-remaining scheduling, layout, and accuracy issues are resolved.
+remaining scheduling, layout, and numerical-closure issues are resolved.
 
 ## DENSEGEMM Design
 
@@ -304,7 +305,7 @@ tcgen05 MMA, on top of which expert-aware alpha fusion is implemented separately
 | | FC1 | FC2 |
 |---|---|---|
 | Custom op | `cute_dsl_nvfp4_dense_gemm_swiglu_blackwell` | `cute_dsl_nvfp4_dense_gemm_fc2_blackwell` |
-| Math form | `A = SwiGLU(alpha_fc31 x X @ W^T)`, optional `A x alpha_post` | `C = (alpha_scale x A) @ B` |
+| Math form | `A = SwiGLU(alpha_fc31 x X @ W^T)`, optional `A x alpha_post` | `C = (alpha_scale x A) @ B^T` |
 | Expert concat dim | N (per-expert tile = `2 x intermediate`) | K (per-expert tile = `intermediate`, 256-aligned) |
 | Alpha fusion site | **Epilogue**, block-wise along N | **Mainloop**, block-wise along M and K |
 | AutoTune space | MMA `[(128,128),(128,256),(256,256)]`, cluster `[(1,1),(1,2),(1,4),(2,1)]` | MMA `[(128,64),(128,128),(128,256)]`, cluster `[(1,1),(1,2),(1,4)]` |
@@ -349,37 +350,39 @@ The table below reports latency for representative `num_tokens` values with
 `TRTLLM_MOE_FUSED_FC2_ALPHA=1`. Before reading the full table, the three main takeaways are:
 
 - DENSEGEMM is not the min-latency winner at `num_tokens <= 32`.
-- DENSEGEMM is strongest in the `num_tokens = 48-256` range, with the largest observed lead at
+- DENSEGEMM is strongest in the `num_tokens = 64-208` range, with the largest observed lead at
   `num_tokens = 128`.
-- TRTLLM-Gen catches up and overtakes once DENSEGEMM approaches the compute-bound crossover.
+- TRTLLM-Gen catches up around `num_tokens = 224-256` and clearly overtakes from `num_tokens = 272`.
 
 The speedup column is `t_TRTLLM-Gen / t_DENSEGEMM`; values greater than 1 indicate DENSEGEMM is faster.
 
 | num_tokens | DENSEGEMM (us) | TRTLLM-Gen (us) | CUTLASS (us) | DENSEGEMM vs TRTLLM-Gen |
 |---:|---:|---:|---:|:---:|
-| 1 | 156.21 | 31.21 | 96.77 | 0.20x |
-| 8 | 147.20 | 63.39 | 150.55 | 0.43x |
-| 16 | 148.09 | 90.91 | 200.05 | 0.61x |
-| 32 | 140.59 | 119.07 | 262.73 | 0.85x |
-| **48** | **136.11** | 141.37 | 290.50 | **1.04x** |
-| **64** | **136.79** | 149.23 | 308.44 | **1.09x** |
-| **128** | **138.86** | 166.35 | 335.65 | **1.20x** |
-| **192** | **161.16** | 176.63 | 350.68 | **1.10x** |
-| **256** | **165.91** | 176.21 | 351.98 | **1.06x** |
-| 272 | 223.99 | 184.42 | 357.90 | 0.82x |
-| 336 | 228.42 | 189.59 | 363.58 | 0.83x |
-| 384 | 231.17 | 196.47 | 368.12 | 0.85x |
+| 1 | 149.66 | 26.78 | 96.77 | 0.18x |
+| 8 | 142.15 | 57.68 | 150.55 | 0.41x |
+| 16 | 144.25 | 86.55 | 200.05 | 0.60x |
+| 32 | 144.15 | 117.20 | 262.73 | 0.81x |
+| 48 | 139.35 | 133.54 | 290.50 | 0.96x |
+| **64** | **140.59** | 141.68 | 308.44 | **1.01x** |
+| **128** | **144.50** | 161.87 | 335.65 | **1.12x** |
+| **192** | **166.61** | 168.23 | 350.68 | **1.01x** |
+| **208** | **168.38** | 169.34 | 354.73 | **1.01x** |
+| 224 | 169.61 | 169.24 | 354.01 | 1.00x |
+| 256 | 173.01 | 172.17 | 351.98 | 1.00x |
+| 272 | 241.80 | 176.10 | 357.90 | 0.73x |
+| 336 | 251.33 | 184.32 | 363.58 | 0.73x |
+| 384 | 257.37 | 186.92 | 368.12 | 0.73x |
 
 Observations:
 
-- **`num_tokens = 48-256` is DENSEGEMM's measured sweet spot**, with a 4%-20% lead over TRTLLM-Gen and
-  a 2.1x-2.4x lead over CUTLASS across that range.
+- **`num_tokens = 64-208` is DENSEGEMM's measured sweet spot**, reaching up to a 12% lead over TRTLLM-Gen
+  and a 2.1x-2.3x lead over CUTLASS across that range.
 - **DENSEGEMM is not advantageous at `num_tokens <= 32`.** The current implementation loads weights for
   all 256 routed experts; at small batch sizes, the weight-load time is roughly fixed at about 145 us,
   while TRTLLM-Gen only loads selected experts.
-- **TRTLLM-Gen overtakes DENSEGEMM at `num_tokens >= 272`** because DENSEGEMM steps up to a slower
-  FC1 tactic/configuration while the workload approaches the compute-bound crossover where redundant
-  dense arithmetic starts to matter.
+- **TRTLLM-Gen catches up around `num_tokens = 224` and clearly overtakes at `num_tokens >= 272`** because
+  DENSEGEMM steps up to a slower FC1 tactic/configuration while the workload approaches the compute-bound
+  crossover where redundant dense arithmetic starts to matter.
 
 ### Roofline Sanity Check
 
@@ -387,7 +390,8 @@ The measured FC1 behavior matches the roofline prediction. At `num_tokens = 48` 
 about 80% of B200 HBM bandwidth and stays close to the memory-bound lower bound. Around
 `num_tokens = 336`, FC1 crosses into the compute-bound region: `xRoofline` rises above 2x and effective
 bandwidth drops below 50%. This matches the MoE module latency trend where DENSEGEMM wins in the
-`48-256` range but loses again once the redundant dense arithmetic becomes visible.
+`64-208` range, returns to parity around `224-256`, and loses again once the redundant dense arithmetic
+becomes visible.
 
 ## Current Limitations and Future Work
 
@@ -420,8 +424,8 @@ Future directions include:
 
 ## References
 
-- Source code: [`tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py`](../../../../tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py)
-- Backend selection: [`tensorrt_llm/_torch/modules/fused_moe/create_moe.py`](../../../../tensorrt_llm/_torch/modules/fused_moe/create_moe.py)
-- FC1 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py`](../../../../tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py)
-- FC2 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py`](../../../../tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py)
-- Custom op registration: [`tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py`](../../../../tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py)
+- Source code: [`tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py)
+- Backend selection: [`tensorrt_llm/_torch/modules/fused_moe/create_moe.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/create_moe.py)
+- FC1 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py)
+- FC2 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py)
+- Custom op registration: [`tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py)
