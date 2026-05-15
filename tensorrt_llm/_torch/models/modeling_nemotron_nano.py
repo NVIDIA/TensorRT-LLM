@@ -1,7 +1,6 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import math
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
@@ -43,9 +42,13 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
+    _is_disagg,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
+    has_raw_multimodal_payload,
+    is_disagg_context_role,
+    make_multimodal_layout_metadata,
 )
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
@@ -398,27 +401,6 @@ class DynamicResolutionImageTiler:
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
-    return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
-
-
-_DISAGG_ROLE_ENV_NAME = "TRTLLM_DISAGG_ROLE"
-_DISAGG_CONTEXT_ROLES = {"context", "ctx"}
-
-
-def _is_disagg_context_role() -> bool:
-    return os.getenv(_DISAGG_ROLE_ENV_NAME, "").lower() in _DISAGG_CONTEXT_ROLES
-
-
-def _has_raw_multimodal_data(param: MultimodalParams) -> bool:
-    multimodal_data = param.multimodal_data or {}
-    modality_type = multimodal_data.get("modality_type")
-    return (
-        modality_type in ("image", "video", "audio")
-        and multimodal_data.get(modality_type) is not None
-    )
-
-
 class SquaredReLU(nn.Module):
     def forward(self, x):
         return torch.pow(torch.nn.functional.relu(x), 2)
@@ -2354,13 +2336,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             mm_mask, num_mm_tokens
         )
 
-        layout_metadata = {
-            "multimodal_item_run_cu_offsets": item_run_cu_offsets,
-            "multimodal_run_positions": run_positions,
-            "multimodal_run_lengths": run_lengths,
-            "multimodal_embedding_lengths": multimodal_embedding_lengths,
-            "special_token_offsets": special_token_offsets,
-        }
+        layout_metadata = make_multimodal_layout_metadata(
+            item_run_cu_offsets,
+            run_positions,
+            run_lengths,
+            multimodal_embedding_lengths,
+            special_token_offsets=special_token_offsets,
+        )
         return expanded_ids, num_mm_tokens, mm_token_offsets, layout_metadata
 
     def _prepare_audio_features(
@@ -2626,7 +2608,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # to be the LLM-only config and no longer has vision_config /
         # sound_config / force_image_size / etc.
         mm_pretrained = self._mm_model_config.pretrained_config
-        is_multimodal_encoder_worker = not _is_disagg() or _is_disagg_context_role()
+        is_multimodal_encoder_worker = not _is_disagg() or is_disagg_context_role()
         if self.vision_encoder is None and is_multimodal_encoder_worker:
             self.vision_encoder = NanoV2VLVisionEncoder(self._mm_model_config).eval().to("cuda")
         sound_config = getattr(mm_pretrained, "sound_config", None)
@@ -3130,9 +3112,9 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             ctx_params = multimodal_params[:num_context_requests]
             if self.video_pruning_rate > 0:
                 self._validate_evs_context_batch(ctx_params, num_context_requests)
-            raw_ctx_params = [param for param in ctx_params if _has_raw_multimodal_data(param)]
+            raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
             if raw_ctx_params:
-                if _is_disagg() and not _is_disagg_context_role():
+                if _is_disagg() and not is_disagg_context_role():
                     raise ValueError(
                         "Raw multimodal inputs require a local multimodal encoder on the "
                         "disaggregated context worker. Set TRTLLM_DISAGG_ROLE=context for "

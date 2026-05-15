@@ -18,11 +18,9 @@ from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.inputs.multimodal import (MultimodalInput,
-                                            _find_mm_embedding_lengths_from_masks,
                                             _find_mm_token_runs_from_mask,
                                             apply_mm_hashes)
-from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
-                                                 serialize_item)
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -695,30 +693,6 @@ def test_multimodal_input_exact_run_buffers():
             multimodal_run_positions=[1],
             multimodal_run_lengths=[3],
         )
-
-
-def test_multimodal_embedding_lengths_exclude_special_tokens():
-    """Embedding lengths omit multimodal wrapper tokens used only in prompts."""
-    mm_mask = torch.tensor(
-        [False, True, True, True, True, True, False, True, True, True, True])
-    embed_mask = torch.tensor([
-        False,
-        False,
-        True,
-        True,
-        False,
-        True,
-        False,
-        True,
-        False,
-        True,
-        True,
-    ])
-
-    embedding_lengths = _find_mm_embedding_lengths_from_masks(
-        mm_mask, embed_mask, [5, 4])
-
-    assert embedding_lengths == [3, 3]
 
 
 def test_multimodal_input_rejects_exact_run_int32_overflow():

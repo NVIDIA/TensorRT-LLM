@@ -87,47 +87,6 @@ class RMSNorm(nn.Module):
                 return_hp_output = False
         self.return_hp_output = return_hp_output
 
-    def _torch_rms_norm(
-        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        if residual is not None:
-            hidden_states = hidden_states + residual.to(torch.float32)
-            residual = hidden_states.to(input_dtype)
-
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance +
-                                                    self.variance_epsilon)
-        if not self.use_gemma:
-            hidden_states = self.weight * hidden_states.to(input_dtype)
-        else:
-            hidden_states = (self.weight + 1) * hidden_states.to(input_dtype)
-        return hidden_states, residual
-
-    def _flashinfer_rms_norm(
-        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        from ..custom_ops import (flashinfer_fused_add_rmsnorm,
-                                  flashinfer_gemma_fused_add_rmsnorm,
-                                  flashinfer_gemma_rmsnorm, flashinfer_rmsnorm)
-        if residual is not None:
-            if not self.use_gemma:
-                flashinfer_fused_add_rmsnorm(hidden_states, residual,
-                                             self.weight, self.variance_epsilon)
-            else:
-                flashinfer_gemma_fused_add_rmsnorm(hidden_states, residual,
-                                                   self.weight,
-                                                   self.variance_epsilon)
-        else:
-            if not self.use_gemma:
-                hidden_states = flashinfer_rmsnorm(hidden_states, self.weight,
-                                                   self.variance_epsilon)
-            else:
-                hidden_states = flashinfer_gemma_rmsnorm(
-                    hidden_states, self.weight, self.variance_epsilon)
-        return hidden_states, residual
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -228,11 +187,42 @@ class RMSNorm(nn.Module):
                     use_gemma=self.use_gemma,
                 )
         elif IS_FLASHINFER_AVAILABLE:
-            hidden_states, residual = self._flashinfer_rms_norm(
-                hidden_states, residual)
+            from ..custom_ops import (flashinfer_fused_add_rmsnorm,
+                                      flashinfer_gemma_fused_add_rmsnorm,
+                                      flashinfer_gemma_rmsnorm,
+                                      flashinfer_rmsnorm)
+            if residual is not None:
+                if not self.use_gemma:
+                    flashinfer_fused_add_rmsnorm(hidden_states, residual,
+                                                 self.weight,
+                                                 self.variance_epsilon)
+                else:
+                    flashinfer_gemma_fused_add_rmsnorm(hidden_states, residual,
+                                                       self.weight,
+                                                       self.variance_epsilon)
+            else:
+                if not self.use_gemma:
+                    hidden_states = flashinfer_rmsnorm(hidden_states,
+                                                       self.weight,
+                                                       self.variance_epsilon)
+                else:
+                    hidden_states = flashinfer_gemma_rmsnorm(
+                        hidden_states, self.weight, self.variance_epsilon)
         else:
-            hidden_states, residual = self._torch_rms_norm(
-                hidden_states, residual)
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            if residual is not None:
+                hidden_states = hidden_states + residual.to(torch.float32)
+                residual = hidden_states.to(input_dtype)
+
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance +
+                                                        self.variance_epsilon)
+            if not self.use_gemma:
+                hidden_states = self.weight * hidden_states.to(input_dtype)
+            else:
+                hidden_states = (self.weight +
+                                 1) * hidden_states.to(input_dtype)
 
         if has_residual:
             return hidden_states, cast(Optional[torch.Tensor], residual)

@@ -32,11 +32,46 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
+_DISAGG_ROLE_ENV_NAME = "TRTLLM_DISAGG_ROLE"
+_DISAGG_CONTEXT_ROLES = {"context", "ctx"}
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+
+
+def is_disagg_context_role() -> bool:
+    return os.getenv(_DISAGG_ROLE_ENV_NAME, "").lower() in _DISAGG_CONTEXT_ROLES
+
+
+def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
+    multimodal_data = param.multimodal_data or {}
+    modality_type = multimodal_data.get("modality_type")
+    return (modality_type in ("image", "video", "audio")
+            and multimodal_data.get(modality_type) is not None)
+
+
+def make_multimodal_layout_metadata(
+    item_run_cu_offsets: List[int],
+    run_positions: List[int],
+    run_lengths: List[int],
+    multimodal_embedding_lengths: List[int],
+    *,
+    special_token_offsets: Optional[List[int]] = None,
+    item_types: Optional[List[int]] = None,
+) -> Dict[str, List[int]]:
+    metadata = {
+        "multimodal_item_run_cu_offsets": item_run_cu_offsets,
+        "multimodal_run_positions": run_positions,
+        "multimodal_run_lengths": run_lengths,
+        "multimodal_embedding_lengths": multimodal_embedding_lengths,
+    }
+    if special_token_offsets is not None:
+        metadata["special_token_offsets"] = special_token_offsets
+    if item_types is not None:
+        metadata["item_types"] = item_types
+    return metadata
 
 
 # Processor *output* keys that transformers 5.x's

@@ -8,6 +8,7 @@ import torch
 from tensorrt_llm.inputs.multimodal import (
     MultimodalInput,
     MultimodalRuntimeData,
+    _find_mm_embedding_lengths_from_masks,
     add_multimodal_run_metadata,
 )
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
@@ -58,6 +59,30 @@ def test_add_multimodal_run_metadata_preserves_item_runs_in_py_data():
         "multimodal_run_positions": [2],
         "multimodal_run_lengths": [4],
     }
+
+
+def test_multimodal_embedding_lengths_exclude_special_tokens():
+    """Embedding lengths omit multimodal wrapper tokens used only in prompts."""
+    mm_mask = torch.tensor([False, True, True, True, True, True, False, True, True, True, True])
+    embed_mask = torch.tensor(
+        [
+            False,
+            False,
+            True,
+            True,
+            False,
+            True,
+            False,
+            True,
+            False,
+            True,
+            True,
+        ]
+    )
+
+    embedding_lengths = _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask, [5, 4])
+
+    assert embedding_lengths == [3, 3]
 
 
 def test_runtime_data_cumsum_math_simplest():

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm.inputs import (
     AudioData,
+    VideoData,
     create_input_processor,
     create_input_processor_with_hash,
     default_multimodal_input_loader,
@@ -93,7 +94,7 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypat
         MagicMock(return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None)),
     )
 
-    video = SimpleNamespace(frames=[object()], metadata={}, audio=None)
+    video = VideoData(frames=[object()], metadata={}, audio=None)
     expanded_ids, mm_lengths, mm_offsets, layout = processor.get_prompt_token_ids(
         {
             "prompt": "Question <video> answer",
