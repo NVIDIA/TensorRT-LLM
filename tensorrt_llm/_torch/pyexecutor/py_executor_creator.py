@@ -825,6 +825,17 @@ def create_py_executor(
         is_hybrid = is_hybrid_linear(config)
 
         if is_disagg and is_hybrid:
+            # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
+            # no effect in disagg. The disagg manager choice is driven solely
+            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
+            # otherwise CppMambaCacheManager. Clear the var here so the
+            # mutual-exclusion check in use_cpp_mamba_cache_manager() does
+            # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
+            if os.environ.pop("TRTLLM_USE_PY_MAMBA", "0") == "1":
+                logger.warning(
+                    "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
+                    "use cache_transceiver_config.transceiver_runtime='PYTHON' "
+                    "to select PythonMambaCacheManager.")
             if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
                     "TRTLLM_USE_CPP_MAMBA") == "1":
                 logger.info("Disaggregated serving with hybrid model detected. "
