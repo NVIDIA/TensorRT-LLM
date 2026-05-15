@@ -215,6 +215,21 @@ class LTX2Attention(Attention):
             self.attn = self._ulysses_cross_attn if active else self._plain_cross_attn
             return
 
+    def is_ulysses_active(self) -> bool:
+        """Whether ``self.attn`` is currently the Ulysses-wrapped path.
+
+        Symmetric with ``set_ulysses_active``. Returns False when no Ulysses
+        wrapper was built for this module (e.g. Attention2D mode, or cross-
+        attn without ``use_ulysses_cross``), so callers can use it to decide
+        whether to pass seq-sharded K/V (wrapper handles a2a) or to all-
+        gather K/V into full sequence first (plain backend).
+        """
+        if self._has_dual_attn:
+            return self.attn is self._ulysses_attn
+        if self._has_cross_dual_attn:
+            return self.attn is self._ulysses_cross_attn
+        return False
+
     def _init_qkv_proj(self):
         """Override for cross-attention: use _context_dim for K/V input.
 
@@ -800,24 +815,30 @@ class BasicAVTransformerBlock(nn.Module):
 
                 # Project-before-gather (video → audio direction). RoPE applied
                 # to K in project_kv on local shard; see audio→video branch above.
-                # Strict-Ulysses v2a: K/V (video, large) stay seq-sharded when
-                # ``_audio_is_sharded`` is True; the UlyssesAttention wrapper
-                # inside ``video_to_audio_attn`` handles the Q a2a + fused
-                # K|V 5D a2a (or independent 4D a2a when the underlying backend
-                # doesn't support fused QKV) + output a2a. RoPE commutes with
-                # the a2a along the seq dim, so rotate-before-gather is
-                # value-preserving. No key_padding_mask — video K/V is
-                # unpadded; padded audio Q is stripped on exit by
-                # LTXModel.forward.
-                # When _audio_is_sharded is False (no padding + non-divisible
-                # T_a), ``set_ulysses_active(False)`` switches v2a back to
-                # the plain backend, and we AG video K/V here.
+                # Strict-Ulysses v2a: when the v2a Ulysses wrapper is active,
+                # K/V (video, large) stay seq-sharded and the wrapper handles
+                # the Q a2a + fused K|V 5D a2a (or independent 4D a2a when the
+                # underlying backend doesn't support fused QKV) + output a2a.
+                # RoPE commutes with a2a along the seq dim, so
+                # rotate-before-gather is value-preserving. No key_padding_mask
+                # — video K/V is unpadded; padded audio Q is stripped on exit
+                # by LTXModel.forward.
+                # When the wrapper is not active (no Ulysses build, or Stage 2
+                # disable, or audio not sharded), we fall back to the
+                # all-gather path so the plain backend gets full K/V.
+                # The gate uses the attention module's own state rather than
+                # ``_audio_is_sharded`` because the latter can be true under
+                # Attention2D (generic sequence parallelism, ulysses_size==1)
+                # where the Ulysses wrapper was never built.
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
                     vx_scaled, pe=video.cross_positional_embeddings
                 )
-                if self._sharder.is_active and not self._audio_is_sharded:
-                    # Fallback: audio not sharded → wrapper inactive → run plain
-                    # backend with all-gathered video K/V (existing behavior).
+                if (
+                    not self.video_to_audio_attn.is_ulysses_active()
+                    and self._sharder.is_active
+                ):
+                    # Fallback: wrapper inactive → all-gather sharded video
+                    # K/V to full so plain backend can run.
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
 
