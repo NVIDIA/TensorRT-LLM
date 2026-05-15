@@ -3497,7 +3497,17 @@ class PyTorchModelEngine(ModelEngine):
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
                                        outputs: dict):
-        """Apply logit post processors (in-place modify outputs Tensors) if any."""
+        """Apply logit post processors (in-place modify outputs Tensors) if any.
+
+        For beam search (beam_width > 1), iterates over all beams for each
+        request and passes per-beam token histories to the callback.
+        The logits tensor has ``beam_width`` rows per generation request, laid
+        out as ``[ctx_0, ..., gen_0_beam_0, gen_0_beam_1, ..., gen_1_beam_0, ...]``.
+
+        On 1.2.x this must run BEFORE make_decoding_batch_input so the
+        decoder sees the modified logits (forward_async reads from
+        decoding_input, not decoder_input_buffers).
+        """
 
         if not (self.mapping.is_last_pp_rank()):
             return
@@ -3509,29 +3519,66 @@ class PyTorchModelEngine(ModelEngine):
         num_ctx_req = len(scheduled_requests.context_requests)
         logits_tensor = outputs["logits"]
 
+        # Track running offset into logits_tensor because during beam search,
+        # generation requests contribute beam_width rows each while context
+        # requests contribute 1 row.
+        logit_row = 0
         for idx, request in enumerate(scheduled_requests.all_requests()):
+            is_ctx = idx < num_ctx_req
+            beam_width = 1 if is_ctx else request.sampling_config.beam_width
+
             logits_processors = getattr(request, "py_logits_post_processors",
                                         None)
             if not logits_processors:
+                logit_row += beam_width
                 continue
 
-            token_ids = request.get_tokens(0)
-            if idx < num_ctx_req and request.py_orig_prompt_len < len(
-                    token_ids):
-                # Skip as we only need to apply logit processor on the last context request
-                continue
+            if is_ctx:
+                token_ids = request.get_tokens(0)
+                if request.py_orig_prompt_len < len(token_ids):
+                    logit_row += 1
+                    continue
 
-            logits_row = logits_tensor[idx]
-            # Reshape to align w/ the shape used in the TRT backend,
-            # so the same logit processors can be used across both backends.
-            logits_row = logits_row.view(1, 1, -1)
-            token_ids = [token_ids]
-            for lp in logits_processors:
-                lp_params = inspect.signature(lp).parameters
+            if beam_width == 1:
+                # Single beam: original path.
+                token_ids = request.get_tokens(0)
+                logits_row = logits_tensor[logit_row]
+                logits_row = logits_row.view(1, 1, -1)
+                token_ids = [token_ids]
+                for lp in logits_processors:
+                    lp_params = inspect.signature(lp).parameters
+                    assert 4 <= len(lp_params) <= 5, (
+                        "Logit post processor signature must match the `LogitsProcessor` interface "
+                        "defined in `tensorrtllm.sampling_params`.")
+                    lp(request.py_request_id, logits_row, token_ids, None, None)
+                logits_tensor[logit_row] = logits_row.view(-1)
+                logit_row += 1
+            else:
+                # Beam search: process all beams together.
+                vocab_size = logits_tensor.shape[-1]
+                logits_block = logits_tensor[logit_row:logit_row + beam_width]
+                # Shape: [1, beam_width, vocab] to match TRT backend convention.
+                logits_block_3d = logits_block.view(1, beam_width, vocab_size)
 
-                assert 4 <= len(lp_params) <= 5, (
-                    "Logit post processor signature must match the `LogitsProcessor` interface "
-                    "defined in `tensorrtllm.sampling_params`.")
-                lp(request.py_request_id, logits_row, token_ids, None, None)
+                # Use coherent per-beam token histories if available.
+                # Built by PyExecutor._update_requests using parentIds
+                # tracing from the previous sampling step.
+                # Falls back to raw slot histories for the first step
+                # (before any beam reassignment has occurred).
+                coherent = getattr(request, 'py_coherent_beam_tokens', None)
+                if coherent is not None and len(coherent) == beam_width:
+                    all_beam_token_ids = coherent
+                else:
+                    all_beam_token_ids = [
+                        request.get_tokens(beam) for beam in range(beam_width)
+                    ]
 
-            logits_tensor[idx] = logits_row.view(-1)
+                for lp in logits_processors:
+                    lp_params = inspect.signature(lp).parameters
+                    assert 4 <= len(lp_params) <= 5, (
+                        "Logit post processor signature must match the `LogitsProcessor` interface "
+                        "defined in `tensorrtllm.sampling_params`.")
+                    lp(request.py_request_id, logits_block_3d,
+                       all_beam_token_ids, None, None)
+                logits_tensor[logit_row:logit_row + beam_width] = logits_block_3d.view(beam_width, vocab_size)
+                logit_row += beam_width
