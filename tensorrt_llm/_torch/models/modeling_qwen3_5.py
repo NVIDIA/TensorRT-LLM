@@ -5,6 +5,7 @@ import torch
 from transformers import PretrainedConfig
 
 from ...inputs import (
+    ContentFormat,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     register_input_processor,
@@ -112,32 +113,6 @@ def _normalize_qwen35_exclude_modules(model_config):
     qc.exclude_modules = sorted(normalized)
 
 
-def _ensure_qwen35_mrope_compat(text_config: PretrainedConfig) -> None:
-    """Normalize Qwen3.5 mRoPE fields for the shared Qwen3-VL wrapper.
-
-    Qwen3.5 stores RoPE metadata in ``rope_parameters``.  Some config classes
-    may also materialize default top-level ``rope_theta`` or
-    ``partial_rotary_factor`` values, so prefer the checkpoint-provided nested
-    values unconditionally here.
-    """
-    rope_parameters = getattr(text_config, "rope_parameters", None)
-    if not rope_parameters:
-        return
-
-    rope_params = dict(rope_parameters)
-    rope_theta = rope_params.pop("rope_theta", None)
-    if rope_theta is not None:
-        text_config.rope_theta = rope_theta
-
-    partial_rotary_factor = rope_params.pop("partial_rotary_factor", None)
-    if partial_rotary_factor is not None:
-        text_config.partial_rotary_factor = partial_rotary_factor
-
-    if not getattr(text_config, "rope_scaling", None):
-        rope_params.pop("rope_type", None)
-        text_config.rope_scaling = rope_params
-
-
 @register_auto_model("Qwen3_5MoeForCausalLM")
 class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     """Thin wrapper that registers the Qwen3.5 MoE text architecture.
@@ -193,14 +168,13 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
+        content_format=ContentFormat.STRING,
     ),
 )
 class Qwen3_5MoeVLModel(Qwen3VLModelBase):
     """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
-        _ensure_qwen35_mrope_compat(model_config.pretrained_config.text_config)
-
         kwargs["vision_model_class"] = Qwen3VisionModel
         kwargs["disable_fuse_rope"] = kwargs.get("disable_fuse_rope", False)
         super().__init__(model_config, *args, **kwargs)

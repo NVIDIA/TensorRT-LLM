@@ -6,6 +6,7 @@ from typing import List, Optional
 import torch
 import transformers
 
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 
 
@@ -19,6 +20,57 @@ def is_gemma4_hybrid(config):
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+
+
+def _coerce_torch_dtype(dtype):
+    """Normalize dtype values from HF configs into torch dtype objects.
+
+    HF configs may store dtype fields as torch dtypes, strings, or the sentinel
+    value "auto". Returning None for "auto" lets the caller keep its normal
+    fallback path instead of treating "auto" as a concrete cache dtype.
+    """
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype == "auto":
+        return None
+    if isinstance(dtype, str):
+        return str_dtype_to_torch(dtype)
+    return dtype
+
+
+def resolve_hf_torch_dtype(config):
+    """Return the model's regular tensor dtype from common HF config fields.
+
+    Transformers has used both dtype and torch_dtype across versions and model
+    families. This helper checks both names and coerces whichever one is present
+    into the form expected by TRT-LLM runtime code.
+    """
+    for attr in ("dtype", "torch_dtype"):
+        dtype = getattr(config, attr, None)
+        if dtype is not None:
+            return _coerce_torch_dtype(dtype)
+    return None
+
+
+def resolve_mamba_ssm_cache_dtype(config):
+    """Return the dtype to use for hybrid Mamba/SSM cache allocations.
+
+    Qwen3.5-style configs may store this field on the top-level config or the
+    nested text_config, and may call it either mamba_ssm_cache_dtype or
+    mamba_ssm_dtype. This helper centralizes that lookup so cache creation does
+    not fail later with a missing dtype.
+    """
+    configs = [config]
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        configs.append(text_config)
+
+    for candidate_config in configs:
+        for attr in ("mamba_ssm_cache_dtype", "mamba_ssm_dtype"):
+            dtype = getattr(candidate_config, attr, None)
+            if dtype is not None:
+                return _coerce_torch_dtype(dtype)
+    return None
 
 
 def is_nemotron_hybrid(config):
@@ -251,6 +303,12 @@ def extract_mamba_kv_cache_params(
 
     mamba_ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
                              if quant_config is not None else None)
+    if mamba_ssm_cache_dtype is not None:
+        mamba_ssm_cache_dtype = _coerce_torch_dtype(mamba_ssm_cache_dtype)
+    else:
+        mamba_ssm_cache_dtype = (resolve_mamba_ssm_cache_dtype(config)
+                                 or resolve_hf_torch_dtype(config)
+                                 or torch.bfloat16)
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -262,16 +320,21 @@ def extract_mamba_kv_cache_params(
         full_attention_layer_mask=full_attn_mask,
         num_mamba_layers=sum(mamba_mask),
         num_full_attention_layers=sum(full_attn_mask),
-        dtype=config.torch_dtype,
+        dtype=resolve_hf_torch_dtype(config) or torch.bfloat16,
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
     )
 
 
 class _Qwen35ConfigCompat:
-    """Temporary shim that normalizes Qwen3.5 HF configs into Qwen3NextConfig.
+    """Temporary shim for flattening Qwen3.5 text configs into Qwen3NextConfig.
+
+    This is used for Qwen3.5 text-only configs and for shared helper logic such
+    as RoPE and quantization exclude-module normalization. Qwen3.5-MoE VLM
+    configs should stay composite and use transformers.Qwen3_5MoeConfig plus
+    _normalize_qwen35_moe_vl_config instead.
 
     To remove: delete this class and the elif branch in
-    load_pretrained_config that references it.
+    load_pretrained_config that flattens Qwen3.5 text configs.
     """
 
     @staticmethod
@@ -415,6 +478,80 @@ class _Qwen35ConfigCompat:
         return text_config
 
 
+def _normalize_qwen35_mrope_config(text_config) -> None:
+    """Materialize Qwen3.5 mRoPE aliases needed by the Qwen3-VL path.
+
+    HF stores RoPE metadata under ``rope_parameters``; the shared Qwen3-VL
+    wrapper reads ``rope_theta``, ``partial_rotary_factor``, and
+    ``rope_scaling`` directly on the text config.
+    """
+    rope_parameters = getattr(text_config, "rope_parameters", None)
+    if not rope_parameters:
+        return
+    if hasattr(rope_parameters, "to_dict"):
+        rope_parameters = rope_parameters.to_dict()
+    flattened = _Qwen35ConfigCompat._flatten_rope({
+        "rope_parameters":
+        dict(rope_parameters),
+        "rope_scaling":
+        dict(getattr(text_config, "rope_scaling", None) or {}),
+    })
+    for attr in ("rope_theta", "partial_rotary_factor", "rope_scaling"):
+        value = flattened.get(attr)
+        if value is not None:
+            setattr(text_config, attr, value)
+
+
+def _normalize_qwen35_qwen3next_text_aliases(text_config) -> None:
+    """Materialize Qwen3Next-style text aliases used by the shared runtime."""
+    if getattr(text_config, "intermediate_size", None) is None:
+        moe_intermediate_size = getattr(text_config, "moe_intermediate_size",
+                                        None)
+        num_experts_per_tok = getattr(text_config, "num_experts_per_tok", None)
+        shared_expert_intermediate_size = getattr(
+            text_config, "shared_expert_intermediate_size", 0) or 0
+        if (moe_intermediate_size is not None
+                and num_experts_per_tok is not None):
+            text_config.intermediate_size = (
+                num_experts_per_tok * moe_intermediate_size +
+                shared_expert_intermediate_size)
+
+
+def _normalize_qwen35_quantization_config(model_config) -> None:
+    quantization_config = getattr(model_config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return
+
+    modules = quantization_config.get("modules_to_not_convert")
+    if modules is None:
+        return
+
+    text_config = getattr(model_config, "text_config", None)
+    normalized_modules = _Qwen35ConfigCompat._normalize_exclude_modules(modules)
+    if text_config is not None:
+        normalized_modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
+            text_config.to_dict(), normalized_modules)
+    quantization_config["modules_to_not_convert"] = sorted(
+        set(normalized_modules))
+
+
+def _normalize_qwen35_moe_vl_config(model_config) -> None:
+    """Adapt HF Qwen3.5-MoE VLM config to TRT-LLM runtime conventions."""
+    if not getattr(model_config, "architectures", None):
+        model_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+
+    text_config = getattr(model_config, "text_config", None)
+    if text_config is None:
+        raise ValueError("Qwen3.5-MoE VLM config is missing text_config")
+
+    text_config.architectures = ["Qwen3_5MoeForCausalLM"]
+    _normalize_qwen35_qwen3next_text_aliases(text_config)
+    _normalize_qwen35_mrope_config(text_config)
+
+    model_config.get_text_config = lambda decoder=False: text_config
+    _normalize_qwen35_quantization_config(model_config)
+
+
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -427,7 +564,6 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
-    qwen3_5_moe="Qwen3_5MoeConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 
@@ -445,6 +581,13 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif (model_type == "qwen3_5_moe" and
+          (("text_config" in config_dict and "vision_config" in config_dict) or
+           (architectures
+            and architectures[0] == "Qwen3_5MoeForConditionalGeneration"))):
+        model_config = transformers.Qwen3_5MoeConfig.from_pretrained(
+            model_name_or_path, **kwargs)
+        _normalize_qwen35_moe_vl_config(model_config)
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

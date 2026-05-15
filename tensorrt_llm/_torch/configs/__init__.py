@@ -26,5 +26,4 @@ del _register_custom_configs_with_transformers
 
 __all__ = [
     "DeepseekV3Config",
-    "Qwen3_5MoeConfig",
 ]
