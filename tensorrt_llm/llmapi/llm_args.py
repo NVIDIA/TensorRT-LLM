@@ -914,6 +914,14 @@ class DecodingBaseConfig(StrictBaseModel):
         "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
     )
 
+    use_rejection_sampling: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, enables rejection sampling for one-model speculative decoding paths. "
+        "This is intended for non-greedy sampling configurations on the PyTorch backend. "
+        "The non-dynamic-tree one-model path requires FlashInfer.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -965,6 +973,17 @@ class DecodingBaseConfig(StrictBaseModel):
             # This ensures efficient lookup
             return dict(sorted(v.items(), key=lambda x: x[0]))
         return v
+
+    @model_validator(mode='after')
+    def validate_rejection_sampling_config(self):
+        """Reject SA-enhanced configurations that invalidate rejection sampling."""
+        if self.use_rejection_sampling and getattr(self, 'sa_config',
+                                                   None) is not None:
+            raise ValueError(
+                "use_rejection_sampling is incompatible with sa_config "
+                "because SA enhancement may override the proposed draft tokens."
+            )
+        return self
 
     @model_validator(mode='after')
     # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
@@ -1348,10 +1367,16 @@ class SAEnhancerConfig(StrictBaseModel):
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
-    max_batch_size: Optional[int] = Field(
-        default=None,
-        description="Max batch size for pre-allocating dynamic tree buffers. "
-        "Required when use_dynamic_tree=True.")
+    # Backs the dynamic-tree worker's pre-allocated, batch-indexed CUDA buffers
+    # (draft_tokens_buffer, history_*_buffer, tree_mask_buffer, etc. in
+    # Eagle3OneModelDynamicTreeWorker.__init__). This MUST equal the global
+    # max_batch_size: the worker indexes those buffers with batch_idx in
+    # [0, global_max_batch_size) at runtime with no bounds check, so any value
+    # smaller than the global will OOB during warmup or generation as soon as
+    # batch_idx exceeds this capacity (illegal memory access). It is therefore
+    # exposed as a PrivateAttr -- not a user-tunable knob -- and is
+    # auto-populated by py_executor_creator from the global max_batch_size.
+    _max_batch_size: Optional[int] = PrivateAttr(default=None)
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
@@ -4119,6 +4144,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            if self.speculative_config.use_rejection_sampling:
+                if not isinstance(self.speculative_config,
+                                  Eagle3DecodingConfig):
+                    raise ValueError(
+                        "use_rejection_sampling is only supported for "
+                        "PyTorch Eagle3 one-model speculative decoding paths.")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
