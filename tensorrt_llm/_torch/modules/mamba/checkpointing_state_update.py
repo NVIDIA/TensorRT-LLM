@@ -3330,22 +3330,28 @@ def _persistent_main_impl(
     state_ptrs = (
         state_ptr_raw + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
     )
-    # Pick LOAD flag.  In non-dynamic mode WRITE_CHECKPOINT is constexpr,
-    # so we pick the matching flag at compile time and the dead branch is
-    # DCE'd.  In dynamic mode, slot may be write or nowrite per-CTA — TMA
-    # load there would require real descriptors at BOTH compile branches
-    # (else compilation fails because state_tma_descriptor is a plain
-    # tensor when TMA is off), which is not currently wired up.  Force
-    # use_tma_load=False for dynamic mode; revisit if dynamic+TMA becomes
-    # worth wiring up.
-    if IS_DYNAMIC:
-        use_tma_load: tl.constexpr = False
+    # Load state.  Branch on is_write (constexpr in non-dynamic mode, runtime
+    # in dynamic), then constexpr-pick TMA-vs-tl.load per side.
+    #
+    # Non-dynamic (is_write is constexpr = WRITE_CHECKPOINT): outer `if`
+    # DCE's, only the matching side's constexpr-gated load survives.
+    #
+    # Dynamic (is_write is runtime per-CTA): both write and nowrite blocks
+    # emit; each contains exactly one of (TMA load, tl.load) after the
+    # constexpr USE_TMA_LOAD_* gate resolves.  The descriptor is real iff
+    # any of the 4 TMA flags is on at the wrapper (line 4712-4713 of this
+    # file); the constexpr gating guarantees we never call .load() on the
+    # plain-tensor fallback path, so this stays compilation-safe.
+    if is_write:
+        if USE_TMA_LOAD_WRITE:
+            state = state_tma_descriptor.load([offs_y, 0]).to(tl.float32)
+        else:
+            state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
     else:
-        use_tma_load: tl.constexpr = USE_TMA_LOAD_WRITE if WRITE_CHECKPOINT else USE_TMA_LOAD_NOWRITE
-    if use_tma_load:
-        state = state_tma_descriptor.load([offs_y, 0]).to(tl.float32)
-    else:
-        state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
+        if USE_TMA_LOAD_NOWRITE:
+            state = state_tma_descriptor.load([offs_y, 0]).to(tl.float32)
+        else:
+            state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
     if QUANT_MAX > 0.0:
         state_scales_base = (
             state_scales_ptr
@@ -4695,13 +4701,19 @@ def checkpointing_state_update(
         state_scales_arg = state  # any valid ptr — gated by QUANT_MAX==0
         state_scales_strides = (0, 0, 0)
 
-    # Single TMA descriptor for state — used by all TMA-consuming paths
-    # (rect load, replay write load, replay write store, replay nowrite load).
-    # Same memory (state's flat 2D view, shape (cache*nheads*dim, dstate)),
-    # same block_shape, same underlying tensor descriptor — gated at usage
-    # sites by per-path constexprs.  When no TMA flag is on, the variable
-    # holds the raw `state` tensor as a dummy; kernels never reference it
-    # because their constexprs are all False (Triton DCEs the dead branches).
+    # Per-path TMA descriptors for state — write-side and nowrite-side.  Each
+    # kernel launch consumes the descriptor whose block_shape[0] matches its
+    # BLOCK_SIZE_M constexpr.  With M-split (Mw != Mnw) the two sides need
+    # distinct descriptors; otherwise the descriptor's block_shape[0] would
+    # mismatch the kernel's BLOCK_SIZE_M and downstream tl.dot / arithmetic
+    # on the loaded tile fails shape inference at compile time
+    # ("Cannot make_shape_compatible: incompatible dimensions").  When Mw ==
+    # Mnw (tied, the common case) the two descriptors are the same object.
+    # Same memory (state's flat 2D view, shape (cache*nheads*dim, dstate))
+    # and same dstate block_shape — only block_shape[0] differs.
+    # When no TMA flag is on, both variables hold the raw `state` tensor as a
+    # dummy; kernels never reference it because their constexprs are all
+    # False (Triton DCEs the dead branches).
     # `triton.set_allocator()` must run before any descriptor-using launch.
     if (_use_tma_rect_load or _use_tma_replay_write_load
             or _use_tma_replay_write_store or _use_tma_replay_nowrite_load):
@@ -4709,12 +4721,20 @@ def checkpointing_state_update(
         _ensure_tma_allocator()
         assert state.is_contiguous(), "TMA state requires contiguous state"
         assert state.stride(-1) == 1, "TMA state requires inner stride 1"
-        state_tma_descriptor = TensorDescriptor.from_tensor(
-            state.view(-1, state.shape[-1]),
-            block_shape=[BLOCK_SIZE_M, triton.next_power_of_2(dstate)],
+        _state_flat = state.view(-1, state.shape[-1])
+        _dstate_pow2 = triton.next_power_of_2(dstate)
+        state_tma_descriptor_write = TensorDescriptor.from_tensor(
+            _state_flat, block_shape=[BLOCK_SIZE_M_WRITE, _dstate_pow2],
         )
+        if BLOCK_SIZE_M_NOWRITE == BLOCK_SIZE_M_WRITE:
+            state_tma_descriptor_nowrite = state_tma_descriptor_write
+        else:
+            state_tma_descriptor_nowrite = TensorDescriptor.from_tensor(
+                _state_flat, block_shape=[BLOCK_SIZE_M_NOWRITE, _dstate_pow2],
+            )
     else:
-        state_tma_descriptor = state  # dummy; all consuming constexprs False
+        state_tma_descriptor_write = state   # dummy; all consuming constexprs False
+        state_tma_descriptor_nowrite = state  # dummy; all consuming constexprs False
 
     # Slot permutation — pointer + USE_PERM gate.  When the caller provides
     # a perm tensor the dl-family launches read pid_b through it; otherwise
@@ -4861,10 +4881,14 @@ def checkpointing_state_update(
         _bsm = BLOCK_SIZE_M_WRITE if write_checkpoint else BLOCK_SIZE_M_NOWRITE
         _nw = NUM_WARPS_WRITE if write_checkpoint else NUM_WARPS_NOWRITE
         _ns = NUM_STAGES_WRITE if write_checkpoint else NUM_STAGES_NOWRITE
+        # Per-path TMA descriptor: block_shape[0] must match the kernel's
+        # BLOCK_SIZE_M (`_bsm`); see the descriptor build block above.
+        _desc = (state_tma_descriptor_write if write_checkpoint
+                 else state_tma_descriptor_nowrite)
         def _main_grid_local(META, _bsm=_bsm):
             return (triton.cdiv(dim, _bsm), batch, nheads)
         _checkpointing_main_kernel[_main_grid_local](
-            state, state_tma_descriptor, state_scales_arg, old_x,
+            state, _desc, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
@@ -4918,8 +4942,10 @@ def checkpointing_state_update(
         _ns = NUM_STAGES_NOWRITE
         def _main_grid_local(META, _bsm=_bsm):
             return (triton.cdiv(dim, _bsm), batch, nheads)
+        # Rectangle is always the nowrite-side path; descriptor block_shape[0]
+        # must match BLOCK_SIZE_M_NOWRITE (= _bsm here).
         _rectangle_main_kernel[_main_grid_local](
-            state, state_tma_descriptor, state_scales_arg, old_x,
+            state, state_tma_descriptor_nowrite, state_scales_arg, old_x,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
             cb_scaled, decay_vec,
@@ -4953,8 +4979,11 @@ def checkpointing_state_update(
 
     def launch_dynamic_main(rectangle: bool,
                             launch_dependent_kernels: bool = False):
+        # Dynamic mode uses a single BLOCK_SIZE_M (no M-split inside this
+        # kernel); BLOCK_SIZE_M == BLOCK_SIZE_M_WRITE by the wrapper's tied
+        # convention, so the write-side descriptor matches.
         _dynamic_main_kernel[main_grid](
-            state, state_tma_descriptor, state_scales_arg, old_x,
+            state, state_tma_descriptor_write, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
@@ -5022,7 +5051,11 @@ def checkpointing_state_update(
     # tile_id is covered exactly once across all live pids in [0, grid) when
     # grid <= NUM_PERSISTENT (each CTA does 1 tile; loop step >= total_work
     # exits immediately) AND when grid == NUM_PERSISTENT (each CTA loops over
-    # multiple tiles).  NUM_PERSISTENT stays a constexpr = cta_per_sm * num_sms.
+    # multiple tiles).  NUM_PERSISTENT is now a runtime int (see kernel def
+    # docstring at _persistent_main_kernel) so changing cta_per_sm does NOT
+    # trigger a new Triton compile — same kernel binary, different loop step.
+    # (Named UPPERCASE for historical Triton-style consistency only; not
+    # constexpr.)
     _num_pid_m = (dim + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
     def launch_persistent_main(write_checkpoint: bool,
@@ -5070,8 +5103,11 @@ def checkpointing_state_update(
             _n_slots_for_launch = batch
         _total_work_launch = max(1, _n_slots_for_launch * _num_pid_m_local * nheads)
         grid = (min(_num_persistent, _total_work_launch),)
+        # Per-path TMA descriptor — block_shape[0] must match _bsm.
+        _desc = (state_tma_descriptor_write if write_checkpoint
+                 else state_tma_descriptor_nowrite)
         _persistent_main_kernel[grid](
-            state, state_tma_descriptor, state_scales_arg, old_x,
+            state, _desc, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
@@ -5143,8 +5179,12 @@ def checkpointing_state_update(
         # comment for correctness rationale.
         _total_work_launch = max(1, batch * _num_pid_m * nheads)
         grid = (min(num_persistent_arg, _total_work_launch),)
+        # Persistent-dynamic kernel uses a single BLOCK_SIZE_M (same as the
+        # wrapper's BLOCK_SIZE_M == BLOCK_SIZE_M_WRITE tied convention), so
+        # the write-side descriptor matches.  Both write and nowrite slots
+        # in this kernel share that BSM.
         _persistent_main_kernel[grid](
-            state, state_tma_descriptor, state_scales_arg, old_x,
+            state, state_tma_descriptor_write, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
