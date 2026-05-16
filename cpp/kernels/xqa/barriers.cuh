@@ -111,22 +111,34 @@ public:
             return;
         }
 #else
-        static_assert(scope == Scope::CTA && order == ArriveOrder::RELEASE);
-        if (update > 1)
+        if constexpr (scope == Scope::CTA)
         {
-            asm volatile("mbarrier.arrive.noComplete" STR_REL_CTA ".b64 %0, [%1], %2;\n"
-                         : "=l"(token)
-                         : "l"(addr()), "r"(update - 1U)
-                         : "memory");
-            ArrivalToken refToken;
-            asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(refToken) : "l"(addr()) : "memory");
-            assert(token == refToken);
-            return token;
+            static_assert(order == ArriveOrder::RELEASE);
+            if (update > 1)
+            {
+                asm volatile("mbarrier.arrive.noComplete" STR_REL_CTA ".b64 %0, [%1], %2;\n"
+                             : "=l"(token)
+                             : "l"(addr()), "r"(update - 1U)
+                             : "memory");
+                ArrivalToken refToken;
+                asm volatile(
+                    "mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(refToken) : "l"(addr()) : "memory");
+                assert(token == refToken);
+                return token;
+            }
+            else
+            {
+                asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(token) : "l"(addr()) : "memory");
+                return token;
+            }
         }
         else
         {
-            asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(token) : "l"(addr()) : "memory");
-            return token;
+            static_assert(scope == Scope::CGA);
+#if defined(__CUDA_ARCH__)
+            asm volatile("trap;\n");
+#endif
+            return;
         }
 #endif
     }
