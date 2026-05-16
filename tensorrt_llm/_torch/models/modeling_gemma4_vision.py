@@ -47,10 +47,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import maybe_pin_memory
 
-from ..attention_backend.interface import (AttentionMetadata,
-                                           PredefinedAttentionMask)
+from ..attention_backend.interface import AttentionMetadata, PredefinedAttentionMask
 from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
@@ -62,6 +61,7 @@ from .modeling_utils import _load_weights_impl
 @dataclass
 class _VisionOutput:
     """Stand-in for ``transformers.BaseModelOutputWithPast`` (only field used)."""
+
     last_hidden_state: torch.Tensor
 
 
@@ -156,9 +156,9 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
             dim_position_ids = position_ids[:, :, i]
             dim_position_ids_expanded = dim_position_ids[:, None, :].float()
             with torch.autocast(device_type=x.device.type, enabled=False):
-                freqs = (
-                    inv_freq_expanded.float() @ dim_position_ids_expanded.float()
-                ).transpose(1, 2)
+                freqs = (inv_freq_expanded.float() @ dim_position_ids_expanded.float()).transpose(
+                    1, 2
+                )
                 emb = torch.cat((freqs, freqs), dim=-1)
                 cos = emb.cos() * self.attention_scaling
                 sin = emb.sin() * self.attention_scaling
@@ -255,11 +255,9 @@ class Gemma4VisionAttention(Attention):
     so we pass ``q_scaling = 1 / sqrt(head_dim)`` to neutralize the sqrt.
     """
 
-    def __init__(self,
-                 model_config: ModelConfig,
-                 vision_config,
-                 layer_idx: int,
-                 dtype: torch.dtype):
+    def __init__(
+        self, model_config: ModelConfig, vision_config, layer_idx: int, dtype: torch.dtype
+    ):
         head_dim = getattr(
             vision_config,
             "head_dim",
@@ -301,19 +299,26 @@ class Gemma4VisionAttention(Attention):
             has_weights=False,
         )
 
-        self.use_clipped_linears = bool(
-            getattr(vision_config, "use_clipped_linears", False))
+        self.use_clipped_linears = bool(getattr(vision_config, "use_clipped_linears", False))
         if self.use_clipped_linears:
             neg_inf = torch.tensor(-float("inf"))
             pos_inf = torch.tensor(float("inf"))
             for name in (
-                "qkv_input_min", "q_output_min", "k_output_min", "v_output_min",
-                "o_input_min", "o_output_min",
+                "qkv_input_min",
+                "q_output_min",
+                "k_output_min",
+                "v_output_min",
+                "o_input_min",
+                "o_output_min",
             ):
                 self.register_buffer(name, neg_inf.clone())
             for name in (
-                "qkv_input_max", "q_output_max", "k_output_max", "v_output_max",
-                "o_input_max", "o_output_max",
+                "qkv_input_max",
+                "q_output_max",
+                "k_output_max",
+                "v_output_max",
+                "o_input_max",
+                "o_output_max",
             ):
                 self.register_buffer(name, pos_inf.clone())
 
@@ -334,9 +339,7 @@ class Gemma4VisionAttention(Attention):
         # Flat (num_tokens, hidden) layout — encoder flattens (B, N, H) before
         # dispatching to attention.
         if self.use_clipped_linears:
-            hidden_states = torch.clamp(
-                hidden_states, self.qkv_input_min, self.qkv_input_max
-            )
+            hidden_states = torch.clamp(hidden_states, self.qkv_input_min, self.qkv_input_max)
 
         qkv = self.qkv_proj(hidden_states)
         q, k, v = self.split_qkv(qkv)
@@ -356,12 +359,8 @@ class Gemma4VisionAttention(Attention):
         v = self._head_norm(v, self.v_norm)
 
         cos, sin = position_embeddings
-        q = _apply_multidimensional_rope(
-            q, cos, sin, position_ids, unsqueeze_dim=1
-        )
-        k = _apply_multidimensional_rope(
-            k, cos, sin, position_ids, unsqueeze_dim=1
-        )
+        q = _apply_multidimensional_rope(q, cos, sin, position_ids, unsqueeze_dim=1)
+        k = _apply_multidimensional_rope(k, cos, sin, position_ids, unsqueeze_dim=1)
 
         q = q.reshape(num_tokens, self.num_heads * self.head_dim)
         k = k.reshape(num_tokens, self.num_key_value_heads * self.head_dim)
@@ -381,26 +380,24 @@ class Gemma4VisionAttention(Attention):
         )
 
         if self.use_clipped_linears:
-            attn_output = torch.clamp(
-                attn_output, self.o_input_min, self.o_input_max
-            )
+            attn_output = torch.clamp(attn_output, self.o_input_min, self.o_input_max)
         attn_output = self.o_proj(attn_output, layer_idx=self.layer_idx)
         if self.use_clipped_linears:
-            attn_output = torch.clamp(
-                attn_output, self.o_output_min, self.o_output_max
-            )
+            attn_output = torch.clamp(attn_output, self.o_output_min, self.o_output_max)
         return attn_output
 
 
 class Gemma4VisionEncoderLayer(nn.Module):
     """Sandwich norm pattern: input → attn → post_attn → +res; pre_ffn → mlp → post_ffn → +res."""
 
-    def __init__(self,
-                 model_config: ModelConfig,
-                 vision_config,
-                 layer_idx: int,
-                 dtype: torch.dtype,
-                 mapping=None):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        vision_config,
+        layer_idx: int,
+        dtype: torch.dtype,
+        mapping=None,
+    ):
         super().__init__()
         self.self_attn = Gemma4VisionAttention(
             model_config=model_config,
@@ -464,23 +461,22 @@ class Gemma4VisionEncoder(nn.Module):
     Mapping back to ``(B, N)`` for the pooler is the caller's job.
     """
 
-    def __init__(self,
-                 model_config: ModelConfig,
-                 vision_config,
-                 dtype: torch.dtype,
-                 mapping=None):
+    def __init__(self, model_config: ModelConfig, vision_config, dtype: torch.dtype, mapping=None):
         super().__init__()
         self.config = vision_config
         self.rotary_emb = Gemma4VisionRotaryEmbedding(vision_config)
-        self.layers = nn.ModuleList([
-            Gemma4VisionEncoderLayer(
-                model_config=model_config,
-                vision_config=vision_config,
-                layer_idx=i,
-                dtype=dtype,
-                mapping=mapping,
-            ) for i in range(vision_config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Gemma4VisionEncoderLayer(
+                    model_config=model_config,
+                    vision_config=vision_config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    mapping=mapping,
+                )
+                for i in range(vision_config.num_hidden_layers)
+            ]
+        )
 
     def forward(
         self,
@@ -541,8 +537,7 @@ class Gemma4VisionPatchEmbedder(nn.Module):
     ) -> torch.Tensor:
         # Gemma4 scales pixel inputs in model code (no normalization in the processor).
         pixel_values = 2 * (pixel_values - 0.5)
-        hidden_states = self.input_proj(
-            pixel_values.to(self.input_proj.weight.dtype))
+        hidden_states = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
         position_embeddings = self._position_embeddings(pixel_position_ids, padding_positions)
         return hidden_states + position_embeddings
 
@@ -619,8 +614,7 @@ class Gemma4VisionModel(nn.Module):
         dtype = getattr(self.config, "torch_dtype", None) or torch.bfloat16
         mapping = getattr(model_config, "mapping", None)
 
-        self.patch_embedder = Gemma4VisionPatchEmbedder(
-            self.config, dtype=dtype, mapping=mapping)
+        self.patch_embedder = Gemma4VisionPatchEmbedder(self.config, dtype=dtype, mapping=mapping)
         self.encoder = Gemma4VisionEncoder(
             model_config=model_config,
             vision_config=self.config,
@@ -630,17 +624,12 @@ class Gemma4VisionModel(nn.Module):
         self.pooler = Gemma4VisionPooler(self.config)
         self.standardize = bool(getattr(self.config, "standardize", False))
         if self.standardize:
-            self.register_buffer(
-                "std_bias", torch.zeros(self.config.hidden_size, dtype=dtype)
-            )
-            self.register_buffer(
-                "std_scale", torch.ones(self.config.hidden_size, dtype=dtype)
-            )
+            self.register_buffer("std_bias", torch.zeros(self.config.hidden_size, dtype=dtype))
+            self.register_buffer("std_scale", torch.ones(self.config.hidden_size, dtype=dtype))
 
         # SigLip-style context-only metadata: kv_cache_manager=None, no decode
         # phase. Re-prepared each forward with the actual per-image seq lens.
-        self.metadata_cls = get_attention_backend(
-            model_config.attn_backend).Metadata
+        self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         self.attn_metadata = self.metadata_cls(
             max_num_requests=8192,
             max_num_tokens=getattr(model_config, "max_num_tokens", 8192),
@@ -653,9 +642,7 @@ class Gemma4VisionModel(nn.Module):
         self.attn_metadata.num_contexts = batch_size
         self.attn_metadata.request_ids = list(range(1, batch_size + 1))
         self.attn_metadata.prompt_lens = prompt_lens
-        self.attn_metadata.seq_lens = seq_lens_cpu.to(
-            dtype=torch.int, copy=True).pin_memory() if prefer_pinned() else \
-            seq_lens_cpu.to(dtype=torch.int, copy=True)
+        self.attn_metadata.seq_lens = maybe_pin_memory(seq_lens_cpu.to(dtype=torch.int, copy=True))
         self.attn_metadata.max_seq_len = max(prompt_lens) if prompt_lens else 0
         self.attn_metadata.prepare()
         return self.attn_metadata
@@ -677,11 +664,9 @@ class Gemma4VisionModel(nn.Module):
         B, N = padding_positions.shape
 
         # Patch embed produces (B, N, H) including padded slots zeroed.
-        inputs_embeds = self.patch_embedder(
-            pixel_values, pixel_position_ids, padding_positions)
+        inputs_embeds = self.patch_embedder(pixel_values, pixel_position_ids, padding_positions)
         # Position embeddings (cos/sin) are (B, N, head_dim) per spatial dim.
-        position_embeddings_btn = self.encoder.rotary_emb(
-            inputs_embeds, pixel_position_ids)
+        position_embeddings_btn = self.encoder.rotary_emb(inputs_embeds, pixel_position_ids)
 
         # Flatten to (sum_valid, H) and drop padded tokens — encoder runs
         # FULL attention with per-image cu_seqlens.
@@ -754,7 +739,7 @@ class Gemma4VisionModel(nn.Module):
         # buffers. Copy clamp scalars and optional standardize buffers here.
         for name, buf in self.named_buffers():
             if name in remapped:
-                buf.data.copy_(remapped[name][:].to(buf.dtype).to(buf.device))
+                buf.data.copy_(remapped[name].to(buf.dtype).to(buf.device))
 
     def _remap_clamp_buffers(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Rename HF clamp buffer keys onto our consolidated layout.
@@ -767,12 +752,11 @@ class Gemma4VisionModel(nn.Module):
               ``encoder.layers.{i}.self_attn.o_{input,output}_{min,max}``
         """
         import re
+
         remapped = dict(weights)
         # Find all attention prefixes by scanning for q_proj.input_min
         prefix_re = re.compile(r"^(.*self_attn)\.q_proj\.input_min$")
-        prefixes = sorted({
-            m.group(1) for k in weights for m in [prefix_re.match(k)] if m
-        })
+        prefixes = sorted({m.group(1) for k in weights for m in [prefix_re.match(k)] if m})
         for prefix in prefixes:
             # Collapse q/k/v input clamps → one qkv_input_*, asserting equality.
             for kind in ("min", "max"):
@@ -780,14 +764,15 @@ class Gemma4VisionModel(nn.Module):
                 k_key = f"{prefix}.k_proj.input_{kind}"
                 v_key = f"{prefix}.v_proj.input_{kind}"
                 if q_key in weights and k_key in weights and v_key in weights:
-                    q_val = weights[q_key][:]
-                    k_val = weights[k_key][:]
-                    v_val = weights[v_key][:]
+                    q_val = weights[q_key].clone()
+                    k_val = weights[k_key].clone()
+                    v_val = weights[v_key].clone()
                     if not (torch.equal(q_val, k_val) and torch.equal(k_val, v_val)):
                         raise ValueError(
                             f"Gemma4 vision clamp fusion: q/k/v input clamp "
                             f"{kind} mismatch at {prefix}; cannot collapse to "
-                            f"fused qkv_input_{kind}.")
+                            f"fused qkv_input_{kind}."
+                        )
                     remapped[f"{prefix}.qkv_input_{kind}"] = q_val
                     remapped.pop(q_key, None)
                     remapped.pop(k_key, None)
@@ -796,12 +781,12 @@ class Gemma4VisionModel(nn.Module):
                 for sec in ("q", "k", "v"):
                     src = f"{prefix}.{sec}_proj.output_{kind}"
                     if src in weights:
-                        remapped[f"{prefix}.{sec}_output_{kind}"] = weights[src][:]
+                        remapped[f"{prefix}.{sec}_output_{kind}"] = weights[src].clone()
                         remapped.pop(src, None)
                 # o_proj clamps: move into the attention module.
                 for io in ("input", "output"):
                     src = f"{prefix}.o_proj.{io}_{kind}"
                     if src in weights:
-                        remapped[f"{prefix}.o_{io}_{kind}"] = weights[src][:]
+                        remapped[f"{prefix}.o_{io}_{kind}"] = weights[src].clone()
                         remapped.pop(src, None)
         return remapped

@@ -49,7 +49,6 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
-from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -580,6 +579,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             "attn_backend": "FLASHINFER",
         }
 
+    def _check_and_adjust_experts_implementation(self, *args, **kwargs):
+        # transformers 5.x ``PreTrainedModel.__init__`` calls this with an
+        # ``experts_implementation`` argument and fails for VL wrapper models
+        # that do not directly contain MoE layers. TRT-LLM manages expert
+        # implementations independently, so skip the check.
+        return None
+
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_disagg():
             raise NotImplementedError(
@@ -640,9 +646,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # --- Vision tower (native TRT-LLM, see modeling_gemma4_vision.py) ---
         if config.vision_config is not None:
             vision_model_config = self.get_sub_model_config(model_config_cp, "vision_config")
-            self.vision_tower = (
-                Gemma4VisionModel(vision_model_config).eval().to(self._device)
-            )
+            self.vision_tower = Gemma4VisionModel(vision_model_config).eval().to(self._device)
             vision_hidden = config.vision_config.hidden_size
             text_hidden = config.text_config.hidden_size
             vision_eps = config.vision_config.rms_norm_eps
