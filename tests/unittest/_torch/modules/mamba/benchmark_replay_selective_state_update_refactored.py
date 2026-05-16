@@ -196,7 +196,7 @@ def _import_mamba_kernels_fast():
     _load("softplus", "softplus.py")
     # 3. The actual kernels
     replay_mod = _load("replay_selective_state_update", "replay_selective_state_update.py")
-    checkpoint_mod = _load("checkpointing_state_update", "checkpointing_state_update.py")
+    checkpoint_mod = _load("checkpointing_state_update_refactored", "checkpointing_state_update_refactored.py")
     base_mod = _load("selective_state_update", "selective_state_update.py")
     conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
 
@@ -211,7 +211,7 @@ def _import_mamba_kernels_fast():
 def _import_mamba_kernels_full():
     """Import via the standard tensorrt_llm package (slow but safe)."""
     from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import causal_conv1d_update
-    from tensorrt_llm._torch.modules.mamba.checkpointing_state_update import (
+    from tensorrt_llm._torch.modules.mamba.checkpointing_state_update_refactored import (
         checkpointing_state_update,
     )
     from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (

@@ -3308,21 +3308,39 @@ def _persistent_main_impl(
     PHILOX_ROUNDS: tl.constexpr,
     QUANT_MAX: tl.constexpr,
     WRITE_CHECKPOINT: tl.constexpr,
+    # IS_DYNAMIC: kept in the signature for caller-side bookkeeping (the
+    # outer _persistent_main_kernel still inspects it to decide the slot-
+    # IS_DYNAMIC: when True (persistent_dynamic), is_write is per-slot from
+    # PNAT.  When False (persistent_main), is_write is constexpr from
+    # WRITE_CHECKPOINT.  See also WC_IS_CONSTEXPR below.
     IS_DYNAMIC: tl.constexpr,
-    # TMA flags — picked inside body based on is_write (which is constexpr
-    # from WRITE_CHECKPOINT when IS_DYNAMIC=False, or runtime from PNAT
-    # when IS_DYNAMIC=True).  use_tma_load = USE_TMA_LOAD_WRITE if is_write
-    # else USE_TMA_LOAD_NOWRITE — constexpr-folds in non-dynamic mode,
-    # runtime ternary in dynamic.
+    # WC_IS_CONSTEXPR: when True, force is_write = WRITE_CHECKPOINT (constexpr)
+    # regardless of IS_DYNAMIC.  Callers in RECT=1 use this in the is_w=True
+    # arm of _persistent_main_kernel (we know all slots that reach this call
+    # need is_write=True because is_w was the PNAT-derived runtime check, and
+    # this arm only fires when is_w is True).  Passing WRITE_CHECKPOINT=True
+    # as a literal at the call site + WC_IS_CONSTEXPR=True here lets the inner
+    # body DCE the nowrite path under IS_DYNAMIC=True too — same codegen
+    # quality as persistent_main mode (-3.7% measured at b=1024 dyn-shape).
+    # When False (RECT=0 callers, where both write and nowrite slots are
+    # dispatched to ONE call), use the original runtime is_write under
+    # IS_DYNAMIC=True; avoids the binary-doubling regression that two
+    # specialized calls would cause.
+    WC_IS_CONSTEXPR: tl.constexpr = False,
+    # TMA flags — picked inside body based on is_write.  When is_write is
+    # constexpr (either IS_DYNAMIC=False or WC_IS_CONSTEXPR=True), the
+    # use_tma_load = USE_TMA_LOAD_WRITE if is_write else USE_TMA_LOAD_NOWRITE
+    # ternary constexpr-folds and only one TMA load form survives.
     USE_TMA_LOAD_WRITE: tl.constexpr = False,
     USE_TMA_LOAD_NOWRITE: tl.constexpr = False,
     USE_TMA_STORE: tl.constexpr = False,
 ):
-    # IS_DYNAMIC: when False, WRITE_CHECKPOINT is the constexpr write/nowrite
-    # selector (caller pre-sorts and splits halves).  When True, WRITE_CHECKPOINT
-    # is ignored; the impl computes is_write at runtime per work-item from
-    # the loaded PNAT.  Used by mode="persistent_dynamic" — single kernel,
-    # one launch, no half-split, runtime per-slot dispatch.
+    # IS_DYNAMIC: kernel-mode label, used by the OUTER _persistent_main_kernel
+    # to decide slot-range derivation and outer is_w dispatch strategy
+    # (constexpr WC for persistent_main; runtime is_w split -> 2 specialized
+    # impl calls for persistent_dynamic).  Inside this impl, IS_DYNAMIC is
+    # NOT consulted at runtime -- WRITE_CHECKPOINT is the only constexpr that
+    # gates the write/nowrite codegen, in BOTH modes.
 
     # Compile-time invariant: QUANT_MAX > 0 must coincide with a quantized
     # state dtype (int8 / int16 / float8e4nv) and only those.
@@ -3345,11 +3363,19 @@ def _persistent_main_impl(
 
     active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
-    # Resolve is_write: constexpr from caller (persistent_main) or runtime
-    # from PNAT (persistent_dynamic).  When IS_DYNAMIC=False, is_write
-    # collapses to a constexpr 0/1 and the downstream `if is_write:`
-    # blocks DCE the dead path at compile time.
-    if IS_DYNAMIC:
+    # Resolve is_write: see WC_IS_CONSTEXPR / IS_DYNAMIC docs in the param
+    # list above.  Three cases:
+    #   - WC_IS_CONSTEXPR=True (RECT=1 is_w=True arm callers): use WC
+    #     constexpr.  Caller knows the slot needs write; inner DCEs nowrite
+    #     paths.  Avoids the binary-doubling overhead that calling the impl
+    #     twice would cause, while still constexpr-DCEing the nowrite half.
+    #   - IS_DYNAMIC=True (RECT=0 caller, persistent_dynamic): runtime
+    #     branch on PNAT.  Both write and nowrite codegen live in one body
+    #     (no bloat) — same as the pre-refactor behavior.
+    #   - IS_DYNAMIC=False (persistent_main): WC constexpr from caller.
+    if WC_IS_CONSTEXPR:
+        is_write: tl.constexpr = WRITE_CHECKPOINT
+    elif IS_DYNAMIC:
         is_write = (prev_num_accepted_tokens + T) > MAX_REPLAY_BUFFER_LENGTH
     else:
         is_write = WRITE_CHECKPOINT
@@ -3385,18 +3411,12 @@ def _persistent_main_impl(
     state_ptrs = (
         state_ptr_raw + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
     )
-    # Load state.  Branch on is_write (constexpr in non-dynamic mode, runtime
-    # in dynamic), then constexpr-pick TMA-vs-tl.load per side.
-    #
-    # Non-dynamic (is_write is constexpr = WRITE_CHECKPOINT): outer `if`
-    # DCE's, only the matching side's constexpr-gated load survives.
-    #
-    # Dynamic (is_write is runtime per-CTA): both write and nowrite blocks
-    # emit; each contains exactly one of (TMA load, tl.load) after the
-    # constexpr USE_TMA_LOAD_* gate resolves.  The descriptor is real iff
-    # any of the 4 TMA flags is on at the wrapper (line 4712-4713 of this
-    # file); the constexpr gating guarantees we never call .load() on the
-    # plain-tensor fallback path, so this stays compilation-safe.
+    # Load state.  Branch on is_write (constexpr = WRITE_CHECKPOINT in BOTH
+    # modes after the outer-dispatch refactor), then constexpr-pick TMA-vs-
+    # tl.load per side.  Outer `if` DCE's, only the matching side's
+    # constexpr-gated load survives -- same compile-time picking for both
+    # persistent_main and persistent_dynamic (the latter dispatches at the
+    # outer kernel level so each impl instance sees a constexpr WC).
     if is_write:
         if USE_TMA_LOAD_WRITE:
             state = state_tma_descriptor.load([offs_y, 0]).to(tl.float32)
@@ -4158,6 +4178,18 @@ def _persistent_main_kernel(
                 else:
                     is_w = WRITE_CHECKPOINT
                 if is_w:
+                    # Pass WRITE_CHECKPOINT=True constexpr to specialize this
+                    # impl call for the write path.  Under IS_DYNAMIC=True, the
+                    # kernel-level WRITE_CHECKPOINT is False (launcher default),
+                    # but the OUTER is_w branch we are inside narrows the
+                    # runtime path to writes-only, so we override to True here
+                    # so the impl's constexpr-gated `if is_write:` blocks DCE
+                    # to the write-only codegen.  Under IS_DYNAMIC=False
+                    # (persistent_main), the kernel-level WRITE_CHECKPOINT is
+                    # itself True for this half (write half launches with
+                    # WC=True), and the outer is_w = WRITE_CHECKPOINT = True
+                    # constexpr-folds; passing literal True here is consistent
+                    # and constexpr-equivalent.
                     _persistent_main_impl(
                         pid_m, pid_b, pid_h,
                         state_ptr, state_tma_descriptor, state_scales_ptr,
@@ -4185,10 +4217,11 @@ def _persistent_main_kernel(
                         BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
                         BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_WINDOW,
                         LAUNCH_WITH_PDL, USE_RS_ROUNDING, PHILOX_ROUNDS, QUANT_MAX,
-                        WRITE_CHECKPOINT, IS_DYNAMIC,
+                        True, IS_DYNAMIC,  # WRITE_CHECKPOINT=True (write arm)
+                        True,  # WC_IS_CONSTEXPR — force inner to use WC constexpr
                         # 3 TMA flags: write-load fires here (we're in the
                         # is_write branch), nowrite-load is dead (no slot
-                        # reaches it), store fires when WC=True at runtime.
+                        # reaches it), store fires (write path).
                         USE_TMA_LOAD_WRITE, USE_TMA_LOAD_NOWRITE, USE_TMA_STORE,
                     )
                 else:
@@ -4228,6 +4261,9 @@ def _persistent_main_kernel(
             # impl picks USE_TMA_LOAD_WRITE vs USE_TMA_LOAD_NOWRITE based on
             # its computed is_write — constexpr-folds when is_write is
             # constexpr (non-dyn), runtime branch when IS_DYNAMIC=True.
+            # (Reverted from outer two-call dispatch: that doubled the
+            # compiled body size under IS_DYNAMIC=True and regressed RECT=0
+            # perf by ~+24%.)
             _persistent_main_impl(
                 pid_m, pid_b, pid_h,
                 state_ptr, state_tma_descriptor, state_scales_ptr,
@@ -4256,6 +4292,7 @@ def _persistent_main_kernel(
                 BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_WINDOW,
                 LAUNCH_WITH_PDL, USE_RS_ROUNDING, PHILOX_ROUNDS, QUANT_MAX,
                 WRITE_CHECKPOINT, IS_DYNAMIC,
+                False,  # WC_IS_CONSTEXPR=False — RECT=0 has both write/nowrite slots in one call
                 USE_TMA_LOAD_WRITE, USE_TMA_LOAD_NOWRITE, USE_TMA_STORE,
             )
 
