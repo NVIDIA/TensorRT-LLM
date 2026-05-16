@@ -726,6 +726,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
 
 #if IS_MLA
+    uint32_t const multiBlockNum = 1;
     auto runKernel = [&]()
     {
         launchMLA(prop, qSeqLen, qScale,
