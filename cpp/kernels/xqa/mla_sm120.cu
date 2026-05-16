@@ -1792,7 +1792,7 @@ __device__ inline void mergePartialOutputs(uint32_t& semaphore, Vec<OutputHead, 
 
 inline constexpr uint32_t cgaSize = nbProducerCtasPerCga + nbVSplit;
 
-CUBIN_EXPORT __global__ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha(
+CUBIN_EXPORT __global__ __launch_bounds__(32 * 4 * 3, 1) void kernel_mha(
     __grid_constant__ CUtensorMap const tensorMapQ, // MhaIOHead[nbQHeads * totalNbInputTokens],
     __grid_constant__ CUtensorMap const tensorMapK, // with box=64 for the least significant dim
     __grid_constant__ CUtensorMap const tensorMapV, // with box=128 for the least significant dim
@@ -2020,7 +2020,7 @@ void launchMLA(cudaDeviceProp const& prop,
     // gridDim.z == nbKHeads * batchSize && gridDim.y == nbSubSeqPerSeq && gridDim.x == nbInputSeqSplit
     dim3 const dimGrid{4 * inputSeqLen, nbSubSeqPerSeq, nbKHeads * batchSize};
     dim3 const dimCta{warp_size * 4 * 3, 1, 1};
-    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
+    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0, dim3{cgaSize, 1, 1});
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
 #if PAGED_KV_CACHE_LAYOUT == 1
