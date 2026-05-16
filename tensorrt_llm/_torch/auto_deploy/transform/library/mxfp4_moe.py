@@ -659,15 +659,69 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
                 ("fc2_bias_trtllm_gen", prep.fc2_bias_f32),
             ]
             new_attr_paths = []
-            for short, tensor in new_param_specs:
-                experts_mod.register_parameter(
-                    short, nn.Parameter(tensor.contiguous(), requires_grad=False)
+
+            # AD_MOE_ARENA=1: allocate ONE contiguous byte buffer for all 6 MoE
+            # weight tensors of this layer, then slice + view + copy into it.
+            # This guarantees every tensor lands at a 1 MiB-aligned offset from
+            # the arena's base (which is itself >=2 MiB-aligned because the arena
+            # is large enough to trigger a fresh cudaMalloc segment), matching
+            # PT's "tight-loop" allocator pattern that yields uniform 1 MiB
+            # alignment for fc1_w/fc2_w/fc1_scale/fc2_scale (see
+            # analysis_ad_vs_pt_weight_addrs.md). Default off.
+            _USE_ARENA = os.environ.get("AD_MOE_ARENA", "0") == "1"
+            if _USE_ARENA:
+                _ALIGN = 1 << 20  # 1 MiB per-tensor offset alignment
+                # Compute byte sizes and aligned offsets up front.
+                _layout = []  # list of (short, src, offset, sz_bytes, sz_aligned)
+                _total = 0
+                for short, src in new_param_specs:
+                    src_c = src.contiguous()  # ensure contig source
+                    sz = src_c.numel() * src_c.element_size()
+                    sz_a = (sz + _ALIGN - 1) & ~(_ALIGN - 1)
+                    _layout.append((short, src_c, _total, sz, sz_a))
+                    _total += sz_a
+                # Allocate one big uint8 buffer; the size is comparable to a
+                # full MoE expert tensor (>1 GiB), so the caching allocator
+                # falls through to cudaMalloc which returns a 2 MiB-aligned
+                # base address.
+                _arena = torch.empty(_total, dtype=torch.uint8, device="cuda")
+                _arena_ptr = int(_arena.data_ptr())
+                # Sanity: if base isn't 1 MiB-aligned we lose the guarantee.
+                # Don't assert (allocator could return e.g. 512 KiB-aligned on
+                # weird platforms); just emit a warning so we can debug.
+                if _arena_ptr % _ALIGN != 0:
+                    import sys as _sys
+
+                    _sys.stderr.write(
+                        f"[AD_MOE_ARENA] WARN: arena base 0x{_arena_ptr:016x} "
+                        f"not {_ALIGN}-aligned (got align={(_arena_ptr & -_arena_ptr):d})\n"
+                    )
+                # Slice + view + copy each tensor into the arena.
+                for short, src_c, offset, sz, sz_a in _layout:
+                    byte_view = _arena.narrow(0, offset, sz)
+                    typed = byte_view.view(src_c.dtype).view(src_c.shape)
+                    typed.copy_(src_c)
+                    experts_mod.register_parameter(short, nn.Parameter(typed, requires_grad=False))
+                    new_attr_paths.append((experts_path + "." if experts_path else "") + short)
+                    _maybe_advise_readmostly(
+                        f"{experts_path}.{short}", experts_mod._parameters[short].data
+                    )
+                # Keep arena alive as a non-persistent buffer so it isn't GC'd.
+                experts_mod.register_buffer(
+                    f"_moe_arena_{experts_path.replace('.', '_') if experts_path else 'root'}",
+                    _arena,
+                    persistent=False,
                 )
-                new_attr_paths.append((experts_path + "." if experts_path else "") + short)
-                # V22: advise driver to keep this MoE weight page resident.
-                # Default off; enable via AD_MOE_WEIGHTS_READMOSTLY=1.
-                registered = experts_mod._parameters[short].data  # storage after register
-                _maybe_advise_readmostly(f"{experts_path}.{short}", registered)
+            else:
+                for short, tensor in new_param_specs:
+                    experts_mod.register_parameter(
+                        short, nn.Parameter(tensor.contiguous(), requires_grad=False)
+                    )
+                    new_attr_paths.append((experts_path + "." if experts_path else "") + short)
+                    # V22: advise driver to keep this MoE weight page resident.
+                    # Default off; enable via AD_MOE_WEIGHTS_READMOSTLY=1.
+                    registered = experts_mod._parameters[short].data
+                    _maybe_advise_readmostly(f"{experts_path}.{short}", registered)
 
             sa_short, sb_short, sl_short = (
                 "swiglu_alpha_trtllm_gen",
