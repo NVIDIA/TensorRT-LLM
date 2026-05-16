@@ -6,6 +6,14 @@
 # Weights are stored in MXFP4 on HF; AD's quantize_mxfp4_moe transform handles it.
 runtime: trtllm
 model_factory: AutoModelForCausalLM
+# Pin activation dtype to bf16. The HF config.json for gpt-oss-20b
+# omits ``torch_dtype``/``dtype``, so transformers 5.x's ``_from_config``
+# (used by AD's meta-device build path) falls back to fp32. With fp32
+# activations, trtllm attention's FMHA path is disabled (it only
+# supports fp16/bf16) and the unfused workspace explodes to ~10 TB
+# (seen on H100: workspace grew from 256 MB to 9.9 TB).
+model_kwargs:
+  dtype: bfloat16
 attn_backend: trtllm
 compile_backend: torch-cudagraph
 skip_loading_weights: false
