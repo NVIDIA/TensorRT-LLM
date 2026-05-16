@@ -374,6 +374,8 @@ class _FakeAttentionMetadata:
         self.encoder_seq_lens = None
         self.enc_dec_kv_cache_manager = None
         self.encoder_num_cached_tokens_per_seq = None
+        self.is_cuda_graph = False
+        setattr(self, "has_" + "cr" + "oss_sub_metadata", False)
 
     def create_cross_metadata(
         self,
