@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Literal, Tuple, Type
 
 import torch
@@ -246,6 +247,15 @@ class InsertMXFP4MLP(BaseTransform):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
+        # MXFP4 + trtllm-gen modeling-side path: the modeling code already
+        # registers the prepared-shape parameters and calls the fused op
+        # directly, so this transform has nothing to do. The graph won't have
+        # ``torch_moe_dense_mlp`` calls in that mode (the modeling forward
+        # routes through ``trtllm_mxfp4_w4a*_moe_fused`` op directly).
+        if os.environ.get("AD_MXFP4_TRTLLM_GEN_MODELING", "1") == "1":
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
         num_matches = 0
 
         for n in list(gm.graph.nodes):
@@ -441,6 +451,15 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         qcfg = factory.get_quant_config()
         if not qcfg or qcfg.get("quant_method", "") != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # MXFP4 + trtllm-gen modeling-side path: the modeling code already
+        # registers prepared-shape parameters and emits ``trtllm_mxfp4_w4a*``
+        # op calls in its forward, so there is no ``triton_mxfp4_moe`` graph
+        # node to retarget. Nothing to do.
+        if os.environ.get("AD_MXFP4_TRTLLM_GEN_MODELING", "1") == "1":
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

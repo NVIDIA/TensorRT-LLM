@@ -1303,8 +1303,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_mxfp4_gsm8k(self, model_id, model_name, world_size_override,
                          mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
-        # DEBUG: limit samples for fast bisect
-        mocker.patch.object(GSM8K, "NUM_SAMPLES", 50)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
 

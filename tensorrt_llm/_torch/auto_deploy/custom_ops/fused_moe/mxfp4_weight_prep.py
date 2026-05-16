@@ -635,9 +635,26 @@ def make_mxfp4_trtllm_gen_load_hook(
         "fc2_w_scale_trtllm_gen",
         "fc2_bias_trtllm_gen",
     )
+    # SwiGLU constants. These are NOT in HF safetensors, but the modeling code
+    # registers them as parameters expected by the trtllm-gen op call. Under
+    # ``init_empty_weights`` they get demoted to meta during ``__init__`` and
+    # then ``model.to(cuda)`` lands undefined values on the device. The hook
+    # injects them into ``state_dict`` so the regular load path populates them
+    # correctly. Constants match gpt-oss config (alpha=1.702, beta=1.0,
+    # limit=7.0).
+    _SWIGLU_SUFFIXES = (
+        ("swiglu_alpha_trtllm_gen", 1.702),
+        ("swiglu_beta_trtllm_gen", 1.0),
+        ("swiglu_limit_trtllm_gen", 7.0),
+    )
 
-    def hook(state_dict, prefix, *args, **kwargs):
+    def hook(state_dict, prefix, *args, local_metadata=None, **kwargs):
+        import sys as _sys
+
         tp_size, tp_rank = tp_info_fn()
+        _matched_layers = 0
+        # Diagnostic: dtype/shape of raw vs prepared layer 0 for sanity.
+        _layer0_diag = None
         for layer_idx in range(num_layers):
             base = f"{prefix}{layer_prefix}.{layer_idx}.{experts_subpath}."
             raw_keys = [base + s for s in _RAW_SUFFIXES]
@@ -645,7 +662,22 @@ def make_mxfp4_trtllm_gen_load_hook(
             # All raw keys must be present together; otherwise this layer is
             # either non-MXFP4 or already prepped — skip.
             if not all(k in state_dict for k in raw_keys):
+                if layer_idx == 0:
+                    # Diagnostic: layer 0 raw keys missing. Print what we got
+                    # so the cause (prefix mismatch / wrong subpath) is obvious.
+                    present_under_prefix = sorted(
+                        k for k in state_dict if k.startswith(f"{prefix}{layer_prefix}.0.")
+                    )[:10]
+                    print(
+                        f"[mxfp4_load_hook] layer 0 raw MXFP4 keys not found at "
+                        f"prefix={prefix!r}, sub={experts_subpath!r}. Want={raw_keys}. "
+                        f"State dict has under {prefix}{layer_prefix}.0.*: "
+                        f"{present_under_prefix}",
+                        file=_sys.stderr,
+                        flush=True,
+                    )
                 continue
+            _matched_layers += 1
 
             (
                 gu_blocks_key,
@@ -684,5 +716,38 @@ def make_mxfp4_trtllm_gen_load_hook(
             )
             for suffix, tensor in zip(_PREPARED_SUFFIXES, prepared_tensors):
                 state_dict[base + suffix] = tensor.contiguous()
+
+            # Inject swiglu constants for this layer too — they are not in
+            # state_dict, but the modeling code registers them as parameters
+            # which will be missing-keys (and stay zero/meta) without this.
+            num_local_experts_layer = int(prepared.fc1_weights_mxfp4.shape[0])
+            for suffix, value in _SWIGLU_SUFFIXES:
+                state_dict[base + suffix] = torch.full(
+                    (num_local_experts_layer,), float(value), dtype=torch.float32
+                )
+
+            if layer_idx == 0:
+                # One-shot post-prep summary for layer 0: lets us tell at a
+                # glance whether shapes/dtypes look right vs the transform path.
+                _layer0_diag = {
+                    "fc1_w_dtype": str(prepared.fc1_weights_mxfp4.dtype),
+                    "fc1_w_shape": tuple(prepared.fc1_weights_mxfp4.shape),
+                    "fc1_bias_dtype": str(prepared.fc1_bias_f32.dtype),
+                    "fc1_bias_abs_max": float(prepared.fc1_bias_f32.abs().max().item()),
+                }
+
+        if _matched_layers > 0:
+            if _layer0_diag is not None:
+                print(
+                    f"[mxfp4_load_hook] layer0 diag: {_layer0_diag}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+            print(
+                f"[mxfp4_load_hook] prefix={prefix!r} prepped {_matched_layers}/"
+                f"{num_layers} layers (tp_size={tp_size}, tp_rank={tp_rank})",
+                file=_sys.stderr,
+                flush=True,
+            )
 
     return hook

@@ -45,6 +45,7 @@ Shardable custom ops used:
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -236,13 +237,49 @@ class GptOssTopKRouter(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _detect_mxfp4_trtllm_gen(config) -> bool:
+    """Return True iff the HF config marks MXFP4 quantization.
+
+    For gpt-oss the trtllm-gen modeling-side weight layout is intrinsic to the
+    architecture (the kernel needs a specific shuffle/pad/block-scale-interleave
+    that no generic transform can detect from the FX graph alone), so this is
+    the default path whenever the checkpoint advertises MXFP4. The escape hatch
+    ``AD_MXFP4_TRTLLM_GEN_MODELING=0`` falls back to the post-load transform
+    flow (kept around for bring-up / A-B regressions).
+    """
+    quant_cfg = getattr(config, "quantization_config", None)
+    if quant_cfg is None:
+        return False
+    if isinstance(quant_cfg, dict):
+        is_mxfp4 = quant_cfg.get("quant_method") == "mxfp4"
+    else:
+        is_mxfp4 = getattr(quant_cfg, "quant_method", None) == "mxfp4"
+    if not is_mxfp4:
+        return False
+    return os.environ.get("AD_MXFP4_TRTLLM_GEN_MODELING", "1") == "1"
+
+
 class GptOssExperts(nn.Module):
     """GPT-OSS dense experts module.
 
-    Identical to ``modeling_gpt_oss.GptOssExperts``.  Expert weights stay
-    replicated across TP ranks under sharding-IR; EP / TP-MoE for the
-    MXFP4 trtllm-gen path is handled by a dedicated ``ShardableNode``
-    (Step 5 of the V4 plan), not by this hint-based path.
+    Two parameter layouts depending on MXFP4 detection (see
+    :func:`_detect_mxfp4_trtllm_gen`):
+
+    * **Default (bf16 dense)** — keeps the four HF-style placeholder params
+      ``gate_up_proj`` / ``gate_up_proj_bias`` / ``down_proj`` /
+      ``down_proj_bias``. The forward calls ``torch_moe_dense_mlp``.  The
+      ``quantize_mxfp4_moe`` transform may rewrite this to the triton MXFP4 op
+      (used on gpt-oss-20b today), and ``quantize_mxfp4_moe_trtllm_gen``
+      further to the trtllm-gen MoE op at post-load.
+
+    * **MXFP4 + trtllm-gen modeling-side** — registers the prepared-shape
+      MXFP4 params directly (``fc1_w_trtllm_gen`` / ``fc1_w_scale_trtllm_gen``
+      / ``fc1_bias_trtllm_gen`` / ``fc2_*``) plus per-expert SwiGLU
+      constants. The forward routes through the trtllm-gen op call (see
+      :class:`GptOssMLP`). Weight prep happens at ``load_state_dict`` time
+      via :func:`make_mxfp4_trtllm_gen_load_hook` registered on
+      :class:`GptOssForCausalLM`, so the legacy post-load transform's
+      double-alloc raw/prepared cycle is avoided.
     """
 
     def __init__(self, config):
@@ -253,16 +290,171 @@ class GptOssExperts(nn.Module):
         self.alpha = _GPTOSS_GLU_ALPHA
         self.limit = float(getattr(config, "swiglu_limit", _GPTOSS_GLU_LIMIT_FALLBACK))
 
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim)
+        self._use_mxfp4_trtllm_gen = _detect_mxfp4_trtllm_gen(config)
+
+        if self._use_mxfp4_trtllm_gen:
+            # MXFP4 + trtllm-gen modeling path: skip the bf16 dense placeholder
+            # parameters and register the prepared-shape MXFP4 parameters that
+            # the trtllm-gen MoE op expects. Values are zero-init; the
+            # ``load_state_dict`` pre-hook converts raw HF MXFP4 state-dict
+            # entries into prepared values at load time.
+            self._register_mxfp4_trtllm_gen_params()
+        else:
+            # Legacy bf16 dense placeholders.
+            self.gate_up_proj = nn.Parameter(
+                torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim)
+            )
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.empty(self.num_experts, 2 * self.expert_dim)
+            )
+            self.down_proj = nn.Parameter(
+                torch.empty(self.num_experts, self.expert_dim, self.hidden_size)
+            )
+            self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
+
+    def _register_mxfp4_trtllm_gen_params(self) -> None:
+        """Allocate prepared-shape MXFP4 parameters + SwiGLU constants.
+
+        Shapes are derived by running ``prepare_mxfp4_weights_for_trtllm_gen``
+        on small CPU zero-tensors (so they're independent of any active
+        ``init_empty_weights`` / meta-device context the model is being
+        constructed under). Only the resulting *shapes* are kept; the
+        registered parameters themselves are zero-init and will be filled
+        from the HF state dict by the load hook.
+
+        TP info is read from ``torch.distributed`` at construction time;
+        falls back to ``(1, 0)`` when distributed is uninitialized.
+        """
+        # Lazy import to avoid a transform-library dependency in the modeling
+        # source tree.
+        from ...custom_ops.fused_moe.mxfp4_weight_prep import (
+            _get_default_tp_info,
+            make_swiglu_param_tensors,
+            prepare_mxfp4_weights_for_trtllm_gen,
         )
-        self.gate_up_proj_bias = nn.Parameter(torch.empty(self.num_experts, 2 * self.expert_dim))
-        self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.expert_dim, self.hidden_size)
+
+        tp_size, tp_rank = _get_default_tp_info()
+        e = self.num_experts
+        h = self.hidden_size
+        i = self.expert_dim
+
+        # HF on-disk MXFP4 shapes (used only for shape-derivation, not stored).
+        h_blk = max(1, h // 32)
+        i_blk = max(1, i // 32)
+
+        zero_kw = {"device": "cpu"}
+        prep = prepare_mxfp4_weights_for_trtllm_gen(
+            torch.zeros((e, 2 * i, h_blk, 16), dtype=torch.uint8, **zero_kw),
+            torch.zeros((e, 2 * i, h_blk), dtype=torch.uint8, **zero_kw),
+            torch.zeros((e, 2 * i), dtype=torch.bfloat16, **zero_kw),
+            torch.zeros((e, h, i_blk, 16), dtype=torch.uint8, **zero_kw),
+            torch.zeros((e, h, i_blk), dtype=torch.uint8, **zero_kw),
+            torch.zeros((e, h), dtype=torch.bfloat16, **zero_kw),
+            hidden_size=h,
+            intermediate_size=i,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
-        self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
+
+        self._tp_size = tp_size
+        self._tp_rank = tp_rank
+        self._valid_hidden_size = int(prep.valid_hidden_size)
+        self._valid_intermediate_size = int(prep.valid_intermediate_size)
+        self._num_local_experts = int(prep.fc1_weights_mxfp4.shape[0])
+
+        # Register zero-init params with the prepared shapes. ``torch.empty``
+        # (no ``device=``) is meta-aware so this still respects an enclosing
+        # ``init_empty_weights`` context.
+        def _empty_like(t):
+            return torch.empty(t.shape, dtype=t.dtype)
+
+        self.register_parameter(
+            "fc1_w_trtllm_gen",
+            nn.Parameter(_empty_like(prep.fc1_weights_mxfp4), requires_grad=False),
+        )
+        self.register_parameter(
+            "fc1_w_scale_trtllm_gen",
+            nn.Parameter(_empty_like(prep.fc1_weights_scale_ue8m0), requires_grad=False),
+        )
+        self.register_parameter(
+            "fc1_bias_trtllm_gen",
+            nn.Parameter(_empty_like(prep.fc1_bias_f32), requires_grad=False),
+        )
+        self.register_parameter(
+            "fc2_w_trtllm_gen",
+            nn.Parameter(_empty_like(prep.fc2_weights_mxfp4), requires_grad=False),
+        )
+        self.register_parameter(
+            "fc2_w_scale_trtllm_gen",
+            nn.Parameter(_empty_like(prep.fc2_weights_scale_ue8m0), requires_grad=False),
+        )
+        self.register_parameter(
+            "fc2_bias_trtllm_gen",
+            nn.Parameter(_empty_like(prep.fc2_bias_f32), requires_grad=False),
+        )
+
+        a, b, c = make_swiglu_param_tensors(self._num_local_experts)
+        self.register_parameter("swiglu_alpha_trtllm_gen", nn.Parameter(a, requires_grad=False))
+        self.register_parameter("swiglu_beta_trtllm_gen", nn.Parameter(b, requires_grad=False))
+        self.register_parameter("swiglu_limit_trtllm_gen", nn.Parameter(c, requires_grad=False))
+
+    # Names of parameters whose dtype must NOT be changed by ``.to(dtype)``
+    # walks. The trtllm-gen MoE kernel API mandates: uint8 for MXFP4 weights
+    # and ue8m0 scales, float32 for biases and SwiGLU constants. Without this
+    # protection, ``model.to(bf16)`` would downcast bias/swiglu to bf16 and
+    # lose precision before the data lands on the device, producing garbage
+    # MoE output.
+    _DTYPE_PROTECTED = (
+        "fc1_w_trtllm_gen",
+        "fc1_w_scale_trtllm_gen",
+        "fc2_w_trtllm_gen",
+        "fc2_w_scale_trtllm_gen",
+        "fc1_bias_trtllm_gen",
+        "fc2_bias_trtllm_gen",
+        "swiglu_alpha_trtllm_gen",
+        "swiglu_beta_trtllm_gen",
+        "swiglu_limit_trtllm_gen",
+    )
+
+    def _apply(self, fn, recurse=True):
+        """Override to protect MXFP4 trtllm-gen parameters from dtype changes.
+
+        Temporarily detach the dtype-protected parameters from ``_parameters``
+        so the base ``_apply`` walk doesn't touch them, then run ``fn`` on
+        them ourselves with only the *non-dtype* portion of the transform
+        (i.e., apply ``fn`` and then restore the original dtype).
+
+        ``fn`` for ``.to(dtype)`` is roughly ``lambda t: t.to(dtype)``. By
+        restoring dtype after, we still pick up device transfers (``.to('cuda')``)
+        but keep our kernel-required dtypes.
+        """
+        if not getattr(self, "_use_mxfp4_trtllm_gen", False):
+            return super()._apply(fn, recurse=recurse)
+
+        protected = {}
+        for name in self._DTYPE_PROTECTED:
+            p = self._parameters.get(name)
+            if p is not None:
+                protected[name] = (p, p.dtype)
+                # Drop temporarily so super()._apply doesn't include it in its walk.
+                del self._parameters[name]
+
+        super()._apply(fn, recurse=recurse)
+
+        # Re-attach with dtype preserved. Apply ``fn`` to pick up the device /
+        # layout part of the transform, then cast back to the original dtype.
+        for name, (orig_param, orig_dtype) in protected.items():
+            new_data = fn(orig_param.data)
+            if new_data.dtype != orig_dtype:
+                new_data = new_data.to(orig_dtype)
+            orig_param.data = new_data
+            self._parameters[name] = orig_param
+
+        return self
 
     def forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
+        # Legacy bf16 dense forward; MXFP4 trtllm-gen path bypasses this via
+        # the ``GptOssMLP.forward`` dispatch.
         return torch.ops.auto_deploy.torch_moe_dense_mlp(
             hidden_states,
             routing_weights,
@@ -282,9 +474,50 @@ class GptOssMLP(nn.Module):
         super().__init__()
         self.router = GptOssTopKRouter(config)
         self.experts = GptOssExperts(config)
+        self.top_k = int(getattr(config, "num_experts_per_tok", 4))
+        # ``RoutingMethodType.Renormalize`` == 1 (matches PT's gpt-oss path).
+        self._routing_method_type = 1
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, hidden_dim = hidden_states.shape
+        if getattr(self.experts, "_use_mxfp4_trtllm_gen", False):
+            # MXFP4 trtllm-gen modeling path: call the fused op directly with
+            # raw router_weight/bias so the C++ runner does fused topk+softmax
+            # internally. Activation precision (``bf16`` vs ``mxfp8``) is
+            # selected via env var ``AD_MXFP4_QUANT_ACT`` (default ``mxfp8``).
+            quant_act = os.environ.get("AD_MXFP4_QUANT_ACT", "mxfp8")
+            if quant_act == "mxfp8":
+                op = torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused
+            else:
+                op = torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused
+            e = self.experts
+            out = op(
+                hidden_states,
+                self.router.weight,
+                self.router.bias,
+                self.top_k,
+                e.fc1_w_trtllm_gen,
+                e.fc2_w_trtllm_gen,
+                e.fc1_w_scale_trtllm_gen,
+                e.fc2_w_scale_trtllm_gen,
+                e.fc1_bias_trtllm_gen,
+                e.fc2_bias_trtllm_gen,
+                e.swiglu_alpha_trtllm_gen,
+                e.swiglu_beta_trtllm_gen,
+                e.swiglu_limit_trtllm_gen,
+                e._valid_hidden_size,
+                e._valid_intermediate_size,
+                0,  # local_expert_offset
+                e._num_local_experts,
+                self._routing_method_type,
+            )
+            # All-reduce across MoE-TP ranks; on TP=1 the call is a no-op
+            # placeholder that the sharding transform may rewrite/elide.
+            if getattr(e, "_tp_size", 1) > 1:
+                out = torch.ops.auto_deploy.all_reduce(out, "auto")
+            return out.view(bsz, seq_len, hidden_dim)
+        # Legacy bf16 dense path; ``quantize_mxfp4_moe`` / ``_trtllm_gen`` may
+        # rewrite the experts call further at transform time.
         routing_weights = self.router(hidden_states)  # [B*S, E]
         out = self.experts(hidden_states, routing_weights)
         return out.view(bsz, seq_len, hidden_dim)
@@ -521,6 +754,24 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         # in this codebase, and the absolute gain from sharding lm_head on
         # gpt-oss-120b is marginal (<1% of total ITL).
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # MXFP4 + trtllm-gen modeling path: register a state_dict pre-hook that
+        # converts raw HF MXFP4 expert tensors into trtllm-gen-prepared values
+        # at load time. With this hook, the experts module never allocates the
+        # raw HF layout — only the prepared-shape parameters — so we avoid the
+        # transient double-allocation in the legacy post-load-fusion transform
+        # (~150 GB on gpt-oss-120b 128 experts x 36 layers).
+        if _detect_mxfp4_trtllm_gen(config):
+            from ...custom_ops.fused_moe.mxfp4_weight_prep import make_mxfp4_trtllm_gen_load_hook
+
+            self._register_load_state_dict_pre_hook(
+                make_mxfp4_trtllm_gen_load_hook(
+                    num_layers=int(config.num_hidden_layers),
+                    hidden_size=int(config.hidden_size),
+                    intermediate_size=int(config.intermediate_size),
+                )
+            )
+
         self.post_init()
 
     def get_input_embeddings(self):
