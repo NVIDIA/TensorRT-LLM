@@ -59,9 +59,9 @@ class CompileModelConfig(TransformConfig):
     num_batched_inputs: int = Field(
         default=2, description="The number of batched inputs to use for CUDA graphs."
     )
-    backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = Field(
-        description="The backend to use for compiling the model."
-    )
+    backend: Literal[
+        "torch-simple", "torch-compile", "torch-cudagraph", "torch-opt", "grafia"
+    ] = Field(description="The backend to use for compiling the model.")
     piecewise_enabled: bool = Field(
         default=False,
         description="Enable piecewise CUDA graph for prefill/mixed batches (dual-mode).",

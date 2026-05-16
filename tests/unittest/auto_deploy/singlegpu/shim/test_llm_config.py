@@ -47,6 +47,31 @@ def test_requires_uniform_kv_caches_follows_attention_backend():
     )
 
 
+def test_grafia_compile_backend_shortcut_forces_torch_rmsnorm_backend():
+    args = LlmArgs(model="test-model", compile_backend="grafia")
+
+    assert args.compile_backend == "grafia"
+    assert args.transforms["compile_model"]["backend"] == "grafia"
+    assert args.transforms["fuse_rmsnorm"]["rmsnorm_backend"] == "torch"
+
+
+@pytest.mark.parametrize("rmsnorm_backend", ["flashinfer", "torch"])
+def test_grafia_compile_backend_transform_config_forces_torch_rmsnorm_backend(
+    rmsnorm_backend,
+):
+    args = LlmArgs(
+        model="test-model",
+        transforms={
+            "compile_model": {"backend": "grafia"},
+            "fuse_rmsnorm": {"rmsnorm_backend": rmsnorm_backend},
+        },
+    )
+
+    assert args.compile_backend == "grafia"
+    assert args.transforms["compile_model"]["backend"] == "grafia"
+    assert args.transforms["fuse_rmsnorm"]["rmsnorm_backend"] == "torch"
+
+
 # ================================
 # Config Flow Tests
 # ================================

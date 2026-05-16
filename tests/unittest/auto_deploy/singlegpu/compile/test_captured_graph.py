@@ -815,7 +815,8 @@ class TestCompileModelGraphModuleTargetCollection:
         assert compiled_models == [wrapper.child]
 
     @pytest.mark.parametrize(
-        "backend", ["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"]
+        "backend",
+        ["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt", "grafia"],
     )
     def test_non_cudagraph_backends_compile_full_wrapper_model(self, monkeypatch, backend):
         wrapper = self._make_wrapper_with_graphmodule_child()
@@ -884,7 +885,7 @@ class TestCompileModelGraphModuleTargetCollection:
         assert info.skipped is False
         assert compiled_models == [wrapper]
 
-    @pytest.mark.parametrize("backend", ["torch-simple", "torch-compile"])
+    @pytest.mark.parametrize("backend", ["torch-simple", "torch-compile", "grafia"])
     def test_piecewise_requires_cudagraph_or_opt_backend(self, backend):
         with pytest.raises(
             ValidationError,

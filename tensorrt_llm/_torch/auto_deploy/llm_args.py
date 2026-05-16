@@ -301,6 +301,14 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def preserve_rmsnorm_for_grafia_compile_backend(self):
+        """Keep canonical RMSNorm nodes available for the Grafia compile backend."""
+        if self.compile_backend == "grafia" and "fuse_rmsnorm" in self.transforms:
+            self.transforms["fuse_rmsnorm"]["rmsnorm_backend"] = "torch"
+
+        return self
+
+    @model_validator(mode="after")
     def sync_cuda_graph_batch_sizes_to_compile_config(self):
         """Propagate cuda_graph_config.batch_sizes into compile_model transform config.
 
