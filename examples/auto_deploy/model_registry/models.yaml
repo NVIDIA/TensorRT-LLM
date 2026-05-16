@@ -220,6 +220,8 @@ models:
 - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
   config_id: nano_v3
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
+- name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_omni.yaml', 'nano_omni_multimodal_smoke.yaml']
 - name: Qwen/QwQ-32B-Preview
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']

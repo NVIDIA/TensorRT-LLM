@@ -33,6 +33,7 @@ _MODEL_MODULES = {
     "modeling_mistral3": ["Mistral3ForConditionalGenerationAD", "Mistral4ForCausalLM"],
     "modeling_nemotron_flash": ["NemotronFlashForCausalLM", "NemotronFlashPreTrainedTokenizerFast"],
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
+    "modeling_nemotron_nano_omni": ["NemotronNanoOmniForConditionalGeneration"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
     "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
     "modeling_starcoder2": ["Starcoder2ForCausalLM"],
