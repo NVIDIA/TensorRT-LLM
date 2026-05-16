@@ -50,6 +50,67 @@ from tensorrt_llm.serve.responses_utils import (
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
 
+def _summarize_disagg_params(params: Optional[DisaggregatedParams]) -> str:
+    if params is None:
+        return "none"
+    encoded_opaque_state = params.encoded_opaque_state
+    return (
+        f"request_type={params.request_type!r} "
+        f"ctx_request_id={params.ctx_request_id!r} "
+        f"disagg_request_id={params.disagg_request_id!r} "
+        f"schedule_style={params.schedule_style!r} "
+        f"ctx_dp_rank={params.ctx_dp_rank!r} "
+        f"ctx_info_endpoint={params.ctx_info_endpoint!r} "
+        f"opaque_state_bytes={len(encoded_opaque_state) if encoded_opaque_state else 0} "
+        f"first_gen_tokens={len(params.first_gen_tokens) if params.first_gen_tokens else 0} "
+        f"draft_tokens={len(params.draft_tokens) if params.draft_tokens else 0}"
+    )
+
+
+def _summarize_request(request: UCompletionRequest) -> str:
+    if isinstance(request, CompletionRequest):
+        prompt = request.prompt
+        if isinstance(prompt, str):
+            prompt_summary = f"prompt_chars={len(prompt)}"
+        elif isinstance(prompt, list):
+            prompt_summary = f"prompt_list_len={len(prompt)}"
+        else:
+            prompt_summary = f"prompt_type={type(prompt).__name__}"
+    elif isinstance(request, ChatCompletionRequest):
+        messages = getattr(request, "messages", [])
+        prompt_token_ids = getattr(request, "prompt_token_ids", None)
+        prompt_summary = (
+            f"messages={len(messages)} "
+            f"prompt_token_ids={len(prompt_token_ids) if prompt_token_ids else 0}"
+        )
+    else:
+        prompt_summary = f"request_type={type(request).__name__}"
+
+    return (
+        f"model={getattr(request, 'model', None)!r} "
+        f"stream={getattr(request, 'stream', None)!r} "
+        f"max_tokens={getattr(request, 'max_tokens', None)!r} "
+        f"temperature={getattr(request, 'temperature', None)!r} "
+        f"ignore_eos={getattr(request, 'ignore_eos', None)!r} "
+        f"{prompt_summary} disagg=({_summarize_disagg_params(request.disaggregated_params)})"
+    )
+
+
+def _summarize_response(response: Optional[UCompletionResponse]) -> str:
+    if response is None:
+        return "none"
+    if not response.choices:
+        return "choices=0"
+    choice = response.choices[0]
+    prompt_token_ids = getattr(response, "prompt_token_ids", None)
+    return (
+        f"choices={len(response.choices)} "
+        f"finish_reason={getattr(choice, 'finish_reason', None)!r} "
+        f"prompt_token_ids={len(prompt_token_ids) if prompt_token_ids else 0} "
+        f"disagg=({_summarize_disagg_params(getattr(choice, 'disaggregated_params', None))})"
+    )
+
+
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
         self,
@@ -136,18 +197,48 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_response = None
         gen_req = request
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
+        logger.info(
+            f"[disagg-debug] ctx-first request start: disagg_request_id={disagg_request_id} "
+            f"request=({_summarize_request(request)})"
+        )
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
             ctx_server, _ = await self._ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
-            ctx_response = await self._ctx_client.send_request(
-                ctx_req, server=ctx_server, hooks=hooks
+            logger.info(
+                f"[disagg-debug] ctx-first selected context server: "
+                f"disagg_request_id={disagg_request_id} ctx_server={ctx_server} "
+                f"reserved_gen_server={gen_server} ctx_request=({_summarize_request(ctx_req)})"
+            )
+            try:
+                ctx_response = await self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks
+                )
+            except Exception:
+                logger.error(
+                    f"[disagg-debug] ctx-first context request failed: "
+                    f"disagg_request_id={disagg_request_id} ctx_server={ctx_server}"
+                )
+                raise
+            logger.info(
+                f"[disagg-debug] ctx-first context response: "
+                f"disagg_request_id={disagg_request_id} ctx_server={ctx_server} "
+                f"response=({_summarize_response(ctx_response)})"
             )
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+            logger.info(
+                f"[disagg-debug] ctx-first generated generation request: "
+                f"disagg_request_id={disagg_request_id} gen_request=({_summarize_request(gen_req)})"
+            )
         else:
+            logger.info(
+                f"[disagg-debug] ctx-first skipping context phase: "
+                f"disagg_request_id={disagg_request_id} reserved_gen_server={gen_server} "
+                f"request=({_summarize_request(gen_req)})"
+            )
             # Clear synthetic disaggregated_params that may have been
             # injected by _extract_conversation_id (e.g. from the
             # X-Correlation-ID header).  When need_ctx=False the gen
@@ -165,11 +256,34 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks
+            logger.info(
+                f"[disagg-debug] ctx-first selected generation server: "
+                f"disagg_request_id={disagg_request_id} gen_server={gen_server} "
+                f"ctx_server={ctx_server} gen_request=({_summarize_request(gen_req)})"
+            )
+            try:
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks
+                )
+            except Exception:
+                logger.error(
+                    f"[disagg-debug] ctx-first generation request failed: "
+                    f"disagg_request_id={disagg_request_id} gen_server={gen_server} "
+                    f"ctx_server={ctx_server}"
+                )
+                raise
+            logger.info(
+                f"[disagg-debug] ctx-first generation response object: "
+                f"disagg_request_id={disagg_request_id} gen_server={gen_server} "
+                f"response_type={type(gen_response).__name__}"
             )
             return self._rewrite_disagg_usage(gen_response, ctx_response)
         else:
+            logger.info(
+                f"[disagg-debug] ctx-first context phase completed request without generation: "
+                f"disagg_request_id={disagg_request_id} ctx_server={ctx_server} "
+                f"ctx_response=({_summarize_response(ctx_response)})"
+            )
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator

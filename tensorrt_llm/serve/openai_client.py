@@ -41,6 +41,55 @@ from tensorrt_llm.serve.router import Router
 # yapf: enable
 
 
+def _summarize_disagg_params(request: UCompletionRequest) -> str:
+    params = getattr(request, "disaggregated_params", None)
+    if params is None:
+        return "none"
+    encoded_opaque_state = getattr(params, "encoded_opaque_state", None)
+    first_gen_tokens = getattr(params, "first_gen_tokens", None)
+    draft_tokens = getattr(params, "draft_tokens", None)
+    return (
+        f"request_type={getattr(params, 'request_type', None)!r} "
+        f"ctx_request_id={getattr(params, 'ctx_request_id', None)!r} "
+        f"disagg_request_id={getattr(params, 'disagg_request_id', None)!r} "
+        f"schedule_style={getattr(params, 'schedule_style', None)!r} "
+        f"ctx_dp_rank={getattr(params, 'ctx_dp_rank', None)!r} "
+        f"ctx_info_endpoint={getattr(params, 'ctx_info_endpoint', None)!r} "
+        f"opaque_state_bytes={len(encoded_opaque_state) if encoded_opaque_state else 0} "
+        f"first_gen_tokens={len(first_gen_tokens) if first_gen_tokens else 0} "
+        f"draft_tokens={len(draft_tokens) if draft_tokens else 0}"
+    )
+
+
+def _summarize_request(request: UCompletionRequest) -> str:
+    if isinstance(request, CompletionRequest):
+        prompt = request.prompt
+        if isinstance(prompt, str):
+            prompt_summary = f"prompt_chars={len(prompt)}"
+        elif isinstance(prompt, list):
+            prompt_summary = f"prompt_list_len={len(prompt)}"
+        else:
+            prompt_summary = f"prompt_type={type(prompt).__name__}"
+    elif isinstance(request, ChatCompletionRequest):
+        messages = getattr(request, "messages", [])
+        prompt_token_ids = getattr(request, "prompt_token_ids", None)
+        prompt_summary = (
+            f"messages={len(messages)} "
+            f"prompt_token_ids={len(prompt_token_ids) if prompt_token_ids else 0}"
+        )
+    else:
+        prompt_summary = f"request_type={type(request).__name__}"
+
+    return (
+        f"model={getattr(request, 'model', None)!r} "
+        f"stream={getattr(request, 'stream', None)!r} "
+        f"max_tokens={getattr(request, 'max_tokens', None)!r} "
+        f"temperature={getattr(request, 'temperature', None)!r} "
+        f"ignore_eos={getattr(request, 'ignore_eos', None)!r} "
+        f"{prompt_summary} disagg=({_summarize_disagg_params(request)})"
+    )
+
+
 class OpenAIClient(ABC):
     async def send_request(
         self,
@@ -129,14 +178,20 @@ class OpenAIHttpClient(OpenAIClient):
         if server is None:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
-        logger.debug(
-            f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
+        logger.info(
+            f"[disagg-debug] OpenAI client send start: role={self._role} "
+            f"endpoint={endpoint} server={server} url={url} "
+            f"request=({_summarize_request(request)})"
         )
         try:
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)
             if request.stream:
                 # return the response generator, the request is not done yet
+                logger.info(
+                    f"[disagg-debug] OpenAI client returning streaming generator: "
+                    f"role={self._role} url={url}"
+                )
                 return resp_generator
             else:
                 # consume the generator to get the response and return it directly when it's not streaming
@@ -149,10 +204,19 @@ class OpenAIHttpClient(OpenAIClient):
                         else:
                             hooks.on_first_token(server, request)
                             hooks.on_resp_done(server, request, response)
+                logger.info(
+                    f"[disagg-debug] OpenAI client send done: role={self._role} "
+                    f"url={url} response_type={type(response).__name__ if response else None}"
+                )
                 return response
         except Exception:
             self._metrics_collector.error_requests.inc()
             # finish the request upon error
+            logger.error(
+                f"[disagg-debug] OpenAI client send failed: role={self._role} "
+                f"url={url} request=({_summarize_request(request)})",
+                traceback.format_exc(),
+            )
             await self._finish_request(request)
             raise
 
@@ -171,11 +235,24 @@ class OpenAIHttpClient(OpenAIClient):
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = self._disagg_id_generator()
             json_data = request.model_dump(exclude_unset=True, mode="json")
+            lines_yielded = 0
             try:
-                lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
+                logger.info(
+                    f"[disagg-debug] HTTP post start: role={self._role} "
+                    f"attempt={attempt}/{self._max_retries} server={server} "
+                    f"url={url} stream={is_stream} payload_keys={sorted(json_data.keys())} "
+                    f"request=({_summarize_request(request)})"
+                )
                 async with self._session.post(url, json=json_data) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
+                    logger.info(
+                        f"[disagg-debug] HTTP post response headers: role={self._role} "
+                        f"attempt={attempt}/{self._max_retries} url={url} "
+                        f"status={http_response.status} reason={http_response.reason!r} "
+                        f"content_type={content_type!r} elapsed_s="
+                        f"{get_steady_clock_now_in_seconds() - start_time:.3f}"
+                    )
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
@@ -200,6 +277,11 @@ class OpenAIHttpClient(OpenAIClient):
                                 headers=http_response.headers,
                             )
                         response_dict = await http_response.json()
+                        logger.info(
+                            f"[disagg-debug] HTTP post JSON received: role={self._role} "
+                            f"url={url} response_keys={sorted(response_dict.keys())} "
+                            f"elapsed_s={get_steady_clock_now_in_seconds() - start_time:.3f}"
+                        )
                         # yield here since python forbids return statements in async generators
                         yield response_dict
                         # finish the request after the successful response
@@ -207,8 +289,12 @@ class OpenAIHttpClient(OpenAIClient):
                         self._metrics_collector.complete_latency_seconds.observe(
                             get_steady_clock_now_in_seconds() - start_time
                         )
+                        logger.info(
+                            f"[disagg-debug] HTTP post complete: role={self._role} "
+                            f"url={url} elapsed_s={get_steady_clock_now_in_seconds() - start_time:.3f}"
+                        )
                 break  # break and skip retries if the whole response is processed without exception
-            except (aiohttp.ClientError, OSError) as e:
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",

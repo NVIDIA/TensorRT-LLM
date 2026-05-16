@@ -75,6 +75,135 @@ def cleanup_output_files():
             pass
 
 
+_DISAGG_DEBUG_ENV_KEYS = {
+    "AWS_OFI_NCCL_VERSION",
+    "BUILD_ID",
+    "BUILD_URL",
+    "CUDA_HOME",
+    "CUDA_VISIBLE_DEVICES",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LIBRARY_PATH",
+    "LLM_MODELS_ROOT",
+    "NCCL_DEBUG",
+    "NCCL_DEBUG_SUBSYS",
+    "NCCL_IB_HCA",
+    "NCCL_IB_DISABLE",
+    "NCCL_NET",
+    "NCCL_NET_PLUGIN",
+    "NCCL_P2P_DISABLE",
+    "NCCL_P2P_LEVEL",
+    "NCCL_RUNTIME_CONNECT",
+    "NCCL_SOCKET_IFNAME",
+    "NVIDIA_DRIVER_CAPABILITIES",
+    "NVIDIA_VISIBLE_DEVICES",
+    "PATH",
+    "PYTHONPATH",
+    "TLLM_LOG_LEVEL_BY_MODULE",
+    "TLLM_NUMA_AWARE_WORKER_AFFINITY",
+    "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP",
+    "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY",
+    "TRTLLM_USE_MPI_KVCACHE",
+    "TRTLLM_USE_NIXL_KVCACHE",
+    "TRTLLM_USE_UCX_KVCACHE",
+    "UCX_CUDA_IPC_ENABLE_MNNVL",
+    "UCX_LOG_LEVEL",
+    "UCX_NET_DEVICES",
+    "UCX_RNDV_SCHEME",
+    "UCX_TLS",
+}
+_DISAGG_DEBUG_ENV_PREFIXES = ("NCCL_", "NIXL_", "UCX_", "CUDA_", "TRTLLM_",
+                              "FI_", "OMPI_", "PMI_", "PMIX_")
+_DISAGG_DEBUG_TESTS = ("gpt_oss_120b_harmony", "gpt_oss_120b_stress")
+
+
+def _should_print_disagg_debug(test_desc: str | None) -> bool:
+    return test_desc in _DISAGG_DEBUG_TESTS
+
+
+def _print_disagg_debug(message: str) -> None:
+    print(f"[disagg-debug] {message}", flush=True)
+
+
+def _env_debug_snapshot(env: dict[str, str] | None) -> dict[str, str]:
+    source_env = os.environ if env is None else env
+    snapshot = {}
+    for key, value in source_env.items():
+        if key in _DISAGG_DEBUG_ENV_KEYS or key.startswith(
+                _DISAGG_DEBUG_ENV_PREFIXES):
+            snapshot[key] = value
+    return dict(sorted(snapshot.items()))
+
+
+def _run_disagg_debug_command(cmd: list[str],
+                              env: dict[str, str] | None = None,
+                              cwd: str | None = None,
+                              timeout: int = 15) -> None:
+    _print_disagg_debug(f"diagnostic command start: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd,
+                                cwd=cwd,
+                                env=env,
+                                capture_output=True,
+                                text=True,
+                                timeout=timeout,
+                                check=False)
+    except FileNotFoundError as e:
+        _print_disagg_debug(f"diagnostic command missing: {cmd[0]}: {e}")
+        return
+    except subprocess.TimeoutExpired as e:
+        _print_disagg_debug(
+            f"diagnostic command timeout after {timeout}s: {' '.join(cmd)}")
+        if e.stdout:
+            _print_disagg_debug(f"stdout before timeout:\n{e.stdout[-20000:]}")
+        if e.stderr:
+            _print_disagg_debug(f"stderr before timeout:\n{e.stderr[-20000:]}")
+        return
+
+    _print_disagg_debug(
+        f"diagnostic command done: returncode={result.returncode} cmd={' '.join(cmd)}"
+    )
+    if result.stdout:
+        _print_disagg_debug(f"stdout:\n{result.stdout[-20000:]}")
+    if result.stderr:
+        _print_disagg_debug(f"stderr:\n{result.stderr[-20000:]}")
+
+
+def _print_disagg_setup_debug(test_desc: str | None, config_file: str,
+                              model: str | None, config: dict[str, Any],
+                              ctx_worker_config: dict[str, Any],
+                              gen_worker_config: dict[str, Any],
+                              env: dict[str, str] | None, cwd: str | None,
+                              work_dir: str, server_port: int) -> None:
+    if not _should_print_disagg_debug(test_desc):
+        return
+
+    _print_disagg_debug(
+        f"setup start: test_desc={test_desc} config_file={config_file} "
+        f"model={model} real_model_path={os.path.realpath(model) if model else None} "
+        f"cwd={cwd} work_dir={work_dir} server_port={server_port}")
+    _print_disagg_debug(
+        "selected environment:\n" +
+        json.dumps(_env_debug_snapshot(env), indent=2, sort_keys=True))
+    _print_disagg_debug("base disagg config:\n" +
+                        yaml.safe_dump(config, sort_keys=True))
+    _print_disagg_debug("context worker config:\n" +
+                        yaml.safe_dump(ctx_worker_config, sort_keys=True))
+    _print_disagg_debug("generation worker config:\n" +
+                        yaml.safe_dump(gen_worker_config, sort_keys=True))
+
+    for cmd in (["nvidia-smi", "-L"], [
+            "nvidia-smi",
+            "--query-gpu=index,name,pci.bus_id,uuid,compute_mode,memory.total",
+            "--format=csv,noheader",
+    ], ["nvidia-smi", "topo", "-m"], ["ls", "-l", "/sys/class/infiniband"],
+                ["ls", "-l", "/usr/lib/x86_64-linux-gnu/librdmacm.so.1"
+                 ], ["ls", "-l", "/usr/lib64/librdmacm.so.1"],
+                ["ibv_devinfo", "-l"], ["rdma", "link",
+                                        "show"], ["ip", "-o", "addr", "show"]):
+        _run_disagg_debug_command(cmd, env=env, cwd=cwd)
+
+
 def get_default_disagg_cluster_config():
     """Get default disaggregated cluster configuration."""
     return {
@@ -350,9 +479,14 @@ def run_client_tests(example_dir,
     """Run client tests against the disaggregated server."""
     if client_test_set is None:
         client_test_set = get_client_test_set(test_desc)
+    if _should_print_disagg_debug(test_desc):
+        _print_disagg_debug(
+            f"client test set: test_desc={test_desc} num_iters={num_iters} "
+            f"prompt_file={prompt_file} server_url={server_url} "
+            f"client_test_set={client_test_set}")
 
     client_dir = f"{example_dir}/clients"
-    for _ in range(num_iters):
+    for iter_idx in range(num_iters):
         client_cmd = [
             'python3', f'{client_dir}/disagg_client.py', '-c', f'{config_file}',
             '-p', f'{client_dir}/{prompt_file}', '--ignore-eos',
@@ -379,6 +513,10 @@ def run_client_tests(example_dir,
 
         # Run completion test (non-streaming)
         if client_test_set.completion:
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"running completion client: iter={iter_idx} cmd={client_cmd}"
+                )
             check_call(client_cmd, env=env, poll_procs=poll_procs)
 
         # Streaming client run
@@ -386,12 +524,20 @@ def run_client_tests(example_dir,
             streaming_client_cmd = client_cmd + [
                 '--streaming', '-o', 'output_streaming.json'
             ]
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"running streaming completion client: iter={iter_idx} "
+                    f"cmd={streaming_client_cmd}")
             check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run chat completion test
         if client_test_set.chat:
             chat_output = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
             chat_client_cmd = client_cmd + ['-e', 'chat', '-o', chat_output]
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"running chat client: iter={iter_idx} cmd={chat_client_cmd}"
+                )
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run streaming chat completion test
@@ -399,6 +545,10 @@ def run_client_tests(example_dir,
             streaming_chat_client_cmd = client_cmd + [
                 '-e', 'chat', '--streaming', '-o', 'output_streaming_chat.json'
             ]
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"running streaming chat client: iter={iter_idx} "
+                    f"cmd={streaming_chat_client_cmd}")
             check_call(streaming_chat_client_cmd,
                        env=env,
                        poll_procs=poll_procs)
@@ -471,6 +621,7 @@ def setup_disagg_cluster(
     cwd: str | None = None,
     server_start_timeout: int = 300,
     schedule_style: str | None = None,
+    test_desc: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -481,6 +632,7 @@ def setup_disagg_cluster(
         env: Environment variables to pass to subprocess (workers and disagg server)
         server_start_timeout: Timeout in seconds for server to become ready
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
+        test_desc: Test description, used only to gate extra diagnostics
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -525,12 +677,21 @@ def setup_disagg_cluster(
 
     import torch
     num_gpus = torch.cuda.device_count()
+    _print_disagg_setup_debug(test_desc, config_file, model, config,
+                              ctx_worker_config, gen_worker_config, env, cwd,
+                              work_dir, server_port)
+    if _should_print_disagg_debug(test_desc):
+        _print_disagg_debug(f"torch.cuda.device_count={num_gpus}")
 
     try:
         for i in range(num_ctx_instances):
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_ctx)))
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"launching context worker: instance={i} "
+                    f"device_ids={device_ids} gpus_per_ctx={gpus_per_ctx}")
             ctx_workers.append(
                 run_ctx_worker(model,
                                ctx_worker_config,
@@ -538,12 +699,21 @@ def setup_disagg_cluster(
                                port=0,
                                device=device_ids,
                                env=env))
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"context worker launched: instance={i} "
+                    f"pid={ctx_workers[-1].process.pid} device_ids={device_ids}"
+                )
             next_device += gpus_per_ctx
 
         for i in range(num_gen_instances):
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_gen)))
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"launching generation worker: instance={i} "
+                    f"device_ids={device_ids} gpus_per_gen={gpus_per_gen}")
             gen_workers.append(
                 run_gen_worker(model,
                                gen_worker_config,
@@ -551,6 +721,11 @@ def setup_disagg_cluster(
                                port=0,
                                device=device_ids,
                                env=env))
+            if _should_print_disagg_debug(test_desc):
+                _print_disagg_debug(
+                    f"generation worker launched: instance={i} "
+                    f"pid={gen_workers[-1].process.pid} device_ids={device_ids}"
+                )
             next_device += gpus_per_gen
 
         # Build minimal server config and launch
@@ -579,10 +754,18 @@ def setup_disagg_cluster(
                                           server_port,
                                           env=env,
                                           cwd=cwd)
+        if _should_print_disagg_debug(test_desc):
+            _print_disagg_debug(
+                f"disagg server launched: pid={disagg_server.process.pid} "
+                f"server_config:\n{yaml.safe_dump(server_config, sort_keys=True)}"
+            )
 
         asyncio.run(
             wait_for_disagg_server_ready(server_port,
                                          timeout=server_start_timeout))
+        if _should_print_disagg_debug(test_desc):
+            _print_disagg_debug(
+                f"disagg server ready: server_port={server_port}")
     except Exception:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -611,7 +794,8 @@ def run_disaggregated_test(example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=env, cwd=cwd,
-                             schedule_style=disagg_schedule_style)
+                             schedule_style=disagg_schedule_style,
+                             test_desc=test_desc)
 
     server_host = config.get("hostname", "localhost")
 
@@ -626,6 +810,10 @@ def run_disaggregated_test(example_dir,
                                                        dir=work_dir)
         with os.fdopen(temp_fd, 'w') as f:
             yaml.dump(client_config, f)
+        if _should_print_disagg_debug(test_desc):
+            _print_disagg_debug(
+                f"client config written: path={client_config_file}\n"
+                f"{yaml.safe_dump(client_config, sort_keys=True)}")
 
         # collect all worker processes for monitoring
         all_worker_procs = [w.process for w in ctx_workers
@@ -1772,7 +1960,6 @@ def run_disaggregated_aiperf(config_file,
         env: Environment variables dict
         cwd: Working directory
     """
-
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()

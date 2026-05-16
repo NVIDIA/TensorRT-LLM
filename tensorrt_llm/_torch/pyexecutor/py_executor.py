@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import datetime
 import functools
@@ -8,7 +23,7 @@ import traceback
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -87,6 +102,77 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+
+def _safe_len(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return -1
+
+
+def _summarize_disagg_params(params: Any) -> str:
+    if params is None:
+        return "none"
+    encoded_opaque_state = getattr(params, "encoded_opaque_state", None)
+    first_gen_tokens = getattr(params, "first_gen_tokens", None)
+    draft_tokens = getattr(params, "draft_tokens", None)
+    return (
+        f"request_type={getattr(params, 'request_type', None)!r} "
+        f"ctx_request_id={getattr(params, 'ctx_request_id', None)!r} "
+        f"disagg_request_id={getattr(params, 'disagg_request_id', None)!r} "
+        f"schedule_style={getattr(params, 'schedule_style', None)!r} "
+        f"ctx_dp_rank={getattr(params, 'ctx_dp_rank', None)!r} "
+        f"ctx_info_endpoint={getattr(params, 'ctx_info_endpoint', None)!r} "
+        f"opaque_state_bytes={len(encoded_opaque_state) if encoded_opaque_state else 0} "
+        f"first_gen_tokens={_safe_len(first_gen_tokens)} "
+        f"draft_tokens={_safe_len(draft_tokens)}")
+
+
+def _summarize_disagg_request(req: LlmRequest) -> str:
+    return (
+        f"request_id={getattr(req, 'py_request_id', getattr(req, 'request_id', None))!r} "
+        f"state={getattr(req, 'state', None)!r} "
+        f"prompt_len={getattr(req, 'py_prompt_len', getattr(req, 'prompt_len', None))!r} "
+        f"orig_prompt_len={getattr(req, 'py_orig_prompt_len', getattr(req, 'orig_prompt_len', None))!r} "
+        f"max_new_tokens={getattr(req, 'py_max_new_tokens', getattr(req, 'max_new_tokens', None))!r} "
+        f"context_current_position={getattr(req, 'context_current_position', None)!r} "
+        f"decoding_iter={getattr(req, 'py_decoding_iter', None)!r} "
+        f"seq_slot={getattr(req, 'py_seq_slot', None)!r} "
+        f"client_id={getattr(req, 'py_client_id', None)!r} "
+        f"is_child={getattr(req, 'is_child', None)!r} "
+        f"parent_request_id={getattr(req, 'parent_request_id', None)!r} "
+        f"is_context_only={getattr(req, 'is_context_only_request', None)!r} "
+        f"is_gen_init={getattr(req, 'is_disagg_generation_init_state', None)!r} "
+        f"is_gen_transfer_in_progress={getattr(req, 'is_disagg_generation_transmission_in_progress', None)!r} "
+        f"is_gen_transfer_complete={getattr(req, 'is_disagg_generation_transmission_complete', None)!r} "
+        f"kv_transfer_start={getattr(req, 'py_kv_transfer_start_time', None)!r} "
+        f"kv_transfer_timed_out={getattr(req, 'py_kv_transfer_timed_out', None)!r} "
+        f"disagg=({_summarize_disagg_params(getattr(req, 'py_disaggregated_params', None))})"
+    )
+
+
+def _summarize_disagg_requests(requests: Iterable[LlmRequest],
+                               limit: int = 8) -> str:
+    requests = list(requests)
+    summarized = [_summarize_disagg_request(req) for req in requests[:limit]]
+    if len(requests) > limit:
+        summarized.append(f"... {len(requests) - limit} more")
+    return "[" + "; ".join(summarized) + "]"
+
+
+def _summarize_transfer_result(result: Any) -> str:
+    if isinstance(result, tuple):
+        parts = []
+        for item in result:
+            try:
+                parts.append(str(len(item)))
+            except TypeError:
+                parts.append(type(item).__name__)
+        return f"tuple_lengths={parts}"
+    return repr(result)
 
 
 class PPCommTag(IntEnum):
@@ -666,6 +752,12 @@ class PyExecutor:
             self.kv_connector_manager.wait_for_initialization()
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+        logger.info(
+            f"[disagg-debug] ending KV transfer: "
+            f"request=({_summarize_disagg_request(request)}) "
+            f"request_in_active={request in self.active_requests} "
+            f"should_store_blocks={self.async_transfer_manager.should_store_blocks}"
+        )
         if self.kv_cache_transceiver and request in self.active_requests:
             # Fast-transfer: KV transfer completed in the same iteration
             # before _handle_responses could run. Create the response now
@@ -3424,10 +3516,11 @@ class PyExecutor:
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
 
-        need_check = any([
-            req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
+        in_progress_reqs = [
+            req for req in self.active_requests
+            if req.is_disagg_generation_transmission_in_progress
+        ]
+        need_check = bool(in_progress_reqs)
         non_gen_first_reqs = [
             req for req in self.active_requests
             if req.py_disaggregated_params and req.py_disaggregated_params.
@@ -3439,6 +3532,12 @@ class PyExecutor:
 
         if need_check:
             at_least_num = 1 if need_check_one else 0
+            logger.info(
+                f"[disagg-debug] generation transfer status poll: "
+                f"at_least_num={at_least_num} need_check_one={need_check_one} "
+                f"in_progress={_summarize_disagg_requests(in_progress_reqs)} "
+                f"non_gen_first={_summarize_disagg_requests(non_gen_first_reqs)}"
+            )
             self._check_disagg_gen_cache_transfer_status(at_least_num)
 
         return
@@ -3577,6 +3676,11 @@ class PyExecutor:
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
+            logger.info(
+                f"[disagg-debug] prepare disagg generation init: "
+                f"count={len(fitting_disagg_gen_init_requests)} "
+                f"requests={_summarize_disagg_requests(fitting_disagg_gen_init_requests)}"
+            )
             disagg_gen_init_to_prepare = ScheduledRequests()
             disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
 
@@ -3587,12 +3691,21 @@ class PyExecutor:
                 if (resource_mgr_type in self.resource_manager.resource_managers
                         and self.resource_manager.
                         resource_managers[resource_mgr_type] is not None):
+                    logger.info(
+                        f"[disagg-debug] prepare resources for disagg generation init: "
+                        f"resource_mgr_type={resource_mgr_type} "
+                        f"request_count={len(fitting_disagg_gen_init_requests)}"
+                    )
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            logger.info(
+                f"[disagg-debug] prepare disagg generation init done: "
+                f"requests={_summarize_disagg_requests(fitting_disagg_gen_init_requests)}"
+            )
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
@@ -3601,6 +3714,11 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
+            logger.info(
+                f"[disagg-debug] disagg generation transmission complete: "
+                f"count={len(cache_trans_complete_requests)} "
+                f"requests={_summarize_disagg_requests(cache_trans_complete_requests)}"
+            )
             requests = ScheduledRequests()
             requests.context_requests_last_chunk = cache_trans_complete_requests
             self.resource_manager.resource_managers[
@@ -3668,24 +3786,43 @@ class PyExecutor:
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
+        logger.info(
+            f"[disagg-debug] recv disagg generation cache start: "
+            f"count={len(new_gen_reqs)} "
+            f"disable_overlap={os.getenv('TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP')} "
+            f"benchmark_gen_only={os.getenv('TRTLLM_DISAGG_BENCHMARK_GEN_ONLY')} "
+            f"requests={_summarize_disagg_requests(new_gen_reqs)}")
 
         # For gen-only benchmarking, mark new gen request as transmission complete right away
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            logger.info(
+                f"[disagg-debug] recv disagg generation cache skipped for gen-only benchmark: "
+                f"requests={_summarize_disagg_requests(new_gen_reqs)}")
             return
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
+                logger.info(
+                    f"[disagg-debug] requesting synchronous generation KV cache receive: "
+                    f"req=({_summarize_disagg_request(req)})")
                 self.kv_cache_transceiver.request_and_receive_sync(req)
         else:
             for req in new_gen_reqs:
+                logger.info(
+                    f"[disagg-debug] requesting asynchronous generation KV cache receive: "
+                    f"req=({_summarize_disagg_request(req)})")
                 self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
+                    logger.info(
+                        f"[disagg-debug] generation KV transfer timeout tracking started: "
+                        f"timeout_ms={self.kv_cache_transceiver.kv_transfer_timeout_ms} "
+                        f"req=({_summarize_disagg_request(req)})")
 
         non_gen_first_active = [
             req for req in self.active_requests
@@ -3695,6 +3832,11 @@ class PyExecutor:
         block_transfer = bool(non_gen_first_active) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_active)
+        logger.info(
+            f"[disagg-debug] checking generation KV cache transfer after receive request: "
+            f"block_transfer={block_transfer} at_least_num={1 if block_transfer else 0} "
+            f"non_gen_first_active={_summarize_disagg_requests(non_gen_first_active)} "
+            f"new_gen_reqs={_summarize_disagg_requests(new_gen_reqs)}")
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
 
         return
@@ -3721,8 +3863,13 @@ class PyExecutor:
                 ) and not req.is_finished_due_to_cancellation:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
+                    logger.info(f"[disagg-debug] context KV cache send start: "
+                                f"req=({_summarize_disagg_request(req)})")
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
+                    logger.info(
+                        f"[disagg-debug] context KV cache send submitted: "
+                        f"req=({_summarize_disagg_request(req)})")
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
@@ -3757,8 +3904,22 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
+        requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+        )
+        if atLeastNum > 0 or requests_in_transfer:
+            logger.info(
+                f"[disagg-debug] check context KV transfer status begin: "
+                f"atLeastNum={atLeastNum} "
+                f"inflight={_summarize_disagg_requests(requests_in_transfer.values())}"
+            )
+        start_time = time.monotonic()
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
+        if atLeastNum > 0 or finished_requests or error_requests:
+            logger.info(
+                f"[disagg-debug] check context KV transfer status result: "
+                f"atLeastNum={atLeastNum} elapsed_s={time.monotonic() - start_time:.3f} "
+                f"finished={finished_requests} errors={error_requests}")
 
         completed_req_ids = set(finished_requests + error_requests)
 
@@ -3796,7 +3957,24 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+        in_progress_reqs = [
+            req for req in self.active_requests
+            if req.is_disagg_generation_transmission_in_progress
+        ]
+        if atLeastNum > 0 or in_progress_reqs:
+            logger.info(
+                f"[disagg-debug] check generation KV transfer status begin: "
+                f"atLeastNum={atLeastNum} "
+                f"in_progress={_summarize_disagg_requests(in_progress_reqs)}")
+        start_time = time.monotonic()
         result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+        if atLeastNum > 0 or in_progress_reqs:
+            logger.info(
+                f"[disagg-debug] check generation KV transfer status result: "
+                f"atLeastNum={atLeastNum} elapsed_s={time.monotonic() - start_time:.3f} "
+                f"result={_summarize_transfer_result(result)} "
+                f"in_progress_after={_summarize_disagg_requests(in_progress_reqs)}"
+            )
         if isinstance(result, tuple):
             _, _, cancelled_reqs = result
             user_canceled_set = set(self.canceled_req_ids)
