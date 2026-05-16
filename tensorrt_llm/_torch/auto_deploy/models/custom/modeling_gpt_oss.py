@@ -511,11 +511,20 @@ class GptOssMLP(nn.Module):
                 e._num_local_experts,
                 self._routing_method_type,
             )
-            # All-reduce across MoE-TP ranks; on TP=1 the call is a no-op
-            # placeholder that the sharding transform may rewrite/elide.
-            if getattr(e, "_tp_size", 1) > 1:
-                out = torch.ops.auto_deploy.all_reduce(out, "auto")
-            return out.view(bsz, seq_len, hidden_dim)
+            # All-reduce across MoE-TP ranks. Always emit so it's captured by
+            # FX export -- conditioning on ``_tp_size`` would constant-fold the
+            # branch away whenever ``torch.distributed`` is not yet initialised
+            # at module ``__init__`` time. On TP=1 the placeholder is a no-op
+            # handled by the sharding transform / runtime. Placement is
+            # *after* the view so the downstream ``view -> AR -> add -> norm``
+            # order matches the ``fuse_allreduce_residual_rmsnorm`` matcher
+            # (see commit 6985001ee2).
+            # ``layer_type="moe"`` so ``apply_sharding_hints`` with
+            # ``shard_layers=["mha", "moe"]`` will resolve this placeholder to
+            # a real dist all_reduce on TP > 1.
+            out = out.view(bsz, seq_len, hidden_dim)
+            out = torch.ops.auto_deploy.all_reduce(out, "moe")
+            return out
         # Legacy bf16 dense path; ``quantize_mxfp4_moe`` / ``_trtllm_gen`` may
         # rewrite the experts call further at transform time.
         routing_weights = self.router(hidden_states)  # [B*S, E]

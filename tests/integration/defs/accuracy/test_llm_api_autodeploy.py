@@ -1312,6 +1312,33 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
+        # On TP > 1 the default `dist_mapping` resolves to EP=world_size
+        # (Triton EP path). The modeling-side trtllm-gen MXFP4 load hook
+        # however TP-slices the intermediate, so we must force the runtime
+        # `dist_mapping` to MoE-TP topology and include "moe" in shard_layers
+        # so `AllReduceShardableNode` resolves the post-MoE all_reduce
+        # placeholder emitted by `GptOssMLP.forward`.
+        extra_kwargs = {}
+        if model_id == "120b" and world_size == 2:
+            extra_kwargs["transforms"] = {
+                "detect_sharding": {
+                    "enabled": False
+                },
+                "sharding_transform_executor": {
+                    "enabled": False
+                },
+                "apply_sharding_hints": {
+                    "enabled": True,
+                    "requires_shape_prop": True,
+                    "shard_layers": ["mha", "moe"],
+                    "dist_mapping": {
+                        "tp": world_size,
+                        "moe_tp": world_size,
+                        "moe_ep": 1,
+                    },
+                },
+            }
+
         model_path = self.MODEL_PATHS[model_id]
         with AutoDeployLLM(
                 model=model_path,
@@ -1319,6 +1346,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 world_size=world_size,
                 yaml_extra=yaml_paths,
                 max_seq_len=GSM8K.MAX_INPUT_LEN + self.GSM8K_MAX_OUTPUT_LEN,
+                **extra_kwargs,
         ) as llm:
             task = GSM8K(model_name)
             task.evaluate(llm,
