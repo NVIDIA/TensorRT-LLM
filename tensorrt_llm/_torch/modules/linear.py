@@ -100,11 +100,13 @@ class TensorParallelMode(str, enum.Enum):
 
 def load_weight_shard(
     weight,
+    module: Linear,
     tensor_parallel_size: int = 1,
     tensor_parallel_rank: int = 0,
     tensor_parallel_mode: Optional[TensorParallelMode] = None,
     device: torch.device = torch.device('cpu'),
     return_slice_indices: bool = False,
+    name: Optional[str] = None,
 ) -> torch.Tensor:
     # Skip device transfers on integrated GPUs to conserve shared memory
     if weight.device.type != device.type and is_device_integrated():
@@ -149,9 +151,7 @@ def load_weight_shard(
     if width == 1:
         return maybe_convert_to_torch_tensor(weight)
 
-    slice_width = math.ceil(width / tensor_parallel_size)
-    slice_start = tensor_parallel_rank * slice_width
-    slice_end = min((tensor_parallel_rank + 1) * slice_width, width)
+    slice_start, slice_end = module.calc_tp_shard(width, name=name)
     slice_obj = [slice(d) for d in tensor_shape]
     slice_obj[split_dim] = slice(slice_start, slice_end)
     return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
@@ -185,7 +185,7 @@ def load_weights_vanilla_helper(module: Linear,
             assert "bias" in weights[0]
     device = torch.device('cuda')
 
-    weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    weight = load_weight_shard(weights[0]['weight'], module, module.tp_size,
                                module.tp_rank, module.tp_mode,
                                device) if "weight" in weights[0] else None
 
@@ -202,7 +202,7 @@ def load_weights_vanilla_helper(module: Linear,
         copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
-        bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+        bias = load_weight_shard(weights[0]['bias'], module, module.tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "bias" in weights[0] else None
         if bias is not None:
@@ -226,24 +226,24 @@ def load_weights_fused_qkv_helper(
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
 
-    q_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    q_weight = load_weight_shard(weights[0]['weight'], module, module.tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "weight" in weights[0] else None
-    k_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
+    k_weight = load_weight_shard(weights[1]['weight'], module, module.tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "weight" in weights[1] else None
-    v_weight = load_weight_shard(weights[2]['weight'], module.tp_size,
+    v_weight = load_weight_shard(weights[2]['weight'], module, module.tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "weight" in weights[2] else None
 
     if module.bias is not None:
-        q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+        q_bias = load_weight_shard(weights[0]['bias'], module, module.tp_size,
                                    module.tp_rank, module.tp_mode,
                                    device) if "bias" in weights[0] else None
-        k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
+        k_bias = load_weight_shard(weights[1]['bias'], module, module.tp_size,
                                    module.tp_rank, module.tp_mode,
                                    device) if "bias" in weights[1] else None
-        v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
+        v_bias = load_weight_shard(weights[2]['bias'], module, module.tp_size,
                                    module.tp_rank, module.tp_mode,
                                    device) if "bias" in weights[2] else None
         if not allow_partial_loading:
@@ -279,17 +279,17 @@ def load_weights_fused_gate_up_helper(
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
 
-    gate_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    gate_weight = load_weight_shard(weights[0]['weight'], module, module.tp_size,
                                     module.tp_rank, module.tp_mode,
                                     device) if "weight" in weights[0] else None
-    up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
+    up_weight = load_weight_shard(weights[1]['weight'], module, module.tp_size,
                                   module.tp_rank, module.tp_mode,
                                   device) if "weight" in weights[1] else None
     if module.bias is not None:
-        gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+        gate_bias = load_weight_shard(weights[0]['bias'], module, module.tp_size,
                                       module.tp_rank, module.tp_mode,
                                       device) if "bias" in weights[0] else None
-        up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
+        up_bias = load_weight_shard(weights[1]['bias'], module, module.tp_size,
                                     module.tp_rank, module.tp_mode,
                                     device) if "bias" in weights[1] else None
         if not allow_partial_loading:
@@ -1003,7 +1003,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             module, weights, allow_partial_loading=allow_partial_loading)
         scale_name = self._get_scale_name(weights)
         if scale_name in weights[0]:
-            weight_scale = load_weight_shard(weights[0][scale_name],
+            weight_scale = load_weight_shard(weights[0][scale_name], module,
                                              module.tp_size, module.tp_rank,
                                              module.tp_mode)
             copy_weight(module.weight_scale, weight_scale)
@@ -1019,13 +1019,13 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             module, weights, allow_partial_loading=allow_partial_loading)
         scale_name = self._get_scale_name(weights)
         q_scale = load_weight_shard(
-            weights[0][scale_name], module.tp_size, module.tp_rank,
+            weights[0][scale_name], module, module.tp_size, module.tp_rank,
             module.tp_mode) if scale_name in weights[0] else None
         k_scale = load_weight_shard(
-            weights[1][scale_name], module.tp_size, module.tp_rank,
+            weights[1][scale_name], module, module.tp_size, module.tp_rank,
             module.tp_mode) if scale_name in weights[1] else None
         v_scale = load_weight_shard(
-            weights[2][scale_name], module.tp_size, module.tp_rank,
+            weights[2][scale_name], module, module.tp_size, module.tp_rank,
             module.tp_mode) if scale_name in weights[2] else None
         for shard_key, scale in zip(
                 module.fused_weight_shard_indices_mapping.keys(),
@@ -1045,10 +1045,10 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             module, weights, allow_partial_loading=allow_partial_loading)
         scale_name = self._get_scale_name(weights)
         gate_scale = load_weight_shard(
-            weights[0][scale_name], module.tp_size, module.tp_rank,
+            weights[0][scale_name], module, module.tp_size, module.tp_rank,
             module.tp_mode) if scale_name in weights[0] else None
         up_scale = load_weight_shard(
-            weights[1][scale_name], module.tp_size, module.tp_rank,
+            weights[1][scale_name], module, module.tp_size, module.tp_rank,
             module.tp_mode) if scale_name in weights[1] else None
         for shard_key, scale in zip(
                 module.fused_weight_shard_indices_mapping.keys(),
@@ -1157,7 +1157,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             # modelopt fp8_pb_wo can have 2 extra singleton dimensions
             if full_weight_scale.dim() == 4:
                 full_weight_scale = full_weight_scale.squeeze(1).squeeze(-1)
-            weight_scale = load_weight_shard(full_weight_scale, module.tp_size,
+            weight_scale = load_weight_shard(full_weight_scale,module, module.tp_size,
                                              module.tp_rank, module.tp_mode)
             copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
@@ -1202,7 +1202,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         ]
 
         scales = [
-            load_weight_shard(s, module.tp_size, module.tp_rank, module.tp_mode)
+            load_weight_shard(s, module, module.tp_size, module.tp_rank, module.tp_mode)
             if s is not None else None for s in full_scales_squeezed
         ]
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
@@ -1230,7 +1230,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             for s in full_scales
         ]
         scales = [
-            load_weight_shard(s, module.tp_size, module.tp_rank, module.tp_mode)
+            load_weight_shard(s, module, module.tp_size, module.tp_rank, module.tp_mode)
             if s is not None else None for s in full_scales_squeezed
         ]
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
@@ -1475,6 +1475,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             for shard_key, w in zip(shard_keys, weights):
                 if "weight_scale" in w:
                     ws = load_weight_shard(w["weight_scale"],
+                                           module,
                                            module.tp_size,
                                            module.tp_rank,
                                            module.tp_mode,
@@ -1487,6 +1488,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             w = weights[0]
             if "weight_scale" in w:
                 ws = load_weight_shard(w["weight_scale"],
+                                       module,
                                        module.tp_size,
                                        module.tp_rank,
                                        module.tp_mode,
@@ -1598,6 +1600,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             device = module.weight.device
             pre_quant_scale = load_weight_shard(
                 weights[0]["pre_quant_scale"],
+                module,
                 module.tp_size,
                 module.tp_rank,
                 # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
@@ -1712,6 +1715,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             device = module.weight.device
             pre_quant_scale = load_weight_shard(
                 weights[0]["pre_quant_scale"],
+                module,
                 module.tp_size,
                 module.tp_rank,
                 # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
@@ -1952,6 +1956,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                         ...], "The input_scale should be same for all the weights"
             if "weight_scale" in w:
                 ws = load_weight_shard(w["weight_scale"],
+                                       module,
                                        tp_size,
                                        tp_rank,
                                        tp_mode,
@@ -2108,6 +2113,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         for w in weights:
             if "weight_scale" in w:
                 ws = load_weight_shard(w["weight_scale"],
+                                       module,
                                        tp_size,
                                        tp_rank,
                                        tp_mode,
@@ -2208,16 +2214,19 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
             tp_mode: Optional[TensorParallelMode] = None) -> List[torch.Tensor]:
         device = torch.device("cuda")
         q_weight_scale = load_weight_shard(weights[0]['weight_scale'],
+                                           module,
                                            tp_size,
                                            tp_rank,
                                            tp_mode,
                                            device=device)
         k_weight_scale = load_weight_shard(weights[1]['weight_scale'],
+                                           module,
                                            tp_size,
                                            tp_rank,
                                            tp_mode,
                                            device=device)
         v_weight_scale = load_weight_shard(weights[2]['weight_scale'],
+                                           module,
                                            tp_size,
                                            tp_rank,
                                            tp_mode,
@@ -2230,7 +2239,7 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
         load_weights_vanilla_helper(module, weights)
 
         device = torch.device('cuda')
-        weight_scale = load_weight_shard(weights[0]['weight_scale'],
+        weight_scale = load_weight_shard(weights[0]['weight_scale'], module,
                                          module.tp_size, module.tp_rank,
                                          module.tp_mode, device)
 
@@ -2274,10 +2283,10 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
 
         copy_weight(module.weight, fused_weight)
 
-        left_scale = load_weight_shard(weights[0]['weight_scale'],
+        left_scale = load_weight_shard(weights[0]['weight_scale'], module,
                                        module.tp_size, module.tp_rank,
                                        module.tp_mode, device).contiguous()
-        right_scale = load_weight_shard(weights[1]['weight_scale'],
+        right_scale = load_weight_shard(weights[1]['weight_scale'], module,
                                         module.tp_size, module.tp_rank,
                                         module.tp_mode, device).contiguous()
         fused_scale = torch.cat([left_scale, right_scale], dim=0)
@@ -2342,16 +2351,19 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
             tp_mode: Optional[TensorParallelMode] = None) -> List[torch.Tensor]:
         device = torch.device("cuda")
         q_weight_scale = load_weight_shard(weights[0]['weight_scale'],
+                                           module,
                                            tp_size,
                                            tp_rank,
                                            tp_mode,
                                            device=device)
         k_weight_scale = load_weight_shard(weights[1]['weight_scale'],
+                                           module,
                                            tp_size,
                                            tp_rank,
                                            tp_mode,
                                            device=device)
         v_weight_scale = load_weight_shard(weights[2]['weight_scale'],
+                                           module,
                                            tp_size,
                                            tp_rank,
                                            tp_mode,
@@ -2368,6 +2380,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         device = module.weight.device
         pre_quant_scale = load_weight_shard(
             weights[0]["pre_quant_scale"],
+            module,
             module.tp_size,
             module.tp_rank,
             # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
@@ -2379,7 +2392,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
             torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
             requires_grad=False).to(device=device)
 
-        weight_scale = load_weight_shard(weights[0]['weight_scale'],
+        weight_scale = load_weight_shard(weights[0]['weight_scale'], module,
                                          module.tp_size, module.tp_rank,
                                          module.tp_mode, device)
 
@@ -2418,10 +2431,10 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
 
         copy_weight(module.weight, fused_weight)
 
-        left_scale = load_weight_shard(weights[0]['weight_scale'],
+        left_scale = load_weight_shard(weights[0]['weight_scale'], module,
                                        module.tp_size, module.tp_rank,
                                        module.tp_mode, device).contiguous()
-        right_scale = load_weight_shard(weights[1]['weight_scale'],
+        right_scale = load_weight_shard(weights[1]['weight_scale'], module,
                                         module.tp_size, module.tp_rank,
                                         module.tp_mode, device).contiguous()
         fused_scale = torch.cat([left_scale, right_scale], dim=0).T.contiguous()
@@ -2529,6 +2542,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
                         ...], "The input_scale should be same for all the weights"
             if "weight_scale" in w:
                 ws = load_weight_shard(w["weight_scale"],
+                                       module,
                                        tp_size,
                                        tp_rank,
                                        tp_mode,
@@ -2555,6 +2569,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         device = module.weight.device
         pre_quant_scale = load_weight_shard(
             weights[0]["pre_quant_scale"],
+            module,
             module.tp_size,
             module.tp_rank,
             # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
@@ -2623,6 +2638,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
             device = module.weight.device
             pre_quant_scale = load_weight_shard(
                 weights[0]["pre_quant_scale"],
+                module,
                 module.tp_size,
                 module.tp_rank,
                 # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
@@ -2669,6 +2685,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
             device = module.weight.device
             pre_quant_scale = load_weight_shard(
                 weights[0]["pre_quant_scale"],
+                module,
                 module.tp_size,
                 module.tp_rank,
                 # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
@@ -2763,6 +2780,7 @@ class Linear(nn.Module):
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
         enable_gemm_allreduce_fusion: bool = True,
+        force_sharding_alignment: Optional[Union[int, dict]] = None,
     ):
         """
         Args:
@@ -2805,16 +2823,18 @@ class Linear(nn.Module):
         local_in_features = in_features
         local_out_features = out_features
 
+        self.force_sharding_alignment = force_sharding_alignment
+
         if self.tp_mode == TensorParallelMode.ROW:
-            assert in_features % self.tp_size == 0, (
-                f'in_features {in_features} must be divisible by tp_size {self.tp_size}'
-            )
-            local_in_features = in_features // self.tp_size
+            local_in_features = self.calc_tp_shard_size(in_features)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            assert out_features % self.tp_size == 0, (
-                f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
-            )
-            local_out_features = out_features // self.tp_size
+            if self.fused_weight_shard_indices_mapping is None:
+                local_out_features = self.calc_tp_shard_size(out_features)
+            else:
+                shards = (
+                    self.calc_tp_shard_size(length, name)
+                    for name, (_, length) in self.fused_weight_shard_indices_mapping.items() )
+                local_out_features = sum(shards)
             reduce_output = False if self.mapping.enable_attention_dp else reduce_output
         else:
             assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
@@ -2863,6 +2883,27 @@ class Linear(nn.Module):
 
         if not skip_create_weights_in_init:
             self.create_weights()
+
+    def calc_tp_shard(self, dim, name=None):
+        align = 1
+        if type(self.force_sharding_alignment) is int:
+            align = self.force_sharding_alignment
+        elif type(self.force_sharding_alignment) is dict:
+            align = self.force_sharding_alignment[name]
+
+        assert dim % align == 0, 'cannot align shard if the alignement does not divide the shard dimension'
+
+        shard = math.ceil(dim / self.mapping.tp_size)
+        shard = math.ceil(shard / align) * align
+
+        start = shard * self.mapping.tp_rank
+        end = min(shard * (self.tp_rank + 1), dim)
+        return start, end
+
+    def calc_tp_shard_size(self, dim, name=None):
+        start, end = self.calc_tp_shard(dim, name=name)
+        return end - start
+
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         return get_quant_method(quant_config)
