@@ -3319,6 +3319,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd,
                   windowSize + mChunkSize)
             + mSinkBubbleLength;
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
+                promptCacheLen, getTokensPerBlock(), mEnableBlockReuse);
+        }
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
@@ -3363,6 +3368,12 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const maxTokensToAdd = std::min((twoStepsLookAhead ? 2 : 1) * tokensPerStep, maxTokensToAddToKVCache);
         auto const numNextTokens = numCurrTokens + maxTokensToAdd;
 
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            return mBlockManager.getLinearAttentionMetadata()->calcNumAdditionalBlocksNeededForReq(
+                numCurrTokens, req.getPromptLen(), getTokensPerBlock(), mEnableBlockReuse);
+        }
+
         if (numNextTokens > mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum)
         {
             return 0;
@@ -3397,7 +3408,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     {
         if (req.isGenerationInProgressState())
         {
-            return 0; // no need to allocate blocks for recurrent states during generation
+            return mBlockManager.getLinearAttentionMetadata()->calcNumAdditionalBlocksNeededForReq(
+                req.getNumTokens(0), req.getPromptLen(), getTokensPerBlock(), mEnableBlockReuse);
         }
         else if (!req.isContextFinished())
         {
@@ -3407,12 +3419,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             {
                 return 0;
             }
-            if (mEnableBlockReuse)
-            {
-                return req.getPromptLen() / mBlockManager.getLinearAttentionMetadata()->statesSnapshotInterval + 1
-                    + (mBlockManager.getLinearAttentionMetadata()->saveLastSnapshot ? 1 : 0);
-            }
-            return 1;
+            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
+                req.mPromptLen, getTokensPerBlock(), mEnableBlockReuse);
         }
     }
 
@@ -3558,8 +3566,27 @@ void KVCacheManager::addToken(RequestIdType requestId)
 
 bool KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
 {
+    if (!mEnableBlockReuse)
+    {
+        // When block reuse is disabled, we always use a single slot for a sequence and move it to
+        // the end of blocks list, so copying is not needed.
+        return false;
+    }
     auto& sequence = getSequence(llmRequest.mRequestId);
     return mBlockManager.copyLinearAttentionBlock(sequence, llmRequest);
+}
+
+bool KVCacheManager::copyLinearAttentionBlockBatch(std::vector<std::shared_ptr<LlmRequest>> const& llmRequests)
+{
+    bool copiedAny = false;
+    for (auto const& req : llmRequests)
+    {
+        if (copyLinearAttentionBlock(*req))
+        {
+            copiedAny = true;
+        }
+    }
+    return copiedAny;
 }
 
 void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
@@ -3749,7 +3776,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     }
     else
     {
-        TLLM_LOG_WARNING("[kv cache manager] storeContextBlocks: Can not find sequence for request %lu", requestId);
+        // TLLM_LOG_WARNING("[kv cache manager] storeContextBlocks: Can not find sequence for request %lu", requestId);
     }
 }
 

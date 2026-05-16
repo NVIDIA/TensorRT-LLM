@@ -90,9 +90,29 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
+        if kv_cache_config.enable_block_reuse:
+            return CppMambaHybridCacheManager
         if is_disagg or use_cpp_mamba_cache_manager():
             return MixedMambaHybridCacheManager
-        return CppMambaHybridCacheManager
+        default_cls = CppMambaHybridCacheManager
+        env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
+        if env_override is not None:
+            if env_override.upper() == 'MIXED':
+                logger.warning(
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED overrides the default Mamba cache manager to MixedMambaHybridCacheManager. This may lead to increased memory usage due to lack of block reuse, but can be necessary for disaggregated setups or to avoid potential issues with the C++ manager. Set TLLM_MAMBA_MANAGER_PREFERENCE=CPP to use the CppMambaHybridCacheManager instead, which is the default for non-disaggregated setups without block reuse explicitly disabled."
+                )
+                return MixedMambaHybridCacheManager
+            elif env_override.upper() == 'CPP':
+                logger.warning(
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP overrides the default Mamba cache manager to CppMambaHybridCacheManager. This enables block reuse and can reduce memory usage, but may not be compatible with disaggregated setups. Set TLLM_MAMBA_MANAGER_PREFERENCE=MIXED to use the MixedMambaHybridCacheManager instead if you encounter issues with the C++ manager or are running in a disaggregated environment."
+                )
+                return CppMambaHybridCacheManager
+            else:
+                logger.warning(
+                    f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
+                    f"Expected 'CPP' or 'MIXED'. Using default {default_cls.__name__}."
+                )
+        return default_cls
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 

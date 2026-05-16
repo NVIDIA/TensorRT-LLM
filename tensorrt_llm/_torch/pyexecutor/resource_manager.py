@@ -1203,7 +1203,14 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        if self.is_vswa or self.is_linear_attention:
+        if self.is_linear_attention:
+            value = self.impl.get_kv_cache_stats(
+            ).num_free_blocks_per_window_size[self.max_seq_len]
+            logger.debug(
+                f"For linear attention case, we return the number of free blocks for the kv cache (not for the recurrent states): {value}"
+            )
+            return value
+        if self.is_vswa:
             logger.info(
                 f"For {'linear attention' if self.is_linear_attention else 'VSWA'} case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
             )
@@ -1219,10 +1226,16 @@ class KVCacheManager(BaseResourceManager):
                                  token_num_upper_bound: int,
                                  max_num_draft_tokens: int = 0,
                                  **kwargs) -> int:
-        return min(
-            token_num_upper_bound,
-            self.get_num_free_blocks() * self.tokens_per_block -
+        free_blocks = self.get_num_free_blocks()
+        result = min(
+            token_num_upper_bound, free_blocks * self.tokens_per_block -
             self.num_extra_kv_tokens - max_num_draft_tokens)
+        logger.debug(
+            f"[get_num_available_tokens] free_blocks={free_blocks}, "
+            f"tokens_per_block={self.tokens_per_block}, "
+            f"num_extra_kv_tokens={self.num_extra_kv_tokens}, "
+            f"token_num_upper_bound={token_num_upper_bound}, result={result}")
+        return result
 
     def get_buffers(self,
                     layer_idx: int,

@@ -32,7 +32,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
+from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -1169,6 +1170,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices = torch.zeros([self.max_batch_size],
                                               dtype=torch.int32,
                                               device="cuda")
+        self._host_state_indices = torch.zeros([self.max_batch_size],
+                                               dtype=torch.int32,
+                                               pin_memory=prefer_pinned())
+        self._row_indices = torch.arange(self.max_batch_size,
+                                         dtype=torch.long,
+                                         device="cpu")
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1309,11 +1316,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # cudaMemcpyAsync calls instead of being serialized behind them.
         # copy_linear_attention_block returns True iff it actually issued a copy;
         # we skip refresh_blocks entirely when nothing was scheduled.
-        copied_any = False
-        for req in self.requests:
-            if self.impl.copy_linear_attention_block(req):
-                copied_any = True
-        self._pending_state_transfers = copied_any
+        self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
+            self.requests)
+        if self._pending_state_transfers:
+            logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
         # Reset replay double-buffer state for fresh context blocks. A reused
         # block (prefix-cache hit or block recycled across requests) may carry
@@ -1465,34 +1471,41 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.impl.copy_batch_block_offsets(
             self.host_block_offsets,
             [req.py_request_id for req in self.requests], 1, 0)
-        host_block_offsets = torch.zeros([len(self.requests)],
-                                         dtype=torch.int32,
-                                         device="cpu")
-        for i in range(len(self.requests)):
-            # With layer-first pool layout, setOffsets produces the block index directly
-            # (no longer multiplied by num_local_mamba_layers)
-            value = self.host_block_offsets[self.recurrent_states_pool_index, i,
-                                            0, block_indices[i]]
-            max_blocks = self.blocks_per_window[
-                LinearCacheType.RECURRENT_STATES.value][0]
-            if value < 0 or value >= max_blocks:
-                req = self.requests[i]
+
+        max_blocks = self.blocks_per_window[
+            LinearCacheType.RECURRENT_STATES.value][0]
+        n = len(self.requests)
+        self._host_state_indices.zero_()
+        if n > 0:
+            # Vectorized gather: replace per-element Python loop with a single
+            # tensor index op. block_indices is a small Python list so
+            # torch.tensor() conversion here is O(n) at C level, much cheaper
+            # than n round-trips through Python indexing.
+            bi = torch.tensor(block_indices, dtype=torch.long)
+            rows = self._row_indices[:n]
+            # host_block_offsets: [num_pools, max_batch_size, 2, max_blocks_per_seq]
+            values = self.host_block_offsets[self.recurrent_states_pool_index,
+                                             rows, 0, bi]
+            invalid_mask = (values < 0) | (values >= max_blocks)
+            if invalid_mask.any():
+                bad_i = int(invalid_mask.nonzero(as_tuple=False)[0, 0])
+                req = self.requests[bad_i]
+                value = int(values[bad_i])
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
-                    f"(expected 0 <= index < {max_blocks}) for request {i}, "
+                    f"(expected 0 <= index < {max_blocks}) for request {bad_i}, "
                     f"prompt_len={req.prompt_len}, "
                     f"is_context_finished={req.is_context_finished}, "
                     f"context_current_position={req.context_current_position}, "
                     f"prepopulated_token_num={req.prepopulated_prompt_len}, "
                     f"context_chunk_size={req.context_chunk_size if not req.is_context_finished else 'N/A'}, "
-                    f"block_index for next step is {block_indices[i]}, "
+                    f"block_index for next step is {block_indices[bad_i]}, "
                     f"\nblock_ids={self.impl.get_cache_block_ids(req.py_request_id, LinearCacheType.RECURRENT_STATES.value)}"
                 )
-            host_block_offsets[i] = value
+            self._host_state_indices[:n] = values
 
-        torch.fill_(self.cuda_state_indices, 0)
-        self.cuda_state_indices[:len(self.requests)] = host_block_offsets.cuda()
-        self._host_state_indices = host_block_offsets.clone()
+        self.cuda_state_indices.copy_(self._host_state_indices,
+                                      non_blocking=True)
 
     def get_state_indices(
             self,
