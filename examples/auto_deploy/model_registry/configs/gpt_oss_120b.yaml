@@ -6,6 +6,11 @@
 # single-GPU with plenty of memory so OOM risk is low.
 runtime: trtllm
 model_factory: AutoModelForCausalLM
+# Temp: bf16 dtype pin so transformers 5.x doesn't fall back to fp32
+# (which blows up attention workspace to ~1 TB). Mirrors the fix on
+# the rebased branch.
+model_kwargs:
+  dtype: bfloat16
 attn_backend: trtllm
 compile_backend: torch-cudagraph
 skip_loading_weights: false

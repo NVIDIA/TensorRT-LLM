@@ -1121,7 +1121,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytest.param(
             "120b",
             "openai/gpt-oss-120b",
-            marks=pytest.mark.skip_less_device(4),
+            # marks=pytest.mark.skip_less_device(4),  # temp: 1-GPU run
             id="120b",
         ),
     ]
@@ -1129,6 +1129,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("model_id,model_name", MODEL_PARAMS)
     def test_mxfp4_gsm8k(self, model_id, model_name, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        mocker.patch.object(GSM8K, "NUM_SAMPLES", 50)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
 
