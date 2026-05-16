@@ -5,37 +5,43 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Slimmed-down PyTorch GPT-OSS model for AutoDeploy export (prefill only).
+"""GPT-OSS model with explicit sharding hint ops (sharding-IR default).
 
-Source:
-    https://huggingface.co/openai/gpt-oss-20b
-    https://huggingface.co/openai/gpt-oss-120b
+Default GPT-OSS modeling for AutoDeploy: every attention Linear is
+expressed via ``torch.ops.auto_deploy.torch_linear_simple`` with sharding hint
+kwargs (``tp_mode``, ``tp_min_local_shape``, ``layer_type``), and the
+post-attention all-reduce is expressed via the ``torch.ops.auto_deploy.all_reduce``
+placeholder.  This makes the exported graph a complete, self-contained
+specification of how the attention block should be tensor-parallel sharded; the
+``apply_sharding_hints`` transform then reads those hints together with a
+runtime ``DistConfig`` to produce deterministic, node-local sharding.
 
-Both 20b and 120b share the same architecture (only num_hidden_layers and
-num_local_experts differ), so this file covers both variants.
+Scope of this IR variant (matches the ``qwen3_ir`` / ``qwen3_5_moe_ir``
+convention):
 
-Key architecture features:
-* GQA: 64 Q heads / 8 KV heads, head_dim=64, hidden_size=2880
-* Attention sinks: per-head learnable scalar concatenated into softmax denominator
-* Alternating sliding/full attention by layer (sliding_window=128)
-* YaRN-scaled RoPE (factor=32, original_max=4096), Llama-style half-rotary
-* MoE: 32 experts (20b) / 128 experts (120b), top-4 routing
-* Stacked MoE weights with biases on both gate_up and down projections
-* Custom GLU activation: ``(up + 1) * gate * sigmoid(gate * 1.702)`` with
-  ``gate.clamp(max=7)`` and ``up.clamp(-7, 7)``
-* MXFP4 quantized MoE weights handled by the AD ``quantize_mxfp4_moe`` transform
+  * Attention q/k/v/o use ``torch_linear_simple`` with hints (q/k/v colwise
+    + ``tp_min_local_shape=head_dim`` for GQA, o rowwise) plus a trailing
+    ``auto_deploy.all_reduce`` for the rowwise output.
+  * View ops on q/k/v/attn_out use ``torch.ops.auto_deploy.view`` with
+    ``tp_scaled_dim=2`` so the head-count dimension scales with TP.
+  * MoE router (``torch_moe_router``) and experts (``torch_moe_dense_mlp``)
+    are unchanged from ``modeling_gpt_oss.py`` -- expert weights stay
+    replicated under sharding-IR; EP/TP-MoE for the trtllm-gen path
+    happens via a separate ``ShardableNode`` (Step 5 of the V4 plan).
+  * ``lm_head`` is left as a plain ``nn.Linear`` -- there is no canonical
+    sharding-IR pattern for col-parallel-linear-then-all-gather in this
+    codebase, and the absolute gain (~80 us / token at TP=4 for
+    gpt-oss-120b) is marginal compared to attention TP.  ``qwen3_ir`` and
+    ``qwen3_5_moe_ir`` make the same choice.
 
-Differences from the HF reference (modeling_gpt_oss.py):
-* Stripped KV cache, training paths, dropout, mask construction, deprecated kwargs
-* Uses AD canonical ops:
-    - ``torch_rmsnorm``                 (normalization)
-    - ``torch_attention``               (with ``sinks=`` and ``sliding_window=``)
-    - ``torch_rope_with_explicit_cos_sin``
-    - ``torch_moe_router``              (linear + topk + softmax + scatter)
-    - ``torch_moe_dense_mlp``           (dense bmm-based GPT-OSS expert math)
-* No ``repeat_kv`` (``torch_attention`` handles GQA natively)
-* RoPE cos/sin is computed once per forward and pre-sliced by ``position_ids``
-* The HF config class ``GptOssConfig`` is reused directly from ``transformers``
+Historical note: the legacy non-IR ``modeling_gpt_oss.py`` was removed in
+favor of this sharding-IR path so TP > 1 attention sharding works out of
+the box without an opt-in env var.
+
+Shardable custom ops used:
+  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, tp_min_local_shape, layer_type)
+  - torch.ops.auto_deploy.view                 (tp_scaled_dim, layer_type)
+  - torch.ops.auto_deploy.all_reduce           (placeholder, layer_type)
 """
 
 import math
@@ -50,10 +56,10 @@ from transformers.utils import ModelOutput
 
 from tensorrt_llm._utils import get_hf_rope_theta
 
+from ... import custom_ops  # noqa: F401 -- ensure all custom ops are registered
 from ..hf import AutoModelForCausalLMFactory
 
 # GPT-OSS hard-codes these in the HF reference (see modeling_gpt_oss.GptOssExperts).
-# ``alpha`` controls the SwiGLU sigmoid scaling, ``limit`` clamps gate/up before the GLU.
 _GPTOSS_GLU_ALPHA = 1.702
 _GPTOSS_GLU_LIMIT_FALLBACK = 7.0
 
@@ -129,11 +135,8 @@ class GptOssRMSNorm(nn.Module):
 class GptOssRotaryEmbedding(nn.Module):
     """YaRN-scaled rotary embedding for GPT-OSS.
 
-    The HF reference applies RoPE via ``torch.chunk(x, 2, dim=-1)`` with cos/sin
-    of length ``head_dim/2``. This is mathematically identical to the standard
-    Llama RoPE (``rotate_half`` + ``cos = sin = cat(freqs, freqs)``), so we cache
-    a duplicated ``[max_pos, head_dim]`` table and feed it to the AD canonical
-    ``torch_rope_with_explicit_cos_sin`` op.
+    Identical to ``modeling_gpt_oss.GptOssRotaryEmbedding``; no sharding
+    hints are needed for the rotary table itself.
     """
 
     def __init__(
@@ -210,8 +213,9 @@ class GptOssRotaryEmbedding(nn.Module):
 class GptOssTopKRouter(nn.Module):
     """Top-K router: linear projection + topk + softmax + scatter.
 
-    Produces ``router_scores`` of shape ``[B*S, num_experts]`` with non-zero
-    entries only at the top-k expert positions, summing to 1 along dim=-1.
+    The router lives on every TP rank (replicated) under sharding-IR --
+    expert routing decisions must agree across ranks.  No sharding hints
+    are needed.
     """
 
     def __init__(self, config):
@@ -235,20 +239,10 @@ class GptOssTopKRouter(nn.Module):
 class GptOssExperts(nn.Module):
     """GPT-OSS dense experts module.
 
-    Holds the four stacked parameters that match the HF safetensors layout:
-        gate_up_proj      : [E, H, 2I]  (gate and up interleaved on the last dim)
-        gate_up_proj_bias : [E, 2I]
-        down_proj         : [E, I, H]
-        down_proj_bias    : [E, H]
-
-    The forward delegates to ``torch_moe_dense_mlp``, which encodes GPT-OSS's
-    custom GLU: ``(up + 1) * gate * sigmoid(alpha * gate)`` with clamps on
-    gate (max=limit) and up (-limit, limit).
-
-    The MXFP4 quantization path replaces this op (and the upstream router op)
-    with ``triton_mxfp4_moe`` in the AD ``quantize_mxfp4_moe`` graph transform;
-    the ``_blocks`` / ``_scales`` parameters are registered there at transform
-    time so we do not declare them here.
+    Identical to ``modeling_gpt_oss.GptOssExperts``.  Expert weights stay
+    replicated across TP ranks under sharding-IR; EP / TP-MoE for the
+    MXFP4 trtllm-gen path is handled by a dedicated ``ShardableNode``
+    (Step 5 of the V4 plan), not by this hint-based path.
     """
 
     def __init__(self, config):
@@ -257,8 +251,6 @@ class GptOssExperts(nn.Module):
         self.hidden_size = int(config.hidden_size)
         self.expert_dim = int(config.intermediate_size)
         self.alpha = _GPTOSS_GLU_ALPHA
-        # The HF safetensors / config carry ``swiglu_limit``; fall back to 7.0
-        # for synthetic configs that omit it.
         self.limit = float(getattr(config, "swiglu_limit", _GPTOSS_GLU_LIMIT_FALLBACK))
 
         self.gate_up_proj = nn.Parameter(
@@ -299,12 +291,20 @@ class GptOssMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Attention (GQA + sinks + per-layer sliding window)
+# Attention (GQA + sinks + per-layer sliding window) -- sharding-IR variant
 # ---------------------------------------------------------------------------
 
 
 class GptOssAttention(nn.Module):
-    """GPT-OSS attention with learnable per-head sinks and optional sliding window."""
+    """GPT-OSS attention with sharding hints.
+
+    Sharding strategy (matches ``qwen3_ir.Qwen3Attention``):
+      q_proj -> colwise  (+ tp_min_local_shape=head_dim for GQA)
+      k_proj -> colwise  (+ tp_min_local_shape=head_dim for GQA)
+      v_proj -> colwise  (+ tp_min_local_shape=head_dim for GQA)
+      view   -> tp_scaled_dim=2 (head-count dim shrinks with TP)
+      o_proj -> rowwise + auto_deploy.all_reduce
+    """
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -345,17 +345,53 @@ class GptOssAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout).
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        q = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
 
-        cos, sin = position_embeddings  # [B, S, head_dim]
-        # Apply RoPE with unsqueeze_dim=2 for BSND layout.
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.view(
+            k,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.view(
+            v,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+
+        cos, sin = position_embeddings
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
 
-        # ``torch_attention`` handles GQA natively; sinks/sliding_window are
-        # per-call kwargs. Causal mask is applied internally for prefill.
         attn_output = torch.ops.auto_deploy.torch_attention(
             q,
             k,
@@ -368,9 +404,23 @@ class GptOssAttention(nn.Module):
             sliding_window=self.sliding_window,
             layout="bsnd",
         )
-        # [B, S, N, D] -> [B, S, N*D]
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-        return self.o_proj(attn_output)
+
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
+        return attn_output
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +482,7 @@ class GptOssModel(GptOssPreTrainedModel):
             head_dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
             # FIX: transformers 5.x moved rope_theta to config.rope_scaling['rope_theta'].
-            # Use get_hf_rope_theta() helper (same as PT modeling) instead of direct
-            # getattr which silently returns the 10000.0 default and breaks RoPE.
+            # Use get_hf_rope_theta() helper (same as PT modeling).
             rope_theta=get_hf_rope_theta(config, 10000.0),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
@@ -467,6 +516,10 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.model = GptOssModel(config)
+        # lm_head stays as plain nn.Linear -- matches qwen3_ir convention; no
+        # canonical sharding-IR pattern for col-parallel-then-all-gather exists
+        # in this codebase, and the absolute gain from sharding lm_head on
+        # gpt-oss-120b is marginal (<1% of total ITL).
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
@@ -504,4 +557,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
 # Registration
 # ---------------------------------------------------------------------------
 
+# Registers AFTER ``modeling_gpt_oss``; last-registration-wins semantics in the
+# factory means this IR variant takes precedence when ``AD_USE_IR_MODELS`` is
+# set (see ``models/custom/__init__.py``).
 AutoModelForCausalLMFactory.register_custom_model_cls("GptOssConfig", GptOssForCausalLM)
