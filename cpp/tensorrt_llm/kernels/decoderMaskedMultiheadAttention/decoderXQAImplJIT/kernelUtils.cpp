@@ -16,6 +16,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include <list>
 
@@ -208,10 +209,8 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
-    // The current SM120 MLA kernel specialization assumes the full 128-query-head group.
-    // TP-sharded MLA shapes need either a retuned kernel or a padded wrapper before they
-    // can safely enter this JIT path.
-    if (xqaParams.num_q_heads / xqaParams.num_kv_heads != 128)
+    int32_t const head_grp_size = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+    if (head_grp_size <= 0 || head_grp_size > kXqaMlaKernelHeadGrpSize)
     {
         return false;
     }

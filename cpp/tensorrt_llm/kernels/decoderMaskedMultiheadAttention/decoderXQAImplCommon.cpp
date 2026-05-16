@@ -49,11 +49,17 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
 
     unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
     // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
-    unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
     bool supportQGMMA = jit::supportConfigQGMMA(xqaParams, SM, true);
     bool supportMLA = jit::supportConfigMLA(xqaParams, SM, true);
-    unsigned int kernel_m_tilesize = getKernelMTileSize(
-        num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, isXqaJit, supportQGMMA, supportMLA);
+    unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
+    if (supportMLA)
+    {
+        kernel_num_q_heads_over_kv = kXqaMlaKernelHeadGrpSize;
+    }
+    unsigned int kernel_m_tilesize = supportMLA ? kXqaMlaKernelHeadGrpSize
+                                                : getKernelMTileSize(num_q_heads_over_kv,
+                                                    xqaParams.multi_query_tokens, qSeqLen, isXqaJit, supportQGMMA,
+                                                    supportMLA);
 
     // precompiled XQA does not use is_fp8_output as hashing key
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,

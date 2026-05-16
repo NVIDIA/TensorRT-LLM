@@ -191,6 +191,15 @@ size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens, int max_num_sequences
             = computeMultiBlockCountForMLA(max_num_sequences, max_attention_window_size, mMultiProcessorCount);
         kernel_scratch_size = static_cast<size_t>(multi_block_count) * max_num_tokens
             * (xqaMlaCgaXBufSize + xqaMlaPartialResultSize);
+        int const head_group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
+        if (head_group_size < kXqaMlaKernelHeadGrpSize)
+        {
+            size_t const padded_q_size = static_cast<size_t>(max_num_tokens) * kXqaMlaKernelHeadGrpSize
+                * mFixedParams.headSize * kXqaMlaQElemBytes;
+            size_t const padded_output_size = static_cast<size_t>(max_num_tokens) * kXqaMlaKernelHeadGrpSize
+                * kXqaMlaOutputHeadSize * kXqaMlaOutputElemBytes;
+            kernel_scratch_size += roundUp<size_t>(padded_q_size, 128) + roundUp<size_t>(padded_output_size, 128);
+        }
     }
     workspace_size = roundUp<size_t>(workspace_size, 128) + kernel_scratch_size;
     if (mFixedParams.multiBlockMode && !mFixedParams.isMLA)

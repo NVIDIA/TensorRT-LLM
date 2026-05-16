@@ -18,6 +18,7 @@
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
@@ -27,6 +28,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
+#include <cstddef>
 
 namespace
 {
@@ -416,14 +418,55 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     void const* const kernel_input_tokens = (applyRoPEInXqaKernel ? launchParams.qkv : xqa_q_input_ptr);
     if (isMLAKernel)
     {
-        CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, xqaParams, kernel_input_tokens);
+        auto const roundUpTo128 = [](size_t value) { return ((value + 127) / 128) * 128; };
+        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        auto* scratchBytes = static_cast<std::byte*>(launchParams.scratch);
+        size_t const cgaXBufBytes = static_cast<size_t>(xqaMlaCgaXBufSize) * multi_block
+            * xqaParams.total_num_input_tokens;
+        size_t const partialResultBytes = static_cast<size_t>(xqaMlaPartialResultSize) * multi_block
+            * xqaParams.total_num_input_tokens;
+        auto* partialResults = scratchBytes + cgaXBufBytes;
+
+        XQAParams kernelXQAParams = xqaParams;
+        void const* kernelInputTokens = kernel_input_tokens;
+        auto* kernelOutput = launchParams.output;
+        bool const padMlaHeadGroup = num_q_heads_over_kv < kXqaMlaKernelHeadGrpSize;
+        if (padMlaHeadGroup)
+        {
+            TLLM_CHECK_WITH_INFO(num_kv_heads == 1,
+                "The SM120 MLA padded wrapper only supports one KV head per rank.");
+            kernelXQAParams.num_q_heads = kXqaMlaKernelHeadGrpSize;
+            kernelXQAParams.num_kv_heads = 1;
+
+            size_t const realQPitch = static_cast<size_t>(xqaParams.head_size) * xqaParams.num_q_heads
+                * kXqaMlaQElemBytes;
+            size_t const paddedQPitch
+                = static_cast<size_t>(xqaParams.head_size) * kXqaMlaKernelHeadGrpSize * kXqaMlaQElemBytes;
+            size_t const paddedQBytes = paddedQPitch * xqaParams.total_num_input_tokens;
+            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kXqaMlaKernelHeadGrpSize
+                * kXqaMlaOutputElemBytes;
+            size_t const paddedOutputBytes = paddedOutputPitch * xqaParams.total_num_input_tokens;
+            auto* paddedQ = partialResults + partialResultBytes;
+            auto* paddedOutput = paddedQ + roundUpTo128(paddedQBytes);
+
+            TLLM_LOG_DEBUG("Padding SM120 MLA XQA head group from %d to %d for the existing 128-head kernel.",
+                num_q_heads_over_kv, kXqaMlaKernelHeadGrpSize);
+            TLLM_CUDA_CHECK(cudaMemsetAsync(paddedQ, 0, paddedQBytes, stream));
+            TLLM_CUDA_CHECK(cudaMemcpy2DAsync(paddedQ, paddedQPitch, kernel_input_tokens, realQPitch, realQPitch,
+                xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
+            TLLM_CUDA_CHECK(cudaMemsetAsync(paddedOutput, 0, paddedOutputBytes, stream));
+            kernelInputTokens = paddedQ;
+            kernelOutput = reinterpret_cast<uint8_t*>(paddedOutput);
+        }
+
+        CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, kernelXQAParams, kernelInputTokens);
         appendParam(&tensorMapQ);
-        CUtensorMap const tensorMapK = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, true);
+        CUtensorMap const tensorMapK = makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, true);
         appendParam(&tensorMapK);
-        CUtensorMap const tensorMapV = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, false);
+        CUtensorMap const tensorMapV = makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, false);
         appendParam(&tensorMapV);
         appendParam(&launchParams.qScale);
-        appendParam(&launchParams.output);
+        appendParam(&kernelOutput);
         appendParam(&launchParams.kvCacheParams);
         appendParam(&launchParams.batch_size);
         appendParam(&launchParams.kv_scale_quant_orig);
@@ -431,9 +474,6 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         bool const useSeparateReduce = tensorrt_llm::common::getBoolEnv("XQA_MLA_SEPARATE_REDUCE");
         uint32_t* semaphores = useSeparateReduce ? nullptr : reinterpret_cast<uint32_t*>(launchParams.semaphores);
         appendParam(&semaphores);
-        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
-        std::byte* const partialResults = static_cast<std::byte*>(launchParams.scratch)
-            + xqaMlaCgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
         appendParam(&partialResults);
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
         uint32_t const inputSeqLen = (xqaParams.multi_query_tokens || xqaParams.isMLA())
@@ -444,9 +484,18 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         cubinObj->launch(dimGrid, blockDim, stream, kernelParams, dim3{kXqaMlaCgaSize, 1, 1});
         if (useSeparateReduce && multi_block > 1)
         {
-            cubinObj->launchMlaReduce(launchParams.output, partialResults,
+            cubinObj->launchMlaReduce(kernelOutput, partialResults,
                 reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths), multi_block, inputSeqLen,
                 xqaParams.total_num_input_tokens, stream);
+        }
+        if (padMlaHeadGroup)
+        {
+            size_t const realOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * xqaParams.num_q_heads
+                * kXqaMlaOutputElemBytes;
+            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kXqaMlaKernelHeadGrpSize
+                * kXqaMlaOutputElemBytes;
+            TLLM_CUDA_CHECK(cudaMemcpy2DAsync(launchParams.output, realOutputPitch, kernelOutput, paddedOutputPitch,
+                realOutputPitch, xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
         }
     }
     else if (isSpecDec && isHMMAKernel)
