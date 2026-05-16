@@ -571,6 +571,9 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
+            # TODO(TRTLLM-xxxxx): Pass encoder-side MM layout through
+            # DisaggregatedParams so prefill does not rebuild prompt tokens,
+            # positions, lengths, runs, special offsets, and cumsum here.
             prompt_token_result = self.input_processor.get_prompt_token_ids(
                 inputs, mm_handles)
             if len(prompt_token_result) == 3:
