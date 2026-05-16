@@ -1716,7 +1716,12 @@ class PyExecutor:
                                 sample_state = self._sample_async(
                                     scheduled_batch, batch_outputs)
 
-                            assert sample_state is not None, "Sampling failed"
+                            if sample_state is None:
+                                logger.error(
+                                    "Sampling failed: _sample_async returned None. "
+                                    f"batch_outputs keys={list(batch_outputs.keys()) if isinstance(batch_outputs, dict) else type(batch_outputs)}"
+                                )
+                                raise RuntimeError("Sampling failed")
 
                             # Handle guided decoder errors after _sample_async to avoid state conflicts.
                             # If called before, failed requests would be marked as GENERATION_COMPLETE,
@@ -2669,7 +2674,12 @@ class PyExecutor:
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
-                    assert sample_state is not None, "Sampling failed"
+                    if sample_state is None:
+                        logger.error(
+                            "Sampling failed: _sample_async returned None. "
+                            f"batch_outputs keys={list(batch_outputs.keys()) if isinstance(batch_outputs, dict) else type(batch_outputs)}"
+                        )
+                        raise RuntimeError("Sampling failed")
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,

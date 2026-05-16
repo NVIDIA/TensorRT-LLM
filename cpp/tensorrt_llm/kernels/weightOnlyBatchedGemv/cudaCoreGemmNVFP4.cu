@@ -227,6 +227,14 @@ bool cudaCoreGemmTemplateCaller(Params const& params, cudaStream_t stream)
         cudaCoreGemmKernel<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>(params, stream);
         return true;
     }
+    if constexpr (TILE_M == cudaCoreGemmTemplateMaxM)
+    {
+        if (params.m > TILE_M && params.m % TILE_M == 0)
+        {
+            cudaCoreGemmKernel<InputType, OutputType, ScaleType, TILE_M, TILE_N, BLOCK_SIZE>(params, stream);
+            return true;
+        }
+    }
     if constexpr (TILE_M < cudaCoreGemmTemplateMaxM)
     {
         return cudaCoreGemmTemplateCaller<InputType, OutputType, ScaleType, TILE_M + 1, TILE_N, BLOCK_SIZE>(

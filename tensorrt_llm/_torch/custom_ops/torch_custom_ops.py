@@ -56,6 +56,99 @@ if IS_CUTLASS_DSL_AVAILABLE:
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
 
+def _add_tactic_id_token(target: set[int], token: str, env_name: str) -> None:
+    token = token.strip()
+    if not token:
+        return
+    if "-" in token and not token.startswith("-"):
+        parts = token.split("-", 1)
+        if len(parts) == 2:
+            try:
+                start, end = int(parts[0]), int(parts[1])
+                if start <= end:
+                    target.update(range(start, end + 1))
+                    return
+            except ValueError:
+                pass
+    try:
+        target.add(int(token))
+    except ValueError:
+        logger.warning_once(
+            f"Ignoring invalid autotune tactic id '{token}' from {env_name}.",
+            key=("autotune", "invalid_skip_tactic", env_name, token))
+
+
+def _get_generic_tactic_skip_specs(custom_op: str) -> List[str]:
+    raw_value = os.environ.get("TRTLLM_AUTOTUNE_SKIP_TACTICS")
+    if not raw_value:
+        return []
+
+    specs: List[str] = []
+    for entry in raw_value.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" in entry:
+            op_name, tactic_spec = entry.split("=", 1)
+        else:
+            op_name, sep, tactic_spec = entry.rpartition(":")
+            if not sep:
+                logger.warning_once(
+                    f"Ignoring invalid TRTLLM_AUTOTUNE_SKIP_TACTICS entry '{entry}'. "
+                    "Use 'custom_op=tactic_list' entries separated by semicolons.",
+                    key=("autotune", "invalid_generic_skip_tactic", entry))
+                continue
+        if op_name.strip() == custom_op:
+            specs.append(tactic_spec.strip())
+    return specs
+
+
+def _parse_int_tactic_skip_specs(env_name: str,
+                                 raw_values: List[str]) -> set[int]:
+    skip_tactics: set[int] = set()
+    for raw_value in raw_values:
+        if not raw_value:
+            continue
+        for token in raw_value.replace(";", ",").replace(" ", ",").split(
+                ","):
+            _add_tactic_id_token(skip_tactics, token, env_name)
+    return skip_tactics
+
+
+def _parse_backend_tactic_skip_specs(
+        env_name: str,
+        raw_values: List[str]) -> Tuple[set[int], Dict[str, set[int]]]:
+    skip_all: set[int] = set()
+    skip_by_backend: Dict[str, set[int]] = {}
+    for raw_value in raw_values:
+        if not raw_value:
+            continue
+        active_backend: Optional[str] = None
+        for token in raw_value.replace(";", ",").replace(" ", ",").split(
+                ","):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" in token:
+                backend_name, tactic_id = token.split(":", 1)
+                active_backend = backend_name.strip().lower()
+                if not active_backend:
+                    logger.warning_once(
+                        f"Ignoring invalid backend tactic spec '{token}' from {env_name}.",
+                        key=("autotune", "invalid_backend_skip_tactic",
+                             env_name, token))
+                    continue
+                target = skip_by_backend.setdefault(active_backend, set())
+                _add_tactic_id_token(target, tactic_id, env_name)
+            elif active_backend is not None:
+                _add_tactic_id_token(
+                    skip_by_backend.setdefault(active_backend, set()), token,
+                    env_name)
+            else:
+                _add_tactic_id_token(skip_all, token, env_name)
+    return skip_all, skip_by_backend
+
+
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
@@ -144,7 +237,8 @@ class MoERunner(TunableRunner):
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         gemm_idx = kwargs["gemm_idx"]
         tactics = list(range(self.fused_moe_runner.get_tactic_num(gemm_idx)))
-        skip_tactics = self._get_skip_tactics(gemm_idx)
+        custom_op = f"trtllm::fused_moe::gemm{gemm_idx}"
+        skip_tactics = self._get_skip_tactics(custom_op, gemm_idx)
         if not skip_tactics:
             return tactics
 
@@ -161,27 +255,13 @@ class MoERunner(TunableRunner):
         return filtered_tactics
 
     @staticmethod
-    def _get_skip_tactics(gemm_idx: int) -> set[int]:
-        skip_tactics: set[int] = set()
+    def _get_skip_tactics(custom_op: str, gemm_idx: int) -> set[int]:
         env_names = ("TRTLLM_MOE_SKIP_TACTICS",
                      f"TRTLLM_MOE_SKIP_GEMM{gemm_idx}_TACTICS")
-        for env_name in env_names:
-            raw_value = os.environ.get(env_name)
-            if not raw_value:
-                continue
-            for token in raw_value.replace(";", ",").replace(" ", ",").split(
-                    ","):
-                token = token.strip()
-                if not token:
-                    continue
-                try:
-                    skip_tactics.add(int(token))
-                except ValueError:
-                    logger.warning_once(
-                        f"Ignoring invalid MoE tactic id '{token}' from {env_name}.",
-                        key=("moe_runner", "invalid_skip_tactic", env_name,
-                             token))
-        return skip_tactics
+        raw_values = [
+            os.environ.get(env_name, "") for env_name in env_names
+        ] + _get_generic_tactic_skip_specs(custom_op)
+        return _parse_int_tactic_skip_specs("MoE tactic skip env", raw_values)
 
     def unique_id(self):
         return (
@@ -642,7 +722,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
     This runner is available on:
     - SM >= 100 (Blackwell)
-    - M <= 8 (small batch size limitation from kernel template)
+    - M <= 16, or selected 16-row multiples up to 64
     """
 
     # Shared tuning config (no tactics needed, single implementation)
@@ -650,8 +730,9 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
     # Minimum supported architecture: SM100 (Blackwell)
     MIN_SM_VERSION = 100
-    # Maximum M dimension (from cudaCoreGemmTemplateMaxM in C++ kernel)
-    MAX_M_DIMENSION = 8
+    # The C++ kernel specializes exact M=1..16 and can tile larger multiples
+    # of 16. Keep this as a fallback-sized cap so large GEMMs stay on CUTLASS.
+    MAX_M_DIMENSION = 64
 
     def __init__(self,
                  output_buffer_kind: int,
@@ -678,7 +759,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
         # Check M dimension limitation (kernel template constraint)
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
         m = act_fp4.shape[0]
-        if m > self.MAX_M_DIMENSION:
+        if m > self.MAX_M_DIMENSION or (m > 16 and m % 16 != 0):
             return []
 
         # Single tactic (no config variations)
@@ -882,7 +963,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                 for tactic in cuda_core_tactics])
             elif self._is_only_backend("cuda_core"):
                 # Explicitly forced but conditions not met - raise error
-                error_msg = f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION} and M <= {CudaCoreNVFP4Runner.MAX_M_DIMENSION}. "
+                error_msg = (
+                    f"CUDA Core backend requires SM >= {CudaCoreNVFP4Runner.MIN_SM_VERSION} "
+                    f"and M <= 16 or M <= {CudaCoreNVFP4Runner.MAX_M_DIMENSION} with M divisible by 16. "
+                )
                 error_msg += f"Current: SM={sm_version if sm_version else 'N/A'}, M={m}. "
                 error_msg += "Please add other backends to allowed_backends."
                 raise ValueError(error_msg)
@@ -953,7 +1037,50 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     "Please check CuteDSL installation or add other backends to allowed_backends."
                 )
 
-        return tactics
+        return self._filter_skipped_tactics(tactics)
+
+    @staticmethod
+    def _get_skip_tactics() -> Tuple[set[int], Dict[str, set[int]]]:
+        custom_op = "trtllm::nvfp4_gemm::gemm"
+        raw_values = [
+            os.environ.get("TRTLLM_NVFP4_GEMM_SKIP_TACTICS", "")
+        ] + _get_generic_tactic_skip_specs(custom_op)
+        skip_all, skip_by_backend = _parse_backend_tactic_skip_specs(
+            "NVFP4 GEMM tactic skip env", raw_values)
+
+        for backend_name in ("cutlass", "cublaslt", "cuda_core", "cutedsl"):
+            env_name = f"TRTLLM_NVFP4_GEMM_SKIP_{backend_name.upper()}_TACTICS"
+            backend_skips = _parse_int_tactic_skip_specs(
+                env_name, [os.environ.get(env_name, "")])
+            if backend_skips:
+                skip_by_backend.setdefault(backend_name,
+                                           set()).update(backend_skips)
+        return skip_all, skip_by_backend
+
+    def _filter_skipped_tactics(
+            self,
+            tactics: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+        skip_all, skip_by_backend = self._get_skip_tactics()
+        if not skip_all and not skip_by_backend:
+            return tactics
+
+        filtered_tactics: List[Tuple[str, int]] = []
+        skipped_tactics: List[Tuple[str, int]] = []
+        for backend_name, tactic in tactics:
+            backend_skips = skip_by_backend.get(backend_name, set())
+            if tactic in skip_all or tactic in backend_skips:
+                skipped_tactics.append((backend_name, tactic))
+            else:
+                filtered_tactics.append((backend_name, tactic))
+
+        if skipped_tactics:
+            logger.warning_once(
+                f"Skipping NVFP4 GEMM autotune tactics {skipped_tactics} "
+                "because TRTLLM_NVFP4_GEMM_SKIP_TACTICS, "
+                "TRTLLM_NVFP4_GEMM_SKIP_<BACKEND>_TACTICS, or "
+                "TRTLLM_AUTOTUNE_SKIP_TACTICS is set.",
+                key=("nvfp4_gemm", "skip_tactics", tuple(skipped_tactics)))
+        return filtered_tactics
 
     def forward(
         self,
