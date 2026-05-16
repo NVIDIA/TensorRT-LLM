@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 from einops import repeat
 
-from tensorrt_llm._torch.modules.mamba.checkpointing_state_update import (
+from tensorrt_llm._torch.modules.mamba.checkpointing_state_update_refactored import (
     _stochastic_round_int8_packed,
     _stochastic_round_int16_packed,
     checkpointing_state_update,
