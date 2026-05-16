@@ -27,6 +27,8 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "xqaParams.h"
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -392,9 +394,28 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
     return multi_block_count;
 }
 
+inline int computeMultiBlockCountForMLA(int batch_size, int max_seq_len, int multiprocessor_count)
+{
+    auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
+    if (userSpecified.has_value())
+    {
+        return userSpecified.value();
+    }
+
+    int const safe_batch_size = std::max(batch_size, 1);
+    int const max_by_sm = std::max(1, static_cast<int>(std::round(
+                                      static_cast<float>(multiprocessor_count) / static_cast<float>(safe_batch_size))));
+    int const max_by_seq_len = std::max(
+        1, (max_seq_len + kXqaMlaTokensPerTile * kXqaMlaMultiBlockMinTilesPerCta - 1)
+            / (kXqaMlaTokensPerTile * kXqaMlaMultiBlockMinTilesPerCta));
+    int const max_by_workspace = std::max(1, getXqaMaxNumSubSeq(/*isMLA=*/true) / safe_batch_size);
+    return std::max(1, std::min({max_by_sm, max_by_seq_len, max_by_workspace}));
+}
+
 inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multiprocessor_count)
 {
-    return 1; // disable multi-block for MLA kernel for now.
+    return computeMultiBlockCountForMLA(
+        static_cast<int>(xqaParams.batch_size), xqaParams.max_past_kv_length, multiprocessor_count);
 }
 
 inline int computeMultiBlockCountSpecDecGMMA(

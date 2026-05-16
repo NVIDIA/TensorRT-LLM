@@ -402,7 +402,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&launchParams.batch_size);
         appendParam(&launchParams.kv_scale_quant_orig);
         appendParam(&launchParams.scratch);
-        appendParam(&launchParams.semaphores);
+        bool const useSeparateReduce = tensorrt_llm::common::getBoolEnv("XQA_MLA_SEPARATE_REDUCE");
+        uint32_t* semaphores = useSeparateReduce ? nullptr : reinterpret_cast<uint32_t*>(launchParams.semaphores);
+        appendParam(&semaphores);
         uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
         std::byte* const partialResults = static_cast<std::byte*>(launchParams.scratch)
             + xqaMlaCgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
@@ -411,9 +413,15 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         uint32_t const inputSeqLen = (xqaParams.multi_query_tokens || xqaParams.isMLA())
             ? static_cast<uint32_t>(xqaParams.generation_input_length)
             : 1U;
-        dim3 const dimGrid{4 * inputSeqLen, multi_block, xqaParams.batch_size};
+        dim3 const dimGrid{kXqaMlaCgaSize * inputSeqLen, multi_block, xqaParams.batch_size};
         dim3 const blockDim(128 * 3, 1, 1);
-        cubinObj->launch(dimGrid, blockDim, stream, kernelParams);
+        cubinObj->launch(dimGrid, blockDim, stream, kernelParams, dim3{kXqaMlaCgaSize, 1, 1});
+        if (useSeparateReduce && multi_block > 1)
+        {
+            cubinObj->launchMlaReduce(launchParams.output, partialResults,
+                reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths), multi_block, inputSeqLen,
+                xqaParams.total_num_input_tokens, stream);
+        }
     }
     else if (isSpecDec && isHMMAKernel)
     {

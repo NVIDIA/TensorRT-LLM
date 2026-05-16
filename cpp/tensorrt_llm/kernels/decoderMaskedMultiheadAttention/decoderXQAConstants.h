@@ -29,6 +29,10 @@ inline constexpr int kMinHistoryTokensPerBlock = 128;
 inline constexpr float kEnableMinBlockFactor = 4.0;
 inline constexpr int kTargetWaveFactor = 8;
 
+inline constexpr int kXqaMlaCgaSize = 4;
+inline constexpr int kXqaMlaTokensPerTile = 64;
+inline constexpr int kXqaMlaMultiBlockMinTilesPerCta = 2;
+
 // For multi-block mode. We reserve workspace for this amount of sub-sequences.
 // This should be enough. Huge batch size may result in larger value, but for large batch size,
 // multi-block mode is not useful. For llama v2 70b, 6000 results in ~12MB multi-block

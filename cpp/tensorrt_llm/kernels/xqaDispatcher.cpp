@@ -169,26 +169,35 @@ int XqaDispatcher::getWorkspaceAlignment()
     int group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
     int32_t const multi_block_workspace_alignment
         = roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mFixedParams.headSize, 128);
-    return mFixedParams.multiBlockMode ? multi_block_workspace_alignment : 128;
+    return (mFixedParams.multiBlockMode || mFixedParams.isMLA) ? multi_block_workspace_alignment : 128;
 }
 
-size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens)
+size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens, int max_num_sequences, int max_attention_window_size)
 {
     // buffer for RoPE / output quantization.
     constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
     constexpr int kMaxBeamWidth = 4;
-    size_t workspace_size = roundUp<size_t>(
-        kXQA_OUT_ELEM_SIZE * mFixedParams.headSize * mFixedParams.numQHeads * max_num_tokens, 128); // rope
-    // output conversion.
-    workspace_size = roundUp<size_t>(
-        workspace_size + kXQA_OUT_ELEM_SIZE * mFixedParams.headSize * mFixedParams.numQHeads * max_num_tokens, 128);
-    workspace_size = roundUp<size_t>(workspace_size, 128) + xqaMlaCgaXBufSize * max_num_tokens;
-    if (mFixedParams.multiBlockMode)
+    int group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
+    size_t const multi_block_workspace_alignment
+        = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * mFixedParams.headSize, 128);
+    size_t const io_workspace_size
+        = kXQA_OUT_ELEM_SIZE * mFixedParams.headSize * mFixedParams.numQHeads * max_num_tokens;
+    size_t workspace_size = roundUp<size_t>(io_workspace_size, multi_block_workspace_alignment); // rope
+    workspace_size = roundUp<size_t>(workspace_size + io_workspace_size, multi_block_workspace_alignment);
+    size_t kernel_scratch_size = xqaMlaCgaXBufSize * max_num_tokens;
+    if (mFixedParams.isMLA)
+    {
+        int const multi_block_count
+            = computeMultiBlockCountForMLA(max_num_sequences, max_attention_window_size, mMultiProcessorCount);
+        kernel_scratch_size = static_cast<size_t>(multi_block_count) * max_num_tokens
+            * (xqaMlaCgaXBufSize + xqaMlaPartialResultSize);
+    }
+    workspace_size = roundUp<size_t>(workspace_size, 128) + kernel_scratch_size;
+    if (mFixedParams.multiBlockMode && !mFixedParams.isMLA)
     {
         size_t workspaces[4];
         size_t const nbSubSeq = getXqaMaxNumSubSeq(mFixedParams.isMLA);
         size_t const nbSeq = nbSubSeq / 2;
-        int group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         workspaces[0] = sizeof(uint32_t) * nbSeq;                           // semaphores
         workspaces[1] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowMax
         workspaces[2] = sizeof(float) * roundUp(group_size, 32) * nbSubSeq; // rowSum

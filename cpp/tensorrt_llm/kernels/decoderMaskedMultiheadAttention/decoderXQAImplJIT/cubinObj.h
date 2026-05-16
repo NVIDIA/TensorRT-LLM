@@ -48,7 +48,10 @@ public:
 
     // Should be called at least once before calling launch().
     void initialize();
-    void launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const;
+    void launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams,
+        dim3 clusterDim = dim3{1, 1, 1}) const;
+    void launchMlaReduce(void* output, void const* partialResults, uint32_t const* seqLenList, uint32_t maxNbSubSeq,
+        uint32_t inputSeqLen, uint32_t totalNumInputTokens, CUstream hStream) const;
 
     // It is safe to call getSerializeSize()/serialize() before calling initialize().
     size_t getSerializationSize() const noexcept;
@@ -81,6 +84,7 @@ private:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     CUlibrary mLibrary;
     CUkernel mKernel;
+    CUkernel mReduceKernel;
     unsigned int mSharedMemBytes;
     XQAKernelType mKernelType;
 };

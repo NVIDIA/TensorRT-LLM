@@ -1006,7 +1006,8 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         xqa_workspaces[5] = sizeof(float);
         xqa_workspaces[6] = sparse_attn_cache_size;
         xqa_workspaces[7] = mXqaDispatcher->getWorkspaceSize(
-            std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
+            std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens), max_num_seq,
+            max_attention_window_size);
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
