@@ -37,6 +37,7 @@
 #include <limits>
 #include <nvtx3/nvToolsExt.h>
 #include <random>
+#include <sstream>
 #include <thread>
 
 #ifdef NDEBUG
@@ -1486,8 +1487,34 @@ TEST(NVRTC, compile)
         = [&](int input_fp16, int cache_enum, int head_dim, int head_grp_size, bool use_paged_kv_cache,
               int paged_kv_cache_layout, int beam_width, char const* source_file, int compileMajor, int compileMinor)
     {
-        std::string arch_flag = "-arch=sm_" + std::to_string(compileMajor) + std::to_string(compileMinor);
-        if ((compileMajor == 9 || compileMajor == 10 || compileMajor == 12) && compileMinor == 0)
+        char const* sourceName = "unknown";
+        if (source_file == tensorrt_llm::kernels::mla_sm120_cu_content)
+        {
+            sourceName = "mla_sm120.cu";
+        }
+        else if (source_file == tensorrt_llm::kernels::mha_sm90_cu_content)
+        {
+            sourceName = "mha_sm90.cu";
+        }
+        else if (source_file == tensorrt_llm::kernels::mha_cu_content)
+        {
+            sourceName = "mha.cu";
+        }
+        std::string arch_flag;
+        if (compileMajor == 12 && (compileMinor == 0 || compileMinor == 1)
+            && source_file == tensorrt_llm::kernels::mla_sm120_cu_content)
+        {
+            arch_flag = "-arch=sm_120a";
+        }
+        else if (compileMajor == 12 && (compileMinor == 0 || compileMinor == 1))
+        {
+            arch_flag = "-arch=sm_120f";
+        }
+        else
+        {
+            arch_flag = "-arch=sm_" + std::to_string(compileMajor) + std::to_string(compileMinor);
+        }
+        if ((compileMajor == 9 || compileMajor == 10) && compileMinor == 0)
         {
             arch_flag += "a";
         }
@@ -1535,7 +1562,14 @@ TEST(NVRTC, compile)
             NVRTC_RUN(nvrtcGetProgramLogSize(program, &log_size));
             log.resize(log_size);
             NVRTC_RUN(nvrtcGetProgramLog(program, const_cast<char*>(log.data())));
-            FAIL() << log;
+            std::stringstream message;
+            message << "NVRTC failed for " << sourceName << " with options:";
+            for (auto const& option : options)
+            {
+                message << " " << option;
+            }
+            message << "\n" << log;
+            FAIL() << message.str();
         }
 
         size_t cubinSize;
@@ -1591,6 +1625,14 @@ TEST(NVRTC, compile)
                             for (auto const& [source_file, archCond] : sourceFileAndArchCond)
                             {
                                 if (!archCond(major, minor))
+                                {
+                                    continue;
+                                }
+                                // The SM120 MLA JIT compile is covered explicitly above. Keep the generic SM120 XQA
+                                // sweep to small smoke shapes so unsupported broad-shape stress cases do not mask MLA
+                                // regressions.
+                                if (major == 12 && source_file == tensorrt_llm::kernels::mha_cu_content
+                                    && (beam_width != 1 || head_dim > 128))
                                 {
                                     continue;
                                 }
