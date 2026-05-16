@@ -227,7 +227,7 @@ struct XQAParams
 
     bool isMLA() const
     {
-        return head_size == 576 && num_q_heads == 128 && num_kv_heads == 1;
+        return head_size == 576 && num_q_heads > 0 && num_q_heads <= 128 && num_kv_heads == 1;
     }
 };
 

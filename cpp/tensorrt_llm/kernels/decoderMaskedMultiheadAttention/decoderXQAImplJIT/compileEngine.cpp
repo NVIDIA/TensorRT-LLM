@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include <string>
 #include <vector>
@@ -87,10 +88,11 @@ CubinObj CompileEngine::compile() const
     {
         TLLM_CHECK(ropeStyle == tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE);
     }
+    bool const isMlaKernel = mXqaParams.isMLA();
     tllmXqaJitContext context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
-        /*num_q_heads=*/static_cast<uint32_t>(mXqaParams.num_q_heads),
-        /*num_kv_heads=*/static_cast<uint32_t>(mXqaParams.num_kv_heads),
+        /*num_q_heads=*/static_cast<uint32_t>(isMlaKernel ? kXqaMlaKernelHeadGrpSize : mXqaParams.num_q_heads),
+        /*num_kv_heads=*/static_cast<uint32_t>(isMlaKernel ? 1 : mXqaParams.num_kv_heads),
         /*beam_width=*/static_cast<uint32_t>(mXqaParams.beam_width),
         /*tokens_per_block=*/static_cast<uint32_t>(mXqaParams.tokens_per_block),
         /*multi_query_tokens=*/mXqaParams.multi_query_tokens,
@@ -98,8 +100,7 @@ CubinObj CompileEngine::compile() const
         /*paged_kv_cache=*/mXqaParams.paged_kv_cache,
         /*data_type=*/static_cast<int>(mXqaParams.data_type),
         /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),
-        /*kernel_type=*/mXqaParams.isMLA() ? TLLM_XQA_JIT_MLA
-                                           : (useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA),
+        /*kernel_type=*/isMlaKernel ? TLLM_XQA_JIT_MLA : (useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA),
         /*fp8_output=*/mXqaParams.is_fp8_output,
         // If applyRoPEInXqaKernel, no scratch is needed for storing intermediate RoPE result. Use input KV instead of
         // scratch in this case.

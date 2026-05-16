@@ -32,6 +32,10 @@ inline constexpr int kTargetWaveFactor = 8;
 inline constexpr int kXqaMlaCgaSize = 4;
 inline constexpr int kXqaMlaTokensPerTile = 64;
 inline constexpr int kXqaMlaMultiBlockMinTilesPerCta = 2;
+inline constexpr int kXqaMlaKernelHeadGrpSize = 128;
+inline constexpr int kXqaMlaQElemBytes = 1;
+inline constexpr int kXqaMlaOutputHeadSize = 512;
+inline constexpr int kXqaMlaOutputElemBytes = 2;
 
 // For multi-block mode. We reserve workspace for this amount of sub-sequences.
 // This should be enough. Huge batch size may result in larger value, but for large batch size,
