@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -485,6 +485,7 @@ NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
 TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 {
     auto startTime = std::chrono::steady_clock::now();
+    auto nextLogTime = startTime + std::chrono::seconds(30);
 
     while (true)
     {
@@ -498,6 +499,18 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
             return TransferState::kFAILURE;
         }
 
+        auto const now = std::chrono::steady_clock::now();
+        auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+        if (now >= nextLogTime)
+        {
+            TLLM_LOG_INFO(
+                "[disagg-debug] C++ NIXL transfer wait still in progress: handle=%p timeoutMs=%lld "
+                "elapsedMs=%lld status=%s",
+                static_cast<void*>(mHandle), static_cast<long long>(timeout_ms), static_cast<long long>(elapsed),
+                nixlEnumStrings::statusStr(status).c_str());
+            nextLogTime = now + std::chrono::seconds(30);
+        }
+
         // If timeout_ms < 0, wait indefinitely until status is not NIXL_IN_PROG
         if (timeout_ms < 0)
         {
@@ -506,9 +519,6 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
         }
 
         // Check if timeout has elapsed
-        auto elapsed
-            = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
-                  .count();
         if (elapsed >= timeout_ms)
         {
             return TransferState::kIN_PROGRESS;

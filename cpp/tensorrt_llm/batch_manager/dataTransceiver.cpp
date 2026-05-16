@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager
@@ -795,7 +796,14 @@ public:
 
     void receiveSync(TransferSession& session)
     {
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver receiveSync begin: requestId=%zu ctxRequestId=%zu "
+            "connections=%zu",
+            session.getLlmRequest().mRequestId, session.getLlmRequest().getContextPhaseParams().value().getReqId(),
+            session.getConnections().size());
         mCacheTransferLayer.unformat(session);
+        TLLM_LOG_INFO("[disagg-debug] C++ CacheReceiver receiveSync unformat done: requestId=%zu ctxRequestId=%zu",
+            session.getLlmRequest().mRequestId, session.getLlmRequest().getContextPhaseParams().value().getReqId());
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
@@ -817,6 +825,10 @@ public:
         auto const& commState = contextState.getCommState().value();
         auto const& destCacheState = contextState.getCacheState().value();
         mCacheTransferLayer.validateSupport(contextState);
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver sendRequestInfo begin: requestId=%zu ctxRequestId=%zu "
+            "selfIdx=%d contextSelfIdx=%d",
+            llmRequest.mRequestId, requestId, mSelfState.getCommState().value().getSelfIdx(), commState.getSelfIdx());
 
         RequestInfo requestInfo(requestId, mSelfState);
 
@@ -871,6 +883,29 @@ public:
                 destCacheState, mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx())
                                   .mIRanks;
         }
+        std::ostringstream allCounterpartsStream;
+        for (size_t i = 0; i < allCounterparts.size(); i++)
+        {
+            if (i > 0)
+            {
+                allCounterpartsStream << ",";
+            }
+            allCounterpartsStream << allCounterparts[i];
+        }
+        std::ostringstream kvCounterpartsStream;
+        for (size_t i = 0; i < kvCounterParts.size(); i++)
+        {
+            if (i > 0)
+            {
+                kvCounterpartsStream << ",";
+            }
+            kvCounterpartsStream << kvCounterParts[i];
+        }
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver sendRequestInfo counterparts: requestId=%zu ctxRequestId=%zu "
+            "all=[%s] kv=[%s] rnnCount=%zu",
+            llmRequest.mRequestId, requestId, allCounterpartsStream.str().c_str(), kvCounterpartsStream.str().c_str(),
+            rnnCounterParts.size());
 
         auto connections = mManager->getConnections(commState);
         std::vector<executor::kv_cache::Connection const*> allConnections;
@@ -931,19 +966,50 @@ public:
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
 
+                size_t activeBufferCount = 0;
+                for (auto const& id : idsForRank)
+                {
+                    if (id.has_value())
+                    {
+                        activeBufferCount++;
+                    }
+                }
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver sendRequestAndBufferInfo begin: requestId=%zu "
+                    "ctxRequestId=%zu counterpartRank=%d connectionIdx=%d isKv=%d isRnn=%d "
+                    "activeBuffers=%zu",
+                    llmRequest.mRequestId, requestId, rank, validConnectionIdx, static_cast<int>(isKvCounterpart),
+                    static_cast<int>(isRnnCounterpart), activeBufferCount);
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
                     ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx);
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver sendRequestAndBufferInfo end: requestId=%zu "
+                    "ctxRequestId=%zu counterpartRank=%d connectionIdx=%d",
+                    llmRequest.mRequestId, requestId, rank, validConnectionIdx);
             }
             else
             {
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver sendRequestInfo legacy send begin: requestId=%zu "
+                    "ctxRequestId=%zu counterpartRank=%d",
+                    llmRequest.mRequestId, requestId, rank);
                 sendRequestInfo(connection, requestInfo);
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver sendRequestInfo legacy send end: requestId=%zu "
+                    "ctxRequestId=%zu counterpartRank=%d",
+                    llmRequest.mRequestId, requestId, rank);
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+        auto session = TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
             std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
             requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
             !common::getEnvKVCacheTimeOutputPath().empty());
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver sendRequestInfo end: requestId=%zu ctxRequestId=%zu "
+            "connections=%zu",
+            llmRequest.mRequestId, requestId, session.getConnections().size());
+        return session;
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -1010,25 +1076,54 @@ public:
         bool isReadyFinal = true;
         bool isReady = false;
         auto const& connections = session.getConnections();
+        auto const& request = session.getLlmRequest();
+        auto const& counterpartRanks = session.getCounterPartRanks();
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver receiveReadySignal begin: requestId=%zu ctxRequestId=%zu "
+            "connections=%zu",
+            request.mRequestId, request.getContextPhaseParams().value().getReqId(), connections.size());
 
         for (size_t i = 0; i < connections.size(); i++)
         {
+            int const counterpartRank = i < counterpartRanks.size() ? static_cast<int>(counterpartRanks[i]) : -1;
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver recvReadySignal begin: requestId=%zu ctxRequestId=%zu "
+                    "connectionIdx=%zu counterpartRank=%d",
+                    request.mRequestId, request.getContextPhaseParams().value().getReqId(), i, counterpartRank);
                 isReady = agentConnection->recvReadySignal(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, mTerminate});
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver recvReadySignal end: requestId=%zu ctxRequestId=%zu "
+                    "connectionIdx=%zu counterpartRank=%d isReady=%d",
+                    request.mRequestId, request.getContextPhaseParams().value().getReqId(), i, counterpartRank,
+                    static_cast<int>(isReady));
             }
             else
             {
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver recvReadySignal legacy begin: requestId=%zu "
+                    "ctxRequestId=%zu connectionIdx=%zu counterpartRank=%d",
+                    request.mRequestId, request.getContextPhaseParams().value().getReqId(), i, counterpartRank);
                 connections.at(i)->recv(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ CacheReceiver recvReadySignal legacy end: requestId=%zu "
+                    "ctxRequestId=%zu connectionIdx=%zu counterpartRank=%d isReady=%d",
+                    request.mRequestId, request.getContextPhaseParams().value().getReqId(), i, counterpartRank,
+                    static_cast<int>(isReady));
             }
             isReadyFinal &= isReady;
         }
 
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver receiveReadySignal end: requestId=%zu ctxRequestId=%zu "
+            "isReadyFinal=%d",
+            request.mRequestId, request.getContextPhaseParams().value().getReqId(), static_cast<int>(isReadyFinal));
         return isReadyFinal;
     }
 
@@ -1052,11 +1147,29 @@ private:
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
+        TLLM_LOG_INFO("[disagg-debug] C++ CacheReceiver requestSync start: requestId=%zu ctxRequestId=%zu",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver requestSync sendRequestInfo call: requestId=%zu "
+            "ctxRequestId=%zu",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
         auto session = sendRequestInfo(llmRequest);
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver requestSync sendRequestInfo returned: requestId=%zu "
+            "ctxRequestId=%zu",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
         session.setTime(TransferSession::kTimeRequestInfo);
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver requestSync receiveReadySignal call: requestId=%zu "
+            "ctxRequestId=%zu",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
         bool isReady = receiveReadySignal(session);
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver requestSync receiveReadySignal returned: requestId=%zu "
+            "ctxRequestId=%zu isReady=%d",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId(), static_cast<int>(isReady));
         if (!isReady)
         {
             // Reuse the error state for the cancelled request.
@@ -1064,12 +1177,20 @@ private:
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             return;
         }
+        TLLM_LOG_INFO("[disagg-debug] C++ CacheReceiver requestSync receiveSync call: requestId=%zu ctxRequestId=%zu",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
         receiveSync(session);
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheReceiver requestSync receiveSync returned: requestId=%zu "
+            "ctxRequestId=%zu",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
+        TLLM_LOG_INFO("[disagg-debug] C++ CacheReceiver requestSync end: requestId=%zu ctxRequestId=%zu",
+            llmRequest.mRequestId, llmRequest.getContextPhaseParams().value().getReqId());
     }
 
     struct RequestAndPromise

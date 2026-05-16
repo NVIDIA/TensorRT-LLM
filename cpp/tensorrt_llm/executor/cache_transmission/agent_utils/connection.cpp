@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,8 +18,10 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include <chrono>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 
@@ -585,6 +587,18 @@ template <typename NotificationType>
 void AgentConnectionManager::waitForNotification(
     std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag)
 {
+    auto const startTime = std::chrono::steady_clock::now();
+    auto nextLogTime = startTime + std::chrono::seconds(30);
+    char const* notificationType = "unknown";
+    if constexpr (std::is_same_v<NotificationType, NotificationSyncInfo>)
+    {
+        notificationType = "NotificationSyncInfo";
+    }
+    else if constexpr (std::is_same_v<NotificationType, ReadySignalInfo>)
+    {
+        notificationType = "ReadySignalInfo";
+    }
+
     while (!terminateFlag.load())
     {
 
@@ -594,6 +608,25 @@ void AgentConnectionManager::waitForNotification(
         }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
+        auto const now = std::chrono::steady_clock::now();
+        if (now >= nextLogTime)
+        {
+            size_t pendingNotificationCount = 0;
+            for (auto const& [agent, notifications] : mUnhandledNotifications)
+            {
+                pendingNotificationCount += notifications.size();
+            }
+            auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+            TLLM_LOG_INFO(
+                "[disagg-debug] C++ waitForNotification still waiting: type=%s remoteAgent=%s "
+                "expectedAgent=%s tag=%llu pendingAgents=%zu pendingNotifications=%zu elapsedMs=%lld "
+                "terminate=%d running=%d",
+                notificationType, remoteAgentName.c_str(), expectedInfo.mAgentName.c_str(),
+                static_cast<unsigned long long>(expectedInfo.mContext.getTag()), mUnhandledNotifications.size(),
+                pendingNotificationCount, static_cast<long long>(elapsedMs), static_cast<int>(terminateFlag.load()),
+                static_cast<int>(mIsRunning.load()));
+            nextLogTime = now + std::chrono::seconds(30);
+        }
         auto it = mUnhandledNotifications.begin();
         while (it != mUnhandledNotifications.end())
         {
@@ -618,6 +651,11 @@ void AgentConnectionManager::waitForNotification(
                             && notificationData.mAgentName == expectedInfo.mAgentName)
                         {
                             erase = true;
+                            TLLM_LOG_INFO(
+                                "[disagg-debug] C++ waitForNotification matched: type=%s remoteAgent=%s "
+                                "expectedAgent=%s tag=%llu",
+                                notificationType, remoteAgentName.c_str(), expectedInfo.mAgentName.c_str(),
+                                static_cast<unsigned long long>(expectedInfo.mContext.getTag()));
                             notifIt = notifs.erase(notifIt);
                             if (notifs.empty())
                             {
@@ -638,6 +676,12 @@ void AgentConnectionManager::waitForNotification(
                             expectedInfo.mIsReady = readySignalData.mIsReady;
 
                             erase = true;
+                            TLLM_LOG_INFO(
+                                "[disagg-debug] C++ waitForNotification matched: type=%s remoteAgent=%s "
+                                "expectedAgent=%s tag=%llu isReady=%d",
+                                notificationType, remoteAgentName.c_str(), expectedInfo.mAgentName.c_str(),
+                                static_cast<unsigned long long>(expectedInfo.mContext.getTag()),
+                                static_cast<int>(expectedInfo.mIsReady));
                             notifIt = notifs.erase(notifIt);
                             if (notifs.empty())
                             {

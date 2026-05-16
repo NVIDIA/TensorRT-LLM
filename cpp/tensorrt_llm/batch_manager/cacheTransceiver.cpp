@@ -600,10 +600,22 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
+    TLLM_LOG_INFO(
+        "[disagg-debug] C++ checkGenTransferStatus enter: atLeastRequestNum=%d blockAll=%d "
+        "requesterFutures=%zu",
+        atLeastRequestNum.value_or(-1), static_cast<int>(blockAll), mRequesterFutures.size());
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
     {
-        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        auto const status = future.wait_for(std::chrono::milliseconds(0));
+        auto const ctxRequestId
+            = request->getContextPhaseParams().has_value() ? request->getContextPhaseParams().value().getReqId() : 0;
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ checkGenTransferStatus future probe: requestId=%zu ctxRequestId=%zu "
+            "ready=%d state=%d",
+            request->mRequestId, ctxRequestId, static_cast<int>(status == std::future_status::ready),
+            static_cast<int>(request->getState()));
+        if (status == std::future_status::ready)
         {
             genTransferReadyRequestIds.push_back(request->mRequestId);
         }
@@ -710,13 +722,39 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
+    std::ostringstream selectedIds;
+    bool firstSelectedId = true;
+    for (auto const requestId : toCompleteIdSet)
+    {
+        if (!firstSelectedId)
+        {
+            selectedIds << ",";
+        }
+        selectedIds << requestId;
+        firstSelectedId = false;
+    }
+    TLLM_LOG_INFO(
+        "[disagg-debug] C++ checkGenTransferStatus selected requests: readyLocal=%zu freqVec=%zu "
+        "toComplete=%zu ids=[%s]",
+        genTransferReadyRequestIds.size(), freqVec.size(), toCompleteIdSet.size(), selectedIds.str().c_str());
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
         if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
         {
             try
             {
+                auto const ctxRequestId = it->first->getContextPhaseParams().has_value()
+                    ? it->first->getContextPhaseParams().value().getReqId()
+                    : 0;
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ checkGenTransferStatus waiting on requester future: requestId=%zu "
+                    "ctxRequestId=%zu blockAll=%d",
+                    it->first->mRequestId, ctxRequestId, static_cast<int>(blockAll));
                 it->second.get();
+                TLLM_LOG_INFO(
+                    "[disagg-debug] C++ checkGenTransferStatus requester future completed: requestId=%zu "
+                    "ctxRequestId=%zu",
+                    it->first->mRequestId, ctxRequestId);
                 it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 
                 // Gather the kv cache transfer time from all workers and update to leader rank
