@@ -237,6 +237,30 @@ class GptOssTopKRouter(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _resolve_moe_dist_info() -> Tuple[int, int, int, int]:
+    """Return ``(moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank)``.
+
+    Prefers the active ``DistConfig`` set by ``build_model`` transform via
+    ``use_dist_config``. Falls back to ``(world_size, rank, 1, 0)`` from
+    ``torch.distributed`` (all-TP MoE topology, matches the load hook's
+    default) when no ``DistConfig`` is plumbed, then to ``(1, 0, 1, 0)``
+    when distributed is not initialised.
+    """
+    from ...utils.dist_config import get_active_dist_config
+
+    dc = get_active_dist_config()
+    if dc is not None:
+        return (
+            int(dc.moe_tp_size),
+            int(dc.moe_tp_rank),
+            int(dc.moe_ep_size),
+            int(dc.moe_ep_rank),
+        )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(), torch.distributed.get_rank(), 1, 0
+    return 1, 0, 1, 0
+
+
 def _detect_mxfp4_trtllm_gen(config) -> bool:
     """Return True iff the HF config marks MXFP4 quantization.
 
@@ -322,19 +346,26 @@ class GptOssExperts(nn.Module):
         registered parameters themselves are zero-init and will be filled
         from the HF state dict by the load hook.
 
-        TP info is read from ``torch.distributed`` at construction time;
-        falls back to ``(1, 0)`` when distributed is uninitialized.
+        MoE topology (``moe_tp_size`` / ``moe_ep_size``) is read from the
+        active ``DistConfig`` (plumbed via ``use_dist_config`` in the
+        ``build_model`` transform). Falls back to assigning all of
+        ``world_size`` to MoE-TP when no ``DistConfig`` is active (matches
+        the legacy hook behaviour for non-AD entry points).
         """
         # Lazy import to avoid a transform-library dependency in the modeling
         # source tree.
         from ...custom_ops.fused_moe.mxfp4_weight_prep import (
-            _get_default_tp_info,
             make_swiglu_param_tensors,
             prepare_mxfp4_weights_for_trtllm_gen,
         )
 
-        tp_size, tp_rank = _get_default_tp_info()
-        e = self.num_experts
+        moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank = _resolve_moe_dist_info()
+        if self.num_experts % moe_ep_size != 0:
+            raise ValueError(
+                f"num_experts ({self.num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
+            )
+        e_full = self.num_experts
+        e = e_full // moe_ep_size  # per-rank local expert count
         h = self.hidden_size
         i = self.expert_dim
 
@@ -352,15 +383,24 @@ class GptOssExperts(nn.Module):
             torch.zeros((e, h), dtype=torch.bfloat16, **zero_kw),
             hidden_size=h,
             intermediate_size=i,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            tp_size=moe_tp_size,
+            tp_rank=moe_tp_rank,
         )
 
-        self._tp_size = tp_size
-        self._tp_rank = tp_rank
+        self._moe_tp_size = moe_tp_size
+        self._moe_tp_rank = moe_tp_rank
+        self._moe_ep_size = moe_ep_size
+        self._moe_ep_rank = moe_ep_rank
+        # Kept for backwards-compatibility with any external references.
+        self._tp_size = moe_tp_size
+        self._tp_rank = moe_tp_rank
         self._valid_hidden_size = int(prep.valid_hidden_size)
         self._valid_intermediate_size = int(prep.valid_intermediate_size)
         self._num_local_experts = int(prep.fc1_weights_mxfp4.shape[0])
+        # Per-rank local expert subset offset within the global expert set
+        # — passed to the trtllm-gen MoE op so the kernel restricts its
+        # local routing to ``[offset, offset + num_local_experts)``.
+        self._local_expert_offset = moe_ep_rank * (e_full // moe_ep_size)
 
         # Register zero-init params with the prepared shapes. ``torch.empty``
         # (no ``device=``) is meta-aware so this still respects an enclosing
@@ -507,7 +547,7 @@ class GptOssMLP(nn.Module):
                 e.swiglu_limit_trtllm_gen,
                 e._valid_hidden_size,
                 e._valid_intermediate_size,
-                0,  # local_expert_offset
+                e._local_expert_offset,
                 e._num_local_experts,
                 self._routing_method_type,
             )
@@ -773,11 +813,20 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         if _detect_mxfp4_trtllm_gen(config):
             from ...custom_ops.fused_moe.mxfp4_weight_prep import make_mxfp4_trtllm_gen_load_hook
 
+            # Snapshot the MoE dist info NOW (while the active ``DistConfig``
+            # context is still in scope) so the hook -- which fires later at
+            # ``load_state_dict`` -- sees the same topology that the experts
+            # registered their prepared-shape parameters against. Without
+            # this snapshot, ``_get_default_dist_info`` would fall back to
+            # ``(world_size, rank, 1, 0)`` and shape-mismatch under EP.
+            _dist_info = _resolve_moe_dist_info()
             self._register_load_state_dict_pre_hook(
                 make_mxfp4_trtllm_gen_load_hook(
                     num_layers=int(config.num_hidden_layers),
                     hidden_size=int(config.hidden_size),
                     intermediate_size=int(config.intermediate_size),
+                    num_experts=int(config.num_local_experts),
+                    dist_info_fn=lambda: _dist_info,
                 )
             )
 

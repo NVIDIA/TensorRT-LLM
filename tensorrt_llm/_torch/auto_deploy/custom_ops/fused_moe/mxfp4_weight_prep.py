@@ -556,14 +556,19 @@ def make_swiglu_param_tensors(
 # decouple MoE-TP from data-TP, plumb a closure that returns the right pair.
 
 
-def _get_default_tp_info() -> Tuple[int, int]:
-    """Return ``(tp_size, tp_rank)`` from ``torch.distributed``.
+def _get_default_dist_info() -> Tuple[int, int, int, int]:
+    """Return ``(moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank)``.
 
-    Falls back to ``(1, 0)`` when distributed is not initialized.
+    Defaults to assigning all of ``world_size`` to MoE-TP (no EP). Falls
+    back to ``(1, 0, 1, 0)`` when distributed is not initialised. This
+    matches the legacy behaviour of the load hook when no ``DistConfig``
+    is plumbed.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(), torch.distributed.get_rank()
-    return 1, 0
+        ws = torch.distributed.get_world_size()
+        rk = torch.distributed.get_rank()
+        return ws, rk, 1, 0
+    return 1, 0, 1, 0
 
 
 def make_mxfp4_trtllm_gen_load_hook(
@@ -571,9 +576,10 @@ def make_mxfp4_trtllm_gen_load_hook(
     num_layers: int,
     hidden_size: int,
     intermediate_size: int,
+    num_experts: int,
     layer_prefix: str = "model.layers",
     experts_subpath: str = "mlp.experts",
-    tp_info_fn=_get_default_tp_info,
+    dist_info_fn=_get_default_dist_info,
 ):
     """Build a ``load_state_dict`` pre-hook that converts raw HF MXFP4 expert
     state-dict entries into trtllm-gen-ready prepared tensors.
@@ -584,31 +590,34 @@ def make_mxfp4_trtllm_gen_load_hook(
 
     For each layer that has raw MXFP4 keys, the hook:
 
-    1. Calls :func:`prepare_mxfp4_weights_for_trtllm_gen` with the raw
-       tensors and the runtime ``(tp_size, tp_rank)`` returned by
-       ``tp_info_fn``.
-    2. Pops the six raw keys (``gate_up_proj_{blocks,scales,bias}``,
+    1. Selects this rank's expert subset on the leading axis using
+       ``moe_ep_size`` / ``moe_ep_rank`` from ``dist_info_fn``. When
+       ``moe_ep_size == 1`` the full expert set is kept.
+    2. Calls :func:`prepare_mxfp4_weights_for_trtllm_gen` on the
+       EP-sliced tensors with ``tp_size=moe_tp_size`` / ``tp_rank=moe_tp_rank``
+       to apply intermediate-axis TP slicing + the trtllm-gen layout
+       transforms.
+    3. Pops the six raw keys (``gate_up_proj_{blocks,scales,bias}``,
        ``down_proj_{blocks,scales,bias}``) from the state dict.
-    3. Inserts the six prepared keys (``fc1_weights_mxfp4``,
-       ``fc1_weights_scale_ue8m0``, ``fc1_bias_f32``, ``fc2_weights_mxfp4``,
-       ``fc2_weights_scale_ue8m0``, ``fc2_bias_f32``) at the same experts
-       subpath.
-
-    SwiGLU per-expert parameters (alpha / beta / limit) are NOT injected by
-    the hook — they are constants and should be registered as buffers/parameters
-    by the modeling code at construction time. The hook focuses on weight prep
-    only.
+    4. Inserts the six prepared keys (``fc1_w_trtllm_gen``,
+       ``fc1_w_scale_trtllm_gen``, ``fc1_bias_trtllm_gen``,
+       ``fc2_w_trtllm_gen``, ``fc2_w_scale_trtllm_gen``,
+       ``fc2_bias_trtllm_gen``) at the same experts subpath, plus the three
+       SwiGLU constants (``swiglu_alpha_trtllm_gen`` / beta / limit).
 
     Args:
         num_layers: number of decoder layers to scan.
         hidden_size: model hidden dim (H), used to compute prepared shapes.
         intermediate_size: per-expert intermediate dim (I); will be sliced
-            per-rank by the prep helper using ``tp_info_fn``.
+            per-rank by the prep helper using ``dist_info_fn``.
+        num_experts: total expert count (E); used to compute the EP slice.
         layer_prefix: where layers live, default ``"model.layers"``.
         experts_subpath: where the experts module sits within each layer,
             default ``"mlp.experts"``.
-        tp_info_fn: zero-arg callable returning ``(tp_size, tp_rank)``.
-            Default reads from ``torch.distributed``.
+        dist_info_fn: zero-arg callable returning
+            ``(moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank)``.
+            Default reads from ``torch.distributed`` and assigns all of
+            world_size to MoE-TP.
 
     Returns:
         A hook with signature ``(state_dict, prefix, local_metadata, strict,
@@ -651,7 +660,15 @@ def make_mxfp4_trtllm_gen_load_hook(
     def hook(state_dict, prefix, *args, local_metadata=None, **kwargs):
         import sys as _sys
 
-        tp_size, tp_rank = tp_info_fn()
+        moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank = dist_info_fn()
+        if num_experts % moe_ep_size != 0:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
+            )
+        experts_per_rank = num_experts // moe_ep_size
+        ep_start = moe_ep_rank * experts_per_rank
+        ep_stop = ep_start + experts_per_rank
+
         _matched_layers = 0
         # Diagnostic: dtype/shape of raw vs prepared layer 0 for sanity.
         _layer0_diag = None
@@ -688,17 +705,26 @@ def make_mxfp4_trtllm_gen_load_hook(
                 dn_bias_key,
             ) = raw_keys
 
+            # EP slicing on the leading expert axis (no-op when moe_ep_size==1).
+            # The intermediate-axis TP slicing happens inside prepare_*().
+            gu_blocks = state_dict[gu_blocks_key][ep_start:ep_stop]
+            gu_scales = state_dict[gu_scales_key][ep_start:ep_stop]
+            gu_bias = state_dict[gu_bias_key][ep_start:ep_stop]
+            dn_blocks = state_dict[dn_blocks_key][ep_start:ep_stop]
+            dn_scales = state_dict[dn_scales_key][ep_start:ep_stop]
+            dn_bias = state_dict[dn_bias_key][ep_start:ep_stop]
+
             prepared = prepare_mxfp4_weights_for_trtllm_gen(
-                state_dict[gu_blocks_key],
-                state_dict[gu_scales_key],
-                state_dict[gu_bias_key],
-                state_dict[dn_blocks_key],
-                state_dict[dn_scales_key],
-                state_dict[dn_bias_key],
+                gu_blocks,
+                gu_scales,
+                gu_bias,
+                dn_blocks,
+                dn_scales,
+                dn_bias,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
+                tp_size=moe_tp_size,
+                tp_rank=moe_tp_rank,
             )
 
             # Drop raw keys so load_state_dict doesn't complain about
@@ -745,7 +771,8 @@ def make_mxfp4_trtllm_gen_load_hook(
                 )
             print(
                 f"[mxfp4_load_hook] prefix={prefix!r} prepped {_matched_layers}/"
-                f"{num_layers} layers (tp_size={tp_size}, tp_rank={tp_rank})",
+                f"{num_layers} layers "
+                f"(moe_tp={moe_tp_size}r{moe_tp_rank}, moe_ep={moe_ep_size}r{moe_ep_rank})",
                 file=_sys.stderr,
                 flush=True,
             )

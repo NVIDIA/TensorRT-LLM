@@ -1270,14 +1270,19 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "120b": f"{llm_models_root()}/gpt_oss/gpt-oss-120b",
     }
 
-    # Each entry: (model_id, model_name, world_size_override).
+    # Each entry: (model_id, model_name, world_size_override, moe_topology).
     # ``world_size_override=None`` keeps the per-model yaml's ``world_size``
     # (TP=1 for both 20b and 120b). A non-None value overrides the yaml so we
     # can exercise the TP > 1 path with the same accuracy bar.
+    # ``moe_topology``:
+    #   ``None``  -> default (no MoE sharding override; only valid on TP=1).
+    #   ``"tp"``  -> ``moe_tp=world_size, moe_ep=1`` (intermediate-TP MoE).
+    #   ``"ep"``  -> ``moe_tp=1, moe_ep=world_size`` (expert-parallel MoE).
     MODEL_PARAMS = [
         pytest.param(
             "20b",
             "openai/gpt-oss-20b",
+            None,
             None,
             marks=pytest.mark.skip_less_device(2),
             id="20b",
@@ -1286,6 +1291,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "120b",
             "openai/gpt-oss-120b",
             None,
+            None,
             # marks=pytest.mark.skip_less_device(4),
             id="120b",
         ),
@@ -1293,15 +1299,24 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "120b",
             "openai/gpt-oss-120b",
             2,
+            "tp",
             marks=pytest.mark.skip_less_device(2),
             id="120b-tp2",
         ),
+        pytest.param(
+            "120b",
+            "openai/gpt-oss-120b",
+            2,
+            "ep",
+            marks=pytest.mark.skip_less_device(2),
+            id="120b-ep2",
+        ),
     ]
 
-    @pytest.mark.parametrize("model_id,model_name,world_size_override",
-                             MODEL_PARAMS)
+    @pytest.mark.parametrize(
+        "model_id,model_name,world_size_override,moe_topology", MODEL_PARAMS)
     def test_mxfp4_gsm8k(self, model_id, model_name, world_size_override,
-                         mocker):
+                         moe_topology, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -1313,13 +1328,18 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             pytest.skip("Not enough devices for world size, skipping test")
 
         # On TP > 1 the default `dist_mapping` resolves to EP=world_size
-        # (Triton EP path). The modeling-side trtllm-gen MXFP4 load hook
-        # however TP-slices the intermediate, so we must force the runtime
-        # `dist_mapping` to MoE-TP topology and include "moe" in shard_layers
-        # so `AllReduceShardableNode` resolves the post-MoE all_reduce
+        # (Triton EP path). We override `dist_mapping` here according to
+        # `moe_topology` and include "moe" in `shard_layers` so
+        # `AllReduceShardableNode` resolves the post-MoE all_reduce
         # placeholder emitted by `GptOssMLP.forward`.
         extra_kwargs = {}
-        if model_id == "120b" and world_size == 2:
+        if moe_topology is not None and world_size > 1:
+            if moe_topology == "tp":
+                moe_tp, moe_ep = world_size, 1
+            elif moe_topology == "ep":
+                moe_tp, moe_ep = 1, world_size
+            else:
+                raise ValueError(f"unknown moe_topology={moe_topology!r}")
             extra_kwargs["transforms"] = {
                 "detect_sharding": {
                     "enabled": False
@@ -1333,8 +1353,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                     "shard_layers": ["mha", "moe"],
                     "dist_mapping": {
                         "tp": world_size,
-                        "moe_tp": world_size,
-                        "moe_ep": 1,
+                        "moe_tp": moe_tp,
+                        "moe_ep": moe_ep,
                     },
                 },
             }
