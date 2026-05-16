@@ -30,7 +30,7 @@ from tensorrt_llm.inputs.multimodal import (
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
-from tensorrt_llm.inputs.utils import AudioData
+from tensorrt_llm.inputs.multimodal_data import AudioData
 
 
 def make_tiler(**overrides):
