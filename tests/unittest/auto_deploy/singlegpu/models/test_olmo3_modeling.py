@@ -13,32 +13,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Qwen3 MoE custom model implementation.
+"""Tests for OLMo-3 custom model implementation.
 
-This module tests the custom Qwen3 MoE model implementation which uses
+This module tests the custom OLMo-3 model implementation which uses
 auto_deploy custom ops (torch_attention, torch_rope_with_explicit_cos_sin,
-torch_moe) for export compatibility. Qwen3 MoE uses GQA with per-head Q/K
-normalization and softmax top-k MoE routing.
+torch_rmsnorm) for export compatibility.
+
+OLMo-3 key features:
+* Post-norm residual pattern (RMSNorm after attention/MLP, not before)
+* QK normalization on full projection (not per-head)
+* RoPE configured through config.rope_parameters
+* Mixed attention types per layer via config.layer_types
 """
 
 import pytest
 import torch
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers.models.olmo3.configuration_olmo3 import Olmo3Config
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_moe import (
-    Qwen3MoeAttention,
-    Qwen3MoeDecoderLayer,
-    Qwen3MoeForCausalLM,
-    Qwen3MoeMLP,
-    Qwen3MoeRotaryEmbedding,
-    Qwen3MoeSparseMoeBlock,
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_olmo3 import (
+    Olmo3Attention,
+    Olmo3DecoderLayer,
+    Olmo3ForCausalLM,
+    Olmo3MLP,
+    Olmo3RotaryEmbedding,
+    Olmo3YarnRotaryEmbedding,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
+
+
+def _create_causal_mask(B: int, S: int, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """Create the additive causal mask expected by HF eager attention."""
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    return causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, S, S)
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -46,31 +58,51 @@ def set_seed():
     torch.manual_seed(42)
 
 
-def _create_small_config() -> Qwen3MoeConfig:
-    """Create a small Qwen3 MoE config for testing."""
-    return Qwen3MoeConfig(
+def _create_small_config(rope_type: str = "yarn") -> Olmo3Config:
+    """Create a small OLMo-3 config for testing.
+
+    Uses a minimal layer_types pattern with both sliding and full attention
+    to cover both code paths. Includes GQA (4 Q heads, 2 KV heads).
+    """
+    if rope_type == "default":
+        rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+        }
+    elif rope_type == "yarn":
+        rope_parameters = {
+            "rope_type": "yarn",
+            "rope_theta": 10000.0,
+            "factor": 8.0,
+            "original_max_position_embeddings": 64,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "attention_factor": 1.2,
+        }
+    else:
+        raise ValueError(f"Unsupported test RoPE type: {rope_type}")
+
+    return Olmo3Config(
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=128,
-        num_hidden_layers=3,
+        num_hidden_layers=4,
         num_attention_heads=4,
         num_key_value_heads=2,  # GQA: 4 heads, 2 KV heads
         hidden_act="silu",
         max_position_embeddings=512,
         rms_norm_eps=1e-6,
-        rope_theta=10000.0,
-        rope_scaling=None,
+        rope_parameters=rope_parameters,
         attention_bias=False,
         attention_dropout=0.0,
-        use_sliding_window=False,
+        sliding_window=4096,
+        layer_types=[
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
         tie_word_embeddings=False,
-        # MoE settings
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=32,
-        norm_topk_prob=True,
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
     )
 
 
@@ -80,102 +112,86 @@ def _create_small_config() -> Qwen3MoeConfig:
 
 
 def _get_hf_model_class():
-    """Get the HF Qwen3MoeForCausalLM class."""
+    """Get the HF Olmo3ForCausalLM class."""
     try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeForCausalLM as HFQwen3MoeForCausalLM,
-        )
+        from transformers.models.olmo3.modeling_olmo3 import Olmo3ForCausalLM as HFOlmo3ForCausalLM
 
-        return HFQwen3MoeForCausalLM
+        return HFOlmo3ForCausalLM
     except ImportError:
         return None
 
 
 def _get_hf_attention_class():
-    """Get the HF Qwen3MoeAttention class."""
+    """Get the HF Olmo3Attention class."""
     try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeAttention as HFQwen3MoeAttention,
-        )
+        from transformers.models.olmo3.modeling_olmo3 import Olmo3Attention as HFOlmo3Attention
 
-        return HFQwen3MoeAttention
+        return HFOlmo3Attention
     except ImportError:
         return None
 
 
 def _get_hf_mlp_class():
-    """Get the HF Qwen3MoeMLP class."""
+    """Get the HF Olmo3MLP class."""
     try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeMLP as HFQwen3MoeMLP
+        from transformers.models.olmo3.modeling_olmo3 import Olmo3MLP as HFOlmo3MLP
 
-        return HFQwen3MoeMLP
-    except ImportError:
-        return None
-
-
-def _get_hf_moe_class():
-    """Get the HF Qwen3MoeSparseMoeBlock class."""
-    try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeSparseMoeBlock as HFQwen3MoeSparseMoeBlock,
-        )
-
-        return HFQwen3MoeSparseMoeBlock
+        return HFOlmo3MLP
     except ImportError:
         return None
 
 
 def _get_hf_decoder_layer_class():
-    """Get the HF Qwen3MoeDecoderLayer class."""
+    """Get the HF Olmo3DecoderLayer class."""
     try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeDecoderLayer as HFQwen3MoeDecoderLayer,
+        from transformers.models.olmo3.modeling_olmo3 import (
+            Olmo3DecoderLayer as HFOlmo3DecoderLayer,
         )
 
-        return HFQwen3MoeDecoderLayer
+        return HFOlmo3DecoderLayer
     except ImportError:
         return None
 
 
 def _get_hf_rotary_class():
-    """Get the HF Qwen3MoeRotaryEmbedding class."""
+    """Get the HF Olmo3RotaryEmbedding class."""
     try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeRotaryEmbedding as HFQwen3MoeRotaryEmbedding,
+        from transformers.models.olmo3.modeling_olmo3 import (
+            Olmo3RotaryEmbedding as HFOlmo3RotaryEmbedding,
         )
 
-        return HFQwen3MoeRotaryEmbedding
+        return HFOlmo3RotaryEmbedding
     except ImportError:
         return None
 
 
-def _init_hf_moe_params_in_place(module: torch.nn.Module, std: float = 0.02) -> None:
-    """Manually initialize standalone HF Qwen3MoE submodule parameters.
+def _create_custom_rotary(config: Olmo3Config, head_dim: int) -> torch.nn.Module:
+    rope_parameters = config.rope_parameters
+    rope_type = rope_parameters.get("rope_type", "default")
+    rope_theta = rope_parameters["rope_theta"]
 
-    These would normally be filled by ``Qwen3MoePreTrainedModel._init_weights``
-    via ``post_init()``.
-
-    transformers 5.x's ``Qwen3MoeExperts`` allocates ``gate_up_proj`` /
-    ``down_proj`` with ``torch.empty(...)`` (uninitialized memory) and
-    ``Qwen3MoeTopKRouter`` allocates ``weight`` with ``torch.zeros(...)``.
-    When these are constructed standalone (not inside a ``PreTrainedModel``
-    subclass), ``post_init()`` is never run, so matmuls produce NaN.
-    Walk every submodule and apply the same ``normal_(0, std)`` that the
-    upstream ``_init_weights`` would.
-    """
-    try:
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-            Qwen3MoeExperts,
-            Qwen3MoeTopKRouter,
+    if rope_type == "default":
+        return Olmo3RotaryEmbedding(
+            head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
         )
-    except ImportError:
-        return
-    for m in module.modules():
-        if isinstance(m, Qwen3MoeExperts):
-            torch.nn.init.normal_(m.gate_up_proj, mean=0.0, std=std)
-            torch.nn.init.normal_(m.down_proj, mean=0.0, std=std)
-        elif isinstance(m, Qwen3MoeTopKRouter):
-            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+
+    if rope_type == "yarn":
+        return Olmo3YarnRotaryEmbedding(
+            head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=rope_theta,
+            scaling_factor=rope_parameters["factor"],
+            original_max_position_embeddings=rope_parameters.get(
+                "original_max_position_embeddings", 64
+            ),
+            beta_fast=rope_parameters.get("beta_fast", 32.0),
+            beta_slow=rope_parameters.get("beta_slow", 1.0),
+            attention_factor=rope_parameters.get("attention_factor", 1.0),
+        )
+
+    raise ValueError(f"Unsupported OLMo-3 RoPE type: {rope_type}")
 
 
 # =========================================================================
@@ -186,30 +202,26 @@ def _init_hf_moe_params_in_place(module: torch.nn.Module, std: float = 0.02) -> 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
-def test_qwen3_moe_mlp_equivalence(B, S, dtype):
+def test_olmo3_mlp_equivalence(B, S, dtype):
     """Test MLP layer produces numerically equivalent output to HF implementation."""
     HFMLP = _get_hf_mlp_class()
     if HFMLP is None:
-        pytest.skip("transformers doesn't have Qwen3MoeMLP")
+        pytest.skip("transformers doesn't have Olmo3MLP")
 
     device = "cuda"
     config = _create_small_config()
 
-    # Create HF MLP
     hf_mlp = HFMLP(config)
     hf_mlp.to(device=device, dtype=dtype)
     hf_mlp.eval()
 
-    # Create custom MLP and load same weights
-    custom_mlp = Qwen3MoeMLP(config)
+    custom_mlp = Olmo3MLP(config)
     custom_mlp.to(device=device, dtype=dtype)
     custom_mlp.load_state_dict(hf_mlp.state_dict())
     custom_mlp.eval()
 
-    # Create input
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
 
-    # Run both
     hf_out = hf_mlp(x)
     custom_out = custom_mlp(x)
 
@@ -219,113 +231,69 @@ def test_qwen3_moe_mlp_equivalence(B, S, dtype):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
+@pytest.mark.parametrize("layer_idx", [0, 3])  # sliding (idx=0) and full (idx=3)
 @torch.no_grad()
-def test_qwen3_moe_attention_equivalence(B, S, dtype):
-    """Test Attention layer produces numerically equivalent output to HF implementation."""
+def test_olmo3_attention_equivalence(B, S, dtype, layer_idx, rope_type):
+    """Test Attention layer produces numerically equivalent output to HF implementation.
+
+    Tests both sliding_attention and full_attention with default and YaRN RoPE.
+    """
     HFAttention = _get_hf_attention_class()
     HFRotary = _get_hf_rotary_class()
     if HFAttention is None or HFRotary is None:
-        pytest.skip("transformers doesn't have Qwen3MoeAttention or Qwen3MoeRotaryEmbedding")
+        pytest.skip("transformers doesn't have Olmo3Attention or Olmo3RotaryEmbedding")
 
     device = "cuda"
-    config = _create_small_config()
-    # Force eager attention for HF model
+    config = _create_small_config(rope_type=rope_type)
     config._attn_implementation = "eager"
 
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    attention_type = config.layer_types[layer_idx]
+
     # Create HF attention
-    hf_attn = HFAttention(config, layer_idx=0)
+    hf_attn = HFAttention(config, layer_idx=layer_idx)
     hf_attn.to(device=device, dtype=dtype)
     hf_attn.eval()
 
     # Create custom attention and load same weights
-    custom_attn = Qwen3MoeAttention(config, layer_idx=0)
+    custom_attn = Olmo3Attention(config, layer_idx=layer_idx)
     custom_attn.to(device=device, dtype=dtype)
     custom_attn.load_state_dict(hf_attn.state_dict())
     custom_attn.eval()
 
-    # Create input
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
     # Compute HF position embeddings
     hf_rotary = HFRotary(config=config, device=device)
-    hf_cos, hf_sin = hf_rotary(x, position_ids)  # [B, S, head_dim]
+    hf_cos, hf_sin = hf_rotary(x, position_ids)
 
-    # Compute custom position embeddings (pre-sliced by position_ids)
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    custom_rotary = Qwen3MoeRotaryEmbedding(
-        head_dim,
-        max_position_embeddings=config.max_position_embeddings,
-        base=config.rope_parameters["rope_theta"],
-    )
+    # Compute custom position embeddings
+    custom_rotary = _create_custom_rotary(config, head_dim)
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    q_len = S
-    causal_mask = (
-        torch.triu(
-            torch.full((q_len, q_len), float("-inf"), device=device, dtype=dtype),
-            diagonal=1,
-        )
-        .unsqueeze(0)
-        .unsqueeze(0)
-    )
+    # HF eager attention is non-causal when attention_mask=None, but the
+    # AutoDeploy custom attention models prefill-only causal attention.
+    causal_mask = _create_causal_mask(B, S, device, dtype)
 
+    # Run HF attention
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=(hf_cos, hf_sin),
         attention_mask=causal_mask,
     )
 
-    # Run custom attention (position_embeddings are pre-sliced)
+    # Run custom attention
     custom_out = custom_attn(
         hidden_states=x,
         position_embeddings=(custom_cos, custom_sin),
     )
 
-    # Attention uses custom ops, allow wider tolerance
-    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.10, msg="Attention: ")
-
-
-@pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@torch.no_grad()
-def test_qwen3_moe_sparse_moe_block_equivalence(B, S, dtype):
-    """Test MoE block produces numerically equivalent output to HF implementation."""
-    HFMoE = _get_hf_moe_class()
-    if HFMoE is None:
-        pytest.skip("transformers doesn't have Qwen3MoeSparseMoeBlock")
-
-    device = "cuda"
-    config = _create_small_config()
-
-    # Create HF MoE block. Standalone construction skips PreTrainedModel.post_init(),
-    # so Qwen3MoeExperts (torch.empty) and Qwen3MoeTopKRouter (torch.zeros) need
-    # manual initialization to avoid NaN matmuls on uninitialized memory.
-    hf_moe = HFMoE(config)
-    hf_moe.to(device=device, dtype=dtype)
-    _init_hf_moe_params_in_place(hf_moe, std=config.initializer_range)
-    hf_moe.eval()
-
-    # Create custom MoE block and load same weights
-    custom_moe = Qwen3MoeSparseMoeBlock(config)
-    custom_moe.to(device=device, dtype=dtype)
-    custom_moe.load_state_dict(hf_moe.state_dict())
-    custom_moe.eval()
-
-    # Create input
-    x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
-
-    # Run both. transformers 5.x's HFMoE.forward returns a single tensor
-    # despite its ``tuple[Tensor, Tensor]`` annotation; older versions
-    # returned ``(output, router_logits)``.
-    hf_out = hf_moe(x)
-    if isinstance(hf_out, tuple):
-        hf_out = hf_out[0]
-    custom_out, _ = custom_moe(x)
-
-    # MoE uses fused routing, use relaxed tolerance
-    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.02, msg="MoE block: ")
+    assert_rmse_close(
+        custom_out, hf_out, rmse_ratio_tol=0.10, msg=f"Attention ({attention_type}): "
+    )
 
 
 # =========================================================================
@@ -335,34 +303,37 @@ def test_qwen3_moe_sparse_moe_block_equivalence(B, S, dtype):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
+@pytest.mark.parametrize("layer_idx", [0, 3])  # sliding and full
 @torch.no_grad()
-def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
-    """Test decoder layer produces numerically equivalent output to HF implementation."""
+def test_olmo3_decoder_layer_equivalence(B, S, dtype, layer_idx, rope_type):
+    """Test decoder layer produces numerically equivalent output to HF implementation.
+
+    Tests both sliding_attention and full_attention with default and YaRN RoPE.
+    """
     HFDecoderLayer = _get_hf_decoder_layer_class()
     HFRotary = _get_hf_rotary_class()
     if HFDecoderLayer is None or HFRotary is None:
-        pytest.skip("transformers doesn't have Qwen3MoeDecoderLayer or Qwen3MoeRotaryEmbedding")
+        pytest.skip("transformers doesn't have Olmo3DecoderLayer or Olmo3RotaryEmbedding")
 
     device = "cuda"
-    config = _create_small_config()
+    config = _create_small_config(rope_type=rope_type)
     config._attn_implementation = "eager"
 
-    # Create HF decoder layer. Standalone construction skips
-    # PreTrainedModel.post_init(), so the inner Qwen3MoeExperts /
-    # Qwen3MoeTopKRouter parameters (torch.empty / torch.zeros) need manual
-    # initialization to avoid NaN matmuls.
-    hf_layer = HFDecoderLayer(config, layer_idx=0)
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    attention_type = config.layer_types[layer_idx]
+
+    # Create HF decoder layer
+    hf_layer = HFDecoderLayer(config, layer_idx=layer_idx)
     hf_layer.to(device=device, dtype=dtype)
-    _init_hf_moe_params_in_place(hf_layer, std=config.initializer_range)
     hf_layer.eval()
 
     # Create custom decoder layer and load same weights
-    custom_layer = Qwen3MoeDecoderLayer(config, layer_idx=0)
+    custom_layer = Olmo3DecoderLayer(config, layer_idx=layer_idx)
     custom_layer.to(device=device, dtype=dtype)
     custom_layer.load_state_dict(hf_layer.state_dict())
     custom_layer.eval()
 
-    # Create input
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
@@ -370,25 +341,13 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
     hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
-    # Compute custom position embeddings (pre-sliced by position_ids)
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    custom_rotary = Qwen3MoeRotaryEmbedding(
-        head_dim,
-        max_position_embeddings=config.max_position_embeddings,
-        base=config.rope_parameters["rope_theta"],
-    )
+    # Compute custom position embeddings
+    custom_rotary = _create_custom_rotary(config, head_dim)
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    q_len = S
-    causal_mask = (
-        torch.triu(
-            torch.full((q_len, q_len), float("-inf"), device=device, dtype=dtype),
-            diagonal=1,
-        )
-        .unsqueeze(0)
-        .unsqueeze(0)
-    )
+    # Match the custom decoder layer's causal prefill behavior.
+    causal_mask = _create_causal_mask(B, S, device, dtype)
 
     # Run HF decoder layer
     hf_out = hf_layer(
@@ -406,7 +365,9 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
         position_embeddings=(custom_cos, custom_sin),
     )
 
-    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Decoder layer: ")
+    assert_rmse_close(
+        custom_out, hf_out, rmse_ratio_tol=0.05, msg=f"Decoder layer ({attention_type}): "
+    )
 
 
 # =========================================================================
@@ -417,17 +378,18 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
 @torch.no_grad()
-def test_qwen3_moe_full_model_equivalence(B, S, dtype, device):
+def test_olmo3_full_model_equivalence(B, S, dtype, device, rope_type):
     """Test full model produces numerically equivalent output to HF implementation."""
     HFModel = _get_hf_model_class()
     if HFModel is None:
-        pytest.skip("transformers doesn't have Qwen3MoeForCausalLM")
+        pytest.skip("transformers doesn't have Olmo3ForCausalLM")
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    config = _create_small_config()
+    config = _create_small_config(rope_type=rope_type)
     config._attn_implementation = "eager"
 
     # Create HF model
@@ -436,16 +398,14 @@ def test_qwen3_moe_full_model_equivalence(B, S, dtype, device):
     hf_model.eval()
 
     # Create custom model and load same weights
-    custom_model = Qwen3MoeForCausalLM(config)
+    custom_model = Olmo3ForCausalLM(config)
     custom_model.to(device=device, dtype=dtype)
     custom_model.load_state_dict(hf_model.state_dict())
     custom_model.eval()
 
-    # Create input
     input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    # Run both
     hf_out = hf_model(input_ids=input_ids, position_ids=position_ids)
     custom_out = custom_model(input_ids=input_ids, position_ids=position_ids)
 
@@ -462,8 +422,9 @@ def test_qwen3_moe_full_model_equivalence(B, S, dtype, device):
 # =========================================================================
 
 
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
 @torch.no_grad()
-def test_qwen3_moe_model_can_be_exported():
+def test_olmo3_model_can_be_exported(rope_type):
     """Test that the custom model can be exported with torch_export_to_gm.
 
     Verifies:
@@ -473,21 +434,18 @@ def test_qwen3_moe_model_can_be_exported():
     """
     device = "cuda"
     dtype = torch.bfloat16
-    config = _create_small_config()
+    config = _create_small_config(rope_type=rope_type)
 
-    model = Qwen3MoeForCausalLM(config)
+    model = Olmo3ForCausalLM(config)
     model.to(device=device, dtype=dtype)
     model.eval()
 
-    # Create input
     B, S = 2, 8
     input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    # Get eager model output for comparison
     eager_out = model(input_ids=input_ids, position_ids=position_ids)
 
-    # Define dynamic shapes
     batch_size_dynamic = Dim.DYNAMIC
     seq_len_dynamic = Dim.DYNAMIC
     dynamic_shapes = (
@@ -495,7 +453,6 @@ def test_qwen3_moe_model_can_be_exported():
         {0: batch_size_dynamic, 1: seq_len_dynamic},
     )
 
-    # Export the model
     gm = torch_export_to_gm(
         model,
         args=tuple(),
@@ -503,10 +460,8 @@ def test_qwen3_moe_model_can_be_exported():
         dynamic_shapes=dynamic_shapes,
     )
 
-    # Move graph module to device
     move_to_device(gm, device)
 
-    # Verify the exported model produces numerically equivalent output
     with torch.inference_mode():
         out_gm = gm(input_ids=input_ids, position_ids=position_ids)
 
@@ -547,57 +502,67 @@ def test_qwen3_moe_model_can_be_exported():
 # =========================================================================
 
 
-def test_qwen3_moe_config_registration():
+def test_olmo3_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
-    assert config.model_type == "qwen3_moe"
+    assert config.model_type == "olmo3"
     assert hasattr(config, "hidden_size")
     assert hasattr(config, "num_attention_heads")
     assert hasattr(config, "num_key_value_heads")
-    assert hasattr(config, "num_experts")
-    assert hasattr(config, "num_experts_per_tok")
+    assert hasattr(config, "layer_types")
 
 
-def test_qwen3_moe_structure():
-    """Test model structure: GQA, Q/K norms, MoE layers."""
+def test_olmo3_post_norm_structure():
+    """Test that OLMo-3 uses post-norm (not pre-norm)."""
     config = _create_small_config()
-    model = Qwen3MoeForCausalLM(config)
+    model = Olmo3ForCausalLM(config)
 
-    # Check attention
+    layer = model.model.layers[0]
+    # OLMo-3 has post_attention_layernorm and post_feedforward_layernorm
+    assert hasattr(layer, "post_attention_layernorm"), "Should have post_attention_layernorm"
+    assert hasattr(layer, "post_feedforward_layernorm"), "Should have post_feedforward_layernorm"
+    # OLMo-3 does NOT have input_layernorm (pre-norm)
+    assert not hasattr(layer, "input_layernorm"), (
+        "Should NOT have input_layernorm (post-norm model)"
+    )
+
+
+def test_olmo3_qk_norm_structure():
+    """Test that attention uses QK normalization on full projection."""
+    config = _create_small_config()
+    model = Olmo3ForCausalLM(config)
+
     attn = model.model.layers[0].self_attn
-    assert attn.num_heads == 4, f"Expected 4 Q heads, got {attn.num_heads}"
-    assert attn.num_kv_heads == 2, f"Expected 2 KV heads, got {attn.num_kv_heads}"
     assert hasattr(attn, "q_norm"), "Attention should have q_norm"
     assert hasattr(attn, "k_norm"), "Attention should have k_norm"
 
-    # All layers should be MoE (decoder_sparse_step=1, no mlp_only_layers)
-    for i, layer in enumerate(model.model.layers):
-        assert isinstance(layer.mlp, Qwen3MoeSparseMoeBlock), (
-            f"Layer {i} should use MoE, got {type(layer.mlp)}"
-        )
+    # Q norm weight size should be num_heads * head_dim (full projection)
+    head_dim = config.hidden_size // config.num_attention_heads
+    assert attn.q_norm.weight.shape[0] == config.num_attention_heads * head_dim
+    assert attn.k_norm.weight.shape[0] == config.num_key_value_heads * head_dim
 
 
-def test_qwen3_moe_dense_layer_config():
-    """Test that mlp_only_layers correctly creates dense MLP layers."""
+def test_olmo3_mixed_attention_types():
+    """Test that model correctly assigns sliding/full attention types."""
     config = _create_small_config()
-    config.mlp_only_layers = [0]  # First layer should be dense
+    model = Olmo3ForCausalLM(config)
 
-    model = Qwen3MoeForCausalLM(config)
+    for idx, layer in enumerate(model.model.layers):
+        expected_type = config.layer_types[idx]
+        actual_type = layer.self_attn.attention_type
+        assert actual_type == expected_type, (
+            f"Layer {idx}: expected {expected_type}, got {actual_type}"
+        )
+        if expected_type == "sliding_attention":
+            assert layer.self_attn.sliding_window == config.sliding_window
+        else:
+            assert layer.self_attn.sliding_window is None
 
-    # Layer 0 should be dense MLP
-    assert isinstance(model.model.layers[0].mlp, Qwen3MoeMLP), (
-        f"Layer 0 should use dense MLP, got {type(model.model.layers[0].mlp)}"
-    )
-    # Layer 1 should be MoE
-    assert isinstance(model.model.layers[1].mlp, Qwen3MoeSparseMoeBlock), (
-        f"Layer 1 should use MoE, got {type(model.model.layers[1].mlp)}"
-    )
 
-
-def test_qwen3_moe_state_dict_keys():
+def test_olmo3_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()
-    model = Qwen3MoeForCausalLM(config)
+    model = Olmo3ForCausalLM(config)
     state_dict = model.state_dict()
 
     expected_key_patterns = [
@@ -608,13 +573,11 @@ def test_qwen3_moe_state_dict_keys():
         "model.layers.0.self_attn.o_proj.weight",
         "model.layers.0.self_attn.q_norm.weight",
         "model.layers.0.self_attn.k_norm.weight",
-        # MoE-specific keys
-        "model.layers.0.mlp.gate.weight",
-        "model.layers.0.mlp.experts.0.gate_proj.weight",
-        "model.layers.0.mlp.experts.0.up_proj.weight",
-        "model.layers.0.mlp.experts.0.down_proj.weight",
-        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
         "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.post_feedforward_layernorm.weight",
         "model.norm.weight",
         "lm_head.weight",
     ]

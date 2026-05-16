@@ -31,24 +31,27 @@ models:
 - name: google/gemma-3-1b-it
   config_id: gemma3_1b
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3_1b.yaml']
+- name: meta-llama/Meta-Llama-3-8B-Instruct
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: meta-llama/Llama-3.1-8B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: casperhansen/llama-3-8b-instruct-awq
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-1B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: meta-llama/Llama-3.2-3B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen2.5-1.5B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen2.5-3B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen2.5-7B-Instruct
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -56,8 +59,8 @@ models:
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-4B
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-8B
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -74,11 +77,11 @@ models:
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: google/gemma-2-2b-it
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/gemma-2-9b-it
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/codegemma-7b-it
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -110,23 +113,23 @@ models:
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ibm-granite/granite-3.1-2b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.1-8b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.3-2b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.3-8b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-guardian-3.1-2b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-guardian-3.2-5b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: meta-llama/CodeLlama-7b-Instruct-hf
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -143,11 +146,11 @@ models:
   config_id: llama3_1_8b
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -158,8 +161,8 @@ models:
   config_id: gpt_oss_20b
   yaml_extra: ['gpt_oss_20b.yaml']
 - name: ibm-granite/granite-3.0-8b-instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: mistralai/Ministral-8B-Instruct-2410
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -176,14 +179,20 @@ models:
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: deepseek-ai/DeepSeek-V2.5
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: deepseek_v2_ep
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'deepseek_v2_ep.yaml']
 - name: ai21labs/AI21-Jamba-1.5-Mini
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-11B-Vision-Instruct
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: meta-llama/Meta-Llama-3-70B-Instruct
+  config_id: default_ws_4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: meta-llama/Llama-3.1-70B-Instruct
+  config_id: default_ws_4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: meta-llama/Llama-3.3-70B-Instruct
   config_id: llama3_3_70b
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
@@ -209,8 +218,8 @@ models:
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: google/gemma-2-27b-it
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: perplexity-ai/r1-1776-distill-llama-70b
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -263,8 +272,8 @@ models:
   config_id: simple_shard_only
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
-  config_id: simple_shard_only
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+  config_id: nemotron_super_49b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'nemotron_super_49b.yaml']
 - name: Qwen/Qwen3-30B-A3B
   config_id: simple_shard_only
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'simple_shard_only.yaml']
@@ -278,8 +287,8 @@ models:
   config_id: deepseek_r1
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml']
 - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: deepseek_v2_ep
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v2_ep.yaml']
 - name: Qwen/Qwen3-VL-8B-Instruct
   config_id: multimodal__qwen3_vl
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
@@ -332,15 +341,15 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml']
 # --- GLM-5 (Feb 2026) ---
 - name: zai-org/GLM-5
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: glm_5
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'glm_5.yaml', 'num_hidden_layers_5.yaml']
 - name: zai-org/GLM-5-FP8
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: glm_5_fp8_bf16
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'glm_5_fp8_bf16.yaml', 'num_hidden_layers_5.yaml']
 # --- MiniMax-M2.5 / M2.7 (Feb 2026) ---
 - name: MiniMaxAI/MiniMax-M2.5
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: minimax_m2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 - name: MiniMaxAI/MiniMax-M2.7
   config_id: minimax_m2_7
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.7.yaml']
@@ -354,8 +363,8 @@ models:
   yaml_extra: ['kimi_k2.yaml']
 # --- GLM-4.7 (Dec 2025) ---
 - name: zai-org/GLM-4.7
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: glm4_moe
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'glm4_moe.yaml']
 # --- DeepSeek V3.2 (Dec 2025) ---
 - name: deepseek-ai/DeepSeek-V3.2
   config_id: num_hidden_layers_5
@@ -368,19 +377,19 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 # --- GLM-4.6 (Sep 2025) ---
 - name: zai-org/GLM-4.6
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: glm4_moe
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'glm4_moe.yaml']
 # --- Qwen3-Next (Sep 2025) ---
 - name: Qwen/Qwen3-Next-80B-A3B-Instruct
   config_id: qwen3next
   yaml_extra: ['qwen3Next.yaml']
 # --- OLMo 3 (Nov 2025) ---
 - name: allenai/Olmo-3-7B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: allenai/Olmo-3.1-32B-Instruct
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Command A (2025) ---
 - name: CohereLabs/c4ai-command-a-03-2025
   config_id: default_ws_8
@@ -390,32 +399,32 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
 # --- Aya Expanse (2025) - multilingual ---
 - name: CohereForAI/aya-expanse-8b
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: CohereForAI/aya-expanse-32b
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Tencent Hunyuan (2025) ---
 - name: tencent/Hunyuan-A13B-Instruct
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: hunyuan_a13b_ep
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'hunyuan_a13b_ep.yaml']
 - name: tencent/Hunyuan-7B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Nemotron-H (2025) - hybrid Mamba-Transformer ---
 - name: nvidia/Nemotron-H-8B-Base-8K
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Nemotron-H-47B-Reasoning-128K
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# --- Granite 4.0 (2025) - hybrid Mamba/Transformer ---
-- name: ibm-granite/granite-4.0-micro
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-- name: ibm-granite/granite-4.0-h-small
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# --- Granite 4.0 (2025) - hybrid Mamba/Transformer ---
+- name: ibm-granite/granite-4.0-micro
+  config_id: granite_4_0_micro
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'granite_4.0_micro.yaml']
+- name: ibm-granite/granite-4.0-h-small
+  config_id: granite_4_0_h_small
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'granite_4.0_h_small.yaml']
 # --- AI21 Jamba (2025) - hybrid SSM-Transformer ---
 - name: ai21labs/AI21-Jamba-Large-1.7
   config_id: default_ws_8
@@ -431,6 +440,9 @@ models:
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Seed (2025) ---
+- name: ByteDance-Seed/Seed-Coder-8B-Base
+  config_id: default_ws_2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ByteDance-Seed/Seed-Coder-8B-Instruct
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -439,15 +451,15 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Qwen3 Instruct 2507 update ---
 - name: Qwen/Qwen3-4B-Instruct-2507
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- SmolLM3 (Jul 2025) ---
 - name: HuggingFaceTB/SmolLM3-3B
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: HuggingFaceTB/SmolLM3-3B-Base
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Gemma 3n (Jun 2025) - on-device VLM ---
 - name: google/gemma-3n-E2B-it
   config_id: multimodal
@@ -468,12 +480,12 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'gemma4_dense.yaml']
 # --- JetBrains Mellum (Apr 2025) - code specialist ---
 - name: JetBrains/Mellum-4b-sft-all
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Qwen3 missing sizes (May 2025) ---
 - name: Qwen/Qwen3-1.7B
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-32B
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -497,23 +509,23 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
 # --- MiniMax M2 (2025) ---
 - name: MiniMaxAI/MiniMax-M2
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: minimax_m2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- Tencent Hunyuan small (2025) ---
 - name: tencent/Hunyuan-1.8B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: tencent/Hunyuan-MT-7B
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- UI-TARS (2025) - GUI agent VLM ---
 - name: ByteDance-Seed/UI-TARS-1.5-7B
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- Nvidia Nemotron Flash (2025) ---
 - name: nvidia/Nemotron-Flash-3B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: nemotron_flash
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'nemotron_flash.yaml']
 # --- InternLM3 (Jan 2025) ---
 - name: internlm/internlm3-8b-instruct
   config_id: default_ws_2
@@ -554,11 +566,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 # --- OLMo 2 (Mar 2025) ---
 - name: allenai/OLMo-2-0325-32B-Instruct
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: allenai/OLMo-2-0325-32B-DPO
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Command A variants (2025) ---
 - name: CohereLabs/command-a-translate-08-2025
   config_id: default_ws_8
@@ -575,11 +587,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # --- EXAONE 3.5 (Dec 2024) ---
 - name: LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: exaone
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'exaone.yaml']
 - name: LGAI-EXAONE/EXAONE-3.5-32B-Instruct
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: exaone
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'exaone.yaml']
 # --- SmolLM2 (Nov 2024) ---
 - name: HuggingFaceTB/SmolLM2-135M-Instruct
   config_id: default_ws_1
@@ -596,8 +608,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- OLMo 3 Think (Nov 2025) ---
 - name: allenai/Olmo-3-32B-Think
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Qwen3-14B (May 2025) ---
 - name: Qwen/Qwen3-14B
   config_id: default_ws_4
@@ -637,8 +649,8 @@ models:
   config_id: simple_shard_only
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-0.6B-FP8
-  config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+  config_id: qwen3_fp8_bf16
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'qwen3_fp8_bf16.yaml']
 # --- Mistral updates (2025) ---
 - name: mistralai/Codestral-25.01
   config_id: default_ws_4
@@ -652,12 +664,12 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
 # --- Granite 4.0 tiny (2025) ---
 - name: ibm-granite/granite-4.0-tiny-preview
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: granite_4_0_tiny_preview
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'granite_4.0_tiny_preview.yaml']
 # --- OLMo 3 Think 7B (2025) ---
 - name: allenai/Olmo-3-7B-Think
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Nemotron-H reasoning 8B (2025) ---
 - name: nvidia/Nemotron-H-8B-Reasoning-128K
   config_id: default_ws_2
@@ -668,16 +680,16 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
 # --- DeepSeek Coder V2 Lite (2025) ---
 - name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: deepseek_v2_ep
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'deepseek_v2_ep.yaml']
 # --- Seed-Coder reasoning (2025) ---
 - name: ByteDance-Seed/Seed-Coder-8B-Reasoning
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # --- Tencent Hunyuan translation (2025) ---
 - name: tencent/Hunyuan-MT-Chimera-7B
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Phi-4-mini flash reasoning (2025) ---
 - name: microsoft/Phi-4-mini-flash-reasoning
   config_id: default_ws_1
@@ -692,7 +704,7 @@ models:
 # --- Qwen3-VL MoE (2025) - flagship VLM ---
 - name: Qwen/Qwen3-VL-30B-A3B-Instruct
   config_id: multimodal__qwen3_vl
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
 # --- InternVL3 (Apr 2025) - #1 open-source VLM ---
 - name: OpenGVLab/InternVL3-8B
   config_id: multimodal
@@ -711,7 +723,7 @@ models:
 # --- Molmo2 (2025) - fully open VLM ---
 - name: allenai/Molmo2-8B
   config_id: multimodal
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml']
 # --- DeepSeek-VL2 (2025) - MoE VLM ---
 - name: deepseek-ai/deepseek-vl2-small
   config_id: multimodal
@@ -719,7 +731,7 @@ models:
 # --- Aya Vision (2025) - multilingual VLM ---
 - name: CohereLabs/aya-vision-8b
   config_id: multimodal
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'aya_vision_8b.yaml']
 - name: CohereLabs/aya-vision-32b
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']

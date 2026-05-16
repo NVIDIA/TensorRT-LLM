@@ -13,27 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Starcoder2 custom model implementation.
+"""Tests for Seed-OSS custom model implementation.
 
-This module tests the custom Starcoder2 model implementation which uses
+This module tests the custom Seed-OSS model implementation which uses
 auto_deploy custom ops (torch_attention, torch_rope_with_explicit_cos_sin)
-for export compatibility. Starcoder2 uses GQA with a 4096-token sliding window,
-standard RoPE, vanilla GELU MLP (no gating), and LayerNorm normalization.
+for export compatibility. Seed-OSS uses GQA with standard RoPE and
+attention_bias=True on Q/K/V projections.
 """
 
 import pytest
 import torch
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
-from transformers.models.starcoder2.configuration_starcoder2 import Starcoder2Config
+from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_starcoder2 import (
-    Starcoder2Attention,
-    Starcoder2DecoderLayer,
-    Starcoder2ForCausalLM,
-    Starcoder2MLP,
-    Starcoder2RotaryEmbedding,
+from tensorrt_llm._torch.auto_deploy.models.custom._rope_utils import get_rope_theta
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_seed_oss import (
+    SeedOssAttention,
+    SeedOssDecoderLayer,
+    SeedOssForCausalLM,
+    SeedOssMLP,
+    SeedOssRotaryEmbedding,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
@@ -45,25 +46,27 @@ def set_seed():
     torch.manual_seed(42)
 
 
-def _create_small_config() -> Starcoder2Config:
-    """Create a small Starcoder2 config for testing."""
-    return Starcoder2Config(
+def _create_small_config() -> SeedOssConfig:
+    """Create a small Seed-OSS config for testing."""
+    return SeedOssConfig(
         vocab_size=1000,
         hidden_size=64,
-        intermediate_size=256,
+        intermediate_size=128,
         num_hidden_layers=3,
         num_attention_heads=4,
-        num_key_value_heads=2,  # GQA: 4 Q heads, 2 KV heads
-        hidden_act="gelu_pytorch_tanh",
+        num_key_value_heads=2,  # GQA: 4 heads, 2 KV heads
+        head_dim=16,
+        hidden_act="silu",
         max_position_embeddings=512,
-        norm_epsilon=1e-5,
+        rms_norm_eps=1e-6,
         rope_theta=10000.0,
         rope_scaling=None,
-        sliding_window=None,  # Disable sliding window for small test (seq < 4096 anyway)
-        use_bias=True,
-        residual_dropout=0.0,
+        attention_bias=True,
+        attention_out_bias=False,
         attention_dropout=0.0,
-        embedding_dropout=0.0,
+        residual_dropout=0.0,
+        mlp_bias=False,
+        tie_word_embeddings=False,
     )
 
 
@@ -73,61 +76,59 @@ def _create_small_config() -> Starcoder2Config:
 
 
 def _get_hf_model_class():
-    """Get the HF Starcoder2ForCausalLM class."""
+    """Get the HF SeedOssForCausalLM class."""
     try:
-        from transformers.models.starcoder2.modeling_starcoder2 import (
-            Starcoder2ForCausalLM as HFStarcoder2ForCausalLM,
+        from transformers.models.seed_oss.modeling_seed_oss import (
+            SeedOssForCausalLM as HFSeedOssForCausalLM,
         )
 
-        return HFStarcoder2ForCausalLM
+        return HFSeedOssForCausalLM
     except ImportError:
         return None
 
 
 def _get_hf_attention_class():
-    """Get the HF Starcoder2Attention class."""
+    """Get the HF SeedOssAttention class."""
     try:
-        from transformers.models.starcoder2.modeling_starcoder2 import (
-            Starcoder2Attention as HFStarcoder2Attention,
+        from transformers.models.seed_oss.modeling_seed_oss import (
+            SeedOssAttention as HFSeedOssAttention,
         )
 
-        return HFStarcoder2Attention
+        return HFSeedOssAttention
     except ImportError:
         return None
 
 
 def _get_hf_mlp_class():
-    """Get the HF Starcoder2MLP class."""
+    """Get the HF SeedOssMLP class."""
     try:
-        from transformers.models.starcoder2.modeling_starcoder2 import (
-            Starcoder2MLP as HFStarcoder2MLP,
-        )
+        from transformers.models.seed_oss.modeling_seed_oss import SeedOssMLP as HFSeedOssMLP
 
-        return HFStarcoder2MLP
+        return HFSeedOssMLP
     except ImportError:
         return None
 
 
 def _get_hf_decoder_layer_class():
-    """Get the HF Starcoder2DecoderLayer class."""
+    """Get the HF SeedOssDecoderLayer class."""
     try:
-        from transformers.models.starcoder2.modeling_starcoder2 import (
-            Starcoder2DecoderLayer as HFStarcoder2DecoderLayer,
+        from transformers.models.seed_oss.modeling_seed_oss import (
+            SeedOssDecoderLayer as HFSeedOssDecoderLayer,
         )
 
-        return HFStarcoder2DecoderLayer
+        return HFSeedOssDecoderLayer
     except ImportError:
         return None
 
 
 def _get_hf_rotary_class():
-    """Get the HF Starcoder2RotaryEmbedding class."""
+    """Get the HF SeedOssRotaryEmbedding class."""
     try:
-        from transformers.models.starcoder2.modeling_starcoder2 import (
-            Starcoder2RotaryEmbedding as HFStarcoder2RotaryEmbedding,
+        from transformers.models.seed_oss.modeling_seed_oss import (
+            SeedOssRotaryEmbedding as HFSeedOssRotaryEmbedding,
         )
 
-        return HFStarcoder2RotaryEmbedding
+        return HFSeedOssRotaryEmbedding
     except ImportError:
         return None
 
@@ -140,15 +141,11 @@ def _get_hf_rotary_class():
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
-def test_starcoder2_mlp_equivalence(B, S, dtype):
-    """Test MLP layer produces numerically equivalent output to HF implementation.
-
-    Starcoder2 MLP is a vanilla 2-layer GELU MLP (c_fc -> GELU -> c_proj).
-    Uses identical math, so tight tolerance is expected.
-    """
+def test_seed_oss_mlp_equivalence(B, S, dtype):
+    """Test MLP layer produces numerically equivalent output to HF implementation."""
     HFMLP = _get_hf_mlp_class()
     if HFMLP is None:
-        pytest.skip("transformers doesn't have Starcoder2MLP")
+        pytest.skip("transformers doesn't have SeedOssMLP")
 
     device = "cuda"
     config = _create_small_config()
@@ -158,37 +155,36 @@ def test_starcoder2_mlp_equivalence(B, S, dtype):
     hf_mlp.to(device=device, dtype=dtype)
     hf_mlp.eval()
 
-    # Create custom MLP and load same weights (identical key names: c_fc, c_proj)
-    custom_mlp = Starcoder2MLP(config)
+    # Create custom MLP and load same weights
+    custom_mlp = SeedOssMLP(config)
     custom_mlp.to(device=device, dtype=dtype)
     custom_mlp.load_state_dict(hf_mlp.state_dict())
     custom_mlp.eval()
 
+    # Create input
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
 
+    # Run both
     hf_out = hf_mlp(x)
     custom_out = custom_mlp(x)
 
-    # Identical math → tight tolerance
+    # MLP uses identical math, so use tight tolerance
     torch.testing.assert_close(custom_out, hf_out, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
-def test_starcoder2_attention_equivalence(B, S, dtype):
-    """Test Attention layer produces numerically equivalent output to HF implementation.
-
-    Starcoder2 uses GQA (4 Q heads, 2 KV heads in test config) with standard RoPE.
-    HF uses BNSD + repeat_kv; custom uses BSND + torch_attention (GQA-native).
-    """
+def test_seed_oss_attention_equivalence(B, S, dtype):
+    """Test Attention layer produces numerically equivalent output to HF implementation."""
     HFAttention = _get_hf_attention_class()
     HFRotary = _get_hf_rotary_class()
     if HFAttention is None or HFRotary is None:
-        pytest.skip("transformers doesn't have Starcoder2Attention or Starcoder2RotaryEmbedding")
+        pytest.skip("transformers doesn't have SeedOssAttention or SeedOssRotaryEmbedding")
 
     device = "cuda"
     config = _create_small_config()
+    # Force eager attention for HF model
     config._attn_implementation = "eager"
 
     # Create HF attention
@@ -196,48 +192,45 @@ def test_starcoder2_attention_equivalence(B, S, dtype):
     hf_attn.to(device=device, dtype=dtype)
     hf_attn.eval()
 
-    # Create custom attention and load same weights (identical key names)
-    custom_attn = Starcoder2Attention(config, layer_idx=0)
+    # Create custom attention and load same weights
+    custom_attn = SeedOssAttention(config, layer_idx=0)
     custom_attn.to(device=device, dtype=dtype)
     custom_attn.load_state_dict(hf_attn.state_dict())
     custom_attn.eval()
 
+    # Create input
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
-    # Compute HF position embeddings: [B, S, head_dim]
+    # Compute HF position embeddings
     hf_rotary = HFRotary(config=config, device=device)
-    hf_cos, hf_sin = hf_rotary(x, position_ids)
+    hf_cos, hf_sin = hf_rotary(x, position_ids)  # [B, S, head_dim]
 
-    # Compute custom position embeddings (full table, slicing happens inside attention)
-    head_dim = config.hidden_size // config.num_attention_heads
-    custom_rotary = Starcoder2RotaryEmbedding(
-        head_dim,
+    # Compute custom position embeddings (pre-sliced by position_ids)
+    custom_rotary = SeedOssRotaryEmbedding(
+        config.head_dim,
         max_position_embeddings=config.max_position_embeddings,
-        base=config.rope_parameters["rope_theta"],
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
-    custom_cos, custom_sin = custom_rotary(x)  # full tables [max_seq_len, head_dim]
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    # Create causal attention mask in HF additive format [B, 1, S, S]:
-    # 0 for attended positions (on/below diagonal), -inf for masked (above diagonal)
-    causal_mask = torch.zeros(B, 1, S, S, device=device, dtype=dtype)
-    causal_mask = causal_mask.masked_fill(
-        torch.ones(S, S, device=device, dtype=torch.bool).triu(diagonal=1),
-        float("-inf"),
-    )
+    # Construct causal mask for HF eager attention (which does NOT apply causal masking
+    # when attention_mask=None — unlike our custom model which always uses is_causal=True)
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
 
-    # Run HF attention (uses pre-sliced cos/sin from HF rotary: [B, S, head_dim])
+    # Run HF attention with explicit causal mask
     hf_out, _ = hf_attn(
         hidden_states=x,
         position_embeddings=(hf_cos, hf_sin),
         attention_mask=causal_mask,
     )
 
-    # Run custom attention (receives full tables, slices by position_ids internally)
+    # Run custom attention (position_embeddings are pre-sliced)
     custom_out = custom_attn(
         hidden_states=x,
-        position_ids=position_ids,
         position_embeddings=(custom_cos, custom_sin),
     )
 
@@ -253,12 +246,12 @@ def test_starcoder2_attention_equivalence(B, S, dtype):
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @torch.no_grad()
-def test_starcoder2_decoder_layer_equivalence(B, S, dtype):
+def test_seed_oss_decoder_layer_equivalence(B, S, dtype):
     """Test decoder layer produces numerically equivalent output to HF implementation."""
     HFDecoderLayer = _get_hf_decoder_layer_class()
     HFRotary = _get_hf_rotary_class()
     if HFDecoderLayer is None or HFRotary is None:
-        pytest.skip("transformers doesn't have Starcoder2DecoderLayer or Starcoder2RotaryEmbedding")
+        pytest.skip("transformers doesn't have SeedOssDecoderLayer or SeedOssRotaryEmbedding")
 
     device = "cuda"
     config = _create_small_config()
@@ -270,11 +263,12 @@ def test_starcoder2_decoder_layer_equivalence(B, S, dtype):
     hf_layer.eval()
 
     # Create custom decoder layer and load same weights
-    custom_layer = Starcoder2DecoderLayer(config, layer_idx=0)
+    custom_layer = SeedOssDecoderLayer(config, layer_idx=0)
     custom_layer.to(device=device, dtype=dtype)
     custom_layer.load_state_dict(hf_layer.state_dict())
     custom_layer.eval()
 
+    # Create input
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
@@ -282,24 +276,21 @@ def test_starcoder2_decoder_layer_equivalence(B, S, dtype):
     hf_rotary = HFRotary(config=config, device=device)
     hf_cos, hf_sin = hf_rotary(x, position_ids)
 
-    # Compute custom position embeddings (full table, slicing happens inside attention)
-    head_dim = config.hidden_size // config.num_attention_heads
-    custom_rotary = Starcoder2RotaryEmbedding(
-        head_dim,
+    # Compute custom position embeddings (pre-sliced by position_ids)
+    custom_rotary = SeedOssRotaryEmbedding(
+        config.head_dim,
         max_position_embeddings=config.max_position_embeddings,
-        base=config.rope_parameters["rope_theta"],
+        base=get_rope_theta(config),
     )
     custom_rotary.to(device=device, dtype=dtype)
-    custom_cos, custom_sin = custom_rotary(x)  # full tables
+    custom_cos, custom_sin = custom_rotary(x, position_ids)
 
-    # Create causal attention mask in HF additive format [B, 1, S, S]
-    causal_mask = torch.zeros(B, 1, S, S, device=device, dtype=dtype)
-    causal_mask = causal_mask.masked_fill(
-        torch.ones(S, S, device=device, dtype=torch.bool).triu(diagonal=1),
-        float("-inf"),
-    )
+    # Construct causal mask for HF eager attention
+    causal_mask = torch.full((S, S), float("-inf"), device=device, dtype=dtype)
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
 
-    # Run HF decoder layer
+    # Run HF decoder layer (returns tensor directly, but handle tuple for safety)
     hf_out = hf_layer(
         hidden_states=x,
         attention_mask=causal_mask,
@@ -309,10 +300,9 @@ def test_starcoder2_decoder_layer_equivalence(B, S, dtype):
     if isinstance(hf_out, tuple):
         hf_out = hf_out[0]
 
-    # Run custom decoder layer (full tables passed; position_ids used for slicing inside)
+    # Run custom decoder layer (position_embeddings are pre-sliced)
     custom_out = custom_layer(
         hidden_states=x,
-        position_ids=position_ids,
         position_embeddings=(custom_cos, custom_sin),
     )
 
@@ -328,11 +318,11 @@ def test_starcoder2_decoder_layer_equivalence(B, S, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
 @torch.no_grad()
-def test_starcoder2_full_model_equivalence(B, S, dtype, device):
+def test_seed_oss_full_model_equivalence(B, S, dtype, device):
     """Test full model produces numerically equivalent output to HF implementation."""
     HFModel = _get_hf_model_class()
     if HFModel is None:
-        pytest.skip("transformers doesn't have Starcoder2ForCausalLM")
+        pytest.skip("transformers doesn't have SeedOssForCausalLM")
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -346,14 +336,16 @@ def test_starcoder2_full_model_equivalence(B, S, dtype, device):
     hf_model.eval()
 
     # Create custom model and load same weights
-    custom_model = Starcoder2ForCausalLM(config)
+    custom_model = SeedOssForCausalLM(config)
     custom_model.to(device=device, dtype=dtype)
     custom_model.load_state_dict(hf_model.state_dict())
     custom_model.eval()
 
+    # Create input
     input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
+    # Run both
     hf_out = hf_model(input_ids=input_ids, position_ids=position_ids)
     custom_out = custom_model(input_ids=input_ids, position_ids=position_ids)
 
@@ -371,7 +363,7 @@ def test_starcoder2_full_model_equivalence(B, S, dtype, device):
 
 
 @torch.no_grad()
-def test_starcoder2_model_can_be_exported():
+def test_seed_oss_model_can_be_exported():
     """Test that the custom model can be exported with torch_export_to_gm.
 
     Verifies:
@@ -383,10 +375,11 @@ def test_starcoder2_model_can_be_exported():
     dtype = torch.bfloat16
     config = _create_small_config()
 
-    model = Starcoder2ForCausalLM(config)
+    model = SeedOssForCausalLM(config)
     model.to(device=device, dtype=dtype)
     model.eval()
 
+    # Create input
     B, S = 2, 8
     input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
@@ -394,11 +387,15 @@ def test_starcoder2_model_can_be_exported():
     # Get eager model output for comparison
     eager_out = model(input_ids=input_ids, position_ids=position_ids)
 
+    # Define dynamic shapes
+    batch_size_dynamic = Dim.DYNAMIC
+    seq_len_dynamic = Dim.DYNAMIC
     dynamic_shapes = (
-        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
-        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
+        {0: batch_size_dynamic, 1: seq_len_dynamic},
     )
 
+    # Export the model
     gm = torch_export_to_gm(
         model,
         args=tuple(),
@@ -406,8 +403,10 @@ def test_starcoder2_model_can_be_exported():
         dynamic_shapes=dynamic_shapes,
     )
 
+    # Move graph module to device
     move_to_device(gm, device)
 
+    # Verify the exported model produces numerically equivalent output
     with torch.inference_mode():
         out_gm = gm(input_ids=input_ids, position_ids=position_ids)
 
@@ -431,8 +430,9 @@ def test_starcoder2_model_can_be_exported():
         out_gm2 = gm(input_ids=input_ids2, position_ids=position_ids2)
 
     logits2 = out_gm2["logits"]
-    assert logits2.shape == (B2, S2, config.vocab_size), (
-        f"Dynamic shape test failed: expected {(B2, S2, config.vocab_size)}, got {logits2.shape}"
+    expected_shape = (B2, S2, config.vocab_size)
+    assert logits2.shape == expected_shape, (
+        f"Dynamic shape test failed: expected {expected_shape}, got {logits2.shape}"
     )
     assert_rmse_close(
         logits2.float(),
@@ -447,34 +447,42 @@ def test_starcoder2_model_can_be_exported():
 # =========================================================================
 
 
-def test_starcoder2_config_recognition():
+def test_seed_oss_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
-    assert config.model_type == "starcoder2"
+    assert config.model_type == "seed_oss"
     assert hasattr(config, "hidden_size")
     assert hasattr(config, "num_attention_heads")
     assert hasattr(config, "num_key_value_heads")
-    assert hasattr(config, "sliding_window")
+    assert hasattr(config, "head_dim")
+    assert hasattr(config, "attention_bias")
+    assert hasattr(config, "attention_out_bias")
 
 
-def test_starcoder2_gqa_structure():
+def test_seed_oss_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
-    model = Starcoder2ForCausalLM(config)
+    model = SeedOssForCausalLM(config)
 
     attn = model.model.layers[0].self_attn
-    assert attn.num_heads == config.num_attention_heads
-    assert attn.num_kv_heads == config.num_key_value_heads
-    assert attn.num_kv_heads < attn.num_heads, "Should use GQA"
+    assert attn.num_heads == 4, f"Expected 4 Q heads, got {attn.num_heads}"
+    assert attn.num_kv_heads == 2, f"Expected 2 KV heads, got {attn.num_kv_heads}"
+
+    # Verify Q/K projections have bias (Seed-OSS specific: attention_bias=True)
+    assert attn.q_proj.bias is not None, "Q projection should have bias"
+    assert attn.k_proj.bias is not None, "K projection should have bias"
+    assert attn.v_proj.bias is not None, "V projection should have bias"
+    # O projection has no bias (attention_out_bias=False)
+    assert attn.o_proj.bias is None, "O projection should not have bias"
 
 
-def test_starcoder2_state_dict_keys():
-    """Test that state_dict keys match expected HF checkpoint format."""
+def test_seed_oss_state_dict_keys():
+    """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()
-    model = Starcoder2ForCausalLM(config)
+    model = SeedOssForCausalLM(config)
     state_dict = model.state_dict()
 
-    expected_keys = [
+    expected_key_patterns = [
         "model.embed_tokens.weight",
         "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.self_attn.q_proj.bias",
@@ -483,21 +491,21 @@ def test_starcoder2_state_dict_keys():
         "model.layers.0.self_attn.v_proj.weight",
         "model.layers.0.self_attn.v_proj.bias",
         "model.layers.0.self_attn.o_proj.weight",
-        "model.layers.0.self_attn.o_proj.bias",
-        "model.layers.0.mlp.c_fc.weight",
-        "model.layers.0.mlp.c_fc.bias",
-        "model.layers.0.mlp.c_proj.weight",
-        "model.layers.0.mlp.c_proj.bias",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
         "model.layers.0.input_layernorm.weight",
-        "model.layers.0.input_layernorm.bias",
         "model.layers.0.post_attention_layernorm.weight",
-        "model.layers.0.post_attention_layernorm.bias",
         "model.norm.weight",
-        "model.norm.bias",
         "lm_head.weight",
     ]
 
-    for key in expected_keys:
+    for key in expected_key_patterns:
         assert key in state_dict, (
-            f"Expected key '{key}' in state_dict. Got keys: {list(state_dict.keys())[:10]}..."
+            f"Expected key '{key}' in state_dict, got keys: {list(state_dict.keys())[:10]}..."
         )
+
+    # Verify O projection does NOT have bias key
+    assert "model.layers.0.self_attn.o_proj.bias" not in state_dict, (
+        "O projection should not have bias key in state_dict"
+    )
