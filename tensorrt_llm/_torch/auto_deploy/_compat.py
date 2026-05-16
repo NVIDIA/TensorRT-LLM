@@ -129,10 +129,39 @@ if TRTLLM_AVAILABLE:
         get_sm_version,
         is_sm_100f,
         mpi_disabled,
-        nvtx_range,
         prefer_pinned,
         str_dtype_to_torch,
     )
+    from tensorrt_llm._utils import nvtx_range as _real_nvtx_range
+
+    # AD_DISABLE_NVTX=1 → returns a class-based null CM (cheaper than @contextmanager generator).
+    # @contextmanager produces a generator-based CM with non-trivial per-use overhead; the native
+    # nvtx.annotate is a C-extension CM that may be cheaper. Use a class-based singleton to ensure
+    # the null path is strictly lighter than the real path.
+    if os.environ.get("AD_DISABLE_NVTX", "0") == "1":
+        # nvtx.annotate is used in TWO ways in AD code:
+        #   1. context manager:  with nvtx_range("foo"): ...
+        #   2. decorator:        @nvtx_range("foo")\n def bar(...): ...
+        # So our null replacement must support both patterns.
+        class _NullNvtxCM:
+            __slots__ = ()
+
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def __call__(self, func):
+                # Decorator usage: return the wrapped function unchanged.
+                return func
+
+        _NULL_NVTX_CM = _NullNvtxCM()
+
+        def nvtx_range(msg, color="grey", domain="auto_deploy", category=None):
+            return _NULL_NVTX_CM
+    else:
+        nvtx_range = _real_nvtx_range
 else:
     # -- get_free_port --
     def get_free_port() -> int:
