@@ -2387,7 +2387,7 @@ TEST_F(CapacitySchedulerTest, EncoderInitMaxUtilizationAdmits)
     EXPECT_EQ(fittingRequests.front()->mRequestId, 1u);
 }
 
-// Without an enc_dec_kv_cache_manager, an encoder-init request cannot honour the
+// Without a cross_kv_cache_manager, an encoder-init request cannot honour the
 // dual-pool contract and must fail fast for both policies.
 TEST_F(CapacitySchedulerTest, EncoderInitWithoutCrossManagerThrows)
 {

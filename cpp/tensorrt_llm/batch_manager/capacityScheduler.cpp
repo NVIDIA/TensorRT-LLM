@@ -326,7 +326,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     // cannot be satisfied later by decoder context, so fail
                     // fast instead of admitting a request that cannot complete.
                     TLLM_CHECK_WITH_INFO(reservedCrossBlocks.has_value(),
-                        "Encoder-init request %lu requires an enc_dec_kv_cache_manager.", req->mRequestId);
+                        "Encoder-init request %lu requires a cross_kv_cache_manager.", req->mRequestId);
                 }
 
                 // Beneficial-to-skip check using the cached summary
@@ -566,7 +566,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
             // manager we cannot honour the dual-pool contract at the later
             // decoder-context admission, so fail before running encoder work.
             TLLM_CHECK_WITH_INFO(crossBlocksManager.has_value(),
-                "Encoder-init request %lu requires an enc_dec_kv_cache_manager.", req->mRequestId);
+                "Encoder-init request %lu requires a cross_kv_cache_manager.", req->mRequestId);
             auto const crossScheduledIfFits = crossBlocksManager->prepareNewNumberOfBlocksIfWeEndUpScheduling(*req);
             if (crossScheduledIfFits && fitsPeft)
             {

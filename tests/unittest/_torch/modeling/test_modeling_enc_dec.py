@@ -210,7 +210,7 @@ def _build_trtllm_cross_metadata(
 
     request_ids = list(range(num_seqs))
     if kv_managers is None:
-        enc_dec_kv_cache_manager = kv_cache_manager_cls(
+        cross_kv_cache_manager = kv_cache_manager_cls(
             KvCacheConfig(max_tokens=num_seqs * cross_max_seq_len),
             cross_cache_type,
             num_layers=1,
@@ -235,10 +235,10 @@ def _build_trtllm_cross_metadata(
             dtype=kv_cache_dtype,
         )
 
-        enc_dec_kv_cache_manager.add_dummy_requests(request_ids, [int(x) for x in encoder_seq_lens])
+        cross_kv_cache_manager.add_dummy_requests(request_ids, [int(x) for x in encoder_seq_lens])
         self_kv_cache_manager.add_dummy_requests(request_ids, [int(x) for x in decoder_seq_lens])
     else:
-        self_kv_cache_manager, enc_dec_kv_cache_manager = kv_managers
+        self_kv_cache_manager, cross_kv_cache_manager = kv_managers
 
     decoder_seq_lens_tensor = torch.tensor([int(x) for x in decoder_seq_lens], dtype=torch.int32)
     encoder_seq_lens_tensor = torch.tensor([int(x) for x in encoder_seq_lens], dtype=torch.int32)
@@ -264,11 +264,11 @@ def _build_trtllm_cross_metadata(
     )
     cross_metadata = metadata.create_cross_metadata(
         encoder_seq_lens=encoder_seq_lens_tensor,
-        enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+        cross_kv_cache_manager=cross_kv_cache_manager,
         encoder_num_cached_tokens_per_seq=encoder_cached,
     )
     cross_metadata.prepare()
-    return metadata, cross_metadata, (self_kv_cache_manager, enc_dec_kv_cache_manager)
+    return metadata, cross_metadata, (self_kv_cache_manager, cross_kv_cache_manager)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -364,7 +364,7 @@ class TestCrossAttentionTrtllmBackend(unittest.TestCase):
         vanilla_metadata = _make_vanilla_metadata(decoder_seq_lens, device)
         vanilla_cross_metadata = vanilla_metadata.create_cross_metadata(
             encoder_seq_lens=torch.tensor([int(x) for x in encoder_seq_lens], dtype=torch.int32),
-            enc_dec_kv_cache_manager=None,
+            cross_kv_cache_manager=None,
         )
         vanilla_cross_metadata.prepare()
         return vanilla_metadata, vanilla_cross_metadata

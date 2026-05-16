@@ -406,8 +406,8 @@ class AttentionMetadata:
     def create_cross_metadata(
         self,
         encoder_seq_lens: torch.Tensor,
-        enc_dec_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2,
-                                        None] = None,
+        cross_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2,
+                                      None] = None,
         *,
         encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
     ) -> "AttentionMetadata":
@@ -429,7 +429,7 @@ class AttentionMetadata:
                 the full encoder length; on generation steps it should be
                 ``0`` (no new K/V tokens to add to the cross pool — the
                 encoder K/V are already cached).
-            enc_dec_kv_cache_manager: KV cache manager for the cross pool.
+            cross_kv_cache_manager: KV cache manager for the cross pool.
                 When ``None``, the returned metadata uses the stateless
                 (no-KV-cache) path (suitable for unit tests).
             encoder_num_cached_tokens_per_seq: Per-request count of encoder
@@ -449,7 +449,7 @@ class AttentionMetadata:
             # CUDA graph metadata buffers separate so preparing cross metadata
             # cannot overwrite self-attention sequence lengths.
             cross_md.cuda_graph_buffers = Buffers()
-        cross_md.kv_cache_manager = enc_dec_kv_cache_manager
+        cross_md.kv_cache_manager = cross_kv_cache_manager
         cross_md._seq_lens_kv = None
         cross_md._seq_lens_kv_cuda = None
         cross_md.cross = None
@@ -459,7 +459,7 @@ class AttentionMetadata:
             base_params = self.kv_cache_params
             cross_md.kv_cache_params = KVCacheParams(
                 use_cache=base_params.use_cache if base_params is not None else
-                (enc_dec_kv_cache_manager is not None),
+                (cross_kv_cache_manager is not None),
                 num_cached_tokens_per_seq=list(
                     encoder_num_cached_tokens_per_seq),
                 block_ids_per_seq=base_params.block_ids_per_seq

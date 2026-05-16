@@ -140,7 +140,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
         draft_kv_cache_manager=None,  # KVCacheManagerV2 for MTP draft layers
-        enc_dec_kv_cache_manager=None,  # KVCacheManagerV2 for enc-dec cross-attn
+        cross_kv_cache_manager=None,  # KVCacheManagerV2 for enc-dec cross-attn
     ):
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
@@ -153,7 +153,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
-        self.enc_dec_kv_cache_manager = enc_dec_kv_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
@@ -171,15 +171,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         draft_mgr_name = (
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
         )
-        enc_dec_mgr_name = (
-            type(enc_dec_kv_cache_manager).__name__
-            if enc_dec_kv_cache_manager is not None
-            else "None"
+        cross_mgr_name = (
+            type(cross_kv_cache_manager).__name__ if cross_kv_cache_manager is not None else "None"
         )
         logger.info(
             f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
-            f"draft_mgr={draft_mgr_name}, enc_dec_mgr={enc_dec_mgr_name}"
+            f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -404,9 +402,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # context step. If the runtime did not plumb one through, surface this
         # loudly rather than silently routing to the self pool, which would
         # corrupt the dual-pool contract.
-        if self.enc_dec_kv_cache_manager is None:
+        if self.cross_kv_cache_manager is None:
             raise RuntimeError(
-                f"Encoder-init request {req.py_request_id} requires an enc_dec_kv_cache_manager."
+                f"Encoder-init request {req.py_request_id} requires a cross_kv_cache_manager."
             )
 
         req_tokens = req.encoder_output_len
@@ -546,10 +544,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self._needs_cross_context_allocation(req):
             return ScheduleAction.SCHEDULED
 
-        if self.enc_dec_kv_cache_manager is None:
+        if self.cross_kv_cache_manager is None:
             logger.warning(
                 "Decoder context request %s requires cross-KV cache but "
-                "no enc_dec_kv_cache_manager is configured. Skipping.",
+                "no cross_kv_cache_manager is configured. Skipping.",
                 req.py_request_id,
             )
             return ScheduleAction.STOP
@@ -557,29 +555,29 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_tokens = int(req.encoder_output_len)
         from ..resource_manager import KVCacheManagerV2
 
-        if isinstance(self.enc_dec_kv_cache_manager, KVCacheManagerV2):
+        if isinstance(self.cross_kv_cache_manager, KVCacheManagerV2):
             if not self._try_schedule_cross_context_v2(
-                self.enc_dec_kv_cache_manager, req, req_tokens
+                self.cross_kv_cache_manager, req, req_tokens
             ):
                 return ScheduleAction.SKIP
             return ScheduleAction.SCHEDULED
 
-        if not self.enc_dec_kv_cache_manager.prepare_context(req):
+        if not self.cross_kv_cache_manager.prepare_context(req):
             logger.debug(
                 "cross prepare_context failed for decoder context request %s",
                 req.py_request_id,
             )
             return ScheduleAction.SKIP
-        if not self.enc_dec_kv_cache_manager.resize_context(req, req_tokens):
+        if not self.cross_kv_cache_manager.resize_context(req, req_tokens):
             return ScheduleAction.SKIP
         return ScheduleAction.SCHEDULED
 
     @staticmethod
     def _try_schedule_cross_context_v2(
-        enc_dec_kv_cache_manager, req: LlmRequest, req_tokens: int
+        cross_kv_cache_manager, req: LlmRequest, req_tokens: int
     ) -> bool:
         """Reserve V2 cross-KV without mutating decoder context position."""
-        kv_cache = enc_dec_kv_cache_manager.kv_cache_map.get(req.py_request_id)
+        kv_cache = cross_kv_cache_manager.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             if not req.is_first_context_chunk:
                 logger.debug(
@@ -589,21 +587,21 @@ class KVCacheV2Scheduler(RequestScheduler):
                 return False
             input_tokens = (
                 req.get_encoder_unique_tokens()
-                if enc_dec_kv_cache_manager.enable_block_reuse
+                if cross_kv_cache_manager.enable_block_reuse
                 else None
             )
-            kv_cache = enc_dec_kv_cache_manager._create_kv_cache(
+            kv_cache = cross_kv_cache_manager._create_kv_cache(
                 req.py_request_id, req.lora_task_id, input_tokens
             )
-            kv_cache.cuda_stream = enc_dec_kv_cache_manager._stream.cuda_stream
+            kv_cache.cuda_stream = cross_kv_cache_manager._stream.cuda_stream
 
-        if not enc_dec_kv_cache_manager.enable_block_reuse:
+        if not cross_kv_cache_manager.enable_block_reuse:
             kv_cache.stop_committing()
 
-        if not enc_dec_kv_cache_manager._resume_and_restore(req.py_request_id, kv_cache):
+        if not cross_kv_cache_manager._resume_and_restore(req.py_request_id, kv_cache):
             return False
 
-        target_capacity = req_tokens + enc_dec_kv_cache_manager.num_extra_kv_tokens
+        target_capacity = req_tokens + cross_kv_cache_manager.num_extra_kv_tokens
         if not kv_cache.resize(max(kv_cache.capacity, target_capacity)):
             if req.is_first_context_chunk:
                 kv_cache.suspend()

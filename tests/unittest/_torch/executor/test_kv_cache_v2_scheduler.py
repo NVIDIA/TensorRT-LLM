@@ -176,7 +176,7 @@ def make_scheduler(
     scheduler_capacity=None,
     no_schedule_until_state=None,
     no_schedule_after_state=None,
-    enc_dec_kv_cache_manager=None,
+    cross_kv_cache_manager=None,
 ):
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -190,8 +190,8 @@ def make_scheduler(
             kwargs["no_schedule_until_state"] = no_schedule_until_state
         if no_schedule_after_state is not None:
             kwargs["no_schedule_after_state"] = no_schedule_after_state
-        if enc_dec_kv_cache_manager is not None:
-            kwargs["enc_dec_kv_cache_manager"] = enc_dec_kv_cache_manager
+        if cross_kv_cache_manager is not None:
+            kwargs["cross_kv_cache_manager"] = cross_kv_cache_manager
         return KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -204,21 +204,21 @@ def make_scheduler(
         )
 
 
-def make_encoder_scheduler(kv_cache_manager, enc_dec_kv_cache_manager=None, **kwargs):
+def make_encoder_scheduler(kv_cache_manager, cross_kv_cache_manager=None, **kwargs):
     """Scheduler with state range widened to include ENCODER_INIT (matches
     C++ trtEncoderModel pattern).
 
-    Encoder-decoder runtime requires a enc_dec_kv_cache_manager for the later
+    Encoder-decoder runtime requires a cross_kv_cache_manager for the later
     decoder-context cross-KV step. By default we wire a fresh mock cross
     manager that succeeds; tests that exercise misconfiguration pass an
     explicit ``None`` through ``make_scheduler`` directly.
     """
-    if enc_dec_kv_cache_manager is None:
-        enc_dec_kv_cache_manager = make_kv_cache_manager()
+    if cross_kv_cache_manager is None:
+        cross_kv_cache_manager = make_kv_cache_manager()
     return make_scheduler(
         kv_cache_manager,
         no_schedule_until_state=LlmRequestState.ENCODER_INIT,
-        enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+        cross_kv_cache_manager=cross_kv_cache_manager,
         **kwargs,
     )
 
@@ -1030,9 +1030,9 @@ class TestEncoder:
         allocation are decoder-context responsibilities.
         """
         self_mgr = make_kv_cache_manager()
-        enc_dec_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
         sched = make_encoder_scheduler(
-            self_mgr, enc_dec_kv_cache_manager=enc_dec_mgr, max_num_tokens=1000
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
         )
         req = make_encoder_request(0, encoder_output_len=100)
         out = sched.schedule_request([req], set())
@@ -1041,12 +1041,12 @@ class TestEncoder:
         self_mgr.prepare_context.assert_not_called()
         self_mgr.resize_context.assert_not_called()
         self_mgr.try_allocate_generation.assert_not_called()
-        enc_dec_mgr.prepare_context.assert_not_called()
-        enc_dec_mgr.resize_context.assert_not_called()
-        enc_dec_mgr.try_allocate_generation.assert_not_called()
+        cross_mgr.prepare_context.assert_not_called()
+        cross_mgr.resize_context.assert_not_called()
+        cross_mgr.try_allocate_generation.assert_not_called()
 
     def test_encoder_without_cross_manager_raises(self):
-        """No enc_dec_kv_cache_manager -> encoder request cannot be admitted.
+        """No cross_kv_cache_manager -> encoder request cannot be admitted.
 
         The dual-pool contract requires a cross manager.  Without one
         the scheduler errors rather than silently routing to the
@@ -1068,7 +1068,7 @@ class TestEncoder:
                 no_schedule_until_state=LlmRequestState.ENCODER_INIT,
             )
         reqs = [make_encoder_request(0, encoder_output_len=100)]
-        with pytest.raises(RuntimeError, match="requires an enc_dec_kv_cache_manager"):
+        with pytest.raises(RuntimeError, match="requires a cross_kv_cache_manager"):
             sched.schedule_request(reqs, set())
         # Self pool must not be touched.
         mgr.prepare_context.assert_not_called()
@@ -1076,9 +1076,9 @@ class TestEncoder:
     def test_encoder_then_context_defers_cross_pool_to_context(self):
         """Cross-pool allocation is deferred from ENCODER_INIT to CONTEXT_INIT."""
         self_mgr = make_kv_cache_manager()
-        enc_dec_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
         sched = make_encoder_scheduler(
-            self_mgr, enc_dec_kv_cache_manager=enc_dec_mgr, max_num_tokens=1000
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
         )
 
         # Iteration 1: ENCODER_INIT → encoder compute admission.
@@ -1087,8 +1087,8 @@ class TestEncoder:
         assert ids(out1.context_requests) == [0]
         self_mgr.prepare_context.assert_not_called()
         self_mgr.resize_context.assert_not_called()
-        enc_dec_mgr.prepare_context.assert_not_called()
-        enc_dec_mgr.resize_context.assert_not_called()
+        cross_mgr.prepare_context.assert_not_called()
+        cross_mgr.resize_context.assert_not_called()
 
         # Iteration 2: CONTEXT_INIT (post-encoder transition) → both pools.
         ctx_req = make_ctx_request(0, context_remaining_length=50, encoder_output_len=80)
@@ -1096,15 +1096,15 @@ class TestEncoder:
         assert ids(out2.context_requests) == [0]
         self_mgr.prepare_context.assert_called_once_with(ctx_req)
         self_mgr.resize_context.assert_called_once_with(ctx_req, 50)
-        enc_dec_mgr.prepare_context.assert_called_once_with(ctx_req)
-        enc_dec_mgr.resize_context.assert_called_once_with(ctx_req, 80)
+        cross_mgr.prepare_context.assert_called_once_with(ctx_req)
+        cross_mgr.resize_context.assert_called_once_with(ctx_req, 80)
 
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
         """Later decoder chunks read existing cross-KV without reallocation."""
         self_mgr = make_kv_cache_manager()
-        enc_dec_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
         sched = make_encoder_scheduler(
-            self_mgr, enc_dec_kv_cache_manager=enc_dec_mgr, max_num_tokens=1000
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
         )
         ctx_req = make_ctx_request(
             0,
@@ -1119,8 +1119,8 @@ class TestEncoder:
         assert ids(out.context_requests) == [0]
         self_mgr.prepare_context.assert_called_once_with(ctx_req)
         self_mgr.resize_context.assert_called_once_with(ctx_req, 50)
-        enc_dec_mgr.prepare_context.assert_not_called()
-        enc_dec_mgr.resize_context.assert_not_called()
+        cross_mgr.prepare_context.assert_not_called()
+        cross_mgr.resize_context.assert_not_called()
 
 
 # ===========================================================================

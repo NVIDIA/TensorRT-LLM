@@ -1137,7 +1137,7 @@ class KvCacheCreator:
 
         return self_kv_cache_config, cross_kv_cache_config
 
-    def _create_enc_dec_kv_cache_manager(
+    def _create_cross_kv_cache_manager(
         self,
         cross_kv_cache_config: KvCacheConfig,
         estimating_kv_cache: bool = False,
@@ -1255,16 +1255,16 @@ class KvCacheCreator:
                 kv_cache_config_override=draft_build_kv_cache_config)
 
         # Encoder-decoder cross-attention pool
-        enc_dec_kv_cache_manager = None
+        cross_kv_cache_manager = None
         if cross_kv_cache_config is not None:
-            enc_dec_kv_cache_manager = self._create_enc_dec_kv_cache_manager(
+            cross_kv_cache_manager = self._create_cross_kv_cache_manager(
                 cross_kv_cache_config, estimating_kv_cache)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
-        resources[ResourceManagerType.
-                  ENC_DEC_KV_CACHE_MANAGER] = enc_dec_kv_cache_manager
+        resources[
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
@@ -1275,12 +1275,12 @@ class KvCacheCreator:
         if draft_kv_cache_manager:
             draft_kv_cache_manager.shutdown()
         del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
-        enc_dec_kv_cache_manager = resources.get(
-            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER)
-        if enc_dec_kv_cache_manager is not None:
-            enc_dec_kv_cache_manager.shutdown()
-        if ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER in resources:
-            del resources[ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER]
+        cross_kv_cache_manager = resources.get(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is not None:
+            cross_kv_cache_manager.shutdown()
+        if ResourceManagerType.CROSS_KV_CACHE_MANAGER in resources:
+            del resources[ResourceManagerType.CROSS_KV_CACHE_MANAGER]
 
 
 def _build_per_layer_num_kv_heads(
@@ -1853,11 +1853,11 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
-    enc_dec_kv_cache_manager = resources.get(
-        ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER)
-    if enc_dec_kv_cache_manager is not None:
+    cross_kv_cache_manager = resources.get(
+        ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+    if cross_kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
-            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER, last=True)
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
@@ -1870,7 +1870,7 @@ def create_py_executor_instance(
     # encoder loop can run. Decoder-only deployments keep the default
     # CONTEXT_INIT gating.
     no_schedule_until_state = (LlmRequestState.ENCODER_INIT
-                               if enc_dec_kv_cache_manager is not None else
+                               if cross_kv_cache_manager is not None else
                                LlmRequestState.CONTEXT_INIT)
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
@@ -1890,7 +1890,7 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_capacity=scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
-            enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+            cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
         )
     elif (scheduler_config is not None
@@ -1904,8 +1904,8 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_policy=scheduler_config.capacity_scheduler_policy,
             ctx_chunk_config=ctx_chunk_config,
-            enc_dec_kv_cache_manager=enc_dec_kv_cache_manager.impl
-            if enc_dec_kv_cache_manager is not None else None,
+            cross_kv_cache_manager=cross_kv_cache_manager.impl
+            if cross_kv_cache_manager is not None else None,
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity,
             no_schedule_until_state=no_schedule_until_state)
@@ -1915,8 +1915,8 @@ def create_py_executor_instance(
             kv_cache_manager.impl if kv_cache_manager is not None else None,
             peft_cache_manager.impl if peft_cache_manager is not None else None,
             scheduler_config.capacity_scheduler_policy,
-            enc_dec_kv_cache_manager=enc_dec_kv_cache_manager.impl
-            if enc_dec_kv_cache_manager is not None else None,
+            cross_kv_cache_manager=cross_kv_cache_manager.impl
+            if cross_kv_cache_manager is not None else None,
             two_step_lookahead=mapping.has_pp(),
             no_schedule_until_state=no_schedule_until_state)
 

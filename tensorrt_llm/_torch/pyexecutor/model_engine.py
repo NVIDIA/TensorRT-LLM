@@ -1862,11 +1862,11 @@ class PyTorchModelEngine(ModelEngine):
             raise RuntimeError(
                 "Encoder-decoder decoder forward requires a resource manager "
                 "with a cross-KV cache manager.")
-        enc_dec_kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER)
-        if enc_dec_kv_cache_manager is None:
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is None:
             raise RuntimeError("Encoder-decoder decoder forward requires "
-                               "ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER.")
+                               "ResourceManagerType.CROSS_KV_CACHE_MANAGER.")
 
         new_encoder_tokens = sum(encoder_seq_lens)
         if encoder_hidden_states:
@@ -1895,14 +1895,14 @@ class PyTorchModelEngine(ModelEngine):
         def update_cross_metadata(
                 cross_attn_metadata: AttentionMetadata) -> AttentionMetadata:
             base_params = attn_metadata.kv_cache_params
-            cross_attn_metadata.kv_cache_manager = enc_dec_kv_cache_manager
+            cross_attn_metadata.kv_cache_manager = cross_kv_cache_manager
             cross_attn_metadata._seq_lens = attn_metadata.seq_lens
             cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
             cross_attn_metadata.cross = cross_attn_metadata
             cross_attn_metadata.seq_lens_kv = encoder_seq_lens_tensor
             if encoder_num_cached_tokens_per_seq is not None:
                 use_cache = (base_params.use_cache if base_params is not None
-                             else (enc_dec_kv_cache_manager is not None))
+                             else (cross_kv_cache_manager is not None))
                 block_ids_per_seq = (base_params.block_ids_per_seq
                                      if base_params is not None else None)
                 host_max_attention_window_sizes = (
@@ -1932,7 +1932,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             cross_attn_metadata = attn_metadata.create_cross_metadata(
                 encoder_seq_lens=encoder_seq_lens_tensor,
-                enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+                cross_kv_cache_manager=cross_kv_cache_manager,
                 encoder_num_cached_tokens_per_seq=
                 encoder_num_cached_tokens_per_seq,
             )

@@ -372,31 +372,31 @@ class _FakeAttentionMetadata:
         self.num_seqs = num_seqs
         self.cross_metadata = _FakeCrossAttentionMetadata()
         self.encoder_seq_lens = None
-        self.enc_dec_kv_cache_manager = None
+        self.cross_kv_cache_manager = None
         self.encoder_num_cached_tokens_per_seq = None
         self.is_cuda_graph = False
-        setattr(self, "has_" + "cr" + "oss_sub_metadata", False)
+        self.has_cross_sub_metadata = False
 
     def create_cross_metadata(
         self,
         encoder_seq_lens,
-        enc_dec_kv_cache_manager,
+        cross_kv_cache_manager,
         *,
         encoder_num_cached_tokens_per_seq=None,
     ):
         self.encoder_seq_lens = encoder_seq_lens
-        self.enc_dec_kv_cache_manager = enc_dec_kv_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
         self.encoder_num_cached_tokens_per_seq = encoder_num_cached_tokens_per_seq
         return self.cross_metadata
 
 
 class _FakeResourceManager:
-    def __init__(self, enc_dec_kv_cache_manager):
-        self.enc_dec_kv_cache_manager = enc_dec_kv_cache_manager
+    def __init__(self, cross_kv_cache_manager):
+        self.cross_kv_cache_manager = cross_kv_cache_manager
 
     def get_resource_manager(self, key):
-        assert key == ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER
-        return self.enc_dec_kv_cache_manager
+        assert key == ResourceManagerType.CROSS_KV_CACHE_MANAGER
+        return self.cross_kv_cache_manager
 
 
 class TestPrepareEncoderDecoderCrossAttentionInputs:
@@ -423,7 +423,7 @@ class TestPrepareEncoderDecoderCrossAttentionInputs:
         assert inputs["cross_attn_metadata"] is metadata.cross_metadata
         assert metadata.cross_metadata.prepared is True
         assert metadata.encoder_seq_lens.tolist() == [2, 0, 0]
-        assert metadata.enc_dec_kv_cache_manager is cross_manager
+        assert metadata.cross_kv_cache_manager is cross_manager
         assert metadata.encoder_num_cached_tokens_per_seq == [0, 5, 7]
 
     def test_all_cached_sequences_skip_projection(self):
@@ -458,12 +458,12 @@ class TestPrepareEncoderDecoderCrossAttentionInputs:
                 resource_manager,
             )
 
-    def test_requires_enc_dec_kv_cache_manager(self):
+    def test_requires_cross_kv_cache_manager(self):
         engine = self._engine()
         metadata = _FakeAttentionMetadata(num_seqs=1)
         resource_manager = _FakeResourceManager(None)
 
-        with pytest.raises(RuntimeError, match="ENC_DEC_KV_CACHE_MANAGER"):
+        with pytest.raises(RuntimeError, match="CROSS_KV_CACHE_MANAGER"):
             engine._prepare_encoder_decoder_cross_attention_inputs(
                 [],
                 [0],

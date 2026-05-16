@@ -244,13 +244,13 @@ class CrossAttention(nn.Module):
             encoder_seq_lens = self._infer_encoder_seq_lens(encoder_hidden_states, attn_metadata)
             metadata = attn_metadata.create_cross_metadata(
                 encoder_seq_lens=encoder_seq_lens,
-                enc_dec_kv_cache_manager=None,
+                cross_kv_cache_manager=None,
             )
         else:
             assert metadata.is_cross, (
                 "cross_attn_metadata.is_cross must be True. Build it via "
                 "attn_metadata.create_cross_metadata(encoder_seq_lens, "
-                "enc_dec_kv_cache_manager) so seq_lens_kv differs from "
+                "cross_kv_cache_manager) so seq_lens_kv differs from "
                 "seq_lens."
             )
 

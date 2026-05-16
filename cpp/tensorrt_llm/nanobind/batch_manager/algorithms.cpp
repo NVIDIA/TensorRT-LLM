@@ -91,7 +91,7 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE)
         .def("__call__", &CapacityScheduler::operator(), nb::arg("active_requests"),
             nb::arg("kv_cache_manager") = nullptr, nb::arg("peft_cache_manager") = nullptr,
-            nb::arg("enc_dec_kv_cache_manager") = nullptr)
+            nb::arg("cross_kv_cache_manager") = nullptr)
         .def("set_agent_tree_reorder_policy", &CapacityScheduler::setAgentTreeReorderPolicy,
             nb::arg("agent_percentage"), nb::arg("agent_types"), nb::arg("agent_inflight_seq_num"))
         .def("name", [](CapacityScheduler const&) { return CapacityScheduler::name; });
@@ -110,7 +110,7 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
         .def(nb::init<SizeType32>(), nb::arg("max_input_len"))
         .def("__call__", &PauseRequests::operator(), nb::arg("requests_to_pause"), nb::arg("inflight_req_ids"),
             nb::arg("req_ids_to_pause"), nb::arg("pause_flagged"), nb::arg("seq_slot_manager"),
-            nb::arg("kv_cache_manager") = std::nullopt, nb::arg("enc_dec_kv_cache_manager") = std::nullopt,
+            nb::arg("kv_cache_manager") = std::nullopt, nb::arg("cross_kv_cache_manager") = std::nullopt,
             nb::arg("peft_cache_manager") = std::nullopt)
         .def("name", [](PauseRequests const&) { return PauseRequests::name; });
 
@@ -123,7 +123,7 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
     nb::class_<AllocateKvCache>(m, AllocateKvCache::name)
         .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
         .def("__call__", &AllocateKvCache::operator(), nb::arg("kv_cache_manager"), nb::arg("context_requests"),
-            nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("enc_dec_kv_cache_manager") = std::nullopt,
+            nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("cross_kv_cache_manager") = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
         .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 

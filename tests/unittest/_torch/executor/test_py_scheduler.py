@@ -2399,7 +2399,7 @@ class TestPyCapacitySchedulerCrossKVCache:
         scheduler = PyCapacityScheduler(
             max_num_requests=2,
             kv_cache_manager=kv,
-            enc_dec_kv_cache_manager=cross_kv,
+            cross_kv_cache_manager=cross_kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         r0 = make_context_request(0, prompt_len=10)
@@ -2416,7 +2416,7 @@ class TestPyCapacitySchedulerCrossKVCache:
         scheduler = PyCapacityScheduler(
             max_num_requests=2,
             kv_cache_manager=kv,
-            enc_dec_kv_cache_manager=cross_kv,
+            cross_kv_cache_manager=cross_kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         r0 = make_context_request(0, prompt_len=10)
@@ -2446,7 +2446,7 @@ class TestPyCapacitySchedulerEncoderInit:
         return PyCapacityScheduler(
             max_num_requests=max_num_requests,
             kv_cache_manager=kv,
-            enc_dec_kv_cache_manager=cross_kv,
+            cross_kv_cache_manager=cross_kv,
             scheduler_policy=policy,
             no_schedule_until_state=LlmRequestState.ENCODER_INIT,
         )
@@ -2481,7 +2481,7 @@ class TestPyCapacitySchedulerEncoderInit:
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
         scheduler = self._make_scheduler(kv, None, CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
         requests = [make_encoder_request(0, encoder_output_len=10)]
-        with pytest.raises(RuntimeError, match="requires an enc_dec_kv_cache_manager"):
+        with pytest.raises(RuntimeError, match="requires a cross_kv_cache_manager"):
             scheduler.schedule_request(requests)
 
     def test_guaranteed_no_evict_encoder_does_not_consume_self_pool(self):
@@ -2522,7 +2522,7 @@ class TestPyCapacitySchedulerEncoderInit:
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
         scheduler = self._make_scheduler(kv, None, CapacitySchedulerPolicy.MAX_UTILIZATION)
         requests = [make_encoder_request(0, encoder_output_len=10)]
-        with pytest.raises(RuntimeError, match="requires an enc_dec_kv_cache_manager"):
+        with pytest.raises(RuntimeError, match="requires a cross_kv_cache_manager"):
             scheduler.schedule_request(requests)
 
     def test_max_utilization_encoder_not_evictable_victim(self):

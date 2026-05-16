@@ -270,13 +270,13 @@ class BindCapacityScheduler(CapacityScheduler):
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         *,
-        enc_dec_kv_cache_manager=None,
+        cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
     ):
         """C++-bound capacity scheduler wrapper.
 
-        ``enc_dec_kv_cache_manager`` enables encoder-decoder dual-pool
+        ``cross_kv_cache_manager`` enables encoder-decoder dual-pool
         scheduling.  When provided, callers should also pass
         ``no_schedule_until_state=LlmRequestState.ENCODER_INIT`` so the
         scheduler admits requests already in ``ENCODER_INIT`` for the
@@ -287,7 +287,7 @@ class BindCapacityScheduler(CapacityScheduler):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
-        self.enc_dec_kv_cache_manager = enc_dec_kv_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
@@ -305,7 +305,7 @@ class BindCapacityScheduler(CapacityScheduler):
             active_requests,
             self.kv_cache_manager,
             self.peft_cache_manager,
-            self.enc_dec_kv_cache_manager,
+            self.cross_kv_cache_manager,
         )
 
 
@@ -964,7 +964,7 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
     GuaranteedNoEvictScheduler: Reserve blocks for requests to complete without eviction.
     C++ reference: capacityScheduler.cpp:194-331
 
-    Encoder-decoder support: when ``enc_dec_kv_cache_manager`` is configured
+    Encoder-decoder support: when ``cross_kv_cache_manager`` is configured
     on the parent scheduler and ``no_schedule_until_state=ENCODER_INIT``,
     encoder-init requests are considered in the same *scheduler pass* as
     context/generation requests. This does not mean encoder and decoder
@@ -1001,10 +1001,8 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
         reserved_blocks = NoEvictScheduledBlocksManager(scheduler.kv_cache_manager)
         reserved_cross_blocks: Optional[NoEvictScheduledBlocksManager] = None
-        if scheduler.enc_dec_kv_cache_manager is not None:
-            reserved_cross_blocks = NoEvictScheduledBlocksManager(
-                scheduler.enc_dec_kv_cache_manager
-            )
+        if scheduler.cross_kv_cache_manager is not None:
+            reserved_cross_blocks = NoEvictScheduledBlocksManager(scheduler.cross_kv_cache_manager)
 
         # PEFT state - only used when has_peft
         claimed_peft_pages = 0
@@ -1054,7 +1052,7 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                     if req.is_encoder_init_state and reserved_cross_blocks is None:
                         raise RuntimeError(
                             f"Encoder-init request {req.request_id} requires "
-                            "an enc_dec_kv_cache_manager."
+                            "a cross_kv_cache_manager."
                         )
 
                     if (
@@ -1155,7 +1153,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
     Encoder-decoder support: encoder-init requests are considered in the
     same *scheduler pass* as context/generation requests when
     ``no_schedule_until_state=ENCODER_INIT`` and a
-    ``enc_dec_kv_cache_manager`` is configured. Encoder admission only
+    ``cross_kv_cache_manager`` is configured. Encoder admission only
     schedules encoder compute; self- and cross-pool budgeting happens
     when the request transitions to ``CONTEXT_INIT`` on a later
     decoder-context iteration. Encoder requests are not eligible eviction
@@ -1173,10 +1171,10 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
             scheduler.kv_cache_manager, scheduler.two_step_lookahead
         )
         scheduled_cross_blocks_manager: Optional[MaxUtilizationScheduledBlocksManager] = None
-        if scheduler.enc_dec_kv_cache_manager is not None:
-            scheduler.enc_dec_kv_cache_manager.start_scheduling()
+        if scheduler.cross_kv_cache_manager is not None:
+            scheduler.cross_kv_cache_manager.start_scheduling()
             scheduled_cross_blocks_manager = MaxUtilizationScheduledBlocksManager(
-                scheduler.enc_dec_kv_cache_manager, scheduler.two_step_lookahead
+                scheduler.cross_kv_cache_manager, scheduler.two_step_lookahead
             )
 
         num_scheduled_peft_pages = 0
@@ -1218,7 +1216,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
 
             if req.is_encoder_init_state and scheduled_cross_blocks_manager is None:
                 raise RuntimeError(
-                    f"Encoder-init request {req.request_id} requires an enc_dec_kv_cache_manager."
+                    f"Encoder-init request {req.request_id} requires a cross_kv_cache_manager."
                 )
 
             if skipping_is_relevant and scheduler._beneficial_to_skip(
@@ -1254,8 +1252,8 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 if last_started_idx is not None:
                     paused_req = requests_list[last_started_idx]
                     scheduler.kv_cache_manager.scheduling_remove_sequence(paused_req.py_request_id)
-                    if scheduler.enc_dec_kv_cache_manager is not None:
-                        scheduler.enc_dec_kv_cache_manager.scheduling_remove_sequence(
+                    if scheduler.cross_kv_cache_manager is not None:
+                        scheduler.cross_kv_cache_manager.scheduling_remove_sequence(
                             paused_req.py_request_id
                         )
                     paused_requests.append(paused_req)
@@ -1479,7 +1477,7 @@ class PyCapacityScheduler:
         kv_cache_manager=None,
         peft_cache_manager=None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        enc_dec_kv_cache_manager=None,
+        cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_COMPLETE,
@@ -1492,7 +1490,7 @@ class PyCapacityScheduler:
             kv_cache_manager: KV cache manager (None for MaxRequestsScheduler)
             peft_cache_manager: PEFT/LoRA cache manager (optional)
             scheduler_policy: Scheduling policy
-            enc_dec_kv_cache_manager: Cross-attention KV cache manager for encoder-decoder
+            cross_kv_cache_manager: Cross-attention KV cache manager for encoder-decoder
             two_step_lookahead: Enable two-step lookahead for MAX_UTILIZATION
             no_schedule_until_state: Don't schedule until this state is reached
             no_schedule_after_state: Don't schedule after this state is reached
@@ -1500,7 +1498,7 @@ class PyCapacityScheduler:
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
-        self.enc_dec_kv_cache_manager = enc_dec_kv_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
         self.scheduler_policy = scheduler_policy
         self.two_step_lookahead = two_step_lookahead
         self.no_schedule_until_state = no_schedule_until_state
@@ -1551,8 +1549,8 @@ class PyCapacityScheduler:
         if self.kv_cache_manager.is_variable_window:
             return False
         if (
-            self.enc_dec_kv_cache_manager is not None
-            and self.enc_dec_kv_cache_manager.is_variable_window
+            self.cross_kv_cache_manager is not None
+            and self.cross_kv_cache_manager.is_variable_window
         ):
             return False
         return True
@@ -1572,8 +1570,8 @@ class PyCapacityScheduler:
 
         enable_block_reuse = self.kv_cache_manager.enable_block_reuse
         cross_enable_reuse = (
-            self.enc_dec_kv_cache_manager is not None
-            and self.enc_dec_kv_cache_manager.enable_block_reuse
+            self.cross_kv_cache_manager is not None
+            and self.cross_kv_cache_manager.enable_block_reuse
         )
 
         for req in active_requests:
@@ -1589,7 +1587,7 @@ class PyCapacityScheduler:
                 if cross_enable_reuse:
                     encoder_unique_tokens = req.get_encoder_unique_tokens()
                     if encoder_unique_tokens is not None:
-                        summary = self.enc_dec_kv_cache_manager.analyze_prefix_reuse(
+                        summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
                             encoder_unique_tokens, req
                         )
                         if summary.first_new_block is not None:
@@ -1643,14 +1641,14 @@ class PyCapacityScheduler:
                 ctx_new_block = summary.first_new_block
 
         if (
-            self.enc_dec_kv_cache_manager is not None
-            and self.enc_dec_kv_cache_manager.enable_block_reuse
+            self.cross_kv_cache_manager is not None
+            and self.cross_kv_cache_manager.enable_block_reuse
         ):
             summary = cross_summary_by_req.get(req_id) if cross_summary_by_req is not None else None
             if summary is None:
                 encoder_unique_tokens = req.get_encoder_unique_tokens()
                 if encoder_unique_tokens is not None:
-                    summary = self.enc_dec_kv_cache_manager.analyze_prefix_reuse(
+                    summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
                         encoder_unique_tokens, req
                     )
                     if cross_summary_by_req is not None:
@@ -1751,7 +1749,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         peft_cache_manager,
         scheduler_policy: CapacitySchedulerPolicy,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
-        enc_dec_kv_cache_manager=None,
+        cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
         scheduler_capacity: Optional[int] = None,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
@@ -1767,7 +1765,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
             kv_cache_manager=kv_cache_manager,
             peft_cache_manager=peft_cache_manager,
             scheduler_policy=scheduler_policy,
-            enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+            cross_kv_cache_manager=cross_kv_cache_manager,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=no_schedule_until_state,
         )
