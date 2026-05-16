@@ -529,3 +529,160 @@ def make_swiglu_param_tensors(
     b = torch.full((num_local_experts,), beta, dtype=torch.float32, device=dev)
     c = torch.full((num_local_experts,), limit, dtype=torch.float32, device=dev)
     return a, b, c
+
+
+# ============================================================================
+# Load hook helper: GLM5-style state_dict pre-hook that runs trtllm-gen
+# MXFP4 weight prep at weight-load time instead of in a post-load transform.
+# ============================================================================
+#
+# Motivation: the previous flow allocated raw HF MXFP4 expert weights
+# (gate_up_proj_blocks / _scales / _bias and down_proj_blocks / _scales /
+# _bias) on each experts module, then a post-load transform read those raw
+# tensors, ran ``prepare_mxfp4_weights_for_trtllm_gen``, registered NEW
+# prepared-shape parameters (fc1_weights_mxfp4 etc.), retargeted the FX op,
+# and deleted the raw parameters. Peak memory included both raw + prepared
+# tensors briefly (~150 GB on gpt-oss-120b 128 experts × 36 layers).
+#
+# The hook here folds the prep into ``load_state_dict``. The state-dict
+# pre-hook receives raw HF MXFP4 keys, runs the prep helper, writes the
+# results back under the prepared key names, and pops the raw keys. The
+# module only ever allocates prepared-shape parameters, so peak memory
+# matches the steady-state working set.
+#
+# TP info is read from ``torch.distributed`` at hook fire time (rank 0 / TP=1
+# fallback when uninitialised). This assumes ``moe_tp_size == world_size``
+# (true for gpt-oss configurations on the standalone yaml). For models that
+# decouple MoE-TP from data-TP, plumb a closure that returns the right pair.
+
+
+def _get_default_tp_info() -> Tuple[int, int]:
+    """Return ``(tp_size, tp_rank)`` from ``torch.distributed``.
+
+    Falls back to ``(1, 0)`` when distributed is not initialized.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(), torch.distributed.get_rank()
+    return 1, 0
+
+
+def make_mxfp4_trtllm_gen_load_hook(
+    *,
+    num_layers: int,
+    hidden_size: int,
+    intermediate_size: int,
+    layer_prefix: str = "model.layers",
+    experts_subpath: str = "mlp.experts",
+    tp_info_fn=_get_default_tp_info,
+):
+    """Build a ``load_state_dict`` pre-hook that converts raw HF MXFP4 expert
+    state-dict entries into trtllm-gen-ready prepared tensors.
+
+    Use with ``module._register_load_state_dict_pre_hook(hook)`` on any
+    ancestor of the experts modules; the hook walks ``num_layers`` layers and
+    looks for raw keys at ``{prefix}{layer_prefix}.{i}.{experts_subpath}.``.
+
+    For each layer that has raw MXFP4 keys, the hook:
+
+    1. Calls :func:`prepare_mxfp4_weights_for_trtllm_gen` with the raw
+       tensors and the runtime ``(tp_size, tp_rank)`` returned by
+       ``tp_info_fn``.
+    2. Pops the six raw keys (``gate_up_proj_{blocks,scales,bias}``,
+       ``down_proj_{blocks,scales,bias}``) from the state dict.
+    3. Inserts the six prepared keys (``fc1_weights_mxfp4``,
+       ``fc1_weights_scale_ue8m0``, ``fc1_bias_f32``, ``fc2_weights_mxfp4``,
+       ``fc2_weights_scale_ue8m0``, ``fc2_bias_f32``) at the same experts
+       subpath.
+
+    SwiGLU per-expert parameters (alpha / beta / limit) are NOT injected by
+    the hook — they are constants and should be registered as buffers/parameters
+    by the modeling code at construction time. The hook focuses on weight prep
+    only.
+
+    Args:
+        num_layers: number of decoder layers to scan.
+        hidden_size: model hidden dim (H), used to compute prepared shapes.
+        intermediate_size: per-expert intermediate dim (I); will be sliced
+            per-rank by the prep helper using ``tp_info_fn``.
+        layer_prefix: where layers live, default ``"model.layers"``.
+        experts_subpath: where the experts module sits within each layer,
+            default ``"mlp.experts"``.
+        tp_info_fn: zero-arg callable returning ``(tp_size, tp_rank)``.
+            Default reads from ``torch.distributed``.
+
+    Returns:
+        A hook with signature ``(state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs)`` suitable for
+        ``Module._register_load_state_dict_pre_hook(hook, with_module=False)``.
+    """
+
+    _RAW_SUFFIXES = (
+        "gate_up_proj_blocks",
+        "gate_up_proj_scales",
+        "gate_up_proj_bias",
+        "down_proj_blocks",
+        "down_proj_scales",
+        "down_proj_bias",
+    )
+    # Names match those registered by ``quantize_mxfp4_moe_trtllm_gen`` so
+    # state_dict load resolves to the prepared-shape parameters allocated by
+    # the transform.
+    _PREPARED_SUFFIXES = (
+        "fc1_w_trtllm_gen",
+        "fc1_w_scale_trtllm_gen",
+        "fc1_bias_trtllm_gen",
+        "fc2_w_trtllm_gen",
+        "fc2_w_scale_trtllm_gen",
+        "fc2_bias_trtllm_gen",
+    )
+
+    def hook(state_dict, prefix, *args, **kwargs):
+        tp_size, tp_rank = tp_info_fn()
+        for layer_idx in range(num_layers):
+            base = f"{prefix}{layer_prefix}.{layer_idx}.{experts_subpath}."
+            raw_keys = [base + s for s in _RAW_SUFFIXES]
+
+            # All raw keys must be present together; otherwise this layer is
+            # either non-MXFP4 or already prepped — skip.
+            if not all(k in state_dict for k in raw_keys):
+                continue
+
+            (
+                gu_blocks_key,
+                gu_scales_key,
+                gu_bias_key,
+                dn_blocks_key,
+                dn_scales_key,
+                dn_bias_key,
+            ) = raw_keys
+
+            prepared = prepare_mxfp4_weights_for_trtllm_gen(
+                state_dict[gu_blocks_key],
+                state_dict[gu_scales_key],
+                state_dict[gu_bias_key],
+                state_dict[dn_blocks_key],
+                state_dict[dn_scales_key],
+                state_dict[dn_bias_key],
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+
+            # Drop raw keys so load_state_dict doesn't complain about
+            # "unexpected" entries; the matching prepared keys take their place.
+            for k in raw_keys:
+                state_dict.pop(k, None)
+
+            prepared_tensors = (
+                prepared.fc1_weights_mxfp4,
+                prepared.fc1_weights_scale_ue8m0,
+                prepared.fc1_bias_f32,
+                prepared.fc2_weights_mxfp4,
+                prepared.fc2_weights_scale_ue8m0,
+                prepared.fc2_bias_f32,
+            )
+            for suffix, tensor in zip(_PREPARED_SUFFIXES, prepared_tensors):
+                state_dict[base + suffix] = tensor.contiguous()
+
+    return hook
