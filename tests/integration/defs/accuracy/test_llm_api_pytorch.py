@@ -2738,7 +2738,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          False,
                          True,
                          True,
-                         32,
+                         8,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
         ],
@@ -2756,7 +2756,14 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        # PP4 + MTP + ep_size=1 keeps all 256 experts on every rank, so the
+        # weight footprint per GPU is much higher than the EP-sharded variants.
+        # The default 0.70 KV fraction leaves too little headroom for runtime
+        # NCCL / cuBLAS workspaces on Blackwell, which manifests as mid-run
+        # CUBLAS_STATUS_EXECUTION_FAILED in the router GEMM (NVBug 6018046).
+        kv_fraction = 0.5 if (pp_size > 1 and ep_size == 1
+                              and mtp_nextn > 0) else 0.70
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=kv_fraction)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
