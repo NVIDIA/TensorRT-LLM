@@ -91,7 +91,7 @@ public:
 
     int getWorkspaceAlignment();
 
-    size_t getWorkspaceSize(int max_num_tokens);
+    size_t getWorkspaceSize(int max_num_tokens, int max_num_sequences, int max_attention_window_size);
 
     bool shouldUse(XQAParams const& params);
 
@@ -116,6 +116,8 @@ protected:
 };
 
 constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
+// sizeof(PartialResult) in cpp/kernels/xqa/mla_sm120.cu for HEAD_GRP_SIZE=128, HEAD_ELEMS=576.
+constexpr uint32_t xqaMlaPartialResultSize = 132096;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
