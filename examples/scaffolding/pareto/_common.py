@@ -33,7 +33,6 @@ from typing import Any, Dict, List, Optional
 
 from tensorrt_llm.scaffolding.execution_trace import TraceEvent
 
-
 # ---------------------------------------------------------------------------
 # Trace discovery and summarization
 # ---------------------------------------------------------------------------
@@ -236,14 +235,71 @@ def is_oom_exception(exc: BaseException) -> bool:
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
-    """Write JSON atomically (temp file + replace) and fsync."""
+    """Write JSON via /tmp + bash-cp to bypass Lustre direct-write hangs.
+
+    Repeated experience on this cluster: writing JSON directly to Lustre
+    blocks indefinitely when any OST is flapping. Even ``os.replace`` (the
+    rename step) blocks at the kernel layer if the writer holds open file
+    descriptors that the OST hasn't finalized. ``fsync`` was already
+    avoided in the previous version, but rename alone wasn't enough.
+
+    Strategy here:
+      1. Serialize JSON in-memory and write to ``/tmp`` (always local;
+         tmpfs / local disk; never hangs).
+      2. ``cp`` /tmp -> Lustre ``<path>.tmp`` via subprocess with a hard
+         timeout. If timeout fires, dump the JSON to stdout under
+         ``ATOMIC_WRITE_JSON_BEGIN/END`` markers so slurm.out is the
+         last-resort archival. Then raise.
+      3. ``mv`` ``<path>.tmp`` -> ``<path>`` on Lustre via subprocess
+         with a hard timeout. If mv times out, leave the ``.tmp``
+         in place (a valid recoverable artifact) and warn — do NOT
+         raise, so callers continue.
+    """
+    import subprocess
+    import sys
+    import tempfile
+
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+
+    text = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+    fd, tmp_local = tempfile.mkstemp(suffix=".json", prefix=path.stem + ".", dir="/tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+
+        lustre_tmp = str(path) + ".tmp"
+        try:
+            subprocess.run(["cp", tmp_local, lustre_tmp], timeout=120, check=True)
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            print(
+                f"[atomic_write_json] LUSTRE_CP_FAIL for {path}: {e}. "
+                f"Dumping recoverable JSON to stdout (parse via "
+                f"ATOMIC_WRITE_JSON_BEGIN/END markers).",
+                flush=True,
+                file=sys.stderr,
+            )
+            print(f"---ATOMIC_WRITE_JSON_BEGIN {path}---", flush=True)
+            print(text, flush=True)
+            print(f"---ATOMIC_WRITE_JSON_END {path}---", flush=True)
+            raise RuntimeError(f"Lustre cp failed for {path}; data dumped to stdout") from None
+
+        try:
+            subprocess.run(["mv", lustre_tmp, str(path)], timeout=60, check=True)
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            print(
+                f"[atomic_write_json] LUSTRE_MV_TIMEOUT for {path}: {e}. "
+                f"The .tmp file at {lustre_tmp} holds the data; readers "
+                f"should fall back to *.tmp.",
+                flush=True,
+                file=sys.stderr,
+            )
+    finally:
+        try:
+            os.unlink(tmp_local)
+        except OSError:
+            pass
 
 
 def read_json(path: Path) -> Any:

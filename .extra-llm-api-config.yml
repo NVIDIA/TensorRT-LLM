@@ -1,0 +1,8 @@
+enable_autotuner: false
+enable_iter_perf_stats: true
+return_perf_metrics: true
+perf_metrics_max_requests: 1000
+moe_config:
+    backend: CUTLASS
+scheduler_config:
+    capacity_scheduler_policy: MAX_UTILIZATION

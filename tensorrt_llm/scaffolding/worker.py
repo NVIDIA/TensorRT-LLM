@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 import os
+import time
 import types
 from abc import ABC
 from enum import Enum
@@ -142,6 +143,69 @@ class OpenaiWorker(Worker):
         self.extra_body = copy.deepcopy(
             extra_body) if extra_body is not None else {}
 
+    async def send_kv_cache_truncate_tokens(
+        self,
+        prefixes: List[List[int]],
+        num_tokens_to_keep: List[int],
+        request_timeout_s: float = 60.0,
+    ) -> None:
+        """POST a token-level KV cache truncate batch to trtllm-serve.
+
+        Free radix-tree blocks the worker previously caused the server to
+        commit (by sending the full ``prefix`` on a generation request).
+        ``num_tokens_to_keep[i]`` is the prefix length to retain in the
+        radix tree for ``prefixes[i]``; everything past that point on the
+        same chain has its refcount decremented, and blocks whose
+        refcount drops to zero are returned to the free pool.
+
+        Hits ``/_control/kv_cache/truncate_tokens`` (added by
+        :class:`tensorrt_llm.serve.control_plane.KVCacheControlPlane`) —
+        a sibling of ``/_control/kv_cache/truncate`` that bypasses
+        ``apply_chat_template`` so the radix-tree walk hashes the exact
+        token-id bytes the caller previously sent on a ``/v1/completions``
+        request.
+
+        The endpoint is rooted at the server's host (NOT under ``/v1``),
+        so we strip the ``/v1`` suffix that the OpenAI client's
+        ``base_url`` typically carries.
+
+        Raises :class:`RuntimeError` on a non-200 response.
+        """
+        if len(prefixes) != len(num_tokens_to_keep):
+            raise ValueError(
+                f"prefixes ({len(prefixes)}) and num_tokens_to_keep "
+                f"({len(num_tokens_to_keep)}) length mismatch")
+        if not prefixes:
+            return
+
+        base_url = str(self.async_client.base_url)
+        # The OpenAI client's base_url is typically ``http://host:port/v1``
+        # or ``http://host:port/v1/``; the control plane lives at
+        # ``http://host:port/_control/...``, one level up.
+        for v1_suffix in ("/v1/", "/v1"):
+            if base_url.endswith(v1_suffix):
+                base_url = base_url[:-len(v1_suffix)]
+                break
+        url = base_url.rstrip("/") + "/_control/kv_cache/truncate_tokens"
+
+        headers = {"Content-Type": "application/json"}
+        api_key = getattr(self.async_client, "api_key", None)
+        if api_key is not None:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "model": self.model,
+            "prefixes": [list(p) for p in prefixes],
+            "num_tokens_to_keep": list(num_tokens_to_keep),
+        }
+
+        async with httpx.AsyncClient(timeout=request_timeout_s) as http:
+            response = await http.post(url, json=payload, headers=headers)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"truncate_tokens failed: HTTP {response.status_code} "
+                    f"body={response.text!r}")
+
     def convert_task_params(self, task: GenerationTask | ChatTask):
         params = {
             "model": self.model,
@@ -225,26 +289,90 @@ class OpenaiWorker(Worker):
         thinking = cls._get_response_field(thinking_blocks[0], "thinking")
         return thinking if isinstance(thinking, str) else None
 
-    def fill_generation_task_with_response(self, task: GenerationTask,
-                                           response: openai.Completion):
-        task.output_str = response.choices[0].text
-        task.output_tokens = response.choices[0].token_ids
-        task.finish_reason = response.choices[0].finish_reason
-        task.logprobs = response.choices[0].logprobs
-
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
+        """Stream one completion and record per-request timing on *task*.
+
+        Uses ``stream=True`` + ``stream_options={"include_usage": True}`` so we
+        can measure TTFT (wall-time from request start to the first chunk that
+        carries a token) and the full per-request ``latency`` (to the final
+        chunk), and pick up ``usage.completion_tokens`` from the trailing
+        usage-only chunk. These are the same per-request quantities
+        SemiAnalysis's ``benchmark_serving.py`` records for the
+        InferenceMAX ``intvty`` headline, letting the trace-replay Pareto
+        pipeline emit ``1000 / median_TPOT`` per LLM call instead of a
+        per-session proxy. See ``intvty_alignment_handoff.md`` §7 (Phase A).
+
+        The trtllm-serve ``/v1/completions`` backend happens to not emit
+        ``token_ids`` when ``detokenize`` is on (the default), so we do not
+        try to reconstruct a token list here; callers that care about the
+        count use ``task.usage_completion_tokens`` (authoritative, from the
+        server's ``usage`` chunk) or the known ``max_tokens`` budget.
+        """
         params = self.convert_task_params(task)
         task.llm_request_params = self._request_params_for_trace(params)
+        params["stream"] = True
+        params["stream_options"] = {"include_usage": True}
 
-        # Make the API call
+        text_parts: List[str] = []
+        token_ids_acc: List[int] = []
+        logprobs_acc: List = []
+        finish_reason: Optional[str] = None
+        usage_completion_tokens: Optional[int] = None
+        usage_prompt_tokens: Optional[int] = None
+        ttft_s: Optional[float] = None
+        request_id: Optional[str] = None
+
+        t_start = time.perf_counter()
         try:
-            response = await self.async_client.completions.create(**params)
-            self.fill_generation_task_with_response(task, response)
+            stream = await self.async_client.completions.create(**params)
+            async for chunk in stream:
+                now = time.perf_counter()
+                # Every chunk carries the server-assigned request id. Capture
+                # it once (the first non-None value) so callers can later
+                # correlate per-request perf metrics drained from
+                # ``/perf_metrics`` with the GenerationTask that issued them.
+                if request_id is None:
+                    cid = getattr(chunk, "id", None)
+                    if cid is not None:
+                        request_id = cid
+                for choice in (chunk.choices or []):
+                    delta_text = getattr(choice, "text", "") or ""
+                    delta_token_ids = getattr(choice, "token_ids", None)
+                    if ttft_s is None and (delta_text or delta_token_ids):
+                        ttft_s = now - t_start
+                    if delta_text:
+                        text_parts.append(delta_text)
+                    if delta_token_ids:
+                        token_ids_acc.extend(delta_token_ids)
+                    delta_logprobs = getattr(choice, "logprobs", None)
+                    if delta_logprobs is not None:
+                        logprobs_acc.append(delta_logprobs)
+                    fr = getattr(choice, "finish_reason", None)
+                    if fr is not None:
+                        finish_reason = fr
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    ct = getattr(usage, "completion_tokens", None)
+                    pt = getattr(usage, "prompt_tokens", None)
+                    if ct is not None:
+                        usage_completion_tokens = int(ct)
+                    if pt is not None:
+                        usage_prompt_tokens = int(pt)
+            latency_s = time.perf_counter() - t_start
+
+            task.output_str = "".join(text_parts)
+            task.output_tokens = token_ids_acc if token_ids_acc else None
+            task.finish_reason = finish_reason
+            task.logprobs = logprobs_acc if logprobs_acc else None
+            task.ttft_s = ttft_s
+            task.latency_s = latency_s
+            task.usage_completion_tokens = usage_completion_tokens
+            task.usage_prompt_tokens = usage_prompt_tokens
+            task.request_id = request_id
 
             return TaskStatus.SUCCESS
 
         except Exception as e:
-            # Handle errors
             print('Openai client get exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
 

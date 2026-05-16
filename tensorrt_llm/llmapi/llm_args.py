@@ -2678,6 +2678,38 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
 
+    # Pure python fields: server-wide defaults that LLM.generate_async applies to
+    # every request whose kv_cache_retention_config is None. Used by the priority-
+    # demotion experiment to give active-session blocks a higher retention priority
+    # than the runtime default (kDefaultRetentionPriority = 35), so that session-end
+    # demotion to 35 creates a two-tier free-queue eviction order.
+    default_retention_priority: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description=
+        "If set, every request whose `kv_cache_retention_config` is None gets a "
+        "single TokenRangeRetentionConfig(priority=default_retention_priority) "
+        "covering its whole prompt. Overridden by `retention_priority_gradient_*` "
+        "when both are set. Valid range: 0..100 (see KvCacheRetentionConfig).")
+    retention_priority_gradient_start: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description=
+        "First-block retention priority for the server-wide gradient. Must be set "
+        "together with `retention_priority_gradient_end`. When set, every request "
+        "whose `kv_cache_retention_config` is None gets a per-block gradient from "
+        "`start` (first block) to `end` (last block), linearly interpolated. "
+        "Overrides `default_retention_priority`.")
+    retention_priority_gradient_end: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description=
+        "Last-block retention priority for the server-wide gradient. See "
+        "`retention_priority_gradient_start`.")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -2755,6 +2787,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
+
+    @model_validator(mode='after')
+    def validate_retention_priority_overrides(self) -> 'KvCacheConfig':
+        start = self.retention_priority_gradient_start
+        end = self.retention_priority_gradient_end
+        if (start is None) != (end is None):
+            raise ValueError(
+                "kv_cache_config.retention_priority_gradient_start and "
+                "retention_priority_gradient_end must either both be set or both be None"
+            )
+        return self
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -3891,6 +3934,59 @@ class TorchLlmArgs(BaseLlmArgs):
                                  description="Print iteration logs.",
                                  status="beta")
 
+    kv_monitor_log_period_s: NonNegativeFloat = Field(
+        default=5.0,
+        description=(
+            "Period in seconds at which the pytorch executor emits a "
+            "one-line KV cache + inflight batching summary to the server "
+            "log (throttled from the per-iter stats hook, so it does not "
+            "scale with iter rate). The line carries used/max KV blocks, "
+            "free headroom percent, the current numPausedRequests count "
+            "(non-zero = MAX_UTILIZATION scheduler is already evicting "
+            "in-flight requests due to KV contention), queued/active "
+            "counts, and the running cache hit rate. Set to 0 to disable."),
+        status="prototype")
+
+    iter_state_sample_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "When set, rank 0 of the pytorch executor appends one JSONL "
+            "record per sampled iteration (every "
+            "iter_state_sample_every_iters-th iter) to an in-memory "
+            "buffer, flushed to this file every "
+            "iter_state_drain_period_s seconds. Each record carries "
+            "{iter, t_unix, t_mono, active, max_active, queued, ctx, "
+            "gen, paused, ctx_tokens, kv_used_blk, kv_max_blk, "
+            "tokens_per_blk, iter_latency_ms}. Default None = disabled "
+            "(no overhead, no file is opened). Use for post-hoc "
+            "batch-size-distribution / time-series analysis without "
+            "grepping human-oriented log lines. See ``recipe.md`` §3.2 "
+            "for the canonical methodology and downstream interpretation "
+            "(``(active - paused) * dp_size`` as the global batch proxy)."),
+        status="prototype")
+
+    iter_state_sample_every_iters: PositiveInt = Field(
+        default=100,
+        description=(
+            "Stride between sampled iterations when "
+            "iter_state_sample_path is set. At typical pytorch-executor "
+            "iter rates of 50-200 iter/s, every=100 gives a 0.5-2 Hz "
+            "sample stream (450-1800 records over a 15-min run), "
+            "enough for both distribution and time-series plots while "
+            "adding only a list.append on the hot path. See "
+            "``recipe.md`` §3.2."),
+        status="prototype")
+
+    iter_state_drain_period_s: NonNegativeFloat = Field(
+        default=5.0,
+        description=(
+            "Wall-clock boundary (seconds) at which the in-memory sample "
+            "buffer is flushed to iter_state_sample_path. Matches "
+            "kv_monitor_log_period_s so the two trace-emitters fire on "
+            "similar cadences. 0 = flush on every sample (not "
+            "recommended; defeats buffering). See ``recipe.md`` §3.2."),
+        status="prototype")
+
     batch_wait_timeout_ms: NonNegativeFloat = Field(
         default=0,
         description=
@@ -3909,6 +4005,41 @@ class TorchLlmArgs(BaseLlmArgs):
         le=1,
         description=
         "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays.",
+        status="prototype")
+
+    decode_defer_threshold: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Defer the decode batch when fewer than "
+            "decode_defer_threshold * max_batch_size generation requests "
+            "would be scheduled this iteration AND at least one prefill "
+            "request is ready to fill the slot, allowing the decode "
+            "batch to accumulate over the next few iterations before "
+            "execution. Mirrors the existing prefill-deferral knob "
+            "(batch_wait_*) but acts on the inverse phase: prefill is "
+            "executed first, decode waits. Targets agent / tool-using "
+            "workloads where tool-call sleeps leave the in-flight "
+            "decode batch persistently below the concurrency cap, "
+            "starving expert-parallel MoE all-to-all bandwidth (small "
+            "decode batch -> few tokens per all-to-all -> fixed-cost "
+            "communication dominates). 0 = disabled (default; identical "
+            "to current behavior). Typical value 0.5 = defer when "
+            "decode batch would be < half of max_batch_size. See "
+            "``recipe.md`` (workspace root) section 12."),
+        status="prototype")
+
+    max_decode_defer_iters: NonNegativeInt = Field(
+        default=10,
+        description=(
+            "Anti-starvation cap for decode_defer_threshold: after this "
+            "many consecutive iterations of deferring decode the "
+            "scheduler forces decode regardless of batch size. Bounds "
+            "the worst-case TPOT regression to "
+            "max_decode_defer_iters * iter_latency. Ignored when "
+            "decode_defer_threshold == 0. Default 10 (~50-200 ms at "
+            "typical executor iter rates of 50-200 iter/s)."),
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(

@@ -97,6 +97,33 @@ class GenerationTask(Task):
     logprobs: Optional[TokenLogprobs] = None
     customized_result_fields: Dict[str, Any] = field(default_factory=dict)
 
+    # Per-request timing + usage captured by streaming OpenAI workers.
+    # ``ttft_s`` is the wall-time from request submission to the first
+    # server chunk carrying a token (prefill + first decode token + in-flight
+    # scheduler wait); ``latency_s`` is wall-time to the final chunk (full
+    # generation). ``usage_completion_tokens`` / ``usage_prompt_tokens`` come
+    # from the server's ``usage`` chunk (``stream_options.include_usage``)
+    # and are the authoritative per-request token counts — the
+    # ``/v1/completions`` endpoint does not stream ``token_ids`` when
+    # ``detokenize`` is on, so ``len(output_tokens)`` alone is unreliable.
+    # TPOT (tokens-per-output-token) is derived downstream as
+    # ``(latency_s - ttft_s) / (usage_completion_tokens - 1)``, matching
+    # SemiAnalysis's InferenceMAX ``intvty`` definition.
+    ttft_s: Optional[float] = None
+    latency_s: Optional[float] = None
+    usage_completion_tokens: Optional[int] = None
+    usage_prompt_tokens: Optional[int] = None
+
+    # Server-side request id captured from the OpenAI client's streaming
+    # chunks (every chunk's ``chunk.id`` field).  Trace-replay clients use
+    # this to look up the matching record in trtllm-serve's
+    # ``/perf_metrics`` drain and attach per-request KV-cache statistics
+    # (``num_reused_blocks`` / ``num_missed_blocks`` / ``free_num_blocks``)
+    # to the per-LLM-call row in the step JSON.  ``None`` until the worker
+    # observes the first chunk (or when not running against an
+    # OpenAI-compatible server, e.g. the in-process executor path).
+    request_id: Optional[str] = None
+
     @staticmethod
     def create_from_prompt(prompt: str) -> "GenerationTask":
         task = GenerationTask()

@@ -417,6 +417,31 @@ class CompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
+    attention_dp_rank: Optional[int] = Field(
+        default=None,
+        description=(
+            "When attention DP is enabled, pin this request to the given DP "
+            "rank. The ADP router in the pytorch executor will place the "
+            "request on the specified rank whenever that rank still has "
+            "capacity for one more active request; if not, and "
+            "``attention_dp_relax`` is true (the default), the router falls "
+            "back to its load-balanced placement path, and if "
+            "``attention_dp_relax`` is false, the request is held in the "
+            "waiting queue until the target rank frees a slot. This lets a "
+            "client pre-warm specific ranks (e.g. by pinning a short "
+            "system-prompt prefill to each rank in turn) and have the server "
+            "honour the placement even when the ADP group is otherwise empty."),
+    )
+    attention_dp_relax: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Companion to ``attention_dp_rank``. True (the default when "
+            "``attention_dp_rank`` is set) = if the target rank is full, fall "
+            "back to load-balanced placement; False = strictly pin, let the "
+            "request wait for the target rank. Has no effect when "
+            "``attention_dp_rank`` is not set."),
+    )
+
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
@@ -798,6 +823,31 @@ class ChatCompletionRequest(OpenAIBaseModel):
     agent_hierarchy: Optional[AgentHierarchy] = Field(
         default=None, description="Agent hierarchy ")
 
+    attention_dp_rank: Optional[int] = Field(
+        default=None,
+        description=(
+            "When attention DP is enabled, pin this request to the given DP "
+            "rank. The ADP router in the pytorch executor will place the "
+            "request on the specified rank whenever that rank still has "
+            "capacity for one more active request; if not, and "
+            "``attention_dp_relax`` is true (the default), the router falls "
+            "back to its load-balanced placement path, and if "
+            "``attention_dp_relax`` is false, the request is held in the "
+            "waiting queue until the target rank frees a slot. This lets a "
+            "client pre-warm specific ranks (e.g. by pinning a short "
+            "system-prompt prefill to each rank in turn) and have the server "
+            "honour the placement even when the ADP group is otherwise empty."),
+    )
+    attention_dp_relax: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Companion to ``attention_dp_rank``. True (the default when "
+            "``attention_dp_rank`` is set) = if the target rank is full, fall "
+            "back to load-balanced placement; False = strictly pin, let the "
+            "request wait for the target rank. Has no effect when "
+            "``attention_dp_rank`` is not set."),
+    )
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self,
@@ -919,6 +969,33 @@ class KVCacheTruncateRequest(OpenAIBaseModel):
     chat_template_kwargs: Optional[dict] = None
     reasoning_effort: Optional[str] = None
     tool_choice: Optional[str] = None
+
+
+class KVCacheTruncateTokensRequest(OpenAIBaseModel):
+    """Token-level analog of :class:`KVCacheTruncateRequest`.
+
+    Bypasses the chat-template tokenization path: ``prefixes`` is a batch
+    of full token-id sequences and ``num_tokens_to_keep`` is the parallel
+    list of prefix lengths to retain in the radix tree.  Posted to the
+    ``/_control/kv_cache/truncate_tokens`` endpoint by callers (e.g. trace
+    replay) that already operate on raw token ids and do not want
+    ``apply_chat_template`` to re-tokenize anything.
+
+    Each ``prefixes[i]`` produces one
+    :class:`tensorrt_llm.executor.request.TruncateKVCacheRequest` sent on
+    the executor's KV cache control queue, with the request's
+    ``messages = prefixes[i]`` and the ``num_tokens_to_keep[i]`` consumed
+    via ``messages_to_retain = prefixes[i][:num_tokens_to_keep[i]]``
+    (only the length is used downstream by
+    ``KVCacheManager.truncate_blocks``).  Splitting one batched HTTP
+    request into N control-queue requests keeps the radix-tree mutation
+    atomic per (prefix, keep) pair while the network hop pays one TLS /
+    request handshake for the whole drop event.
+    """
+
+    model: Optional[str] = None
+    prefixes: List[List[int]]
+    num_tokens_to_keep: List[int]
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,

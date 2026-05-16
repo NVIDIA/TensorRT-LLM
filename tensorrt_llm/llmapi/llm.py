@@ -507,6 +507,11 @@ class BaseLLM:
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
+
+        if kv_cache_retention_config is None:
+            kv_cache_retention_config = self._build_default_retention_config(
+                len(prompt_token_ids))
+
         result = self._executor.generate_async(
             prompt_token_ids,
             query_token_ids=query_token_ids,
@@ -531,6 +536,67 @@ class BaseLLM:
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
+
+    def _build_default_retention_config(
+            self, prompt_len: int) -> Optional[KvCacheRetentionConfig]:
+        """Construct a server-wide default ``KvCacheRetentionConfig``.
+
+        Called by :meth:`generate_async` only when the caller did not supply a
+        ``kv_cache_retention_config`` on the request. Two modes, precedence
+        high → low:
+
+          1. ``kv_cache_config.retention_priority_gradient_start / _end`` set:
+             emit one ``TokenRangeRetentionConfig`` per block, with priority
+             linearly interpolated from ``start`` (block 0) to ``end``
+             (last block). The block size comes from
+             ``kv_cache_config.tokens_per_block``.
+          2. ``kv_cache_config.default_retention_priority`` set: emit a single
+             full-prompt ``TokenRangeRetentionConfig`` at that priority.
+
+        Returns ``None`` when neither is set, preserving the
+        ``kDefaultRetentionPriority`` (=35) path in the C++ block manager.
+        """
+        kv_cfg = getattr(self.args, "kv_cache_config", None)
+        if kv_cfg is None:
+            return None
+        start = getattr(kv_cfg, "retention_priority_gradient_start", None)
+        end = getattr(kv_cfg, "retention_priority_gradient_end", None)
+        default_priority = getattr(kv_cfg, "default_retention_priority", None)
+        if start is None and end is None and default_priority is None:
+            return None
+        if prompt_len <= 0:
+            return None
+        if start is not None and end is not None:
+            tokens_per_block = max(int(getattr(kv_cfg, "tokens_per_block", 32)),
+                                   1)
+            num_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+            ranges: List[KvCacheRetentionConfig.TokenRangeRetentionConfig] = []
+            denom = max(num_blocks - 1, 1)
+            for bi in range(num_blocks):
+                priority = start + (end - start) * bi // denom
+                token_start = bi * tokens_per_block
+                token_end = ((bi + 1) *
+                             tokens_per_block) if bi < num_blocks - 1 else None
+                ranges.append(
+                    KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                        token_start=token_start,
+                        token_end=token_end,
+                        priority=int(priority),
+                    ))
+            return KvCacheRetentionConfig(
+                token_range_retention_configs=ranges,
+                decode_retention_priority=int(end),
+            )
+        return KvCacheRetentionConfig(
+            token_range_retention_configs=[
+                KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                    token_start=0,
+                    token_end=None,
+                    priority=int(default_priority),
+                )
+            ],
+            decode_retention_priority=int(default_priority),
+        )
 
     def _preprocess(
         self,

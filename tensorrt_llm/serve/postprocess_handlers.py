@@ -469,6 +469,17 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         include_usage = False
         include_continuous_usage = False
 
+    # Use the executor's request id as the stream chunk ``id`` so the
+    # client can correlate ``chunk.id`` with the ``request_id`` field
+    # trtllm-serve emits on /perf_metrics records — matches the behaviour
+    # of the chat-completion path (``ChatCompletionResponse(id=str(promise.request_id))``)
+    # and the chat-harmony streaming path (``request_id=str(rsp.id)``).
+    # Without this, the streaming Completions response defaults the id
+    # to a fresh ``cmpl-<uuid>`` per the schema's ``default_factory``,
+    # which has no relationship to the executor's int request id and
+    # makes /perf_metrics joins return zero matches.
+    completion_id = f"cmpl-{rsp.id}"
+
     for output in rsp.outputs:
         delta_text = output.text_diff
         if args.echo and args.first_iteration:
@@ -489,7 +500,9 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             choice.logprobs = create_completion_logprobs(
                 token_ids, args.tokenizer, logprobs, output._last_text_len)
 
-        chunk = CompletionStreamResponse(model=args.model, choices=[choice])
+        chunk = CompletionStreamResponse(id=completion_id,
+                                         model=args.model,
+                                         choices=[choice])
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
@@ -509,9 +522,12 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                 cached_tokens=rsp.cached_tokens),
         )
 
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
-                                                         model=args.model,
-                                                         usage=final_usage)
+        final_usage_chunk = CompletionStreamResponse(
+            id=completion_id,
+            choices=[],
+            model=args.model,
+            usage=final_usage,
+        )
         final_usage_data = final_usage_chunk.model_dump_json()
         res.append(f"data: {final_usage_data}\n\n")
     args.first_iteration = False

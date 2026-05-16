@@ -300,9 +300,15 @@ class DefaultADPRouter(ADPRouter):
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
 
+        # ``attention_dp_relax`` is ``Optional[bool]``; both "the caller did
+        # not attach a SchedulingParams" and "the caller attached one but
+        # left relax unset" mean the same thing semantically: route this
+        # request through the load-balanced bucket. Collapsing both to
+        # ``True`` keeps the sort key monomorphic so Python's stable sort
+        # never has to compare ``None < True``.
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            if scheduling_params is None:
+            if scheduling_params is None or scheduling_params.attention_dp_relax is None:
                 return True
             val = scheduling_params.attention_dp_relax
             return True if val is None else val
@@ -578,9 +584,15 @@ class KVCacheAwareADPRouter(ADPRouter):
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [float(s.num_active_tokens) for s in all_rank_states]
 
+        # ``attention_dp_relax`` is ``Optional[bool]``; both "the caller did
+        # not attach a SchedulingParams" and "the caller attached one but
+        # left relax unset" mean the same thing semantically: route this
+        # request through the load-balanced bucket. Collapsing both to
+        # ``True`` keeps the sort key monomorphic so Python's stable sort
+        # never has to compare ``None < True``.
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-            if scheduling_params is None:
+            if scheduling_params is None or scheduling_params.attention_dp_relax is None:
                 return True
             val = scheduling_params.attention_dp_relax
             return True if val is None else val

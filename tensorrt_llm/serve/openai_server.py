@@ -929,6 +929,24 @@ class OpenAIServer(_VideoRoutesMixin):
                 timing_metrics.last_token_time.total_seconds() +
                 self.disagg_server_steady_clock_offset,
             }
+            # ``KvCacheMetrics`` (a pybind11 binding from
+            # ``tensorrt_llm.bindings.executor``) only guarantees
+            # the per-request hit-accounting fields
+            # (``num_total_allocated_blocks`` /
+            # ``num_new_allocated_blocks`` / ``num_reused_blocks`` /
+            # ``num_missed_blocks``).  The pool-state snapshot fields
+            # (``max_num_blocks`` / ``used_num_blocks`` /
+            # ``free_num_blocks``) were added to this serializer ahead
+            # of the binding and may be absent on older builds; access
+            # them via :func:`getattr` so the endpoint degrades to a
+            # ``None`` snapshot instead of returning HTTP 500.
+            max_num_blocks = getattr(kv_cache_metrics, "max_num_blocks", None)
+            used_num_blocks = getattr(kv_cache_metrics, "used_num_blocks", None)
+            free_num_blocks = getattr(kv_cache_metrics, "free_num_blocks", None)
+            utilization = None
+            if (max_num_blocks is not None and used_num_blocks is not None
+                    and max_num_blocks > 0):
+                utilization = used_num_blocks / max_num_blocks
             metrics_json["kv_cache_metrics"] = {
                 "num_total_allocated_blocks":
                 kv_cache_metrics.num_total_allocated_blocks,
@@ -936,6 +954,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 kv_cache_metrics.num_new_allocated_blocks,
                 "num_reused_blocks": kv_cache_metrics.num_reused_blocks,
                 "num_missed_blocks": kv_cache_metrics.num_missed_blocks,
+                "max_num_blocks": max_num_blocks,
+                "used_num_blocks": used_num_blocks,
+                "free_num_blocks": free_num_blocks,
+                "utilization": utilization,
             }
             if timing_metrics.kv_cache_size > 0:
                 metrics_json["timing_metrics"].update({
@@ -1215,7 +1237,10 @@ class OpenAIServer(_VideoRoutesMixin):
                              tracing.extract_trace_headers(raw_request.headers))
 
             scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy)
+                agent_hierarchy=request.agent_hierarchy,
+                attention_dp_rank=request.attention_dp_rank,
+                attention_dp_relax=request.attention_dp_relax,
+            )
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -1514,6 +1539,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 else:
                     tokens_prompt = prompt
 
+                scheduling_params = SchedulingParams(
+                    attention_dp_rank=request.attention_dp_rank,
+                    attention_dp_relax=request.attention_dp_relax,
+                )
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -1521,7 +1550,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     streaming=request.stream,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
-                    trace_headers=trace_headers)
+                    trace_headers=trace_headers,
+                    scheduling_params=scheduling_params)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -1628,7 +1658,10 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
             scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy)
+                agent_hierarchy=request.agent_hierarchy,
+                attention_dp_rank=request.attention_dp_rank,
+                attention_dp_relax=request.attention_dp_relax,
+            )
 
             # Generate
             promise = self.generator.generate_async(

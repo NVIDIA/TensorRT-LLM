@@ -30,7 +30,7 @@ from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
-from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
+from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest, KVCacheTruncateTokensRequest
 
 
 class ResourceGovernor:
@@ -67,6 +67,19 @@ class ResourceGovernor:
         else:
             handler = self._truncate_kv_cache
         app.add_api_route("/_resource_governor/truncate", handler, methods=["POST"])
+        # Alias under the new ``/_control/kv_cache/*`` namespace; kept
+        # alongside the legacy ``/_resource_governor/*`` route until all
+        # external callers are migrated.
+        app.add_api_route("/_control/kv_cache/truncate", handler, methods=["POST"])
+        # Token-level variant for callers that already have raw token ids
+        # (trace replay, synthetic-prompt benchmarks).  Skips the chat
+        # template path so the radix-tree walk targets the exact byte
+        # sequence the caller previously sent on a generation request.
+        app.add_api_route(
+            "/_control/kv_cache/truncate_tokens",
+            self._truncate_kv_cache_tokens,
+            methods=["POST"],
+        )
 
     def _create_error_response(self, message: str, status_code: int) -> JSONResponse:
         return JSONResponse(content={"error": message}, status_code=status_code)
@@ -189,6 +202,53 @@ class ResourceGovernor:
                 )
             )
             return err or Response(status_code=200)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self._create_error_response(str(e), HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    async def _truncate_kv_cache_tokens(self, request: KVCacheTruncateTokensRequest) -> Response:
+        """Handle :class:`KVCacheTruncateTokensRequest` — token-level truncate variant.
+
+        Used by trace replay.
+
+        Validates the parallel arrays, then posts one
+        :class:`TruncateKVCacheRequest` per ``(prefix, keep)`` pair onto
+        the executor's KV cache control queue.  Does not touch the chat
+        template, the tokenizer, or the harmony adapter — the radix-tree
+        lookup hashes the prefix bytes the caller already sent on a prior
+        generation request.
+        """
+        try:
+            prefixes = request.prefixes or []
+            keeps = request.num_tokens_to_keep or []
+            if len(prefixes) != len(keeps):
+                return self._create_error_response(
+                    f"len(prefixes)={len(prefixes)} != len(num_tokens_to_keep)={len(keeps)}",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            for i, (prefix, keep) in enumerate(zip(prefixes, keeps)):
+                if keep < 0 or keep > len(prefix):
+                    return self._create_error_response(
+                        f"prefixes[{i}]: num_tokens_to_keep={keep} out of range [0, {len(prefix)}]",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+
+            for prefix, keep in zip(prefixes, keeps):
+                # Only ``len(messages_to_retain)`` is read by
+                # ``KVCacheManager.truncate_blocks`` (it uses the count as
+                # the tokens-to-keep cap on the prefix walk), so the
+                # contents of ``messages_to_retain`` are immaterial here.
+                # Slicing ``prefix[:keep]`` keeps the values consistent
+                # for any future consumer that decides to inspect them.
+                err = self._put_or_unavailable(
+                    TruncateKVCacheRequest(
+                        messages_to_retain=list(prefix[:keep]),
+                        messages=list(prefix),
+                    )
+                )
+                if err is not None:
+                    return err
+            return Response(status_code=200)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self._create_error_response(str(e), HTTPStatus.INTERNAL_SERVER_ERROR)

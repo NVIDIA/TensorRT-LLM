@@ -30,7 +30,7 @@ endif()
 set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
 execute_process(
   WORKING_DIRECTORY ${cutlass_source_dir}/python/
-  COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user
+  COMMAND ${Python3_EXECUTABLE} setup_library.py develop
   RESULT_VARIABLE _CUTLASS_LIBRARY_SUCCESS)
 
 if(NOT _CUTLASS_LIBRARY_SUCCESS EQUAL 0)
