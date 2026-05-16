@@ -21,9 +21,36 @@ from unittest import mock
 import pytest
 import torch
 from datasets import load_dataset
+from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
 
+from tensorrt_llm import LLM
+from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
+    is_swizzling_supported
 
+# isort: off
+from tensorrt_llm.llmapi import (
+    AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
+    DFlashDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
+    MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
+    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
+    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
+    TorchCompileConfig)
+# isort: on
+from tensorrt_llm.quantization import QuantAlgo
+
+from ..conftest import (get_device_count, get_device_memory, llm_models_root,
+                        parametrize_with_ids, skip_no_hopper,
+                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
+                        skip_pre_hopper, skip_ray)
+from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
+                            JsonModeEval, LlmapiAccuracyTestHarness,
+                            LongBenchV1, LongBenchV2)
+
+
+# Keep helper definitions below imports so new imports do not need E402
+# suppressions in this legacy test file.
 def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
     """
     Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
@@ -46,31 +73,6 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
 
     mocker.patch.object(MpiPoolSession, '_start_mpi_pool',
                         patched_start_mpi_pool)
-
-
-from defs.conftest import get_sm_version, is_sm_100f
-
-from tensorrt_llm import LLM
-from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
-
-# isort: off
-from tensorrt_llm.llmapi import (
-    AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
-    DFlashDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
-    MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
-    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
-    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
-    TorchCompileConfig)
-# isort: on
-from tensorrt_llm.quantization import QuantAlgo
-
-from ..conftest import (get_device_count, get_device_memory, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper,
-                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2)
 
 
 def _get_default_torch_compile_config(torch_compile):
@@ -5390,12 +5392,6 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-def is_h20_gpu() -> bool:
-    """Return True if the current GPU is an H20."""
-    name = torch.cuda.get_device_name()
-    return "H20" in name and "H200" not in name
-
-
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
@@ -5422,7 +5418,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
                      overlap_scheduler, mocker, v2_kv_cache):
-        if (moe_backend == "TRITON" and is_h20_gpu()):
+        if (moe_backend == "TRITON" and not is_swizzling_supported()):
             pytest.skip("nvbugs/5446119")
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
@@ -5458,7 +5454,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # layer_idx to propagate into MoE so MoE.forward dispatches through
         # the torch.library.custom_op path instead of tracing the Triton
         # kernel call (which Dynamo cannot lift).
-        if is_h20_gpu():
+        if not is_swizzling_supported():
             pytest.skip("nvbugs/5446119")
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
@@ -5552,7 +5548,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_4gpus(self, v2_kv_cache, kv_cache_reuse, kv_cache_dtype,
                       moe_backend, tp_size, pp_size, ep_size, attention_dp,
                       cuda_graph, overlap_scheduler, mocker):
-        if (moe_backend == "TRITON" and is_h20_gpu()):
+        if (moe_backend == "TRITON" and not is_swizzling_supported()):
             pytest.skip("nvbugs/5446119")
 
         MAX_OUTPUT_LEN = 128179

@@ -53,6 +53,9 @@ from tensorrt_llm.visual_gen import VisualGen
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
 
+# Bound gRPC messages while leaving room for multimodal image payloads.
+_GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
+
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
@@ -417,8 +420,10 @@ def launch_grpc_server(host: str,
         # Create gRPC server
         server = grpc.aio.server(
             options=[
-                ("grpc.max_send_message_length", -1),  # Unlimited
-                ("grpc.max_receive_message_length", -1),  # Unlimited
+                ("grpc.max_send_message_length",
+                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
+                ("grpc.max_receive_message_length",
+                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
                 ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
                 ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
                 ("grpc.keepalive_permit_without_calls", True),

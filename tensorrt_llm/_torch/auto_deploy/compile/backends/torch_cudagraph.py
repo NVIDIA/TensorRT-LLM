@@ -47,6 +47,7 @@ except ModuleNotFoundError:
 
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
+from ...utils.multi_stream_utils import disable_multi_stream
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
 from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrapper, OutputInfo
 from ..piecewise_utils import (
@@ -470,14 +471,6 @@ class PiecewiseCapturedGraph(nn.Module):
             self.split_info.static_submod_indices + self.split_info.dynamic_submod_indices
         )
         current_static_runner: Optional[ADPiecewiseRunner] = None
-        # Fallback runner: the first available static runner.  When
-        # multi-stream transforms reclassify the initial static partition(s)
-        # as dynamic (e.g. record_event_passthrough from multi_stream_mla_attn)
-        # AND the static partitions between metadata-prep and attention have
-        # no CUDA ops (skipped), there is no *preceding* static runner for the
-        # first attention op.  In that case we fall back to the nearest
-        # *following* static runner — any runner in the shared graph pool can
-        # host the pre-allocated output buffer.
         fallback_runner: Optional[ADPiecewiseRunner] = None
         if runner_by_idx:
             fallback_runner = runner_by_idx[min(runner_by_idx)]
@@ -682,38 +675,45 @@ class PiecewiseCapturedGraph(nn.Module):
         self._allocate_static_input_buffers(get_args_kwargs)
 
         num_tokens_list = sorted(self.piecewise_num_tokens, reverse=True)
-        for nt in num_tokens_list:
-            ad_logger.info(f"PiecewiseCapturedGraph: warming up for num_tokens={nt}")
-            args, kwargs = get_args_kwargs(nt)
-            self._copy_to_static_buffers(kwargs)
+        # Multi-stream passthroughs (begin_aux/end_aux/wait_aux/record_event)
+        # must be no-ops on the piecewise path: host-side caller-stream
+        # synchronization between captured segments breaks replay-time
+        # address-stability invariants.  Decode batches still overlap via
+        # the monolithic CG path, where ``disable_multi_stream`` is not in
+        # scope.
+        with disable_multi_stream():
+            for nt in num_tokens_list:
+                ad_logger.info(f"PiecewiseCapturedGraph: warming up for num_tokens={nt}")
+                args, kwargs = get_args_kwargs(nt)
+                self._copy_to_static_buffers(kwargs)
 
-            ADPiecewiseRunner.set_current_num_tokens(nt)
+                ADPiecewiseRunner.set_current_num_tokens(nt)
 
-            with CudaGraphWarmUpPhase():
-                ADPiecewiseRunner.set_current_phase("warmup")
-                for _ in range(warmup_iters - 1):
-                    self.split_gm(*args, **kwargs)
+                with CudaGraphWarmUpPhase():
+                    ADPiecewiseRunner.set_current_phase("warmup")
+                    for _ in range(warmup_iters - 1):
+                        self.split_gm(*args, **kwargs)
 
-                # Last warmup iteration: discover dynamic output shapes
-                if self._wrapped_dynamic_indices:
-                    discovered = self._discover_dynamic_output_shapes(args, kwargs)
-                    self._set_dynamic_out_info_on_runners(discovered)
-                else:
-                    self.split_gm(*args, **kwargs)
+                    # Last warmup iteration: discover dynamic output shapes
+                    if self._wrapped_dynamic_indices:
+                        discovered = self._discover_dynamic_output_shapes(args, kwargs)
+                        self._set_dynamic_out_info_on_runners(discovered)
+                    else:
+                        self.split_gm(*args, **kwargs)
 
-                # Capture phase
-                ADPiecewiseRunner.set_current_phase("capture")
-                try:
-                    self.split_gm(*args, **kwargs)
-                finally:
-                    for runner in self._static_runners.values():
-                        runner.finalize_capture(nt)
+                    # Capture phase
+                    ADPiecewiseRunner.set_current_phase("capture")
+                    try:
+                        self.split_gm(*args, **kwargs)
+                    finally:
+                        for runner in self._static_runners.values():
+                            runner.finalize_capture(nt)
 
-            ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
+                ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
 
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
         ADPiecewiseRunner.set_current_num_tokens(None)
         ADPiecewiseRunner.set_current_phase("replay")
@@ -743,7 +743,11 @@ class PiecewiseCapturedGraph(nn.Module):
             self._copy_to_static_buffers(kwargs)
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
             try:
-                result = self.split_gm(*args, **kwargs)
+                # Keep multi-stream passthroughs as no-ops during piecewise
+                # replay — they were captured as no-ops during warmup_and_capture,
+                # so they must remain no-ops at runtime for consistency.
+                with disable_multi_stream():
+                    result = self.split_gm(*args, **kwargs)
                 # Some captured kernels use internal CUDA streams, so wait for
                 # graph-launched work to finish before returning to eager code.
                 if torch.cuda.is_available():
