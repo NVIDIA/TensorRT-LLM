@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from typing import Optional
+import math
 
 import torch
 from torch import nn
@@ -36,6 +37,7 @@ class RMSNorm(nn.Module):
         enable_tp: bool = False,
         mapping: Optional[Mapping] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.NCCL,
+        force_sharding_alignment: Optional[int] = None,
     ):
         super().__init__()
 
@@ -48,7 +50,10 @@ class RMSNorm(nn.Module):
         if enable_tp:
             assert mapping is not None
             self.full_size = hidden_size
-            shard = hidden_size // mapping.tp_size
+            self.align = force_sharding_alignment or 1
+            assert self.full_size % self.align == 0, 'Cannot align shard if the alignment does not divide the sharding dim'
+            shard = math.ceil(hidden_size / mapping.tp_size)
+            shard = math.ceil(shard / self.align) * self.align
             start = shard * mapping.tp_rank
             end = min(shard * (mapping.tp_rank + 1), hidden_size)
             hidden_size = end - start
@@ -97,7 +102,8 @@ class RMSNorm(nn.Module):
             if param is None or param_name not in weights:
                 continue
             if param_name == 'weight' and self.enable_tp:
-                shard = self.full_size // self.mapping.tp_size
+                shard = math.ceil(self.full_size / self.mapping.tp_size)
+                shard = math.ceil(shard / self.align) * self.align
                 start = shard * self.mapping.tp_rank
                 end = min(shard * (self.mapping.tp_rank + 1), self.full_size)
                 data = weights[param_name][..., start:end]

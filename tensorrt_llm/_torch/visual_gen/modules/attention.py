@@ -1,5 +1,6 @@
 from enum import Enum
 from typing import Optional, Tuple
+import math
 
 import torch
 import torch.nn as nn
@@ -60,14 +61,14 @@ class Attention(nn.Module):
         self.mapping = getattr(config, "mapping", None)
         self.allreduce_strategy = config.allreduce_strategy
 
-        tp_size = self.mapping.tp_size if self.mapping else 1
-
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
         self.bias = bias
+
+        tp_size = self.mapping.tp_size if self.mapping else 1
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
         # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
@@ -112,6 +113,7 @@ class Attention(nn.Module):
                 has_weights=True,
                 enable_tp=enable_tp_rms,
                 mapping=self.mapping,
+                force_sharding_alignment=self.head_dim,
             )
             self.norm_k = RMSNorm(
                 hidden_size=k_norm_dim,
@@ -120,6 +122,7 @@ class Attention(nn.Module):
                 has_weights=True,
                 enable_tp=enable_tp_rms,
                 mapping=self.mapping,
+                force_sharding_alignment=self.head_dim,
             )
 
         # TODO: Use weight mapper to create just a Linear module
@@ -137,6 +140,7 @@ class Attention(nn.Module):
                     tensor_parallel_mode=TensorParallelMode.ROW if tp_size > 1 else None,
                     reduce_output=(tp_size > 1),
                     allreduce_strategy=self.allreduce_strategy,
+                    force_sharding_alignment=self.head_dim,
                 )
             ]
         )
@@ -146,6 +150,7 @@ class Attention(nn.Module):
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
         use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
@@ -158,14 +163,17 @@ class Attention(nn.Module):
             backend_num_kv_heads = self.num_key_value_heads
 
         if tp_size > 1:
-            assert backend_num_heads % tp_size == 0
-            backend_num_heads = backend_num_heads // tp_size
+            def calc_heads_shard(heads):
+                shard = math.ceil(heads / tp_size)
+                start = shard * self.mapping.tp_rank
+                end = min(shard * (self.mapping.tp_rank + 1), heads)
+                return end - start
 
-            assert backend_num_kv_heads % tp_size == 0
-            backend_num_kv_heads = backend_num_kv_heads // tp_size
+            backend_num_heads = calc_heads_shard(backend_num_heads)
+            backend_num_kv_heads = calc_heads_shard(backend_num_kv_heads)
 
-            self.num_attention_heads //= tp_size
-            self.num_key_value_heads //= tp_size
+            self.num_attention_heads = calc_heads_shard(self.num_attention_heads)
+            self.num_key_value_heads = calc_heads_shard(self.num_key_value_heads)
 
             self.q_dim = self.num_attention_heads * self.head_dim
             self.kv_dim = self.num_key_value_heads * self.head_dim
@@ -224,6 +232,7 @@ class Attention(nn.Module):
                 },
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                force_sharding_alignment=self.head_dim,
             )
         else:
             self.to_q = Linear(
@@ -237,6 +246,7 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                force_sharding_alignment=self.head_dim,
             )
             self.to_k = Linear(
                 self.hidden_size,
@@ -249,6 +259,7 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                force_sharding_alignment=self.head_dim,
             )
             self.to_v = Linear(
                 self.hidden_size,
@@ -261,6 +272,7 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                force_sharding_alignment=self.head_dim,
             )
 
     def get_qkv(
