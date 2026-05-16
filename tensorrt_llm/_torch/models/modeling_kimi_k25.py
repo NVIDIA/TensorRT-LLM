@@ -1582,6 +1582,18 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         model_config._frozen = True
 
     @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    @property
+    def load_draft_weights(self):
+        return self.llm.load_draft_weights
+
+    @property
     def multimodal_data_device_paths(self) -> List[str]:
         return [
             "image.pixel_values",
@@ -1627,48 +1639,44 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        multimodal_params: Optional[List[MultimodalParams]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        num_context_requests = attn_metadata.num_contexts
-        multimodal_params = kwargs.get("multimodal_params", [])
+        multimodal_params = multimodal_params or []
         mm_embeds: List[torch.Tensor] = []
+        mm_token_ids = None
+        fuse_kwargs = kwargs
 
         if len(multimodal_params) > 0:
-            if not DISAGG:
-                mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self.mm_encoder.forward,
-                    multimodal_params=multimodal_params[:num_context_requests],
-                )
-            else:
+            if DISAGG:
                 raise NotImplementedError("Disaggregated inference not yet supported for K2.5.")
-            mm_embeds = find_input_mm_embeds(
-                mm_embeds,
-                multimodal_params[:num_context_requests],
+            mm_ctx_params = multimodal_params[: attn_metadata.num_contexts]
+            mm_embeds = get_multimodal_embeddings(
+                encoder_forward_fn=self.mm_encoder.forward,
+                multimodal_params=mm_ctx_params,
             )
+            mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
-        fuse_kwargs = kwargs
-        mm_token_ids = None
-        if len(mm_embeds) > 0:
-            placeholder_id = self._media_placeholder_token_id
-            num_mm_in_ids = int((input_ids == placeholder_id).sum().item())
-            if num_mm_in_ids == 0:
-                logger.warning(
-                    "Vision embeddings computed but no placeholder tokens "
-                    "found in input_ids — embeddings discarded."
-                )
-                mm_embeds = []
-            else:
-                # Exclude keys not accepted by fuse_input_embeds
-                fuse_kwargs = {
-                    k: v
-                    for k, v in kwargs.items()
-                    if k not in ("mm_token_indices", "text_token_indices")
-                }
-                mm_token_ids = torch.tensor(
-                    [placeholder_id],
-                    dtype=input_ids.dtype,
-                    device=input_ids.device,
-                )
+            if len(mm_embeds) > 0:
+                placeholder_id = self._media_placeholder_token_id
+                if int((input_ids == placeholder_id).sum().item()) == 0:
+                    logger.warning(
+                        "Vision embeddings computed but no placeholder tokens "
+                        "found in input_ids — embeddings discarded."
+                    )
+                    mm_embeds = []
+                else:
+                    mm_token_ids = torch.tensor(
+                        [placeholder_id],
+                        dtype=input_ids.dtype,
+                        device=input_ids.device,
+                    )
+                    # fuse_input_embeds doesn't accept the mm_*_indices kwargs.
+                    fuse_kwargs = {
+                        k: v
+                        for k, v in kwargs.items()
+                        if k not in ("mm_token_indices", "text_token_indices")
+                    }
 
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
@@ -1684,4 +1692,5 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             position_ids,
             inputs_embeds,
             return_context_logits,
+            **kwargs,
         )
