@@ -42,6 +42,29 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const&
         std::nullopt};
 }
 
+void logUnsupportedXQAConfig(char const* prefix, XQAParams const& xqaParams, int sm, bool forConfigurePlugin)
+{
+    int const headGrpSize
+        = xqaParams.num_kv_heads == 0 ? 0 : (xqaParams.num_q_heads / xqaParams.num_kv_heads);
+    bool const supportQGMMA = tensorrt_llm::kernels::jit::supportConfigQGMMA(xqaParams, sm, forConfigurePlugin);
+    bool const supportHMMA = tensorrt_llm::kernels::jit::supportConfigHMMA(xqaParams, sm, forConfigurePlugin);
+    bool const supportMLA = tensorrt_llm::kernels::jit::supportConfigMLA(xqaParams, sm, forConfigurePlugin);
+
+    TLLM_LOG_DEBUG(
+        "%s: sm=%d for_configure_plugin=%d data_type=%d kv_cache_data_type=%d output_data_type=%d "
+        "head_size=%d num_q_heads=%d num_kv_heads=%d head_grp_size=%d tokens_per_block=%d paged_kv_cache=%d "
+        "beam_width=%d q_seq_len=%d total_num_input_tokens=%d is_mla=%d is_fp8_output=%d "
+        "chunked_attention_size=%d mask_type=%d unidirectional=%d position_embedding_type=%d position_shift_enabled=%d "
+        "sink_token_length=%d skip_softmax_threshold_scale_factor=%g support_qgmma=%d support_hmma=%d support_mla=%d",
+        prefix, sm, forConfigurePlugin, static_cast<int>(xqaParams.data_type),
+        static_cast<int>(xqaParams.kv_cache_data_type), static_cast<int>(xqaParams.output_data_type), xqaParams.head_size,
+        xqaParams.num_q_heads, xqaParams.num_kv_heads, headGrpSize, xqaParams.tokens_per_block, xqaParams.paged_kv_cache,
+        xqaParams.beam_width, xqaParams.generation_input_length, xqaParams.total_num_input_tokens, xqaParams.isMLA(),
+        xqaParams.is_fp8_output, xqaParams.chunked_attention_size, static_cast<int>(xqaParams.mask_type),
+        xqaParams.unidirectional, static_cast<int>(xqaParams.position_embedding_type), xqaParams.position_shift_enabled,
+        xqaParams.sink_token_length, xqaParams.skip_softmax_threshold_scale_factor, supportQGMMA, supportHMMA, supportMLA);
+}
+
 } // anonymous namespace
 
 TRTLLM_NAMESPACE_BEGIN
@@ -113,6 +136,8 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
             }
         }
         TLLM_LOG_DEBUG("JIT XQA is not used: no supported configuration found for any beam_width");
+        logUnsupportedXQAConfig("JIT XQA unsupported configure-time umbrella config", umbrellaXQAParams, mSM,
+            forConfigurePlugin);
         return false;
     }
     else
@@ -122,6 +147,7 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         if (!isConfigSupported)
         {
             TLLM_LOG_DEBUG("JIT XQA is not used: unsupported configuration");
+            logUnsupportedXQAConfig("JIT XQA unsupported runtime config", xqaParams, mSM, forConfigurePlugin);
             return false;
         }
         bool hasPerfGain = mayHavePerfGain(xqaParams);

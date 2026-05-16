@@ -18,7 +18,7 @@ import os
 import threading
 from dataclasses import replace
 from functools import lru_cache
-from typing import ClassVar, List, Mapping, Optional, Tuple, Union
+from typing import ClassVar, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]

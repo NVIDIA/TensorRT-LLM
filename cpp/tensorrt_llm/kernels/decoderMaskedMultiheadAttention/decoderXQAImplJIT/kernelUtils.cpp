@@ -188,7 +188,7 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
-    if (SM != kSM_120)
+    if (SM != kSM_120 && SM != kSM_121)
     {
         return false;
     }
@@ -205,6 +205,13 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
         return false;
     }
     if (!xqaParams.isMLA())
+    {
+        return false;
+    }
+    // The current SM120 MLA kernel specialization assumes the full 128-query-head group.
+    // TP-sharded MLA shapes need either a retuned kernel or a padded wrapper before they
+    // can safely enter this JIT path.
+    if (xqaParams.num_q_heads / xqaParams.num_kv_heads != 128)
     {
         return false;
     }
