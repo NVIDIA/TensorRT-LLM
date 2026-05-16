@@ -113,7 +113,9 @@ public:
 #else
         if constexpr (scope == Scope::CTA)
         {
-            static_assert(order == ArriveOrder::RELEASE);
+            // The host parse pass reaches this branch with __CUDA_ARCH__ undefined.
+            // Use the conservative release fallback for CTA arrivals; SM90+ device
+            // compilation above emits the order-specific release/relaxed instruction.
             if (update > 1)
             {
                 asm volatile("mbarrier.arrive.noComplete" STR_REL_CTA ".b64 %0, [%1], %2;\n"
