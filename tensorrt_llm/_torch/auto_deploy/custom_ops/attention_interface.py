@@ -161,6 +161,24 @@ class InputBuffer:
         # Track current lengths for each tensor (for truncation optimization)
         self._current_lengths: Dict[str, int] = {name: 0 for name in self._tensor_order}
 
+        # V7/V8: per-name cache of last staged value for fast-path skip in stage().
+        # V7 covers list/tuple inputs; V8 (AD_STAGE_CACHE_TENSOR=1) extends to small
+        # CPU tensors via bytes-key comparison. Default off for safety.
+        # V9 (AD_TRUNC_DIRTY_SKIP=1): in copy_to_device, skip H2D for truncatables
+        # whose previous stage() was a cache hit (data already on device from prev iter).
+        import os as _os
+
+        self._stage_cache_enabled: bool = _os.environ.get("AD_STAGE_CACHE", "0") == "1"
+        self._stage_cache_tensor_enabled: bool = (
+            _os.environ.get("AD_STAGE_CACHE_TENSOR", "0") == "1"
+        )
+        self._trunc_dirty_skip_enabled: bool = _os.environ.get("AD_TRUNC_DIRTY_SKIP", "0") == "1"
+        self._stage_cache_list: Dict[str, tuple] = {}
+        self._stage_cache_tensor: Dict[str, tuple] = {}
+        # Names that were ACTUALLY written this iter (vs cache-hit skipped). Reset per iter
+        # by copy_to_device. Used by V9 to skip H2D of unchanged truncatables.
+        self._dirty_names: Set[str] = set(self._tensor_order)  # start dirty
+
         # === CONTIGUOUS BUFFER (small, fixed-size tensors) ===
         self._offsets: Dict[str, int] = {}
         self._byte_sizes: Dict[str, int] = {}
@@ -272,6 +290,41 @@ class InputBuffer:
             Number of elements stored.
         """
         numel, dtype = self._tensor_specs[name]
+
+        # V7/V8: fast-path — skip stage if value identical to previous staging for
+        # this name. Tail beyond length already at fill_value from prev iter's
+        # identical stage, so fill is also safe to skip.
+        cache_key = None
+        cache_key_tensor = None
+        if self._stage_cache_enabled and isinstance(data, (list, tuple)):
+            try:
+                cache_key = tuple(data)
+            except TypeError:
+                cache_key = None
+            if cache_key is not None and self._stage_cache_list.get(name) == cache_key:
+                return self._current_lengths[name]
+        elif (
+            self._stage_cache_tensor_enabled
+            and isinstance(data, torch.Tensor)
+            and data.device.type == "cpu"
+            and data.numel() <= 256  # bytes-hash is cheap only for small tensors
+        ):
+            try:
+                # data should already be contiguous since it comes from host-side compute;
+                # avoid extra cost by using untyped_storage's bytes directly.
+                cache_key_tensor = (
+                    tuple(data.shape),
+                    data.dtype,
+                    bytes(data.detach().contiguous().view(torch.uint8).numpy()),
+                )
+            except Exception:
+                cache_key_tensor = None
+            if (
+                cache_key_tensor is not None
+                and self._stage_cache_tensor.get(name) == cache_key_tensor
+            ):
+                return self._current_lengths[name]
+
         host_view = self.get_host_view(name)
 
         if fill_value is not None:
@@ -287,6 +340,16 @@ class InputBuffer:
         dst = host_view[:length].numpy()
         src = (data if data.dtype == dtype else data.to(dtype)).numpy()
         np.copyto(dst, src)
+
+        # Update cache after successful stage (only when fast-path is enabled)
+        if cache_key is not None:
+            self._stage_cache_list[name] = cache_key
+        if cache_key_tensor is not None:
+            self._stage_cache_tensor[name] = cache_key_tensor
+
+        # V9: mark dirty for copy_to_device. Cache-hit early returns above skip this,
+        # so name remains in last-iter dirty-set ONLY if it was written then.
+        self._dirty_names.add(name)
 
         self._current_lengths[name] = length
         return length
@@ -315,16 +378,27 @@ class InputBuffer:
 
         Contiguous tensors are copied in a single bulk transfer.
         Truncatable tensors are each copied independently, truncated to actual length.
+        V9: when AD_TRUNC_DIRTY_SKIP=1, skip H2D for truncatables whose stage()
+        cache-hit this iter (data already on device from previous iter's identical stage).
         """
         with nvtx_range("ad_input_buffer_h2d_copy"):
-            # Copy contiguous buffer in one shot
+            # Copy contiguous buffer in one shot. (Skip-if-no-dirty only when feature on
+            # AND no contiguous name is dirty — usually input_ids is always dirty so keep
+            # the bulk copy.)
             if self._total_bytes > 0:
-                h_buffer = self._host_buffer[: self._total_bytes]
-                d_buffer = self._device_buffer[: self._total_bytes]
-                d_buffer.copy_(h_buffer, non_blocking=True)
+                contig_dirty = not self._trunc_dirty_skip_enabled or any(
+                    n in self._dirty_names for n in self._contiguous_names
+                )
+                if contig_dirty:
+                    h_buffer = self._host_buffer[: self._total_bytes]
+                    d_buffer = self._device_buffer[: self._total_bytes]
+                    d_buffer.copy_(h_buffer, non_blocking=True)
 
             # Copy each truncatable tensor independently, truncated to current length
             for name in self._truncatable_names:
+                # V9: skip if previous stage was a cache hit (data unchanged on device)
+                if self._trunc_dirty_skip_enabled and name not in self._dirty_names:
+                    continue
                 length = self.get_current_length(name)
                 if length > 0:
                     _, dtype = self._tensor_specs[name]
@@ -332,6 +406,10 @@ class InputBuffer:
                     trunc_d_buf = self._trunc_device_bufs[name][:copy_bytes]
                     trunc_h_buf = self._trunc_host_bufs[name][:copy_bytes]
                     trunc_d_buf.copy_(trunc_h_buf, non_blocking=True)
+
+        # V9: reset dirty tracking for next iter (always after copy_to_device).
+        if self._trunc_dirty_skip_enabled:
+            self._dirty_names.clear()
 
     def copy_to_host(self) -> None:
         """Copy from device buffer to host buffer.
