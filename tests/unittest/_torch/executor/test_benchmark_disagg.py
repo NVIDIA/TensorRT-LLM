@@ -1024,7 +1024,11 @@ class TestFillPhaseEndToEnd:
         # Phase 4: Gate opens, fill phase clears
         ex._benchmark_fill_phase_active = False
 
-        # Phase 5: After fill, if new INIT requests appear, fail-fast fires
+        # Phase 5: After fill, if new INIT requests appear and the scheduler
+        # cannot fit any of them, fail-fast fires.  Reset _schedule from
+        # Phase 2b's healthy-fill mock so it once again returns no fitting
+        # INIT requests, mirroring genuine insufficient-KV conditions.
+        ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
         stuck_req = _make_active_request(in_init=True)
         ex.active_requests = [stuck_req] + ready_reqs
 
