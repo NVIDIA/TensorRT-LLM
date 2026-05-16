@@ -784,6 +784,11 @@ public:
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
 
             mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, stream);
+
+            if (profile_id == -1)
+            {
+                return;
+            }
         }
 
         // Profile specific tactic. Assuming at least one preparation phase has been executed already.

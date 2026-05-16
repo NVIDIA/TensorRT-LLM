@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import os
 import threading
 from dataclasses import replace
 from functools import lru_cache
@@ -141,7 +142,46 @@ class MoERunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
+        gemm_idx = kwargs["gemm_idx"]
+        tactics = list(range(self.fused_moe_runner.get_tactic_num(gemm_idx)))
+        skip_tactics = self._get_skip_tactics(gemm_idx)
+        if not skip_tactics:
+            return tactics
+
+        filtered_tactics = [
+            tactic for tactic in tactics if tactic not in skip_tactics
+        ]
+        skipped = sorted(set(tactics) & skip_tactics)
+        if skipped:
+            logger.warning_once(
+                f"Skipping MoE GEMM{gemm_idx} autotune tactics {skipped} "
+                "because TRTLLM_MOE_SKIP_TACTICS or "
+                f"TRTLLM_MOE_SKIP_GEMM{gemm_idx}_TACTICS is set.",
+                key=("moe_runner", "skip_tactics", gemm_idx, tuple(skipped)))
+        return filtered_tactics
+
+    @staticmethod
+    def _get_skip_tactics(gemm_idx: int) -> set[int]:
+        skip_tactics: set[int] = set()
+        env_names = ("TRTLLM_MOE_SKIP_TACTICS",
+                     f"TRTLLM_MOE_SKIP_GEMM{gemm_idx}_TACTICS")
+        for env_name in env_names:
+            raw_value = os.environ.get(env_name)
+            if not raw_value:
+                continue
+            for token in raw_value.replace(";", ",").replace(" ", ",").split(
+                    ","):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    skip_tactics.add(int(token))
+                except ValueError:
+                    logger.warning_once(
+                        f"Ignoring invalid MoE tactic id '{token}' from {env_name}.",
+                        key=("moe_runner", "invalid_skip_tactic", env_name,
+                             token))
+        return skip_tactics
 
     def unique_id(self):
         return (
