@@ -614,7 +614,9 @@ class BaseWorker(GenerationExecutor):
                 executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
+                    # E/P handoff embedding handles parked under "multimodal_embedding".
+                    # Model code sees local tensor views after this point.
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 

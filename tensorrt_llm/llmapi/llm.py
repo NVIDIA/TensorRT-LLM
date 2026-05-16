@@ -603,6 +603,10 @@ class BaseLLM:
                         "multimodal_run_positions"),
                     mm_run_lengths=mm_layout_metadata.get(
                         "multimodal_run_lengths"))
+                # E/P handoff carries SharedTensorContainer dicts. Park them under the
+                # embedding key so BaseWorker's recursive to_tensor("multimodal_data")
+                # restores local tensor views before PyTorch forward. Until then this
+                # key holds handles, not tensors.
                 multimodal_data = {"multimodal_embedding": mm_handles}
                 if "multimodal_embedding_lengths" in mm_layout_metadata:
                     multimodal_data["multimodal_embedding_lengths"] = (

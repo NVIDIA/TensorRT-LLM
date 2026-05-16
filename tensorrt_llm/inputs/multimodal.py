@@ -396,7 +396,10 @@ class MultimodalParams:
                 "mrope_rotary_cos_sin": torch.Tensor,    # Rotary embeddings (Qwen2/2.5-VL)
                 "mrope_position_deltas": torch.Tensor,   # Position deltas (Qwen2/2.5-VL)
             },
-            "multimodal_embedding": torch.Tensor,        # Pre-computed vision embeddings
+            "multimodal_embedding": torch.Tensor | List[SharedTensor handle dict],
+                # Pre-computed embeddings. In E/P handoff this may temporarily hold
+                # SharedTensorContainer dicts; BaseWorker restores them to tensors with
+                # to_tensor("multimodal_data") before PyTorch forward.
             "image": {
                 "pixel_values": torch.Tensor,
                 "image_height": torch.Tensor | List[int],
