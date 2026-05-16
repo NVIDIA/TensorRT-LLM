@@ -33,6 +33,15 @@ from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 # Saves ~5 elementwise launches per layer × 36 ≈ 180 launches/iter on gpt-oss-120b.
 _AD_W4A8_FUSED_ROUTING = os.environ.get("AD_W4A8_FUSED_ROUTING", "0") == "1"
 
+# AD_DUMP_MOE_ROUTING: wrap each W4A8 MoE runner call in an NVTX range whose
+# name encodes the selected expert ids for the first token in the batch — gives
+# us nsys-timeline-visible correlation between FC1 latency and routing pattern.
+# Requires AD_W4A8_FUSED_ROUTING=0 to see real expert ids; otherwise emits "fused".
+# Counter is global to the process; layer index within an iter is derived by the
+# analysis script (counter % num_moe_layers).
+_AD_DUMP_MOE_ROUTING = os.environ.get("AD_DUMP_MOE_ROUTING", "0") == "1"
+_MOE_CALL_COUNTER = 0
+
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
     """Check if MoE all-to-all mode should be used and validate parameters.
@@ -1328,12 +1337,14 @@ def trtllm_mxfp4_w4a8_moe_fused(
         runner_topk_weights = None
         runner_topk_ids = None
         runner_router_logits = router_logits
+        _dump_topk_ids = None
     else:
         topk_vals, topk_ids = torch.topk(router_logits.to(torch.float32), top_k, dim=-1)
         topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
         runner_topk_weights = topk_weights.to(torch.bfloat16)
         runner_topk_ids = topk_ids.to(torch.int32)
         runner_router_logits = None
+        _dump_topk_ids = topk_ids
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
     expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
@@ -1368,6 +1379,68 @@ def trtllm_mxfp4_w4a8_moe_fused(
         local_num_experts = int(fc1_weights_mxfp4.shape[0])
     intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
 
+    if _AD_DUMP_MOE_ROUTING:
+        global _MOE_CALL_COUNTER
+        _MOE_CALL_COUNTER += 1
+        # .tolist() is a D2H sync — illegal during CUDA stream capture.
+        # Guard so warmup capture doesn't corrupt the stream; the actual
+        # dump is intended for eager (torch-simple) runs anyway.
+        try:
+            _capturing = torch.cuda.is_current_stream_capturing()
+        except Exception:
+            _capturing = False
+        if _dump_topk_ids is not None and not _capturing:
+            try:
+                _ids_first = _dump_topk_ids[0].tolist()
+            except Exception:
+                _ids_first = []
+            _ids_str = "_".join(str(int(e)) for e in _ids_first)
+        elif _capturing:
+            _ids_str = "capt"
+        else:
+            _ids_str = "fused"
+        torch.cuda.nvtx.range_push(f"MoE_c{_MOE_CALL_COUNTER}_e{_ids_str}")
+
+    # AD_DUMP_WEIGHT_ADDRS=1: one-shot per-tensor dump of MoE weight addresses
+    if os.environ.get("AD_DUMP_WEIGHT_ADDRS") == "1":
+        import sys as _sys
+
+        _dumped = getattr(trtllm_mxfp4_w4a8_moe_fused, "_dumped_ids", None)
+        if _dumped is None:
+            _dumped = set()
+            trtllm_mxfp4_w4a8_moe_fused._dumped_ids = _dumped
+        # Dedupe per (data_ptr) — same layer's weight stays unchanged, but different layers print.
+        for _name, _t in (
+            ("fc1_w", fc1_weights_mxfp4),
+            ("fc2_w", fc2_weights_mxfp4),
+            ("fc1_scale", fc1_weights_scale_ue8m0),
+            ("fc2_scale", fc2_weights_scale_ue8m0),
+            ("fc1_bias", fc1_bias_f32),
+            ("fc2_bias", fc2_bias_f32),
+            ("swiglu_a", swiglu_alpha),
+            ("swiglu_b", swiglu_beta),
+            ("swiglu_l", swiglu_limit),
+            ("router_w", router_weight),
+            ("router_b", router_bias),
+        ):
+            if _t is None:
+                continue
+            _ptr = int(_t.data_ptr())
+            if _ptr in _dumped:
+                continue
+            _dumped.add(_ptr)
+            _sz = _t.numel() * _t.element_size()
+            _align = 1
+            for _b in (1 << 20, 1 << 16, 4096, 1024, 512, 256, 128, 64, 32, 16, 8, 4):
+                if _ptr % _b == 0:
+                    _align = _b
+                    break
+            _sys.stderr.write(
+                f"AD_DUMP {_name:<10} ptr=0x{_ptr:016x} size={_sz:>12} "
+                f"align={_align:>7} shape={list(_t.shape)} dtype={_t.dtype}\n"
+            )
+            _sys.stderr.flush()
+
     result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
         runner_router_logits,  # router_logits (None if pre-computed topk path)
         None,  # routing_bias
@@ -1397,6 +1470,10 @@ def trtllm_mxfp4_w4a8_moe_fused(
         topk_weights=runner_topk_weights,
         topk_ids=runner_topk_ids,
     )
+
+    if _AD_DUMP_MOE_ROUTING:
+        torch.cuda.nvtx.range_pop()
+
     if result.shape[-1] > valid_hidden_size:
         result = result[..., :valid_hidden_size].contiguous()
     return result.view(*x_shape[:-1], valid_hidden_size)

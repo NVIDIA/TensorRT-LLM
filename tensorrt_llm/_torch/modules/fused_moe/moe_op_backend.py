@@ -343,6 +343,49 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
                 # mxfp4
+                # AD_DUMP_WEIGHT_ADDRS=1: one-shot per-tensor dump of MoE weight addresses (PT path).
+                # Keyed by data_ptr so each layer's unique weight is dumped once.
+                # Use class attribute for dedup state (bound methods are immutable).
+                import os as _os
+                import sys as _sys  # local import to avoid module-level changes
+
+                if _os.environ.get("AD_DUMP_WEIGHT_ADDRS") == "1":
+                    _cls = type(self)
+                    _dumped = getattr(_cls, "_pt_dump_ids", None)
+                    if _dumped is None:
+                        _dumped = set()
+                        _cls._pt_dump_ids = _dumped
+                    for _name, _t in (
+                        ("fc1_w", gemm1_weights),
+                        ("fc2_w", gemm2_weights),
+                        ("fc1_scale", gemm1_weights_scale),
+                        ("fc2_scale", gemm2_weights_scale),
+                        ("fc1_bias", gemm1_bias),
+                        ("fc2_bias", gemm2_bias),
+                        ("swiglu_a", gemm1_alpha),
+                        ("swiglu_b", gemm1_beta),
+                        ("swiglu_l", gemm1_clamp_limit),
+                        ("router_w", router_logits),
+                        ("router_b", routing_bias),
+                    ):
+                        if _t is None:
+                            continue
+                        _ptr = int(_t.data_ptr())
+                        if _ptr in _dumped:
+                            continue
+                        _dumped.add(_ptr)
+                        _sz = _t.numel() * _t.element_size()
+                        _align = 1
+                        for _b in (1 << 20, 1 << 16, 4096, 1024, 512, 256, 128, 64, 32, 16, 8, 4):
+                            if _ptr % _b == 0:
+                                _align = _b
+                                break
+                        _sys.stderr.write(
+                            f"PT_DUMP {_name:<10} ptr=0x{_ptr:016x} size={_sz:>12} "
+                            f"align={_align:>7} shape={list(_t.shape)} dtype={_t.dtype}\n"
+                        )
+                        _sys.stderr.flush()
+
                 return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                     router_logits,
                     routing_bias,
