@@ -33,6 +33,7 @@ dump*/
 *.log
 *.pkl
 *.hdf5
+.nfs*
 config.json
 /*.svg
 cpp/cmake-build-*
