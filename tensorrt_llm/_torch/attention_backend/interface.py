@@ -775,14 +775,16 @@ class AttentionSparseArgs:
     sparse_attn_indices_block_size: int = 0
 
 
-# AttentionForwardArgs fields intentionally NOT consumed by thop.attention.
-# The sync test (test_attention_op_sync.py) checks every other field has a
-# matching thop kwarg.
+# AttentionForwardArgs fields intentionally NOT consumed directly by the thop
+# wrapper. The sync test (test_attention_op_sync.py) checks every other field
+# has a matching thop kwarg or is read via a @property listed here.
 _THOP_EXCLUDED_FIELDS: frozenset = frozenset({
     "is_generation",  # consumed only by DSA (sparse/dsa.py)
     "topk_indices",  # consumed only by DSA
-    "attention_mask",  # translated to thop's ``mask_type`` via @property
+    "attention_mask",  # input to the ``mask_type`` @property
     "attention_mask_data",  # not used by thop (separate code path)
+    "out_scale",  # input to the ``effective_out_scale`` @property
+    "out_scale_sf",  # input to the ``effective_out_scale`` @property
 })
 
 # thop kwargs that are intentionally passed as literal ``None`` at the
