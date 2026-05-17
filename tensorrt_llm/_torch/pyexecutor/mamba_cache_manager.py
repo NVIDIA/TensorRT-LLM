@@ -1398,6 +1398,33 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                                       num_accepted_draft_tokens]
         self.all_conv_states[:, state_indices_d, :] = accepted_conv
 
+    def get_num_available_tokens(self,
+                                 token_num_upper_bound: int,
+                                 max_num_draft_tokens: int = 0,
+                                 **kwargs) -> int:
+        # Base bound from attention KV cache pool (the parent's behaviour).
+        result = super().get_num_available_tokens(token_num_upper_bound,
+                                                  max_num_draft_tokens,
+                                                  **kwargs)
+        # Also bound by the recurrent-state pool capacity: each request needs
+        # roughly ceil(N / states_snapshot_interval) recurrent-state blocks
+        # (+1 for the corner case where N is a multiple of tokens_per_block).
+        # When block reuse is disabled, only one snapshot is needed per
+        # request, so no additional capping is required here.
+        interval = (self.linear_attention_metadata.states_snapshot_interval
+                    if self.linear_attention_metadata is not None else 0)
+        if interval and interval > 0:
+            stats = self.impl.get_kv_cache_stats()
+            rs_free = stats.num_free_blocks_per_window_size.get(
+                LinearCacheType.RECURRENT_STATES.value, 0)
+            # Reserve 1 block for the always-allocated last block (corner case
+            # / final live state) so we don't promise more tokens than the
+            # pool can actually back at allocation time.
+            usable_rs_blocks = max(0, rs_free - 1)
+            rs_token_cap = usable_rs_blocks * interval
+            result = min(result, rs_token_cap)
+        return max(result, 0)
+
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self.all_ssm_states[self.mamba_layer_offsets[layer_idx]]
 
