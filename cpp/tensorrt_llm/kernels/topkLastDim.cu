@@ -1170,6 +1170,154 @@ __global__ void radix_topk_one_block_kernel(T const* in, IdxT const* in_idx, con
         }
     }
 }
+// ==================== Small-Vocab Optimized TopK Kernel ====================
+// For beam search Stage 1 with small vocab (N <= 4096).
+// Loads entire input to shared memory, performs 2-pass radix selection (BitsPerPass=8).
+// Advantages over general radix_topk_one_block_kernel:
+//   1. Single global memory read (data resides in smem for all passes)
+//   2. Smaller histogram (256 bins vs 2048) -> less smem, faster scan
+//   3. No IS_STABLE overhead (no atomicMin loops)
+//   4. Smaller block size (256 vs 512) -> better occupancy
+//   5. No external CUB sort kernel needed (output unsorted, fine for beam search)
+template <typename T, typename IdxT, int BlockSize = 256, int MaxVocab = 4096>
+__global__ void small_vocab_topk_kernel(
+    T const* __restrict__ in, IdxT const len, IdxT const k, T* __restrict__ out, IdxT* __restrict__ out_idx,
+    bool const select_min)
+{
+    using UBits = typename cub::Traits<T>::UnsignedBits;
+    constexpr int BITS_PER_PASS = 8;
+    constexpr int NUM_BUCKETS = 1 << BITS_PER_PASS; // 256
+    constexpr int NUM_PASSES = ceildiv<int>(sizeof(T) * 8, BITS_PER_PASS);
+
+    // Shared memory: values (8KB for half*4096) + histogram (1KB) + counters
+    __shared__ T s_values[MaxVocab];
+    __shared__ IdxT s_histogram[NUM_BUCKETS];
+    __shared__ IdxT s_k;
+    __shared__ UBits s_kth_bits;
+    __shared__ IdxT s_out_cnt;
+
+    size_t const batch_id = blockIdx.x;
+    in += batch_id * len;
+    out += batch_id * k;
+    out_idx += batch_id * k;
+
+    // Initialize state
+    if (threadIdx.x == 0)
+    {
+        s_k = k;
+        s_kth_bits = 0;
+        s_out_cnt = 0;
+    }
+
+    // Load input to shared memory (single coalesced global read)
+    for (IdxT i = threadIdx.x; i < len; i += BlockSize)
+    {
+        s_values[i] = in[i];
+    }
+    __syncthreads();
+
+    // Multi-pass radix selection from shared memory
+    for (int pass = 0; pass < NUM_PASSES; ++pass)
+    {
+        // Clear histogram
+        for (int i = threadIdx.x; i < NUM_BUCKETS; i += BlockSize)
+        {
+            s_histogram[i] = 0;
+        }
+        __syncthreads();
+
+        int const start_bit = calc_start_bit<T, BITS_PER_PASS>(pass);
+        unsigned const mask = calc_mask<T, BITS_PER_PASS>(pass);
+
+        if (pass == 0)
+        {
+            // First pass: histogram all elements from smem
+            for (IdxT i = threadIdx.x; i < len; i += BlockSize)
+            {
+                int bucket = calc_bucket<T, BITS_PER_PASS>(s_values[i], start_bit, mask, select_min);
+                atomicAdd(&s_histogram[bucket], static_cast<IdxT>(1));
+            }
+        }
+        else
+        {
+            // Subsequent passes: only histogram elements matching kth_bits prefix
+            int const prev_start_bit = calc_start_bit<T, BITS_PER_PASS>(pass - 1);
+            UBits const kth_bits = s_kth_bits;
+            for (IdxT i = threadIdx.x; i < len; i += BlockSize)
+            {
+                UBits bits = twiddle_in(s_values[i], select_min);
+                UBits prev_bits = (bits >> prev_start_bit) << prev_start_bit;
+                if (prev_bits == kth_bits)
+                {
+                    int bucket = (bits >> start_bit) & mask;
+                    atomicAdd(&s_histogram[bucket], static_cast<IdxT>(1));
+                }
+            }
+        }
+        __syncthreads();
+
+        // Serial inclusive prefix sum (256 bins - fast enough for single thread)
+        if (threadIdx.x == 0)
+        {
+            IdxT sum = 0;
+            for (int i = 0; i < NUM_BUCKETS; ++i)
+            {
+                sum += s_histogram[i];
+                s_histogram[i] = sum;
+            }
+        }
+        __syncthreads();
+
+        // Choose bucket containing the k-th element
+        IdxT const current_k = s_k;
+        for (int i = threadIdx.x; i < NUM_BUCKETS; i += BlockSize)
+        {
+            IdxT prev = (i == 0) ? 0 : s_histogram[i - 1];
+            IdxT cur = s_histogram[i];
+            if (prev < current_k && cur >= current_k)
+            {
+                s_k = current_k - prev;
+                s_kth_bits |= static_cast<UBits>(i) << start_bit;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Output phase: write top-k elements to global memory
+    UBits const final_kth_bits = s_kth_bits;
+    int const last_start_bit = calc_start_bit<T, BITS_PER_PASS>(NUM_PASSES - 1);
+
+    // Phase 1: elements strictly better than k-th value
+    for (IdxT i = threadIdx.x; i < len; i += BlockSize)
+    {
+        UBits bits = twiddle_in(s_values[i], select_min);
+        UBits masked_bits = (bits >> last_start_bit) << last_start_bit;
+        if (masked_bits < final_kth_bits)
+        {
+            IdxT pos = atomicAdd(&s_out_cnt, static_cast<IdxT>(1));
+            out[pos] = s_values[i];
+            out_idx[pos] = i;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: boundary elements (equal to k-th value), fill remaining slots
+    for (IdxT i = threadIdx.x; i < len; i += BlockSize)
+    {
+        UBits bits = twiddle_in(s_values[i], select_min);
+        UBits masked_bits = (bits >> last_start_bit) << last_start_bit;
+        if (masked_bits == final_kth_bits)
+        {
+            IdxT pos = atomicAdd(&s_out_cnt, static_cast<IdxT>(1));
+            if (pos < k)
+            {
+                out[pos] = s_values[i];
+                out_idx[pos] = i;
+            }
+        }
+    }
+}
+
 } // namespace air_topk_stable
 
 //}
@@ -1532,6 +1680,35 @@ void standalone_stable_radix_11bits(void* buf, size_t& buf_size, T const* in, in
         }
     }
 }
+
+// ==================== Small-Vocab TopK Dispatch (no workspace needed) ====================
+template <typename T>
+void invokeSmallVocabTopkLastDim(SizeType32 batchSize, SizeType32 inputLength, SizeType32 k, bool is_largest,
+    void const* __restrict__ input, void* __restrict__ out_val, void* __restrict__ out_idx, cudaStream_t stream)
+{
+    using IdxT = SizeType32;
+    constexpr int BlockSize = 256;
+    constexpr int MaxVocab = 4096;
+
+    T const* in = reinterpret_cast<T const*>(input);
+    T* out_val_ = reinterpret_cast<T*>(out_val);
+    IdxT* out_idx_ = reinterpret_cast<IdxT*>(out_idx);
+
+    air_topk_stable::small_vocab_topk_kernel<T, IdxT, BlockSize, MaxVocab>
+        <<<batchSize, BlockSize, 0, stream>>>(in, inputLength, k, out_val_, out_idx_, !is_largest);
+}
+
+#define INSTANTIATE_SMALL_VOCAB_TOPK(T)                                                                                \
+    template void invokeSmallVocabTopkLastDim<T>(SizeType32 batchSize, SizeType32 inputLength, SizeType32 k,            \
+        bool is_largest, void const* __restrict__ input, void* __restrict__ out_val, void* __restrict__ out_idx,        \
+        cudaStream_t stream)
+
+INSTANTIATE_SMALL_VOCAB_TOPK(float);
+INSTANTIATE_SMALL_VOCAB_TOPK(half);
+#ifdef ENABLE_BF16
+INSTANTIATE_SMALL_VOCAB_TOPK(__nv_bfloat16);
+#endif
+#undef INSTANTIATE_SMALL_VOCAB_TOPK
 
 int nextPowerOfTwo(int num)
 {

@@ -35,6 +35,13 @@ void invokeTopkLastDim(runtime::SizeType32 batchSize, runtime::SizeType32 inputL
     bool is_largest, void const* __restrict__ input, void* __restrict__ out_val, void* __restrict__ out_ind,
     void* workspace, cudaStream_t stream);
 
+// Small-vocab optimized TopK (no workspace needed, output unsorted).
+// For inputLength <= 4096. Designed for beam search Stage 1 with small vocab.
+template <typename T>
+void invokeSmallVocabTopkLastDim(runtime::SizeType32 batchSize, runtime::SizeType32 inputLength,
+    runtime::SizeType32 k, bool is_largest, void const* __restrict__ input, void* __restrict__ out_val,
+    void* __restrict__ out_idx, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

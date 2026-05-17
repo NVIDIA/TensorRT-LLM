@@ -626,7 +626,15 @@ void beamSearchKernelLauncher(
         void* pTopK = reinterpret_cast<void*>(reinterpret_cast<char*>(workspace) + offset);
 
         // Stage 1
-        invokeTopkLastDim<T>(nBS * nBMIn, nV, nBMOut * 2, true, logProbs, pStage1LogProbs, pStage1Ids, pTopK, stream);
+        if (nV <= 4096)
+        {
+            // Small-vocab optimized path: smem-resident radix, no workspace needed
+            invokeSmallVocabTopkLastDim<T>(nBS * nBMIn, nV, nBMOut * 2, true, logProbs, pStage1LogProbs, pStage1Ids, stream);
+        }
+        else
+        {
+            invokeTopkLastDim<T>(nBS * nBMIn, nV, nBMOut * 2, true, logProbs, pStage1LogProbs, pStage1Ids, pTopK, stream);
+        }
         sync_check_cuda_error(stream);
 
         int nThread = min(roundUp(nBMIn * nBMOut * 2, 32), 1024);

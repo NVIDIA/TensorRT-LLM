@@ -32,22 +32,6 @@
  #include <cstdint>
  #include <type_traits>
  
- // Set to 1 to enable per-beam diagnostic prints (head 0, request 0, beams 0..3).
- // MUST be 0 for production. Output goes to stderr via CUDA printf.
- // M3 numerical verification closed (2026-05-09): kept at 0. Flip to 1 only for regression debug.
- #define CASCADE_DEBUG 0
- #define CASCADE_DEBUG_HEAD 0
- // Kill switch: when set to 1 at compile time, Phase 2 ignores cache_indir
- // and always uses src_beam = beam_idx.  If beam=128 logits become correct
- // (or much closer to baseline) with this on, the bug lies in cache_indir
- // data / writer; if logits stay broken, the bug is elsewhere (Phase 1 math
- // or Phase 3 merge).  Toggled via -DCASCADE_FORCE_NO_INDIR=1 build flag.
- #ifndef CASCADE_FORCE_NO_INDIR
- #define CASCADE_FORCE_NO_INDIR 0
- #endif
- // M3 diagnostic: bumped 4 -> 16 to capture beam-pair swap evidence at beams 8/9, 18/19, ...
- #define CASCADE_DEBUG_MAX_BEAM 16
- 
  TRTLLM_NAMESPACE_BEGIN
  
  namespace kernels
@@ -148,27 +132,70 @@
      return blockPtr[localOffset];
  }
  
- // Block-wide reduction. THDS == Dh, so no inter-warp shuffle is required for
- // final results - we use a single shared scratch slot.
+ // Block-wide reduction.
+ //
+ // Two implementations are kept side-by-side and selected at compile time via
+ // BLOCK_SUM_VERSION (see top-of-file macro definition).  This allows direct
+ // numerical comparison without code churn:
+ //
+ //   v0 (BLOCK_SUM_VERSION=0): tree reduction over SMEM.
+ //     Requires log2(THDS) __syncthreads, i.e. 7 barriers per call for THDS=128
+ //     (plus init/final = 9 total).  Add order is deterministic across launches:
+ //     ((s0+s64) + (s32+s96)) + ... pairwise.
+ //
+ //   v1 (BLOCK_SUM_VERSION=1, default): warp-shuffle + single cross-warp reduce.
+ //     Total barrier count drops to 3:
+ //       1. after each warp leader publishes its partial to scratch[warp_id]
+ //       2. after warp 0's final reduction writes the broadcast value to scratch[0]
+ //       3. after every thread reads scratch[0] (keeps scratch reusable across calls)
+ //     Intra-warp shuffle reduction (5 steps) carries zero __syncthreads and
+ //     zero SMEM traffic.  Add order: lane-pairwise within warp, then warp-pairwise
+ //     within warp 0.  Final fp32 result may differ from v0 by O(ULP).
  template <int THDS>
  __device__ inline float block_sum(float v, float* scratch)
  {
-     int const tid = threadIdx.x;
-     scratch[tid] = v;
-     __syncthreads();
-     // Tree reduction.
+     // ---------- v1: warp-shuffle + 1 SMEM cross-warp reduce -----------------
+     static_assert(THDS % 32 == 0, "block_sum requires THDS to be a multiple of warpSize");
+     constexpr int N_WARPS = THDS / 32;
+     int const tid     = threadIdx.x;
+     int const warp_id = tid >> 5;
+     int const lane_id = tid & 31;
+ 
+     // Step 1: intra-warp shuffle reduction (no __syncthreads needed).
  #pragma unroll
-     for (int s = THDS / 2; s > 0; s >>= 1)
+     for (int offset = 16; offset > 0; offset >>= 1)
      {
-         if (tid < s)
-         {
-             scratch[tid] += scratch[tid + s];
-         }
-         __syncthreads();
+         v += __shfl_xor_sync(0xFFFFFFFFu, v, offset);
      }
-     float result = scratch[0];
+ 
+     // Step 2: each warp's lane 0 publishes the warp partial.
+     if (lane_id == 0)
+     {
+         scratch[warp_id] = v;
+     }
      __syncthreads();
+ 
+     // Step 3: warp 0 reduces the N_WARPS partials and broadcasts the result
+     //         back through scratch[0].
+     if (warp_id == 0)
+     {
+         float block_val = (lane_id < N_WARPS) ? scratch[lane_id] : 0.f;
+ #pragma unroll
+         for (int offset = N_WARPS / 2; offset > 0; offset >>= 1)
+         {
+             block_val += __shfl_xor_sync(0xFFFFFFFFu, block_val, offset);
+         }
+         if (lane_id == 0)
+         {
+             scratch[0] = block_val;
+         }
+     }
+     __syncthreads();
+ 
+     float const result = scratch[0];
+     __syncthreads();  // keep scratch free for the next invocation
      return result;
+
  }
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -211,123 +238,6 @@
      if (active)
      {
          vec[c] = (c < half) ? (val * cos_a - partner * sin_a) : (val * cos_a + partner * sin_a);
-     }
- }
- 
- ////////////////////////////////////////////////////////////////////////////////////////////////////
- //
- // Phase 0: Write current step's K/V to KV cache.
- //
- // The standard MMHA (HANDLE_KV=true for self-attention) reads K/V from params,
- // applies bias + RoPE, and writes to cache. Since our cascade replaces the
- // standard MMHA entirely, we must perform this write ourselves.
- //
- // Grid:  ( num_kv_heads, total_seqs )
- // Block: ( Dh threads )
- //
- ////////////////////////////////////////////////////////////////////////////////////////////////////
- 
- template <typename T, typename T_cache, typename KVCacheBuffer, int Dh>
- __global__ void cascade_write_kv_kernel(Multihead_attention_params<T, false> params, KVCacheBuffer kv_cache_buffer)
- {
-     int const kv_head_idx = blockIdx.x;
-     int const seq = blockIdx.y; // batch_beam_idx
-     int const tid = threadIdx.x;
- 
-     int const num_kv_heads = params.num_kv_heads > 0 ? params.num_kv_heads : params.num_heads;
-     int const dim = params.hidden_size_per_head;
- 
-     if (kv_head_idx >= num_kv_heads || tid >= dim)
-     {
-         return;
-     }
- 
-     // Position in cache where current K/V should be written.
-     // length_per_sample includes current timestep; subtract 1 for cache index.
-     int const write_pos = (params.length_per_sample != nullptr)
-         ? (params.length_per_sample[seq] - 1)
-         : params.timestep;
- 
-     // --- Write K ---
-     uint32_t const k_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_kv_heads * dim);
-     int const k_offset = seq * k_stride + kv_head_idx * dim + tid;
-     float k_val = to_float<T>(params.k[k_offset]);
- 
-     if (params.k_bias != nullptr)
-     {
-         k_val += to_float<T>(params.k_bias[kv_head_idx * dim + tid]);
-     }
- 
-     // Apply RoPE to K (NeoX style). Use cos_sin_cache for exact numerical match
-     // with how K was rotated during the context phase.
-     extern __shared__ float kv_smem[];
-     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)
-     {
-         kv_smem[tid] = k_val;
-         __syncthreads();
- 
-         int const rotary_dim = params.rotary_embedding_dim;
-         if (tid < rotary_dim)
-         {
-             int const half = rotary_dim / 2;
-             int const freq_idx = (tid < half) ? tid : (tid - half);
-             float cos_a, sin_a;
- 
-             if (params.rotary_embedding_cos_sin_cache != nullptr)
-             {
-                 float2 const* cache_base = params.rotary_embedding_cos_sin_cache
-                     + static_cast<int64_t>(write_pos) * half;
-                 float2 cs = __ldg(&cache_base[freq_idx]);
-                 cos_a = cs.x;
-                 sin_a = cs.y;
-             }
-             else
-             {
-                 cascade_rope_cs(tid, rotary_dim, write_pos,
-                     params.rotary_embedding_base, params.rotary_embedding_scale, cos_a, sin_a);
-             }
- 
-             float const val = kv_smem[tid];
-             float const partner = (tid < half) ? kv_smem[tid + half] : kv_smem[tid - half];
-             k_val = (tid < half)
-                 ? (val * cos_a - partner * sin_a)
-                 : (val * cos_a + partner * sin_a);
-         }
-         __syncthreads();
-     }
- 
-     // Store K to cache.
-     {
-         auto const localTokenIdx = kv_cache_buffer.getKVTokenIdx(write_pos);
-         auto* kPtr = reinterpret_cast<T_cache*>(kv_cache_buffer.getKBlockPtr(seq, localTokenIdx));
-         auto const localOffset = kv_cache_buffer.getKVLocalIdx(localTokenIdx, kv_head_idx, dim, tid);
-         kPtr[localOffset] = from_float<T_cache>(k_val);
-     }
- 
- #if CASCADE_DEBUG
-     if (tid == 0 && kv_head_idx == 0 && seq < CASCADE_DEBUG_MAX_BEAM)
-     {
-         printf("[CASCADE WRITE_KV] seq=%d write_pos=%d k_after_rope[0]=%.6f\n",
-             seq, write_pos, k_val);
-     }
- #endif
- 
-     // --- Write V (no RoPE) ---
-     uint32_t const v_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_kv_heads * dim);
-     int const v_offset = seq * v_stride + kv_head_idx * dim + tid;
-     float v_val = to_float<T>(params.v[v_offset]);
- 
-     if (params.v_bias != nullptr)
-     {
-         v_val += to_float<T>(params.v_bias[kv_head_idx * dim + tid]);
-     }
- 
-     // Store V to cache.
-     {
-         auto const localTokenIdx = kv_cache_buffer.getKVTokenIdx(write_pos);
-         auto* vPtr = reinterpret_cast<T_cache*>(kv_cache_buffer.getVBlockPtr(seq, localTokenIdx));
-         auto const localOffset = kv_cache_buffer.getKVLocalIdx(localTokenIdx, kv_head_idx, dim, tid);
-         vPtr[localOffset] = from_float<T_cache>(v_val);
      }
  }
  
@@ -591,16 +501,6 @@
          }
          __syncthreads();
      }
- 
- #if CASCADE_DEBUG
-     if (tid == 0 && head_idx == CASCADE_DEBUG_HEAD && req_idx == 0 && beam_chunk == 0)
-     {
-         // M3 identifier: build timestamp + double-buffer marker.  If you see the
-         // literal string "PREFIX-TC-M3" below you are on the M3 binary.
-         printf("[CASCADE PREFIX-TC-M3 build=" __DATE__ " " __TIME__ " dbuf=1] h=%d r=%d chunk=%d prefix_len=%d Dh=%d\n",
-             head_idx, req_idx, beam_chunk, prefix_len, Dh);
-     }
- #endif
  
      // =====================================================================
      // Main loop over prefix tokens in tiles of TOKEN_TILE.
@@ -873,14 +773,6 @@
              }
          }
      }
- #if CASCADE_DEBUG
-     if (tid == 0 && head_idx == CASCADE_DEBUG_HEAD && req_idx == 0 && beam_chunk == 0)
-     {
-         int const row0 = req_idx * beam_width * num_heads + head_idx;
-         printf("[CASCADE PREFIX-TC done] m[0]=%.4f l[0]=%.4f out[0][0]=%.4f\n",
-             partial_m[row0], partial_l[row0], partial_out[row0 * Dh]);
-     }
- #endif
  }
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -937,6 +829,7 @@
      extern __shared__ float smem[];
      float* reduce = smem;          // THDS floats
      float* q_smem = reduce + THDS; // Dh floats
+     float* k_smem = q_smem + Dh;   // Dh floats (for K RoPE partner exchange)
  
      // Load Q for this (head, beam) into shared mem so threads can read each
      // other's channels during RoPE rotation.
@@ -964,17 +857,84 @@
  
      float const q_val = (tid < Dh) ? q_smem[tid] : 0.f;
  
- #if CASCADE_DEBUG
-     // Print Q[0] after RoPE for diagnostic.
-     if (tid == 0 && head_idx == CASCADE_DEBUG_HEAD && req_idx == 0 && beam_idx < CASCADE_DEBUG_MAX_BEAM)
+     // =====================================================================
+     // Fused Phase 0: compute the current step's K/V (bias + RoPE) and have
+     // the leader Q-head in each GQA group persist them to the KV cache so
+     // the next decode step sees them.  The per-channel values are also
+     // kept in registers (k_cur / v_cur) and reused for the tok==tlength
+     // round of the attention loop, avoiding an HBM write+read round-trip.
+     // =====================================================================
+     float k_cur = 0.f;
+     float v_cur = 0.f;
      {
-         int const _ilen = (params.input_lengths != nullptr) ? params.input_lengths[seq] : -1;
-         int const _lps  = (params.length_per_sample != nullptr) ? params.length_per_sample[seq] : -1;
-         printf("[CASCADE SUFFIX] beam=%d q_pos=%d input_lengths[seq]=%d length_per_sample[seq]=%d prefix_len=%d tlength=%d step=%d q[0]=%.6f q[1]=%.6f\n",
-             beam_idx, (params.length_per_sample[seq] - 1), _ilen, _lps, prefix_len, tlength,
-             (_lps - _ilen), q_smem[0], q_smem[1]);
+         int const num_kv_heads_eff = (num_kv_heads > 0) ? num_kv_heads : num_heads;
+         int const kv_group         = num_heads / num_kv_heads_eff;
+         bool const is_leader       = ((head_idx % kv_group) == 0);
+ 
+         // K/V share the same packed QKV per-sample stride as Q.
+         uint32_t const kv_stride = params.stride ? static_cast<uint32_t>(params.stride)
+                                                  : static_cast<uint32_t>(num_kv_heads_eff * Dh);
+         int const k_off = seq * kv_stride + kv_head_idx * Dh + tid;
+         int const v_off = seq * kv_stride + kv_head_idx * Dh + tid;
+         k_cur = to_float<T>(params.k[k_off]);
+         v_cur = to_float<T>(params.v[v_off]);
+ 
+         if (params.k_bias != nullptr)
+         {
+             k_cur += to_float<T>(params.k_bias[kv_head_idx * Dh + tid]);
+         }
+         if (params.v_bias != nullptr)
+         {
+             v_cur += to_float<T>(params.v_bias[kv_head_idx * Dh + tid]);
+         }
+ 
+         // Apply NeoX RoPE to K.  Matches baseline numerics: prefer the
+         // framework-provided cos_sin_cache when available.
+         if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)
+         {
+             k_smem[tid] = k_cur;
+             __syncthreads();
+ 
+             int const rotary_dim = params.rotary_embedding_dim;
+             if (tid < rotary_dim)
+             {
+                 int const half     = rotary_dim / 2;
+                 int const freq_idx = (tid < half) ? tid : (tid - half);
+                 float cos_a, sin_a;
+                 if (params.rotary_embedding_cos_sin_cache != nullptr)
+                 {
+                     float2 const* cache_base = params.rotary_embedding_cos_sin_cache
+                         + static_cast<int64_t>(tlength) * half;
+                     float2 cs = __ldg(&cache_base[freq_idx]);
+                     cos_a = cs.x;
+                     sin_a = cs.y;
+                 }
+                 else
+                 {
+                     cascade_rope_cs(tid, rotary_dim, tlength,
+                         params.rotary_embedding_base, params.rotary_embedding_scale, cos_a, sin_a);
+                 }
+                 float const val     = k_smem[tid];
+                 float const partner = (tid < half) ? k_smem[tid + half] : k_smem[tid - half];
+                 k_cur = (tid < half) ? (val * cos_a - partner * sin_a)
+                                      : (val * cos_a + partner * sin_a);
+             }
+             __syncthreads();
+         }
+ 
+         // Leader (one Q-head per GQA group) persists current K/V to cache.
+         if (is_leader)
+         {
+             auto const localTokenIdx = kv_cache_buffer.getKVTokenIdx(tlength);
+             auto* kPtr = reinterpret_cast<T_cache*>(kv_cache_buffer.getKBlockPtr(seq, localTokenIdx));
+             auto* vPtr = reinterpret_cast<T_cache*>(kv_cache_buffer.getVBlockPtr(seq, localTokenIdx));
+             auto const off = kv_cache_buffer.getKVLocalIdx(localTokenIdx, kv_head_idx, Dh, tid);
+             kPtr[off] = from_float<T_cache>(k_cur);
+             vPtr[off] = from_float<T_cache>(v_cur);
+         }
+         // No __threadfence needed: the next decode step is launched on the
+         // same stream and stream ordering guarantees cross-kernel visibility.
      }
- #endif
  
      float m = -FLT_MAX;
      float l = 0.f;
@@ -984,40 +944,22 @@
      int const* cache_indir = params.cache_indir;
  
      // tlength = position of the current decode token in the cache.
-     // Attention covers all suffix tokens INCLUDING the current one: [prefix_len, tlength].
-     // Phase 0 has already written the current K/V to cache[tlength].
-     for (int tok = prefix_len; tok <= tlength; ++tok)
+     // Attention covers all suffix tokens INCLUDING the current one.  Past
+     // tokens [prefix_len, tlength) are read from cache via cache_indir;
+     // the current token (tok == tlength) is handled separately below using
+     // k_cur / v_cur that we computed and (if leader) wrote to cache above.
+     for (int tok = prefix_len; tok < tlength; ++tok)
      {
-         // Resolve the physical beam this cached token came from.
-         // For the current token (tok == tlength), Phase 0 wrote K/V to this beam's
-         // own cache slot, and cache_indir hasn't been updated yet for this position
-         // (beam search runs AFTER attention). So skip indirection for current step.
+         // Resolve the physical beam this cached token came from via
+         // cache_indir (beam search's indirection table).
          int src_beam = beam_idx;
-         int indir_raw = -1;  // for diagnostic only
-         if (cache_indir != nullptr && tok < tlength)
+         if (cache_indir != nullptr)
          {
              int const indir_offset
                  = req_idx * beam_width * max_attention_window + beam_idx * max_attention_window + tok;
-             indir_raw = cache_indir[indir_offset];
- #if CASCADE_FORCE_NO_INDIR
-             // Diagnostic mode: ignore cache_indir, always self-pointing.
-             // src_beam stays as beam_idx; indir_raw still recorded for log.
- #else
-             src_beam = indir_raw;
- #endif
+             src_beam = cache_indir[indir_offset];
          }
          int const src_seq = req_idx * beam_width + src_beam;
- 
- #if CASCADE_DEBUG
-         // Per-token src_beam dump.  Compare beam-pair (e.g. 8 vs 9) at tok=prefix_len
-         // to see if cache_indir is returning swapped values across beams.
-         if (tid == 0 && head_idx == CASCADE_DEBUG_HEAD && req_idx == 0
-             && beam_idx < CASCADE_DEBUG_MAX_BEAM && tok < tlength)
-         {
-             printf("[CASCADE SUFFIX-INDIR] beam=%d tok=%d tlength=%d indir_raw=%d -> src_seq=%d\n",
-                 beam_idx, tok, tlength, indir_raw, src_seq);
-         }
- #endif
  
          float k_val = to_float<T_cache>(load_k<T_cache>(kv_cache_buffer, src_seq, tok, kv_head_idx, dim, tid));
          float v_val = to_float<T_cache>(load_v<T_cache>(kv_cache_buffer, src_seq, tok, kv_head_idx, dim, tid));
@@ -1025,21 +967,26 @@
          float partial = q_val * k_val;
          float qk = block_sum<THDS>(partial, reduce) * inv_sqrt_dh;
  
- #if CASCADE_DEBUG
-         if (tid == 0 && head_idx == CASCADE_DEBUG_HEAD && req_idx == 0 && beam_idx < CASCADE_DEBUG_MAX_BEAM)
-         {
-             printf("[CASCADE SUFFIX] beam=%d tok=%d src_beam=%d qk=%.6f k[0]=%.6f v[0]=%.6f\n",
-                 beam_idx, tok, src_beam, qk,
-                 to_float<T_cache>(load_k<T_cache>(kv_cache_buffer, src_seq, tok, kv_head_idx, dim, 0)),
-                 to_float<T_cache>(load_v<T_cache>(kv_cache_buffer, src_seq, tok, kv_head_idx, dim, 0)));
-         }
- #endif
- 
          float new_m = fmaxf(m, qk);
          float scale = expf(m - new_m);
          float p = expf(qk - new_m);
          l = l * scale + p;
          v_acc = v_acc * scale + p * v_val;
+         m = new_m;
+     }
+ 
+     // Current step (tok == tlength): use K/V from registers — cache_indir
+     // has not yet been updated for this position (beam search runs AFTER
+     // attention), so the current step is always self-pointing.
+     {
+         float partial = q_val * k_cur;
+         float qk = block_sum<THDS>(partial, reduce) * inv_sqrt_dh;
+ 
+         float new_m = fmaxf(m, qk);
+         float scale = expf(m - new_m);
+         float p = expf(qk - new_m);
+         l = l * scale + p;
+         v_acc = v_acc * scale + p * v_cur;
          m = new_m;
      }
  
@@ -1085,100 +1032,18 @@
          out_val = 0.f;
      }
  
- #if CASCADE_DEBUG
-     if (tid == 0 && head_idx == CASCADE_DEBUG_HEAD && req_idx == 0 && beam_idx < CASCADE_DEBUG_MAX_BEAM)
-     {
-         printf("[CASCADE SUFFIX+MERGE] beam=%d m_p=%.4f l_p=%.4f m_s=%.4f l_s=%.4f has_p=%d has_s=%d out[0]=%.6f\n",
-             beam_idx, m_p, l_p, m_s, l_s, (int) has_p, (int) has_s, out_val);
-     }
- #endif
- 
      int const out_offset = seq * num_heads * Dh + head_idx * Dh + tid;
-     reinterpret_cast<T*>(params.out)[out_offset] = from_float<T>(out_val);
- }
- 
- ////////////////////////////////////////////////////////////////////////////////////////////////////
- //
- // Phase 3: numerically stable merge of prefix and suffix attention states.
- //
- // Grid:  ( num_heads, batch_size * beam_width )
- // Block: ( Dh threads )
- //
- ////////////////////////////////////////////////////////////////////////////////////////////////////
- 
- template <typename T, int Dh>
- __global__ void cascade_merge_kernel(Multihead_attention_params<T, false> params,
-     float const* __restrict__ partial_out_p, float const* __restrict__ partial_m_p, float const* __restrict__ partial_l_p,
-     float const* __restrict__ partial_out_s, float const* __restrict__ partial_m_s, float const* __restrict__ partial_l_s)
- {
-     int const head_idx = blockIdx.x;
-     int const seq = blockIdx.y;
-     int const tid = threadIdx.x;
- 
-     int const num_heads = params.num_heads;
-     int const dim = params.hidden_size_per_head;
-     if (dim != Dh || tid >= Dh)
-     {
-         return;
-     }
- 
-     int const row = seq * num_heads + head_idx;
-     float const m_p = partial_m_p[row];
-     float const l_p = partial_l_p[row];
-     float const m_s = partial_m_s[row];
-     float const l_s = partial_l_s[row];
- 
-     float const v_p = partial_out_p[row * Dh + tid];
-     float const v_s = partial_out_s[row * Dh + tid];
- 
-     // If suffix is empty (no decode tokens generated yet), m_s == -inf.
-     // Likewise, if prefix is empty, m_p == -inf. Handle both gracefully.
-     bool const has_p = (l_p > 0.f) && (m_p > -FLT_MAX / 2.f);
-     bool const has_s = (l_s > 0.f) && (m_s > -FLT_MAX / 2.f);
- 
-     float out_val;
-     if (has_p && has_s)
-     {
-         float const new_m = fmaxf(m_p, m_s);
-         float const ep = expf(m_p - new_m);
-         float const es = expf(m_s - new_m);
-         float const new_l = l_p * ep + l_s * es;
-         // v_p and v_s are UNNORMALIZED weighted sums: sum(exp(qk_j - m) * V_j).
-         // Rescale each to the common reference max (new_m), then normalize.
-         out_val = (v_p * ep + v_s * es) / fmaxf(new_l, 1e-30f);
-     }
-     else if (has_p)
-     {
-         out_val = v_p / fmaxf(l_p, 1e-30f);
-     }
-     else if (has_s)
-     {
-         out_val = v_s / fmaxf(l_s, 1e-30f);
-     }
-     else
-     {
-         out_val = 0.f;
-     }
- 
-     int const out_offset = seq * num_heads * Dh + head_idx * Dh + tid;
- 
- #if CASCADE_DEBUG
-     int const beam_width_dbg = params.beam_width;
-     int const req_idx_dbg = seq / beam_width_dbg;
-     int const beam_idx_dbg = seq % beam_width_dbg;
-     if (tid == 0 && head_idx == CASCADE_DEBUG_HEAD && req_idx_dbg == 0 && beam_idx_dbg < CASCADE_DEBUG_MAX_BEAM)
-     {
-         printf("[CASCADE MERGE] beam=%d m_p=%.4f l_p=%.4f m_s=%.4f l_s=%.4f has_p=%d has_s=%d out[0]=%.6f\n",
-             beam_idx_dbg, m_p, l_p, m_s, l_s, (int)has_p, (int)has_s, out_val);
-     }
- #endif
- 
      reinterpret_cast<T*>(params.out)[out_offset] = from_float<T>(out_val);
  }
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  //
  // Eligibility & launcher.
+ //
+ // Note: The former Phase 3 `cascade_merge_kernel` has been removed.  Its
+ // online-softmax merge logic is now fused into the tail of
+ // `cascade_suffix_decode_kernel` (see P1 fusion comment there), so the merge
+ // happens in registers without an extra kernel launch / DRAM round-trip.
  //
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  
@@ -1299,13 +1164,11 @@
  // making the launch path 100% graph-capture compatible (only kernel
  // launches happen at runtime).
  //
- // Layout of the single allocation:
+ // Layout of the single allocation (post-P1-fusion: suffix-side partials are
+ // kept in registers and merged in-kernel, so only prefix-side buffers remain):
  //   [out_p: batch*beam*heads*Dh floats]
- //   [out_s: batch*beam*heads*Dh floats]
  //   [m_p:   batch*beam*heads   floats]
  //   [l_p:   batch*beam*heads   floats]
- //   [m_s:   batch*beam*heads   floats]
- //   [l_s:   batch*beam*heads   floats]
  struct PersistentWorkspace
  {
      void* base = nullptr;
@@ -1386,7 +1249,9 @@
      size_t const stat_elems = static_cast<size_t>(total_seqs) * num_heads;
      size_t const out_bytes = out_elems * sizeof(float);
      size_t const stat_bytes = stat_elems * sizeof(float);
-     size_t const total_bytes = 2 * out_bytes + 4 * stat_bytes;
+     // Post-P1-fusion: only prefix-side out/m/l are persisted; suffix-side
+     // partials live in registers inside the fused suffix+merge kernel.
+     size_t const total_bytes = out_bytes + 2 * stat_bytes;
  
      // Persistent workspace: allocated ONCE on first call (during TRT warmup,
      // before graph capture). All subsequent calls (including during graph
@@ -1401,11 +1266,8 @@
      // Carve pointers from the contiguous workspace block.
      char* ws = static_cast<char*>(g_cascade_workspace.base);
      float* ws_out_p = reinterpret_cast<float*>(ws);
-     float* ws_out_s = reinterpret_cast<float*>(ws + out_bytes);
-     float* ws_m_p   = reinterpret_cast<float*>(ws + 2 * out_bytes);
-     float* ws_l_p   = reinterpret_cast<float*>(ws + 2 * out_bytes + stat_bytes);
-     float* ws_m_s   = reinterpret_cast<float*>(ws + 2 * out_bytes + 2 * stat_bytes);
-     float* ws_l_s   = reinterpret_cast<float*>(ws + 2 * out_bytes + 3 * stat_bytes);
+     float* ws_m_p   = reinterpret_cast<float*>(ws + out_bytes);
+     float* ws_l_p   = reinterpret_cast<float*>(ws + out_bytes + stat_bytes);
  
      // The prefix_len is NOT fetched to host. Instead, the device pointer
      // params.input_lengths is passed directly to the kernels, and each kernel
@@ -1427,22 +1289,10 @@
          if (!banner_printed.exchange(true))
          {
              fprintf(stderr,
-                 "[CASCADE M3+P1 BANNER] build=%s %s | Phase1=TC+cp.async+double-buffer+padding | Phase2=fused-merge | Dh=%d | CASCADE_DEBUG=%d | FORCE_NO_INDIR=%d\n",
-                 __DATE__, __TIME__, Dh, CASCADE_DEBUG, CASCADE_FORCE_NO_INDIR);
+                 "[CASCADE BANNER] [CASCADE BANNER] build=%s %s Dh=%d\n",
+                 __DATE__, __TIME__, Dh);
              fflush(stderr);
          }
-     }
- 
-     // Phase 0: Write current step's K/V to KV cache.
-     // Standard MMHA (HANDLE_KV=true) writes K/V as part of its execution.
-     // Since cascade fully replaces MMHA, we must write K/V ourselves FIRST.
-     {
-         int const num_kv_heads_actual = params.num_kv_heads > 0 ? params.num_kv_heads : num_heads;
-         dim3 grid_p0(num_kv_heads_actual, total_seqs);
-         dim3 block_p0(dh);
-         size_t const smem_p0 = dh * sizeof(float); // for RoPE rotation
-         cascade_write_kv_kernel<T, T_cache, KVCacheBuffer, Dh><<<grid_p0, block_p0, smem_p0, stream>>>(
-             params, kv_cache_buffer);
      }
  
      // Phase 1: shared-prefix attention (all beams share the same KV prefix).
@@ -1477,26 +1327,23 @@
              params, kv_cache_buffer, d_input_lengths, ws_out_p, ws_m_p, ws_l_p);
      }
  
-     // Phase 2 (FUSED): per-beam suffix decode + in-register merge with prefix.
-     // Grid Y = total_seqs: one block per (request, beam) pair.
-     // P1 fusion: reads Phase 1's prefix partial (ws_out_p / ws_m_p / ws_l_p)
-     // and writes params.out directly; no separate merge kernel is launched.
+     // Phase 2 (FUSED): Phase-0 write_kv + per-beam suffix decode + in-register
+     // merge with prefix.  Grid Y = total_seqs: one block per (request, beam).
+     // The leader Q-head in each GQA group writes the current step's K/V to
+     // cache; the other Q-heads keep K/V only in registers for their own use.
      {
          dim3 grid(num_heads, total_seqs);
          dim3 block(THDS);
-         // reduce(THDS) + q_smem(Dh)
-         size_t const smem_bytes = (THDS + Dh) * sizeof(float);
+         // reduce(THDS) + q_smem(Dh) + k_smem(Dh, for K RoPE partner exchange)
+         size_t const smem_bytes = (THDS + 2 * Dh) * sizeof(float);
          cascade_suffix_decode_kernel<T, T_cache, KVCacheBuffer, Dh><<<grid, block, smem_bytes, stream>>>(
              params, kv_cache_buffer, d_input_lengths, ws_out_p, ws_m_p, ws_l_p);
      }
  
-     // Phase 3 removed: merge is now fused into the tail of Phase 2.
-     // The suffix workspace (ws_out_s / ws_m_s / ws_l_s) is no longer written
-     // or read by any kernel; it remains allocated for ABI stability but can be
-     // reclaimed in a follow-up cleanup.
-     (void) ws_out_s;
-     (void) ws_m_s;
-     (void) ws_l_s;
+     // Phase 0 + Phase 3 removed: current-step K/V write is now done in the
+     // suffix kernel's prologue (leader-elected), and the prefix/suffix merge
+     // is fused into the suffix kernel's epilogue.  The workspace only carries
+     // prefix-side buffers, and we never leave the stream for launches.
  
      // No synchronization or deallocation needed. The workspace persists
      // across calls, and stream ordering guarantees correctness.
