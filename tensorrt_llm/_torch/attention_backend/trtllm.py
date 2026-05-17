@@ -131,6 +131,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # post-init assignment). 0 means non-sparse / not applicable.
     num_sparse_topk: int = 0
 
+    # Whether the kernel should use paged context FMHA. Derived from
+    # ``runtime_features`` in ``__post_init__``; ``TrtllmAttention.forward``
+    # then overrides it for SM-version / sparse-algorithm / MLA cases before
+    # dispatching. ``init=False`` so user code can't set it directly.
+    use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
+
     @property
     def max_seq_len(self) -> int:
         """
@@ -176,6 +182,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
+        # Initial value derived from runtime_features; further per-call
+        # overrides land in TrtllmAttention.forward().
+        self.use_paged_context_fmha = (
+            self.runtime_features.chunked_prefill
+            or self.runtime_features.cache_reuse
+            or self.runtime_features.has_speculative_draft_tokens
+        ) if self.runtime_features is not None else False
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:
@@ -1215,7 +1228,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
         sparse_args: AttentionSparseArgs,
-        use_paged_context_fmha: bool,
         compressed_kv_cache_pool_ptr: Optional[int],
         skip_softmax_threshold_scale_factor_prefill: Optional[float],
         skip_softmax_threshold_scale_factor_decode: Optional[float],
@@ -1429,7 +1441,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 rotary_embedding_scale_type,
                 rotary_embedding_scales,
                 rotary_embedding_max_position_info,
-                use_paged_context_fmha,
+                metadata.use_paged_context_fmha,
                 int(attention_input_type),
                 self.is_mla_enable,
                 forward_args.chunked_prefill_buffer_batch_size,
@@ -1515,7 +1527,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 rotary_embedding_scale_type,
                 rotary_embedding_scales,
                 rotary_embedding_max_position_info,
-                use_paged_context_fmha,
+                metadata.use_paged_context_fmha,
                 int(attention_input_type),
                 self.is_mla_enable,
                 forward_args.chunked_prefill_buffer_batch_size,
@@ -1583,26 +1595,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
 
-        use_paged_context_fmha = (
-            metadata.runtime_features.chunked_prefill
-            or metadata.runtime_features.cache_reuse
-            or metadata.runtime_features.has_speculative_draft_tokens
-        ) if metadata.runtime_features else False
-
+        # Initial value was set in metadata.__post_init__ from runtime_features.
+        # Apply per-call overrides here (SM version / sparse algorithm / MLA).
         # This is a workaround for https://nvbugs/5624818
         # Paged context FMHA is forced on SM90 for correctness
         if get_sm_version() == 90:
-            use_paged_context_fmha = True
+            metadata.use_paged_context_fmha = True
 
         # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
         # Force paged context FMHA so QKV preprocessing writes Q to q_buf_2_.
         if (self.sparse_attention_config is not None and getattr(
                 self.sparse_attention_config, 'algorithm', None) == 'mqa_gqa'):
-            use_paged_context_fmha = True
+            metadata.use_paged_context_fmha = True
 
         if self.is_mla_enable:
             # Context MLA uses separate qkv instead of paged_context_fmha
-            use_paged_context_fmha = False
+            metadata.use_paged_context_fmha = False
 
         output = forward_args.output
         output_sf = forward_args.output_sf
@@ -1615,7 +1623,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 is_quantize_output=forward_args.out_scale is not None,
                 metadata=metadata,
                 attention_mask=forward_args.attention_mask,
-                use_paged_context_fmha=use_paged_context_fmha,
+                use_paged_context_fmha=metadata.use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
                 is_gen_only=is_gen_only,
             )
@@ -1666,8 +1674,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.update_blackwell_first_sparse_mask_offset()
 
         self._run(q, k, v, output, output_sf, metadata, forward_args,
-                  sparse_args, use_paged_context_fmha,
-                  compressed_kv_cache_pool_ptr,
+                  sparse_args, compressed_kv_cache_pool_ptr,
                   skip_softmax_threshold_scale_factor_prefill,
                   skip_softmax_threshold_scale_factor_decode)
 
