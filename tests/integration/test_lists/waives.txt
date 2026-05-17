@@ -296,7 +296,7 @@ full:B200/perf/test_perf.py::test_perf[t5_3b] SKIP (bert_attention_plugin does n
 full:B200/perf/test_perf.py::test_perf[t5_base] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B200/perf/test_perf.py::test_perf[t5_large] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B300/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM" SKIP (https://nvbugs/6165866)
-full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_python_scheduler[ep4-mtp_nextn=2] SKIP (temporary debug for DGX_B200 PyTorch-2 disaggregated GPT-OSS logs)
+full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus_python_scheduler[ep4-mtp_nextn=2] SKIP (temporary debug for DGX_B200 PyTorch-2 disaggregated GPT-OSS logs) # rerun-7c4f9a2b
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-True-True] SKIP (temporary debug for DGX_B200 PyTorch-2 disaggregated GPT-OSS logs)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar_custom_op SKIP (temporary debug for DGX_B200 PyTorch-2 disaggregated GPT-OSS logs)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] SKIP (temporary debug for DGX_B200 PyTorch-2 disaggregated GPT-OSS logs)
