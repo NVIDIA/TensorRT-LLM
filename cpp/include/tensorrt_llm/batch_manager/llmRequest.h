@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1833,6 +1833,15 @@ public:
     [[nodiscard]] SizeType32 getAllocNewBlocksPerRequest() const
     {
         return mPerfMetrics.kvCacheMetrics.numNewAllocatedBlocks;
+    }
+
+    void updateKvCachePerfMetrics(
+        SizeType32 allocTotalBlocks, SizeType32 allocNewBlocks, SizeType32 reusedBlocks, SizeType32 missedBlocks)
+    {
+        updateAllocTotalBlocksPerRequest(allocTotalBlocks);
+        updateAllocNewBlocksPerRequest(allocNewBlocks);
+        updateReusedBlocksPerRequest(reusedBlocks);
+        updateMissedBlocksPerRequest(missedBlocks);
     }
 
     void updateReusedBlocksPerRequest(SizeType32 reusedBlocksPerRequest)

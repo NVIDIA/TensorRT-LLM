@@ -274,6 +274,8 @@ def create_draft_kv_cache_manager_maybe(
         max_beam_width=ad_config.max_beam_width,
         kv_connector_manager=None,  # KV connector manager not used in AutoDeploy (no disagg support)
         estimating_kv_cache=False,
+        enable_kv_cache_stats=ad_config.enable_iter_perf_stats
+        or getattr(ad_config, "return_perf_metrics", False),
     )
 
 

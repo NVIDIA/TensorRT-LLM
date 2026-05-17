@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -196,6 +196,8 @@ void initBindings(nb::module_& m)
         .def_prop_ro("alloc_total_blocks", &GenLlmReq::getAllocTotalBlocksPerRequest)
         .def_prop_ro("alloc_new_blocks", &GenLlmReq::getAllocNewBlocksPerRequest)
         .def("alloc_context_logits", &GenLlmReq::allocContextLogitsHost, nb::arg("vocab_size"), nb::arg("logit_dtype"))
+        .def("update_kv_cache_perf_metrics", &GenLlmReq::updateKvCachePerfMetrics, nb::arg("alloc_total_blocks"),
+            nb::arg("alloc_new_blocks"), nb::arg("reused_blocks"), nb::arg("missed_blocks"))
         .def_prop_ro("reused_blocks", &GenLlmReq::getReusedBlocksPerRequest)
         .def_prop_ro("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_prop_ro("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
