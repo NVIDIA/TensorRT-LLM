@@ -745,6 +745,12 @@ class AttentionForwardArgs:
         raise ValueError(
             f"Unexpected attention mask type: {self.attention_mask!r}")
 
+    @property
+    def effective_out_scale(self) -> Optional[torch.Tensor]:
+        """The thop ``out_scale`` kwarg picks ``out_scale_sf`` when the output
+        is NVFP4 (``output_sf is not None``), else the plain ``out_scale``."""
+        return self.out_scale_sf if self.output_sf is not None else self.out_scale
+
 
 @dataclass(kw_only=True, slots=True)
 class AttentionSparseArgs:
