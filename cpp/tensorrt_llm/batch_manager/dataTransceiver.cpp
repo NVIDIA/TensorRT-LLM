@@ -302,16 +302,21 @@ public:
         std::promise<void> promise;
         auto future = promise.get_future();
         llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+        size_t readyResponseCount{0};
         {
             {
                 std::scoped_lock lkResp(mSenderMutex);
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
+                readyResponseCount = mReadyResponses.size();
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
         }
         mSenderCv.notify_all();
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheSender sendAsync queued: requestId=%zu selfIdx=%d device=%d readyResponses=%zu",
+            llmRequest.mRequestId, mSelfState.getCommState().value().getSelfIdx(), mDeviceId, readyResponseCount);
         return future;
     }
 
@@ -356,6 +361,16 @@ public:
     {
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
+
+        if (isAgent)
+        {
+            TLLM_LOG_INFO(
+                "[disagg-debug] C++ CacheSender recvRequestInfo wait: selfIdx=%d device=%d localAgent=%s "
+                "terminate=%d managerRunning=%d",
+                mSelfState.getCommState().value().getSelfIdx(), mDeviceId,
+                agentConnectionManager->getAgentName().c_str(), static_cast<int>(mTerminate.load()),
+                static_cast<int>(mManager->isRunning()));
+        }
 
         TransceiverTag::Id id;
         RequestInfo info;
@@ -635,6 +650,40 @@ private:
                 }
                 if (!mReadyResponses.empty())
                 {
+                    auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+                    std::ostringstream readyRequestIds;
+                    std::string currentRequest{"none"};
+                    size_t readyResponseCount{0};
+                    {
+                        std::scoped_lock lkResp(mSenderMutex);
+                        readyResponseCount = mReadyResponses.size();
+                        bool first = true;
+                        for (auto const& [requestId, response] : mReadyResponses)
+                        {
+                            (void) response;
+                            if (!first)
+                            {
+                                readyRequestIds << ",";
+                            }
+                            readyRequestIds << requestId;
+                            first = false;
+                        }
+                        if (mCurrentRequest.has_value())
+                        {
+                            currentRequest = std::to_string(mCurrentRequest.value());
+                        }
+                    }
+                    auto const readyRequestIdsString = readyRequestIds.str();
+                    TLLM_LOG_INFO(
+                        "[disagg-debug] C++ CacheSender response waiting for request-info: selfIdx=%d device=%d "
+                        "isAgent=%d localAgent=%s readyResponses=%zu readyRequestIds=[%s] currentRequest=%s "
+                        "anyReady=%d terminate=%d managerRunning=%d",
+                        mSelfState.getCommState().value().getSelfIdx(), mDeviceId,
+                        static_cast<int>(agentConnectionManager != nullptr),
+                        agentConnectionManager != nullptr ? agentConnectionManager->getAgentName().c_str() : "",
+                        readyResponseCount, readyRequestIdsString.c_str(), currentRequest.c_str(),
+                        static_cast<int>(mAnyReady), static_cast<int>(mTerminate.load()),
+                        static_cast<int>(mManager->isRunning()));
                     auto const& requestInfo = recvRequestInfo();
                     if (mTerminate || !mManager->isRunning())
                     {
