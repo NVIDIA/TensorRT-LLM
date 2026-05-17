@@ -392,6 +392,7 @@ public:
 
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
+        size_t connectionCount = 0;
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(requestId);
@@ -405,12 +406,13 @@ public:
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
-            TLLM_LOG_INFO(
-                "[disagg-debug] C++ CacheSender request-info received: requestId=%zu selfIdx=%d "
-                "peerSelfIdx=%d peerIdx=%d counterpartCount=%zu connections=%zu",
-                requestId, mSelfState.getCommState().value().getSelfIdx(), peerSelfIdx, peerIdx, allCounterparts.size(),
-                it->second.getConnections().size());
+            connectionCount = it->second.getConnections().size();
         }
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheSender request-info received: requestId=%zu selfIdx=%d "
+            "peerSelfIdx=%d peerIdx=%d counterpartCount=%zu connections=%zu",
+            requestId, mSelfState.getCommState().value().getSelfIdx(), peerSelfIdx, peerIdx, allCounterparts.size(),
+            connectionCount);
         return info;
     }
 

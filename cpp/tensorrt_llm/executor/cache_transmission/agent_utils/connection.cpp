@@ -385,8 +385,6 @@ AgentConnectionManager::AgentConnectionManager(
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
     batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag)
 {
-    auto const startTime = std::chrono::steady_clock::now();
-    auto nextLogTime = startTime + std::chrono::seconds(60);
     while (!terminateFlag.load())
     {
         if (!mIsRunning)
@@ -395,23 +393,6 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
         }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
-        auto const now = std::chrono::steady_clock::now();
-        if (now >= nextLogTime)
-        {
-            size_t pendingNotificationCount = 0;
-            for (auto const& [agent, notifications] : mUnhandledNotifications)
-            {
-                pendingNotificationCount += notifications.size();
-            }
-            auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
-            TLLM_LOG_INFO(
-                "[disagg-debug] C++ recvConnectionAndRequestInfo still waiting: localAgent=%s "
-                "pendingAgents=%zu pendingNotifications=%zu elapsedMs=%lld terminate=%d running=%d",
-                mAgentName.c_str(), mUnhandledNotifications.size(), pendingNotificationCount,
-                static_cast<long long>(elapsedMs), static_cast<int>(terminateFlag.load()),
-                static_cast<int>(mIsRunning.load()));
-            nextLogTime = now + std::chrono::seconds(60);
-        }
         auto it = mUnhandledNotifications.begin();
         while (it != mUnhandledNotifications.end())
         {
