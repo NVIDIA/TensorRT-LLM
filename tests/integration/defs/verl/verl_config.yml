@@ -50,3 +50,4 @@ verl_config:
     - "Qwen/Qwen2.5-0.5B-Instruct"
     - "Qwen/Qwen2.5-1.5B-Instruct"
     - "Qwen/Qwen2.5-VL-7B-Instruct"
+    - "Qwen/Qwen2.5-7B-Instruct"
