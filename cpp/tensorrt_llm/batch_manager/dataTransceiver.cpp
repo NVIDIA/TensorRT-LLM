@@ -405,6 +405,11 @@ public:
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
+            TLLM_LOG_INFO(
+                "[disagg-debug] C++ CacheSender request-info received: requestId=%zu selfIdx=%d "
+                "peerSelfIdx=%d peerIdx=%d counterpartCount=%zu connections=%zu",
+                requestId, mSelfState.getCommState().value().getSelfIdx(), peerSelfIdx, peerIdx, allCounterparts.size(),
+                it->second.getConnections().size());
         }
         return info;
     }
@@ -468,6 +473,10 @@ public:
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
             }
         }
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ CacheSender ready signal sent: requestId=%zu selfIdx=%d isReady=%d "
+            "connections=%zu",
+            requestId, mSelfState.getCommState().value().getSelfIdx(), static_cast<int>(isReady), connections.size());
     }
 
     ~Impl()
