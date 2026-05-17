@@ -1,7 +1,9 @@
-# Config for SuperV3 with MTP speculative decoding.
+# Config for SuperV3 with MTP speculative decoding, WS=4 (4-GPU EP+BMM sharding).
+# Derived from super_v3_mtp.yaml with world_size: 4 to enable sharding.
 #
 runtime: trtllm
 compile_backend: torch-cudagraph
+world_size: 4
 max_batch_size: 64
 max_seq_len: 8192
 max_num_tokens: 2048
@@ -13,6 +15,8 @@ cuda_graph_config:
   max_batch_size: 64
   enable_padding: true
 kv_cache_config:
+  # tunable mamba cache dtype
+  # --> use float32 for accuracy and default (auto) for speed
   mamba_ssm_cache_dtype: auto
 speculative_config:
   decoding_type: MTP
