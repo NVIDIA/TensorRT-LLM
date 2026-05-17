@@ -238,7 +238,9 @@ class CommittedPage(Page):
         # block may be None when rebase happens, i.e. another block with the same key is committed,
         # replacing it, but the page is still used by a _KVCache.
         if block is not None:
-            block.unset_page(
+            block.unlink_page(self.life_cycle)
+            Block.clear_stale_blocks_after_page_unlink(
+                block,
                 self.life_cycle,
                 self.manager._life_cycles.get_life_cycle(self.life_cycle),
             )

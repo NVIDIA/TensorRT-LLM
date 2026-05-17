@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, chunked, filled_list, unwrap_rawref
+from ._utils import TypedIndexList, chunked, filled_list, typed_enumerate, unwrap_rawref
 
 if TYPE_CHECKING:
     from ._page import CommittedPage
@@ -100,34 +100,40 @@ def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
     return node
 
 
-def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"]]:
+def detach_next(parent: "Block | RootBlock", key: BlockKey) -> "Block | None":
+    child = parent.next.pop(key, None)
+    if child is None:
+        return None
+
+    child._prev = rawref.NULL
+    if isinstance(parent, RootBlock) and not parent.next:
+        tree = parent._prev()
+        if tree is not None and parent.key in tree.next:
+            detached_root = tree.next.pop(parent.key)
+            parent._prev = rawref.NULL
+            assert detached_root is parent
+    return child
+
+
+def remove_subtree(root: "Block") -> None:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
-    ret: list[rawref.ref["CommittedPage"]] = []
-    block: "RootBlock | Block" = root
+    # ~Block() / __del__() handles page cleanup (nulling back-pointers, excludeFromEviction).
+    block: Block = root
     while True:
         if block.next:
             block = next(iter(block.next.values()))
         else:
-            if isinstance(block, Block):
-                ret.extend(p for p in block.storage if p is not None)
-                block.storage = filled_list(None, block.num_life_cycles)
-            assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
-                "Storage is not cleared, yet"
-            )
             if block._prev() is None:
                 assert block is root
                 break
-            prev_block: Block | RootBlock | BlockRadixTree = block.prev
-            # Because Block.__del__() may remove RootBlock from BlockRadixTree, we need to check here.
-            # It may not be in prev_block.next when block is RootBlock.
-            if block.key in prev_block.next:
-                prev_block.next.pop(block.key)
+            prev_block: Block | RootBlock = block.prev
+            detached = detach_next(prev_block, block.key)
+            assert detached is block
             if block is root:
                 break
-            assert not isinstance(prev_block, BlockRadixTree)
+            assert isinstance(prev_block, Block)
             block = prev_block
-    return ret
 
 
 def traverse_post_order(root: "Block") -> Iterator["Block"]:
@@ -288,20 +294,20 @@ class Block:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
         for k in to_remove:
-            b = prev.next.pop(k)
+            b = detach_next(prev, k)
+            assert isinstance(b, Block)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
         prev.next[self.key] = self
 
     def __del__(self) -> None:
-        for ref in self.storage:
+        for lc_idx, ref in typed_enumerate(self.storage):
             if ref is not None and ref() is not None:
                 page = unwrap_rawref(ref)
+                self.unlink_page(lc_idx)
                 if page.status == PageStatus.DROPPABLE:
                     if page.scheduled_for_eviction:
                         page.manager.exclude_from_eviction(page)
-        if self._prev() is not None and isinstance(self.prev, RootBlock) and not self.prev.next:
-            self.prev.prev.next.pop(self.prev.key)
         self.__rawref__.invalidate()
 
     def _partial_match_this_node(self, tokens: TokenBlock) -> int:
@@ -321,31 +327,35 @@ class Block:
     def prev(self) -> "Block | RootBlock":
         return unwrap_rawref(self._prev)
 
-    def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
-        if self.storage[lc_idx] is None:
-            return
-        ordinal = self.ordinal
-        self.storage[lc_idx] = None
+    def unlink_page(self, lc_idx: LifeCycleId) -> None:
+        page_ref = self.storage[lc_idx]
+        if page_ref is not None:
+            page = page_ref()
+            if page is not None:
+                page.block = rawref.NULL
+            self.storage[lc_idx] = None
+
+    @staticmethod
+    def clear_stale_blocks_after_page_unlink(
+        start: "Block", lc_idx: LifeCycleId, lc: LifeCycle
+    ) -> None:
+        assert start.storage[lc_idx] is None
+        ordinal = start.ordinal
         if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
-            pages = remove_subtree(self)
-            for r in pages:
-                if r() is not None:
-                    page = unwrap_rawref(r)
-                    assert page.status == PageStatus.DROPPABLE
-                    if page.scheduled_for_eviction:
-                        page.manager.exclude_from_eviction(page)
+            remove_subtree(start)
         # It's possible to implement more sophisticated logic to remove useless blocks for SWA, e.g.
         # check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
         # But for simplicity, we leave it for now.
-        curr = self
+        curr = start
         while (
             (isinstance(curr, Block) and curr.storage[lc_idx] is None)
             and not curr.next
             and curr._prev() is not None
         ):
-            if curr.key in curr.prev.next:
-                curr.prev.next.pop(curr.key)
-            curr = curr.prev
+            prev = curr.prev
+            detached = detach_next(prev, curr.key)
+            assert detached is curr
+            curr = prev
 
     @property
     def tokens_per_block(self) -> int:
@@ -359,7 +369,9 @@ class Block:
 
     @property
     def is_orphan(self) -> bool:
-        return self.key not in self.prev.next or self.prev.next[self.key] is not self
+        prev = self._prev()
+        assert prev is None or (self.key in prev.next and prev.next[self.key] is self)
+        return prev is None
 
 
 class BlockRadixTree:
@@ -396,15 +408,16 @@ class BlockRadixTree:
     def num_life_cycles(self) -> LifeCycleId:
         return self.life_cycles.size
 
-    def clear(self) -> list[rawref.ref["CommittedPage"]]:
+    def clear(self) -> None:
         # taking O(1) space
         # remove leaf blocks one by one, in post-order
-        ret: list[rawref.ref["CommittedPage"]] = []
+        # ~Block() / __del__() handles page cleanup.
+        # detach_next() auto-prunes empty RootBlocks from the tree.
         while self.next:
-            block = next(iter(self.next.values()))
-            ret.extend(remove_subtree(block))
+            root = next(iter(self.next.values()))
+            while root.next:
+                remove_subtree(next(iter(root.next.values())))
         assert not self.next
-        return ret
 
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to
     # tokens_per_block except the last one.

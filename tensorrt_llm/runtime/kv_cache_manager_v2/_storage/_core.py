@@ -604,7 +604,10 @@ class GpuPoolGroup(PoolGroupBase):
             slot_size_list,
             lambda slot_size: GpuSlotPool(
                 slot_size,
-                round_down(int(total_gpu_memory * slot_size / max_slot_size), phys_mem_size),
+                max(
+                    round_down(int(total_gpu_memory * slot_size / max_slot_size), phys_mem_size),
+                    round_up(num_slots * slot_size, phys_mem_size),
+                ),
                 shared_phys_mem_pool,
                 num_slots,
             ),

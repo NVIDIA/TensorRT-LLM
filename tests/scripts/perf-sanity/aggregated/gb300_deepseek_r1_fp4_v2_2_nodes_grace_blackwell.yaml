@@ -30,6 +30,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
+      use_kv_cache_manager_v2: true
     speculative_config:
       decoding_type: 'MTP'
       max_draft_len: 1
@@ -67,6 +68,7 @@ server_configs:
       dtype: 'fp8'
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
+      use_kv_cache_manager_v2: true
     speculative_config:
       decoding_type: 'MTP'
       max_draft_len: 1
@@ -98,6 +100,7 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       free_gpu_memory_fraction: 0.5
+      use_kv_cache_manager_v2: true
     speculative_config:
       decoding_type: 'MTP'
       max_draft_len: 3
