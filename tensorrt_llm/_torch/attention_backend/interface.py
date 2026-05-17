@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
-from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
-                                     RotaryScalingType)
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RopeEmbeddingUtils, RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -708,7 +708,8 @@ class AttentionForwardArgs:
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
-    mrope_config: Optional[dict] = None
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
+    mrope_position_deltas: Optional[torch.Tensor] = None
 
     softmax_stats_tensor: Optional[torch.Tensor] = None
     chunked_prefill_buffer_batch_size: int = 1
@@ -726,10 +727,64 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
-    enable_attn_nvfp4_output: bool = True
     topk_indices: Optional[torch.Tensor] = None
     is_generation: bool = False
 
+    @property
+    def mask_type(self) -> int:
+        """Translated form of ``attention_mask`` consumed by ``thop.attention``.
+
+        Mirrors the legacy ``TrtllmAttention._get_mask_type`` for the predefined
+        cases. Other backends read ``attention_mask`` directly and don't touch
+        this property.
+        """
+        if self.attention_mask == PredefinedAttentionMask.CAUSAL:
+            return int(AttentionMaskType.causal)
+        if self.attention_mask == PredefinedAttentionMask.FULL:
+            return int(AttentionMaskType.padding)
+        raise ValueError(
+            f"Unexpected attention mask type: {self.attention_mask!r}")
+
+
+@dataclass(kw_only=True, slots=True)
+class AttentionSparseArgs:
+    """Sparse-attention args that don't already live on
+    ``TrtllmAttention``/``TrtllmAttentionMetadata``/``AttentionForwardArgs``.
+
+    Built by the attention backend's ``_run`` from its own sparsity state.
+    Backends without sparse attention pass ``AttentionSparseArgs()`` (defaults).
+
+    Notes
+    -----
+    - ``num_sparse_topk`` is on ``TrtllmAttentionMetadata`` (default 0,
+      DSA overrides), not duplicated here.
+    - ``sparse_mla_topk_lens`` is always ``None`` in the current trtllm path —
+      passed as literal ``None`` at the wrapper site (see
+      :data:`_THOP_LITERAL_NONE`).
+    """
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+
+
+# AttentionForwardArgs fields intentionally NOT consumed by thop.attention.
+# The sync test (test_attention_op_sync.py) checks every other field has a
+# matching thop kwarg.
+_THOP_EXCLUDED_FIELDS: frozenset = frozenset({
+    "is_generation",  # consumed only by DSA (sparse/dsa.py)
+    "topk_indices",  # consumed only by DSA
+    "attention_mask",  # translated to thop's ``mask_type`` via @property
+    "attention_mask_data",  # not used by thop (separate code path)
+})
+
+# thop kwargs that are intentionally passed as literal ``None`` at the
+# wrapper site rather than sourced from any rich object. The sync test
+# allowlists these.
+_THOP_LITERAL_NONE: frozenset = frozenset({
+    "sparse_mla_topk_lens",  # always None in the current trtllm path
+})
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
     AttentionForwardArgs.__dataclass_fields__)

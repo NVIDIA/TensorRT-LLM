@@ -22,9 +22,9 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_args)
+                        AttentionSparseArgs, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, merge_attention_forward_args)
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
@@ -126,6 +126,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _flash_mla_metadata_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
+
+    # Top-k count used by sparse-attention backends (DSA overrides via
+    # post-init assignment). 0 means non-sparse / not applicable.
+    num_sparse_topk: int = 0
 
     @property
     def max_seq_len(self) -> int:
@@ -1210,18 +1214,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output_sf: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
+        sparse_args: AttentionSparseArgs,
         use_paged_context_fmha: bool,
-        sparse_kv_indices: Optional[torch.Tensor],
-        sparse_kv_offsets: Optional[torch.Tensor],
-        sparse_attn_indices: Optional[torch.Tensor],
-        sparse_attn_offsets: Optional[torch.Tensor],
-        sparse_attn_indices_block_size: int,
-        num_sparse_topk: int,
-        sparse_mla_topk_lens: Optional[torch.Tensor],
         compressed_kv_cache_pool_ptr: Optional[int],
         skip_softmax_threshold_scale_factor_prefill: Optional[float],
         skip_softmax_threshold_scale_factor_decode: Optional[float],
     ) -> None:
+        # Unpack sparse_args for use in the existing positional call sites.
+        # (Subsequent refactor step will move these into a `_call_thop_attention`
+        # wrapper that destructures at the call site.)
+        sparse_kv_indices = sparse_args.sparse_kv_indices
+        sparse_kv_offsets = sparse_args.sparse_kv_offsets
+        sparse_attn_indices = sparse_args.sparse_attn_indices
+        sparse_attn_offsets = sparse_args.sparse_attn_offsets
+        sparse_attn_indices_block_size = sparse_args.sparse_attn_indices_block_size
+        num_sparse_topk = metadata.num_sparse_topk
+        sparse_mla_topk_lens = None  # always None in current trtllm path
         is_fused_qkv = not metadata.is_cross and k is None
         update_kv_cache = not metadata.is_cross or k is not None
         assert (is_fused_qkv and k is None
@@ -1328,12 +1336,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_scale_quant_orig = (self.kv_scale_quant_orig
                                if forward_args.kv_scales_sf is None else
                                forward_args.kv_scales_sf)
-        mrope_rotary_cos_sin = forward_args.mrope_config.get(
-            'mrope_rotary_cos_sin'
-        ) if forward_args.mrope_config is not None else None
-        mrope_position_deltas = forward_args.mrope_config.get(
-            'mrope_position_deltas'
-        ) if forward_args.mrope_config is not None else None
+        mrope_rotary_cos_sin = forward_args.mrope_rotary_cos_sin
+        mrope_position_deltas = forward_args.mrope_position_deltas
         workspace = metadata.workspace if not metadata.is_cuda_graph else metadata.cuda_graph_workspace
         flash_mla_tile_scheduler_metadata = (
             metadata.flash_mla_tile_scheduler_metadata
@@ -1619,12 +1623,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             output = outputs[0]
             output_sf = outputs[1] if len(outputs) == 2 else None
 
-        sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
-        sparse_attn_indices_block_size = 1
+        sparse_args = AttentionSparseArgs()
         skip_softmax_threshold_scale_factor_prefill = None
         skip_softmax_threshold_scale_factor_decode = None
-        num_sparse_topk = getattr(metadata, 'num_sparse_topk', 0)
-        sparse_mla_topk_lens = None
         compressed_kv_cache_pool_ptr = None
         if self.sparse_attention_config is not None:
             if isinstance(self.sparse_attention_config,
@@ -1637,7 +1638,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     q, k, metadata, forward_args)
                 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
                     q, k, metadata, forward_args)
-                sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
+                sparse_args = AttentionSparseArgs(
+                    sparse_kv_indices=sparse_kv_indices,
+                    sparse_kv_offsets=sparse_kv_offsets,
+                    sparse_attn_indices=sparse_attn_indices,
+                    sparse_attn_offsets=sparse_attn_offsets,
+                    sparse_attn_indices_block_size=self.sparse_attention_config.
+                    get_indices_block_size(),
                 )
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
@@ -1659,10 +1666,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.update_blackwell_first_sparse_mask_offset()
 
         self._run(q, k, v, output, output_sf, metadata, forward_args,
-                  use_paged_context_fmha, sparse_kv_indices, sparse_kv_offsets,
-                  sparse_attn_indices, sparse_attn_offsets,
-                  sparse_attn_indices_block_size, num_sparse_topk,
-                  sparse_mla_topk_lens, compressed_kv_cache_pool_ptr,
+                  sparse_args, use_paged_context_fmha,
+                  compressed_kv_cache_pool_ptr,
                   skip_softmax_threshold_scale_factor_prefill,
                   skip_softmax_threshold_scale_factor_decode)
 

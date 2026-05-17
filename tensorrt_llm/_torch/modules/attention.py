@@ -718,14 +718,6 @@ class Attention(nn.Module):
         if v is not None:
             v = v[:num_tokens, :]
 
-        mrope_config = None
-        if mrope_rotary_cos_sin is not None or mrope_position_deltas is not None:
-            mrope_config = dict()
-            if mrope_rotary_cos_sin is not None:
-                mrope_config["mrope_rotary_cos_sin"] = mrope_rotary_cos_sin
-            if mrope_position_deltas is not None:
-                mrope_config["mrope_position_deltas"] = mrope_position_deltas
-
         # Helix CP generation path: get partial outputs with softmax stats,
         # then exchange and combine across CP ranks.
         # NOTE: The helix post-process combine step works on unquantized
@@ -747,7 +739,8 @@ class Attention(nn.Module):
                 attn_metadata,
                 forward_args=AttentionForwardArgs(
                     attention_mask=attention_mask,
-                    mrope_config=mrope_config,
+                    mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+                    mrope_position_deltas=mrope_position_deltas,
                     attention_window_size=attention_window_size,
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
@@ -785,7 +778,8 @@ class Attention(nn.Module):
                 kv_scales_sf=kv_scales_sf,
                 kv_scales_sf_inv=kv_scales_sf_inv,
                 attention_mask=attention_mask,
-                mrope_config=mrope_config,
+                mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+                mrope_position_deltas=mrope_position_deltas,
                 attention_window_size=attention_window_size,
                 attention_mask_data=attention_mask_data,
                 output=output[:num_tokens, :] if output is not None else None,
