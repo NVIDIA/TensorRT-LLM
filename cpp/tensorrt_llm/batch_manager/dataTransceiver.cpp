@@ -184,22 +184,6 @@ int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
-std::string ranksToString(std::vector<SizeType32> const& ranks)
-{
-    std::ostringstream os;
-    os << "[";
-    for (size_t i = 0; i < ranks.size(); i++)
-    {
-        if (i > 0)
-        {
-            os << ",";
-        }
-        os << ranks[i];
-    }
-    os << "]";
-    return os.str();
-}
-
 std::filesystem::path getTransferOutputPath(char const* tag)
 {
     namespace fs = std::filesystem;
@@ -306,10 +290,6 @@ public:
         mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
         int asyncSendThreadNum = common::getEnvKVCacheSendMaxConcurrenceNum();
-        TLLM_LOG_INFO(
-            "[disagg-debug] C++ CacheSender initialized: selfIdx=%d commSelfIdx=%d device=%d "
-            "asyncSendThreadNum=%d",
-            selfIndex, mSelfState.getCommState().value().getSelfIdx(), mDeviceId, asyncSendThreadNum);
         for (int i = 0; i < asyncSendThreadNum; i++)
         {
             mAsyncSendFutures.emplace_back(
@@ -322,22 +302,16 @@ public:
         std::promise<void> promise;
         auto future = promise.get_future();
         llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendAsync enqueue begin: requestId=%zu state=%d",
-            llmRequest.mRequestId, static_cast<int>(llmRequest.getState()));
         {
             {
                 std::scoped_lock lkResp(mSenderMutex);
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ CacheSender sendAsync queued response: requestId=%zu readyResponses=%zu",
-                    llmRequest.mRequestId, mReadyResponses.size());
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
         }
         mSenderCv.notify_all();
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendAsync enqueue end: requestId=%zu", llmRequest.mRequestId);
         return future;
     }
 
@@ -376,17 +350,12 @@ public:
             it->second.exportMeasure(mMeasuresFile, true);
         }
         mRequestToSession.erase(it);
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender release session: requestId=%zu remainingSessions=%zu", requestId,
-            mRequestToSession.size());
     }
 
     [[nodiscard]] RequestInfo recvRequestInfo()
     {
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender recvRequestInfo begin: selfIdx=%d isAgent=%d managerRunning=%d",
-            mSelfState.getCommState().value().getSelfIdx(), static_cast<int>(isAgent),
-            static_cast<int>(mManager->isRunning()));
 
         TransceiverTag::Id id;
         RequestInfo info;
@@ -413,12 +382,6 @@ public:
 
         auto requestId = info.getRequestId();
         mCacheTransferLayer.validateSupport(info.getTransState());
-        TLLM_LOG_INFO(
-            "[disagg-debug] C++ CacheSender recvRequestInfo got request: requestId=%zu peerSelfIdx=%d "
-            "selfIdx=%d",
-            requestId,
-            info.getTransState().getCommState().has_value() ? info.getTransState().getCommState()->getSelfIdx() : -1,
-            mSelfState.getCommState().value().getSelfIdx());
 
         auto allCounterparts = mCacheTransferLayer.computeCounterparts(
             mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
@@ -429,10 +392,6 @@ public:
 
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
-        TLLM_LOG_INFO(
-            "[disagg-debug] C++ CacheSender recvRequestInfo counterparts: requestId=%zu "
-            "allCounterparts=%s peerSelfIdx=%d peerIdx=%d dataTag=%d",
-            requestId, ranksToString(allCounterparts).c_str(), peerSelfIdx, peerIdx, tagFromRequestId(requestId));
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(requestId);
@@ -444,23 +403,8 @@ public:
                     !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ CacheSender recvRequestInfo created session: requestId=%zu "
-                    "connections=%zu",
-                    requestId, it->second.getConnections().size());
-            }
-            else
-            {
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ CacheSender recvRequestInfo reused session: requestId=%zu "
-                    "connections=%zu",
-                    requestId, it->second.getConnections().size());
             }
             it->second.setConnection(peerIdx, connection);
-            TLLM_LOG_INFO(
-                "[disagg-debug] C++ CacheSender recvRequestInfo set connection: requestId=%zu peerIdx=%d "
-                "peerSelfIdx=%d",
-                requestId, peerIdx, peerSelfIdx);
         }
         return info;
     }
@@ -474,14 +418,9 @@ public:
             TLLM_CHECK(it != mRequestToSession.end());
             session = std::addressof(it->second);
         }
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendSync begin: requestId=%zu connections=%zu dataTag=%d",
-            llmRequest.mRequestId, session->getConnections().size(), session->getDataContext().getTag());
         session->setLlmRequest(llmRequest);
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendSync format begin: requestId=%zu", llmRequest.mRequestId);
         mCacheTransferLayer.format(*session);
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendSync format end: requestId=%zu", llmRequest.mRequestId);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendSync end: requestId=%zu", llmRequest.mRequestId);
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -513,47 +452,22 @@ public:
             session = std::addressof(it->second);
         }
         auto const& connections = session->getConnections();
-        auto const& counterpartRanks = session->getCounterPartRanks();
-        TLLM_LOG_INFO(
-            "[disagg-debug] C++ CacheSender sendReadySignal begin: requestId=%zu isReady=%d "
-            "connections=%zu readyTag=%d dataTag=%d counterpartRanks=%s",
-            requestId, static_cast<int>(isReady), connections.size(), TransceiverTag::kREADY_SIGNAL_TAG,
-            session->getDataContext().getTag(), ranksToString(counterpartRanks).c_str());
         for (size_t i = 0; i < connections.size(); i++)
         {
-            int const counterpartRank = i < counterpartRanks.size() ? static_cast<int>(counterpartRanks[i]) : -1;
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ CacheSender sendReadySignal agent begin: requestId=%zu "
-                    "connectionIdx=%zu counterpartRank=%d isReady=%d",
-                    requestId, i, counterpartRank, static_cast<int>(isReady));
                 agentConnection->sendReadySignal(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, isReady);
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ CacheSender sendReadySignal agent end: requestId=%zu "
-                    "connectionIdx=%zu counterpartRank=%d isReady=%d",
-                    requestId, i, counterpartRank, static_cast<int>(isReady));
             }
             else
             {
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ CacheSender sendReadySignal legacy begin: requestId=%zu "
-                    "connectionIdx=%zu counterpartRank=%d isReady=%d",
-                    requestId, i, counterpartRank, static_cast<int>(isReady));
                 connections.at(i)->send(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ CacheSender sendReadySignal legacy end: requestId=%zu "
-                    "connectionIdx=%zu counterpartRank=%d isReady=%d",
-                    requestId, i, counterpartRank, static_cast<int>(isReady));
             }
         }
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendReadySignal end: requestId=%zu isReady=%d connections=%zu",
-            requestId, static_cast<int>(isReady), connections.size());
     }
 
     ~Impl()
@@ -607,12 +521,9 @@ private:
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendAndRemoveResponse begin: requestId=%zu", id);
             sendSync(*resp.mRequest);
-            TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendAndRemoveResponse sendSync done: requestId=%zu", id);
             release(id);
             resp.mPromise.set_value();
-            TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendAndRemoveResponse end: requestId=%zu", id);
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
@@ -630,8 +541,6 @@ private:
     void asyncSendAndRemoveResponse(RequestIdType id, Response resp) noexcept
     {
         std::unique_lock lk(mAsyncSendResource.mMtxForQueue);
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender asyncSendAndRemoveResponse queued: requestId=%zu queueBefore=%zu",
-            id, mAsyncSendResource.mSendQueue.size());
         mAsyncSendResource.mSendQueue.emplace_back(std::move(resp));
         mAsyncSendResource.mCVforQueue.notify_one();
     }
@@ -641,8 +550,6 @@ private:
         auto reqId = mCurrentRequest.value();
         auto count = --mRemainSendCount[reqId];
         TLLM_CHECK(count >= 0);
-        TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendResponse progress: requestId=%zu remainingBeforeReady=%d",
-            reqId, count);
         if (count == 0)
         {
             mRemainSendCount.erase(reqId);
@@ -656,8 +563,6 @@ private:
                     isReady = false;
                 }
             }
-            TLLM_LOG_INFO("[disagg-debug] C++ CacheSender sendResponse ready decision: requestId=%zu isReady=%d", reqId,
-                static_cast<int>(isReady));
             sendReadySignal(reqId, isReady);
 
             if (isReady)
@@ -706,7 +611,6 @@ private:
         {
             tensorrt_llm::common::setThreadName("dataTransResp");
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            TLLM_LOG_INFO("[disagg-debug] C++ CacheSender response thread start: device=%d", mDeviceId);
             while (!mTerminate || !mAnyReady)
             {
                 if (!mAnyReady)
@@ -716,7 +620,6 @@ private:
                 }
                 if (mTerminate)
                 {
-                    TLLM_LOG_INFO("[disagg-debug] C++ CacheSender response thread terminating");
                     break;
                 }
                 if (!mReadyResponses.empty())
@@ -731,19 +634,11 @@ private:
                     {
                         std::scoped_lock lk(mSenderMutex);
                         mCurrentRequest = reqId;
-                        TLLM_LOG_INFO(
-                            "[disagg-debug] C++ CacheSender response current request set: requestId=%zu "
-                            "readyResponses=%zu",
-                            reqId, mReadyResponses.size());
                     }
 
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
                         mRemainSendCount[reqId] = getCounterpartsCount(reqId);
-                        TLLM_LOG_INFO(
-                            "[disagg-debug] C++ CacheSender response initialized remaining count: "
-                            "requestId=%zu count=%d",
-                            reqId, mRemainSendCount[reqId]);
                     }
                 }
                 auto it = getCurrentResponse();

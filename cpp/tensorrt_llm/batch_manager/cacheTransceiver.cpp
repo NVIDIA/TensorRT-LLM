@@ -327,8 +327,6 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
 void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
-    TLLM_LOG_INFO("[disagg-debug] C++ respondAndSendAsync begin: requestId=%zu state=%d senderFutures=%zu",
-        llmRequest->mRequestId, static_cast<int>(llmRequest->getState()), mSenderFutures.size());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
     // If context phase params is already set, it means that the KV cache
     // transfer is already in progress.
@@ -338,16 +336,11 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         {
             TLLM_LOG_WARNING("Request %ld is already responding", llmRequest->mRequestId);
         }
-        TLLM_LOG_INFO(
-            "[disagg-debug] C++ respondAndSendAsync early return: requestId=%zu contextPhaseParamsAlreadySet=1",
-            llmRequest->mRequestId);
         return;
     }
     setContextState(llmRequest);
     auto future = mCacheSender->sendAsync(*llmRequest);
     mSenderFutures.emplace_back(llmRequest, std::move(future));
-    TLLM_LOG_INFO("[disagg-debug] C++ respondAndSendAsync queued: requestId=%zu ctxRequestId=%zu senderFutures=%zu",
-        llmRequest->mRequestId, llmRequest->getContextPhaseParams().value().getReqId(), mSenderFutures.size());
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -380,30 +373,18 @@ void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
 void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
-    auto const ctxRequestId
-        = llmRequest->getContextPhaseParams().has_value() ? llmRequest->getContextPhaseParams().value().getReqId() : 0;
-    TLLM_LOG_INFO(
-        "[disagg-debug] C++ requestAndReceiveAsync begin: requestId=%zu ctxRequestId=%zu state=%d "
-        "requesterFutures=%zu",
-        llmRequest->mRequestId, ctxRequestId, static_cast<int>(llmRequest->getState()), mRequesterFutures.size());
 
     if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
             [llmRequest](auto const& pair) { return pair.first->mRequestId == llmRequest->mRequestId; })
         != mRequesterFutures.end())
     {
         TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", llmRequest->mRequestId);
-        TLLM_LOG_INFO("[disagg-debug] C++ requestAndReceiveAsync duplicate ignored: requestId=%zu ctxRequestId=%zu",
-            llmRequest->mRequestId, ctxRequestId);
         return;
     }
 
     auto future = mCacheReceiver->receiveAsync(*llmRequest);
     mRequesterFutures.emplace_back(llmRequest, std::move(future));
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
-    TLLM_LOG_INFO(
-        "[disagg-debug] C++ requestAndReceiveAsync queued: requestId=%zu ctxRequestId=%zu "
-        "requesterFutures=%zu state=%d",
-        llmRequest->mRequestId, ctxRequestId, mRequesterFutures.size(), static_cast<int>(llmRequest->getState()));
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -504,11 +485,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
     bool blockAll = !atLeastRequestNum.has_value();
-    TLLM_LOG_INFO(
-        "[disagg-debug] C++ checkContextTransferStatus enter: atLeastRequestNum=%d blockAll=%d "
-        "markComplete=%d senderFutures=%zu",
-        atLeastRequestNum.value_or(-1), static_cast<int>(blockAll), static_cast<int>(markComplete),
-        mSenderFutures.size());
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
     // If blockAll is true, we want to block and not use a timeout
     if (!blockAll && mCacheTransceiverConfig.has_value())
@@ -520,15 +496,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
     for (auto&& [request, future] : mSenderFutures)
     {
-        auto const status = future.wait_for(std::chrono::milliseconds(0));
-        auto const ctxRequestId
-            = request->getContextPhaseParams().has_value() ? request->getContextPhaseParams().value().getReqId() : 0;
-        TLLM_LOG_INFO(
-            "[disagg-debug] C++ checkContextTransferStatus future probe: requestId=%zu ctxRequestId=%zu "
-            "ready=%d state=%d",
-            request->mRequestId, ctxRequestId, static_cast<int>(status == std::future_status::ready),
-            static_cast<int>(request->getState()));
-        if (status == std::future_status::ready)
+        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
             contextCompleteRequestIds.push_back(request->mRequestId);
         }
@@ -573,23 +541,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         toCompleteIdSet.insert(request->mRequestId);
     }
 
-    std::ostringstream selectedIds;
-    bool firstSelectedId = true;
-    for (auto const requestId : toCompleteIdSet)
-    {
-        if (!firstSelectedId)
-        {
-            selectedIds << ",";
-        }
-        selectedIds << requestId;
-        firstSelectedId = false;
-    }
-    TLLM_LOG_INFO(
-        "[disagg-debug] C++ checkContextTransferStatus selected requests: readyLocal=%zu freqVec=%zu "
-        "toComplete=%zu ids=[%s] timeoutMs=%d",
-        contextCompleteRequestIds.size(), freqVec.size(), toCompleteIdSet.size(), selectedIds.str().c_str(),
-        senderFutureTimeoutMs.value_or(-1));
-
     RequestStatuses requestsStatus{};
 
     // Complete all the requests in toCompleteIdSet
@@ -601,21 +552,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             try
             {
                 // Wait for up to a specified timeout
-                auto const ctxRequestId = request->getContextPhaseParams().has_value()
-                    ? request->getContextPhaseParams().value().getReqId()
-                    : 0;
-                TLLM_LOG_INFO(
-                    "[disagg-debug] C++ checkContextTransferStatus waiting on sender future: requestId=%zu "
-                    "ctxRequestId=%zu timeoutMs=%d blockAll=%d",
-                    request->mRequestId, ctxRequestId, senderFutureTimeoutMs.value_or(-1), static_cast<int>(blockAll));
                 auto status = future.wait_for(std::chrono::milliseconds(senderFutureTimeoutMs.value_or(0)));
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    TLLM_LOG_INFO(
-                        "[disagg-debug] C++ checkContextTransferStatus sender future completed: requestId=%zu "
-                        "ctxRequestId=%zu markComplete=%d",
-                        request->mRequestId, ctxRequestId, static_cast<int>(markComplete));
                     requestsStatus.completedRequestIds.insert(request->mRequestId);
                     if (markComplete)
                     {
@@ -627,10 +567,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 {
                     TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
                         senderFutureTimeoutMs.value());
-                    TLLM_LOG_INFO(
-                        "[disagg-debug] C++ checkContextTransferStatus sender future timeout: requestId=%zu "
-                        "ctxRequestId=%zu timeoutMs=%d",
-                        request->mRequestId, ctxRequestId, senderFutureTimeoutMs.value());
                     ++it;
                 }
                 else
