@@ -64,6 +64,7 @@ class MockPyExecutor:
     guided_decoder: Any
     drafter: Any
     resource_governor_queue: Any = None
+    garbage_collection_gen0_threshold: Optional[int] = None
 
 
 @dataclass

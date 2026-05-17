@@ -1420,5 +1420,6 @@ def create_autodeploy_executor(
         guided_decoder=guided_decoder,
         drafter=drafter,
         resource_governor_queue=resource_governor_queue,
+        garbage_collection_gen0_threshold=ad_config.garbage_collection_gen0_threshold,
     )
     return py_executor
