@@ -20,6 +20,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
+    KVCacheV2IterationStatsReport,
+    KVCacheV2PoolGroupIterationStats,
+)
 from tensorrt_llm.executor.base_worker import BaseWorker
 
 
@@ -196,3 +200,50 @@ class TestStatsSerializer:
         result = BaseWorker._stats_serializer((iter_stats, None))
         d = json.loads(result)
         assert "kvCacheIterationStats" not in d
+
+    def test_serializer_with_v2_pool_group_stats(self):
+        """KV cache manager V2 stats should include pool group breakdown."""
+        iter_stats = _make_mock_iteration_stats()
+        by_window = _make_mock_kv_iter_stats(
+            window_size=16,
+            primary_used=10,
+            primary_max=20,
+            reused=5,
+            full_reused=4,
+            partial_reused=1,
+            missed=3,
+            gen_alloc=2,
+        )
+        pool_group_stats = _make_mock_kv_iter_stats(
+            window_size=16,
+            primary_used=10,
+            primary_max=20,
+            reused=5,
+            full_reused=4,
+            partial_reused=1,
+            missed=3,
+            gen_alloc=2,
+        )[16]
+        kv_iter = KVCacheV2IterationStatsReport(
+            by_window,
+            {
+                7: KVCacheV2PoolGroupIterationStats(
+                    pool_group_id=7,
+                    slot_size=(2 << 20,),
+                    window_sizes=(16, 64),
+                    stats=pool_group_stats,
+                )
+            },
+        )
+
+        result = BaseWorker._stats_serializer((iter_stats, None, kv_iter))
+        d = json.loads(result)
+
+        assert d["kvCacheIterationStats"]["16"]["iterReusedBlocks"] == 5
+        assert "kvCacheIterationStatsByPoolGroup" in d
+        pool_group = d["kvCacheIterationStatsByPoolGroup"]["7"]
+        assert pool_group["poolGroupId"] == 7
+        assert pool_group["slotSize"] == [2 << 20]
+        assert pool_group["windowSizes"] == [16, 64]
+        assert pool_group["iterReusedBlocks"] == 5
+        assert pool_group["iterMissedBlocks"] == 3

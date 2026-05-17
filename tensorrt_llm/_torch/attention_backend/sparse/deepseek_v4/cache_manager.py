@@ -476,6 +476,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
+            enable_stats=self.enable_stats,
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
