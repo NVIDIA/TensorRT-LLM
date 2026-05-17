@@ -67,6 +67,22 @@ void logUnsupportedXQAConfig(char const* prefix, XQAParams const& xqaParams, int
         xqaParams.sink_token_length, xqaParams.skip_softmax_threshold_scale_factor, supportQGMMA, supportHMMA, supportMLA);
 }
 
+bool enableXqaMlaDebugSync()
+{
+    static bool const enabled = tensorrt_llm::common::getBoolEnv("XQA_MLA_DEBUG_SYNC");
+    return enabled;
+}
+
+void maybeSyncXqaMlaDebug(cudaStream_t stream, char const* stage)
+{
+    if (enableXqaMlaDebugSync())
+    {
+        TLLM_LOG_DEBUG("XQA MLA debug sync after %s", stage);
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+        TLLM_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 } // anonymous namespace
 
 TRTLLM_NAMESPACE_BEGIN
@@ -449,12 +465,19 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             auto* paddedQ = partialResults + partialResultBytes;
             auto* paddedOutput = paddedQ + roundUpTo128(paddedQBytes);
 
-            TLLM_LOG_DEBUG("Padding SM120 MLA XQA head group from %d to %d for the existing 128-head kernel.",
-                num_q_heads_over_kv, kXqaMlaKernelHeadGrpSize);
+            TLLM_LOG_DEBUG(
+                "Padding SM120 MLA XQA head group from %d to %d for the existing 128-head kernel: "
+                "tokens=%u real_q_pitch=%zu padded_q_pitch=%zu padded_q_bytes=%zu "
+                "real_output_pitch=%zu padded_output_pitch=%zu padded_output_bytes=%zu",
+                num_q_heads_over_kv, kXqaMlaKernelHeadGrpSize, xqaParams.total_num_input_tokens, realQPitch,
+                paddedQPitch, paddedQBytes, static_cast<size_t>(kXqaMlaOutputHeadSize) * xqaParams.num_q_heads
+                    * kXqaMlaOutputElemBytes,
+                paddedOutputPitch, paddedOutputBytes);
             TLLM_CUDA_CHECK(cudaMemsetAsync(paddedQ, 0, paddedQBytes, stream));
             TLLM_CUDA_CHECK(cudaMemcpy2DAsync(paddedQ, paddedQPitch, kernel_input_tokens, realQPitch, realQPitch,
                 xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
             TLLM_CUDA_CHECK(cudaMemsetAsync(paddedOutput, 0, paddedOutputBytes, stream));
+            maybeSyncXqaMlaDebug(stream, "SM120 MLA Q/output padding");
             kernelInputTokens = paddedQ;
             kernelOutput = reinterpret_cast<uint8_t*>(paddedOutput);
         }
@@ -481,12 +504,21 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             : 1U;
         dim3 const dimGrid{kXqaMlaCgaSize * inputSeqLen, multi_block, xqaParams.batch_size};
         dim3 const blockDim(128 * 3, 1, 1);
+        TLLM_LOG_DEBUG(
+            "Launching XQA MLA kernel: grid=(%u,%u,%u) block=(%u,%u,%u) cga=(%u,1,1) "
+            "input_seq_len=%u multi_block=%u total_tokens=%u num_q_heads=%d runtime_num_q_heads=%d "
+            "num_kv_heads=%d separate_reduce=%d padded=%d",
+            dimGrid.x, dimGrid.y, dimGrid.z, blockDim.x, blockDim.y, blockDim.z, kXqaMlaCgaSize, inputSeqLen,
+            multi_block, xqaParams.total_num_input_tokens, kernelXQAParams.num_q_heads, xqaParams.num_q_heads,
+            kernelXQAParams.num_kv_heads, useSeparateReduce, padMlaHeadGroup);
         cubinObj->launch(dimGrid, blockDim, stream, kernelParams, dim3{kXqaMlaCgaSize, 1, 1});
+        maybeSyncXqaMlaDebug(stream, "XQA MLA main kernel");
         if (useSeparateReduce && multi_block > 1)
         {
             cubinObj->launchMlaReduce(kernelOutput, partialResults,
                 reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths), multi_block, inputSeqLen,
                 xqaParams.total_num_input_tokens, stream);
+            maybeSyncXqaMlaDebug(stream, "XQA MLA separate reduce");
         }
         if (padMlaHeadGroup)
         {
@@ -496,6 +528,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
                 * kXqaMlaOutputElemBytes;
             TLLM_CUDA_CHECK(cudaMemcpy2DAsync(launchParams.output, realOutputPitch, kernelOutput, paddedOutputPitch,
                 realOutputPitch, xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
+            maybeSyncXqaMlaDebug(stream, "SM120 MLA output unpadding");
         }
     }
     else if (isSpecDec && isHMMAKernel)
