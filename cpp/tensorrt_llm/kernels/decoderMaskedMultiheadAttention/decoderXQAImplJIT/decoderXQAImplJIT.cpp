@@ -29,6 +29,8 @@
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace
 {
@@ -73,22 +75,73 @@ bool enableXqaMlaDebugSync()
     return enabled;
 }
 
+bool isStreamCapturing(cudaStream_t stream, char const* stage)
+{
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    TLLM_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, nullptr));
+    if (status != cudaStreamCaptureStatusNone)
+    {
+        TLLM_LOG_DEBUG("XQA MLA debug action after %s skipped because stream capture status is %d", stage,
+            static_cast<int>(status));
+        return true;
+    }
+    return false;
+}
+
 void maybeSyncXqaMlaDebug(cudaStream_t stream, char const* stage)
 {
     if (enableXqaMlaDebugSync())
     {
-        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-        TLLM_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream, &status, nullptr, nullptr, nullptr, nullptr));
-        if (status != cudaStreamCaptureStatusNone)
+        if (isStreamCapturing(stream, stage))
         {
-            TLLM_LOG_DEBUG("XQA MLA debug sync after %s skipped because stream capture status is %d", stage,
-                static_cast<int>(status));
             return;
         }
         TLLM_LOG_DEBUG("XQA MLA debug sync after %s", stage);
         TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
         TLLM_CUDA_CHECK(cudaGetLastError());
     }
+}
+
+bool enableXqaMlaNanCheck()
+{
+    static bool const enabled = tensorrt_llm::common::getBoolEnv("XQA_MLA_NAN_CHECK");
+    return enabled;
+}
+
+void maybeCheckXqaMlaBf16OutputForInvalid(
+    cudaStream_t stream, void const* output, uint32_t tokens, uint32_t heads, char const* stage)
+{
+    if (!enableXqaMlaNanCheck())
+    {
+        return;
+    }
+    if (isStreamCapturing(stream, stage))
+    {
+        return;
+    }
+
+    size_t const elems = static_cast<size_t>(tokens) * heads * kXqaMlaOutputHeadSize;
+    std::vector<uint16_t> host(elems);
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(
+        host.data(), output, elems * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    TLLM_CUDA_CHECK(cudaGetLastError());
+
+    for (size_t idx = 0; idx < elems; ++idx)
+    {
+        uint16_t const raw = host[idx];
+        if ((raw & 0x7F80U) == 0x7F80U)
+        {
+            size_t const col = idx % kXqaMlaOutputHeadSize;
+            size_t const head = (idx / kXqaMlaOutputHeadSize) % heads;
+            size_t const token = idx / (static_cast<size_t>(heads) * kXqaMlaOutputHeadSize);
+            TLLM_CHECK_WITH_INFO(false,
+                "XQA MLA BF16 output contains NaN/Inf after %s at token=%zu head=%zu col=%zu raw=0x%04x "
+                "(tokens=%u heads=%u)",
+                stage, token, head, col, static_cast<unsigned>(raw), tokens, heads);
+        }
+    }
+    TLLM_LOG_DEBUG("XQA MLA BF16 output NaN/Inf check passed after %s (tokens=%u heads=%u)", stage, tokens, heads);
 }
 
 } // anonymous namespace
@@ -538,6 +591,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
                 realOutputPitch, xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
             maybeSyncXqaMlaDebug(stream, "SM120 MLA output unpadding");
         }
+        maybeCheckXqaMlaBf16OutputForInvalid(stream, launchParams.output, xqaParams.total_num_input_tokens,
+            xqaParams.num_q_heads, "XQA MLA output");
     }
     else if (isSpecDec && isHMMAKernel)
     {
