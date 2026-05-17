@@ -77,6 +77,14 @@ void maybeSyncXqaMlaDebug(cudaStream_t stream, char const* stage)
 {
     if (enableXqaMlaDebugSync())
     {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        TLLM_CUDA_CHECK(cudaStreamGetCaptureInfo_v2(stream, &status, nullptr, nullptr, nullptr, nullptr));
+        if (status != cudaStreamCaptureStatusNone)
+        {
+            TLLM_LOG_DEBUG("XQA MLA debug sync after %s skipped because stream capture status is %d", stage,
+                static_cast<int>(status));
+            return;
+        }
         TLLM_LOG_DEBUG("XQA MLA debug sync after %s", stage);
         TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
         TLLM_CUDA_CHECK(cudaGetLastError());
