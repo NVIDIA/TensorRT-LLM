@@ -1218,6 +1218,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return AttentionMaskType.padding
         raise ValueError("Unexpected attention mask type")
 
+    @property
+    def skip_softmax_threshold_scale_factor_prefill(self) -> Optional[float]:
+        """Prefill threshold from ``SkipSoftmaxAttentionConfig``, else ``None``."""
+        if isinstance(self.sparse_attention_config, SkipSoftmaxAttentionConfig):
+            return self.sparse_attention_config.threshold_scale_factor_prefill
+        return None
+
+    @property
+    def skip_softmax_threshold_scale_factor_decode(self) -> Optional[float]:
+        """Decode threshold from ``SkipSoftmaxAttentionConfig``, else ``None``."""
+        if isinstance(self.sparse_attention_config, SkipSoftmaxAttentionConfig):
+            return self.sparse_attention_config.threshold_scale_factor_decode
+        return None
+
     def _run(
         self,
         q: torch.Tensor,
@@ -1228,9 +1242,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
         sparse_args: AttentionSparseArgs,
-        compressed_kv_cache_pool_ptr: Optional[int],
-        skip_softmax_threshold_scale_factor_prefill: Optional[float],
-        skip_softmax_threshold_scale_factor_decode: Optional[float],
     ) -> None:
         # Unpack sparse_args for use in the existing positional call sites.
         # (Subsequent refactor step will move these into a `_call_thop_attention`
@@ -1388,9 +1399,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 has_cross_kv=False,
                 quant_config=self.quant_config,
                 kv_cache_manager=metadata.kv_cache_manager,
-                skip_softmax_threshold_scale_factor_prefill=
+                skip_softmax_threshold_scale_factor_prefill=self.
                 skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=
+                skip_softmax_threshold_scale_factor_decode=self.
                 skip_softmax_threshold_scale_factor_decode,
         )[0]:
             trtllm_gen_attention(
@@ -1463,8 +1474,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_offsets,
                 sparse_attn_indices_block_size,
                 num_sparse_topk,
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode,
+                self.skip_softmax_threshold_scale_factor_prefill,
+                self.skip_softmax_threshold_scale_factor_decode,
                 self.skip_softmax_stat,
                 forward_args.cu_q_seqlens,
                 forward_args.cu_kv_seqlens,
@@ -1551,8 +1562,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size,
                 num_sparse_topk,
                 sparse_mla_topk_lens,
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode,
+                self.skip_softmax_threshold_scale_factor_prefill,
+                self.skip_softmax_threshold_scale_factor_decode,
                 self.skip_softmax_stat,
                 forward_args.cu_q_seqlens,
                 forward_args.cu_kv_seqlens,
@@ -1568,7 +1579,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 forward_args.sage_attn_qk_int8,
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
-                compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
+                compressed_kv_cache_pool_ptr=None,
             )
 
         if self.print_skip_softmax_stat:
@@ -1632,28 +1643,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             output_sf = outputs[1] if len(outputs) == 2 else None
 
         sparse_args = AttentionSparseArgs()
-        skip_softmax_threshold_scale_factor_prefill = None
-        skip_softmax_threshold_scale_factor_decode = None
-        compressed_kv_cache_pool_ptr = None
-        if self.sparse_attention_config is not None:
-            if isinstance(self.sparse_attention_config,
-                          SkipSoftmaxAttentionConfig):
-                skip_softmax_threshold_scale_factor_prefill = self.sparse_attention_config.threshold_scale_factor_prefill
-                skip_softmax_threshold_scale_factor_decode = self.sparse_attention_config.threshold_scale_factor_decode
-
-            else:
-                sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                    q, k, metadata, forward_args)
-                sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                    q, k, metadata, forward_args)
-                sparse_args = AttentionSparseArgs(
-                    sparse_kv_indices=sparse_kv_indices,
-                    sparse_kv_offsets=sparse_kv_offsets,
-                    sparse_attn_indices=sparse_attn_indices,
-                    sparse_attn_offsets=sparse_attn_offsets,
-                    sparse_attn_indices_block_size=self.sparse_attention_config.
-                    get_indices_block_size(),
-                )
+        if self.sparse_attention_config is not None and not isinstance(
+                self.sparse_attention_config, SkipSoftmaxAttentionConfig):
+            sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                q, k, metadata, forward_args)
+            sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+                q, k, metadata, forward_args)
+            sparse_args = AttentionSparseArgs(
+                sparse_kv_indices=sparse_kv_indices,
+                sparse_kv_offsets=sparse_kv_offsets,
+                sparse_attn_indices=sparse_attn_indices,
+                sparse_attn_offsets=sparse_attn_offsets,
+                sparse_attn_indices_block_size=self.sparse_attention_config.
+                get_indices_block_size(),
+            )
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
@@ -1674,9 +1677,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.update_blackwell_first_sparse_mask_offset()
 
         self._run(q, k, v, output, output_sf, metadata, forward_args,
-                  sparse_args, compressed_kv_cache_pool_ptr,
-                  skip_softmax_threshold_scale_factor_prefill,
-                  skip_softmax_threshold_scale_factor_decode)
+                  sparse_args)
 
         if output_sf is None:
             return output

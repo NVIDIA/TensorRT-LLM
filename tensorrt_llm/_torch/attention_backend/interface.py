@@ -784,6 +784,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset({
 # allowlists these.
 _THOP_LITERAL_NONE: frozenset = frozenset({
     "sparse_mla_topk_lens",  # always None in the current trtllm path
+    "compressed_kv_cache_pool_ptr",  # always None in the current trtllm path
 })
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
