@@ -833,7 +833,29 @@ class PyTorchModelEngine(ModelEngine):
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
+            # Pre-autotuner TP-group barrier. Ensures every rank has
+            # finished the previous `_general_warmup` collectives before
+            # any rank enters `_run_autotuner_warmup`, so collectives
+            # the autotuner issues internally find all peers.
+            #
+            # Without this and the post-autotuner barrier below, a rank
+            # that exits the autotuner instantly (e.g. when `Cache size
+            # after warmup is 0`) races ahead into the next
+            # collective-issuing `_general_warmup` step while a peer
+            # is still inside its own autotuner — the two collectives
+            # then mismatch and the slower rank's autotuner spins
+            # forever waiting for peers that have moved on, producing
+            # a silent hang with no error message. See
+            # bench-mewtwo/claude_opt/dsv4_autotuner_hang_fix_20260513.md.
+            if self.mapping.tp_size > 1:
+                self.dist.tp_barrier()
             self._run_autotuner_warmup(resource_manager)
+            # Post-autotuner TP-group barrier. Pair to the pre-autotuner
+            # barrier above; holds fast ranks until every rank has
+            # exited the autotuner before any issues the post-autotuner
+            # `_general_warmup` MoE all-to-all collective.
+            if self.mapping.tp_size > 1:
+                self.dist.tp_barrier()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
