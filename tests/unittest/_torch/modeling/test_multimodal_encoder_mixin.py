@@ -1,4 +1,4 @@
-"""Unit tests for `MmEncoderMixin`.
+"""Unit tests for `MultimodalEncoderMixin`.
 
 Verifies that the mixin's default `setup_attn_metadata` builds the encoder's
 AttentionMetadata exactly once with the runtime sizes injected by the engine
@@ -9,7 +9,7 @@ backend (and any GPU/CUDA dependency).
 
 import torch.nn as nn
 
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import MmEncoderMixin
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 
 
 class _StubMetadata:
@@ -19,7 +19,7 @@ class _StubMetadata:
         self.kwargs = kwargs
 
 
-class _DummyEncoder(nn.Module, MmEncoderMixin):
+class _DummyEncoder(nn.Module, MultimodalEncoderMixin):
     def __init__(self):
         super().__init__()
         self.metadata_cls = _StubMetadata
@@ -44,7 +44,7 @@ def test_setup_attn_metadata_builds_with_engine_sizes():
 
 def test_setup_attn_metadata_is_idempotent_per_call():
     """Subsequent calls overwrite the previous AttentionMetadata, which
-    matches how the engine drives `_set_up_mm_encoder_attn_metadata` (called
+    matches how the engine drives `_set_up_multimodal_encoder_attn_metadata` (called
     once at engine init; tests that multiple calls don't crash and that the
     last sizes win)."""
     encoder = _DummyEncoder()
@@ -68,7 +68,7 @@ def test_subclass_can_override_setup_attn_metadata():
     the override is honored and the default is not invoked."""
     captured = {}
 
-    class _OverridingEncoder(nn.Module, MmEncoderMixin):
+    class _OverridingEncoder(nn.Module, MultimodalEncoderMixin):
         def __init__(self):
             super().__init__()
             self.metadata_cls = _StubMetadata

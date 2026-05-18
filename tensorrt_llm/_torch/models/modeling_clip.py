@@ -16,7 +16,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
 from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
-from .modeling_multimodal_encoder import MmEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_utils import _load_weights_impl, register_auto_model
 
 
@@ -177,7 +177,7 @@ class CLIPVisionTransformer(nn.Module):
 
 
 @register_auto_model("CLIPVisionModel")
-class CLIPVisionModel(nn.Module, MmEncoderMixin):
+class CLIPVisionModel(nn.Module, MultimodalEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[CLIPVisionConfig]):
         super().__init__()

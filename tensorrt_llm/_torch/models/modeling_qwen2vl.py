@@ -65,7 +65,7 @@ except ImportError:
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import MmEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -1054,7 +1054,7 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         return hidden_states
 
 
-class Qwen2_5_VisionModel(torch.nn.Module, MmEncoderMixin):
+class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()

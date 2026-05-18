@@ -43,7 +43,7 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import MmEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
@@ -630,7 +630,7 @@ def _triton_pos_embed_interpolate(
     return output
 
 
-class Qwen3VisionModel(torch.nn.Module, MmEncoderMixin):
+class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config
