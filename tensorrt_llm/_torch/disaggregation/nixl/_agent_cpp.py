@@ -77,11 +77,9 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         cpp_agent = getattr(self, "_cpp_agent", None)
         if cpp_agent is None:
             return
-        try:
-            cpp_agent.shutdown()
-        except Exception:
-            pass
+        # Null out first so a re-entrant call after a raise is a no-op; errors propagate.
         self._cpp_agent = None
+        cpp_agent.shutdown()
 
     def __enter__(self):
         return self
