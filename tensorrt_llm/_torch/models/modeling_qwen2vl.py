@@ -258,8 +258,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
         factor = patch_size * merge_size
 
-        resized_w = max(self._round_to_factor(width, factor), factor)
-        resized_h = max(self._round_to_factor(height, factor), factor)
+        # Round half-up to the nearest multiple of ``factor`` (matches the
+        # smart_resize grid the HF Qwen-VL processor uses).
+        resized_w = max(((width + factor // 2) // factor) * factor, factor)
+        resized_h = max(((height + factor // 2) // factor) * factor, factor)
         grid_h = resized_h // patch_size
         grid_w = resized_w // patch_size
 
@@ -285,6 +287,13 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}")
 
+        def closest_factor_pair(n: int) -> Tuple[int, int]:
+            """Closest ``h*w=n`` to square; keeps dummy aspect ratio near 1:1."""
+            for d in range(math.isqrt(n), 0, -1):
+                if n % d == 0:
+                    return d, n // d
+            return 1, n
+
         cfg = self.config.vision_config
         patch_size = cfg.patch_size
         merge_size = cfg.spatial_merge_size
@@ -295,9 +304,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # post-merger units bounds the inner loop and lets us reuse the
         # familiar near-square factor pair for aspect ratio bounds.
         post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
-        h_factor, w_factor = self._closest_factor_pair(post_merger_budget)
+        h_factor, w_factor = closest_factor_pair(post_merger_budget)
         for seq_len in range(post_merger_budget, 0, -1):
-            h_f, w_f = self._closest_factor_pair(seq_len)
+            h_f, w_f = closest_factor_pair(seq_len)
             if w_f / max(h_f, 1) <= 200:
                 h_factor, w_factor = h_f, w_f
                 break
@@ -307,29 +316,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             "height": unit * h_factor,
             "num_frames": 1,
         }
-
-    @staticmethod
-    def _round_to_factor(value: int, factor: int) -> int:
-        """Round ``value`` to the nearest multiple of ``factor`` (half-up).
-
-        Matches the canonical resize-to-grid behavior used by Qwen-VL image
-        processors when assembling fixed-size patches.
-        """
-        if factor <= 0:
-            raise ValueError(f"factor must be positive, got {factor}")
-        return ((value + factor // 2) // factor) * factor
-
-    @staticmethod
-    def _closest_factor_pair(n: int) -> Tuple[int, int]:
-        """Return ``(h, w)`` with ``h*w == n`` and the smaller-first ordering.
-
-        Picks the factorization that is closest to a square so that
-        ``get_size_with_most_features`` prefers near-square dummy images.
-        """
-        for d in range(math.isqrt(n), 0, -1):
-            if n % d == 0:
-                return d, n // d
-        return 1, n
 
     @classmethod
     def _build_temporal_block(
