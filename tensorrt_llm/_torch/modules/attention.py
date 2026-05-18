@@ -2570,7 +2570,6 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
-            is_generation=True,  # used by DSA attention
             cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
             cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
             fmha_scheduler_counter=
@@ -2688,7 +2687,6 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
-            is_generation=False,  # used by DSA attention
         )
         fused_q = None
 

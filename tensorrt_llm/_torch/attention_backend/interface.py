@@ -728,7 +728,6 @@ class AttentionForwardArgs:
     sage_attn_qk_int8: bool = False
 
     topk_indices: Optional[torch.Tensor] = None
-    is_generation: bool = False
 
     @property
     def mask_type(self) -> int:
@@ -779,7 +778,6 @@ class AttentionSparseArgs:
 # wrapper. The sync test (test_attention_op_sync.py) checks every other field
 # has a matching thop kwarg or is read via a @property listed here.
 _THOP_EXCLUDED_FIELDS: frozenset = frozenset({
-    "is_generation",  # consumed only by DSA (sparse/dsa.py)
     "topk_indices",  # consumed only by DSA
     "attention_mask",  # input to the ``mask_type`` @property
     "attention_mask_data",  # not used by thop (separate code path)

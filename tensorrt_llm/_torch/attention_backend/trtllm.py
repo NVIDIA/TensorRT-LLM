@@ -1556,7 +1556,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
         if (_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active
                 and not use_sage_attn and trtllm_gen.is_supported(
-                    self, q, k, metadata, forward_args, sparse_args)[0]):
+                    self, q, k, v, metadata, forward_args, sparse_args)[0]):
             trtllm_gen_attention(self, q, k, v, metadata, forward_args,
                                  sparse_args)
         else:
