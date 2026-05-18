@@ -1431,11 +1431,15 @@ class PyExecutor:
                 "/tmp",  # nosec B108
             )
 
+        # Fail fast if the directory cannot be created. Returning success
+        # here would schedule a profile window that later blows up in
+        # ``export_chrome_trace()`` on the executor thread, after the
+        # HTTP caller has already been told the request was accepted.
         try:
             os.makedirs(output_dir, exist_ok=True)
         except OSError as e:
-            logger.warning(
-                f"Failed to create profile output_dir {output_dir}: {e}")
+            raise RuntimeError(
+                f"Failed to create profile output_dir {output_dir}: {e}") from e
 
         # Include a unique profile id (monotonic timestamp + short uuid
         # fragment) so successive start/stop cycles under the same
@@ -1480,10 +1484,18 @@ class PyExecutor:
         if rank == 0 and eq is not None:
             try:
                 eq.enqueue_profile_start_request(profile_config)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
+            except (RuntimeError, OSError, ValueError, AttributeError) as e:
+                # Roll back the pending markers we just set so a
+                # subsequent ``start_profile()`` is not rejected as
+                # "already pending", and so non-zero ranks (which never
+                # received the broadcast) don't drift out of sync with
+                # rank 0. Then surface the failure to the HTTP layer
+                # rather than silently logging and continuing.
+                self._runtime_profile_pending_start_iter = None
+                self._runtime_profile_activities = None
+                raise RuntimeError(
                     f"start_profile: failed to enqueue profile-start "
-                    f"broadcast item: {e}")
+                    f"broadcast item: {e}") from e
 
     def stop_profile(self) -> None:
         """Schedule the in-progress runtime profiling to stop on the
@@ -1523,10 +1535,15 @@ class PyExecutor:
             if rank == 0 and eq is not None:
                 try:
                     eq.enqueue_profile_stop_request()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
+                except (RuntimeError, OSError, ValueError, AttributeError) as e:
+                    # Local cancel already happened on this rank, but
+                    # subordinate ranks would still be carrying the
+                    # pending start. Surface the broadcast failure so
+                    # the caller can retry rather than silently leaving
+                    # the cluster out of sync.
+                    raise RuntimeError(
                         f"stop_profile: failed to enqueue profile-stop "
-                        f"broadcast item: {e}")
+                        f"broadcast item: {e}") from e
             return
 
         # Apply locally so diagnostic state (profile_stop_iters,
@@ -1543,9 +1560,13 @@ class PyExecutor:
         if rank == 0 and eq is not None:
             try:
                 eq.enqueue_profile_stop_request()
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"stop_profile: failed to enqueue profile-stop "
-                               f"broadcast item: {e}")
+            except (RuntimeError, OSError, ValueError, AttributeError) as e:
+                # Subordinate ranks won't see the stop. Bail out with a
+                # real error rather than silently waiting on a stop that
+                # will never fire.
+                raise RuntimeError(
+                    f"stop_profile: failed to enqueue profile-stop "
+                    f"broadcast item: {e}") from e
 
         # Wait (with timeout) for the stop to actually fire so that by
         # the time stop_profile() returns the chrome trace has been
