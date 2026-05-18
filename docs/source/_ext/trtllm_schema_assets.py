@@ -40,12 +40,9 @@ def _write_schema_assets(app) -> None:
 
     repo_root = _ensure_repo_root_on_syspath()
     generator_path = repo_root / "scripts" / "generate_trtllm_serve_schemas.py"
-    spec = importlib.util.spec_from_file_location(
-        "trtllm_serve_schema_generator", generator_path)
+    spec = importlib.util.spec_from_file_location("trtllm_serve_schema_generator", generator_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(
-            f"Failed to load trtllm-serve schema generator from {generator_path}"
-        )
+        raise RuntimeError(f"Failed to load trtllm-serve schema generator from {generator_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
