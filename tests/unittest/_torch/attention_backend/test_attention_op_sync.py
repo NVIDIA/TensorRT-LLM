@@ -29,10 +29,10 @@ The wrapper is the single explicit-kwarg call site for the C++
 
 import ast
 import inspect
+import pathlib
+import re
 import textwrap
 from dataclasses import fields
-
-import pytest
 
 from tensorrt_llm._torch.attention_backend.interface import (
     _THOP_EXCLUDED_FIELDS,
@@ -49,6 +49,14 @@ _SOURCE_CLASSES = {
     "fwd": AttentionForwardArgs,
     "sparse": AttentionSparseArgs,
 }
+
+# Path to the C++ nanobind file that registers ``thop.attention``. We read it
+# directly because ``inspect.signature(thop.attention)`` returns only
+# ``(*args, **kwargs)`` for nanobind-bound functions — the per-arg names from
+# ``nb::arg("...")`` aren't exposed via Python introspection.
+_BINDINGS_CPP = pathlib.Path(__file__).resolve().parents[4] / (
+    "cpp/tensorrt_llm/nanobind/thop/bindings.cpp"
+)
 
 
 def _parse_call_thop_attention() -> ast.Call:
@@ -100,15 +108,80 @@ def _classify_kwargs() -> tuple[dict[str, tuple[str, str]], set[str], set[str]]:
     return attr_kwargs, literal_none_kwargs, other_kwargs
 
 
+def _runtime_instance_attrs(cls) -> set[str]:
+    """Names assigned as ``self.<name> = ...`` anywhere in ``cls`` or any of
+    its base classes. Catches attributes set in ``__post_init__`` /
+    ``__init__`` / ``prepare`` that won't otherwise appear via
+    ``hasattr(cls, ...)``.
+
+    Walks the full MRO (skipping ``object``) so subclasses inherit attrs
+    set by their parents' constructors.
+    """
+    cache = _runtime_instance_attrs._cache  # type: ignore[attr-defined]
+    if cls in cache:
+        return cache[cls]
+
+    def _walk_target(tgt: ast.AST, names: set[str]) -> None:
+        # Recurse into tuple/list unpacking targets like
+        # ``self.a, self.b = foo()`` (AST: Assign(targets=[Tuple([Attr, Attr])]))
+        if isinstance(tgt, (ast.Tuple, ast.List)):
+            for elt in tgt.elts:
+                _walk_target(elt, names)
+        elif (
+            isinstance(tgt, ast.Attribute)
+            and isinstance(tgt.value, ast.Name)
+            and tgt.value.id == "self"
+        ):
+            names.add(tgt.attr)
+
+    names: set[str] = set()
+    for base in cls.__mro__:
+        if base is object:
+            continue
+        try:
+            src = textwrap.dedent(inspect.getsource(base))
+        except (OSError, TypeError):
+            continue
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    _walk_target(tgt, names)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                _walk_target(node.target, names)
+    cache[cls] = names
+    return names
+
+
+_runtime_instance_attrs._cache = {}  # type: ignore[attr-defined]
+
+
 def _has_attr_or_field(cls, name: str) -> bool:
-    """True if ``cls`` exposes ``name`` as a class attribute (incl. @property
-    descriptor) or as a dataclass field."""
+    """True if ``cls`` exposes ``name`` as a class attribute (incl. @property),
+    a dataclass field, or an instance attribute set as ``self.<name> = ...``
+    anywhere in the class source."""
     if hasattr(cls, name):
         return True
     try:
-        return name in {f.name for f in fields(cls)}
+        if name in {f.name for f in fields(cls)}:
+            return True
     except TypeError:
-        return False
+        pass
+    return name in _runtime_instance_attrs(cls)
+
+
+def _binding_kwargs() -> set[str]:
+    """Read kwarg names registered on ``m.def("attention", ...)`` from the
+    nanobind bindings source. The block lives between the ``q`` arg and the
+    last default-valued arg ``compressed_kv_cache_pool_ptr``."""
+    src = _BINDINGS_CPP.read_text()
+    names = re.findall(r'nb::arg\("([^"]+)"\)', src)
+    if "q" not in names or "compressed_kv_cache_pool_ptr" not in names:
+        raise AssertionError(
+            f"Could not delimit the thop.attention nb::arg block in {_BINDINGS_CPP}"
+        )
+    start = names.index("q")
+    end = names.index("compressed_kv_cache_pool_ptr")
+    return set(names[start : end + 1])
 
 
 # ---- Tests ------------------------------------------------------------------
@@ -116,10 +189,7 @@ def _has_attr_or_field(cls, name: str) -> bool:
 
 def test_wrapper_kwargs_match_binding_kwargs():
     """The wrapper's keyword set must equal the C++ binding's keyword set."""
-    pytest.importorskip("tensorrt_llm.bindings.internal")
-    from tensorrt_llm.bindings.internal import thop
-
-    cpp_kwargs = set(inspect.signature(thop.attention).parameters)
+    cpp_kwargs = _binding_kwargs()
     attr_kwargs, literal_none_kwargs, other_kwargs = _classify_kwargs()
     wrapper_kwargs = set(attr_kwargs) | literal_none_kwargs | other_kwargs
     assert wrapper_kwargs == cpp_kwargs, (
