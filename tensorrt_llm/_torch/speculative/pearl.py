@@ -187,6 +187,67 @@ class PEARLOneModelWorker(DraftTargetOneModelWorker):
         logger.info("PEARL gamma_table set: %s", self._gamma_table)
 
     # ------------------------------------------------------------------
+    # Early prompt push
+    # ------------------------------------------------------------------
+
+    def prepare_target_forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
+        is_warmup: bool = False,
+    ) -> None:
+        """Push context prompts before the target prefill forward.
+
+        The base draft-target path pushes prompts inside
+        ``_rdma_offload_draft_tokens()``, which runs after target logits have
+        already been produced. PEARL wants draft prefill to overlap target
+        prefill, so the model engine calls this hook as soon as request ids
+        and sequence lengths are known, but before target forward.
+
+        ``push_prompt`` binds the logical request to a data-plane route first,
+        then sends the TCP prompt under the resulting wire slot. The later
+        data-plane packets therefore use the same slot without hard-coding
+        request id 0.
+        """
+        if bool(is_warmup) or self._rdma_v2_offload_layer is None:
+            return
+        num_contexts = int(getattr(attn_metadata, "num_contexts", 0))
+        if num_contexts <= 0 or input_ids is None:
+            return
+        request_ids = getattr(spec_metadata, "request_ids", None)
+        if request_ids is None or len(request_ids) < num_contexts:
+            request_ids = getattr(attn_metadata, "request_ids", None)
+        if request_ids is None or len(request_ids) < num_contexts:
+            return
+
+        flat = input_ids.reshape(-1)
+        seq_lens = getattr(attn_metadata, "_seq_lens", None)
+        if seq_lens is None:
+            seq_lens = getattr(attn_metadata, "seq_lens", None)
+        cursor = 0
+        for row in range(num_contexts):
+            if seq_lens is not None:
+                length = int(seq_lens[row].item())
+            else:
+                length = int(getattr(attn_metadata, "num_ctx_tokens", flat.numel()))
+            prompt_tokens = flat[cursor : cursor + length].detach().cpu().tolist()
+            cursor += length
+            try:
+                self._rdma_v2_offload_layer.push_prompt(
+                    int(request_ids[row]),
+                    prompt_tokens,
+                )
+            except RuntimeError as exc:
+                logger.warning(
+                    "PEARL early prompt push failed for request %s: %s",
+                    request_ids[row],
+                    exc,
+                )
+                raise
+
+    # ------------------------------------------------------------------
     # Greedy verify + pre-verify flag tracking
     # ------------------------------------------------------------------
 

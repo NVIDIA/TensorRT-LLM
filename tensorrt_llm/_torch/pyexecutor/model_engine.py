@@ -3078,6 +3078,15 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.all_requests())
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
+            spec_worker = self._get_spec_worker()
+            if spec_worker is not None and hasattr(spec_worker,
+                                                   "prepare_target_forward"):
+                spec_worker.prepare_target_forward(
+                    input_ids=inputs['input_ids'],
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    is_warmup=self.is_warmup,
+                )
 
             if self.enable_attention_dp:
                 all_rank_num_tokens = self.dist.tp_cp_allgather(

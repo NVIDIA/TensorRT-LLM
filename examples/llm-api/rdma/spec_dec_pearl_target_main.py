@@ -26,7 +26,10 @@ both transports — only the target side switches.
 """
 
 import argparse
+import json
 import os
+import socket
+import threading
 
 
 def main() -> int:
@@ -96,6 +99,13 @@ def main() -> int:
         default="",
         help="Write target-side PEARL communication trace as JSONL to this file.",
     )
+    ap.add_argument(
+        "--no-early-draft-init",
+        dest="early_draft_init",
+        action="store_false",
+        default=True,
+        help="Disable sending TcpModelInit before target LLM construction.",
+    )
     args = ap.parse_args()
     if args.trace_log:
         os.environ["PEARL_TARGET_TRACE_PATH"] = args.trace_log
@@ -103,6 +113,55 @@ def main() -> int:
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm._torch.speculative.pearl_trace import log as pearl_trace_log
     from tensorrt_llm.llmapi import KvCacheConfig, PEARLDecodingConfig
+
+    def _send_early_model_init():
+        """Start draft model loading before constructing the target LLM.
+
+        The regular offload layer still sends TcpModelInit later when it
+        starts the data-plane channel. That second request is cheap because
+        the draft server reuses the already-loaded model and returns the
+        selected data port. This early request exists only to overlap draft
+        model load with target model load.
+        """
+        msg = {
+            "msg_type": "model_init",
+            "model_path": str(args.draft_model),
+            "dtype": "bfloat16",
+            "max_draft_len": int(args.max_draft_len),
+            "kv_cache_free_fraction": float(args.kv_cache_free_fraction),
+            "extra_kwargs_json": json.dumps(
+                {
+                    "transport": str(args.transport),
+                    "data_port": int(args.draft_port or 1),
+                    "nic_name": str(args.nic),
+                    "max_num_requests": int(args.max_num_requests),
+                    "early_init": True,
+                }
+            ),
+        }
+        pearl_trace_log("target", "early_control_model_init_send", message=msg)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(900.0)
+        try:
+            sock.connect((str(args.draft_host), int(args.draft_control_port)))
+            sock.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+            chunks = []
+            while True:
+                ch = sock.recv(4096)
+                if not ch:
+                    raise RuntimeError("draft server closed during early model-init ack")
+                chunks.append(ch)
+                if b"\n" in ch:
+                    break
+            ack = json.loads(b"".join(chunks).split(b"\n", 1)[0].decode("utf-8"))
+        finally:
+            sock.close()
+        if ack.get("status") != "ok":
+            raise RuntimeError(
+                "early TcpModelInit failed: " + str(ack.get("error", "<no error message>"))
+            )
+        pearl_trace_log("target", "early_control_model_init_ack", ack=ack)
+        return ack
 
     prompt_tokens = []
     try:
@@ -131,6 +190,28 @@ def main() -> int:
         max_draft_len=int(args.max_draft_len),
         baseline=bool(args.baseline),
     )
+
+    early_init_result = {"ack": None, "error": None}
+    early_init_thread = None
+    if not args.baseline and args.early_draft_init:
+
+        def _early_init_main():
+            try:
+                early_init_result["ack"] = _send_early_model_init()
+            except Exception as exc:
+                early_init_result["error"] = exc
+                pearl_trace_log(
+                    "target",
+                    "early_control_model_init_failed",
+                    error=repr(exc),
+                )
+
+        early_init_thread = threading.Thread(
+            target=_early_init_main,
+            daemon=True,
+            name="pearl-early-draft-init",
+        )
+        early_init_thread.start()
 
     common_kv = KvCacheConfig(
         enable_block_reuse=True,
@@ -168,6 +249,11 @@ def main() -> int:
             kv_cache_config=common_kv,
             cuda_graph_config=None,
         )
+
+    if early_init_thread is not None:
+        early_init_thread.join()
+        if early_init_result["error"] is not None:
+            raise RuntimeError("early draft model init failed") from early_init_result["error"]
 
     sampling = SamplingParams(
         max_tokens=int(args.max_tokens),
