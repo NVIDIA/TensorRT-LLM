@@ -651,10 +651,13 @@ def trtllm_mha_with_cache(
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
     # If out_scale is set, attention quantizes output to FP8.
     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
-    if out is not None:
+    if out is not None and not _dequant_output:
         out_flat = out.view(-1, num_heads * head_dim)
         output = out_flat[:num_tokens]
     else:
+        # _dequant_output: caller's `out` buffer is sized for q.dtype (BF16),
+        # but the kernel will write FP8 — allocate a separate FP8 buffer and
+        # cast/copy back into `out` after the kernel call.
         output = torch.zeros(
             total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
         )
@@ -769,14 +772,17 @@ def trtllm_mha_with_cache(
         num_ctx_tokens=_GlobalTrtllmPlanner.num_ctx_tokens,
     )
 
-    if out is not None:
-        if total_padded_tokens > num_tokens:
-            out_flat[num_tokens:].zero_()
-        return out.new_empty(0)
-
     # Cast forced-FP8 output back to the caller's expected dtype.
     if _dequant_output:
         output = output.to(q.dtype)
+
+    if out is not None:
+        if _dequant_output:
+            out_flat = out.view(-1, num_heads * head_dim)
+            out_flat[:num_tokens].copy_(output[:num_tokens])
+        if total_padded_tokens > num_tokens:
+            out.view(-1, num_heads * head_dim)[num_tokens:].zero_()
+        return out.new_empty(0)
 
     return output.view(*q_shape_og)
 

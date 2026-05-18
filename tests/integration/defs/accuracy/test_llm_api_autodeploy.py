@@ -566,7 +566,10 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
         [
             pytest.param("bf16",
                          marks=pytest.mark.skip_less_device_memory(80000)),
-            pytest.param("fp8", marks=skip_pre_hopper),
+            # FP8 is supported on Ada (sm_89) since trtllm_mha_with_cache now
+            # forces FP8 attention output to select the (E4M3, E4M3, E4M3)
+            # paged-KV cubin available on Ada.
+            pytest.param("fp8", marks=skip_pre_ada),
             pytest.param("nvfp4", marks=skip_pre_blackwell),
         ],
     )
