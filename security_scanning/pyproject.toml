@@ -82,7 +82,7 @@ dependencies = [
     "cuda-tile (>=1.0.1)",
     "nvidia-cuda-tileiras (>=13.1,<13.2)",
     "etcd-sdk-python (==0.0.7)",
-    "python-multipart (>=0.0.28,<0.0.29)",
+    "python-multipart (>=0.0.29,<0.0.30)",
     "smg-grpc-proto (>=0.4.2)",
     "cache-dit (>=1.3.5)"
 ]
