@@ -27,7 +27,6 @@ from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
     convert_image_mode as convert_image_mode
-
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
 from tensorrt_llm.inputs.multimodal_data import \
