@@ -341,7 +341,19 @@ class KvCacheCreator:
         max_beam_width = self._max_beam_width
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
 
-        input_seq_len = min(max_num_tokens, input_seq_len)
+        # Drive the per-request dummy size from the encoder budget so the
+        # vision encoder allocates a workspace fitting ``encoder_max_num_tokens``
+        # attention tokens during ``configure_kv_cache_capacity``. That budget
+        # is in encoder (pre-merger) units; convert to LLM-visible (post-
+        # merger) units to compare against ``input_seq_len`` and the LLM-side
+        # ``max_num_tokens`` cap. Models that do not expose
+        # ``spatial_merge_unit`` default to 1, leaving behavior unchanged.
+        _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
+        spatial_merge_unit = getattr(input_processor, "spatial_merge_unit", 1)
+        encoder_llm_visible = max(encoder_max_num_tokens // spatial_merge_unit,
+                                  1)
+
+        input_seq_len = min(max_num_tokens, input_seq_len, encoder_llm_visible)
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
