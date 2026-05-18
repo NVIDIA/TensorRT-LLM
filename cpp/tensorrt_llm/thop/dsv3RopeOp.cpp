@@ -131,9 +131,9 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
     int64_t const num_kv_heads, int64_t const head_size,
 
-    int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const sink_token_length,
-    int64_t const beam_width, int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank,
-    int64_t kv_lora_rank, int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append)
+    int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const beam_width,
+    int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank, int64_t kv_lora_rank,
+    int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append)
 {
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
@@ -197,11 +197,12 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     bool const fp8_context_fmha = kv_cache_quant_mode.hasFp8KvCache();
     int32_t const batch_beam = beam_width * num_generations;
 
-    auto kv_cache_buffer = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets,
-        host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_cache_quant_mode, layer_idx, batch_beam,
-        tokens_per_block, num_kv_heads, head_size, attention_window_size, attention_window_size, sink_token_length,
-        beam_width, seq_offset, true /*is_mla_enable*/, static_cast<size_t>(fused_q.element_size()))
-                               .kvCacheBuffer;
+    auto kv_cache_buffer
+        = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets, host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping, kv_cache_quant_mode, layer_idx, batch_beam, tokens_per_block, num_kv_heads,
+            head_size, attention_window_size, attention_window_size, 0 /*sink_token_length*/, beam_width, seq_offset,
+            true /*is_mla_enable*/, static_cast<size_t>(fused_q.element_size()))
+              .kvCacheBuffer;
 
     tk::KvCacheDataType cache_type = tk::cacheTypeFromQuantMode(kv_cache_quant_mode);
 
@@ -294,7 +295,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int head_size"
         ", int tokens_per_block"
         ", int attention_window_size"
-        ", int sink_token_length"
         ", int beam_width"
         ", int quant_mode"
         ", float q_scaling"

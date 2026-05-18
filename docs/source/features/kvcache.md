@@ -117,4 +117,10 @@ Property ```max_attention_window``` specifies the maximum attention window size 
 
 ### Deprecated Properties
 
-Properties ```use_uvm``` and ```sink_token_length``` have been deprecated and will be removed in a future release.
+Property ```use_uvm``` has been deprecated and will be removed in a future release.
+
+Property ```sink_token_length``` is deprecated and silently ignored on the PyTorch backend.
+The PyTorch attention kernels do not support StreamingLLM, so any non-``None`` value is
+dropped before reaching the executor. The field remains on ``KvCacheConfig`` only because
+the underlying C++ ``_KvCacheConfig`` pybind type still exposes it; setting it has no
+effect on the generated tokens.

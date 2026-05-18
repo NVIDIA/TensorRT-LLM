@@ -1051,7 +1051,6 @@ def _handle_prefill_thop(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
@@ -1213,7 +1212,6 @@ def _handle_prefill_thop_cached_kv(
         _CONTEXT_LAYER_OFFSET,
         tokens_per_block,
         max_context_length,
-        0,  # sink_token_length
         1,  # beam_width
         quant_mode,
     )
@@ -1343,7 +1341,6 @@ def _handle_prefill_thop_cached_kv(
             max_num_requests,
             max_context_length,
             max_context_length,
-            0,  # sink_token_length
             1,  # beam_width
             int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
             quant_mode,
@@ -1653,7 +1650,6 @@ def _handle_decode_impl(
         gen_head_size,
         tokens_per_block,
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         quant_mode,
         # q_scaling must match the value passed to thop.attention below:
@@ -1718,7 +1714,6 @@ def _handle_decode_impl(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode

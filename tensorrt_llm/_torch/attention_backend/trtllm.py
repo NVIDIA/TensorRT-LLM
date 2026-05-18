@@ -1414,7 +1414,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 metadata.max_num_requests,
                 max_context_length,
                 attention_window_size,
-                0,
                 metadata.beam_width,
                 int(mask_type),
                 self.quant_mode,
@@ -1636,7 +1635,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens == metadata.host_ctx_kv_indptr[
             metadata.num_contexts]
 
-        sink_token_length = 0
         beam_width = 1
 
         compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
@@ -1655,7 +1653,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.qk_rope_head_dim,
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )
@@ -1684,7 +1681,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                      device=cu_chunked_seq_len.device)
             return empty_kv, empty_k_pe
 
-        sink_token_length = 0
         beam_width = 1
 
         output_kv, output_k_pe = torch.ops.trtllm.load_chunked_kv_cache_for_mla(
@@ -1704,7 +1700,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.tokens_per_block,
             chunked_max_seq_len,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )
@@ -1724,7 +1719,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # kernel reads it.
         self._ensure_rope_table_size(metadata.kv_cache_manager.max_seq_len)
 
-        sink_token_length = 0
         beam_width = 1
 
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
@@ -1747,7 +1741,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )
@@ -1831,7 +1824,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-        sink_token_length = 0
 
         # Ensure RoPE cos/sin table covers the sequence length before the
         # kernel reads it.
@@ -1871,7 +1863,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.head_dim,
             metadata.kv_cache_manager.tokens_per_block,
             metadata.max_seq_len,  # attention_window_size
-            sink_token_length,
             metadata.beam_width,
             self.quant_mode,
             self.q_scaling,

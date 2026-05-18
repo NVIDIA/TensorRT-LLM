@@ -333,11 +333,10 @@ public:
     int32_t beam_width;
     int32_t max_num_requests;
     int32_t attention_window_size;
-    int32_t sink_token_length;
 
     auto data() const
     {
-        return std::make_tuple(beam_width, max_num_requests, attention_window_size, sink_token_length);
+        return std::make_tuple(beam_width, max_num_requests, attention_window_size);
     };
 
     virtual ~RunnerBase() = default;
@@ -385,7 +384,7 @@ public:
         enqueueParams.max_attention_window_size = attention_window_size;
         enqueueParams.cyclic_attention_window_size = attention_window_size;
         enqueueParams.max_cyclic_attention_window_size = attention_window_size;
-        enqueueParams.sink_token_length = sink_token_length;
+        enqueueParams.sink_token_length = 0;
         enqueueParams.beam_width = beam_width;
         enqueueParams.num_requests = max_num_requests;
 
@@ -702,7 +701,7 @@ public:
         common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.can_use_one_more_block = can_use_one_more_block;
-        common_enqueue_params.sink_token_length = sink_token_length;
+        common_enqueue_params.sink_token_length = 0;
         common_enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
         common_enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig_ptr;
         common_enqueue_params.attention_output_orig_quant = out_scale_ptr;
@@ -933,11 +932,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
     int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
     int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
-    std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
-    bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
+    int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode, double const q_scaling,
+    int64_t const position_embedding_type, int64_t const rotary_embedding_dim, double const rotary_embedding_base,
+    int64_t const rotary_embedding_scale_type, std::vector<double> rotary_embedding_scales,
+    std::vector<int64_t> rotary_embedding_max_position_info, bool const use_paged_context_fmha,
+    std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim, std::optional<bool> rope_append,
@@ -1037,7 +1036,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     runner->beam_width = beam_width;
     runner->max_num_requests = max_num_requests;
     runner->attention_window_size = attention_window_size;
-    runner->sink_token_length = sink_token_length;
 
     double const rotary_embedding_scale = rotary_embedding_scales[0];
     double const rotary_embedding_short_m_scale = rotary_embedding_scales[1];

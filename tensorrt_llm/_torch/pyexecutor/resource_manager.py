@@ -628,10 +628,6 @@ class KVCacheManager(BaseResourceManager):
             layer_mask=layer_mask,
         )
 
-        sink_token_length = (kv_cache_config.sink_token_length
-                             if kv_cache_config.sink_token_length is not None
-                             else 0)
-
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
@@ -750,7 +746,6 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window_vec=self.max_attention_window_vec,
             blocks_per_window=blocks_per_window,
             tokens_per_block=tokens_per_block,
-            sink_token_length=sink_token_length,
             max_seq_len=self.max_seq_len,
             max_beam_width=max_beam_width,
         )
@@ -783,7 +778,7 @@ class KVCacheManager(BaseResourceManager):
             'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
             'dtype': dtype,
-            'sink_token_length': sink_token_length,
+            'sink_token_length': 0,
             'stream': self._stream.cuda_stream,  # Pass to BufferManager
             'max_sequence_length': self.max_seq_len,
             'chunk_size': min(max_num_tokens, self.max_seq_len),
@@ -1963,7 +1958,6 @@ class KVCacheManager(BaseResourceManager):
         max_attention_window_vec: List[int],
         blocks_per_window: BlocksPerWindow,
         tokens_per_block: int,
-        sink_token_length: int,
         max_seq_len: int,
         max_beam_width: int,
     ) -> Tuple[BlocksPerWindow, int, List[int]]:
@@ -1975,7 +1969,6 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window_vec: List of attention window sizes
             blocks_per_window: Dict mapping window size to (primary_blocks, secondary_blocks)
             tokens_per_block: Number of tokens per block
-            sink_token_length: Length of sink tokens
             max_seq_len: Maximum sequence length
 
         Returns:
@@ -1991,7 +1984,7 @@ class KVCacheManager(BaseResourceManager):
                 blocks_in_primary_pool=blocks_in_primary_pool,
                 tokens_per_block=tokens_per_block,
                 max_beam_width=max_beam_width,
-                sink_token_len=sink_token_length,
+                sink_token_len=0,
                 max_seq_len=max_seq_len)
             if window_size > upper_bound:
                 logger.warning(
