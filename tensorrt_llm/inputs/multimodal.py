@@ -16,7 +16,7 @@ from tensorrt_llm.logger import logger
 
 # Default hasher
 default_hasher = blake3
-_INT32_MAX = 2_147_483_647
+_INT32_MAX = 2**31 - 1
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
@@ -132,6 +132,10 @@ class MultimodalInput:
                 f"Position and length arrays must match in size: "
                 f"positions={len(self.multimodal_positions)}, lengths={len(self.multimodal_lengths)}"
             )
+        if len(self.multimodal_hashes) != len(self.multimodal_positions):
+            raise ValueError(
+                "multimodal_hashes, multimodal_positions, and multimodal_lengths "
+                "must all have the same length")
 
         # Validate multimodal_uuids if provided
         if self.multimodal_uuids is not None:

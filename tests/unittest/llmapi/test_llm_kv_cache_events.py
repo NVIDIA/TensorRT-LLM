@@ -20,7 +20,7 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.inputs.multimodal import (MultimodalInput,
                                             _find_mm_token_runs_from_mask,
                                             apply_mm_hashes)
-from tensorrt_llm.inputs.utils import AudioData, VideoData
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -452,6 +452,13 @@ def test_multimodal_input_dataclass_uuid_validation():
                         multimodal_positions=[10],
                         multimodal_lengths=[50],
                         multimodal_uuids="not-a-list")
+
+
+def test_multimodal_input_dataclass_rejects_mismatched_item_arrays():
+    with pytest.raises(ValueError, match="must all have the same length"):
+        MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+                        multimodal_positions=[10, 100],
+                        multimodal_lengths=[50, 60])
 
 
 def test_multimodal_input_from_components_with_uuids():

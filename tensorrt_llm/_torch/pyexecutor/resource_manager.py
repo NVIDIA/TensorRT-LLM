@@ -113,8 +113,15 @@ class _MmRunMetadata(NamedTuple):
 def _hash_to_digest(hash_ints: Sequence[int]) -> bytes:
     # Convert 8 x int32 hash chunks to the 32-byte digest used by C++ block
     # keys. The byte order matches getNthByte(), which extracts MSB first.
-    assert len(
-        hash_ints) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
+    try:
+        hash_len = len(hash_ints)
+    except TypeError as exc:
+        raise ValueError(
+            "Expected 8 int32 hash values, got non-sized input") from exc
+    if hash_len != 8:
+        raise ValueError(f"Expected 8 int32 hash values, got {hash_len}")
+    if not all(isinstance(value, int) for value in hash_ints):
+        raise ValueError("Expected multimodal hash values to be integers")
     return b''.join(v.to_bytes(4, 'big', signed=True) for v in hash_ints)
 
 
@@ -229,46 +236,36 @@ def _augment_tokens_with_mm_run_metadata(
     # - item_token_offset = item-local run start + intra-run prompt offset
     # Shape [num_overlapping_runs]; item index for each selected flat run.
     overlap_run_item_indices = metadata.run_item_indices[overlap_run_indices]
-    # Shape [num_overlapping_items]; each item is processed once per digest.
-    overlap_item_indices = torch.unique_consecutive(overlap_run_item_indices)
-    for item_idx_tensor in overlap_item_indices:
-        item_idx = int(item_idx_tensor)
-        # Runs from the same item share one digest, so process them together
-        # and only vary the item-local token offset for each overlapping span.
-        # Shape [num_item_overlapping_runs]; selected flat runs for this item.
-        item_overlap_run_indices = overlap_run_indices[overlap_run_item_indices
-                                                       == item_idx]
+    # Materialize the selected run metadata once before the Python loop. These
+    # are CPU tensors by construction, and the loop below is request hot-path
+    # bookkeeping.
+    overlap_run_positions = metadata.run_positions[overlap_run_indices]
+    prompt_overlap_starts = torch.clamp(overlap_run_positions, min=chunk_start)
+    prompt_overlap_ends = torch.clamp(metadata.run_ends[overlap_run_indices],
+                                      max=chunk_end)
+    item_token_offsets = (metadata.run_item_offsets[overlap_run_indices] +
+                          prompt_overlap_starts - overlap_run_positions)
+    chunk_result_offsets = prompt_overlap_starts - chunk_start
+    lengths = prompt_overlap_ends - prompt_overlap_starts
 
-        digest = _hash_to_digest(multimodal_hashes[item_idx])
-        # Shape [num_item_overlapping_runs]; full-prompt bounds clipped to chunk.
-        prompt_overlap_starts = torch.clamp(
-            metadata.run_positions[item_overlap_run_indices], min=chunk_start)
-        prompt_overlap_ends = torch.clamp(
-            metadata.run_ends[item_overlap_run_indices], max=chunk_end)
-        # Shape [num_item_overlapping_runs]; item-local segment start offsets.
-        item_token_offsets = (
-            metadata.run_item_offsets[item_overlap_run_indices] +
-            prompt_overlap_starts -
-            metadata.run_positions[item_overlap_run_indices])
-        # Shape [num_item_overlapping_runs]; chunk-local result start offsets.
-        chunk_result_offsets = prompt_overlap_starts - chunk_start
-        # Shape [num_item_overlapping_runs]; token counts for clipped segments.
-        lengths = prompt_overlap_ends - prompt_overlap_starts
-        for chunk_result_offset_tensor, item_token_offset_tensor, length_tensor in zip(
-                chunk_result_offsets, item_token_offsets, lengths, strict=True):
-            chunk_result_offset = int(chunk_result_offset_tensor)
-            item_token_offset = int(item_token_offset_tensor)
-            length = int(length_tensor)
-            # Feed the coarse item property (content digest) and granular run
-            # properties (item-local offset and span length) into the key
-            # generator, so cache keys reflect the actual multimodal tokens
-            # being rewritten.
-            result[chunk_result_offset:chunk_result_offset +
-                   length] = gen_multimodal_cache_key_tokens(
-                       vocab_size,
-                       digest,
-                       length,
-                       token_offset=item_token_offset)
+    current_item_idx: Optional[int] = None
+    digest = b""
+    for item_idx, chunk_result_offset, item_token_offset, length in zip(
+            overlap_run_item_indices.tolist(),
+            chunk_result_offsets.tolist(),
+            item_token_offsets.tolist(),
+            lengths.tolist(),
+            strict=True):
+        if item_idx != current_item_idx:
+            current_item_idx = item_idx
+            digest = _hash_to_digest(multimodal_hashes[item_idx])
+        # Feed the coarse item property (content digest) and granular run
+        # properties (item-local offset and span length) into the key
+        # generator, so cache keys reflect the actual multimodal tokens being
+        # rewritten.
+        result[chunk_result_offset:chunk_result_offset +
+               length] = gen_multimodal_cache_key_tokens(
+                   vocab_size, digest, length, token_offset=item_token_offset)
 
     return result
 

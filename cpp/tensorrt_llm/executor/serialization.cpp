@@ -412,7 +412,8 @@ void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostre
 size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
 {
     size_t totalSize = 0;
-    if (hasMultimodalInputRunExtension(multimodalInput))
+    auto const hasRunExtension = hasMultimodalInputRunExtension(multimodalInput);
+    if (hasRunExtension)
     {
         totalSize += su::serializedSize(kMultimodalInputRunExtensionTag);
         totalSize += su::serializedSize(kMultimodalInputRunExtensionVersion);
@@ -421,7 +422,7 @@ size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
     totalSize += su::serializedSize(multimodalInput.mMultimodalPositions);
     totalSize += su::serializedSize(multimodalInput.mMultimodalLengths);
     totalSize += su::serializedSize(multimodalInput.mMultimodalUuids);
-    if (hasMultimodalInputRunExtension(multimodalInput))
+    if (hasRunExtension)
     {
         totalSize += su::serializedSize(multimodalInput.mMultimodalItemRunCuOffsets);
         totalSize += su::serializedSize(multimodalInput.mMultimodalRunPositions);
