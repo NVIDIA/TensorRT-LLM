@@ -279,52 +279,46 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             True,
             finished=(output.finish_reason is not None))
 
-        if args.tool_choice and type(
-                args.tool_choice) is ChatCompletionNamedToolChoiceParam:
-            delta_message = DeltaMessage(tool_calls=[
-                DeltaToolCall(
-                    function=DeltaFunctionCall(
-                        name=args.tool_choice.function.name,
-                        arguments=delta_text),
-                    index=i,
-                ),
-            ], )
-        else:
-            delta_text, calls = apply_tool_parser(args, i, delta_text, True)
-            tool_calls = []
-            for call_item in calls:
-                # Tool call ID should be generated only once per tool call
-                if call_item.name:
-                    # First chunk: include ID and function name
-                    tool_call_id = make_tool_call_id(
-                        id_type=args.tool_call_id_type,
-                        func_name=call_item.name,
-                        idx=call_item.tool_index)
-                    function_name = call_item.name
-                else:
-                    # Subsequent chunks: null ID and name for argument deltas
-                    tool_call_id = None
-                    function_name = None
-
-                tool_calls.append(
-                    DeltaToolCall(
-                        id=tool_call_id,
-                        index=call_item.tool_index,
-                        function=DeltaFunctionCall(
-                            name=function_name,
-                            arguments=call_item.parameters,
-                        ),
-                    ))
-            # Keep token-bearing chunks visible even when detokenization has no
-            # text to flush yet.
-            if (tool_calls or delta_text or reasoning_delta_text
-                    or output.finish_reason or has_token_delta):
-                delta_message = DeltaMessage(
-                    content=delta_text,
-                    reasoning_content=reasoning_delta_text,
-                    tool_calls=tool_calls if tool_calls else None)
+        # Note: even when tool_choice forces a named function, guided decoding
+        # constrains the model to emit a structurally-tagged tool call (e.g.
+        # ``<tool_call>\n{"name":"X","arguments":{...}}\n</tool_call>``); the
+        # standard tool parser handles that uniformly with the auto path, so
+        # there is no longer a separate ChatCompletionNamedToolChoiceParam
+        # branch here.
+        delta_text, calls = apply_tool_parser(args, i, delta_text, True)
+        tool_calls = []
+        for call_item in calls:
+            # Tool call ID should be generated only once per tool call
+            if call_item.name:
+                # First chunk: include ID and function name
+                tool_call_id = make_tool_call_id(id_type=args.tool_call_id_type,
+                                                 func_name=call_item.name,
+                                                 idx=call_item.tool_index)
+                function_name = call_item.name
             else:
-                continue
+                # Subsequent chunks: null ID and name for argument deltas
+                tool_call_id = None
+                function_name = None
+
+            tool_calls.append(
+                DeltaToolCall(
+                    id=tool_call_id,
+                    index=call_item.tool_index,
+                    function=DeltaFunctionCall(
+                        name=function_name,
+                        arguments=call_item.parameters,
+                    ),
+                ))
+        # Keep token-bearing chunks visible even when detokenization has no
+        # text to flush yet.
+        if (tool_calls or delta_text or reasoning_delta_text
+                or output.finish_reason or has_token_delta):
+            delta_message = DeltaMessage(
+                content=delta_text,
+                reasoning_content=reasoning_delta_text,
+                tool_calls=tool_calls if tool_calls else None)
+        else:
+            continue
 
         choice = ChatCompletionResponseStreamChoice(
             index=i,
@@ -392,28 +386,22 @@ def chat_response_post_processor(
         text, reasoning_text = apply_reasoning_parser(args, output.index,
                                                       output.text, False)
 
-        if args.tool_choice and isinstance(args.tool_choice,
-                                           ChatCompletionNamedToolChoiceParam):
-            message = ChatMessage(
-                role=role,
-                content="",
-                tool_calls=[
-                    ToolCall(function=FunctionCall(
-                        name=args.tool_choice.function.name, arguments=text))
-                ])
-        else:
-            if text is None:
-                text = ""
-            text, calls = apply_tool_parser(args, output.index, text, False)
-            tool_calls = [
-                ToolCall(function=FunctionCall(name=call.name or "",
-                                               arguments=call.parameters))
-                for call in calls
-            ]
-            message = ChatMessage(role=role,
-                                  content=text,
-                                  reasoning_content=reasoning_text,
-                                  tool_calls=tool_calls)
+        # Named tool_choice is honored by the server via guided decoding (the
+        # model is constrained to emit a tagged tool-call wrapper around the
+        # forced function); the standard tool parser then extracts the call
+        # name and arguments uniformly with the "auto" path.
+        if text is None:
+            text = ""
+        text, calls = apply_tool_parser(args, output.index, text, False)
+        tool_calls = [
+            ToolCall(function=FunctionCall(name=call.name or "",
+                                           arguments=call.parameters))
+            for call in calls
+        ]
+        message = ChatMessage(role=role,
+                              content=text,
+                              reasoning_content=reasoning_text,
+                              tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
