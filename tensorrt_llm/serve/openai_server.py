@@ -2011,18 +2011,28 @@ class OpenAIServer(_VideoRoutesMixin):
                     status_code=409,
                 )
             logger.error(f"/start_profile failed: {e}")
-            return JSONResponse(content={
-                "success": False,
-                "message": msg
-            },
-                                status_code=500)
-        except Exception as e:
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": msg,
+                },
+                status_code=500,
+            )
+        except (OSError, ValueError, TimeoutError) as e:
+            # OSError: filesystem/IPC failures while preparing the
+            # profile window. ValueError: schema-level rejections that
+            # slipped past Pydantic. TimeoutError: ack-queue wait gave
+            # up. Anything truly unexpected is allowed to propagate to
+            # FastAPI's middleware so we get a real stack trace in the
+            # server log instead of swallowing it as a generic 500.
             logger.error(f"/start_profile failed: {e}")
-            return JSONResponse(content={
-                "success": False,
-                "message": str(e)
-            },
-                                status_code=500)
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": str(e),
+                },
+                status_code=500,
+            )
 
         return JSONResponse(content={"message": "Profiling started"})
 
@@ -2044,7 +2054,12 @@ class OpenAIServer(_VideoRoutesMixin):
         """
         try:
             await asyncio.to_thread(self.generator.stop_profile)
-        except Exception as e:
+        except (RuntimeError, OSError, TimeoutError) as e:
+            # RuntimeError: backend rejected the stop or broadcast
+            # enqueue failed. OSError: filesystem error flushing the
+            # trace. TimeoutError: ack-queue wait gave up. Truly
+            # unexpected exceptions propagate to FastAPI so they show
+            # up as a real stack trace rather than a swallowed 500.
             logger.error(f"/stop_profile failed: {e}")
             return JSONResponse(content={"error": str(e)}, status_code=500)
 

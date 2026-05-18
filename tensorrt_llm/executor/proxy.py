@@ -17,6 +17,7 @@ import concurrent.futures
 import json
 import os
 import threading
+import time
 import weakref
 from queue import Empty
 from typing import Dict, List, Optional, Union
@@ -335,32 +336,54 @@ class GenerationExecutorProxy(GenerationExecutor):
         """Block on the worker's ack queue for a profile control request.
 
         Waits for the worker to push an ack on ``profile_ack_queue``
-        matching ``expected_kind`` ("start" or "stop"), or until
-        ``timeout`` elapses.
+        matching ``expected_kind`` ("start" or "stop"), or until the
+        cumulative ``timeout`` elapses across any number of stale-ack
+        consumptions.
 
-        If the worker reports a rejection (non-empty error message),
+        If a stale or out-of-order ack is read (e.g. the previous call
+        timed out and its ack arrived after we returned), we discard it
+        and keep waiting for the expected kind. Returning on a mismatch
+        would break the synchronous contract: the next call could return
+        before its own request has been processed, making the documented
+        guarantee ("trace is on disk by the time /stop_profile returns
+        200") unsound under back-to-back invocations.
+
+        If the worker reports a rejection (non-empty error message), we
         re-raise as ``RuntimeError`` so the HTTP layer can map "already
-        in progress" / "pending" to 409. On timeout we log a warning
+        in progress" / "pending" to 409. On true timeout we log a warning
         and return — the chrome trace may still be flushing on the
         backend, but blocking the FastAPI event loop indefinitely is
         worse than a possibly-stale 200.
         """
-        try:
-            ack = self.profile_ack_queue.get(timeout=timeout)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"{expected_kind}_profile: timed out waiting for worker "
-                f"ack after {timeout:.1f}s ({e}). The chrome trace may "
-                "not be on disk yet.")
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"{expected_kind}_profile: timed out waiting for "
+                    f"worker ack after {timeout:.1f}s. The chrome trace "
+                    "may not be on disk yet.")
+                return
+            try:
+                ack = self.profile_ack_queue.get(timeout=remaining)
+            except Empty:
+                logger.warning(
+                    f"{expected_kind}_profile: timed out waiting for "
+                    f"worker ack after {timeout:.1f}s. The chrome trace "
+                    "may not be on disk yet.")
+                return
+            kind, error_msg = ack
+            if kind != expected_kind:
+                # Out-of-order ack from a previous call; discard and keep
+                # waiting for the ack that belongs to this request.
+                logger.warning(
+                    f"profile ack kind mismatch (expected "
+                    f"{expected_kind!r}, got {kind!r}); discarding stale "
+                    "ack and continuing to wait.")
+                continue
+            if error_msg:
+                raise RuntimeError(error_msg)
             return
-        kind, error_msg = ack
-        if kind != expected_kind:
-            # Out-of-order ack from a previous call; log and ignore.
-            logger.warning(
-                f"profile ack kind mismatch (expected {expected_kind!r}, "
-                f"got {kind!r}); proceeding anyway.")
-        if error_msg:
-            raise RuntimeError(error_msg)
 
     def start_profile(self,
                       output_dir=None,

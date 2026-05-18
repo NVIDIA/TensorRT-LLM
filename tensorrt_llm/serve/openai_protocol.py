@@ -32,8 +32,8 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (BaseModel, ConfigDict, Field, field_validator,
-                      model_validator)
+from pydantic import (BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt,
+                      field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -1590,6 +1590,8 @@ class VideoJobList(OpenAIBaseModel):
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
 UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
 
+ProfileActivity = Literal["CPU", "GPU", "CUDA_PROFILER"]
+
 
 class StartProfileRequest(OpenAIBaseModel):
     """Request body for the POST /start_profile endpoint."""
@@ -1598,14 +1600,20 @@ class StartProfileRequest(OpenAIBaseModel):
         description="Directory where chrome traces are written. Defaults "
         "to the TLLM_TORCH_PROFILER_DIR environment variable, "
         "then /tmp.")
-    num_steps: Optional[int] = Field(
+    num_steps: Optional[PositiveInt] = Field(
         default=None,
-        description="Number of iterations to profile. If omitted, "
-        "profiling runs until /stop_profile is called.")
-    start_step: int = Field(
+        description="Number of iterations to profile. Must be >= 1 if "
+        "provided; if omitted, profiling runs until /stop_profile is "
+        "called. ``num_steps == 0`` is rejected because the profile "
+        "window would never close — the stop iteration would equal the "
+        "start iteration, profile_step() would discard the stop marker "
+        "as stale, and the window would run forever.")
+    start_step: NonNegativeInt = Field(
         default=0,
-        description="Skip this many iterations before profiling begins.")
-    activities: List[str] = Field(
+        description="Skip this many iterations before profiling begins. "
+        "Must be >= 0.")
+    activities: List[ProfileActivity] = Field(
         default_factory=lambda: ["CPU", "GPU"],
         description="Which activities to trace. Supported values: "
-        "'CPU', 'GPU', 'CUDA_PROFILER'.")
+        "'CPU', 'GPU', 'CUDA_PROFILER'. Unknown values are rejected at "
+        "schema validation time.")
