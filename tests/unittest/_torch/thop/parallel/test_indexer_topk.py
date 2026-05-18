@@ -260,6 +260,79 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     ), "CUDA top_k_per_row results don't match torch.topk"
 
 
+# ---------------------------------------------------------------------------
+# Opt-in fp32 paths: fused single-launch split-work + multi-pass radix
+# ---------------------------------------------------------------------------
+
+
+def _run_opt_in_decode(batch_size, num_tokens, *, done_counter, scratch):
+    """Run indexer_topk_decode with the opt-in fp32 buffers and assert
+    output matches torch.topk."""
+    index_topk = 2048
+    next_n = 1
+    torch.manual_seed(24)
+    torch.cuda.manual_seed(24)
+
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
+
+    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
+
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        None,  # pre_idx
+        None,  # heuristic_scratch
+        done_counter,
+        scratch,
+        False,  # is_prefill
+    )
+    torch.cuda.synchronize()
+
+    max_row_len = row_ends.max().item()
+    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
+    mask = (torch_indices >= 0) & ((torch_indices - (row_ends - row_starts)[:, None]) < 0)
+    torch_indices = torch_indices.masked_fill(~mask, -1)
+
+    assert compare_top_k_results(
+        logits, indices, torch_indices, row_starts, row_ends, index_topk
+    ), "opt-in indexer_topk_decode results don't match torch.topk"
+
+
+@pytest.mark.parametrize("batch_size,num_tokens", [(1, 524288), (4, 262144), (16, 131072)])
+def test_indexer_topk_decode_multi_pass_radix(batch_size, num_tokens):
+    """Multi-pass radix path: shapes inside the low-bs / long-seq eligibility
+    zone with a caller-allocated uint8 scratch buffer sized by
+    indexer_topk_decode_scratch_bytes."""
+    index_topk = 2048
+    scratch_bytes = torch.ops.trtllm.indexer_topk_decode_scratch_bytes(
+        batch_size, num_tokens, index_topk
+    )
+    assert scratch_bytes > 0, "scratch size must be positive"
+    # torch.zeros (not empty) so the first call sees a clean per-row state;
+    # subsequent calls are kept clean by the kernel's pass-3 trailer.
+    scratch = torch.zeros(scratch_bytes, dtype=torch.uint8, device="cuda")
+    _run_opt_in_decode(batch_size, num_tokens, done_counter=None, scratch=scratch)
+
+
+@pytest.mark.parametrize("batch_size,num_tokens", [(4, 524288), (8, 262144), (16, 524288)])
+def test_indexer_topk_decode_fused_split_work(batch_size, num_tokens):
+    """Fused single-launch split-work path: N >= splitWorkThreshold (200k)
+    shapes with a caller-allocated zero-initialized done counter."""
+    index_topk = 2048
+    done_counter = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    _run_opt_in_decode(batch_size, num_tokens, done_counter=done_counter, scratch=None)
+
+
 @skip_pre_hopper
 @pytest.mark.parametrize("batch_size", _PREFILL_BATCH_SIZES)
 @pytest.mark.parametrize("index_topk", [2048, 128])

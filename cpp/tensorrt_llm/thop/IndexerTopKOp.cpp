@@ -38,7 +38,8 @@ namespace torch_ext
 
 void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
     int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx,
-    std::optional<th::Tensor> const& heuristic_scratch)
+    std::optional<th::Tensor> const& heuristic_scratch, std::optional<th::Tensor> const& done_counter_scratch,
+    std::optional<th::Tensor> const& scratch, bool is_prefill)
 {
 
     TORCH_CHECK(logits.is_cuda() && seq_lens.is_cuda() && indices.is_cuda(),
@@ -109,6 +110,36 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         heuristicScratchPtr = scratchTensor.data_ptr();
     }
 
+    // Optional buffers for the new fp32-only opt-in paths added by the TPRv2
+    // port (fused single-launch split-work + multi-pass radix).
+    int32_t* doneCounterPtr = nullptr;
+    if (done_counter_scratch.has_value())
+    {
+        auto const& t = done_counter_scratch.value();
+        TORCH_CHECK(t.is_cuda(), "done_counter_scratch must be a CUDA tensor");
+        TORCH_CHECK(t.device() == logits.device(), "done_counter_scratch must be on the same device as logits");
+        TORCH_CHECK(t.is_contiguous(), "done_counter_scratch must be contiguous");
+        TORCH_CHECK(t.scalar_type() == at::ScalarType::Int, "done_counter_scratch must be int32");
+        TORCH_CHECK(t.numel() >= numRows64, "done_counter_scratch must have at least numRows entries");
+        doneCounterPtr = t.data_ptr<int32_t>();
+        TORCH_CHECK(logits_dtype == at::ScalarType::Float,
+            "done_counter_scratch (fused split-work path) is fp32 only; logits dtype was ", logits_dtype);
+    }
+    void* multiPassScratchPtr = nullptr;
+    size_t multiPassScratchBytes = 0;
+    if (scratch.has_value())
+    {
+        auto const& t = scratch.value();
+        TORCH_CHECK(t.is_cuda(), "scratch must be a CUDA tensor");
+        TORCH_CHECK(t.device() == logits.device(), "scratch must be on the same device as logits");
+        TORCH_CHECK(t.is_contiguous(), "scratch must be contiguous");
+        TORCH_CHECK(t.scalar_type() == at::ScalarType::Byte, "scratch must be uint8");
+        multiPassScratchPtr = t.data_ptr();
+        multiPassScratchBytes = static_cast<size_t>(t.numel());
+        TORCH_CHECK(logits_dtype == at::ScalarType::Float,
+            "scratch (multi-pass radix path) is fp32 only; logits dtype was ", logits_dtype);
+    }
+
     int32_t splitWorkThreshold = 200 * 1000;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
@@ -129,7 +160,8 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
             aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
             logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
-            preIdxStride, preIdxCount, static_cast<float*>(heuristicScratchPtr), stream);
+            preIdxStride, preIdxCount, static_cast<float*>(heuristicScratchPtr), doneCounterPtr, stream,
+            multiPassScratchPtr, multiPassScratchBytes, is_prefill);
     }
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
@@ -183,6 +215,16 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
         static_cast<int32_t>(logits_stride_1), static_cast<int32_t>(index_topk), stream);
 }
 
+// Returns the size in bytes of the `scratch` buffer required by
+// indexer_topk_decode's multi-pass radix path for the given shape. Callers
+// can allocate `torch.empty(size, dtype=torch.uint8, device='cuda')` and
+// pass the result as the `scratch` argument.
+int64_t indexer_topk_decode_scratch_bytes(int64_t num_rows, int64_t num_columns, int64_t index_topk)
+{
+    return static_cast<int64_t>(tk::indexerTopKDecodeScratchBytes(
+        static_cast<int>(num_rows), static_cast<int>(num_columns), static_cast<int>(index_topk)));
+}
+
 } // end namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -191,12 +233,19 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
-        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None) -> ()");
+        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, Tensor? done_counter_scratch=None, "
+        "Tensor? scratch=None, bool is_prefill=False) -> ()");
+    m.def("indexer_topk_decode_scratch_bytes(int num_rows, int num_columns, int index_topk) -> int");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("indexer_topk_decode", &tensorrt_llm::torch_ext::indexer_topk_decode);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("indexer_topk_decode_scratch_bytes", &tensorrt_llm::torch_ext::indexer_topk_decode_scratch_bytes);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
