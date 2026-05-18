@@ -217,6 +217,35 @@ def fmin(a: Union[float, cutlass.Float32],
         ))
 
 
+@dsl_user_op
+def fclip_xorsign(a: Union[float, cutlass.Float32],
+                  limit: Union[float, cutlass.Float32],
+                  *,
+                  loc=None,
+                  ip=None) -> cutlass.Float32:
+    """Symmetric clip.
+
+    Emits PTX ``min.xorsign.abs.f32`` with semantics
+    ``d = sign(a XOR limit) * min(|a|, |limit|)``.
+    When ``limit > 0`` this equals ``clip(a, -limit, +limit)``.
+
+    Requires sm_86+.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(limit).ir_value(loc=loc, ip=ip),
+            ],
+            "min.xorsign.abs.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ))
+
+
 def sigmoid_f32(a: Union[float, cutlass.Float32],
                 fastmath: bool = False) -> Union[float, cutlass.Float32]:
     """

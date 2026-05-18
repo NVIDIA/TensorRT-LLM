@@ -440,6 +440,7 @@ def run(
     use_cold_l2: bool = False,
     permuted_m: int = None,
     use_cupti: bool = False,
+    swiglu_limit: float = float('inf'),
     **kwargs,
 ):
     """Prepare A/B/C tensors, launch GPU kernel, and reference checking.
@@ -546,6 +547,7 @@ def run(
         mma_tiler_mn,
         cluster_shape_mn,
         vectorized_f32,
+        swiglu_limit=swiglu_limit,
     )
 
     # Compute max active clusters on current device
@@ -625,6 +627,10 @@ def run(
         gate_idx = block_cols[1::2].reshape(-1)
         ref_up = ref.index_select(1, up_idx)
         ref_gate = ref.index_select(1, gate_idx)
+        # SwiGLU clamp
+        if swiglu_limit != float('inf'):
+            ref_gate = ref_gate.clamp(max=swiglu_limit)
+            ref_up = ref_up.clamp(min=-swiglu_limit, max=swiglu_limit)
         ref_after_swiglu = ref_up * (ref_gate * torch.sigmoid(ref_gate))
         print(f"ref: {ref.shape}, {ref.stride()}")
 
@@ -996,6 +1002,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
     parser.add_argument("--use_cold_l2", action="store_true", default=False, help="Use cold L2")
+    parser.add_argument(
+        "--swiglu_limit",
+        type=float,
+        default=float('inf'),
+        help="Swiglu clamp factor, +inf (default) disables clamp",
+    )
 
     args = parser.parse_args()
 
@@ -1048,6 +1060,7 @@ if __name__ == "__main__":
         args.use_cold_l2,
         args.permuted_m,
         args.use_cupti,
+        args.swiglu_limit,
     )
 
     print(f"Execution time: {exec_time:.2f} us")
