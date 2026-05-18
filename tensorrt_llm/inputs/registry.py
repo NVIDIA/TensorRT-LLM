@@ -308,108 +308,23 @@ class BaseMultimodalInputProcessor(ABC):
                 "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
             )
 
-    def get_num_tokens_per_image(
-        self,
-        *,
-        image: Union[Image.Image, torch.Tensor],
-        **kwargs,
-    ):
-        """
-        Calculate the number of tokens generated for an image.
-
-        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Accepts either a PIL Image or a CHW `torch.Tensor` — the hashing path
-        in `find_mm_token_lengths` feeds tensors directly to avoid a costly
-        ToPIL round-trip, while existing direct callers may still pass PIL.
-
-        Returns the token count for the given image.
-        Example: for Mistral, this count includes IMG placeholders plus row
-        break/end framing tokens, matching the prompt-side logical MM unit.
-
-        Subclasses can override this method to provide custom logic to calculate the number of tokens.
-        """
-        if isinstance(image, torch.Tensor):
-            image_size = tuple(image.shape[-2:])
-        else:
-            image_size = (image.height, image.width)
-        return self.get_num_multimodal_tokens([image_size],
-                                              **kwargs)["num_image_tokens"][0]
-
-    def get_num_tokens_per_video(
-        self,
-        *,
-        video: List[Union[Image.Image, torch.Tensor]],
-        video_metadata: Optional[dict] = None,
-        video_audio: Optional[Any] = None,
-        **kwargs,
-    ):
-        """
-        Calculate the number of tokens generated for a video.
-
-        This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Accepts a list of PIL Images or CHW `torch.Tensor` frames.
-
-        Returns the token count for the given video.
-        Example: for a video item, return the prompt-side token count for that
-        one video unit, not the number of video frames.
-
-        `video_metadata` and `video_audio` are consumed here (not forwarded
-        into `get_num_multimodal_tokens`) so subclasses that don't need them
-        are unaffected.
-
-        Subclasses can override this method to provide custom logic to calculate the number of tokens.
-        """
-        num_frames = len(video)
-        first_frame = video[0]
-        if isinstance(first_frame, torch.Tensor):
-            frame_h = int(first_frame.shape[-2])
-            frame_w = int(first_frame.shape[-1])
-        else:
-            frame_h, frame_w = first_frame.height, first_frame.width
-        video_size = (num_frames, frame_h, frame_w)
-        try:
-            num_video_tokens = self.get_num_multimodal_tokens(
-                video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
-            return num_video_tokens
-        except Exception:
-            # Fallback: treat video as sequence of frames
-            num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
-                                                                 **kwargs)
-            temporal_patch_size = self.temporal_patch_size if hasattr(
-                self, 'temporal_patch_size') else 1
-            return num_tokens_per_frame * num_frames // temporal_patch_size
-
-
-class BaseMultimodalDummyInputsBuilder(ABC):
-    """Build deterministic dummy multimodal inputs for profiling.
-
-    Subclasses provide the model-specific math relating image/video size to
-    encoder attention tokens, and this base class composes that math into a
-    dummy prompt sized exactly to the caller's budget. Token unit is
-    **encoder attention** (pre-merger), matching
-    ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
-    Callers expressing budgets in LLM-visible (post-merger) units convert
-    via ``spatial_merge_unit`` at the boundary.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    @property
-    @abstractmethod
-    def tokenizer(self) -> PreTrainedTokenizerBase:
-        ...
-
-    @property
-    @abstractmethod
-    def config(self) -> PretrainedConfig:
-        ...
-
-    @property
-    @abstractmethod
-    def model_path(self) -> str:
-        ...
-
+    # ------------------------------------------------------------------
+    # Canonical encoder-side math.
+    #
+    # ``get_num_mm_tokens`` is the single source of truth for the
+    # input-size → token-count mapping. Two consumer paths share it:
+    #
+    #   * Dummy sizing (BaseMultimodalDummyInputsBuilder.get_dummy_prompt):
+    #       uses pre-merger tokens directly to size the encoder workspace
+    #       against ``encoder_max_num_tokens``.
+    #   * Prompt-side hashing (get_num_tokens_per_image / _video):
+    #       divides by ``spatial_merge_unit`` to get the placeholder count
+    #       the prompt will carry.
+    #
+    # Models that have not opted in keep the legacy behavior — the default
+    # raises NotImplementedError and the hashing path falls back to the HF
+    # processor delegation it already used.
+    # ------------------------------------------------------------------
     @property
     def spatial_merge_unit(self) -> int:
         """Encoder→LLM token ratio.
@@ -429,16 +344,150 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     ) -> int:
         """Return encoder attention tokens (pre-merger) for given media size.
 
-        Result is in the same unit as ``encoder_max_num_tokens`` /
-        ``AttentionMetadata.max_num_tokens`` so callers can size buffers and
-        compare budgets directly without unit gymnastics.
-
-        Subclasses opting into deterministic dummy sizing override this; the
-        default raises ``NotImplementedError`` so :meth:`get_dummy_prompt`
-        falls back to a text-only dummy (its caller already handles
-        ``None``).
+        Single source of truth for the encoder-side math, in the same unit
+        as ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
+        Subclasses opt in by overriding this method; default raises
+        ``NotImplementedError`` so the legacy HF-processor delegation in
+        :meth:`get_num_tokens_per_image` / :meth:`get_num_tokens_per_video`
+        remains the fallback.
         """
         raise NotImplementedError
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image: Union[Image.Image, torch.Tensor],
+        **kwargs,
+    ):
+        """
+        Calculate the number of tokens generated for an image.
+
+        Tries the deterministic ``get_num_mm_tokens`` path first
+        (encoder-side math, divided by ``spatial_merge_unit`` to land in
+        LLM-visible / post-merger units). Falls back to the Hugging Face
+        processor's ``_get_num_multimodal_tokens`` method when the model
+        has not implemented the deterministic math.
+
+        Accepts either a PIL Image or a CHW `torch.Tensor` — the hashing path
+        in `find_mm_token_lengths` feeds tensors directly to avoid a costly
+        ToPIL round-trip, while existing direct callers may still pass PIL.
+
+        Returns the token count for the given image.
+        Example: for Mistral, this count includes IMG placeholders plus row
+        break/end framing tokens, matching the prompt-side logical MM unit.
+
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
+        """
+        if isinstance(image, torch.Tensor):
+            image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        else:
+            image_h, image_w = image.height, image.width
+
+        try:
+            encoder_tokens = self.get_num_mm_tokens(width=image_w,
+                                                    height=image_h,
+                                                    num_frames=1)
+            return encoder_tokens // self.spatial_merge_unit
+        except NotImplementedError:
+            return self.get_num_multimodal_tokens(
+                [(image_h, image_w)], **kwargs)["num_image_tokens"][0]
+
+    def get_num_tokens_per_video(
+        self,
+        *,
+        video: List[Union[Image.Image, torch.Tensor]],
+        video_metadata: Optional[dict] = None,
+        video_audio: Optional[Any] = None,
+        **kwargs,
+    ):
+        """
+        Calculate the number of tokens generated for a video.
+
+        Tries the deterministic ``get_num_mm_tokens`` path first (passing
+        ``num_frames`` so subclasses can account for temporal patching).
+        Falls back to the Hugging Face processor's
+        ``_get_num_multimodal_tokens`` method on ``NotImplementedError``;
+        a further fallback treats the video as a stack of frames if the HF
+        processor lacks a video-aware path.
+
+        Accepts a list of PIL Images or CHW `torch.Tensor` frames.
+
+        Returns the token count for the given video.
+        Example: for a video item, return the prompt-side token count for that
+        one video unit, not the number of video frames.
+
+        `video_metadata` and `video_audio` are consumed here (not forwarded
+        into `get_num_multimodal_tokens`) so subclasses that don't need them
+        are unaffected.
+
+        Subclasses can override this method to provide custom logic to calculate the number of tokens.
+        """
+        num_frames = len(video)
+        first_frame = video[0]
+        if isinstance(first_frame, torch.Tensor):
+            frame_h = int(first_frame.shape[-2])
+            frame_w = int(first_frame.shape[-1])
+        else:
+            frame_h, frame_w = first_frame.height, first_frame.width
+
+        try:
+            encoder_tokens = self.get_num_mm_tokens(width=frame_w,
+                                                    height=frame_h,
+                                                    num_frames=num_frames)
+            return encoder_tokens // self.spatial_merge_unit
+        except NotImplementedError:
+            pass
+
+        video_size = (num_frames, frame_h, frame_w)
+        try:
+            return self.get_num_multimodal_tokens(
+                video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
+        except Exception:
+            # Fallback: treat video as sequence of frames
+            num_tokens_per_frame = self.get_num_tokens_per_image(image=video[0],
+                                                                 **kwargs)
+            temporal_patch_size = self.temporal_patch_size if hasattr(
+                self, 'temporal_patch_size') else 1
+            return num_tokens_per_frame * num_frames // temporal_patch_size
+
+
+class BaseMultimodalDummyInputsBuilder(ABC):
+    """Build deterministic dummy multimodal inputs for profiling.
+
+    Subclasses provide the model-specific math relating image/video size to
+    encoder attention tokens (via :meth:`BaseMultimodalInputProcessor.get_num_mm_tokens`,
+    which concrete classes inherit alongside this mixin), and this base
+    class composes that math into a dummy prompt sized exactly to the
+    caller's budget. Token unit is **encoder attention** (pre-merger),
+    matching ``encoder_max_num_tokens`` and
+    ``AttentionMetadata.max_num_tokens``. Callers expressing budgets in
+    LLM-visible (post-merger) units convert via ``spatial_merge_unit`` at
+    the boundary.
+
+    Note: ``get_num_mm_tokens`` and ``spatial_merge_unit`` live on
+    :class:`BaseMultimodalInputProcessor` so the hashing path
+    (``get_num_tokens_per_image``) and the dummy path can share a single
+    source of truth — all concrete multimodal processors inherit from both
+    mixins.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @property
+    @abstractmethod
+    def tokenizer(self) -> PreTrainedTokenizerBase:
+        ...
+
+    @property
+    @abstractmethod
+    def config(self) -> PretrainedConfig:
+        ...
+
+    @property
+    @abstractmethod
+    def model_path(self) -> str:
+        ...
 
     def get_size_with_most_features(
         self,
@@ -472,7 +521,12 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         if input_seq_len <= 0:
             return None
 
-        encoder_budget = input_seq_len * self.spatial_merge_unit
+        # ``spatial_merge_unit`` lives on BaseMultimodalInputProcessor; all
+        # concrete classes inherit from both mixins so the attribute is always
+        # available in production. ``getattr`` with default 1 keeps standalone
+        # uses (e.g. unit tests) from crashing on no-merger setups.
+        spatial_merge_unit = getattr(self, "spatial_merge_unit", 1)
+        encoder_budget = input_seq_len * spatial_merge_unit
         try:
             size = self.get_size_with_most_features(max_tokens=encoder_budget)
         except NotImplementedError:
