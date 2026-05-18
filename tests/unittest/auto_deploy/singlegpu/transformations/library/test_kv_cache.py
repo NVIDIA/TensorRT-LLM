@@ -692,10 +692,10 @@ def test_insert_cached_attention_uses_add_resource():
 
     # Verify resources were added
     assert len(cm._resource_lookup) > 0
-    # Should have k_cache and v_cache resources registered
+    # Triton attention registers one combined paged KV cache resource.
     resource_names = list(cm._resource_lookup.keys())
-    assert any("k_cache" in name for name in resource_names)
-    assert any("v_cache" in name for name in resource_names)
+    assert any(name.endswith("kv_cache") for name in resource_names)
+    assert any(handler.is_paged for handler in cm._resource_lookup.values())
 
 
 def test_insert_cached_attention_passes_kv_cache_config():
@@ -770,9 +770,7 @@ def test_insert_cached_attention_passes_kv_cache_config():
     # Initialize resources
     cm.initialize_resources()
 
-    assert not any(handler.is_paged for handler in cm._resource_lookup.values()), (
-        "triton should not use paged resources"
-    )
+    assert any(handler.is_paged for handler in cm._resource_lookup.values())
     assert cm._caches, "at least some resources should be present"
 
     # Verify cache dtype matches config

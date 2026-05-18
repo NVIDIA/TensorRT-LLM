@@ -49,6 +49,7 @@ KV_LAYOUT: Literal["HND", "NHD"] = "HND"
 
 # Cache SM count to avoid repeated get_device_properties calls
 _NUM_SMS: Optional[int] = None
+_MIN_TL_DOT_K = 16
 
 
 def _get_num_sms() -> int:
@@ -57,6 +58,11 @@ def _get_num_sms() -> int:
     if _NUM_SMS is None:
         _NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
     return _NUM_SMS
+
+
+def _get_page_block(page_size: int) -> int:
+    """Return the page tile width used by Triton dot kernels."""
+    return max(_MIN_TL_DOT_K, 1 << (page_size - 1).bit_length())
 
 
 def _get_sm_scale(head_dim: int, scale: Optional[float]) -> float:
@@ -208,7 +214,7 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
         triton.Config({}, num_warps=8, num_stages=2),
         triton.Config({}, num_warps=8, num_stages=3),
     ],
-    key=["HEAD_DIM", "PAGE_SIZE", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
+    key=["HEAD_DIM", "PAGE_SIZE", "PAGE_BLOCK", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
 )
 @triton.jit
 def _flash_decode_stage1_kernel(
@@ -245,6 +251,7 @@ def _flash_decode_stage1_kernel(
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    PAGE_BLOCK: tl.constexpr,
     HEAD_RATIO: tl.constexpr,
     HEAD_RATIO_PADDED: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
@@ -334,7 +341,7 @@ def _flash_decode_stage1_kernel(
         is_last_page_of_seq = page_idx == (num_pages - 1)
         valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
 
-        page_offsets = tl.arange(0, PAGE_SIZE)
+        page_offsets = tl.arange(0, PAGE_BLOCK)
         page_mask = page_offsets < valid_tokens
 
         # Compute cache offset (use int64 to avoid overflow when physical_page * stride > 2^31)
@@ -348,14 +355,14 @@ def _flash_decode_stage1_kernel(
 
         k = tl.load(kv_cache_ptr + cache_base, mask=page_mask_2d, other=0.0).to(
             q_all.dtype
-        )  # [PAGE_SIZE, HEAD_DIM]; cast from fp8 if kv cache is fp8
+        )  # [PAGE_BLOCK, HEAD_DIM]; cast from fp8 if kv cache is fp8
         v = tl.load(
             kv_cache_ptr + cache_base + cache_stride_kv,
             mask=page_mask_2d,
             other=0.0,
-        ).to(q_all.dtype)  # [PAGE_SIZE, HEAD_DIM]; cast from fp8 if kv cache is fp8
+        ).to(q_all.dtype)  # [PAGE_BLOCK, HEAD_DIM]; cast from fp8 if kv cache is fp8
 
-        # [HEAD_RATIO_PADDED, HEAD_DIM] @ [HEAD_DIM, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
+        # [HEAD_RATIO_PADDED, HEAD_DIM] @ [HEAD_DIM, PAGE_BLOCK] -> [HEAD_RATIO_PADDED, PAGE_BLOCK]
         attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
 
         # Combine validity mask with sliding window mask
@@ -370,9 +377,9 @@ def _flash_decode_stage1_kernel(
         m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO_PADDED]
         m_i_new = tl.maximum(m_i, m_ij)
         alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
+        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_BLOCK]
 
-        # [HEAD_RATIO_PADDED, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM] -> [HEAD_RATIO_PADDED, HEAD_DIM]
+        # [HEAD_RATIO_PADDED, PAGE_BLOCK] @ [PAGE_BLOCK, HEAD_DIM] -> [HEAD_RATIO_PADDED, HEAD_DIM]
         acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
@@ -494,6 +501,7 @@ def triton_decode(
     _, _, n_kv_heads, page_size, _ = kv_cache.shape
     head_ratio = n_heads // n_kv_heads
     head_ratio_padded = max(1, 2 ** math.ceil(math.log2(head_ratio))) if head_ratio > 1 else 1
+    page_block = _get_page_block(page_size)
 
     max_pages = kv_indices.shape[0]
     max_seq_len = max_pages * page_size
@@ -557,6 +565,7 @@ def triton_decode(
         N_KV_HEADS=n_kv_heads,
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
+        PAGE_BLOCK=page_block,
         HEAD_RATIO=head_ratio,
         HEAD_RATIO_PADDED=head_ratio_padded,
         NUM_SPLITS=num_splits,
@@ -599,7 +608,7 @@ def triton_decode(
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
     ],
-    key=["HEAD_DIM", "PAGE_SIZE"],
+    key=["HEAD_DIM", "PAGE_SIZE", "PAGE_BLOCK"],
 )
 @triton.jit
 def _paged_context_kernel(
@@ -631,6 +640,7 @@ def _paged_context_kernel(
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    PAGE_BLOCK: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
 ):
     """Context/prefill attention with paged KV cache, causal skip, and page-aligned iteration.
@@ -682,7 +692,7 @@ def _paged_context_kernel(
     m_i = tl.zeros([Q_BLOCK], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([Q_BLOCK], dtype=tl.float32)
 
-    page_offsets = tl.arange(0, PAGE_SIZE)
+    page_offsets = tl.arange(0, PAGE_BLOCK)
 
     # Two-phase page loop:
     # Phase 1 (full pages): pages entirely before the first Q position need no causal mask.
@@ -712,6 +722,7 @@ def _paged_context_kernel(
     # Process one page at a time with a clean inner loop
     kv_head_offset = kv_head_id * cache_stride_head
     local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
+    full_page_mask = page_offsets < PAGE_SIZE
 
     for page_idx in range(first_window_page, num_full_pages):
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
@@ -725,12 +736,12 @@ def _paged_context_kernel(
         if SLIDING_WINDOW > 0:
             k = tl.load(
                 kv_cache_ptr + page_base + local_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                mask=full_page_mask[:, None],
                 other=0.0,
             ).to(q.dtype)  # cast from fp8 if kv cache is fp8
             v = tl.load(
                 kv_cache_ptr + page_base + local_kv + cache_stride_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                mask=full_page_mask[:, None],
                 other=0.0,
             ).to(q.dtype)  # cast from fp8 if kv cache is fp8
 
@@ -741,22 +752,23 @@ def _paged_context_kernel(
             kv_positions = page_idx * PAGE_SIZE + page_offsets[None, :]
             q_kv_pos = q_offsets[:, None] + cache_len
             sw_mask = (q_kv_pos - kv_positions) < SLIDING_WINDOW
-            full_mask_p1 = q_mask[:, None] & sw_mask
+            full_mask_p1 = q_mask[:, None] & sw_mask & full_page_mask[None, :]
             qk = tl.where(full_mask_p1, qk, float("-inf"))
         else:
             k = tl.load(
                 kv_cache_ptr + page_base + local_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                mask=full_page_mask[:, None],
                 other=0.0,
             ).to(q.dtype)  # cast from fp8 if kv cache is fp8
             v = tl.load(
                 kv_cache_ptr + page_base + local_kv + cache_stride_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                mask=full_page_mask[:, None],
                 other=0.0,
             ).to(q.dtype)  # cast from fp8 if kv cache is fp8
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
 
+            qk = tl.where(full_page_mask[None, :], qk, float("-inf"))
             if not is_full_q_block:
                 qk = tl.where(q_mask[:, None], qk, float("-inf"))
 
@@ -840,7 +852,7 @@ def _paged_context_kernel(
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
     ],
-    key=["HEAD_DIM", "PAGE_SIZE"],
+    key=["HEAD_DIM", "PAGE_SIZE", "PAGE_BLOCK"],
 )
 @triton.jit
 def _paged_context_masked_kernel(
@@ -876,6 +888,7 @@ def _paged_context_masked_kernel(
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    PAGE_BLOCK: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
 ):
     """Context/prefill attention with paged KV cache and a backend-provided bool allow-mask."""
@@ -914,7 +927,7 @@ def _paged_context_masked_kernel(
     m_i = tl.zeros([Q_BLOCK], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([Q_BLOCK], dtype=tl.float32)
 
-    page_offsets = tl.arange(0, PAGE_SIZE)
+    page_offsets = tl.arange(0, PAGE_BLOCK)
     kv_head_offset = kv_head_id * cache_stride_head
     local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
     mask_batch_offset = batch_id * mask_stride_batch
@@ -1054,6 +1067,7 @@ def triton_context(
     total_tokens, n_heads, head_dim = q.shape
     _, _, n_kv_heads, page_size, _ = kv_cache.shape
     num_seq = qo_indptr.shape[0] - 1
+    page_block = _get_page_block(page_size)
 
     output = out if out is not None else torch.empty_like(q)
 
@@ -1177,6 +1191,7 @@ def triton_context(
             N_KV_HEADS=n_kv_heads,
             HEAD_DIM=head_dim,
             PAGE_SIZE=page_size,
+            PAGE_BLOCK=page_block,
             SLIDING_WINDOW=sw,
         )
 
@@ -1204,6 +1219,7 @@ def triton_context_with_custom_mask(
     num_seq = qo_indptr.shape[0] - 1
     total_tokens, n_heads, head_dim = q.shape
     _, _, n_kv_heads, page_size, _ = kv_cache.shape
+    page_block = _get_page_block(page_size)
 
     if num_seq == 0 or total_tokens == 0:
         return output
@@ -1255,6 +1271,7 @@ def triton_context_with_custom_mask(
         N_KV_HEADS=n_kv_heads,
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
+        PAGE_BLOCK=page_block,
         SLIDING_WINDOW=sw,
     )
 

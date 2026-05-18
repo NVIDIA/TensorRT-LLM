@@ -243,6 +243,52 @@ class TestTritonDecodeKernel:
         # Compare
         torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
+    def test_decode_kernel_supports_small_page_size(self):
+        """Regression test for page sizes below Triton's minimum dot K dimension."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_decode,
+            update_paged_kv_cache,
+        )
+
+        batch_size, seq_len = 1, 8
+        n_heads, n_kv_heads, head_dim = 4, 2, 32
+        page_size = 4
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = num_pages_per_seq + 2
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        k_flat = k.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        v_flat = v.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        batch_indices = torch.zeros(batch_size * seq_len, dtype=torch.int32, device="cuda")
+        positions = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+        kv_indptr = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(num_pages_per_seq, dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor([page_size], dtype=torch.int32, device="cuda")
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+
+        update_paged_kv_cache(
+            k_flat, v_flat, batch_indices, positions, kv_cache, kv_indices, kv_indptr
+        )
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        output_triton = triton_decode(
+            q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale
+        )
+
+        q_ref = q.unsqueeze(2)
+        k_ref = k.transpose(1, 2).repeat_interleave(n_heads // n_kv_heads, dim=1)
+        v_ref = v.transpose(1, 2).repeat_interleave(n_heads // n_kv_heads, dim=1)
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False
+        ).squeeze(2)
+
+        torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
 
 class TestTritonContextKernel:
     """Tests for the context/prefill kernel."""
@@ -331,6 +377,57 @@ class TestTritonContextKernel:
             k_ref = k_ref.repeat_interleave(head_ratio, dim=1)
             v_ref = v_ref.repeat_interleave(head_ratio, dim=1)
 
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=sm_scale, is_causal=True
+        )
+        output_ref = output_ref.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    def test_context_kernel_supports_small_page_size(self):
+        """Regression test for page sizes below Triton's minimum dot K dimension."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
+            update_paged_kv_cache,
+        )
+
+        batch_size, seq_len = 1, 8
+        n_heads, n_kv_heads, head_dim = 4, 2, 32
+        page_size = 4
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = num_pages_per_seq + 2
+        total_tokens = batch_size * seq_len
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        qo_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda")
+        kv_indices = torch.arange(num_pages_per_seq, dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor([page_size], dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        batch_indices = torch.zeros(total_tokens, dtype=torch.int32, device="cuda")
+        positions = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        output = triton_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+        )
+
+        q_ref = q.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        k_ref = k.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        v_ref = v.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        k_ref = k_ref.repeat_interleave(n_heads // n_kv_heads, dim=1)
+        v_ref = v_ref.repeat_interleave(n_heads // n_kv_heads, dim=1)
         output_ref = torch.nn.functional.scaled_dot_product_attention(
             q_ref, k_ref, v_ref, scale=sm_scale, is_causal=True
         )
