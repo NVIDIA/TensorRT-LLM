@@ -529,6 +529,24 @@ class BasicAVTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
+        # audio_attn1 may receive padded audio (when audio_pad_for_ulysses=True
+        # and T_a % U != 0) and relies on key_padding_mask to zero attention
+        # to padded K positions. The TRTLLM self-attn backend silently ignores
+        # ``key_padding_mask``, which would let valid Q tokens attend to padded
+        # K and corrupt the real audio stream. Mirror the existing cross-attn
+        # TRTLLM→VANILLA fallback (modules/attention.py) and downgrade audio
+        # self-attn to VANILLA in that case. Audio is small (T_a ~ 126) so the
+        # backend downgrade is negligible (<<1ms/step).
+        audio_self_config = model_config
+        if (
+            model_config.parallel.audio_pad_for_ulysses
+            and model_config.attention.backend == "TRTLLM"
+        ):
+            audio_self_config = model_config.model_copy(
+                update={
+                    "attention": model_config.attention.model_copy(update={"backend": "VANILLA"})
+                }
+            )
         self.audio_attn1 = LTX2Attention(
             query_dim=cfg.dim,
             heads=cfg.heads,
@@ -537,7 +555,7 @@ class BasicAVTransformerBlock(nn.Module):
             rope_type=rope_type,
             norm_eps=eps,
             apply_gated_attention=cfg.apply_gated_attention,
-            config=model_config,
+            config=audio_self_config,
             layer_idx=idx,
             use_ulysses=True,
         )

@@ -71,12 +71,14 @@ class FlashAttn4Attention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         causal: bool,
+        seqused_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
         output, lse = _flash_attn_fwd(
             q,
             k,
             v,
+            seqused_k=seqused_k,
             softmax_scale=self.scale,
             causal=causal,
             window_size_left=None,
@@ -120,6 +122,7 @@ class FlashAttn4Attention(AttentionBackend):
         v: torch.Tensor,
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -132,11 +135,22 @@ class FlashAttn4Attention(AttentionBackend):
             k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             attention_mask: Attention mask type (CAUSAL or FULL)
+            key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
+                False = pad. Translated to FA4's ``seqused_k = mask.sum(dim=1)``
+                (assumes True-prefix layout, which matches LTX-2 audio padding).
+                Only the non-causal branch is supported.
 
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
         """
-        output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
+        output, _ = self.forward_with_lse(
+            q,
+            k,
+            v,
+            attention_mask=attention_mask,
+            key_padding_mask=key_padding_mask,
+            **kwargs,
+        )
         return output
 
     def forward_with_lse(
@@ -145,6 +159,7 @@ class FlashAttn4Attention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -157,7 +172,20 @@ class FlashAttn4Attention(AttentionBackend):
                     partial attention results in Attention2D parallelism.
         """
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
-        output, lse = self._fwd(q, k, v, is_causal)
+        seqused_k = None
+        if key_padding_mask is not None:
+            assert not is_causal, "key_padding_mask is not supported with causal attention"
+            assert key_padding_mask.dim() == 2 and key_padding_mask.shape == (
+                q.shape[0],
+                k.shape[1],
+            ), (
+                f"Invalid key_padding_mask shape: expected [B={q.shape[0]}, "
+                f"S_kv={k.shape[1]}], got {tuple(key_padding_mask.shape)}"
+            )
+            # FA4 seqused_k assumes a True-prefix layout: positions [0, valid)
+            # are kept, [valid, S_kv) are masked. mask.sum gives the prefix length.
+            seqused_k = key_padding_mask.sum(dim=1).to(torch.int32)
+        output, lse = self._fwd(q, k, v, is_causal, seqused_k=seqused_k)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
         return output, lse
