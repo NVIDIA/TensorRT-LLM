@@ -6,7 +6,10 @@ set -euo pipefail
 
 MODEL="${MODEL:-$LLM_MODELS_ROOT/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2}"
 NP=${NP:-4}
-BATCH_SIZE=32
+BATCH_SIZE=${BATCH_SIZE:-32}
+# Per-request output length. Must be > BATCH_SIZE + 35 so the profile window
+# captured below (TLLM_PROFILE_START_STOP) is fully contained in the GEN phase.
+OUTPUT_MEAN=${OUTPUT_MEAN:-256}
 
 export PROFILE_DIR="${PROFILE_DIR:-profiles}"
 export TLLM_AUTOTUNER_CACHE_PATH="$PROFILE_DIR/sample_performance_alignment_cache.json"
@@ -22,7 +25,7 @@ python3 ../../benchmarks/cpp/prepare_dataset.py \
     --num-requests $((BATCH_SIZE * NP)) \
     --input-mean 2048 \
     --input-stdev 0 \
-    --output-mean 256 \
+    --output-mean "$OUTPUT_MEAN" \
     --output-stdev 0 \
     >/tmp/dataset.jsonl
 

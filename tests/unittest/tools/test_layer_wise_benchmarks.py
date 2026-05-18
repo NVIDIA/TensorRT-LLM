@@ -187,6 +187,10 @@ def test_performance_alignment(llm_root, world_size):
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     profile_dir = f"profiles/test_performance_alignment_{world_size}"
+    # For CI we only need enough decode iterations to fully contain
+    # the TLLM_PROFILE_START_STOP window (BATCH_SIZE + 10 .. BATCH_SIZE + 35).
+    batch_size = 8
+    output_mean = 64
     check_call(
         [
             "./sample_performance_alignment.sh",
@@ -197,5 +201,7 @@ def test_performance_alignment(llm_root, world_size):
             "MODEL": model_root / "DeepSeek-V3-Lite" / "nvfp4_moe_only",
             "NP": f"{world_size:d}",
             "PROFILE_DIR": profile_dir,
+            "BATCH_SIZE": f"{batch_size:d}",
+            "OUTPUT_MEAN": f"{output_mean:d}",
         },
     )
