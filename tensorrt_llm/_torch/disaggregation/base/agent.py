@@ -115,6 +115,11 @@ class BaseTransferAgent(ABC):
     @abstractmethod
     def check_remote_descs(self, name: str, memory_descs: MemoryDescs) -> bool: ...
 
+    @abstractmethod
+    def shutdown(self) -> None:
+        """Quiesce backend resources; idempotent; drains in-flight ops before returning."""
+        ...
+
 
 def _force_py_nixl_kv_transfer() -> bool:
     env_value = os.getenv("TRTLLM_USE_PY_NIXL_KVCACHE", "0")
