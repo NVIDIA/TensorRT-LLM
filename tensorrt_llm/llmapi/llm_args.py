@@ -1582,13 +1582,50 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
     _draft_target_one_model: bool = PrivateAttr(True)
 
+    draft_offload_enabled: bool = False
+    draft_offload_nic_name: str = "mlx5_0"
+    draft_offload_server_host: str = "127.0.0.1"
+    draft_offload_server_port: int = 47320
+    draft_offload_v2: bool = False
+    draft_offload_v2_max_num_requests: int = 256
+    draft_offload_v2_remote_peer_name: str = "draft_lpu"
+    # Transport for the v2 path. ``ibverbs`` (default) keeps the existing
+    # WRITE_WITH_IMM path. ``tcp`` selects the pure-TCP transport — used
+    # for the spec-decode-over-RDMA progression phase 1 baseline (no RDMA
+    # hardware required) and as a correctness reference when the draft
+    # backend is being brought up.
+    draft_offload_v2_transport: Literal["ibverbs", "tcp", "doca"] = "ibverbs"
+    # When set, the target tells the draft server to lazy-load this model
+    # path (via TcpModelInit) so a single bare draft server process can
+    # serve different draft models depending on which target connects.
+    # If unset, the draft server is expected to have its model loaded
+    # out-of-band before the target connects.
+    draft_offload_v2_model_path: Optional[str] = None
+    draft_offload_v2_model_dtype: str = "bfloat16"
+    draft_offload_v2_kv_cache_free_fraction: float = 0.4
+    # TCP port for the prompt-init / model-init control channel. ``0``
+    # disables; the v2 transport will refuse to push prompts.
+    draft_offload_v2_tcp_prompt_port: int = 0
+
     @model_validator(mode="after")
     def validate_draft_target_config(self):
         if self.max_draft_len is None or self.max_draft_len <= 0:
             raise ValueError("max_draft_len must be > 0 for DraftTarget")
-        if self.speculative_model is None:
+        if self.speculative_model is None and not self.draft_offload_enabled:
             raise ValueError(
-                "speculative_model must be specified for DraftTarget")
+                "speculative_model must be specified for DraftTarget unless "
+                "draft_offload_enabled=True")
+        if self.draft_offload_enabled:
+            if self.draft_offload_server_port <= 0 or self.draft_offload_server_port > 65535:
+                raise ValueError(
+                    "draft_offload_server_port must be in [1, 65535], got "
+                    f"{self.draft_offload_server_port}")
+            if not self.draft_offload_v2:
+                raise ValueError(
+                    "draft_offload_enabled requires draft_offload_v2=True")
+        elif self.draft_offload_v2:
+            raise ValueError(
+                "draft_offload_v2 requires draft_offload_enabled=True")
         self.max_total_draft_tokens = self.max_draft_len  # Current DraftTarget only supports linear tree
         return self
 
@@ -4224,7 +4261,9 @@ class TorchLlmArgs(BaseLlmArgs):
                 self.speculative_config.max_draft_len = 1
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
+                assert self.speculative_config.speculative_model is not None or self.speculative_config.draft_offload_enabled, (
+                    "Draft model must be specified unless draft_offload_enabled=True."
+                )
                 if self.backend == "_autodeploy":
                     self.speculative_config._draft_target_one_model = False
 

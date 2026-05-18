@@ -36,6 +36,8 @@ ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
+ARG TRTLLM_ENABLE_RDMA=0
+ARG DOCA_VERSION="3.3.0"
 ARG TORCH_INSTALL_TYPE="skip"
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
@@ -43,10 +45,14 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     echo "Using GitHub mirror: ${GITHUB_MIRROR}" && \
     echo "Using Python version: ${PYTHON_VERSION}" && \
+    echo "Enable RDMA dependencies: ${TRTLLM_ENABLE_RDMA}" && \
+    echo "Using DOCA version: ${DOCA_VERSION}" && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
     TRT_VER=${TRT_VER} CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
+    TRTLLM_ENABLE_RDMA=${TRTLLM_ENABLE_RDMA} \
+    DOCA_VERSION=${DOCA_VERSION} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
          --tensorrt --polygraphy --mpi4py --pytorch --opencv
@@ -63,12 +69,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
+ARG DISABLE_NIXL_GPUNETIO=0
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} DISABLE_NIXL_GPUNETIO=${DISABLE_NIXL_GPUNETIO} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2

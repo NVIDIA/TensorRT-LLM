@@ -114,3 +114,8 @@ enroot/tensorrt_llm.devel.sqsh
 .claude/agent-memory/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
+
+# Runtime third-party dependencies: symlinks created by cmake build, not part of this repo
+tensorrt_llm/deep_ep
+tensorrt_llm/deep_gemm
+tensorrt_llm/flash_mla

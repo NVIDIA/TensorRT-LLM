@@ -2289,6 +2289,7 @@ class PyTorchModelEngine(ModelEngine):
             'inputs_embeds': None,
             "multimodal_params": [],
             'resource_manager': resource_manager,
+            'is_warmup': self.is_warmup,
         }
 
         if bool(lora_params):
@@ -3148,6 +3149,7 @@ class PyTorchModelEngine(ModelEngine):
             'inputs_embeds': None,
             "multimodal_params": multimodal_params_list,
             'resource_manager': resource_manager,
+            'is_warmup': self.is_warmup,
         }
 
         if bool(lora_params):
@@ -3320,6 +3322,7 @@ class PyTorchModelEngine(ModelEngine):
             'inputs_embeds': None,
             "multimodal_params": multimodal_params_list,
             'resource_manager': resource_manager,
+            'is_warmup': self.is_warmup,
         }
 
         if bool(lora_params):
@@ -3588,6 +3591,7 @@ class PyTorchModelEngine(ModelEngine):
             'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
             'inputs_embeds': None,
             'resource_manager': resource_manager,
+            'is_warmup': self.is_warmup,
         }, gather_ids if is_spec_decode else None
 
     def _get_lora_params_from_requests(

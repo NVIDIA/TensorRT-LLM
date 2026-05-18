@@ -1639,8 +1639,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            draft_offload_enabled = bool(
+                getattr(spec_config, "draft_offload_enabled", False))
             # Only create draft_model for modes MTP, Eagle3 (not SA)
-            if not spec_config.spec_dec_mode.is_sa():
+            if not spec_config.spec_dec_mode.is_sa(
+            ) and not draft_offload_enabled:
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
@@ -1717,6 +1720,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         resource_manager=None,
+        is_warmup: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.model(
@@ -1762,7 +1766,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
                                     draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
+                                    resource_manager=resource_manager,
+                                    is_warmup=is_warmup)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,

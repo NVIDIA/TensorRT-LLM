@@ -13,6 +13,24 @@ rm -rf ${UCX_INSTALL_PATH}
 git clone -b ${UCX_VERSION} ${UCX_REPO}
 cd ucx
 git checkout ${UCX_COMMIT}
+# UCX v1.20.x GDAKI sources can be built after DOCA 3.3 headers are
+# installed, but this commit does not provide a local READ_ONCE fallback
+# for the CUDA perf kernel path. Add the small fallback here instead of
+# disabling CUDA support for the whole UCX build.
+if [ -f src/uct/ib/mlx5/gdaki/gdaki.cuh ] &&
+   ! grep -q "TRTLLM_UCX_READ_ONCE_FALLBACK" src/uct/ib/mlx5/gdaki/gdaki.cuh; then
+  sed -i '1i\
+#ifndef TRTLLM_UCX_READ_ONCE_FALLBACK\
+#define TRTLLM_UCX_READ_ONCE_FALLBACK\
+#ifndef READ_ONCE\
+#define READ_ONCE(x) (*(volatile decltype(x) *)&(x))\
+#endif\
+#ifndef WRITE_ONCE\
+#define WRITE_ONCE(x, v) (*(volatile decltype(x) *)&(x) = (v))\
+#endif\
+#endif\
+' src/uct/ib/mlx5/gdaki/gdaki.cuh
+fi
 cd ..
 tar -czf /third-party-source/ucx-${UCX_VERSION}.tar.gz ucx
 cd ucx

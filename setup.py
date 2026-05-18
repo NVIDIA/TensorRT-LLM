@@ -159,6 +159,8 @@ else:
         'runtime/kv_cache_manager_v2/rawref/*.py',
         'runtime/kv_cache_manager_v2/rawref/*.pyi',
         'runtime/*__mypyc*.so',
+        '_torch/speculative/doca_rdma_ext/*.so',
+        '_torch/speculative/ibverbs_ext/*.so',
     ]
 
 package_data += [
