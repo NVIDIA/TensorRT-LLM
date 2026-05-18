@@ -279,16 +279,18 @@ class NemotronHybridConfig(ModelConfig):
         # the base class; custom configs (e.g. NemotronHConfig) have num_hidden_layers
         # and hybrid_override_pattern on the object but to_dict() omits them. Fill
         # from the config object (and nested text_config/language_config if present).
-        sub_config = getattr(pretrained_config, "text_config", None) or getattr(
-            pretrained_config, "language_config", None)
+        text_config = getattr(pretrained_config, "text_config", None)
+        language_config = getattr(pretrained_config, "language_config", None)
         for key in (
                 "num_hidden_layers",
                 "hybrid_override_pattern",
         ):
             if hf_config.get(key) is None:
                 value = None
-                if sub_config is not None:
-                    value = getattr(sub_config, key, None)
+                if text_config is not None:
+                    value = getattr(text_config, key, None)
+                if value is None and language_config is not None:
+                    value = getattr(language_config, key, None)
                 if value is None:
                     value = getattr(pretrained_config, key, None)
                 if value is None and key == "num_hidden_layers":
@@ -297,6 +299,7 @@ class NemotronHybridConfig(ModelConfig):
                     hf_config[key] = value
 
         return cls(name=model_hf_name, param_count=param_count, **hf_config)
+
 
 class Qwen3HybridConfig(ModelConfig):
     """Config for Qwen3 hybrid models (full-attention + linear-attention layers).
