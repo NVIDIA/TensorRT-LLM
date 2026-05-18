@@ -4608,11 +4608,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
-    def test_fp8_block_scales_early_first_token_emission(self):
+    def test_fp8_block_scales_early_first_token_response(self):
         """Accuracy with overlap scheduler + early first-token emission."""
         pytorch_config = dict(
             disable_overlap_scheduler=False,
-            enable_early_first_token_emission=True,
+            enable_early_first_token_response=True,
             cuda_graph_config=CudaGraphConfig(),
         )
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)

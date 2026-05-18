@@ -143,7 +143,7 @@ methods:
         annotation: bool
         default: False
         status: prototype
-      enable_early_first_token_emission:
+      enable_early_first_token_response:
         annotation: bool
         default: False
         status: prototype

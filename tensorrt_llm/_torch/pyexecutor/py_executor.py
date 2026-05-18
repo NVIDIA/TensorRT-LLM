@@ -290,7 +290,7 @@ class PyExecutor:
             max_num_sequences: int,
             drafter: Optional[Drafter] = None,
             disable_overlap_scheduler: bool = False,
-            enable_early_first_token_emission: bool = False,
+            enable_early_first_token_response: bool = False,
             max_input_len: int = 0x7fffffff,
             max_batch_size: int = 8,
             max_beam_width: int = 1,
@@ -342,7 +342,7 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
-        self.enable_early_first_token_emission = enable_early_first_token_emission
+        self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
@@ -2814,7 +2814,7 @@ class PyExecutor:
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
-                if self.enable_early_first_token_emission:
+                if self.enable_early_first_token_response:
                     if self.previous_batch is not None and should_process_previous_batch:
                         # Early first-token emission. Must run after
                         # `_update_requests` (so `py_decoding_iter` is current)
@@ -2995,7 +2995,7 @@ class PyExecutor:
         # Skip iter-1 emission when `_emit_first_token_responses` already
         # handled it.
         finished_requests = self._handle_responses(
-            emit_first_iter=not self.enable_early_first_token_emission)
+            emit_first_iter=not self.enable_early_first_token_response)
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -4269,7 +4269,7 @@ class PyExecutor:
         """Emit first-token responses ahead of `_sample_async` to reduce
         TTFT. Termination, cleanup, and perf stats remain in
         `_handle_responses`. Only invoked when
-        `enable_early_first_token_emission` is set.
+        `enable_early_first_token_response` is set.
         """
         new_responses = []
         for request in prev_scheduled_requests.all_requests():
