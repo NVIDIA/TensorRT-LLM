@@ -43,7 +43,7 @@ l0_gb200_multi_gpus_ds:
       linux_distribution_name: ubuntu*
       cpu: aarch64
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: pytorch
   tests:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v4_pro_gen_only[deepseek_v4_pro_dep16_gen_only-1024-1024-16384] TIMEOUT (12600)
@@ -58,7 +58,7 @@ l0_gb200_multi_gpus_ds:
       linux_distribution_name: ubuntu*
       cpu: aarch64
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: pytorch
   tests:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v4_pro_ctx2dep4_gen1dep16[conc256] TIMEOUT (12600)
