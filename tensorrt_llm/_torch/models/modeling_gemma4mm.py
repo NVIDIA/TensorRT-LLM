@@ -16,8 +16,8 @@
 and the Gemma4ForConditionalGeneration wrapper.
 
 Vision tower is native TRT-LLM (``modeling_gemma4_vision.py``); audio tower
-still uses ``AutoModel.from_config()`` pending its own migration
-(requires transformers>=5.5.0).
+is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
+``AutoModel.from_config()`` HF fallback (requires transformers>=5.5.0).
 """
 
 import copy
@@ -49,6 +49,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
+from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
@@ -62,7 +63,6 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import (  # noqa: E402
-    AutoModel,
     AutoTokenizer,
     Gemma4Config,
     PretrainedConfig,
@@ -665,9 +665,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             self.vision_tower = None
             self.embed_vision = None
 
-        # --- Audio tower (native transformers, eager mode) ---
+        # --- Audio tower (native TRT-LLM, see modeling_gemma4_audio.py) ---
         if config.audio_config is not None:
-            self.audio_tower = AutoModel.from_config(config.audio_config).eval().to(self._device)
+            audio_model_config = self.get_sub_model_config(model_config_cp, "audio_config")
+            self.audio_tower = Gemma4AudioModel(audio_model_config).eval().to(self._device)
             audio_hidden = getattr(
                 config.audio_config, "output_proj_dims", config.audio_config.hidden_size
             )
@@ -741,7 +742,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         if self.audio_tower is not None:
             audio_weights = filter_weights("audio_tower", stripped)
-            self.audio_tower.load_state_dict(audio_weights, strict=False)
+            self.audio_tower.load_weights(audio_weights)
 
         if self.embed_audio is not None:
             embed_a_weights = filter_weights("embed_audio", stripped)

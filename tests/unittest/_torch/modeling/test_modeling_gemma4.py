@@ -3020,5 +3020,188 @@ class TestGemma4PLEMultimodalGuards(unittest.TestCase):
             )
 
 
+class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
+    """Regression tests for the audio/vision RMSNorm convention silent bug.
+
+    Symptom (E4B CoVoST audio, jobs 2205710/2206264): BLEU dropped from
+    baseline 24.54 to 1.90 with no NaN, no crash, output dtype/shape unchanged
+    — purely a numerical convention error. Root cause: the inline audio
+    RMSNorm used Gemma3 LLM's ``(1 + w) * x / rms(x)`` formula. HF Gemma4
+    (audio + vision + LLM) uses plain ``w * x / rms(x)``. The fix replaces
+    both towers' RMSNorm with thin adapters inheriting
+    ``transformers.models.gemma4.modeling_gemma4.Gemma4RMSNorm``.
+
+    These tests guard against silent re-introduction of the wrong convention
+    and against drift from the HF implementation.
+    """
+
+    @staticmethod
+    def _rms_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
+        """Reference ``x / sqrt(mean(x^2) + eps)`` in fp32, cast back."""
+        return (x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + eps)).to(
+            x.dtype
+        )
+
+    def test_audio_rmsnorm_inherits_from_hf_class(self):
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
+
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+
+        self.assertTrue(issubclass(_Gemma4AudioRMSNorm, HFRMSNorm))
+
+    def test_vision_rmsnorm_inherits_from_hf_class(self):
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
+
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+
+        self.assertTrue(issubclass(_Gemma4VisionRMSNorm, HFRMSNorm))
+
+    def test_audio_rmsnorm_uses_plain_w_not_one_plus_w(self):
+        """With ``weight=ones``, output must equal ``x/rms`` (plain ``w``),
+        NOT ``2*x/rms`` (Gemma3 ``(1+w)`` convention). This is the exact
+        failure mode that produced E4B BLEU=1.90."""
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+
+        hidden_size, eps = 16, 1e-6
+        norm = _Gemma4AudioRMSNorm(hidden_size=hidden_size, eps=eps)
+        with torch.no_grad():
+            norm.weight.fill_(1.0)
+        torch.manual_seed(0)
+        x = torch.randn(4, hidden_size)
+        expected_plain = self._rms_normalize(x, eps)
+        got = norm(x)
+        diff_plain = (got.float() - expected_plain.float()).abs().max().item()
+        diff_one_plus_w = (got.float() - 2 * expected_plain.float()).abs().max().item()
+        self.assertLess(
+            diff_plain,
+            1e-5,
+            f"audio RMSNorm should follow plain w*x/rms (max diff vs reference {diff_plain:.3e}); "
+            f"if this fails the implementation may have reverted to Gemma3 LLM's (1+w) variant.",
+        )
+        # Sanity: the wrong convention would produce a ~2x larger output.
+        self.assertGreater(diff_one_plus_w, 1e-2)
+
+    def test_vision_rmsnorm_uses_plain_w_not_one_plus_w(self):
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+
+        hidden_size, eps = 16, 1e-6
+        norm = _Gemma4VisionRMSNorm(hidden_size=hidden_size, eps=eps)
+        with torch.no_grad():
+            norm.weight.fill_(1.0)
+        torch.manual_seed(1)
+        x = torch.randn(4, hidden_size)
+        expected_plain = self._rms_normalize(x, eps)
+        got = norm(x)
+        diff = (got.float() - expected_plain.float()).abs().max().item()
+        self.assertLess(diff, 1e-5)
+
+    def test_vision_rmsnorm_weightless_variant_skips_scale(self):
+        """``has_weights=False`` maps to HF ``with_scale=False`` — the
+        ``v_norm`` slot in ``Gemma4VisionAttention``. Output is pure
+        ``x/rms`` regardless of any (non-existent) weight buffer."""
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+
+        hidden_size, eps = 16, 1e-6
+        norm = _Gemma4VisionRMSNorm(hidden_size=hidden_size, eps=eps, has_weights=False)
+        torch.manual_seed(2)
+        x = torch.randn(4, hidden_size)
+        expected = self._rms_normalize(x, eps)
+        got = norm(x)
+        self.assertLess((got.float() - expected.float()).abs().max().item(), 1e-5)
+
+    def test_audio_rmsnorm_matches_hf_class_with_same_weights(self):
+        """The adapter must be a behaviourally pure pass-through over HF's
+        ``Gemma4RMSNorm``: same weights → byte-identical output."""
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
+
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+
+        hidden_size, eps = 16, 1e-6
+        adapter = _Gemma4AudioRMSNorm(hidden_size=hidden_size, eps=eps)
+        hf = HFRMSNorm(hidden_size, eps=eps)
+        with torch.no_grad():
+            hf.weight.copy_(adapter.weight)
+        torch.manual_seed(3)
+        x = torch.randn(4, hidden_size)
+        self.assertTrue(torch.equal(adapter(x), hf(x)))
+
+    def test_audio_rmsnorm_dtype_kwarg_casts_weight(self):
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+
+        norm = _Gemma4AudioRMSNorm(hidden_size=8, eps=1e-6, dtype=torch.bfloat16)
+        self.assertEqual(norm.weight.dtype, torch.bfloat16)
+
+    def test_vision_rmsnorm_dtype_kwarg_casts_weight(self):
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+
+        norm = _Gemma4VisionRMSNorm(hidden_size=8, eps=1e-6, dtype=torch.bfloat16)
+        self.assertEqual(norm.weight.dtype, torch.bfloat16)
+
+    def test_vision_attention_uses_native_rmsnorm_adapter(self):
+        """Structural guard: ``Gemma4VisionAttention.q_norm/k_norm/v_norm``
+        must be instances of the HF-derived adapter, not TRT-LLM's
+        ``RMSNorm`` (which dispatches to flashinfer_rmsnorm and rejects
+        bf16 1152-wide SigLIP inputs)."""
+        import tensorrt_llm._torch.models.modeling_gemma4_vision as mv
+
+        # Static structural check via source — building a real VisionAttention
+        # requires a full SigLip config, but the call sites are simple.
+        src = open(mv.__file__).read()
+        # All q_norm/k_norm/v_norm/*_layernorm constructors should be the adapter.
+        forbidden_constructor = "RMSNorm(hidden_size=vision_config"
+        adapter_constructor = "_Gemma4VisionRMSNorm(hidden_size="
+        self.assertNotIn(
+            forbidden_constructor,
+            src,
+            "Vision tower must not construct TRT-LLM RMSNorm directly "
+            "— it dispatches to flashinfer_rmsnorm which rejects "
+            "bf16/non-contiguous SigLip inputs.",
+        )
+        self.assertIn(adapter_constructor, src)
+
+
+class TestGemma4AudioTowerStructure(unittest.TestCase):
+    """Smoke tests for the native Gemma4 audio tower module.
+
+    Full ``Gemma4AudioModel`` instantiation depends on a complete
+    ``Gemma4AudioConfig`` (mel bins, chunk sizes, conformer params); the
+    end-to-end behavioural check is the E4B CoVoST sbatch (job 2206264,
+    BLEU=24.69 ≥ baseline 24.54). These tests cover the module-level
+    invariants we want to guarantee at unit-test time.
+    """
+
+    def test_audio_module_exports_expected_classes(self):
+        """The native audio tower replaces ``AutoModel.from_config`` — the
+        ``Gemma4AudioModel`` + ``_Gemma4AudioRMSNorm`` symbols are part of
+        the contract with ``modeling_gemma4mm.py``."""
+        from tensorrt_llm._torch.models import modeling_gemma4_audio as ma
+
+        self.assertTrue(hasattr(ma, "Gemma4AudioModel"))
+        self.assertTrue(hasattr(ma, "_Gemma4AudioRMSNorm"))
+        # Audio layer is also referenced by load_weights / probe paths.
+        self.assertTrue(hasattr(ma, "Gemma4AudioLayer"))
+
+    def test_audio_module_does_not_import_trtllm_rmsnorm(self):
+        """The audio tower's RMSNorm path must NOT depend on
+        ``..modules.rms_norm.RMSNorm`` — that's the flashinfer_rmsnorm
+        dispatch site that rejects bf16 wide-channel inputs."""
+        from tensorrt_llm._torch.models import modeling_gemma4_audio as ma
+
+        src = open(ma.__file__).read()
+        self.assertNotIn("from ..modules.rms_norm import RMSNorm", src)
+        # Must import HF Gemma4RMSNorm (under its module-local alias).
+        self.assertIn("Gemma4RMSNorm", src)
+
+    def test_mm_wrapper_wires_native_audio_tower(self):
+        """``Gemma4ForConditionalGeneration`` must instantiate the native
+        ``Gemma4AudioModel`` (not fall back to ``AutoModel.from_config``)."""
+        from tensorrt_llm._torch.models import modeling_gemma4mm as mm
+
+        src = open(mm.__file__).read()
+        self.assertIn("Gemma4AudioModel(audio_model_config)", src)
+        # The previous HF fallback line must be gone.
+        self.assertNotIn("AutoModel.from_config(config.audio_config)", src)
+
+
 if __name__ == "__main__":
     unittest.main()

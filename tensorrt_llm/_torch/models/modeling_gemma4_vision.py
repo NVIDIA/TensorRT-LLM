@@ -46,6 +46,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
+from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as _HFGemma4RMSNorm
 
 from tensorrt_llm._utils import maybe_pin_memory
 
@@ -54,8 +55,29 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.linear import Linear
-from ..modules.rms_norm import RMSNorm
 from .modeling_utils import _load_weights_impl
+
+
+# Use HF's ``Gemma4RMSNorm`` directly instead of TRT-LLM's ``RMSNorm`` module.
+# TRT-LLM ``RMSNorm`` dispatches to ``flashinfer_rmsnorm`` whose CUTE kernel
+# rejects non-fp32 / non-contiguous strides and 1152-wide bf16 inputs from
+# SigLip. HF's class is pure PyTorch and handles ``with_scale=False`` (the
+# weightless ``v_norm`` case) via a flag.
+class _Gemma4VisionRMSNorm(_HFGemma4RMSNorm):
+    """Kwarg + dtype adapter around HF ``Gemma4RMSNorm``."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        eps: float,
+        dtype: Optional[torch.dtype] = None,
+        has_weights: bool = True,
+    ):
+        super().__init__(hidden_size, eps=eps, with_scale=has_weights)
+        if dtype is not None and has_weights:
+            with torch.no_grad():
+                self.weight.data = self.weight.data.to(dtype)
 
 
 @dataclass
@@ -286,13 +308,13 @@ class Gemma4VisionAttention(Attention):
 
         # HF Gemma4RMSNorm is the plain variant (``x_normed * weight``, no
         # ``(1+w)``). v_norm has ``with_scale=False`` (no learnable weight).
-        self.q_norm = RMSNorm(
+        self.q_norm = _Gemma4VisionRMSNorm(
             hidden_size=self.head_dim, eps=vision_config.rms_norm_eps, dtype=dtype
         )
-        self.k_norm = RMSNorm(
+        self.k_norm = _Gemma4VisionRMSNorm(
             hidden_size=self.head_dim, eps=vision_config.rms_norm_eps, dtype=dtype
         )
-        self.v_norm = RMSNorm(
+        self.v_norm = _Gemma4VisionRMSNorm(
             hidden_size=self.head_dim,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
@@ -322,11 +344,10 @@ class Gemma4VisionAttention(Attention):
             ):
                 self.register_buffer(name, pos_inf.clone())
 
-    def _head_norm(self, x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
-        # TRT-LLM ``RMSNorm`` may dispatch to ``flashinfer_rmsnorm`` which
-        # expects 2-D inputs — same pattern as ``QKNormRoPEAttention.apply_qk_norm``.
-        shape = x.shape
-        return norm(x.reshape(-1, self.head_dim)).reshape(shape)
+    def _head_norm(self, x: torch.Tensor, norm: _Gemma4VisionRMSNorm) -> torch.Tensor:
+        # HF ``Gemma4RMSNorm`` is pure PyTorch and normalises over the last
+        # dim, so we can pass the (..., head_dim) tensor through directly.
+        return norm(x)
 
     def forward(
         self,
@@ -406,22 +427,22 @@ class Gemma4VisionEncoderLayer(nn.Module):
             dtype=dtype,
         )
         self.mlp = Gemma4VisionMLP(vision_config, dtype, mapping)
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = _Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = _Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
         )
-        self.pre_feedforward_layernorm = RMSNorm(
+        self.pre_feedforward_layernorm = _Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
         )
-        self.post_feedforward_layernorm = RMSNorm(
+        self.post_feedforward_layernorm = _Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
