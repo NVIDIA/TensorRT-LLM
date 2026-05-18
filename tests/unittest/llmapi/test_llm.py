@@ -2789,8 +2789,8 @@ def test_maybe_disable_block_reuse_for_multimodal_text_only_untouched():
         _maybe_disable_block_reuse_for_multimodal
 
     cfg = KvCacheConfig()
-    flipped = _maybe_disable_block_reuse_for_multimodal(
-        _FakeTextProcessor(), cfg)
+    flipped = _maybe_disable_block_reuse_for_multimodal(_FakeTextProcessor(),
+                                                        cfg)
 
     assert flipped is False
     assert cfg.enable_block_reuse is True
