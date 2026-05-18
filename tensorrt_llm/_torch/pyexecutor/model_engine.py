@@ -427,19 +427,13 @@ class PyTorchModelEngine(ModelEngine):
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
             # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
             # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            # Runtime draft length is updated each iteration when dynamic draft length is enabled; otherwise stays fixed.
             if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
+                self.runtime_draft_len = self.max_total_draft_tokens
             else:
                 self.max_draft_len = spec_config.max_draft_len
-            # Mutable per-iteration draft length (updated each iteration when
-            # dynamic draft length is enabled; otherwise stays fixed). For
-            # parallel-draft modes (PARD/DFlash), self.max_draft_len is the
-            # 2K-1 buffer width; the worker forward expects logical K, so
-            # initialize from spec_config.max_draft_len here.
-            if spec_config.spec_dec_mode.is_parallel_draft():
                 self.runtime_draft_len = spec_config.max_draft_len
-            else:
-                self.runtime_draft_len = self.max_draft_len
 
         else:
             self.without_logits = False
