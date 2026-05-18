@@ -279,7 +279,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         raster_along_m: bool = False,
         b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
-        swiglu_limit: cutlass.Float32 = float('inf'),
+        swiglu_limit: cutlass.Float32 = float("inf"),
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -411,7 +411,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.vectorized_f32 = vectorized_f32
 
         self.swiglu_limit = swiglu_limit
-        self.has_swiglu_limit = (swiglu_limit != float('inf'))
+        self.has_swiglu_limit = swiglu_limit != float("inf")
 
         # Multi-B tensor configuration
         if b_tensor_l_sizes is None:

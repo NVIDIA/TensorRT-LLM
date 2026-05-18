@@ -620,7 +620,7 @@ def run(
     use_cupti: bool = False,
     raster_along_m: bool = False,
     num_b_tensors: int = None,
-    swiglu_limit: float = float('inf'),
+    swiglu_limit: float = float("inf"),
     **kwargs,
 ):
     """Run contiguous grouped GEMM with gather operation and SwiGLU fusion for FC1 layer.
@@ -897,7 +897,7 @@ def run(
             ]
 
             # SwiGLU clamp
-            if swiglu_limit != float('inf'):
+            if swiglu_limit != float("inf"):
                 gate_result = gate_result.clamp(max=swiglu_limit)
                 up_result = up_result.clamp(min=-swiglu_limit, max=swiglu_limit)
 
@@ -1397,7 +1397,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--swiglu_limit",
         type=float,
-        default=float('inf'),
+        default=float("inf"),
         help="Swiglu clamp factor, +inf (default) disables clamp",
     )
 
