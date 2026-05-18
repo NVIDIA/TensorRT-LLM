@@ -3359,13 +3359,14 @@ def launchTestJobs(pipeline, testFilter)
 
     SBSASlurmTestConfigs = [
         "GB200-4_GPUs-PyTorch-DS-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 4],
-        "GB200-8_GPUs-PyTorch-DS-1": ["auto:gb200-x8", "l0_gb200_multi_gpus_ds", 1, 1, 8],
-        "GB200-16_GPUs-PyTorch-DS-Post-Merge-1": ["auto:gb200-x16", "l0_gb200_multi_gpus_ds", 1, 1, 16],
-        "GB200-24_GPUs-PyTorch-DS-Post-Merge-1": ["auto:gb200-x24", "l0_gb200_multi_gpus_ds", 1, 1, 24],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
-    multiNodesSBSAConfigs = [:]
+    multiNodesSBSAConfigs = [
+        "GB200-8_GPUs-2_Nodes-PyTorch-DS-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 8, 2],
+        "GB200-16_GPUs-4_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 16, 4],
+        "GB200-24_GPUs-6_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 24, 6],
+    ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
