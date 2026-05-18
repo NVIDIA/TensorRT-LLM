@@ -1230,9 +1230,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         # Per-request fixed cost. STATIC_SLOTS_PER_REQUEST = 1 today (the
         # live mamba state); fixed-position snapshots are not yet
-        # implemented and would simply increment this constant.
+        # implemented and would simply increment this constant. With
+        # pipeline parallelism, multiple microbatches are in-flight
+        # concurrently on the same rank, so each rank holds Mamba state
+        # for up to ``max_batch_size * pp_size`` concurrent sequences.
         STATIC_SLOTS_PER_REQUEST = 1
-        intercept = (max_batch_size * state_bytes_per_rank *
+        pp_size = mapping.pp_size if mapping is not None else 1
+        intercept = (max_batch_size * pp_size * state_bytes_per_rank *
                      STATIC_SLOTS_PER_REQUEST)
 
         # Regular-snapshot bytes per token. None / non-positive intervals

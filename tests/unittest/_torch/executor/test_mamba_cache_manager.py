@@ -340,6 +340,73 @@ def test_cpp_hybrid_recurrent_pool_reserves_draft_len_sentinel_slots():
     )
 
 
+def _build_hybrid_with_mamba_layer_pp(
+    spec_config=None, max_batch_size=4, enable_block_reuse=False, pp_size=2
+):
+    """Same as ``_build_hybrid_with_mamba_layer`` but with ``pp_size`` >= 1.
+
+    Uses ``world_size = pp_size`` and ``rank = 0`` so the real C++ KVCacheManager
+    still goes through its single-process path while the Python pool-sizing
+    code sees ``mapping.pp_size > 1``. Constructs ``pp_size * 2`` total layers
+    (alternating mamba/attn) so that each PP slice has both a mamba and an
+    attention layer — otherwise some ranks would hit a slope=0 edge case in
+    the affine memory model when block reuse is disabled.
+    """
+    pairs = pp_size  # one (mamba, attn) pair per PP stage so every rank has both kinds
+    mamba_mask = [True, False] * pairs
+    attn_mask = [False, True] * pairs
+    mamba_num_layers = sum(mamba_mask)
+    num_layers = sum(attn_mask)
+    mapping = Mapping(world_size=pp_size, rank=0, tp_size=1, pp_size=pp_size)
+    kv_cache_config = KvCacheConfig(max_tokens=512, enable_block_reuse=enable_block_reuse)
+    return CppMambaHybridCacheManager(
+        mamba_d_state=8,
+        mamba_d_conv=4,
+        mamba_num_heads=4,
+        mamba_n_groups=1,
+        mamba_head_dim=8,
+        mamba_num_layers=mamba_num_layers,
+        mamba_layer_mask=mamba_mask,
+        mamba_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=torch.float16,
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=num_layers,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=max_batch_size,
+        mapping=mapping,
+        spec_config=spec_config,
+        layer_mask=attn_mask,
+    )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_cpp_hybrid_recurrent_pool_scales_with_pp_size(pp_size):
+    """With pipeline parallelism, multiple microbatches are in-flight on the
+    same rank concurrently, each holding up to ``max_batch_size`` sequences'
+    Mamba state. The recurrent-state pool must therefore size for
+    ``max_batch_size * pp_size`` live slots (plus the CUDA-graph padding
+    sentinel). Without this scaling, the first inference batch under PP>1
+    trips ``No free block found`` once requests beyond the first microbatch
+    enter the pool (cf. TestNemotronV3Super::test_nvfp4_parallelism[TP4_PP2]).
+    """
+    max_batch_size = 4
+    mgr = _build_hybrid_with_mamba_layer_pp(
+        spec_config=None, max_batch_size=max_batch_size, pp_size=pp_size
+    )
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    expected_min = max_batch_size * pp_size + 1
+    assert recurrent_primary >= expected_min, (
+        f"recurrent-state pool has {recurrent_primary} slots with pp_size={pp_size}, "
+        f"need >= max_batch_size * pp_size + 1 = {expected_min} so concurrent "
+        f"in-flight microbatches don't exhaust live-state slots"
+    )
+
+
 @skip_no_cuda
 def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
     """With block reuse enabled, the block-reuse branch must not drop the

@@ -455,13 +455,19 @@ class KVCacheManager(BaseResourceManager):
                 # slots live in a separate window: at minimum the live
                 # state per concurrent request, and -- when block reuse is
                 # enabled -- enough room for one regular snapshot per
-                # snapshot interval over the full token budget.
-                max_snapshots = self.max_batch_size
+                # snapshot interval over the full token budget. With
+                # pipeline parallelism, multiple microbatches can be
+                # in-flight simultaneously on the same rank, each holding
+                # up to ``max_batch_size`` sequences' Mamba state, so the
+                # live-state slot count must scale with ``pp_size``.
+                pp_size = self.mapping.pp_size if self.mapping is not None else 1
+                live_state_slots = self.max_batch_size * pp_size
+                max_snapshots = live_state_slots
                 if kv_cache_config.enable_block_reuse:
                     max_snapshots = max(
                         kv_cache_config.max_tokens //
                         linear_attention_metadata.states_snapshot_interval,
-                        self.max_batch_size)
+                        live_state_slots)
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
@@ -1546,7 +1552,12 @@ class KVCacheManager(BaseResourceManager):
         slope = attention_slope + mamba_slope
         # STATIC_SLOTS_PER_REQUEST = 1 (live state); fixed-position
         # snapshots are not yet implemented.
-        intercept = self.max_batch_size * state_bytes_local
+        # With pipeline parallelism, multiple microbatches can be in-flight
+        # simultaneously on the same rank, so each rank holds Mamba state for
+        # up to ``max_batch_size * pp_size`` concurrent sequences. Mirror the
+        # behaviour of KVCacheManagerV2 (see max_num_sequences calculation).
+        pp_size = self.mapping.pp_size if self.mapping is not None else 1
+        intercept = self.max_batch_size * pp_size * state_bytes_local
 
         # heuristic: When block reuse is enabled, we assume the mamba snapshots are dominant instead of active states,
         # otherwise we may run out of kv cache blocks prior to mamba blocks due to the large number of max_batch_size.
@@ -1569,8 +1580,11 @@ class KVCacheManager(BaseResourceManager):
         # Recurrent state slot count: live state per concurrent request, with
         # extra room for one regular snapshot per snapshot interval over the
         # full token budget when block reuse is enabled.
-        # +1 is for cuda graph padding
-        max_snapshots = self.max_batch_size + 1
+        # With pipeline parallelism, multiple microbatches can be in-flight
+        # simultaneously on the same rank, each holding up to ``max_batch_size``
+        # sequences' Mamba state, so the live-state slot count must scale with
+        # ``pp_size``. +1 is for the CUDA graph padding dummy.
+        max_snapshots = self.max_batch_size * pp_size + 1
         if self.spec_config is not None:
             # cuda graph has different request ids for different draft len (CUDAGraphRunner::_get_padded_batch)
             # TODO: we can use a same slot for all these
