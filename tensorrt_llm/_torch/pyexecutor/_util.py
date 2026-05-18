@@ -11,7 +11,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -505,19 +504,15 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        # Route to the multimodal dummy path when the input processor declares
-        # itself multimodal — independent of *which* modality the model
-        # supports (audio-only, vision-only, or mixed). Using the
-        # InputProcessor's base class as the discriminator (instead of the
-        # vision-biased ``original_arch`` ∈ ``MODEL_CLASS_VISION_ENCODER_MAPPING``
-        # lookup) removes the vision-encoder-decorator coupling.
+        # Route to the multimodal dummy path when the engine drives a
+        # multimodal model, independent of *which* modality (audio-only,
+        # vision-only, or mixed). The discriminator hides behind
+        # ``is_multimodal``; see PyTorchModelEngine for the signals used.
         #
         # Disaggregated workers receive multimodal embeddings instead of raw
         # pixel inputs, so capacity probing must still use the text-only
         # fallback there.
-        if (not _is_mm_disagg()
-                and isinstance(self._model_engine.input_processor,
-                               BaseMultimodalInputProcessor)):
+        if not _is_mm_disagg() and self._model_engine.is_multimodal:
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
