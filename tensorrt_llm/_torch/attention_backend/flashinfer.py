@@ -65,9 +65,9 @@ class RaggedPlanParams:
 
 
 @dataclass(kw_only=True, frozen=True)
-class MLADecodePlanParams:
+class MLAPlanParams:
     """
-    Parameters for FlashInfer MLA decode using BatchMLAPagedAttentionWrapper.
+    Parameters for FlashInfer MLA using BatchMLAPagedAttentionWrapper.
     """
 
     num_heads: int
@@ -118,17 +118,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper] = field(
             init=False, default=None)
 
-    # MLA decode wrapper (BatchMLAPagedAttentionWrapper) and stable buffers.
+    # MLA wrappers (BatchMLAPagedAttentionWrapper) and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
     # outside stream capture (flashinfer plan() does device->host syncs).
     _mla_decode_wrapper: Optional[object] = field(init=False, default=None)
     _mla_context_wrapper: Optional[object] = field(init=False, default=None)
     _mla_ragged_plan_params: Optional[RaggedPlanParams] = field(init=False,
                                                                 default=None)
-    _mla_context_plan_params: Optional[MLADecodePlanParams] = field(
-        init=False, default=None)
-    _mla_decode_plan_params: Optional[MLADecodePlanParams] = field(init=False,
-                                                                   default=None)
+    _mla_context_plan_params: Optional[MLAPlanParams] = field(init=False,
+                                                              default=None)
+    _mla_decode_plan_params: Optional[MLAPlanParams] = field(init=False,
+                                                             default=None)
     _mla_ragged_planned: bool = field(init=False, default=False)
     _mla_context_planned: bool = field(init=False, default=False)
     _mla_decode_planned: bool = field(init=False, default=False)
@@ -190,6 +190,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # new plan. Reusing a cached plan avoids this sync on later layers.
         torch.cuda.current_stream().synchronize()
 
+        self._do_plan_ragged(qo_indptr, kv_indptr, plan_params)
+        self._mla_ragged_planned = True
+
+        return self._ragged_prefill_wrapper
+
+    def _do_plan_ragged(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        plan_params: RaggedPlanParams,
+    ) -> None:
+        assert self._ragged_prefill_wrapper is not None
         self._ragged_prefill_wrapper.plan(
             qo_indptr,
             kv_indptr,
@@ -203,13 +215,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             kv_data_type=plan_params.kv_dtype,
             sm_scale=plan_params.sm_scale,
         )
-        self._mla_ragged_planned = True
-
-        return self._ragged_prefill_wrapper
 
     def plan_mla_decode(
         self,
-        plan_params: MLADecodePlanParams,
+        plan_params: MLAPlanParams,
     ) -> object:
         """Plan MLA decode using BatchMLAPagedAttentionWrapper.
 
@@ -255,7 +264,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         kv_indptr: torch.Tensor,
         kv_indices: torch.Tensor,
         kv_last_page_len: torch.Tensor,
-        plan_params: MLADecodePlanParams,
+        plan_params: MLAPlanParams,
     ) -> object:
         """Plan MLA context with cached KV using BatchMLAPagedAttentionWrapper."""
         if self._mla_context_wrapper is None:
@@ -277,13 +286,34 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if self._mla_context_planned:
             return self._mla_context_wrapper
 
-        num_pages_per_seq = kv_indptr[1:] - kv_indptr[:-1]
-        kv_len_arr = (num_pages_per_seq -
-                      1) * plan_params.page_size + kv_last_page_len
-
         # Split append_paged_mla_kv_cache from plan() when this wrapper needs a
         # new plan. Reusing a cached plan avoids this sync on later layers.
         torch.cuda.current_stream().synchronize()
+
+        self._do_plan_mla_context(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            plan_params,
+        )
+        self._mla_context_planned = True
+
+        return self._mla_context_wrapper
+
+    def _do_plan_mla_context(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        plan_params: MLAPlanParams,
+    ) -> None:
+        assert self._mla_context_wrapper is not None
+
+        num_pages_per_seq = kv_indptr[1:] - kv_indptr[:-1]
+        kv_len_arr = (num_pages_per_seq -
+                      1) * plan_params.page_size + kv_last_page_len
 
         self._mla_context_wrapper.plan(
             qo_indptr,
@@ -299,11 +329,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             kv_data_type=plan_params.kv_dtype,
             sm_scale=plan_params.sm_scale,
         )
-        self._mla_context_planned = True
 
-        return self._mla_context_wrapper
-
-    def _do_plan_mla_decode(self, plan_params: MLADecodePlanParams) -> None:
+    def _do_plan_mla_decode(self, plan_params: MLAPlanParams) -> None:
         """Compute MLA decode plan inputs and call wrapper.plan().
 
         Must run outside of CUDA graph capture. kv_indptr / kv_indices are
@@ -827,8 +854,35 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
+        # Re-plan MLA wrappers outside of forward/capture using the params
+        # cached by prior warmup forwards. Forward still handles first-use or
+        # dtype/shape changes by syncing only on a plan cache miss.
         self._mla_ragged_planned = False
+        if (self.num_contexts > 0 and self._mla_ragged_plan_params is not None
+                and self._ragged_prefill_wrapper is not None):
+            ragged_indptr = self.qo_indptr[:self.num_contexts + 1]
+            self._do_plan_ragged(ragged_indptr, ragged_indptr,
+                                 self._mla_ragged_plan_params)
+            self._mla_ragged_planned = True
+
         self._mla_context_planned = False
+        if (self.num_contexts > 0 and self._mla_context_plan_params is not None
+                and self._mla_context_wrapper is not None):
+            num_contexts = self.num_contexts
+            num_context_blocks = self.num_context_blocks
+            context_qo_indptr = self.qo_indptr[:num_contexts + 1]
+            context_kv_indptr = self.paged_kv_indptr_prefill[:num_contexts + 1]
+            context_kv_indices = self._paged_kv_indices[:num_context_blocks]
+            context_last_page_len = self._paged_kv_last_page_len[:num_contexts]
+            self._do_plan_mla_context(
+                qo_indptr=context_qo_indptr,
+                kv_indptr=context_kv_indptr,
+                kv_indices=context_kv_indices,
+                kv_last_page_len=context_last_page_len,
+                plan_params=self._mla_context_plan_params,
+            )
+            self._mla_context_planned = True
+
         # Re-plan the MLA decode wrapper outside of any stream capture.
         if (self.num_generations > 0
                 and self._mla_decode_plan_params is not None
@@ -1288,7 +1342,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         else:
             sm_scale = 1.0 / math.sqrt(qk_head_dim)
 
-        plan_params = MLADecodePlanParams(
+        plan_params = MLAPlanParams(
             num_heads=self.num_heads,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -1352,7 +1406,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         else:
             sm_scale = 1.0 / math.sqrt(qk_head_dim)
 
-        plan_params = MLADecodePlanParams(
+        plan_params = MLAPlanParams(
             num_heads=self.num_heads,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
