@@ -37,3 +37,5 @@ transforms:
     enabled: true
   fuse_add_rms_norm:
     enabled: true
+  compile_model:
+    piecewise_enabled: false

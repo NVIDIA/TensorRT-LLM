@@ -1,27 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-# Overlay for gpt-oss-120b running at TP=2. Stacks on top of
-# ``gpt_oss_120b.yaml`` to switch the default MoE topology from EP=2
-# (``moe_tp_size=1, moe_ep_size=2`` — Triton EP path) to TP=2
-# (``moe_tp_size=2, moe_ep_size=1`` — trtllm-gen MoE TP path).
-#
-# Why this overlay is necessary:
-# 1. The default ``dist_mapping`` resolves to ``moe_tp=1, moe_ep=world_size``
-#    (see ``DistConfig.from_sharding_params``). With ``world_size=2`` that
-#    means EP=2.
-# 2. The modeling-side trtllm-gen MXFP4 path (``AD_MXFP4_TRTLLM_GEN_MODELING=1``
-#    default) prepares weights with intermediate-TP slicing via the load
-#    hook. For the runtime to agree, ``dc.moe_tp_size`` must equal the hook's
-#    ``tp_size`` -- i.e., world_size. This overlay sets that.
-# 3. ``apply_sharding_hints`` resolves the modeling's
-#    ``auto_deploy.all_reduce`` placeholder (emitted after the MoE op) into
-#    a real collective; we enable it and disable the legacy sharding
-#    executor.
-# 4. ``shard_layers: ["mha"]`` restricts hint-driven sharding to attention.
-#    MoE TP comes from the ``moe_tp`` field in ``dist_mapping`` which the
-#    weight-prep load hook reads (via world-size) and the all_reduce
-#    placeholder relies on for resolution.
+world_size: 2
 transforms:
   detect_sharding:
     enabled: false
