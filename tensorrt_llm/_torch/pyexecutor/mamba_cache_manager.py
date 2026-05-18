@@ -1146,6 +1146,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval if kv_cache_config.enable_block_reuse else 0
+        # RNN model params for disagg TP-mismatch split/concat.
+        conv_section_map = {"nemotron_hybrid": 1, "qwen3_next": 2}
+        self.linear_attention_metadata.rnn_num_heads = self._rnn_num_heads
+        self.linear_attention_metadata.rnn_head_dim = self._rnn_head_dim
+        self.linear_attention_metadata.rnn_d_state = self._rnn_d_state
+        self.linear_attention_metadata.rnn_d_conv = self._rnn_d_conv
+        self.linear_attention_metadata.rnn_n_groups = self._rnn_n_groups
+        self.linear_attention_metadata.rnn_conv_section_layout = conv_section_map.get(
+            self._rnn_conv_section_layout, 0)
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if kv_cache_config.enable_partial_reuse:
             logger.warning(

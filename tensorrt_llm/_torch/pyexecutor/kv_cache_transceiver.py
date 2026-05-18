@@ -181,20 +181,23 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
 
         # Get RNN state manager and layer distribution if mamba_cache_manager is provided.
-        # For CppMambaHybridCacheManager, recurrent states are in the unified KV pool
-        # — the C++ CacheFormatter handles recurrent state transfer inline, so no separate RnnStateManager
-        # is needed.
         rnn_state_manager = None
         rnn_layer_num_per_pp_rank = []
-        if mamba_cache_manager is not None and not isinstance(
-                mamba_cache_manager, CppMambaHybridCacheManager):
-            rnn_state_manager = mamba_cache_manager._impl.mamba_impl
-            # Get the number of local RNN layers and allgather across PP ranks
-            rnn_local_layer_num = rnn_state_manager.get_num_local_layers()
-            rnn_layer_num_per_pp_rank = dist.pp_allgather(rnn_local_layer_num)
-            logger.info(
-                f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
-            )
+        if mamba_cache_manager is not None:
+            if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
+                # Unified pool path: RNN model config is in LinearAttentionMetadata,
+                # C++ reads it from BlockManager during CacheTransceiver construction.
+                rnn_layer_num_per_pp_rank = dist.pp_allgather(
+                    mamba_cache_manager.local_num_mamba_layers)
+            else:
+                rnn_state_manager = mamba_cache_manager._impl.mamba_impl
+                # Get the number of local RNN layers and allgather across PP ranks
+                rnn_local_layer_num = rnn_state_manager.get_num_local_layers()
+                rnn_layer_num_per_pp_rank = dist.pp_allgather(
+                    rnn_local_layer_num)
+                logger.info(
+                    f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
+                )
 
         self.impl = CacheTransceiverCpp(
             kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
@@ -202,50 +205,6 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             pp_layer_num_per_pp_rank, dtype, attention_type,
             cache_transceiver_config._to_pybind(), rnn_state_manager,
             rnn_layer_num_per_pp_rank)
-
-        # For CppMambaHybridCacheManager, set RNN model config on the CacheState
-        # so the C++ CacheFormatter can perform TP-mismatch split/concat for
-        # recurrent state transfer.
-        if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
-            RnnModelConfig = tensorrt_llm.bindings.internal.batch_manager.RnnModelConfig
-            ConvSectionLayout = tensorrt_llm.bindings.internal.batch_manager.ConvSectionLayout
-            from tensorrt_llm._utils import torch_dtype_to_binding
-            rnn_cfg = RnnModelConfig()
-            rnn_cfg.d_state = mamba_cache_manager._rnn_d_state
-            rnn_cfg.d_conv = mamba_cache_manager._rnn_d_conv
-            rnn_cfg.hidden_size = mamba_cache_manager._rnn_hidden_size
-            rnn_cfg.head_dim = mamba_cache_manager._rnn_head_dim
-            rnn_cfg.conv_dim_size = mamba_cache_manager._rnn_conv_dim_size
-            rnn_cfg.n_groups = mamba_cache_manager._rnn_n_groups
-            rnn_cfg.num_layers = mamba_cache_manager._rnn_num_layers
-            rnn_cfg.num_heads = mamba_cache_manager._rnn_num_heads
-
-            # Map model_type string to ConvSectionLayout enum
-            layout_map = {
-                "nemotron_hybrid": ConvSectionLayout.NEMOTRON,
-                "qwen3_next": ConvSectionLayout.QWEN3_NEXT,
-            }
-            layout_str = mamba_cache_manager._rnn_conv_section_layout
-            rnn_cfg.conv_section_layout = layout_map.get(
-                layout_str, ConvSectionLayout.NONE)
-
-            # Get mamba layer count per PP rank
-            rnn_local_layers = mamba_cache_manager.local_num_mamba_layers
-            rnn_layer_num_per_pp = dist.pp_allgather(rnn_local_layers)
-
-            conv_dtype = torch_dtype_to_binding(
-                mamba_cache_manager.conv_state_dtype)
-            ssm_dtype = torch_dtype_to_binding(
-                mamba_cache_manager.ssm_state_dtype)
-
-            self.impl.set_unified_pool_rnn_config(rnn_cfg, rnn_layer_num_per_pp,
-                                                  conv_dtype, ssm_dtype)
-            logger.info(
-                f"Unified pool RNN config set for disagg: "
-                f"num_heads={rnn_cfg.num_heads}, head_dim={rnn_cfg.head_dim}, "
-                f"d_state={rnn_cfg.d_state}, d_conv={rnn_cfg.d_conv}, "
-                f"conv_section_layout={layout_str}, "
-                f"rnn_layer_num_per_pp={rnn_layer_num_per_pp}")
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)

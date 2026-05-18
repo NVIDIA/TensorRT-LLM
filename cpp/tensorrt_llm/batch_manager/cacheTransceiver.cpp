@@ -206,6 +206,46 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_LOG_INFO("RNN cache transfer components initialized.");
     }
 
+    // Unified pool path (CppMambaHybridCacheManager): build RnnModelConfig from
+    // LinearAttentionMetadata. Detected by rnnLayerNumPerPP set but no RnnStateManager.
+    if (mRnnStateManager == nullptr && !rnnLayerNumPerPP.empty())
+    {
+        auto const& blockManager = cacheManager->getBlockManager();
+        auto const& linearMeta = blockManager.getLinearAttentionMetadata();
+        TLLM_CHECK_WITH_INFO(linearMeta.has_value(), "LinearAttentionMetadata not found for unified pool RNN config");
+
+        executor::kv_cache::CacheState::RnnModelConfig rnnModelCfg{};
+        rnnModelCfg.mNumHeads = linearMeta->rnnNumHeads;
+        rnnModelCfg.mHeadDim = linearMeta->rnnHeadDim;
+        rnnModelCfg.mDState = linearMeta->rnnDState;
+        rnnModelCfg.mDConv = linearMeta->rnnDConv;
+        rnnModelCfg.mNGroups = linearMeta->rnnNGroups;
+        rnnModelCfg.mHiddenSize = linearMeta->rnnHeadDim * linearMeta->rnnNumHeads;
+        rnnModelCfg.mConvSectionLayout = static_cast<executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout>(
+            linearMeta->rnnConvSectionLayout);
+
+        // Derive dtype from the recurrent state pool.
+        nvinfer1::DataType rnnPoolDtype = dataType;
+        auto const totalPools = cacheManager->getNumPools();
+        for (SizeType32 poolIdx = 0; poolIdx < totalPools; ++poolIdx)
+        {
+            auto ws = blockManager.getPoolWindowSize(poolIdx);
+            if (kv_cache_manager::LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+            {
+                rnnPoolDtype = cacheManager->getPrimaryPool(poolIdx)->getDataType();
+                break;
+            }
+        }
+
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, rnnPoolDtype, rnnPoolDtype);
+
+        TLLM_LOG_INFO(
+            "Unified pool RNN config: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
+            "nGroups=%d, hiddenSize=%d, convSectionLayout=%d",
+            rnnModelCfg.mNumHeads, rnnModelCfg.mHeadDim, rnnModelCfg.mDState, rnnModelCfg.mDConv, rnnModelCfg.mNGroups,
+            rnnModelCfg.mHiddenSize, static_cast<int>(rnnModelCfg.mConvSectionLayout));
+    }
+
     mCacheTransBufferManagerPtrs.clear();
     mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size() + (mRnnCacheTransBufferManager ? 1 : 0));
     for (auto& manager : mCacheTransBufferManagers)
@@ -299,31 +339,6 @@ CacheTransceiver::~CacheTransceiver()
         std::lock_guard<std::mutex> lock(mDllMutex);
         dllClose(mWrapperLibHandle);
     }
-}
-
-void CacheTransceiver::setUnifiedPoolRnnConfig(executor::kv_cache::CacheState::RnnModelConfig const& rnnModelConfig,
-    std::vector<SizeType32> const& rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
-    nvinfer1::DataType ssmStateDataType)
-{
-    TLLM_CHECK(mCacheState != nullptr);
-    mCacheState->setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
-
-    // Propagate to CacheSender/CacheReceiver which hold copies of the CacheState.
-    if (mCacheSender)
-    {
-        mCacheSender->setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
-    }
-    if (mCacheReceiver)
-    {
-        mCacheReceiver->setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
-    }
-
-    TLLM_LOG_INFO(
-        "Unified pool RNN config set: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
-        "convDimSize=%d, nGroups=%d, numLayers=%d, convSectionLayout=%d",
-        rnnModelConfig.mNumHeads, rnnModelConfig.mHeadDim, rnnModelConfig.mDState, rnnModelConfig.mDConv,
-        rnnModelConfig.mConvDimSize, rnnModelConfig.mNGroups, rnnModelConfig.mNumLayers,
-        static_cast<int>(rnnModelConfig.mConvSectionLayout));
 }
 
 void CacheTransceiver::initializeCommState()

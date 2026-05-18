@@ -269,12 +269,6 @@ public:
 
     virtual bool cancelRequest(LlmRequest* llmRequest) override;
 
-    /// Set RNN model config on the CacheState for unified pool path (CppMambaHybridCacheManager).
-    /// This enables TP-mismatch split/concat for recurrent state transfer.
-    void setUnifiedPoolRnnConfig(executor::kv_cache::CacheState::RnnModelConfig const& rnnModelConfig,
-        std::vector<SizeType32> const& rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
-        nvinfer1::DataType ssmStateDataType);
-
 private:
     void initializeCommState();
 
