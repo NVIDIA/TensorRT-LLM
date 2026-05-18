@@ -952,7 +952,16 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def setup_attn_metadata(self, max_num_requests: int,
                             max_num_tokens: int) -> None:
         # Override: Qwen2/2.5-VL uses two metadata objects (full + window
-        # attention) instead of the mixin's single `attn_metadata`.
+        # attention) instead of the mixin's single ``attn_metadata``.
+        #
+        # Windowed attention splits each image into many attention sequences
+        # (one per window grid cell), so ``max_num_requests`` here is the
+        # **window** count, not the image count. The legacy hardcoded value
+        # was 8192; preserve that as a floor so callers that leave
+        # ``encoder_max_batch_size`` unset (and thus inherit the LLM-side
+        # ``max_batch_size``, which is far smaller) still get a buffer large
+        # enough for the worst-case window split.
+        max_num_requests = max(max_num_requests, 8192)
         kwargs = dict(max_num_requests=max_num_requests,
                       max_num_tokens=max_num_tokens,
                       kv_cache_manager=None)
