@@ -6,12 +6,6 @@
 # Weights are stored in MXFP4 on HF; AD's quantize_mxfp4_moe transform handles it.
 runtime: trtllm
 model_factory: AutoModelForCausalLM
-# Pin activation dtype to bf16. The HF config.json for gpt-oss-120b
-# omits `torch_dtype`/`dtype`, so transformers 5.x's `_from_config`
-# (used by AD's meta-device build path) falls back to fp32. With
-# fp32 activations, trtllm attention's FMHA path is disabled (it
-# only supports fp16/bf16) and the unfused workspace blows up to
-# ~1 TB during the resize_kv_cache forward pass.
 model_kwargs:
   dtype: bfloat16
 attn_backend: trtllm
@@ -28,20 +22,16 @@ kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
 transforms:
+  detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
   quantize_mxfp4_moe_trtllm_gen:
     enabled: true
-    # MXFP8 input activation: pre-quantize activations to E4M3 + UE8M0 block
-    # scales and dispatch to ``trtllm_mxfp4_w4a8_moe_fused`` (MXFP4 weights ×
-    # MXFP8 activations). Matches PT's ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod``
-    # path; the C++ runner uses the ``bmm_MxE4m3_MxE2m1MxE4m3`` cubin family
-    # which has bigger TileN candidates available than the bf16 fallback.
     quant_act: mxfp8
-  # Fold RoPE into the trtllm attention kernel call so the kernel applies
-  # RoPE internally (same path as the PyTorch backend). When RoPE is applied
-  # externally in modeling code and only Q/K post-RoPE are passed to the
-  # kernel, small precision differences in cos/sin compound through the KV
-  # cache and produce large divergence at decode steps. Verified via 4-layer
-  # PT-vs-AD per-step dump: enabling this transform reduces L0 attn_out
-  # decode_1 rel_RMSE from ~129% to ~1%.
+  fuse_gemms_mixed_children:
+    enabled: true
+  fuse_gemms:
+    enabled: true
   fuse_rope_into_trtllm_attention:
     enabled: true
