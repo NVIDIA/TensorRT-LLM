@@ -185,7 +185,7 @@ class LagunaMoE(nn.Module):
         )
 
         if self.routed_scaling_factor != 1.0:
-            routed_output = routed_output * self.routed_scaling_factor
+            routed_output *= self.routed_scaling_factor
 
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
@@ -246,7 +246,6 @@ class LagunaAttention(QKNormRoPEAttention):
         gating = getattr(config, "gating", False)
         self._use_gating = bool(gating)
         self._gate_per_head = gating == "per-head" or gating is True
-        self._num_heads_local = None  # set after super().__init__
 
         # fuse_qk_norm_rope=False is required: the fused kernel reads
         # partial_rotary_factor and yarn params from pretrained_config
@@ -270,6 +269,7 @@ class LagunaAttention(QKNormRoPEAttention):
 
         self._num_heads_local = self.num_heads
 
+        self.g_proj = None
         if self._use_gating:
             g_out = num_heads if self._gate_per_head else num_heads * self.head_dim
             # In DEP mode (enable_attention_dp=True) the attention base class uses
@@ -386,7 +386,7 @@ class LagunaAttention(QKNormRoPEAttention):
                     * gate.unsqueeze(-1)
                 ).view(shape)
             else:
-                attn_output = attn_output * gate
+                attn_output *= gate
 
         attn_output = _helix_cp_output_projection(
             self.o_proj,
@@ -521,6 +521,7 @@ class LagunaModel(DecoderModel):
             dtype=config.torch_dtype,
         )
 
+    @torch.inference_mode()
     def forward(
         self,
         attn_metadata: AttentionMetadata,

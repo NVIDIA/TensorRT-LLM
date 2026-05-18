@@ -16,6 +16,8 @@
 from transformers.configuration_utils import PretrainedConfig
 
 
+# This is a workaround until we use a version of transformers that supports
+# Laguna. Namely: v5.7.0 or higher.
 class LagunaConfig(PretrainedConfig):
     model_type = "laguna"
     keys_to_ignore_at_inference = ["past_key_values"]
