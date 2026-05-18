@@ -18,7 +18,7 @@ void invokeDeepseekV4QNorm(
 //     stride in bytes is `quantQNopeRowStrideBytes`; pass `nopeDim` for a packed
 //     [totalRows, nopeDim] output buffer, or `headDim` to interleave with the rope
 //     segment of a shared `[totalRows, headDim]` FP8 Q buffer (consumed by FMHA
-//     after RoPE_OptContext fills the rope slot).
+//     after applyMLARopeAndAssignQKVKernelOptContext fills the rope slot).
 //   * the remaining `headDim - nopeDim` columns as the input dtype into `q_pe_out`
 //     (always packed [totalRows, headDim - nopeDim]).
 // Eliminates the trailing bf16→FP8 quant_copy pass that follows q_b_layernorm in the

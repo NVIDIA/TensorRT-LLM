@@ -39,11 +39,14 @@ torch::Tensor deepseekV4QNorm(torch::Tensor q, int64_t numHeads, int64_t headDim
     return output;
 }
 
-// Returns (FP8 nope, bf16/fp16 rope). When `interleavedQuantQ` is true the FP8
-// tensor is laid out [N, H*head_dim] so RoPE_OptContext can fill the rope slot;
-// otherwise it is packed [N, H*nope_dim].
-std::tuple<torch::Tensor, torch::Tensor> deepseekV4QNormFusedFp8(torch::Tensor q, int64_t numHeads, int64_t headDim,
-    int64_t nopeDim, double eps, torch::optional<torch::Tensor> quantScaleQkv, bool interleavedQuantQ)
+// Writes the FP8 nope segment of Q into `quantQOut` and the bf16/fp16 rope
+// segment into `qPeOut` in one fused kernel. The caller pre-allocates both
+// output tensors; the FP8 row stride is inferred from `quantQOut.size(1)`
+// (either `numHeads * headDim` for an interleaved Q buffer that
+// `applyMLARopeAndAssignQKVKernelOptContext` will fill the rope slot of, or
+// `numHeads * nopeDim` for a packed nope-only layout).
+void deepseekV4QNormFusedFp8(torch::Tensor q, torch::Tensor quantQOut, torch::Tensor qPeOut, int64_t numHeads,
+    int64_t headDim, int64_t nopeDim, double eps, torch::optional<torch::Tensor> quantScaleQkv)
 {
     TORCH_CHECK(q.is_cuda(), "deepseek_v4_q_norm_fused_fp8 expects a CUDA tensor");
     TORCH_CHECK(q.is_contiguous(), "deepseek_v4_q_norm_fused_fp8 expects a contiguous tensor");
@@ -58,11 +61,22 @@ std::tuple<torch::Tensor, torch::Tensor> deepseekV4QNormFusedFp8(torch::Tensor q
 
     int64_t const numTokens = q.size(0);
     int64_t const ropeDim = headDim - nopeDim;
-    auto deviceOpts = q.options().device(q.device());
 
-    auto quantQNope = torch::empty(
-        {numTokens, numHeads * (interleavedQuantQ ? headDim : nopeDim)}, deviceOpts.dtype(torch::kFloat8_e4m3fn));
-    auto qPeOut = torch::empty({numTokens, numHeads * ropeDim}, q.options());
+    TORCH_CHECK(quantQOut.is_cuda() && quantQOut.scalar_type() == torch::kFloat8_e4m3fn,
+        "quant_q_out must be a CUDA Float8_e4m3fn tensor");
+    TORCH_CHECK(quantQOut.dim() == 2 && quantQOut.size(0) == numTokens,
+        "quant_q_out must be [num_tokens, num_heads * stride] with matching num_tokens");
+    int64_t const quantQStridePerHead = quantQOut.size(1) / numHeads;
+    TORCH_CHECK(quantQOut.size(1) == numHeads * quantQStridePerHead, "quant_q_out.shape[1] (", quantQOut.size(1),
+        ") must be a multiple of num_heads (", numHeads, ")");
+    TORCH_CHECK(quantQStridePerHead == nopeDim || quantQStridePerHead == headDim,
+        "quant_q_out per-head stride must be nope_dim (", nopeDim, ") for packed or head_dim (", headDim,
+        ") for interleaved, got ", quantQStridePerHead);
+
+    TORCH_CHECK(qPeOut.is_cuda() && qPeOut.scalar_type() == q.scalar_type(),
+        "q_pe_out must be a CUDA tensor with the same dtype as q");
+    TORCH_CHECK(qPeOut.dim() == 2 && qPeOut.size(0) == numTokens && qPeOut.size(1) == numHeads * ropeDim,
+        "q_pe_out must be [num_tokens, num_heads * rope_dim]");
 
     int64_t const totalRows64 = numTokens * numHeads;
     TORCH_CHECK(
@@ -79,15 +93,13 @@ std::tuple<torch::Tensor, torch::Tensor> deepseekV4QNormFusedFp8(torch::Tensor q
         quantScalePtr = s.data_ptr();
     }
 
-    int const quantQNopeRowStrideBytes = interleavedQuantQ ? static_cast<int>(headDim) : static_cast<int>(nopeDim);
+    int const quantQNopeRowStrideBytes = static_cast<int>(quantQStridePerHead);
 
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
     bool const isBfloat16 = (q.scalar_type() == torch::kBFloat16);
-    tensorrt_llm::kernels::invokeDeepseekV4QNormFusedFp8(q.data_ptr(), quantQNope.data_ptr(), qPeOut.data_ptr(),
+    tensorrt_llm::kernels::invokeDeepseekV4QNormFusedFp8(q.data_ptr(), quantQOut.data_ptr(), qPeOut.data_ptr(),
         quantScalePtr, totalRows, static_cast<int>(headDim), static_cast<int>(nopeDim), quantQNopeRowStrideBytes,
         isBfloat16, static_cast<float>(eps), stream);
-
-    return std::make_tuple(std::move(quantQNope), std::move(qPeOut));
 }
 
 } // namespace torch_ext
@@ -98,8 +110,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("deepseek_v4_q_norm(Tensor q, int num_heads, int head_dim, float eps) -> Tensor");
     m.def(
-        "deepseek_v4_q_norm_fused_fp8(Tensor q, int num_heads, int head_dim, int nope_dim, float eps, "
-        "Tensor? quant_scale_qkv, bool interleaved_quant_q=False) -> (Tensor, Tensor)");
+        "deepseek_v4_q_norm_fused_fp8(Tensor q, Tensor(a!) quant_q_out, Tensor(b!) q_pe_out, "
+        "int num_heads, int head_dim, int nope_dim, float eps, Tensor? quant_scale_qkv) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -115,8 +115,11 @@ def test_deepseek_v4_q_norm_fused_fp8_matches_reference(
         scale_tensor = torch.tensor([quant_scale_qkv], dtype=torch.float32, device=device)
         scale_value = quant_scale_qkv
 
-    quant_q_nope, q_pe = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
-        q, num_heads, head_dim, nope_dim, eps, scale_tensor
+    rope_dim = head_dim - nope_dim
+    quant_q_nope = q.new_empty((num_tokens, num_heads * nope_dim), dtype=torch.float8_e4m3fn)
+    q_pe = q.new_empty((num_tokens, num_heads * rope_dim))
+    torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, quant_q_nope, q_pe, num_heads, head_dim, nope_dim, eps, scale_tensor
     )
 
     ref_quant_q_nope, ref_q_pe = _reference_q_norm_fused_fp8(
@@ -153,48 +156,51 @@ def test_deepseek_v4_q_norm_fused_fp8_zero_rows():
     num_heads = 4
     head_dim = 512
     nope_dim = 448
+    rope_dim = head_dim - nope_dim
     eps = 1e-6
     q = torch.empty(0, num_heads * head_dim, dtype=torch.bfloat16, device="cuda")
-    quant_q_nope, q_pe = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
-        q, num_heads, head_dim, nope_dim, eps, None
+    quant_q_nope = q.new_empty((0, num_heads * nope_dim), dtype=torch.float8_e4m3fn)
+    q_pe = q.new_empty((0, num_heads * rope_dim))
+    torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, quant_q_nope, q_pe, num_heads, head_dim, nope_dim, eps, None
     )
     assert quant_q_nope.shape == (0, num_heads * nope_dim)
-    assert q_pe.shape == (0, num_heads * (head_dim - nope_dim))
-    assert quant_q_nope.dtype == torch.float8_e4m3fn
-    assert q_pe.dtype == torch.bfloat16
+    assert q_pe.shape == (0, num_heads * rope_dim)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 129])
 @pytest.mark.parametrize("num_heads", [1, 16, 128])
 def test_deepseek_v4_q_norm_fused_fp8_interleaved_layout(num_tokens, num_heads):
-    """Interleaved mode allocates a [N, H*head_dim] FP8 buffer and only writes
-    the first nope_dim FP8 bytes per (token, head) row. The remaining rope_dim
-    bytes per head are expected to be filled by RoPE_OptContext downstream — this
-    test only confirms the nope slots land at the right offsets and that the
-    rope slots are NOT silently overwritten by the q_norm kernel.
+    """The per-head stride of `quant_q_out` is inferred from the buffer shape:
+    `H * nope_dim` -> packed, `H * head_dim` -> interleaved (rope slot left
+    untouched). This test verifies both shapes write the same nope values to
+    the right offsets and produce identical q_pe.
     """
     torch.manual_seed(0)
     device = "cuda"
     head_dim = 512
     nope_dim = 448
+    rope_dim = head_dim - nope_dim
     eps = 1e-6
     q = torch.randn(
         num_tokens, num_heads * head_dim, dtype=torch.bfloat16, device=device
     ).contiguous()
     scale_tensor = torch.tensor([0.5], dtype=torch.float32, device=device)
 
-    # Packed reference.
-    packed_quant_q_nope, packed_q_pe = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
-        q, num_heads, head_dim, nope_dim, eps, scale_tensor, False
+    # Packed [N, H*nope_dim] layout.
+    packed_quant_q_nope = q.new_empty((num_tokens, num_heads * nope_dim), dtype=torch.float8_e4m3fn)
+    packed_q_pe = q.new_empty((num_tokens, num_heads * rope_dim))
+    torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, packed_quant_q_nope, packed_q_pe, num_heads, head_dim, nope_dim, eps, scale_tensor
     )
 
-    # Allocate an interleaved buffer and PRE-FILL the rope slot with a sentinel so we
-    # can confirm the kernel doesn't touch it.
-    interleaved, q_pe_interleaved = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
-        q, num_heads, head_dim, nope_dim, eps, scale_tensor, True
+    # Interleaved [N, H*head_dim] layout; rope slot must be untouched.
+    interleaved = q.new_empty((num_tokens, num_heads * head_dim), dtype=torch.float8_e4m3fn)
+    q_pe_interleaved = q.new_empty((num_tokens, num_heads * rope_dim))
+    torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, interleaved, q_pe_interleaved, num_heads, head_dim, nope_dim, eps, scale_tensor
     )
 
-    assert interleaved.shape == (num_tokens, num_heads * head_dim)
     # The nope slots of `interleaved` should match the packed output element-by-element.
     interleaved_3d = interleaved.view(num_tokens, num_heads, head_dim)
     packed_3d = packed_quant_q_nope.view(num_tokens, num_heads, nope_dim)

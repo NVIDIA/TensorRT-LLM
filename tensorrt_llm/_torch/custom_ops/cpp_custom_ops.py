@@ -112,20 +112,11 @@ def _register_fake():
         return torch.empty_like(q)
 
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm_fused_fp8")
-    def _(q: torch.Tensor,
-          num_heads: int,
-          head_dim: int,
-          nope_dim: int,
-          eps: float,
-          quant_scale_qkv: Optional[torch.Tensor],
-          interleaved_quant_q: bool = False):
-        num_tokens = q.shape[0]
-        rope_dim = head_dim - nope_dim
-        nope_width = num_heads * (head_dim if interleaved_quant_q else nope_dim)
-        quant_q_nope = q.new_empty((num_tokens, nope_width),
-                                   dtype=torch.float8_e4m3fn)
-        q_pe = q.new_empty((num_tokens, num_heads * rope_dim), dtype=q.dtype)
-        return quant_q_nope, q_pe
+    def _(q: torch.Tensor, quant_q_out: torch.Tensor, q_pe_out: torch.Tensor,
+          num_heads: int, head_dim: int, nope_dim: int, eps: float,
+          quant_scale_qkv: Optional[torch.Tensor]):
+        # In-place op: writes to quant_q_out and q_pe_out, returns nothing.
+        return None
 
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
