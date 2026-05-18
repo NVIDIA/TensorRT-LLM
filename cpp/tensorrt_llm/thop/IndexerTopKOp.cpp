@@ -110,8 +110,10 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         heuristicScratchPtr = scratchTensor.data_ptr();
     }
 
-    // Optional buffers for the new fp32-only opt-in paths added by the TPRv2
-    // port (fused single-launch split-work + multi-pass radix).
+    // Optional buffers for the opt-in fast paths added by the TPRv2 port
+    // (fused single-launch split-work + multi-pass radix). Both are dtype-
+    // agnostic now — the kernels are InputT-templated and aux buffers stay
+    // fp32 regardless of the input dtype.
     int32_t* doneCounterPtr = nullptr;
     if (done_counter_scratch.has_value())
     {
@@ -122,8 +124,6 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         TORCH_CHECK(t.scalar_type() == at::ScalarType::Int, "done_counter_scratch must be int32");
         TORCH_CHECK(t.numel() >= numRows64, "done_counter_scratch must have at least numRows entries");
         doneCounterPtr = t.data_ptr<int32_t>();
-        TORCH_CHECK(logits_dtype == at::ScalarType::Float,
-            "done_counter_scratch (fused split-work path) is fp32 only; logits dtype was ", logits_dtype);
     }
     void* multiPassScratchPtr = nullptr;
     size_t multiPassScratchBytes = 0;
@@ -136,27 +136,27 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         TORCH_CHECK(t.scalar_type() == at::ScalarType::Byte, "scratch must be uint8");
         multiPassScratchPtr = t.data_ptr();
         multiPassScratchBytes = static_cast<size_t>(t.numel());
-        TORCH_CHECK(logits_dtype == at::ScalarType::Float,
-            "scratch (multi-pass radix path) is fp32 only; logits dtype was ", logits_dtype);
     }
 
     int32_t splitWorkThreshold = 200 * 1000;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
+    // Split-work aux buffers (used by the 2-launch and fused-split-work tiers;
+    // also handed to GVR / single-block / insertion-sort paths as zero-sized
+    // placeholders). The buffers are always fp32 regardless of input dtype.
+    constexpr auto multipleBlocksPerRowConfig = 10;
+    th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+    th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+    if (num_columns >= splitWorkThreshold)
+    {
+        aux_indices = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
+            th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+        aux_logits = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
+            th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+    }
+
     if (logits_dtype == at::ScalarType::Float)
     {
-        // fp32 path — full Scheme X v1.2 dispatcher (GVR / Insertion / Radix /
-        // Radix-split-work). aux_logits/aux_indices needed only by split-work.
-        th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-        th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
-        constexpr auto multipleBlocksPerRowConfig = 10;
-        if (num_columns >= splitWorkThreshold)
-        {
-            aux_indices = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
-                th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-            aux_logits = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
-                th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
-        }
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
             aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
             logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
@@ -166,16 +166,20 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr()),
-            seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
-            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
-            preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream);
+            seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), aux_logits.data_ptr<float>(),
+            aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0,
+            logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride,
+            preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), doneCounterPtr, stream, multiPassScratchPtr,
+            multiPassScratchBytes, is_prefill);
     }
     else // Half
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__half const*>(logits.data_ptr()), seq_lens.data_ptr<int32_t>(),
-            indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
-            static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
-            static_cast<__half*>(heuristicScratchPtr), stream);
+            indices.data_ptr<int32_t>(), aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(),
+            splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n),
+            static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
+            static_cast<__half*>(heuristicScratchPtr), doneCounterPtr, stream, multiPassScratchPtr,
+            multiPassScratchBytes, is_prefill);
     }
 }
 

@@ -633,8 +633,8 @@ struct TopKSmem
 
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort, bool multipleBlocksPerRow = false,
-    bool mergeBlocks = false>
-static __device__ void topKPerRowJobWithSmem(int const* indices, float const* logits, int rowStart, int rowEnd,
+    bool mergeBlocks = false, typename InputT = float>
+static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* logits, int rowStart, int rowEnd,
     int* outIndices, float* outLogits, int stride1, int topK,
     TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort>& smem)
 {
@@ -666,7 +666,7 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, float const* lo
             if constexpr (multipleBlocksPerRow)
             {
                 outIndices[rowIt] = rowIt + rowStart;
-                outLogits[rowIt] = logits[rowIt + rowStart];
+                outLogits[rowIt] = static_cast<float>(logits[rowIt + rowStart]);
             }
             else if constexpr (mergeBlocks)
             {
@@ -678,7 +678,7 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, float const* lo
                 outIndices[rowIt] = indices[rowIt];
                 if (outLogits != nullptr)
                 {
-                    outLogits[rowIt] = logits[rowIt];
+                    outLogits[rowIt] = static_cast<float>(logits[rowIt]);
                 }
             }
             else
@@ -948,8 +948,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 #endif
 }
 
-template <int kNumThreadsPerBlock, bool useRadixSort>
-static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFused(float const* logits,
+template <int kNumThreadsPerBlock, bool useRadixSort, typename InputT = float>
+static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFused(InputT const* logits,
     int const* seqLens, int* outIndices, int* outIndicesAux, float* outLogitsAux, int* doneCounter, int stride0,
     int stride1, int const topK, int const next_n, int const numBlocksPerRow)
 {
@@ -964,7 +964,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFu
     int seq_len = seqLens[rowIdx / next_n];
     int rowEndFull = seq_len - next_n + (rowIdx % next_n) + 1;
 
-    float const* rowLogits = logits + static_cast<int64_t>(rowIdx) * stride0;
+    InputT const* rowLogits = logits + static_cast<int64_t>(rowIdx) * stride0;
 
     // One smem allocation shared between part1 and the merge phase. Both calls
     // use the same kNumThreadsPerBlock/kNumBins/useRadixSort, and the
@@ -1250,8 +1250,8 @@ __device__ __forceinline__ void radixLastBlockTrailer(int* gHist, RadixState& st
 //
 // Last block of every pass runs `radixLastBlockTrailer` to compute the
 // next pass's threshold and reset cross-pass state.
-template <int kThreads, int step>
-static __global__ __launch_bounds__(kThreads) void radixPassKernel(float const* logits, int const* seqLens,
+template <int kThreads, int step, typename InputT = float>
+static __global__ __launch_bounds__(kThreads) void radixPassKernel(InputT const* logits, int const* seqLens,
     int* outIndices, int const* candBufIn, int* candBufOut, int* histograms, RadixState* state, int stride0, int next_n,
     int topK)
 {
@@ -1274,11 +1274,12 @@ static __global__ __launch_bounds__(kThreads) void radixPassKernel(float const* 
         // zeroes state+histograms together is enough. Pass-1 trailer below
         // writes st.candCount = seqLens[rowIdx] for pass 2 to consume.
         int const rowEnd = seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1;
-        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
         size_t threadRank = static_cast<size_t>(blockInRow) * kThreads + threadIdx.x;
         size_t numThreads = static_cast<size_t>(blocksPerRow) * kThreads;
-        auto f = [&](float v, size_t /*idx*/)
+        auto f = [&](InputT vIn, size_t /*idx*/)
         {
+            float const v = static_cast<float>(vIn);
             uint32_t bin = extractBinIdx<step>(v);
             atomicAdd(&sHist[bin], 1);
         };
@@ -1287,14 +1288,15 @@ static __global__ __launch_bounds__(kThreads) void radixPassKernel(float const* 
     else if constexpr (step == 2)
     {
         int const rowEnd = st.candCount;
-        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
         int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
         int* candArr = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
         int const prevThresh = st.thresholdBin;
         size_t threadRank = static_cast<size_t>(blockInRow) * kThreads + threadIdx.x;
         size_t numThreads = static_cast<size_t>(blocksPerRow) * kThreads;
-        auto f = [&](float v, size_t i)
+        auto f = [&](InputT vIn, size_t i)
         {
+            float const v = static_cast<float>(vIn);
             int bin1 = static_cast<int>(extractBinIdx<1>(v));
             if (bin1 < prevThresh)
             {
@@ -1316,14 +1318,14 @@ static __global__ __launch_bounds__(kThreads) void radixPassKernel(float const* 
     {
         int const candCnt = st.candCount;
         int const* candArrIn = candBufIn + static_cast<int64_t>(rowIdx) * stride0;
-        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
         int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
         int* candArrOut = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
         int const prevThresh = st.thresholdBin;
         for (int i = blockInRow * kThreads + threadIdx.x; i < candCnt; i += blocksPerRow * kThreads)
         {
             int srcIdx = candArrIn[i];
-            float v = in[srcIdx];
+            float v = static_cast<float>(in[srcIdx]);
             int bin2 = static_cast<int>(extractBinIdx<2>(v));
             if (bin2 < prevThresh)
             {
@@ -1376,7 +1378,7 @@ static __global__ __launch_bounds__(kThreads) void radixPassKernel(float const* 
         int const thresh3 = st.thresholdBin;
         int const prefix3 = st.thresholdLess;
         int const* candArr = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
-        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        InputT const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
         int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
         int const ltBase = st.outIdx;    // already at outBase here
         int const eqBase = ltBase + prefix3;
@@ -1388,7 +1390,7 @@ static __global__ __launch_bounds__(kThreads) void radixPassKernel(float const* 
         for (int i = threadIdx.x; i < filterCnt; i += kThreads)
         {
             int srcIdx = candArr[i];
-            float v = in[srcIdx];
+            float v = static_cast<float>(in[srcIdx]);
             int bin3 = static_cast<int>(extractBinIdx<3>(v));
             if (bin3 < thresh3)
             {
@@ -1445,7 +1447,8 @@ static size_t radixScratchBytes(int numRows, int numColumns)
     return s;
 }
 
-static void launchMultiPassRadix(void* scratch, float const* logits, int const* seqLens, int* outIndices, int numRows,
+template <typename InputT>
+static void launchMultiPassRadix(void* scratch, InputT const* logits, int const* seqLens, int* outIndices, int numRows,
     int numColumns, int topK, int stride0, int next_n, cudaLaunchAttribute const* attrs, cudaStream_t stream)
 {
     auto roundUp = [](size_t x) { return (x + 63) & ~size_t(63); };
@@ -1491,73 +1494,29 @@ static void launchMultiPassRadix(void* scratch, float const* logits, int const* 
         cudaLaunchKernelExC(&cfg, kernel, args);
     };
 
-    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 1>), (int const*) nullptr, (int*) nullptr);
-    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 2>), (int const*) nullptr, candBuf1);
+    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 1, InputT>), (int const*) nullptr,
+        (int*) nullptr);
+    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 2, InputT>), (int const*) nullptr, candBuf1);
     // Pass 3 emits the final top-K inline in its last-block trailer (see
     // radixPassKernel<step=3>) instead of requiring a separate filter launch.
-    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 3>), (int const*) candBuf1, candBuf2);
+    launchPass(
+        reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 3, InputT>), (int const*) candBuf1, candBuf2);
 }
 
-// Scheme X bound calculator — used by the bf16/fp16 dispatcher and by the
-// `bytesPerElem != 4` branch of `canIndexerTopKDecodeUseGvr`. The fp32
-// dispatcher no longer uses this (see the GVR ↔ TPR routing rule there).
-// Caches hardware attrs (SM count, L2 capacity) and the small-N threshold
-// once per process via std::call_once. Per-call cost is just two reads
-// from cached static variables plus a small arithmetic block, no syscalls.
-struct SchemeXBounds
-{
-    int smCount;
-    int l2Bytes;
-    int kBsWave;
-    int kBsL2;
-    int kBsLarge;
-    int kSeqSmall;
-};
-
-inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
-{
-    static std::once_flag sOnce;
-    static int sSm = 0;
-    static int sL2 = 0;
-    static int sNMin = 0;
-    std::call_once(sOnce,
-        []()
-        {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&sSm, cudaDevAttrMultiProcessorCount, dev);
-            cudaDeviceGetAttribute(&sL2, cudaDevAttrL2CacheSize, dev);
-            constexpr int kSeqSmallDefault = 12288;
-            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
-            if (env != nullptr)
-            {
-                int const v = std::atoi(env);
-                sNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
-            }
-            else
-            {
-                sNMin = kSeqSmallDefault;
-            }
-        });
-
-    SchemeXBounds b;
-    b.smCount = sSm;
-    b.l2Bytes = sL2;
-    b.kBsWave = (sSm > 0) ? (sSm * 3 - sSm / 8) : 426;
-    b.kBsL2 = (sL2 > 0 && numColumns > 0)
-        ? static_cast<int>(static_cast<int64_t>(sL2) * 9 / 10 / (static_cast<int64_t>(numColumns) * bytesPerElem))
-        : b.kBsWave;
-    b.kBsLarge = std::min(b.kBsWave, b.kBsL2 > 0 ? b.kBsL2 : b.kBsWave);
-    b.kSeqSmall = sNMin;
-    return b;
-}
-
-} // anonymous namespace
-
-void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
+// ============================================================================
+// Unified dispatcher (fp32, bf16, fp16 all go through this).
+// ============================================================================
+// The TPR-family kernels (insertion-sort, single-block radix, 2-launch
+// split-work, fused split-work, multi-pass radix) are all templated on
+// `InputT` — logits are read with `static_cast<float>(InputT)` at HBM-read
+// sites, so accuracy is identical to up-casting the input tensor to fp32
+// before invoking the kernel. Aux buffers (outLogitsAux / scratch) stay fp32
+// regardless of InputT.
+template <typename InputT>
+void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, float* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
+    int const preIdxCount, InputT* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
     size_t scratchBytes, bool is_prefill)
 {
     // Opt-in fast paths (added in the TPRv2 port — see commit message):
@@ -1574,10 +1533,10 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         = !is_prefill && multi_pass_radix_eligible(numRows, numColumns) && scratch != nullptr && scratchBytes > 0;
 
     // kSortingAlgorithmThreshold (Insertion vs single-block radix boundary)
-    // and the default split-work threshold are now numRows + is_prefill
-    // aware. Behavior at the historical low-bs default (numRows < 1024,
-    // !is_prefill) is preserved at the original 12288 boundary. Cutoffs at
-    // higher BS were picked empirically (see PR description bake-off).
+    // and the default split-work threshold are numRows + is_prefill aware.
+    // Behavior at the historical low-bs default (numRows < 1024, !is_prefill)
+    // is preserved at the original 12288 boundary. Cutoffs at higher BS were
+    // picked empirically (see PR description bake-off).
     //
     //   is_prefill:           force insertion-sort everywhere — per-row work
     //                         is bounded by the small (1..bs) row lengths the
@@ -1605,7 +1564,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
 
-    // GVR ↔ TPR routing rule:
+    // GVR ↔ TPR routing rule (applies to fp32, bf16, fp16 alike now that all
+    // TPR tiers are InputT-templated):
     //   numColumns <= 16384  → TPR (small-N: GVR's fixed Phase-1/4 overhead
     //                                ~11 µs dominates; insertion / single-block
     //                                radix wins. 16K itself stays on TPR.)
@@ -1647,13 +1607,14 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         cudaLaunchAttribute radixAttrs[1];
         radixAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         radixAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-        launchMultiPassRadix(
+        launchMultiPassRadix<InputT>(
             scratch, logits, seqLens, indices, numRows, numColumns, topK, stride0, next_n, radixAttrs, stream);
     }
     else if (numColumns < kSortingAlgorithmThreshold)
     {
-        // Use insertion sort
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, false>;
+        // Use insertion sort.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false,
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
@@ -1671,8 +1632,9 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
-        // From this threshold, use radix sort instead
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, true>;
+        // Single-block radix.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true,
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
@@ -1699,6 +1661,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         // processes (numBlocksPerRow * topK) candidates in a single block, so
         // we never bump past where the merge would dominate. Cutoffs below
         // come from the mid-long-decode sweep.
+        TLLM_CHECK_WITH_INFO(outLogitsAux != nullptr && outIndicesAux != nullptr,
+            "Fused split-work path requires both outLogitsAux and outIndicesAux to be non-null.");
         int numBlocksPerRow = 10;
         if (numRows == 1)
         {
@@ -1724,8 +1688,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         constexpr int kFusedNarrowThreadsPerBlock = 512;
         int const blockDim = useWideBlock ? 1024 : kFusedNarrowThreadsPerBlock;
 
-        auto* kernel_512 = &topKPerRowDecodeFused<kFusedNarrowThreadsPerBlock, true>;
-        auto* kernel_1024 = &topKPerRowDecodeFused<1024, true>;
+        auto* kernel_512 = &topKPerRowDecodeFused<kFusedNarrowThreadsPerBlock, true, InputT>;
+        auto* kernel_1024 = &topKPerRowDecodeFused<1024, true, InputT>;
         static bool s_attr_512 = false;
         static bool s_attr_1024 = false;
         if (useWideBlock && !s_attr_1024)
@@ -1762,9 +1726,15 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     }
     else
     {
-        // Long sequences are run in two steps
+        // Long sequences are run in two steps.
+        TLLM_CHECK_WITH_INFO(outLogitsAux != nullptr && outIndicesAux != nullptr,
+            "Split-work path requires both outLogitsAux and outIndicesAux to be non-null.");
         constexpr auto multipleBlocksPerRowConfig = 10;
-        auto* kernel_instance_part1 = &topKPerRowDecode<kNumThreadsPerBlock, true, true>;
+        // Part 1: reads InputT logits, writes per-block top-K into the fp32
+        // aux buffers (outLogitsAux / outIndicesAux).
+        auto* kernel_instance_part1
+            = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true, /*multipleBlocksPerRow=*/true,
+                /*mergeBlocks=*/false, InputT>;
         cudaLaunchConfig_t config_part1;
         config_part1.gridDim = dim3(numRows, multipleBlocksPerRowConfig);
         config_part1.blockDim = kNumThreadsPerBlock;
@@ -1779,8 +1749,12 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
             next_n, outLogitsAux, 0, nullptr);
 
+        // Part 2 (merge): reads the fp32 aux buffer as its "logits" input, so
+        // it always runs with InputT=float regardless of the original input
+        // dtype.
         constexpr int kNumThreadsPerBlockMerge = 1024;
-        auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>;
+        auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, /*useRadixSort=*/true,
+            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/true>;
         cudaLaunchConfig_t config_part2;
         config_part2.gridDim = numRows;
         config_part2.blockDim = kNumThreadsPerBlockMerge;
@@ -1796,6 +1770,19 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     sync_check_cuda_error(stream);
 }
 
+} // anonymous namespace
+
+void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
+    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
+    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
+    int const preIdxCount, float* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
+    size_t scratchBytes, bool is_prefill)
+{
+    invokeIndexerTopKDecodeImpl<float>(logits, seqLens, indices, outLogitsAux, outIndicesAux, splitWorkThreshold,
+        numRows, numColumns, stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch,
+        doneCounterScratch, stream, scratch, scratchBytes, is_prefill);
+}
+
 size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
 {
     // Returns the bytes the multi-pass radix path needs (state +
@@ -1803,137 +1790,31 @@ size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
     return radixScratchBytes(numRows, numColumns);
 }
 
-// ============================================================================
-// bf16 / fp16 dispatcher overloads
-// ============================================================================
-// bf16/fp16 TPR support is only partial — insertion-sort and single-block
-// radix tiers work via the topKPerRowDecode template with InputT propagated
-// through (histogram and sort run on float keys after static_cast<float>(InputT)
-// at HBM-read sites). The split-work / fused-split-work / multi-pass-radix
-// tiers all require fp32 aux buffers that the bf16/fp16 entry does not expose,
-// so they are not reachable here.
-//
-// Because TPR coverage has gaps at long N, this dispatcher does NOT apply the
-// simplified GVR ↔ TPR rule used by the fp32 dispatcher. Instead it keeps the
-// previous SchemeXBounds-derived GVR preference: GVR is used whenever its
-// preconditions hold (preIdx + topK + bytesPerElem-adjusted L2/wave bounds),
-// and the only TPR fallback exits are insertion-sort and single-block radix.
-//
-// Reuses the BS-threshold + small-N dispatch axes (kBsLarge, kSeqSmall) from
-// the fp32 calculator, except kBsL2 uses sizeof(InputT) bytes/element instead
-// of 4 — L2 footprint is half, so bf16/fp16 path remains valid for larger BS
-// than fp32 at the same N.
-//
-// Fallback chain when GVR-Heuristic preconditions are not met (preIdx
-// missing, BS too large, or numColumns < kSeqSmall):
-//   numColumns < kSortingAlgorithmThreshold (12288)              → insertion sort
-//   kSortingAlgorithmThreshold ≤ numColumns < splitWorkThreshold → radix sort
-//   numColumns ≥ splitWorkThreshold (200K default)               → unsupported
-
-namespace
+// bf16 / fp16 entries — full feature parity with fp32 via the unified
+// invokeIndexerTopKDecodeImpl<InputT> template. All TPR-family kernels
+// (insertion / single-block radix / 2-launch split-work / fused split-work /
+// multi-pass radix) accept InputT now; aux buffers (outLogitsAux / scratch)
+// remain fp32 regardless of dtype.
+void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices, float* outLogitsAux,
+    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
+    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
+    int const preIdxCount, __nv_bfloat16* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream,
+    void* scratch, size_t scratchBytes, bool is_prefill)
 {
-
-template <typename InputT>
-void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
-    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
-    int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
-    cudaStream_t const stream)
-{
-    static_assert(std::is_same_v<InputT, __nv_bfloat16> || std::is_same_v<InputT, __half>,
-        "invokeIndexerTopKDecodeDtype is for bf16/fp16 only");
-
-    constexpr int kSortingAlgorithmThreshold = 12288;
-    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
-    constexpr int kNumThreadsPerBlock = 512;
-    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
-
-    // bf16/fp16: bytes_per_element = sizeof(InputT) = 2 → kBsL2 doubles vs fp32.
-    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/static_cast<int>(sizeof(InputT)));
-    int const kBsLarge = bounds.kBsLarge;
-    int const kSeqSmall = bounds.kSeqSmall;
-
-    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    // Old SchemeXBounds-derived GVR preference (see header comment above for why
-    // bf16/fp16 does not adopt the fp32 dispatcher's simplified rule).
-    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
-        && heuristicScratch != nullptr && numRows < kBsLarge;
-
-    if (canUseHeuristic)
-    {
-        launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
-            preIdxStride, preIdxCount, numRows, stream);
-    }
-    else if (numColumns < kSortingAlgorithmThreshold)
-    {
-        // Insertion sort path — InputT propagated; histogram/sort run on float keys.
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
-
-        cudaLaunchConfig_t config;
-        config.gridDim = numRows;
-        config.blockDim = kNumThreadsPerBlock;
-        config.dynamicSmemBytes = topK * sizeof(int32_t);
-        config.stream = stream;
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-        config.numAttrs = 1;
-        config.attrs = attrs;
-
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
-    }
-    else if (numColumns < effectiveSplitWorkThreshold)
-    {
-        // Radix sort path — InputT propagated; histogram/sort run on float keys.
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
-
-        cudaLaunchConfig_t config;
-        config.gridDim = numRows;
-        config.blockDim = kNumThreadsPerBlock;
-        config.dynamicSmemBytes = topK * sizeof(int32_t);
-        config.stream = stream;
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-        config.numAttrs = 1;
-        config.attrs = attrs;
-
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
-    }
-    else
-    {
-        TLLM_CHECK_WITH_INFO(false,
-            "indexer_topk_decode bf16/fp16 path does not support numColumns >= splitWorkThreshold "
-            "(split-work path requires float aux buffers not exposed in the bf16/fp16 entry). "
-            "Got numColumns=%d splitWorkThreshold=%d. Use the fp32 entry for this regime.",
-            numColumns, effectiveSplitWorkThreshold);
-    }
-
-    sync_check_cuda_error(stream);
+    invokeIndexerTopKDecodeImpl<__nv_bfloat16>(logits, seqLens, indices, outLogitsAux, outIndicesAux, splitWorkThreshold,
+        numRows, numColumns, stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch,
+        doneCounterScratch, stream, scratch, scratchBytes, is_prefill);
 }
 
-} // anonymous namespace
-
-void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
-    int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
-    int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
-    __nv_bfloat16* heuristicScratch, cudaStream_t const stream)
+void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, float* outLogitsAux,
+    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
+    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
+    int const preIdxCount, __half* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
+    size_t scratchBytes, bool is_prefill)
 {
-    invokeIndexerTopKDecodeDtype<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
-        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream);
-}
-
-void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
-    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
-    int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch,
-    cudaStream_t const stream)
-{
-    invokeIndexerTopKDecodeDtype<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
-        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream);
+    invokeIndexerTopKDecodeImpl<__half>(logits, seqLens, indices, outLogitsAux, outIndicesAux, splitWorkThreshold,
+        numRows, numColumns, stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch,
+        doneCounterScratch, stream, scratch, scratchBytes, is_prefill);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
@@ -1959,24 +1840,18 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     sync_check_cuda_error(stream);
 }
 
-bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int bytesPerElem)
+bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int /*bytesPerElem*/)
 {
+    // The dispatcher now applies the same GVR ↔ TPR routing rule for fp32,
+    // bf16, and fp16 (all TPR tiers are InputT-templated). `bytesPerElem` is
+    // kept in the signature for source compatibility but no longer affects
+    // the answer.
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     if (!isSupportedTopK)
     {
         return false;
     }
-    if (bytesPerElem == 4)
-    {
-        // fp32: GVR ↔ TPR routing rule (see invokeIndexerTopKDecode).
-        return numColumns > 16384 && numRows > 32;
-    }
-    // bf16/fp16: TPR support is partial (no split-work). Use the previous
-    // SchemeXBounds-derived GVR preference so the long-N corner is not pushed
-    // onto a TPR tier that asserts unsupported.
-    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
-    auto const bounds = getSchemeXBounds(numColumns, bytesPerElem);
-    return numColumns >= bounds.kSeqSmall && numColumns < kDefaultSplitWorkThreshold && numRows < bounds.kBsLarge;
+    return numColumns > 16384 && numRows > 32;
 }
 
 } // namespace kernels
