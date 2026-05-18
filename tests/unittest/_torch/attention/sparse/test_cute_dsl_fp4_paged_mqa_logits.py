@@ -139,9 +139,45 @@ def cast_back_from_fp4(
 # ---------------------------------------------------------------------------
 
 
-def kv_cache_cast_to_fp4(x: torch.Tensor):
-    num_blocks, block_size, num_heads, head_dim = x.shape
+def _apply_utccp_chunk_layout(sf_per_block: torch.Tensor) -> torch.Tensor:
+    """Reorder SF tokens within each 128-token atom to UTCCP chunk layout.
+
+    Equivalent to the SMEM-side ``utccp_required_smem_warp_transpose``: maps
+    linear token order [t0, t1, ..., t127] to chunk order
+    [t0, t32, t64, t96, t1, t33, ...] per 128-int32 atom.
+
+    Math: ``sf_out[m*4 + k] = sf_in[k*32 + m]`` per atom.
+
+    Used when ``remove_online_sf_transpose=True`` so the kernel can skip the
+    runtime warp_transpose. Only valid when phys_block_kv == 128 (1 phys
+    block = 1 UTCCP atom of 128 tokens).
+    """
+    assert sf_per_block.size(-1) == 128, (
+        f"chunk layout requires atom_size=128 (phys_block_kv=128); got {sf_per_block.size(-1)}"
+    )
+    new_shape = sf_per_block.shape[:-1] + (128,)
+    return (
+        sf_per_block.reshape(*sf_per_block.shape[:-1], 4, 32)
+        .transpose(-1, -2)
+        .contiguous()
+        .reshape(*new_shape)
+    )
+
+
+def kv_cache_cast_to_fp4(x: torch.Tensor, remove_online_sf_transpose: bool = False):
+    # page_size here = phys_block_kv (tokens per physical KV page).
+    num_blocks, page_size, num_heads, head_dim = x.shape
     assert num_heads == 1 and head_dim == 128
+    # Mirror the kernel's graceful fallback: chunk layout only valid for
+    # page_size == 128 (1 phys page = 1 UTCCP atom of 128 tokens).
+    if remove_online_sf_transpose and page_size != 128:
+        print(
+            f"[kv_cache_cast_to_fp4] remove_online_sf_transpose=True ignored: "
+            f"requires page_size (phys_block_kv) == 128, got {page_size}. "
+            f"Falling back to False."
+        )
+        remove_online_sf_transpose = False
+
     x_scaled, sf = per_token_cast_to_fp4(
         x.view(-1, head_dim),
         use_ue8m0=True,
@@ -153,18 +189,25 @@ def kv_cache_cast_to_fp4(x: torch.Tensor):
         sf,
         gran_k=32,
         use_packed_ue8m0=True,
-    ).view(num_blocks, block_size, 1, head_dim)
+    ).view(num_blocks, page_size, 1, head_dim)
     x_fp4 = torch.empty(
-        (num_blocks, block_size * (head_dim // 2 + 4)),
+        (num_blocks, page_size * (head_dim // 2 + 4)),
         device=x.device,
         dtype=torch.uint8,
     )
-    x_fp4[:, : block_size * head_dim // 2] = x_scaled.view(
-        num_blocks, block_size * head_dim // 2
+    x_fp4[:, : page_size * head_dim // 2] = x_scaled.view(
+        num_blocks, page_size * head_dim // 2
     ).view(torch.uint8)
-    x_fp4[:, block_size * head_dim // 2 :] = sf.view(num_blocks, block_size).view(torch.uint8)
+
+    # Reorder SF tokens to UTCCP chunk layout (mirrors what the in-kernel
+    # warp_transpose would do at runtime), so the kernel can skip the
+    # runtime SMEM transpose when remove_online_sf_transpose=True.
+    sf_per_block = sf.view(num_blocks, page_size)  # (num_blocks, 128) int32
+    if remove_online_sf_transpose:
+        sf_per_block = _apply_utccp_chunk_layout(sf_per_block)
+    x_fp4[:, page_size * head_dim // 2 :] = sf_per_block.view(torch.uint8)
     return (
-        x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4),
+        x_fp4.view(num_blocks, page_size, num_heads, head_dim // 2 + 4),
         x_cast_back.to(x.dtype),
     )
 
@@ -375,7 +418,15 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     )
 
     # Quantize KV cache to fused FP4 layout.
-    kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
+    # Exercise the remove_online_sf_transpose path when supported (only valid
+    # for phys_block_kv=128). For other page sizes, both host helper and
+    # kernel silently fall back to False, but we skip enabling to avoid
+    # fallback print noise during the test sweep.
+    remove_online_sf_transpose = phys_block_kv == 128
+
+    kv_fused, kv_simulated = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
 
     # Schedule metadata. DG c491439e requires 2D context_lens, and block_kv
     # must be 64 to align metadata SPLIT_KV (= block_kv*4) with the compute
@@ -413,6 +464,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
         num_epi_subtiles=num_epi_subtiles,
         epi_dtype=epi_dtype,
         output_dtype=output_dtype,
+        remove_online_sf_transpose=remove_online_sf_transpose,
     )
 
     assert logits.dtype == output_dtype

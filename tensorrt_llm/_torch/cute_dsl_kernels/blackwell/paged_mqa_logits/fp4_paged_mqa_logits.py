@@ -364,6 +364,7 @@ class FP4MQALogitsKernel:
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        remove_online_sf_transpose: bool = False,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -398,6 +399,18 @@ class FP4MQALogitsKernel:
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        # When True, skip the in-kernel SMEM warp_transpose for KV SF; assume
+        # the host has pre-arranged GMEM SF into UTCCP chunk layout. Only valid
+        # for phys_block_kv=128 (1 phys block = 1 UTCCP atom). Q SF transpose
+        # is NOT affected by this flag (deferred to a separate phase).
+        if remove_online_sf_transpose and phys_block_kv != 128:
+            print(
+                f"[FP4MQALogitsKernel] remove_online_sf_transpose=True ignored: "
+                f"requires phys_block_kv=128 (1 phys block = 1 UTCCP atom), "
+                f"got phys_block_kv={phys_block_kv}. Falling back to False."
+            )
+            remove_online_sf_transpose = False
+        self.remove_online_sf_transpose = remove_online_sf_transpose
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -1568,14 +1581,18 @@ class FP4MQALogitsKernel:
 
                     # Step 5.6: SF KV transpose + UTCCP. block_kv = 128 = 1
                     # UTCCP atom; loop is constexpr-1 but kept for clarity.
-                    sf_kv_atoms = self.block_kv // 128
-                    for atom_idx in cutlass.range_constexpr(sf_kv_atoms):
-                        atom_offset = atom_idx * 128
-                        stage_offset = kv_stage * sSF_KV_0.layout.stride[1]
-                        utccp_required_smem_warp_transpose(
-                            sSF_KV_0.iterator + stage_offset + atom_offset
-                        )
-                    cute.arch.fence_view_async_shared()
+                    # When remove_online_sf_transpose=True, the host has already
+                    # pre-arranged GMEM SF into UTCCP chunk layout, so the
+                    # in-kernel SMEM transpose (and its fence) can be skipped.
+                    if cutlass.const_expr(not self.remove_online_sf_transpose):
+                        sf_kv_atoms = self.block_kv // 128
+                        for atom_idx in cutlass.range_constexpr(sf_kv_atoms):
+                            atom_offset = atom_idx * 128
+                            stage_offset = kv_stage * sSF_KV_0.layout.stride[1]
+                            utccp_required_smem_warp_transpose(
+                                sSF_KV_0.iterator + stage_offset + atom_offset
+                            )
+                        cute.arch.fence_view_async_shared()
                     # int32 SMEM → UE8M0 view for UTCCP atom + chunk layout.
                     sSF_KV_0_ue8m0 = cute.recast_tensor(sSF_KV_0, Float8E8M0FNU)
                     stage_off_kv0_ue8m0 = kv_stage * sSF_KV_0_ue8m0.layout.stride[1]
@@ -1705,14 +1722,18 @@ class FP4MQALogitsKernel:
                     kv_stage_1 = kv_cons_state_umma_1.index
 
                     # Step 5.6: SF KV (group 1) transpose + UTCCP.
-                    sf_kv_atoms_1 = self.block_kv // 128
-                    for atom_idx in cutlass.range_constexpr(sf_kv_atoms_1):
-                        atom_offset = atom_idx * 128
-                        stage_offset = kv_stage_1 * sSF_KV_1.layout.stride[1]
-                        utccp_required_smem_warp_transpose(
-                            sSF_KV_1.iterator + stage_offset + atom_offset
-                        )
-                    cute.arch.fence_view_async_shared()
+                    # When remove_online_sf_transpose=True, the host has already
+                    # pre-arranged GMEM SF into UTCCP chunk layout, so the
+                    # in-kernel SMEM transpose (and its fence) can be skipped.
+                    if cutlass.const_expr(not self.remove_online_sf_transpose):
+                        sf_kv_atoms_1 = self.block_kv // 128
+                        for atom_idx in cutlass.range_constexpr(sf_kv_atoms_1):
+                            atom_offset = atom_idx * 128
+                            stage_offset = kv_stage_1 * sSF_KV_1.layout.stride[1]
+                            utccp_required_smem_warp_transpose(
+                                sSF_KV_1.iterator + stage_offset + atom_offset
+                            )
+                        cute.arch.fence_view_async_shared()
                     sSF_KV_1_ue8m0 = cute.recast_tensor(sSF_KV_1, Float8E8M0FNU)
                     stage_off_kv1_ue8m0 = kv_stage_1 * sSF_KV_1_ue8m0.layout.stride[1]
                     sSF_KV_1_chunk = cute.make_tensor(

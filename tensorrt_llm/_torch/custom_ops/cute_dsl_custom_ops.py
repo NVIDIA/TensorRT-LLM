@@ -6770,12 +6770,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
 
         @classmethod
-        def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
-                     next_n, num_sms, num_epi_subtiles, epi_dtype,
-                     output_dtype):
+        def _compile(cls,
+                     compute_block_kv,
+                     phys_block_kv,
+                     num_heads,
+                     head_dim,
+                     next_n,
+                     num_sms,
+                     num_epi_subtiles,
+                     epi_dtype,
+                     output_dtype,
+                     remove_online_sf_transpose=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
-                   num_sms, num_epi_subtiles, epi_dtype, output_dtype)
+                   num_sms, num_epi_subtiles, epi_dtype, output_dtype,
+                   remove_online_sf_transpose)
             if key in cls.kernel_cache:
                 return
 
@@ -6845,6 +6854,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_epi_subtiles=num_epi_subtiles,
                 epi_dtype=to_cutlass[epi_dtype],
                 output_dtype=to_cutlass[output_dtype],
+                remove_online_sf_transpose=remove_online_sf_transpose,
             )
 
             compiled = cute.compile(
@@ -6879,6 +6889,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_epi_subtiles: int = 1,
             epi_dtype: torch.dtype = torch.float32,
             output_dtype: torch.dtype = torch.float32,
+            remove_online_sf_transpose: bool = False,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -6946,10 +6957,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
-                   num_epi_subtiles, epi_dtype, output_dtype)
+                   num_epi_subtiles, epi_dtype, output_dtype,
+                   remove_online_sf_transpose)
             if key not in cls.kernel_cache:
-                cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
-                             num_sms, num_epi_subtiles, epi_dtype, output_dtype)
+                cls._compile(
+                    compute_block_kv,
+                    phys_block_kv,
+                    H,
+                    D,
+                    next_n,
+                    num_sms,
+                    num_epi_subtiles,
+                    epi_dtype,
+                    output_dtype,
+                    remove_online_sf_transpose=remove_online_sf_transpose)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -6972,6 +6993,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_epi_subtiles: int = 1,
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        remove_online_sf_transpose: bool = False,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -7008,7 +7030,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_context_len,
             num_epi_subtiles=num_epi_subtiles,
             epi_dtype=epi_dtype,
-            output_dtype=output_dtype)
+            output_dtype=output_dtype,
+            remove_online_sf_transpose=remove_online_sf_transpose)
 
     @torch.library.register_fake("trtllm::cute_dsl_fp4_paged_mqa_logits")
     def _(
@@ -7023,6 +7046,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_epi_subtiles: int = 1,
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        remove_online_sf_transpose: bool = False,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
