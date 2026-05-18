@@ -15,7 +15,6 @@
 
 import array
 import enum
-import hashlib
 import math
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -24,7 +23,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
-from .._block_radix_tree import Block, RootBlock, TreeTaskId, UselessBlockError
+from .._block_radix_tree import Block, ReuseScope, RootBlock, UselessBlockError
 from .._common import (
     BAD_BLOCK_ORDINAL,
     BAD_PAGE_INDEX,
@@ -172,9 +171,7 @@ class _KVCache:
     __slots__ = (
         "id",
         "_manager",
-        "_lora_task_id",
-        "_cache_salt_id",
-        "_tree_task_id",
+        "_reuse_scope",
         "_get_priority",
         "_cuda_stream",
         "_status",
@@ -202,9 +199,7 @@ class _KVCache:
 
     id: int | None
     _manager: "KVCacheManager"
-    _lora_task_id: int | None
-    _cache_salt_id: int | None
-    _tree_task_id: TreeTaskId
+    _reuse_scope: ReuseScope
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
     _status: _Status
@@ -245,17 +240,14 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
+        reuse_scope: ReuseScope,
         input_tokens: Sequence[TokenIdExt] | None,
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
-        cache_salt_id: int | None = None,
     ):
         self.id = id
         self._manager = manager
-        self._lora_task_id = lora_task_id
-        self._cache_salt_id = cache_salt_id
-        self._tree_task_id = _KVCache._make_tree_task_id(lora_task_id, cache_salt_id)
+        self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
         self._status = self.Status.SUSPENDED
@@ -1048,7 +1040,7 @@ class _KVCache:
             raise LogicError("Cannot commit block that is not full except last block")
         prev: RootBlock | Block
         if ordinal == 0:
-            prev = self.manager._radix_tree.add_or_get_existing(self._tree_task_id)
+            prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
         try:
@@ -1256,36 +1248,6 @@ class _KVCache:
         return self.manager._storage
 
     @staticmethod
-    def _make_tree_task_id(lora_task_id: int | None, cache_salt_id: int | None) -> TreeTaskId:
-        """Compute the radix tree's per-request seed.
-
-        When ``cache_salt_id`` is ``None`` the seed reduces to ``lora_task_id``
-        so non-salted requests share the same radix-tree branch and the
-        salt-disabled fast path costs zero hashing.
-
-        When ``cache_salt_id`` is set, the seed becomes a SHA-256 digest that
-        binds ``(lora_task_id, cache_salt_id)`` together so two requests land
-        on the same root only when both fields agree; differing salts cannot
-        reuse one another's blocks.
-        """
-        if cache_salt_id is None:
-            return lora_task_id
-        if lora_task_id is not None and not 0 <= lora_task_id < (1 << 64):
-            raise ValueError(f"lora_task_id must be in [0, 2**64), got {lora_task_id}")
-        if not 0 <= cache_salt_id < (1 << 64):
-            raise ValueError(f"cache_salt_id must be in [0, 2**64), got {cache_salt_id}")
-        h = hashlib.sha256()
-        # Domain-separation byte distinguishes "no LoRA task" from
-        # ``lora_task_id == 0`` so the two cases produce distinct seeds.
-        if lora_task_id is None:
-            h.update(b"\x00")
-        else:
-            h.update(b"\x01")
-            h.update(lora_task_id.to_bytes(8, "little", signed=False))
-        h.update(cache_salt_id.to_bytes(8, "little", signed=False))
-        return h.digest()
-
-    @staticmethod
     def _to_block_ordinal(tokens_per_block: int, token_ordinal: int) -> BlockOrdinal:
         return BlockOrdinal(token_ordinal // tokens_per_block)
 
@@ -1432,12 +1394,9 @@ class _KVCache:
 
     def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]) -> None:
         manager = self.manager
-        # Use the salted tree task ID so requests with different ``cache_salt_id``
-        # values cannot reuse each other's blocks.
-        tree_task_id = self._tree_task_id
         matched = list(
             manager._radix_tree.match(
-                tree_task_id, input_tokens or [], manager.enable_partial_match
+                self._reuse_scope, input_tokens or [], manager.enable_partial_match
             )
         )
         tokens_per_block = manager.tokens_per_block
