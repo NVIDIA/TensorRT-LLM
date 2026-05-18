@@ -45,7 +45,9 @@ using ::tensorrt_llm::kernels::XQAKernelMetaInfo;
 using ::tensorrt_llm::kernels::kXqaMlaMultiBlockMinTilesPerCta;
 using ::tensorrt_llm::kernels::kXqaMlaOutputHeadSize;
 using ::tensorrt_llm::kernels::kXqaMlaTokensPerTile;
-using ::tensorrt_llm::kernels::xqaMlaPartialResultSize;
+using ::tensorrt_llm::kernels::getXqaMlaCgaXBufSize;
+using ::tensorrt_llm::kernels::getXqaMlaKernelHeadGrpSize;
+using ::tensorrt_llm::kernels::getXqaMlaPartialResultSize;
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const& kernelMeta)
 {
@@ -259,14 +261,15 @@ void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partial
         return;
     }
 
-    constexpr uint32_t kRowsPerChunk = 32;
     constexpr uint32_t kChunks = 4;
+    uint32_t const rowsPerChunk = context.kernelNumQHeads / kChunks;
     constexpr size_t kOutputHeadBytes = static_cast<size_t>(kXqaMlaOutputHeadSize) * sizeof(uint16_t);
-    constexpr size_t kChunkDataBytes = static_cast<size_t>(kRowsPerChunk) * kOutputHeadBytes;
-    constexpr size_t kChunkRowSumOffset = kChunkDataBytes;
-    constexpr size_t kChunkRowMaxOffset = kChunkRowSumOffset + static_cast<size_t>(kRowsPerChunk) * sizeof(float);
-    constexpr size_t kChunkBytes = kChunkRowMaxOffset + static_cast<size_t>(kRowsPerChunk) * sizeof(float);
-    static_assert(kChunkBytes * kChunks == xqaMlaPartialResultSize);
+    size_t const chunkDataBytes = static_cast<size_t>(rowsPerChunk) * kOutputHeadBytes;
+    size_t const chunkRowSumOffset = chunkDataBytes;
+    size_t const chunkRowMaxOffset = chunkRowSumOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const chunkBytes = chunkRowMaxOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const partialResultSize = getXqaMlaPartialResultSize(context.kernelNumQHeads);
+    TLLM_CHECK_WITH_INFO(chunkBytes * kChunks == partialResultSize, "Invalid XQA MLA partial debug layout");
 
     uint32_t seqLen0 = 0xffffffffU;
     if (context.sequenceLengths != nullptr)
@@ -275,10 +278,10 @@ void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partial
             &seqLen0, context.sequenceLengths, sizeof(seqLen0), cudaMemcpyDeviceToHost, stream));
     }
 
-    uint32_t const chunksToCheck = (headsToCheck + kRowsPerChunk - 1) / kRowsPerChunk;
+    uint32_t const chunksToCheck = (headsToCheck + rowsPerChunk - 1) / rowsPerChunk;
     TLLM_CHECK_WITH_INFO(chunksToCheck <= kChunks, "Invalid XQA MLA partial debug head count");
     size_t const copies = static_cast<size_t>(tokens) * maxNbSubSeq * chunksToCheck;
-    std::vector<uint8_t> host(copies * kChunkBytes);
+    std::vector<uint8_t> host(copies * chunkBytes);
     auto const* partialBytes = static_cast<uint8_t const*>(partialResults);
     for (uint32_t token = 0; token < tokens; ++token)
     {
@@ -287,11 +290,11 @@ void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partial
             for (uint32_t chunk = 0; chunk < chunksToCheck; ++chunk)
             {
                 size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
-                size_t const srcOffset = (static_cast<size_t>(token) * maxNbSubSeq + subSeq)
-                        * xqaMlaPartialResultSize
-                    + static_cast<size_t>(chunk) * kChunkBytes;
+                size_t const srcOffset
+                    = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * partialResultSize
+                    + static_cast<size_t>(chunk) * chunkBytes;
                 TLLM_CUDA_CHECK(cudaMemcpyAsync(
-                    host.data() + copyIdx * kChunkBytes, partialBytes + srcOffset, kChunkBytes,
+                    host.data() + copyIdx * chunkBytes, partialBytes + srcOffset, chunkBytes,
                     cudaMemcpyDeviceToHost, stream));
             }
         }
@@ -306,17 +309,17 @@ void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partial
             for (uint32_t chunk = 0; chunk < chunksToCheck; ++chunk)
             {
                 size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
-                uint8_t const* chunkData = host.data() + copyIdx * kChunkBytes;
-                uint32_t const rowLimit = std::min(kRowsPerChunk, headsToCheck - chunk * kRowsPerChunk);
+                uint8_t const* chunkData = host.data() + copyIdx * chunkBytes;
+                uint32_t const rowLimit = std::min(rowsPerChunk, headsToCheck - chunk * rowsPerChunk);
                 for (uint32_t row = 0; row < rowLimit; ++row)
                 {
                     float rowSum = 0.F;
                     float rowMax = 0.F;
-                    std::memcpy(&rowSum, chunkData + kChunkRowSumOffset + static_cast<size_t>(row) * sizeof(float),
+                    std::memcpy(&rowSum, chunkData + chunkRowSumOffset + static_cast<size_t>(row) * sizeof(float),
                         sizeof(float));
-                    std::memcpy(&rowMax, chunkData + kChunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float),
+                    std::memcpy(&rowMax, chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float),
                         sizeof(float));
-                    uint32_t const head = chunk * kRowsPerChunk + row;
+                    uint32_t const head = chunk * rowsPerChunk + row;
                     TLLM_CHECK_WITH_INFO(std::isfinite(rowSum) && rowSum > 0.F && std::isfinite(rowMax),
                         "XQA MLA partial row stats invalid after %s at token=%u subseq=%u head=%u "
                         "chunk=%u row=%u row_sum=%g row_max=%g "
@@ -366,18 +369,19 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
         return;
     }
 
-    constexpr uint32_t kRowsPerChunk = 32;
     constexpr uint32_t kChunks = 4;
+    uint32_t const rowsPerChunk = context.kernelNumQHeads / kChunks;
     constexpr size_t kOutputHeadBytes = static_cast<size_t>(kXqaMlaOutputHeadSize) * sizeof(uint16_t);
-    constexpr size_t kChunkDataBytes = static_cast<size_t>(kRowsPerChunk) * kOutputHeadBytes;
-    constexpr size_t kChunkRowSumOffset = kChunkDataBytes;
-    constexpr size_t kChunkRowMaxOffset = kChunkRowSumOffset + static_cast<size_t>(kRowsPerChunk) * sizeof(float);
-    constexpr size_t kChunkBytes = kChunkRowMaxOffset + static_cast<size_t>(kRowsPerChunk) * sizeof(float);
-    static_assert(kChunkBytes * kChunks == xqaMlaPartialResultSize);
+    size_t const chunkDataBytes = static_cast<size_t>(rowsPerChunk) * kOutputHeadBytes;
+    size_t const chunkRowSumOffset = chunkDataBytes;
+    size_t const chunkRowMaxOffset = chunkRowSumOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const chunkBytes = chunkRowMaxOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
+    size_t const partialResultSize = getXqaMlaPartialResultSize(context.kernelNumQHeads);
+    TLLM_CHECK_WITH_INFO(chunkBytes * kChunks == partialResultSize, "Invalid XQA MLA reduce reference layout");
 
     TLLM_CHECK_WITH_INFO(inputSeqLen > 0, "Invalid XQA MLA reduce reference input sequence length");
     TLLM_CHECK_WITH_INFO(headsToCheck <= headPitch, "Invalid XQA MLA reduce reference head layout");
-    uint32_t const chunksToCheck = (headsToCheck + kRowsPerChunk - 1) / kRowsPerChunk;
+    uint32_t const chunksToCheck = (headsToCheck + rowsPerChunk - 1) / rowsPerChunk;
     TLLM_CHECK_WITH_INFO(chunksToCheck <= kChunks, "Invalid XQA MLA reduce reference head count");
 
     uint32_t const batchSize = (tokens + inputSeqLen - 1) / inputSeqLen;
@@ -389,7 +393,7 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
     }
 
     size_t const partialCopies = static_cast<size_t>(tokens) * maxNbSubSeq * chunksToCheck;
-    std::vector<uint8_t> partialHost(partialCopies * kChunkBytes);
+    std::vector<uint8_t> partialHost(partialCopies * chunkBytes);
     auto const* partialBytes = static_cast<uint8_t const*>(partialResults);
     for (uint32_t token = 0; token < tokens; ++token)
     {
@@ -398,11 +402,11 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
             for (uint32_t chunk = 0; chunk < chunksToCheck; ++chunk)
             {
                 size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
-                size_t const srcOffset = (static_cast<size_t>(token) * maxNbSubSeq + subSeq)
-                        * xqaMlaPartialResultSize
-                    + static_cast<size_t>(chunk) * kChunkBytes;
-                TLLM_CUDA_CHECK(cudaMemcpyAsync(partialHost.data() + copyIdx * kChunkBytes,
-                    partialBytes + srcOffset, kChunkBytes, cudaMemcpyDeviceToHost, stream));
+                size_t const srcOffset
+                    = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * partialResultSize
+                    + static_cast<size_t>(chunk) * chunkBytes;
+                TLLM_CUDA_CHECK(cudaMemcpyAsync(partialHost.data() + copyIdx * chunkBytes, partialBytes + srcOffset,
+                    chunkBytes, cudaMemcpyDeviceToHost, stream));
             }
         }
     }
@@ -417,7 +421,7 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
     auto chunkPtr = [&](uint32_t token, uint32_t subSeq, uint32_t chunk) -> uint8_t const*
     {
         size_t const copyIdx = (static_cast<size_t>(token) * maxNbSubSeq + subSeq) * chunksToCheck + chunk;
-        return partialHost.data() + copyIdx * kChunkBytes;
+        return partialHost.data() + copyIdx * chunkBytes;
     };
     auto readFloat = [](uint8_t const* ptr) -> float
     {
@@ -463,15 +467,15 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
 
         for (uint32_t head = 0; head < headsToCheck; ++head)
         {
-            uint32_t const chunk = head / kRowsPerChunk;
-            uint32_t const row = head - chunk * kRowsPerChunk;
+            uint32_t const chunk = head / rowsPerChunk;
+            uint32_t const row = head - chunk * rowsPerChunk;
 
             double rowMax = -std::numeric_limits<double>::infinity();
             for (uint32_t subSeq = 0; subSeq < nbSubSeq; ++subSeq)
             {
                 uint8_t const* chunkData = chunkPtr(token, subSeq, chunk);
                 float const subSeqRowMax
-                    = readFloat(chunkData + kChunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
+                    = readFloat(chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
                 rowMax = std::max(rowMax, static_cast<double>(subSeqRowMax));
             }
 
@@ -480,9 +484,9 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
             {
                 uint8_t const* chunkData = chunkPtr(token, subSeq, chunk);
                 float const subSeqRowSum
-                    = readFloat(chunkData + kChunkRowSumOffset + static_cast<size_t>(row) * sizeof(float));
+                    = readFloat(chunkData + chunkRowSumOffset + static_cast<size_t>(row) * sizeof(float));
                 float const subSeqRowMax
-                    = readFloat(chunkData + kChunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
+                    = readFloat(chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
                 rowSum += static_cast<double>(subSeqRowSum) * std::exp2(static_cast<double>(subSeqRowMax) - rowMax);
             }
 
@@ -493,9 +497,9 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
                 {
                     uint8_t const* chunkData = chunkPtr(token, subSeq, chunk);
                     float const subSeqRowSum
-                        = readFloat(chunkData + kChunkRowSumOffset + static_cast<size_t>(row) * sizeof(float));
+                        = readFloat(chunkData + chunkRowSumOffset + static_cast<size_t>(row) * sizeof(float));
                     float const subSeqRowMax
-                        = readFloat(chunkData + kChunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
+                        = readFloat(chunkData + chunkRowMaxOffset + static_cast<size_t>(row) * sizeof(float));
                     double const weight
                         = static_cast<double>(subSeqRowSum) * std::exp2(static_cast<double>(subSeqRowMax) - rowMax);
                     uint8_t const* rowData = chunkData + static_cast<size_t>(row) * kOutputHeadBytes;
@@ -887,40 +891,42 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     {
         auto const roundUpTo128 = [](size_t value) { return ((value + 127) / 128) * 128; };
         uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        uint32_t const kernelMlaHeadGrpSize = getXqaMlaKernelHeadGrpSize(num_q_heads_over_kv);
         auto* scratchBytes = static_cast<std::byte*>(launchParams.scratch);
-        size_t const cgaXBufBytes = static_cast<size_t>(xqaMlaCgaXBufSize) * multi_block
+        size_t const cgaXBufBytes = static_cast<size_t>(getXqaMlaCgaXBufSize(kernelMlaHeadGrpSize)) * multi_block
             * xqaParams.total_num_input_tokens;
-        size_t const partialResultBytes = static_cast<size_t>(xqaMlaPartialResultSize) * multi_block
+        size_t const partialResultBytes = static_cast<size_t>(getXqaMlaPartialResultSize(kernelMlaHeadGrpSize))
+            * multi_block
             * xqaParams.total_num_input_tokens;
         auto* partialResults = scratchBytes + cgaXBufBytes;
 
         XQAParams kernelXQAParams = xqaParams;
         void const* kernelInputTokens = kernel_input_tokens;
         auto* kernelOutput = launchParams.output;
-        bool const padMlaHeadGroup = num_q_heads_over_kv < kXqaMlaKernelHeadGrpSize;
+        bool const padMlaHeadGroup = num_q_heads_over_kv < kernelMlaHeadGrpSize;
         if (padMlaHeadGroup)
         {
             TLLM_CHECK_WITH_INFO(num_kv_heads == 1,
                 "The SM120 MLA padded wrapper only supports one KV head per rank.");
-            kernelXQAParams.num_q_heads = kXqaMlaKernelHeadGrpSize;
+            kernelXQAParams.num_q_heads = kernelMlaHeadGrpSize;
             kernelXQAParams.num_kv_heads = 1;
 
             size_t const realQPitch = static_cast<size_t>(xqaParams.head_size) * xqaParams.num_q_heads
                 * kXqaMlaQElemBytes;
             size_t const paddedQPitch
-                = static_cast<size_t>(xqaParams.head_size) * kXqaMlaKernelHeadGrpSize * kXqaMlaQElemBytes;
+                = static_cast<size_t>(xqaParams.head_size) * kernelMlaHeadGrpSize * kXqaMlaQElemBytes;
             size_t const paddedQBytes = paddedQPitch * xqaParams.total_num_input_tokens;
-            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kXqaMlaKernelHeadGrpSize
+            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kernelMlaHeadGrpSize
                 * kXqaMlaOutputElemBytes;
             size_t const paddedOutputBytes = paddedOutputPitch * xqaParams.total_num_input_tokens;
             auto* paddedQ = partialResults + partialResultBytes;
             auto* paddedOutput = paddedQ + roundUpTo128(paddedQBytes);
 
             TLLM_LOG_DEBUG(
-                "Padding SM120 MLA XQA head group from %d to %d for the existing 128-head kernel: "
+                "Padding SM120 MLA XQA head group from %d to %u for the selected kernel: "
                 "tokens=%u real_q_pitch=%zu padded_q_pitch=%zu padded_q_bytes=%zu "
                 "real_output_pitch=%zu padded_output_pitch=%zu padded_output_bytes=%zu",
-                num_q_heads_over_kv, kXqaMlaKernelHeadGrpSize, xqaParams.total_num_input_tokens, realQPitch,
+                num_q_heads_over_kv, kernelMlaHeadGrpSize, xqaParams.total_num_input_tokens, realQPitch,
                 paddedQPitch, paddedQBytes, static_cast<size_t>(kXqaMlaOutputHeadSize) * xqaParams.num_q_heads
                     * kXqaMlaOutputElemBytes,
                 paddedOutputPitch, paddedOutputBytes);
@@ -1003,7 +1009,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         {
             size_t const realOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * xqaParams.num_q_heads
                 * kXqaMlaOutputElemBytes;
-            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kXqaMlaKernelHeadGrpSize
+            size_t const paddedOutputPitch = static_cast<size_t>(kXqaMlaOutputHeadSize) * kernelMlaHeadGrpSize
                 * kXqaMlaOutputElemBytes;
             TLLM_CUDA_CHECK(cudaMemcpy2DAsync(launchParams.output, realOutputPitch, kernelOutput, paddedOutputPitch,
                 realOutputPitch, xqaParams.total_num_input_tokens, cudaMemcpyDeviceToDevice, stream));
