@@ -66,6 +66,7 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  deepseekV4QNormOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
