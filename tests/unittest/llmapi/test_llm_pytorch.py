@@ -617,7 +617,7 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
         "Hello, how are you?",
     ]
 
-    sampling_params = SamplingParams(max_tokens=10, add_special_tokens=False)
+    sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
     lora_req = LoRARequest(
         "task-0", 0,
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"

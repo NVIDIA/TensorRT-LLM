@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import (
     ADPiecewiseRunner,
+    MetadataWrapper,
     OutputInfo,
     SegmentEntry,
 )
@@ -97,6 +98,86 @@ class TestSegmentEntry:
         assert entry.static_output is None
         assert entry.dynamic_out_bufs == {}
         assert entry.input_addresses == []
+
+
+# ============================================================================
+# MetadataWrapper tests
+# ============================================================================
+
+
+class _MetadataModule(nn.Module):
+    def forward(self, values: torch.Tensor):
+        return values.to(torch.int32), values.to(torch.int32).view(1, -1)
+
+
+class _MambaMetadataModule(nn.Module):
+    def forward(self, chunk_values: torch.Tensor, seq_idx_values: torch.Tensor):
+        chunk_values = chunk_values.to(torch.int32)
+        return chunk_values, chunk_values.clone(), seq_idx_values.to(torch.int32).view(1, -1)
+
+
+class TestMetadataWrapper:
+    def setup_method(self):
+        ADPiecewiseRunner._current_num_tokens = None
+        ADPiecewiseRunner._current_phase = "replay"
+
+    def test_non_mamba_metadata_returns_real_shape_views(self):
+        wrapper = MetadataWrapper(_MetadataModule(), max_batch_size=8)
+        num_tokens = 128
+
+        ADPiecewiseRunner.set_current_num_tokens(num_tokens)
+        ADPiecewiseRunner.set_current_phase("capture")
+        capture_out = wrapper(torch.arange(10))
+
+        stable = wrapper._stable_outputs[num_tokens]
+        assert stable[0].shape == torch.Size([64])
+        assert stable[1].shape == torch.Size([1, 64])
+        assert capture_out[0].shape == torch.Size([10])
+        assert capture_out[1].shape == torch.Size([1, 10])
+        assert capture_out[0].data_ptr() == stable[0].data_ptr()
+        assert capture_out[1].data_ptr() == stable[1].data_ptr()
+
+        ADPiecewiseRunner.set_current_phase("replay")
+        replay_out = wrapper(torch.arange(7) + 100)
+
+        assert replay_out[0].shape == torch.Size([7])
+        assert replay_out[1].shape == torch.Size([1, 7])
+        assert replay_out[0].data_ptr() == stable[0].data_ptr()
+        assert replay_out[1].data_ptr() == stable[1].data_ptr()
+        assert torch.equal(replay_out[0], torch.arange(7, dtype=torch.int32) + 100)
+        assert torch.equal(replay_out[1], (torch.arange(7, dtype=torch.int32) + 100).view(1, -1))
+        assert torch.count_nonzero(stable[0][7:]) == 0
+        assert torch.count_nonzero(stable[1][:, 7:]) == 0
+
+    def test_mamba_metadata_allows_runtime_growth(self):
+        wrapper = MetadataWrapper(_MambaMetadataModule(), max_batch_size=4)
+        wrapper._pad_for_mamba_metadata = True
+        num_tokens = 64
+
+        ADPiecewiseRunner.set_current_num_tokens(num_tokens)
+        ADPiecewiseRunner.set_current_phase("capture")
+        capture_out = wrapper(torch.arange(64), torch.arange(64))
+
+        stable = wrapper._stable_outputs[num_tokens]
+        assert stable[0].shape == torch.Size([128])
+        assert stable[1].shape == torch.Size([128])
+        assert stable[2].shape == torch.Size([1, 64])
+        assert capture_out[0].shape == torch.Size([64])
+        assert capture_out[1].shape == torch.Size([64])
+        assert capture_out[2].shape == torch.Size([1, 64])
+
+        ADPiecewiseRunner.set_current_phase("replay")
+        replay_out = wrapper(torch.arange(67) + 200, torch.arange(64) + 300)
+
+        assert replay_out[0].shape == torch.Size([67])
+        assert replay_out[1].shape == torch.Size([67])
+        assert replay_out[2].shape == torch.Size([1, 64])
+        assert replay_out[0].data_ptr() == stable[0].data_ptr()
+        assert replay_out[1].data_ptr() == stable[1].data_ptr()
+        assert replay_out[2].data_ptr() == stable[2].data_ptr()
+        assert torch.equal(replay_out[0], torch.arange(67, dtype=torch.int32) + 200)
+        assert torch.equal(replay_out[1], torch.arange(67, dtype=torch.int32) + 200)
+        assert torch.equal(replay_out[2], (torch.arange(64, dtype=torch.int32) + 300).view(1, -1))
 
 
 # ============================================================================

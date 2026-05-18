@@ -419,7 +419,7 @@ std::size_t KVCacheTransferManager::computeBlockTransferBytes(
     std::size_t totalBytes = 0;
     for (auto const& pool : pools)
     {
-        if (!pool.primaryPtr)
+        if (!pool.primaryPtr || pool.primaryPtr->getSize() == 0)
         {
             continue;
         }

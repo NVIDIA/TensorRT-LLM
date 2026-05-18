@@ -589,6 +589,8 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_forma
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=False-overlap_scheduler=False]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=True-overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=True-eagle3_one_model=True-overlap_scheduler=True]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_rejection_dynamic_tree_smoke[no_dynamic_tree]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_rejection_dynamic_tree_smoke[dynamic_tree]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa_global_pool
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
@@ -740,10 +742,11 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_sof
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_4B::test_eagle3
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS]
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-TRTLLM]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash
-accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl]
@@ -899,6 +902,7 @@ test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3
 test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf-Qwen3/qwen3-235B-eagle3]
 test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-Qwen3/qwen3-235B-eagle3]
 test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
+test_e2e.py::test_openai_kv_cache_contamination
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
 disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]

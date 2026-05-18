@@ -29,7 +29,7 @@ respective model files and registered via get_eagle_layers().
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -104,9 +104,11 @@ class EagleConfig(PretrainedConfig):
         model_type: The base model type (e.g., "llama", "nemotron_h") used to look up defaults.
     """
 
-    # Map model_type -> default Eagle config values
-    # Includes _checkpoint_conversion_mapping for model-specific weight key transformations
-    _drafter_defaults: Dict[str, Dict[str, Any]] = {
+    # Map model_type -> default Eagle config values.
+    # Annotated as ClassVar so transformers 5.5.x's @dataclass(kw_only=True)
+    # treatment of PretrainedConfig subclasses skips this (otherwise the
+    # mutable-dict default is rejected at class-creation time).
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": True,
             "load_lm_head_from_target": False,
@@ -140,24 +142,31 @@ class EagleConfig(PretrainedConfig):
     # Some custom HF config classes expose backward-compatibility fields as properties instead of
     # storing them directly in __dict__. Those values do not survive config.to_dict(), so carry
     # them over explicitly before rebuilding a generic EagleConfig.
-    _preserved_config_attrs: Dict[str, tuple[str, ...]] = {
+    _preserved_config_attrs: ClassVar[Dict[str, tuple[str, ...]]] = {
         "nemotron_h": ("mtp_hybrid_override_pattern",),
     }
 
-    def __init__(
-        self,
+    @classmethod
+    def from_base_config(
+        cls,
         config: PretrainedConfig,
         model_type: str,
     ):
-        if model_type not in self._drafter_defaults:
+        """Build an EagleConfig by merging a base model's config with type-specific defaults.
+
+        Use this factory instead of constructing ``EagleConfig`` directly: transformers>=5.5
+        applies ``@dataclass(kw_only=True)`` to ``PretrainedConfig`` subclasses, which
+        overrides any manually defined ``__init__``.
+        """
+        if model_type not in cls._drafter_defaults:
             raise ValueError(
                 f"Unsupported model_type '{model_type}' for EagleConfig. "
-                f"Supported types: {list(self._drafter_defaults.keys())}"
+                f"Supported types: {list(cls._drafter_defaults.keys())}"
             )
 
-        defaults = self._drafter_defaults[model_type]
+        defaults = cls._drafter_defaults[model_type]
         config_dict = config.to_dict()
-        for key in self._preserved_config_attrs.get(model_type, ()):
+        for key in cls._preserved_config_attrs.get(model_type, ()):
             if key not in config_dict and hasattr(config, key):
                 config_dict[key] = getattr(config, key)
 
@@ -170,7 +179,7 @@ class EagleConfig(PretrainedConfig):
                 )
 
         merged = deep_merge_dicts(defaults, config_dict)
-        super().__init__(**merged)
+        return cls(**merged)
 
 
 class LlamaRotaryEmbedding(nn.Module):

@@ -15,6 +15,16 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 
+# Ray-backed LLM teardown spawns the executor main-loop, GC and log/error
+# listener threads in ray-core. These are torn down only when ``ray.shutdown()``
+# fires, which only runs from RayExecutor.shutdown() — itself only called when
+# the LLM object is explicitly closed. The transformers 5.5.x import graph
+# enlarges the live reference set, delaying GC of the test-local LLM past
+# pytest-threadleak's post-teardown snapshot. Disable the leak check for this
+# file (matches the sibling pattern at
+# tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py).
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 class RefHFModelWithIPCHandles(RefHFModel):
     def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: int = 4):
@@ -140,7 +150,7 @@ def test_llm_update_weights(model_dir):
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
     moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
-    llm = LLM(
+    with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=1,
@@ -149,27 +159,28 @@ def test_llm_update_weights(model_dir):
         kv_cache_config=kv_cache_config,
         model_kwargs={"num_hidden_layers": num_hidden_layers},
         moe_config=moe_config,
-    )
+    ) as llm:
+        # Generate texts from the prompts.
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
 
-    # Generate texts from the prompts.
-    prompts_texts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-    del tokenizer
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0])
 
-    ipc_handles = hf_model.get_weight_ipc_handles_serialized([0])
+        llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize the update weights
+        llm._collective_rpc("update_weights", (None,))
 
-    llm._collective_rpc("update_weights", (ipc_handles,))
-    # Finalize the update weights
-    llm._collective_rpc("update_weights", (None,))
-
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)
 
 
 @skip_pre_hopper
@@ -192,7 +203,7 @@ def test_llm_partial_update_weights(model_dir):
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
     moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
-    llm = LLM(
+    with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=1,
@@ -201,44 +212,47 @@ def test_llm_partial_update_weights(model_dir):
         kv_cache_config=kv_cache_config,
         model_kwargs={"num_hidden_layers": num_hidden_layers},
         moe_config=moe_config,
-    )
+    ) as llm:
+        # Generate texts from the prompts.
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
 
-    # Generate texts from the prompts.
-    prompts_texts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-    del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
 
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
 
-    def common_filter(filter_name: str) -> Callable[[str], bool]:
-        def filter_fn(name: str) -> bool:
-            return name.endswith(filter_name)
+            return filter_fn
 
-        return filter_fn
+        # Generate filter_list from model weight keys by removing layer prefix
+        # e.g., "model.layers.41.input_layernorm.weight" -> "input_layernorm.weight"
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            suffix = layer_prefix_pattern.sub("", name)
+            filter_set.add(suffix)
+        filter_list = list(filter_set)
 
-    # Generate filter_list from model weight keys by removing layer prefix
-    # e.g., "model.layers.41.input_layernorm.weight" -> "input_layernorm.weight"
-    layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
-    filter_set = set()
-    for name, _ in hf_model.all_weights[hf_model.device_id]:
-        suffix = layer_prefix_pattern.sub("", name)
-        filter_set.add(suffix)
-    filter_list = list(filter_set)
+        for filter_name in filter_list:
+            weight_filter = common_filter(filter_name=filter_name)
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                [0], weight_filter=weight_filter
+            )
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize the update weights
+        llm._collective_rpc("update_weights", (None,))
 
-    for filter_name in filter_list:
-        weight_filter = common_filter(filter_name=filter_name)
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0], weight_filter=weight_filter)
-        llm._collective_rpc("update_weights", (ipc_handles,))
-    # Finalize the update weights
-    llm._collective_rpc("update_weights", (None,))
-
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)
 
 
 @skip_pre_hopper
@@ -261,7 +275,7 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir, kv_cache
         enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
     )
     moe_config = MoeConfig(backend="DEEPGEMM" if getSMVersion() >= 100 else "CUTLASS")
-    llm = LLM(
+    with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=1,
@@ -278,24 +292,25 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir, kv_cache
             },
         },
         moe_config=moe_config,
-    )
+    ) as llm:
+        # Generate texts from the prompts.
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
 
-    # Generate texts from the prompts.
-    prompts_texts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-    del tokenizer
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0])
 
-    ipc_handles = hf_model.get_weight_ipc_handles_serialized([0])
+        llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize the update weights
+        llm._collective_rpc("update_weights", (None,))
 
-    llm._collective_rpc("update_weights", (ipc_handles,))
-    # Finalize the update weights
-    llm._collective_rpc("update_weights", (None,))
-
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)

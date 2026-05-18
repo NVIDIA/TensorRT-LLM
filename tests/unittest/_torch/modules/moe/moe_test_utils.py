@@ -153,6 +153,27 @@ def _is_fp4_fp8_standalone_gemm_available() -> bool:
     return result
 
 
+def _is_sm103_gpu() -> bool:
+    """Return whether the current test GPU is an SM103 device such as B300."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0) == (10, 3)
+
+
+def skip_trtllm_bf16_on_sm103(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    dtype: torch.dtype,
+) -> None:
+    """Explicitly skip TRTLLM BF16 tests on SM103."""
+    if backend_type == MoeBackendType.TRTLLM and quant_algo is None and dtype == torch.bfloat16:
+        if _is_sm103_gpu():
+            pytest.skip(
+                "FIXME: TRTLLMGenFusedMoE BF16 (FlashInfer backend) is skipped on SM103 "
+                "due to CUDA errors"
+            )
+
+
 def should_skip_trtllm(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
@@ -315,12 +336,14 @@ def should_skip_trtllm(
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
-
-    if quant_algo not in trtllm_gen_quant_algos:
+    # BF16 also uses TRTLLMGen, so keep quant_algo=None in this path:
+    # apply the shared TRTLLMGen constraints, then the BF16 checks below.
+    if quant_algo is not None and quant_algo not in trtllm_gen_quant_algos:
         return None
 
     num_experts = model_config.num_experts
     top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
 
     # Check: num_experts must be divisible by 4
@@ -338,11 +361,41 @@ def should_skip_trtllm(
             f"TRTLLMGenFusedMoE requires num_experts > top_k "
             f"(got num_experts={num_experts}, top_k={top_k})"
         )
+
+    if quant_algo is None:
+        if swiglu_gptoss_style:
+            return "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
+
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            return (
+                "TRTLLMGenFusedMoE BF16 path requires hidden_size and intermediate_size "
+                f"to be multiples of 128 (got h={hidden_size}, i={intermediate_size})."
+            )
+        if comm_method == "NVLINK_TWO_SIDED" and top_k % 8 != 0:
+            return (
+                "TRTLLMGenFusedMoE BF16 path with NVLinkTwoSidedFlashinfer requires "
+                f"top_k to be a multiple of 8 for 16-byte row alignment (got top_k={top_k})."
+            )
+        if moe_tp_size > 1:
+            if intermediate_size % moe_tp_size != 0:
+                return (
+                    "TRTLLMGenFusedMoE BF16 path requires intermediate_size to be "
+                    f"divisible by moe_tp_size (got i={intermediate_size}, "
+                    f"moe_tp_size={moe_tp_size})."
+                )
+            per_shard = intermediate_size // moe_tp_size
+            if per_shard % 64 != 0:
+                return (
+                    "TRTLLMGenFusedMoE BF16 path requires per-shard intermediate_size "
+                    f"to be 64-aligned for BlockMajorK weights (got {per_shard} "
+                    f"= {intermediate_size} / {moe_tp_size})."
+                )
+        return None
+
     # W4A8_MXFP4_MXFP8 with non-128-aligned hidden_size or intermediate_size
     # causes block_scale_interleave_reverse to fail with
     # "rows of Interleaved block scales should be multiple of 128".
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
-        hidden_size = model_config.hidden_size
         if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             return (
                 f"TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with non-128-aligned "
@@ -1097,7 +1150,8 @@ def should_skip_to_accelerate_ci(
     all combinations run (local exhaustive testing).
 
     Rules applied (in order):
-    0. Skip unquantized (quant=None) — quantized paths are the focus of CI
+    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
+       unquantized coverage enabled.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -1123,8 +1177,13 @@ def should_skip_to_accelerate_ci(
     if model_config is None:
         return None
 
-    # --- Rule 0: Skip gated and unquantized (quant=None) ---
-    if quant_algo is None and is_gated_activation(activation_type):
+    # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
+    # Keep TRTLLM BF16 unquantized enabled to cover FlashInfer BF16 TRTLLM MoE.
+    if (
+        quant_algo is None
+        and is_gated_activation(activation_type)
+        and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
+    ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
     # Any e256-class model_config triggers CI Rule-1 minimal coverage:

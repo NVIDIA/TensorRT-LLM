@@ -420,8 +420,12 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
-            # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            # Parallel-draft modes (PARD, DFlash) size their per-request draft
+            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
+            # one slot per draft token the target will verify.  PARD still uses
+            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
+            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
+            # tokens_per_gen_step carries the per-algorithm width.
             if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
             else:
@@ -560,6 +564,13 @@ class PyTorchModelEngine(ModelEngine):
             self.cache_indirection_attention = None
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+
+        # Upper bound on the per-rank token count used for warmup forward passes
+        # (both the max-shape general warmup and the autotuner warmup). Each
+        # tunable op currently generates tuning buckets only up to 8192 (see
+        # MAX_PROFILE_BUCKET in trtllm_gen_custom_ops.py and related files), so
+        # warmup shapes larger than this do not improve tuning quality.
+        self.max_warmup_tokens = 8192
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -741,7 +752,8 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
+                                    self.batch_size * (self.max_seq_len - 1),
+                                    self.max_warmup_tokens)
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -890,7 +902,8 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
+                                    self.batch_size * (self.max_seq_len - 1),
+                                    self.max_warmup_tokens)
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -2982,9 +2995,8 @@ class PyTorchModelEngine(ModelEngine):
                     )
                 if segment.shape[0] != 3 and segment.shape[-1] == 3:
                     logger.warning(
-                        "Transposing unexpected mrope_position_ids shape from %s",
-                        tuple(segment.shape),
-                    )
+                        "Transposing unexpected mrope_position_ids shape from "
+                        f"{tuple(segment.shape)}")
                     segment = segment.transpose(0, 2).contiguous()
                 if segment.shape[:2] != (3, 1):
                     raise RuntimeError(
@@ -3900,9 +3912,10 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # PARD/DFlash have 2K tokens per gen request, not K+1.  Pass 2K-1
-            # so generation_lengths = 2K and the XQA kernel computes
-            # the correct past_kv_len.
+            # Parallel-draft modes advertise a per-gen-step width via
+            # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass
+            # (tokens_per_gen_step - 1) so generation_lengths = tokens_per_gen_step
+            # and the XQA kernel computes the correct past_kv_len.
             if spec_metadata.spec_dec_mode.is_parallel_draft():
                 sd_max_draft_len = self.original_max_total_draft_tokens
                 sd_max_total = self.original_max_total_draft_tokens
