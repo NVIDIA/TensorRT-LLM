@@ -424,7 +424,7 @@ class MetricsCollector:
             labelnames=self.labels.keys())
 
         # Per-position speculative decoding acceptance counters
-        self.labelname_token_pos = "token_position"
+        self.labelname_token_pos = "token_position"  # nosec: B105
         self.labels_with_token_pos = {
             **self.labels, self.labelname_token_pos: ""
         }
