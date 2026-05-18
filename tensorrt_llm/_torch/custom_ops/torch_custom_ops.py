@@ -1530,7 +1530,7 @@ def _(
 # deep_gemm_gen_tuning_buckets is imported from ..utils
 
 _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
-                                           "0") == "1"
+                                           "1") == "1"
 
 
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
