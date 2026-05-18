@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include <chrono>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
@@ -424,14 +425,42 @@ AgentConnectionManager::AgentConnectionManager(
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
     batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag)
 {
+    auto const startTime = std::chrono::steady_clock::now();
+    auto nextLogTime = startTime + std::chrono::seconds(30);
+    uint64_t pollCount{0};
+    constexpr uint64_t kWaitLogPollPeriod{4096};
     while (!terminateFlag.load())
     {
+        pollCount++;
         if (!mIsRunning)
         {
             return nullptr;
         }
         updateUnhandledNotifications();
-        std::scoped_lock lock(mNotificationMutex);
+        bool shouldLogWait{false};
+        size_t pendingAgentCount{0};
+        size_t pendingNotificationCount{0};
+        long long elapsedMs{0};
+        if (pollCount % kWaitLogPollPeriod == 0)
+        {
+            auto const now = std::chrono::steady_clock::now();
+            if (now >= nextLogTime)
+            {
+                shouldLogWait = true;
+                elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+                nextLogTime = now + std::chrono::seconds(30);
+            }
+        }
+        std::unique_lock lock(mNotificationMutex);
+        if (shouldLogWait)
+        {
+            pendingAgentCount = mUnhandledNotifications.size();
+            for (auto const& [agent, notifs] : mUnhandledNotifications)
+            {
+                (void) agent;
+                pendingNotificationCount += notifs.size();
+            }
+        }
         auto it = mUnhandledNotifications.begin();
         while (it != mUnhandledNotifications.end())
         {
@@ -540,6 +569,16 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
             {
                 it++;
             }
+        }
+        if (shouldLogWait)
+        {
+            lock.unlock();
+            TLLM_LOG_INFO(
+                "[disagg-debug] C++ recvConnectionAndRequestInfo still waiting: localAgent=%s pendingAgents=%zu "
+                "pendingNotifications=%zu pollCount=%llu elapsedMs=%lld terminate=%d running=%d",
+                mAgentName.c_str(), pendingAgentCount, pendingNotificationCount,
+                static_cast<unsigned long long>(pollCount), elapsedMs, static_cast<int>(terminateFlag.load()),
+                static_cast<int>(mIsRunning.load()));
         }
     }
     return nullptr;

@@ -34,6 +34,7 @@
 #include <nixl_types.h>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
@@ -828,8 +829,10 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
 {
 
     auto status = mRawAgent->genNotif(name, syncMessage);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    auto const statusString = nixlEnumStrings::statusStr(status);
+    TLLM_LOG_INFO("[disagg-debug] C++ NIXL genNotif returned: selfAgent=%s remoteAgent=%s status=%s payloadBytes=%zu",
+        mName.c_str(), name.c_str(), statusString.c_str(), syncMessage.size());
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, "genNotif failed with status: %s", statusString.c_str());
 }
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()
@@ -837,8 +840,29 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
 
     nixl_notifs_t notifs;
     auto status = mRawAgent->getNotifs(notifs);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "getNotifs failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    auto const statusString = nixlEnumStrings::statusStr(status);
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, "getNotifs failed with status: %s", statusString.c_str());
+    if (!notifs.empty())
+    {
+        size_t totalCount{0};
+        std::ostringstream sourceCounts;
+        bool firstSource{true};
+        for (auto const& [agent, messages] : notifs)
+        {
+            totalCount += messages.size();
+            if (!firstSource)
+            {
+                sourceCounts << ",";
+            }
+            firstSource = false;
+            sourceCounts << agent << ":" << messages.size();
+        }
+        auto const sourceCountsString = sourceCounts.str();
+        TLLM_LOG_INFO(
+            "[disagg-debug] C++ NIXL getNotifs returned: selfAgent=%s status=%s sources=%zu total=%zu "
+            "sourceCounts={%s}",
+            mName.c_str(), statusString.c_str(), notifs.size(), totalCount, sourceCountsString.c_str());
+    }
 
     return notifs;
 }
