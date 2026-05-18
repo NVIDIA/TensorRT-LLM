@@ -25,6 +25,12 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
 
+REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
+REPLAY_WORK_CACHE_SLOT = 1
+REPLAY_WORK_PNAT = 2
+REPLAY_WORK_CACHE_BUF_IDX = 3
+REPLAY_WORK_ITEM_WIDTH = 4
+
 
 @triton.jit
 def _cu_seqlens_triton_kernel(
@@ -214,6 +220,16 @@ class Mamba2Metadata:
                                          dtype=torch.int32,
                                          device="cuda")
 
+        self.replay_work_items = torch.zeros(
+            max_batch_size,
+            REPLAY_WORK_ITEM_WIDTH,
+            dtype=torch.int32,
+            device="cuda")
+        self.replay_n_writes = torch.zeros(1,
+                                           dtype=torch.int32,
+                                           device="cuda")
+        self.replay_num_decodes = 0
+
         # Pre-allocated buffers.
         self._arange_buffer = torch.arange(max_batch_size + 1,
                                            dtype=torch.int,
@@ -222,6 +238,54 @@ class Mamba2Metadata:
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
+
+    def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
+                                   num_contexts: int):
+        self.replay_num_decodes = 0
+        if not getattr(kv_cache_manager, 'use_replay_state_update', False):
+            return
+        if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
+            return
+
+        replay_metadata = kv_cache_manager.get_replay_state_update_metadata()
+        if replay_metadata is None:
+            return
+        self.replay_n_writes.zero_()
+
+        prev_num_accepted_tokens, cache_buf_idx, replay_step_width, \
+            replay_history_size = replay_metadata
+        num_decodes = batch_size - num_contexts
+        self.replay_num_decodes = num_decodes
+        if num_decodes == 0:
+            return
+
+        position_in_decode_batch = torch.arange(num_decodes,
+                                                dtype=torch.int32,
+                                                device=self.state_indices.device)
+        cache_slot = self.state_indices[num_contexts:batch_size]
+        cache_slot_idx = cache_slot.to(torch.long)
+        pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
+        active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
+
+        writes = (pnat + replay_step_width > replay_history_size)
+        writes_i32 = writes.to(torch.int32)
+        write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
+        n_writes = torch.sum(writes_i32, dim=0,
+                             keepdim=True).to(torch.int32)
+        no_write_offsets = position_in_decode_batch - write_offsets
+        output_offsets = torch.where(writes, write_offsets,
+                                     n_writes + no_write_offsets)
+        output_offsets = output_offsets.to(torch.long)
+
+        work_items = self.replay_work_items[:num_decodes]
+        work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH].scatter_(
+            0, output_offsets, position_in_decode_batch)
+        work_items[:, REPLAY_WORK_CACHE_SLOT].scatter_(0, output_offsets,
+                                                       cache_slot)
+        work_items[:, REPLAY_WORK_PNAT].scatter_(0, output_offsets, pnat)
+        work_items[:, REPLAY_WORK_CACHE_BUF_IDX].scatter_(
+            0, output_offsets, active_cache_buf_idx)
+        self.replay_n_writes.copy_(n_writes)
 
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
@@ -246,6 +310,9 @@ class Mamba2Metadata:
                 self.state_indices_cpu[i] = idx
             self.state_indices[:batch_size].copy_(
                 self.state_indices_cpu[:batch_size], non_blocking=True)
+
+        self._prepare_replay_work_items(kv_cache_manager, batch_size,
+                                        num_contexts)
 
         if num_contexts > 0:
             torch.cumsum(context_lens,

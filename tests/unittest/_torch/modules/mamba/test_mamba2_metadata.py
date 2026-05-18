@@ -21,6 +21,10 @@ import torch
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     Mamba2Metadata,
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
 )
@@ -88,6 +92,61 @@ class TestMamba2Metadata:
         assert metadata.use_initial_states is True
         assert metadata.chunk_indices is not None
         assert metadata.chunk_offsets is not None
+
+    def test_prepare_replay_work_items_write_first(self):
+        class ReplayCacheManager:
+            use_replay_state_update = True
+
+            def __init__(self):
+                self.state_indices = [0, 3, 1, 4, 2]
+                self.prev_num_accepted_tokens = torch.tensor(
+                    [0, 4, 10, 11, 20], dtype=torch.int32, device="cuda")
+                self.cache_buf_idx = torch.tensor([0, 1, 0, 1, 0],
+                                                  dtype=torch.int32,
+                                                  device="cuda")
+
+            def get_state_indices(self, request_ids, is_padding):
+                return self.state_indices[:len(request_ids)]
+
+            def get_replay_state_update_metadata(self):
+                return (self.prev_num_accepted_tokens, self.cache_buf_idx, 6,
+                        16)
+
+        metadata = Mamba2Metadata(max_batch_size=5, chunk_size=8)
+        seq_lens = torch.tensor([2, 7, 7, 7, 7], dtype=torch.int)
+        attn_metadata = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=1,
+            num_ctx_tokens=2,
+            kv_cache_manager=ReplayCacheManager(),
+            request_ids=[10, 11, 12, 13, 14],
+            kv_cache_params=SimpleNamespace(
+                num_cached_tokens_per_seq=torch.tensor([0],
+                                                       dtype=torch.int),
+            ),
+        )
+
+        metadata.prepare(attn_metadata)
+
+        expected = torch.tensor(
+            [
+                [0, 3, 11, 1],
+                [2, 4, 20, 0],
+                [1, 1, 4, 1],
+                [3, 2, 10, 0],
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        actual = metadata.replay_work_items[:4]
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(metadata.replay_n_writes.cpu(),
+                                   torch.tensor([2], dtype=torch.int32))
+        assert actual[0, REPLAY_WORK_POSITION_IN_DECODE_BATCH] == 0
+        assert actual[0, REPLAY_WORK_CACHE_SLOT] == 3
+        assert actual[0, REPLAY_WORK_PNAT] == 11
+        assert actual[0, REPLAY_WORK_CACHE_BUF_IDX] == 1
 
     def test_single_sequence_unaligned(self):
         """Test with a single sequence that doesn't align with chunk size."""
