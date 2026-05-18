@@ -476,110 +476,38 @@ def test_block_reuse_disabled_records_generation_alloc(resource_guard) -> None:
     ]
 
 
-def test_v2_full_commit_partial_source_counts_as_reuse_not_miss(resource_guard) -> None:
-    v1_warmup_request = _create_llm_request(101, list(range(9)))
-    v1_reuse_request = _create_llm_request(102, list(range(10)))
-    v2_warmup_request = _StatsRequest(201, list(range(9)), context_remaining_length=9)
-    v2_reuse_request = _StatsRequest(202, list(range(10)), context_remaining_length=10)
-    v1_manager = resource_guard(
-        _create_v1_manager(gpu_bytes=8 << 20),
-        v1_warmup_request,
-        v1_reuse_request,
-    )
-    v2_manager = resource_guard(
+def test_v2_partial_leaf_reuse_counts_reuse_with_private_copy(resource_guard) -> None:
+    warmup_request = _StatsRequest(201, list(range(9)), context_remaining_length=9)
+    reuse_request = _StatsRequest(202, list(range(10)), context_remaining_length=10)
+    manager = resource_guard(
         _create_manager(gpu_bytes=8 << 20),
-        v2_warmup_request,
-        v2_reuse_request,
+        warmup_request,
+        reuse_request,
     )
 
-    _run_v1_context(v1_manager, v1_warmup_request)
-    v1_manager.free_resources(v1_warmup_request)
-    v1_reuse_stats = _run_v1_context(v1_manager, v1_reuse_request)
+    assert manager.prepare_context(warmup_request)
+    assert manager.resize_context(warmup_request, num_tokens=9)
+    _finish_context(manager, warmup_request)
+    _commit_and_get_stats(manager, _context_batch(warmup_request))
+    manager.free_resources(warmup_request)
 
-    assert v2_manager.prepare_context(v2_warmup_request)
-    assert v2_manager.resize_context(v2_warmup_request, num_tokens=9)
-    _finish_context(v2_manager, v2_warmup_request)
-    _commit_and_get_stats(v2_manager, _context_batch(v2_warmup_request))
-    v2_manager.free_resources(v2_warmup_request)
+    assert manager.prepare_context(reuse_request)
+    assert reuse_request.prepopulated_prompt == (9, TOKENS_PER_BLOCK)
+    assert manager.resize_context(reuse_request, num_tokens=1)
+    _finish_context(manager, reuse_request)
 
-    assert v2_manager.prepare_context(v2_reuse_request)
-    assert v1_reuse_request.prepopulated_prompt_len == 8
-    # V2 preserves the original reuse-tree behavior and commits the full
-    # completed context prefix, while V1 probes up to prompt_len - 1.
-    assert v2_reuse_request.prepopulated_prompt == (9, TOKENS_PER_BLOCK)
-    assert v2_manager.resize_context(v2_reuse_request, num_tokens=1)
-    _finish_context(v2_manager, v2_reuse_request)
-
-    v2_reuse_stats = _commit_and_get_stats(v2_manager, _context_batch(v2_reuse_request))
-    _assert_request_stats(v1_reuse_request, alloc_total=1, alloc_new=1, reused=2, missed=1)
+    reuse_stats = _commit_and_get_stats(manager, _context_batch(reuse_request))
     _assert_iteration_delta(
-        v1_reuse_stats,
-        alloc_total=1,
-        alloc_new=1,
-        reused=2,
-        full_reused=2,
-        missed=1,
-    )
-    _assert_iteration_delta(
-        v2_reuse_stats,
+        reuse_stats,
         alloc_total=1,
         alloc_new=1,
         reused=3,
         full_reused=2,
         partial_reused=1,
+        intra_copy=1,
+        intra_copy_bytes=BYTES_PER_BLOCK,
     )
-    assert v2_reuse_request.kv_cache_perf_metric_calls == [
-        _metric_call(alloc_total=1, alloc_new=1, reused=3),
-    ]
-
-
-def test_v2_unreferenced_partial_leaf_reuse_matches_v1_classification(resource_guard) -> None:
-    v1_warmup_request = _create_llm_request(101, list(range(10)))
-    v1_reuse_request = _create_llm_request(102, list(range(11)))
-    v2_warmup_request = _StatsRequest(201, list(range(10)), context_remaining_length=10)
-    v2_reuse_request = _StatsRequest(202, list(range(11)), context_remaining_length=11)
-    v1_manager = resource_guard(
-        _create_v1_manager(gpu_bytes=8 << 20),
-        v1_warmup_request,
-        v1_reuse_request,
-    )
-    v2_manager = resource_guard(
-        _create_manager(gpu_bytes=8 << 20),
-        v2_warmup_request,
-        v2_reuse_request,
-    )
-
-    _run_v1_context(v1_manager, v1_warmup_request)
-    v1_manager.free_resources(v1_warmup_request)
-    v1_reuse_stats = _run_v1_context(v1_manager, v1_reuse_request)
-
-    assert v2_manager.prepare_context(v2_warmup_request)
-    assert v2_manager.resize_context(v2_warmup_request, num_tokens=10)
-    _finish_context(v2_manager, v2_warmup_request)
-    _commit_and_get_stats(v2_manager, _context_batch(v2_warmup_request))
-    v2_manager.free_resources(v2_warmup_request)
-
-    assert v2_manager.prepare_context(v2_reuse_request)
-    assert v1_reuse_request.prepopulated_prompt_len == 9
-    # Keep V2's full commit boundary intact; this intentionally differs from
-    # V1's prompt_len - 1 lookup boundary.
-    assert v2_reuse_request.prepopulated_prompt == (10, TOKENS_PER_BLOCK)
-    assert v2_manager.resize_context(v2_reuse_request, num_tokens=1)
-    _finish_context(v2_manager, v2_reuse_request)
-
-    v2_reuse_stats = _commit_and_get_stats(v2_manager, _context_batch(v2_reuse_request))
-    _assert_iteration_delta(v1_reuse_stats, reused=3, full_reused=2, partial_reused=1)
-    _assert_iteration_delta(
-        v2_reuse_stats,
-        alloc_total=1,
-        alloc_new=1,
-        reused=3,
-        full_reused=2,
-        partial_reused=1,
-    )
-    _assert_request_stats(v1_reuse_request, reused=3)
-    # V2 lacks V1's in-place reuse optimization for an unreferenced partial leaf.
-    assert v2_reuse_request.kv_cache_perf_metric_calls == [
+    assert reuse_request.kv_cache_perf_metric_calls == [
         _metric_call(alloc_total=1, alloc_new=1, reused=3),
     ]
 
