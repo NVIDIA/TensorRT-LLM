@@ -14,7 +14,7 @@
 
 r"""Job-throughput (agent-sessions/h) Pareto PNG for v4 JSON.
 
-Loaded dynamically by examples/scaffolding/pareto/trace_replay_pareto_aggregate.py
+Loaded dynamically by examples/scaffolding/trace_replay/pareto/trace_replay_pareto_aggregate.py
 (via importlib on a resolved sibling path), so this module is intentionally
 standalone — no relative imports, no package init required.
 
@@ -75,6 +75,53 @@ def _title_suffix(record: Dict[str, Any]) -> str:
     return f"{model}{tp_ep}"
 
 
+def _resolve_trace_label(record: Dict[str, Any]) -> str:
+    """Human-readable trace name(s) for the figure caption.
+
+    Prefers ``trace_meta.trace_dir`` (single trace) or ``trace_meta.traces[]``
+    (mix) basename; falls back to ``aggregator_args.trace_dir`` or
+    ``trace_meta.trace_id`` if neither is set.
+    """
+    tm = record.get("trace_meta") or {}
+    traces = tm.get("traces")
+    if isinstance(traces, list) and traces:
+        parts = []
+        for t in traces:
+            td = t.get("trace_dir") or ""
+            parts.append(Path(td).name if td else (t.get("trace_id") or "?"))
+        return " + ".join(parts)
+    td = tm.get("trace_dir")
+    if td:
+        return Path(td).name
+    aa = record.get("aggregator_args") or {}
+    dirs = aa.get("trace_dir") or []
+    if dirs:
+        return " + ".join(Path(d).name for d in dirs)
+    return tm.get("trace_id") or "(unknown trace)"
+
+
+def _format_point_label(r: Dict[str, Any]) -> str:
+    """Pareto point label using the abbreviations documented in
+    :data:`POINT_LABEL_LEGEND` (rendered as the figure caption).
+    """
+    b = r.get("max_batch_size")
+    n = r.get("total_sessions")
+    c = r.get("concurrency")
+    real_max = r.get("real_cache_hit_max")
+    real_avg = r.get("real_cache_hit_avg")
+    opt = r.get("optimal_cache_hit")
+    rmx = f"{real_max:.3f}" if isinstance(real_max, (int, float)) else "—"
+    rav = f"{real_avg:.3f}" if isinstance(real_avg, (int, float)) else "—"
+    ops = f"{opt:.3f}" if isinstance(opt, (int, float)) else "—"
+    return f"B={b} N={n} C={c}\nR_max={rmx}  R_avg={rav}  O={ops}"
+
+
+POINT_LABEL_LEGEND = (
+    "B = max_batch_size    N = total_sessions    C = concurrency\n"
+    "R_max / R_avg = real_cache_hit per session (max / mean across N)    "
+    "O = optimal_cache_hit (offline upper bound)")
+
+
 def _tp_size(record: Dict[str, Any]) -> Optional[int]:
     naming = record.get("artifact_naming", {}) or {}
     tp = naming.get("tensor_parallel_size")
@@ -124,15 +171,13 @@ def write_job_pareto_png_from_json_file(
 
     xs = [x for _, x, _ in usable]
     ys = [y for _, _, y in usable]
-    labels = [
-        (f"step={r.get('ladder_step')} B={r.get('max_batch_size')} C={r.get('concurrency')}")
-        for r, _, _ in usable
-    ]
+    labels = [_format_point_label(r) for r, _, _ in usable]
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
     ax.scatter(xs, ys, color="tab:purple", s=64, zorder=3)
     for x, y, lab in zip(xs, ys, labels):
-        ax.annotate(lab, (x, y), xytext=(5, 5), textcoords="offset points", fontsize=8)
+        ax.annotate(lab, (x, y), xytext=(5, 5), textcoords="offset points",
+                    fontsize=8, annotation_clip=False)
 
     frontier = _pareto_frontier_upper_right(list(zip(xs, ys)))
     if len(frontier) >= 2:
@@ -157,19 +202,25 @@ def write_job_pareto_png_from_json_file(
     ax.set_xlabel("sessions/h/user = 3600 / SD")
     ax.set_ylabel("sessions/h/gpu = 3600 * N / (WC * TP)")
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
+    # axes auto-scale: don't force zero so small ladders fill the panel
 
+    # Caption directly below the plot: per-point label legend + the trace
+    # name in one text block so the caption area stays compact.
+    fig.subplots_adjust(bottom=0.18)
+    caption = (
+        f"{POINT_LABEL_LEGEND}\n"
+        f"Trace: {_resolve_trace_label(record)}")
     if figure_caption:
-        fig.subplots_adjust(bottom=0.18)
-        fig.text(0.5, 0.02, figure_caption, ha="center", fontsize=8, wrap=True)
+        caption = f"{caption}\n{figure_caption}"
+    fig.text(0.5, 0.04, caption, ha="center", fontsize=8,
+             style="italic", wrap=True)
 
     if png_path is None:
         png_path = output_json.with_name(output_json.stem + "_job_pareto.png")
     else:
         png_path = Path(png_path)
 
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=150)
+    # fig.tight_layout() removed: would override explicit subplots_adjust
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return png_path

@@ -15,7 +15,7 @@ Two scripts, two responsibilities:
 - `trace_replay_pareto_aggregate.py`: pure offline aggregator. Reads the N
   step JSONs produced by the client (one per ladder step), assembles them
   into a `trace_replay_pareto_frontier.v4` combined report, then delegates
-  to the plotting helpers in `../tracing/` to write the two Pareto PNGs.
+  to the plotting helpers in `../plots/` to write the two Pareto PNGs.
 
 The server lifecycle (start `trtllm-serve` with a step-specific
 `max_batch_size`, poll `/health`, stop it, wait for port release) lives in
@@ -28,5 +28,5 @@ at the rysun workspace root for the reference driver.
 Companion package: `../benchmarks/` — the shape of these scripts mirrors
 `benchmarks/{agent,chat}_benchmark.py` (external server + `AsyncOpenAI` +
 `TRTOpenaiWorker`). The older in-process `LLM` API variant at
-`../tracing/run_trace_replay_pareto_frontier.py` remains untouched and is
+`../plots/run_trace_replay_pareto_frontier.py` remains untouched and is
 independent of this package.

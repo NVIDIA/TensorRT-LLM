@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import random
+import time
 import uuid
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -126,6 +127,8 @@ class ReplayGenerationStats:
         usage_prompt_tokens: Optional[int] = None,
         request_id: Optional[str] = None,
         branch_path: Optional[Tuple[int, ...]] = None,
+        client_request_start_s: Optional[float] = None,
+        client_request_end_s: Optional[float] = None,
     ) -> None:
         self._entries.append(
             {
@@ -141,6 +144,8 @@ class ReplayGenerationStats:
                 "trace_index": self.trace_index,
                 "request_id": request_id,
                 "branch_path": list(branch_path) if branch_path is not None else [],
+                "client_request_start_s": client_request_start_s,
+                "client_request_end_s": client_request_end_s,
             }
         )
 
@@ -650,7 +655,9 @@ class QueueExecutor:
                 max_tokens=completion_tokens,
                 ignore_eos=True,
             )
+            client_request_start_s = time.perf_counter()
             status = await self.worker.run_task(gen_task)
+            client_request_end_s = time.perf_counter()
             if status != TaskStatus.SUCCESS:
                 raise RuntimeError(f"GenerationTask failed with status {status}")
 
@@ -691,6 +698,8 @@ class QueueExecutor:
                     usage_prompt_tokens=gen_task.usage_prompt_tokens,
                     request_id=gen_task.request_id,
                     branch_path=self._branch_path,
+                    client_request_start_s=client_request_start_s,
+                    client_request_end_s=client_request_end_s,
                 )
             self._store_segment(conv_id, message_index, content_tokens)
 

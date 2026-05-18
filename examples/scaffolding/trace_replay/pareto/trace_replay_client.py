@@ -38,7 +38,7 @@ not here.
 
 Example::
 
-    python examples/scaffolding/pareto/trace_replay_client.py \
+    python examples/scaffolding/trace_replay/pareto/trace_replay_client.py \
         --base_url http://127.0.0.1:8000/v1 \
         --model /path/to/Qwen3-235B-A22B \
         --trace_dir .../traces/swebench/django__django-14787 \
@@ -114,31 +114,48 @@ from tensorrt_llm.scaffolding.task import GenerationTask, TaskStatus
 STEP_SCHEMA = "trace_replay_pareto_frontier.step.v4"
 
 
-def _collect_tpot_seconds(
-    stats_list: List[ReplayGenerationStats],
+def _entry_tpot_seconds(entry: Dict[str, Any]) -> Optional[float]:
+    """Return one per-request TPOT sample, or ``None`` when unavailable."""
+    lat = entry.get("latency_s")
+    ttft = entry.get("ttft_s")
+    out_len = entry.get("usage_completion_tokens")
+    if out_len is None:
+        out_len = entry.get("replay_output_token_len")
+    if lat is None or ttft is None or out_len is None:
+        return None
+    if out_len <= 1:
+        return None
+    tpot = (float(lat) - float(ttft)) / (int(out_len) - 1)
+    if tpot <= 0:
+        return None
+    return tpot
+
+
+def _collect_tpot_seconds_from_entries(
+    entries: List[Dict[str, Any]],
 ) -> List[float]:
-    """Flatten per-LLM-call entries into the TPOT list SemiAnalysis uses.
+    """Collect per-LLM-call TPOT samples from already-flattened rows.
 
     Per request: ``tpot = (latency - ttft) / (output_len - 1)``. Entries
     with ``output_len <= 1`` or missing timing are skipped — matching the
     ``output_len > 1`` guard in ``benchmark_serving.py``.
     """
     out: List[float] = []
-    for s in stats_list:
-        for entry in s.entries:
-            lat = entry.get("latency_s")
-            ttft = entry.get("ttft_s")
-            out_len = entry.get("usage_completion_tokens")
-            if out_len is None:
-                out_len = entry.get("replay_output_token_len")
-            if lat is None or ttft is None or out_len is None:
-                continue
-            if out_len <= 1:
-                continue
-            tpot = (float(lat) - float(ttft)) / (int(out_len) - 1)
-            if tpot > 0:
-                out.append(tpot)
+    for entry in entries:
+        tpot = _entry_tpot_seconds(entry)
+        if tpot is not None:
+            out.append(tpot)
     return out
+
+
+def _collect_tpot_seconds(
+    stats_list: List[ReplayGenerationStats],
+) -> List[float]:
+    """Flatten per-LLM-call entries into the TPOT list SemiAnalysis uses."""
+    entries: List[Dict[str, Any]] = []
+    for s in stats_list:
+        entries.extend(s.entries)
+    return _collect_tpot_seconds_from_entries(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -475,15 +492,23 @@ def _random_token_ids(length: int, rng: Optional[random.Random] = None) -> List[
 
 def _extract_trace_system_segments(
     trace: ExecutionTrace,
-) -> List[Tuple[int, int]]:
-    """Return ``(conv_id, token_count)`` for every system-role message.
+) -> List[Tuple[str, int, int]]:
+    """Return ``(cache_key, conv_id, token_count)`` for every system-role message.
+
+    ``cache_key`` mirrors the key scheme used by
+    :class:`tensorrt_llm.scaffolding.replay.QueueExecutor` at
+    ``replay.py :: _handle_message``: ``event.system_prompt_id`` when present,
+    otherwise the legacy fallback ``f"conv:{conv_id}"``. Keeping this in
+    lock-step with the ReplayEngine is what guarantees warmup-written
+    blocks are hit by the measurement burst (the cache is shared by str
+    key, not int conv_id).
 
     SWE-bench traces have a single ``conv_id == 0`` system event, but we
     iterate so any future multi-conversation trace is handled without
     special-casing. Events without a usable token count (pre-tokenization
     or non-``message`` types) are skipped.
     """
-    out: List[Tuple[int, int]] = []
+    out: List[Tuple[str, int, int]] = []
     ev: TraceEvent
     for ev in trace.events:
         if ev.event_type != "message":
@@ -493,7 +518,9 @@ def _extract_trace_system_segments(
         tok = ev.tokens
         if tok is None or tok <= 0:
             continue
-        out.append((int(ev.conversation_id or 0), int(tok)))
+        conv_id = int(ev.conversation_id or 0)
+        cache_key = ev.system_prompt_id or f"conv:{conv_id}"
+        out.append((cache_key, conv_id, int(tok)))
     return out
 
 
@@ -567,13 +594,13 @@ async def _one_session(
     concurrency: int,
     max_batch_size: int,
     ladder_step: int,
-    system_token_cache: Optional[Dict[int, List[int]]] = None,
+    system_token_cache: Optional[Dict[str, List[int]]] = None,
     rng_factory: Optional[RngFactory] = None,
     drop_path_stats: Optional[DropPathStats] = None,
     retention_probe_stats: Optional[RetentionProbeStats] = None,
     arrival_delay_s: float = 0.0,
     label_prefix: str = "",
-) -> Tuple[float, ReplayGenerationStats]:
+) -> Tuple[float, ReplayGenerationStats, float, float]:
     label = (
         f"{label_prefix}[step={ladder_step} N={total_sessions} C={concurrency} B={max_batch_size}] "
         f"session {session_index + 1}/{total_sessions}"
@@ -604,6 +631,7 @@ async def _one_session(
             trace_index=trace_index,
         )
         t0 = time.perf_counter()
+        replay_start_s = t0
         await ReplayEngine(
             worker,
             generation_stats=stats,
@@ -612,9 +640,10 @@ async def _one_session(
             drop_path_stats=drop_path_stats,
             retention_probe_stats=retention_probe_stats,
         ).launch_trace(trace)
-        elapsed = time.perf_counter() - t0
+        replay_end_s = time.perf_counter()
+        elapsed = replay_end_s - t0
         print(f"{label}: replay done in {elapsed:.3f}s", flush=True)
-        return elapsed, stats
+        return elapsed, stats, replay_start_s, replay_end_s
 
 
 # ---------------------------------------------------------------------------
@@ -625,8 +654,9 @@ async def _one_session(
 def compute_run_row(
     *,
     traces: List[ExecutionTrace],
-    results: List[Tuple[float, ReplayGenerationStats]],
+    results: List[Tuple[float, ReplayGenerationStats, float, float]],
     wall_s: float,
+    wall_start_s: float,
     total_sessions: int,
     concurrency: int,
     max_batch_size: int,
@@ -636,13 +666,18 @@ def compute_run_row(
 ) -> Dict[str, Any]:
     """Build one ``runs[]`` row from successful per-session results.
 
+    The headline throughput and interactivity metrics use the refill-sustained
+    window: start at the C+1 admission, end at the first completion after the
+    final admission, then keep only generation requests fully contained in that
+    interval. Whole-burst metrics are retained under ``full_burst_*`` fields for
+    diagnostics. When ``total_sessions <= concurrency`` (no refill phase ever
+    occurs) the window is invalid and the headline steady-state fields are
+    ``None``; ``full_burst_*`` still reflects the whole burst.
+
     The three load dimensions (``total_sessions``, ``concurrency``,
     ``max_batch_size``) are recorded independently so plot helpers can
     distinguish a step that stacked more total work at the same in-flight
-    concurrency from one that raised the concurrency itself. Field names
-    and formulas otherwise match ``trace_replay_pareto_frontier.v3``
-    (produced by the older in-process script), so existing plot helpers
-    keep working unchanged.
+    concurrency from one that raised the concurrency itself.
 
     With multiple traces, sessions are assigned round-robin
     (``traces[i % len(traces)]``); the trace-metadata-derived totals sum
@@ -651,6 +686,10 @@ def compute_run_row(
     """
     durations = [r[0] for r in results]
     stats_list = [r[1] for r in results]
+    session_start_s = [r[2] for r in results]
+    session_end_s = [r[3] for r in results]
+    session_start_offset_s = [t - wall_start_s for t in session_start_s]
+    session_end_offset_s = [t - wall_start_s for t in session_end_s]
 
     tokens_per_trace_list = [count_assistant_completion_tokens(t.events) for t in traces]
     total_out_tokens_trace_metadata = float(
@@ -677,6 +716,92 @@ def compute_run_row(
     for s in stats_list:
         detail_all_entries.extend(s.entries)
 
+    # Refill-sustained ("steady-state") window. Sessions are ordered by their
+    # actual admission timestamp (post-semaphore, post-arrival-jitter). The
+    # window opens at the (C+1)-th admission — the first refill that can only
+    # happen once one of the initial C sessions has completed — and closes at
+    # the first session_end strictly after the last admission. Only LLM-call
+    # entries whose [client_request_start_s, client_request_end_s] fits fully
+    # inside the window participate in the steady-state aggregates. When
+    # ``total_sessions <= concurrency`` no refill ever happens, the window is
+    # invalid, and headline steady-state fields fall through as None.
+    admission_order = sorted(
+        range(len(results)),
+        key=lambda i: (session_start_s[i], i),
+    )
+    steady_start_s: Optional[float] = None
+    steady_end_s: Optional[float] = None
+    steady_start_session_index: Optional[int] = None
+    steady_end_session_index: Optional[int] = None
+    last_admission_session_index: Optional[int] = None
+    last_admission_s: Optional[float] = None
+    if total_sessions > concurrency and len(admission_order) > concurrency:
+        steady_start_session_index = admission_order[concurrency]
+        steady_start_s = session_start_s[steady_start_session_index]
+        last_admission_session_index = admission_order[-1]
+        last_admission_s = session_start_s[last_admission_session_index]
+        end_candidates = [
+            (session_end_s[i], i)
+            for i in range(len(results))
+            if session_end_s[i] > last_admission_s
+        ]
+        if end_candidates:
+            steady_end_s, steady_end_session_index = min(end_candidates)
+
+    steady_window_valid = (
+        steady_start_s is not None
+        and steady_end_s is not None
+        and steady_end_s > steady_start_s
+    )
+    steady_start_offset_s = (
+        steady_start_s - wall_start_s if steady_start_s is not None else None
+    )
+    steady_end_offset_s = (
+        steady_end_s - wall_start_s if steady_end_s is not None else None
+    )
+    steady_window_s = (
+        steady_end_s - steady_start_s
+        if steady_window_valid and steady_start_s is not None and steady_end_s is not None
+        else None
+    )
+    steady_entries: List[Dict[str, Any]] = []
+    for entry in detail_all_entries:
+        # Replace absolute perf_counter timestamps with wall-relative offsets
+        # so the JSON is portable across hosts; entries written by tekit
+        # versions that pre-date the steady-state feature simply carry None
+        # offsets and never join the steady pool.
+        req_start = entry.pop("client_request_start_s", None)
+        req_end = entry.pop("client_request_end_s", None)
+        entry["client_request_start_offset_s"] = (
+            float(req_start) - wall_start_s if req_start is not None else None
+        )
+        entry["client_request_end_offset_s"] = (
+            float(req_end) - wall_start_s if req_end is not None else None
+        )
+        included = (
+            steady_window_valid
+            and req_start is not None
+            and req_end is not None
+            and steady_start_s is not None
+            and steady_end_s is not None
+            and float(req_start) >= steady_start_s
+            and float(req_end) <= steady_end_s
+        )
+        entry["steady_state_included"] = bool(included)
+        if included:
+            steady_entries.append(entry)
+
+    total_out_tokens_steady_state = float(
+        sum(
+            int(
+                entry.get("usage_completion_tokens")
+                if entry.get("usage_completion_tokens") is not None
+                else (entry.get("replay_output_token_len") or 0)
+            )
+            for entry in steady_entries
+        )
+    )
+
     tp_sizes = [
         per_session_replay_output[i] / durations[i]
         for i in range(len(durations))
@@ -684,12 +809,26 @@ def compute_run_row(
     ]
 
     # Per-request TPOT → intvty, matching SemiAnalysis's InferenceMAX
-    # ``benchmark_serving.py`` (skip-on-``output_len<=1`` included). The
-    # per-request sample count is N×R when every call succeeded with
-    # ``output_len > 1``, which gives much tighter percentile bands than
-    # the N per-session numbers below.
+    # ``benchmark_serving.py`` (skip-on-``output_len<=1`` included). Headline
+    # TPOT/intvty uses only requests fully contained in the steady-state
+    # window; full-burst samples stay available under ``full_burst_*``.
     tpot_seconds = _collect_tpot_seconds(stats_list)
     tpot_ms_sorted = sorted(t * 1000.0 for t in tpot_seconds)
+    steady_tpot_seconds = _collect_tpot_seconds_from_entries(steady_entries)
+    steady_tpot_ms_sorted = sorted(t * 1000.0 for t in steady_tpot_seconds)
+
+    output_tps_aggregate_full_burst = (
+        total_out_tokens_replay_actual / wall_s if wall_s > 0 else None
+    )
+    output_tps_aggregate_steady_state = (
+        total_out_tokens_steady_state / steady_window_s
+        if steady_window_s is not None and steady_window_s > 0
+        else None
+    )
+    # Headline points at steady-state when a refill window exists. Saturation
+    # (N <= C) sweeps therefore see ``output_tps_aggregate is None``; consult
+    # ``output_tps_aggregate_full_burst`` for those configurations.
+    output_tps_aggregate = output_tps_aggregate_steady_state
 
     row: Dict[str, Any] = {
         "ladder_index": ladder_index,
@@ -701,6 +840,25 @@ def compute_run_row(
         "error": None,
         "error_traceback": None,
         "wall_clock_s": wall_s,
+        "steady_state_window": {
+            "valid": steady_window_valid,
+            "start_offset_s": steady_start_offset_s,
+            "end_offset_s": steady_end_offset_s,
+            "duration_s": steady_window_s,
+            "start_admission_rank": concurrency + 1 if steady_window_valid else None,
+            "start_session_index": steady_start_session_index,
+            "last_admission_session_index": last_admission_session_index,
+            "last_admission_offset_s": (
+                last_admission_s - wall_start_s if last_admission_s is not None else None
+            ),
+            "end_session_index": steady_end_session_index,
+            "end_reason": (
+                "first_completion_after_last_admission"
+                if steady_window_valid
+                else "no_refill_phase"
+            ),
+            "included_generation_count": len(steady_entries),
+        },
         # From trace file ``completion_tokens`` (original recording).
         "assistant_output_tokens_per_trace": tokens_per_trace_trace_metadata,
         "total_output_tokens_trace_metadata": total_out_tokens_trace_metadata,
@@ -714,8 +872,11 @@ def compute_run_row(
             statistics.mean(per_session_replay_output) if per_session_replay_output else None
         ),
         "total_output_tokens_replay_actual": total_out_tokens_replay_actual,
+        "total_output_tokens_steady_state": total_out_tokens_steady_state,
         "replay_assistant_generations_detail": detail_all_entries,
         "session_duration_s": durations,
+        "session_start_offset_s": session_start_offset_s,
+        "session_end_offset_s": session_end_offset_s,
         "session_duration_min_s": min(durations) if durations else None,
         "session_duration_max_s": max(durations) if durations else None,
         "session_duration_sum_s": sum(durations) if durations else None,
@@ -734,7 +895,9 @@ def compute_run_row(
         "mean_tps_per_user": statistics.mean(tp_sizes) if tp_sizes else None,
         "min_tps_per_user": min(tp_sizes) if tp_sizes else None,
         "max_tps_per_user": max(tp_sizes) if tp_sizes else None,
-        "output_tps_aggregate": (total_out_tokens_replay_actual / wall_s) if wall_s > 0 else None,
+        "output_tps_aggregate": output_tps_aggregate,
+        "output_tps_aggregate_steady_state": output_tps_aggregate_steady_state,
+        "output_tps_aggregate_full_burst": output_tps_aggregate_full_burst,
         "output_tokens_per_wall_s_per_session_mean": (
             (total_out_tokens_replay_actual / wall_s / total_sessions)
             if wall_s > 0 and total_sessions
@@ -750,6 +913,16 @@ def compute_run_row(
     tp = int(tensor_parallel_size or 0)
     agg = row["output_tps_aggregate"]
     row["output_tps_per_gpu"] = (agg / tp) if (agg is not None and tp > 0) else None
+    row["output_tps_per_gpu_steady_state"] = (
+        output_tps_aggregate_steady_state / tp
+        if output_tps_aggregate_steady_state is not None and tp > 0
+        else None
+    )
+    row["output_tps_per_gpu_full_burst"] = (
+        output_tps_aggregate_full_burst / tp
+        if output_tps_aggregate_full_burst is not None and tp > 0
+        else None
+    )
 
     # InferenceMAX-aligned per-request summary. Field names mirror
     # SemiAnalysis's ``utils/process_result.py`` (``median_tpot_ms``,
@@ -761,6 +934,11 @@ def compute_run_row(
             return None
         return 1000.0 / v
 
+    # Headline (unsuffixed) tpot fields point at the steady-state pool when a
+    # refill window exists; ``full_burst_*`` preserves whole-burst diagnostics.
+    full_burst_tpot_ms_sorted = tpot_ms_sorted
+    tpot_ms_sorted = steady_tpot_ms_sorted
+
     tpot_count = len(tpot_ms_sorted)
     median_tpot_ms = statistics.median(tpot_ms_sorted) if tpot_ms_sorted else None
     mean_tpot_ms = statistics.mean(tpot_ms_sorted) if tpot_ms_sorted else None
@@ -770,6 +948,18 @@ def compute_run_row(
     p1_tpot_ms = _percentile_sorted(tpot_ms_sorted, 0.01)
     min_tpot_ms = tpot_ms_sorted[0] if tpot_ms_sorted else None
     max_tpot_ms = tpot_ms_sorted[-1] if tpot_ms_sorted else None
+
+    full_burst_tpot_count = len(full_burst_tpot_ms_sorted)
+    full_burst_median_tpot_ms = (
+        statistics.median(full_burst_tpot_ms_sorted) if full_burst_tpot_ms_sorted else None
+    )
+    full_burst_mean_tpot_ms = (
+        statistics.mean(full_burst_tpot_ms_sorted) if full_burst_tpot_ms_sorted else None
+    )
+    full_burst_p90_tpot_ms = _percentile_sorted(full_burst_tpot_ms_sorted, 0.90)
+    full_burst_p99_tpot_ms = _percentile_sorted(full_burst_tpot_ms_sorted, 0.99)
+    full_burst_p99_9_tpot_ms = _percentile_sorted(full_burst_tpot_ms_sorted, 0.999)
+
     row.update(
         {
             "tpot_ms_count": tpot_count,
@@ -792,6 +982,28 @@ def compute_run_row(
             "fastest_intvty": _intvty_from_tpot_ms(min_tpot_ms),
             "slowest_intvty": _intvty_from_tpot_ms(max_tpot_ms),
             "p1_intvty_from_tpot": _intvty_from_tpot_ms(p1_tpot_ms),
+            "steady_state_tpot_ms_count": tpot_count,
+            "steady_state_median_tpot_ms": median_tpot_ms,
+            "steady_state_mean_tpot_ms": mean_tpot_ms,
+            "steady_state_p90_tpot_ms": p90_tpot_ms,
+            "steady_state_p99_tpot_ms": p99_tpot_ms,
+            "steady_state_p99_9_tpot_ms": p99_9_tpot_ms,
+            "steady_state_median_intvty": _intvty_from_tpot_ms(median_tpot_ms),
+            "steady_state_mean_intvty": _intvty_from_tpot_ms(mean_tpot_ms),
+            "steady_state_p90_intvty": _intvty_from_tpot_ms(p90_tpot_ms),
+            "steady_state_p99_intvty": _intvty_from_tpot_ms(p99_tpot_ms),
+            "steady_state_p99_9_intvty": _intvty_from_tpot_ms(p99_9_tpot_ms),
+            "full_burst_tpot_ms_count": full_burst_tpot_count,
+            "full_burst_median_tpot_ms": full_burst_median_tpot_ms,
+            "full_burst_mean_tpot_ms": full_burst_mean_tpot_ms,
+            "full_burst_p90_tpot_ms": full_burst_p90_tpot_ms,
+            "full_burst_p99_tpot_ms": full_burst_p99_tpot_ms,
+            "full_burst_p99_9_tpot_ms": full_burst_p99_9_tpot_ms,
+            "full_burst_median_intvty": _intvty_from_tpot_ms(full_burst_median_tpot_ms),
+            "full_burst_mean_intvty": _intvty_from_tpot_ms(full_burst_mean_tpot_ms),
+            "full_burst_p90_intvty": _intvty_from_tpot_ms(full_burst_p90_tpot_ms),
+            "full_burst_p99_intvty": _intvty_from_tpot_ms(full_burst_p99_tpot_ms),
+            "full_burst_p99_9_intvty": _intvty_from_tpot_ms(full_burst_p99_9_tpot_ms),
         }
     )
 
@@ -1006,7 +1218,7 @@ async def run_client(args: argparse.Namespace) -> int:
     # global ``Dict[int, List[int]]`` would let one trace overwrite another
     # trace's entry for ``conv_id == 0``. One dict per trace mirrors the
     # per-trace structure of the server's prefix block tree.
-    trace_system_token_caches: List[Dict[int, List[int]]] = [{} for _ in traces]
+    trace_system_token_caches: List[Dict[str, List[int]]] = [{} for _ in traces]
 
     # When ``--pass_seed_namespace`` is non-empty, every per-session and
     # per-system-prefix RNG is seeded by SHA-256 of (namespace, ...keys).
@@ -1046,13 +1258,13 @@ async def run_client(args: argparse.Namespace) -> int:
     # reproduces the historical cold-cache behaviour only on the server
     # side (client-side cross-session sharing is always on).
     for ti, trace in enumerate(traces):
-        for conv_id, tok_count in _extract_trace_system_segments(trace):
-            if conv_id not in trace_system_token_caches[ti]:
+        for cache_key, _conv_id, tok_count in _extract_trace_system_segments(trace):
+            if cache_key not in trace_system_token_caches[ti]:
                 if deterministic_replay:
-                    sys_rng = _build_seeded_rng(("system", pass_seed_namespace, ti, conv_id))
-                    trace_system_token_caches[ti][conv_id] = _random_token_ids(tok_count, sys_rng)
+                    sys_rng = _build_seeded_rng(("system", pass_seed_namespace, ti, cache_key))
+                    trace_system_token_caches[ti][cache_key] = _random_token_ids(tok_count, sys_rng)
                 else:
-                    trace_system_token_caches[ti][conv_id] = _random_token_ids(tok_count)
+                    trace_system_token_caches[ti][cache_key] = _random_token_ids(tok_count)
 
     # Number of attention DP ranks. With ``--enable_attention_dp`` the
     # server splits the KV cache per rank (the ``tp_size`` attention layers
@@ -1078,8 +1290,8 @@ async def run_client(args: argparse.Namespace) -> int:
         warmup_sem = asyncio.Semaphore(dp_size * len(traces))
         for dp_rank in range(dp_size):
             for ti, trace in enumerate(traces):
-                for conv_id, _ in _extract_trace_system_segments(trace):
-                    prompt_tokens = trace_system_token_caches[ti][conv_id]
+                for cache_key, conv_id, _ in _extract_trace_system_segments(trace):
+                    prompt_tokens = trace_system_token_caches[ti][cache_key]
                     if not prompt_tokens:
                         continue
                     warmup_tasks.append(
@@ -1123,23 +1335,39 @@ async def run_client(args: argparse.Namespace) -> int:
     # Pre-compute per-session arrival-time offsets. Drawn from
     # Uniform[0, args.arrival_jitter_s) with a seed separate from any
     # other RNG so jitter is reproducible across reruns independently of
-    # e.g. the synthetic-token RNG used by _random_token_ids. When
-    # arrival_jitter_s == 0.0 every delay is 0.0 and _one_session's
-    # `if arrival_delay_s > 0.0` guard short-circuits; preserves the
-    # historical lockstep behaviour bit-for-bit.
+    # e.g. the synthetic-token RNG used by _random_token_ids.
+    #
+    # Two-phase warmup semantics (current): only the first
+    # ``warmup_count = min(concurrency, total_sessions)`` sessions get a
+    # U[0, arrival_jitter_s) staggered offset. The remaining N - warmup_count
+    # "post-warmup" sessions are held out of asyncio entirely until the
+    # warmup window has elapsed (see the gate just before the Phase-2
+    # dispatch below). This makes the in-flight count ramp from 0 -> C
+    # smoothly over ``arrival_jitter_s`` seconds, instead of reaching the
+    # semaphore cap in ``arrival_jitter_s * C/N`` seconds (which is what the
+    # old single-gather behaviour did — the first C order statistics of N
+    # uniform draws would win the semaphore race almost immediately, leaving
+    # the rest of the jitter window with no effect).
+    #
+    # When ``arrival_jitter_s == 0.0`` the warmup delays are all 0 and the
+    # gate is skipped, so all N sessions race for the semaphore at t=0 —
+    # preserving the historical lockstep behaviour bit-for-bit.
     arrival_jitter_s = float(getattr(args, "arrival_jitter_s", 0.0))
     arrival_jitter_seed = int(getattr(args, "arrival_jitter_seed", 0))
+    warmup_count = min(concurrency, total_sessions)
     if arrival_jitter_s > 0.0:
         jitter_rng = random.Random(arrival_jitter_seed)
-        arrival_delays = [jitter_rng.uniform(0.0, arrival_jitter_s) for _ in range(total_sessions)]
+        warmup_delays = [jitter_rng.uniform(0.0, arrival_jitter_s) for _ in range(warmup_count)]
         print(
             f"[arrival_jitter] U[0, {arrival_jitter_s:.3f}s), seed={arrival_jitter_seed}, "
-            f"N={total_sessions} -> max_offset={max(arrival_delays):.3f}s, "
-            f"mean={sum(arrival_delays) / len(arrival_delays):.3f}s",
+            f"warmup={warmup_count} (=concurrency, =total_sessions if N<=C) -> "
+            f"max_offset={max(warmup_delays):.3f}s, "
+            f"mean={sum(warmup_delays) / warmup_count:.3f}s; "
+            f"holding {total_sessions - warmup_count} post-warmup sessions until +{arrival_jitter_s:.3f}s",
             flush=True,
         )
     else:
-        arrival_delays = [0.0] * total_sessions
+        warmup_delays = [0.0] * warmup_count
 
     # Per-session :data:`RngFactory` builders.  When deterministic_replay
     # is on, the factory's seed key is
@@ -1226,34 +1454,88 @@ async def run_client(args: argparse.Namespace) -> int:
         )
 
     semaphore = asyncio.Semaphore(concurrency)
+
+    # Helper used by both dispatch phases below — encapsulates the long
+    # _one_session(...) argument list so the two phases don't duplicate it.
+    # Captures ``semaphore`` and all the per-session collections via closure.
+    def _make_session(i: int, arrival_delay_s: float):
+        return _one_session(
+            worker,
+            traces[i % len(traces)],
+            semaphore=semaphore,
+            session_index=i,
+            trace_index=i % len(traces),
+            total_sessions=total_sessions,
+            concurrency=concurrency,
+            max_batch_size=max_batch_size,
+            ladder_step=ladder_step,
+            system_token_cache=trace_system_token_caches[i % len(traces)],
+            rng_factory=_session_rng_factory(i % len(traces), i),
+            drop_path_stats=per_session_drop_stats[i],
+            retention_probe_stats=per_session_retention_stats[i],
+            arrival_delay_s=arrival_delay_s,
+        )
+
     wall_t0 = time.perf_counter()
     try:
-        results = await asyncio.gather(
-            *[
-                _one_session(
-                    worker,
-                    traces[i % len(traces)],
-                    semaphore=semaphore,
-                    session_index=i,
-                    trace_index=i % len(traces),
-                    total_sessions=total_sessions,
-                    concurrency=concurrency,
-                    max_batch_size=max_batch_size,
-                    ladder_step=ladder_step,
-                    system_token_cache=trace_system_token_caches[i % len(traces)],
-                    rng_factory=_session_rng_factory(i % len(traces), i),
-                    drop_path_stats=per_session_drop_stats[i],
-                    retention_probe_stats=per_session_retention_stats[i],
-                    arrival_delay_s=arrival_delays[i],
-                )
-                for i in range(total_sessions)
-            ]
-        )
+        # Phase 1 (ramp): dispatch the first ``warmup_count`` measurement
+        # sessions. Each sleeps for its own U[0, arrival_jitter_s) offset
+        # before grabbing the semaphore, so in-flight ramps 0 -> C linearly
+        # across the warmup window. (Variable name is ``phase1_tasks`` —
+        # NOT ``warmup_tasks`` — to avoid collision with the pinned-prefill
+        # pre-measurement warmup_tasks list a few hundred lines above.)
+        phase1_tasks = [
+            asyncio.create_task(_make_session(i, warmup_delays[i]))
+            for i in range(warmup_count)
+        ]
+
+        # Warmup gate: hold the remaining sessions out of the event loop
+        # entirely until the last Phase-1 session has woken from its jitter
+        # sleep. Without this gate, a post-warmup session that got pushed in
+        # early could grab a semaphore slot that briefly freed up mid-ramp
+        # (e.g. when a short trace's first session completes before the
+        # last ramp session has even woken), defeating the staggered ramp.
+        #
+        # The gate duration is ``max(warmup_delays)``, not the full
+        # ``arrival_jitter_s``: the last warmup session's delay is the
+        # warmup_count-th order statistic of warmup_count U[0,jitter_s)
+        # draws, with expected value ``warmup_count/(warmup_count+1) *
+        # arrival_jitter_s``, so sleeping the full jitter_s would idle
+        # for an expected ``jitter_s / (warmup_count + 1)`` extra seconds
+        # (= ~59s for C=16/jitter=1000s, ~200s for C=4/jitter=1000s)
+        # during which no new Phase-1 session can arrive (they're all
+        # already past their sleep) and Phase-2 is still gated. Releasing
+        # at the actual max removes that idle window without any racing
+        # risk — asyncio.Semaphore queues FIFO, so post-warmup tasks
+        # created at the same instant the last warmup session wakes are
+        # simply enqueued behind it.
+        if arrival_jitter_s > 0.0 and total_sessions > warmup_count:
+            gate_s = max(warmup_delays)
+            print(
+                f"[arrival_jitter] warmup gate: sleeping {gate_s:.3f}s "
+                f"(= max(warmup_delays); arrival_jitter_s={arrival_jitter_s:.3f}s) "
+                f"before dispatching {total_sessions - warmup_count} post-warmup sessions",
+                flush=True,
+            )
+            await asyncio.sleep(gate_s)
+
+        # Phase 2 (steady-state feed): dispatch the remaining sessions with
+        # zero per-session arrival delay — the gate above IS their arrival
+        # process. They'll queue on the semaphore on entry and be admitted
+        # one-by-one as Phase-1 sessions complete -> closed-loop steady
+        # state from t = arrival_jitter_s onward.
+        phase2_tasks = [
+            asyncio.create_task(_make_session(i, 0.0))
+            for i in range(warmup_count, total_sessions)
+        ]
+
+        results = await asyncio.gather(*phase1_tasks, *phase2_tasks)
         wall_s = time.perf_counter() - wall_t0
         run_row = compute_run_row(
             traces=traces,
             results=results,
             wall_s=wall_s,
+            wall_start_s=wall_t0,
             total_sessions=total_sessions,
             concurrency=concurrency,
             max_batch_size=max_batch_size,

@@ -17,12 +17,12 @@ r"""Merge per-step Pareto JSONs into a combined v4 report + write two PNGs.
 Consumes the single-step JSONs produced by ``trace_replay_client.py``
 (``schema == "trace_replay_pareto_frontier.step.v4"``) and assembles a
 combined ``trace_replay_pareto_frontier.v4`` record compatible with the
-existing plot helpers in ``../tracing/``. Does no network I/O and starts
+existing plot helpers in ``../plots/``. Does no network I/O and starts
 no GPU runtime — purely offline post-processing.
 
 Typical usage (one job, one ladder sweep)::
 
-    python examples/scaffolding/pareto/trace_replay_pareto_aggregate.py \
+    python examples/scaffolding/trace_replay/pareto/trace_replay_pareto_aggregate.py \
         --step_jsons out/step8.json out/step16.json out/step32.json \
         --trace_dir .../traces/swebench/django__django-14787 \
         --output_json out/django__django-14787_Qwen3-235B-A22B_tp4_ep4.json
@@ -38,10 +38,12 @@ from __future__ import annotations
 import argparse
 import glob
 import importlib.util
+import json
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from _common import (
     atomic_write_json,
@@ -61,15 +63,15 @@ EXPECTED_STEP_SCHEMA = "trace_replay_pareto_frontier.step.v4"
 
 
 # ---------------------------------------------------------------------------
-# Plot helper loader: aggregator lives in .../scaffolding/pareto/ and the
-# plot helpers live in the sibling .../scaffolding/tracing/. Load them
-# dynamically so we don't have to turn tracing/ into a package or copy
-# code.
+# Plot helper loader: aggregator lives in .../scaffolding/trace_replay/pareto/
+# and the plot helpers live in the sibling .../scaffolding/trace_replay/plots/.
+# Load them dynamically so we don't have to turn plots/ into a package or
+# copy code.
 # ---------------------------------------------------------------------------
 
 
 def _load_plot_helper(module_stem: str, symbol_name: str) -> Optional[Callable]:
-    module_path = Path(__file__).resolve().parent.parent / "tracing" / f"{module_stem}.py"
+    module_path = Path(__file__).resolve().parent.parent / "plots" / f"{module_stem}.py"
     if not module_path.exists():
         print(
             f"WARNING: plot helper not found at {module_path}; skipping {symbol_name}.",
@@ -207,6 +209,109 @@ def _trace_meta(trace_dirs: List[Path], total_sessions: int) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Cache-hit annotations stamped onto each per-step run row so the plot
+# helpers can label every Pareto point with B / N / C / real / optimal.
+#
+# real_cache_hit_max:
+#   Per step. Engine-measured KV cache block hit rate, taken as the maximum
+#   across that step's sessions of sum(num_reused_blocks) /
+#   (sum(num_reused_blocks) + sum(num_missed_blocks)) over the session's
+#   assistant LLM calls. Source: run_row.replay_assistant_generations_detail
+#   (drained from /perf_metrics and merged by trace_replay_client).
+#
+# optimal_cache_hit:
+#   Per trace (constant across ladder steps). Loaded from the offline
+#   upper-bound *.cachehit.json that lives next to each --trace_dir (the
+#   summary file, NOT *.trace.cachehit.json which is the annotated trace).
+#   When multiple traces are mixed 1:1, the per-step row carries their mean.
+# ---------------------------------------------------------------------------
+
+
+def _compute_per_session_block_hit_rates(
+    detail: Optional[List[Dict[str, Any]]],
+) -> List[float]:
+    """Return one block hit rate per (trace_index, session_index) group.
+
+    Each session's rate = sum(num_reused_blocks) / (sum(num_reused) +
+    sum(num_missed)) over that session's assistant LLM calls.
+    """
+    if not detail:
+        return []
+    per_session: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0])
+    for entry in detail:
+        si = entry.get("session_index")
+        if si is None:
+            continue
+        ti = int(entry.get("trace_index") or 0)
+        per_session[(ti, int(si))][0] += int(entry.get("num_reused_blocks") or 0)
+        per_session[(ti, int(si))][1] += int(entry.get("num_missed_blocks") or 0)
+    rates: List[float] = []
+    for (_ti, _si), (reused, missed) in per_session.items():
+        total = reused + missed
+        if total > 0:
+            rates.append(reused / total)
+    return rates
+
+
+def _compute_real_cache_hit_max(detail: Optional[List[Dict[str, Any]]]) -> Optional[float]:
+    rates = _compute_per_session_block_hit_rates(detail)
+    return max(rates) if rates else None
+
+
+def _compute_real_cache_hit_avg(detail: Optional[List[Dict[str, Any]]]) -> Optional[float]:
+    """Plain mean across sessions of per-session block hit rates.
+
+    Each session is weighted equally (averaged over the N dimension);
+    sessions with no cacheable blocks are skipped, matching _max.
+    """
+    rates = _compute_per_session_block_hit_rates(detail)
+    return (sum(rates) / len(rates)) if rates else None
+
+
+def _load_optimal_cache_hit_for_dir(trace_dir: Path) -> Optional[float]:
+    """Read <trace_dir>/<stem>.cachehit.json::summary.overall_cache_block_hit_rate.
+
+    Skips the sibling ``*.trace.cachehit.json`` (annotated trace) and any
+    ``*.realcachehit.json`` we may have written next to the trace.
+    """
+    candidates = sorted(trace_dir.glob("*.cachehit.json"))
+    summary_files = [
+        p for p in candidates
+        if not p.name.endswith(".trace.cachehit.json")
+        and not p.name.endswith(".realcachehit.json")
+    ]
+    if len(summary_files) != 1:
+        return None
+    try:
+        with summary_files[0].open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    summary = data.get("summary") or {}
+    val = summary.get("overall_cache_block_hit_rate")
+    return float(val) if isinstance(val, (int, float)) else None
+
+
+def _load_optimal_cache_hit(trace_dirs: List[Path]) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+    """Return (aggregate_optimal, per_trace_details).
+
+    aggregate_optimal = mean of per-trace optimal rates (matches the
+    round-robin 1:1 mix used by the client); None if no trace has a usable
+    *.cachehit.json. per_trace_details preserves the per-trace breakdown
+    for inclusion in the combined record metadata.
+    """
+    per_trace: List[Dict[str, Any]] = []
+    rates: List[float] = []
+    for td in trace_dirs:
+        rate = _load_optimal_cache_hit_for_dir(td)
+        per_trace.append({"trace_dir": str(td), "optimal_cache_hit": rate})
+        if rate is not None:
+            rates.append(rate)
+    aggregate = (sum(rates) / len(rates)) if rates else None
+    return aggregate, per_trace
+
+
+# ---------------------------------------------------------------------------
 # Combined v4 record assembly
 # ---------------------------------------------------------------------------
 
@@ -217,9 +322,13 @@ def _assemble_combined_record(
     step_paths: List[Path],
     step_records: List[Dict[str, Any]],
     trace_meta: Dict[str, Any],
+    trace_dirs: List[Path],
     output_json: Path,
 ) -> Dict[str, Any]:
     first = step_records[0]
+
+    # Per-trace upper-bound hit rate (constant across ladder steps).
+    optimal_cache_hit_aggregate, optimal_cache_hit_per_trace = _load_optimal_cache_hit(trace_dirs)
 
     # Detect OOM: first row with error_kind=="out_of_memory" marks the
     # stop point; subsequent rows that lack a run should be tagged
@@ -231,6 +340,15 @@ def _assemble_combined_record(
 
     for rec in step_records:
         row = dict(rec["run_row"])
+        # Stamp the two cache-hit annotations onto each row so plotters can
+        # label every Pareto point with (B, N, C, real, optimal) without
+        # having to walk the trace dir / step JSON themselves.
+        _detail = row.get("replay_assistant_generations_detail")
+        _per_session_rates = _compute_per_session_block_hit_rates(_detail)
+        row["real_cache_hit_rates_per_session"] = _per_session_rates
+        row["real_cache_hit_max"] = max(_per_session_rates) if _per_session_rates else None
+        row["real_cache_hit_avg"] = (sum(_per_session_rates) / len(_per_session_rates)) if _per_session_rates else None
+        row["optimal_cache_hit"] = optimal_cache_hit_aggregate
         runs.append(row)
         if oom_at_index is None and row.get("error_kind") == "out_of_memory":
             oom_at_index = row.get("ladder_index")
@@ -346,6 +464,25 @@ def _assemble_combined_record(
             "mean_tps_per_user_session_time": "total_output_tokens_replay_actual / sum(session durations)",
         },
         "step_artifacts": [str(p) for p in step_paths],
+        "cache_hit_annotation": {
+            "real_cache_hit_max_definition": (
+                "engine-measured block hit rate, taken as the max across "
+                "the step's sessions of sum(num_reused_blocks) / "
+                "(sum(num_reused_blocks) + sum(num_missed_blocks)) over each "
+                "session's assistant LLM calls"),
+            "real_cache_hit_avg_definition": (
+                "same per-session block hit rate as real_cache_hit_max, "
+                "averaged with equal weight across all sessions (mean over "
+                "the N dimension)"),
+            "optimal_cache_hit_definition": (
+                "upper-bound block hit rate from the offline infinite-cache "
+                "simulator (examples/scaffolding/trace_replay/analysis/"
+                "compute_cache_hit_trace.py), summary.overall_cache_block_hit_rate "
+                "in <trace_dir>/*.cachehit.json; per-step row stamps the mean "
+                "across all configured trace_dirs"),
+            "optimal_cache_hit_aggregate": optimal_cache_hit_aggregate,
+            "optimal_cache_hit_per_trace": optimal_cache_hit_per_trace,
+        },
         "runs": runs,
     }
 
@@ -490,6 +627,7 @@ def main() -> int:
         step_paths=step_paths,
         step_records=step_records,
         trace_meta=trace_meta,
+        trace_dirs=trace_dirs,
         output_json=output_json,
     )
     atomic_write_json(output_json, record)
@@ -548,6 +686,63 @@ def main() -> int:
         except Exception as exc:
             print(
                 f"WARNING: job-throughput Pareto PNG failed: {exc!r}",
+                file=sys.stderr,
+            )
+
+    write_session_hit = _load_plot_helper(
+        "plot_trace_replay_session_hit_pareto",
+        "write_session_hit_pareto_png_from_json_file",
+    )
+    if write_session_hit is not None:
+        try:
+            png = write_session_hit(
+                output_json,
+                figure_caption=None,
+                png_path=None,
+            )
+            if png is not None:
+                print(f"Wrote {png}")
+        except Exception as exc:
+            print(
+                f"WARNING: session-hit PNG failed: {exc!r}",
+                file=sys.stderr,
+            )
+
+    write_session_hit_t = _load_plot_helper(
+        "plot_trace_replay_session_hit_vs_time",
+        "write_session_hit_vs_time_png_from_json_file",
+    )
+    if write_session_hit_t is not None:
+        try:
+            png = write_session_hit_t(
+                output_json,
+                figure_caption=None,
+                png_path=None,
+            )
+            if png is not None:
+                print(f"Wrote {png}")
+        except Exception as exc:
+            print(
+                f"WARNING: session-hit-vs-time PNG failed: {exc!r}",
+                file=sys.stderr,
+            )
+
+    write_per_call = _load_plot_helper(
+        "plot_trace_replay_per_call_hit_curves",
+        "write_per_call_hit_curves_png_from_json_file",
+    )
+    if write_per_call is not None:
+        try:
+            png = write_per_call(
+                output_json,
+                figure_caption=None,
+                png_path=None,
+            )
+            if png is not None:
+                print(f"Wrote {png}")
+        except Exception as exc:
+            print(
+                f"WARNING: per-call hit-curves PNG failed: {exc!r}",
                 file=sys.stderr,
             )
 
