@@ -291,9 +291,7 @@ class Cosmos3CrossAttention(Attention):
     ):
         original_backend = model_config.attention.backend
         if model_config.attention.backend == "TRTLLM":
-            logger.warning(
-                "TRTLLM backend is not supported for Cosmos3CrossAttention. Falling back to VANILLA."
-            )
+            # TRTLLM backend is not supported for Cosmos3CrossAttention
             model_config.attention.backend = "VANILLA"
 
         super().__init__(
