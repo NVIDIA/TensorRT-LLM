@@ -89,7 +89,7 @@ bool isStreamCapturing(cudaStream_t stream, char const* stage)
     TLLM_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, nullptr));
     if (status != cudaStreamCaptureStatusNone)
     {
-        TLLM_LOG_DEBUG("XQA MLA debug action after %s skipped because stream capture status is %d", stage,
+        TLLM_LOG_TRACE("XQA MLA debug action after %s skipped because stream capture status is %d", stage,
             static_cast<int>(status));
         return true;
     }
@@ -104,7 +104,7 @@ void maybeSyncXqaMlaDebug(cudaStream_t stream, char const* stage)
         {
             return;
         }
-        TLLM_LOG_DEBUG("XQA MLA debug sync after %s", stage);
+        TLLM_LOG_TRACE("XQA MLA debug sync after %s", stage);
         TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
         TLLM_CUDA_CHECK(cudaGetLastError());
     }
@@ -113,12 +113,6 @@ void maybeSyncXqaMlaDebug(cudaStream_t stream, char const* stage)
 bool enableXqaMlaNanCheck()
 {
     static bool const enabled = tensorrt_llm::common::getBoolEnv("XQA_MLA_NAN_CHECK");
-    return enabled;
-}
-
-bool enableXqaMlaZeroPartials()
-{
-    static bool const enabled = tensorrt_llm::common::getBoolEnv("XQA_MLA_ZERO_PARTIALS");
     return enabled;
 }
 
@@ -191,7 +185,7 @@ void maybeCheckXqaMlaBf16BufferForInvalid(cudaStream_t stream, void const* outpu
             }
         }
     }
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_TRACE(
         "XQA MLA BF16 buffer NaN/Inf check passed after %s "
         "(tokens=%u heads_to_check=%u head_pitch=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
         "seq_len0=%u tokens_per_page=%u)",
@@ -245,7 +239,7 @@ void maybeCheckXqaMlaFp8QForInvalid(cudaStream_t stream, void const* q, uint32_t
             }
         }
     }
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_TRACE(
         "XQA MLA FP8 Q NaN check passed after %s "
         "(tokens=%u heads_to_check=%u head_pitch=%u head_size=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
         "seq_len0=%u tokens_per_page=%u)",
@@ -351,7 +345,7 @@ void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partial
             }
         }
     }
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_TRACE(
         "XQA MLA partial NaN/Inf check passed after %s "
         "(tokens=%u max_subseq=%u heads_to_check=%u runtime_num_q_heads=%u kernel_num_q_heads=%u "
         "seq_len0=%u tokens_per_page=%u)",
@@ -530,7 +524,7 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
         }
     }
 
-    TLLM_LOG_DEBUG(
+    TLLM_LOG_TRACE(
         "XQA MLA reduce host reference check after %s: max_abs_diff=%g max_rel_diff=%g "
         "expected_at_diff=%g output_at_diff=%g diff_token=%u diff_head=%u diff_col=%u "
         "max_abs_expected=%g max_abs_output=%g max_abs_partial=%g tokens=%u max_subseq=%u "
@@ -964,12 +958,6 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&semaphores);
         appendParam(&partialResults);
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
-        if (enableXqaMlaZeroPartials())
-        {
-            TLLM_LOG_DEBUG("Zeroing XQA MLA partial workspace before main kernel: bytes=%zu partial_results=%p",
-                partialResultBytes, static_cast<void*>(partialResults));
-            TLLM_CUDA_CHECK(cudaMemsetAsync(partialResults, 0, partialResultBytes, stream));
-        }
         uint32_t const inputSeqLen = (xqaParams.multi_query_tokens || xqaParams.isMLA())
             ? static_cast<uint32_t>(xqaParams.generation_input_length)
             : 1U;
