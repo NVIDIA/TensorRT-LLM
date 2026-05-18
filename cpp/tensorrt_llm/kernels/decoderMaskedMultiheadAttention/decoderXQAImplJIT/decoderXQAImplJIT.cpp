@@ -46,7 +46,7 @@ using ::tensorrt_llm::kernels::kXqaMlaMultiBlockMinTilesPerCta;
 using ::tensorrt_llm::kernels::kXqaMlaOutputHeadSize;
 using ::tensorrt_llm::kernels::kXqaMlaTokensPerTile;
 using ::tensorrt_llm::kernels::getXqaMlaCgaXBufSize;
-using ::tensorrt_llm::kernels::getXqaMlaKernelHeadGrpSize;
+using ::tensorrt_llm::kernels::getXqaMlaRuntimeKernelHeadGrpSize;
 using ::tensorrt_llm::kernels::getXqaMlaPartialResultChunks;
 using ::tensorrt_llm::kernels::getXqaMlaPartialResultSize;
 
@@ -663,6 +663,14 @@ void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
     if (supportConfig(xqaParams, true))
     {
         jit::CubinObjKey key = getCubinObjKeyFromXQAParams(xqaParams);
+        int const headGrpSize = xqaParams.num_kv_heads == 0 ? 0 : xqaParams.num_q_heads / xqaParams.num_kv_heads;
+        int const kernelHeadGrpSize = xqaParams.isMLA() ? getXqaMlaRuntimeKernelHeadGrpSize(headGrpSize) : headGrpSize;
+        bool const cacheHit = registryGlobal->getCubin(key) != nullptr;
+        TLLM_LOG_DEBUG(
+            "JIT XQA cubin cache %s: sm=%d is_mla=%d head_size=%d runtime_head_grp=%d kernel_head_grp=%d "
+            "tokens_per_block=%d q_seq_len=%d beam_width=%d",
+            cacheHit ? "hit" : "miss", mSM, xqaParams.isMLA(), xqaParams.head_size, headGrpSize, kernelHeadGrpSize,
+            xqaParams.tokens_per_block, xqaParams.generation_input_length, xqaParams.beam_width);
         registryGlobal->insertCubinIfNotExists(key, &compileEngine, /*initialize=*/true);
     }
 }
@@ -892,7 +900,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     {
         auto const roundUpTo128 = [](size_t value) { return ((value + 127) / 128) * 128; };
         uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
-        uint32_t const kernelMlaHeadGrpSize = getXqaMlaKernelHeadGrpSize(num_q_heads_over_kv);
+        uint32_t const kernelMlaHeadGrpSize = getXqaMlaRuntimeKernelHeadGrpSize(num_q_heads_over_kv);
         auto* scratchBytes = static_cast<std::byte*>(launchParams.scratch);
         size_t const cgaXBufBytes = static_cast<size_t>(getXqaMlaCgaXBufSize(kernelMlaHeadGrpSize)) * multi_block
             * xqaParams.total_num_input_tokens;
