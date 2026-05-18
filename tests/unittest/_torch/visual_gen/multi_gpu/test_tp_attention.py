@@ -64,10 +64,10 @@ def _cleanup():
         dist.destroy_process_group()
 
 
-def _distributed_worker(rank, world_size, test_fn, port):
+def _distributed_worker(rank, world_size, test_fn, port, *args):
     try:
         _init_worker(rank, world_size, port)
-        test_fn(rank, world_size)
+        test_fn(rank, world_size, *args)
     except Exception as e:
         print(f"Rank {rank} failed: {e}")
         raise
@@ -75,13 +75,13 @@ def _distributed_worker(rank, world_size, test_fn, port):
         _cleanup()
 
 
-def _run(world_size: int, test_fn: Callable):
+def _run(world_size: int, test_fn: Callable, *args):
     if not MODULES_AVAILABLE:
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
     port = get_free_port()
-    mp.spawn(_distributed_worker, args=(world_size, test_fn, port), nprocs=world_size, join=True)
+    mp.spawn(_distributed_worker, args=(world_size, test_fn, port, *args), nprocs=world_size, join=True)
 
 
 # =============================================================================
@@ -356,15 +356,13 @@ def _logic_tp_world_size_4(rank, world_size):
     _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=512, num_heads=16)
 
 
-def _logic_tp_ulysses_combined(rank, world_size):
+def _logic_tp_ulysses_combined(rank, world_size, ulysses_size, tp_size):
     """TP + Ulysses combined matches F.sdpa reference on the full sequence.
 
     4 GPUs: tp_size=2, ulysses_size=2.
     Ulysses shards the sequence; TP shards the heads/weights.
     """
-    assert world_size == 4
-    tp_size = 2
-    ulysses_size = 2
+    assert tp_size * ulysses_size == world_size
     device = torch.device(f"cuda:{rank}")
 
     hidden_size = 512
@@ -448,8 +446,22 @@ class TestTPUlyssesCombined:
     """Tests for combined TP + Ulysses parallelism."""
 
     def test_tp_ulysses_combined(self):
-        _run(4, _logic_tp_ulysses_combined)
+        tp_size = 2
+        ulysses_size = 2
+        world = ulysses_size * tp_size
+        _run(world, _logic_tp_ulysses_combined, ulysses_size, tp_size)
 
+    def test_tp_2_ulysses_4(self):
+        tp_size = 2
+        ulysses_size = 4
+        world = ulysses_size * tp_size
+        _run(world, _logic_tp_ulysses_combined, ulysses_size, tp_size)
+
+    def test_tp_4_ulysses_2(self):
+        tp_size = 4
+        ulysses_size = 2
+        world = ulysses_size * tp_size
+        _run(world, _logic_tp_ulysses_combined, ulysses_size, tp_size)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
