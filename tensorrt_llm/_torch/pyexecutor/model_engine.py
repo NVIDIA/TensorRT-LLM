@@ -70,6 +70,7 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .multimodal_budget import MultimodalEncoderBudget
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                KVCacheManagerV2, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -1519,20 +1520,22 @@ class PyTorchModelEngine(ModelEngine):
 
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the
-        loaded model, using the engine's encoder runtime sizes
-        (`encoder_max_batch_size` / `encoder_max_num_tokens`, falling back to
-        the LLM-side `max_batch_size` / `max_num_tokens`).
+        loaded model, using the engine's encoder runtime budget.
 
-        Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
-        by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
-        so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
-        than being hardcoded inside each encoder's ``__init__``.
+        Reads the budget through
+        :class:`tensorrt_llm._torch.pyexecutor.multimodal_budget.MultimodalEncoderBudget`,
+        which encapsulates the encoder-specific knobs (``encoder_max_batch_size``
+        / ``encoder_max_num_tokens``) with their fallback to LLM-side
+        sizes. Encoders opt in by inheriting :class:`MultimodalEncoderMixin`;
+        the engine drives the construction so sizes are consistent with
+        the rest of the dummy-profile flow.
         """
+        budget = MultimodalEncoderBudget.from_llm_args(self.llm_args)
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
-                    max_num_requests=self.encoder_batch_size,
-                    max_num_tokens=self.encoder_max_num_tokens)
+                    max_num_requests=budget.max_items_per_step,
+                    max_num_tokens=budget.max_tokens_per_step)
 
     def _set_up_spec_metadata(
             self,
