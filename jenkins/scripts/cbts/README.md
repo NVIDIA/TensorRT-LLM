@@ -20,7 +20,7 @@ filter chain.
 
 ## Rules
 
-Six rules, registered in `main.py::RULE_CLASSES`:
+Seven rules, registered in `main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
@@ -29,6 +29,7 @@ Six rules, registered in `main.py::RULE_CLASSES`:
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`) |
 | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; outward-facing files force fallback) |
+| `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. `.md`) |
 | `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
 
 See `rules/README.md` for per-rule logic.
@@ -65,6 +66,9 @@ jenkins/scripts/cbts/
 │   ├── waives_rule.py
 │   ├── tests_def_rule.py
 │   ├── test_list_rule.py
+│   ├── auto_deploy_rule.py
+│   ├── visual_gen_rule.py
+│   ├── spec_dec_rule.py
 │   └── out_of_scope_rule.py
 └── tools/
     └── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)

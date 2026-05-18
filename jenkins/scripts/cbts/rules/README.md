@@ -13,6 +13,7 @@ for the overall CBTS architecture.
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**` (non-`.md`), `tensorrt_llm/_torch/auto_deploy/**` (non-`.md`) |
 | `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**` (non-`.md`), `tensorrt_llm/_torch/visual_gen/**` (non-`.md`), `tensorrt_llm/visual_gen/**` (non-`.md`) |
+| `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**` (non-`.md`), `tensorrt_llm/models/{eagle,medusa,redrafter}/**` (non-`.md`), `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**` (non-`.md`), `examples/llm-api/llm_speculative_decoding.py` |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
 
 ## WaivesRule
@@ -183,6 +184,54 @@ Outcomes:
   (fallback).
 - VG source touched but no VG block found anywhere (defensive) →
   `scope=None` (fallback).
+
+## SpecDecRule
+
+Path-only rule. Claims source files under `tensorrt_llm/_torch/speculative/`,
+`tensorrt_llm/models/{eagle,medusa,redrafter}/`,
+`examples/{eagle,medusa,redrafter,draft_target_model,ngram}/`, and the
+single file `examples/llm-api/llm_speculative_decoding.py` (excluding
+`.md`, which `OutOfScopeRule` claims as noop).
+
+Block selection — entry-pattern based only:
+Spec-dec has no `condition.terms.backend` of its own; entries live in
+`backend: pytorch` and `backend: tensorrt` blocks. A block "belongs to
+spec-dec" iff any of its `tests:` entries matches one of the stable
+markers in `_SPEC_ENTRY_PATTERNS`:
+
+- Filename / method-name markers: `test_eagle`, `test_medusa`,
+  `test_redrafter`, `test_ngram`, `test_draft_target_model`,
+  `test_ad_speculative_decoding`, `unittest/_torch/speculative/`,
+  `test_spec_decoding_metrics`, `test_llmapi_speculative_decoding`,
+  `speculative_decoding_bls`, `test_mtp`.
+- MTP parametrize-id markers: `mtp_nextn` (filtered — see below),
+  `_mtp` (covers `throughput_mtp`, `*_mtp1`, `*_mtp3` suffixes).
+
+For each matched block, `block_filters` keeps only the spec-dec entries.
+Non-spec-dec siblings in the same block stay governed by other rules.
+
+`mtp_nextn=0` carve-out: those parametrizations test MTP-disabled
+baseline behavior, not the spec-dec code path. `_entry_is_spec` drops
+the bare `mtp_nextn` signal when the entry also contains
+`mtp_nextn=0`; another spec-dec marker must match for the entry to
+qualify. As of May 2026 all 183 active `mtp_nextn=0` entries lack any
+other marker and are therefore dropped.
+
+No outward fallback needed: the only non-spec-dec eager import of
+spec-dec types is `tensorrt_llm/commands/build.py` pulling
+`SpeculativeDecodingMode` from `tensorrt_llm/models/modeling_utils.py`,
+which lives outside `_SPEC_SRC_PREFIXES` and therefore is never claimed
+by this rule. PRs that touch `modeling_utils.py` naturally fall back to
+baseline.
+
+Outcomes:
+
+- No spec-dec source files in the diff → rule returns `None`.
+- Spec-dec source touched → `scope=specdeconly`; sanity off (spec-dec
+  changes don't affect wheel sanity); perf-sanity follows the matched
+  blocks (True iff any matched block lives in `*_perf_sanity*` yaml).
+- Spec-dec source touched but no spec-dec block found anywhere
+  (defensive) → `scope=None` (fallback).
 
 ## OutOfScopeRule
 
