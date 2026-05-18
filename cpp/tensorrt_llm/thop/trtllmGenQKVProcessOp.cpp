@@ -333,7 +333,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         {
             return buildPagedKvCacheBuffers(kv_cache_block_offsets, host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping, quantMode, layer_idx, batch_size, tokens_per_block, num_kv_heads, head_size,
-                cyclic_attention_window_size, max_attention_window_size, sink_token_length, 0, 0, is_mla_enable,
+                cyclic_attention_window_size, max_attention_window_size, 0, 0, is_mla_enable,
                 qkvElementSize);
         }();
 
@@ -479,7 +479,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
         {
             return buildPagedKvCacheBuffers(kv_cache_block_offsets, host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping, quantMode, layer_idx, batch_size, tokens_per_block, num_kv_heads, head_size,
-                cyclic_attention_window_size, max_attention_window_size, sink_token_length, 0, 0, is_mla_enable,
+                cyclic_attention_window_size, max_attention_window_size, 0, 0, is_mla_enable,
                 qkvElementSize);
         }();
 
@@ -658,7 +658,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         {
             return buildPagedKvCacheBuffers(kv_cache_block_offsets, host_kv_cache_pool_pointers,
                 host_kv_cache_pool_mapping, quantMode, layer_idx, batch_beam, tokens_per_block, num_kv_heads, head_size,
-                cyclic_attention_window_size, max_attention_window_size, sink_token_length, 1, seq_offset, false,
+                cyclic_attention_window_size, max_attention_window_size, 1, seq_offset, false,
                 qkvElementSize);
         }();
 

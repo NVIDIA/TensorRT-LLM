@@ -197,12 +197,11 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     bool const fp8_context_fmha = kv_cache_quant_mode.hasFp8KvCache();
     int32_t const batch_beam = beam_width * num_generations;
 
-    auto kv_cache_buffer
-        = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets, host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping, kv_cache_quant_mode, layer_idx, batch_beam, tokens_per_block, num_kv_heads,
-            head_size, attention_window_size, attention_window_size, 0 /*sink_token_length*/, beam_width, seq_offset,
-            true /*is_mla_enable*/, static_cast<size_t>(fused_q.element_size()))
-              .kvCacheBuffer;
+    auto kv_cache_buffer = tensorrt_llm::torch_ext::buildPagedKvCacheBuffers(kv_cache_block_offsets,
+        host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_cache_quant_mode, layer_idx, batch_beam,
+        tokens_per_block, num_kv_heads, head_size, attention_window_size, attention_window_size, beam_width, seq_offset,
+        true /*is_mla_enable*/, static_cast<size_t>(fused_q.element_size()))
+                               .kvCacheBuffer;
 
     tk::KvCacheDataType cache_type = tk::cacheTypeFromQuantMode(kv_cache_quant_mode);
 

@@ -123,12 +123,11 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
 
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
     int head_size = lora_size + rope_size;
-    KVBlockArray kv_cache_buffer
-        = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets), std::optional(host_kv_cache_pool_pointers),
-            std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode, layer_idx, num_contexts, tokens_per_block,
-            1 /*kv_head_num*/, head_size, attention_window_size, attention_window_size, 0 /*sink_token_length*/,
-            beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
-              .kvCacheBuffer;
+    KVBlockArray kv_cache_buffer = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets),
+        std::optional(host_kv_cache_pool_pointers), std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode,
+        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, head_size, attention_window_size,
+        attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
+                                       .kvCacheBuffer;
 
     float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;
@@ -212,12 +211,11 @@ std::vector<torch::Tensor> loadChunkedKVCacheForMLA(torch::ScalarType out_dtype,
     TORCH_CHECK(cu_ctx_chunked_kv_lens.size(0) >= num_contexts + 1);
     int head_size = lora_size + rope_size;
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
-    KVBlockArray kv_cache_buffer
-        = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets), std::optional(host_kv_cache_pool_pointers),
-            std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode, layer_idx, num_contexts, tokens_per_block,
-            1 /*kv_head_num*/, head_size, attention_window_size, attention_window_size, 0 /*sink_token_length*/,
-            beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
-              .kvCacheBuffer;
+    KVBlockArray kv_cache_buffer = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets),
+        std::optional(host_kv_cache_pool_pointers), std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode,
+        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, head_size, attention_window_size,
+        attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
+                                       .kvCacheBuffer;
 
     float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;
@@ -316,12 +314,11 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
 
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
     int head_size = lora_size + rope_size;
-    KVBlockArray kv_cache_buffer
-        = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets), std::optional(host_kv_cache_pool_pointers),
-            std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode, layer_idx, num_contexts, tokens_per_block,
-            1 /*kv_head_num*/, head_size, attention_window_size, attention_window_size, 0 /*sink_token_length*/,
-            beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(input_dtype))
-              .kvCacheBuffer;
+    KVBlockArray kv_cache_buffer = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets),
+        std::optional(host_kv_cache_pool_pointers), std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode,
+        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, head_size, attention_window_size,
+        attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(input_dtype))
+                                       .kvCacheBuffer;
 
     float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;

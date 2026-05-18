@@ -109,8 +109,8 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
     std::optional<torch::Tensor> const& host_kv_cache_pool_pointers,
     std::optional<torch::Tensor> const& host_kv_cache_pool_mapping, common::QuantMode quantMode, int64_t layer_idx,
     int64_t batch_size, int64_t tokens_per_block, int64_t kv_head_num, int64_t size_per_head,
-    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t sink_token_length,
-    int64_t beam_width, int64_t seq_offset, bool is_mla_enable, size_t elem_size);
+    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t beam_width, int64_t seq_offset,
+    bool is_mla_enable, size_t elem_size);
 
 at::Tensor buildFlashinferTrtllmGenPagedKvCacheBuffers(at::Tensor host_kv_cache_pool_pointers,
     at::Tensor host_kv_cache_pool_mapping, int64_t layer_idx, int64_t num_kv_heads, int64_t tokens_per_block,
