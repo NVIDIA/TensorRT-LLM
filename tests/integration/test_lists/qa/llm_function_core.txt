@@ -555,6 +555,9 @@ accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8_attn_dp]
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_fp8_blockscale[latency]
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[4gpus]
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[8gpus]
+accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_bf16
+accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_fp8
+accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
