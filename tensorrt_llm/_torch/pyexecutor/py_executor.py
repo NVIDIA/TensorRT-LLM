@@ -1471,6 +1471,20 @@ class PyExecutor:
                 f"profile_stop_iters="
                 f"{sorted(self.profile_stop_iters)[:5]})")
 
+        # Reject ``num_steps <= 0``. The HTTP layer already rejects this
+        # via the ``StartProfileRequest`` Pydantic schema, but
+        # programmatic callers (``LLM.start_profile``, env-var-driven
+        # paths, unit tests) bypass that schema. With ``num_steps == 0``,
+        # ``stop_iter`` would equal ``start_iter`` in
+        # ``_apply_profile_start_config`` below, ``profile_step()`` would
+        # discard the stop marker as stale, and the profile window would
+        # run forever until an explicit ``stop_profile()``.
+        if num_steps is not None and num_steps <= 0:
+            raise ValueError(
+                f"start_profile: num_steps must be >= 1 if provided "
+                f"(got num_steps={num_steps!r}). Pass num_steps=None to "
+                "run until an explicit stop_profile() call.")
+
         if activities is None:
             activities = ["CPU", "GPU"]
 
