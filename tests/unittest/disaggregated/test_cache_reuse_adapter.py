@@ -199,6 +199,68 @@ class TestAdapterPerLayerGroup:
 
 
 # ---------------------------------------------------------------------------
+# _create_kv_slice CTX-side over-allocation guard (MTP / spec-decoding).
+# ---------------------------------------------------------------------------
+
+
+def _ctx_overalloc_trim(block_ids, token_range_end, tpb, is_gen_only=False):
+    """Replicate the CTX-side over-allocation guard in _create_kv_slice.
+
+    The KV cache manager may reserve trailing blocks for MTP /
+    speculative-decoding draft positions that hold no useful context
+    state. The receiver computes total_blocks from token_range.end in
+    Sender._build_kv_write_meta, so extra src blocks would violate the
+    protocol invariant ``src.size <= total_blocks`` and cause the
+    Sender to silently drop the response. GEN-side extra blocks are
+    legitimate (draft tokens) and are handled by the receiver's
+    ``block_diff == 1`` branch in transfer.py.
+    """
+    block_ids = np.array(block_ids, dtype=np.int64)
+    if not is_gen_only:
+        ctx_total_blocks = (token_range_end + tpb - 1) // tpb
+        if block_ids.size > ctx_total_blocks:
+            block_ids = block_ids[:ctx_total_blocks]
+    return block_ids
+
+
+class TestCtxOverAllocationTrim:
+    """Regression for DSv4 + MTP=3 disagg KV transfer (1024-token prompt,
+    tpb=128): cache manager allocates 9 blocks but token_range.end=1024
+    only covers 8, so the trailing MTP scratch block must be dropped.
+    """
+
+    TPB = 128
+
+    def test_mtp_extra_block_dropped(self):
+        # prompt_len=1024 → total_blocks=8; manager exposed 9 blocks.
+        out = _ctx_overalloc_trim(list(range(9)), token_range_end=1024, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(8)))
+
+    def test_no_overalloc_unchanged(self):
+        # mtp0 path: block_ids.size == total_blocks → no-op.
+        out = _ctx_overalloc_trim(list(range(8)), token_range_end=1024, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(8)))
+
+    def test_gen_only_skipped(self):
+        # GEN-side extra block is the draft-token block; guard must not fire.
+        out = _ctx_overalloc_trim(
+            list(range(9)), token_range_end=1024, tpb=self.TPB, is_gen_only=True
+        )
+        np.testing.assert_array_equal(out, list(range(9)))
+
+    def test_partial_block_prompt_rounds_up(self):
+        # prompt_len=1025 → ceil → total_blocks=9; nothing to drop.
+        out = _ctx_overalloc_trim(list(range(9)), token_range_end=1025, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(9)))
+
+    def test_chunked_prefill_slice(self):
+        # Chunked prefill: token_range carries a sub-range (end=512).
+        # total_blocks=4, manager exposed 9 blocks → trim to 4.
+        out = _ctx_overalloc_trim(list(range(9)), token_range_end=512, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(4)))
+
+
+# ---------------------------------------------------------------------------
 # _create_kv_slice SWA block trim: window-trim + cache-skip via per-layer cached.
 # ---------------------------------------------------------------------------
 

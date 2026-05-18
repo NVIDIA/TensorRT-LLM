@@ -189,6 +189,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 groups.append(np.array([], dtype=np.int64))
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
+
+            # CTX-only over-allocation guard: the KV cache manager may
+            # reserve trailing blocks for MTP / speculative-decoding draft
+            # positions that hold no useful context state. The receiver
+            # computes total_blocks from token_range.end in
+            # Sender._build_kv_write_meta, so extra src blocks would
+            # violate the protocol invariant `src.size <= total_blocks`
+            # and the Sender would silently drop the response. GEN-side
+            # extra blocks are legitimate (draft tokens) and are handled
+            # by the existing `block_diff == 1` branch in transfer.py.
+            if not is_gen_only and token_range is not None:
+                ctx_total_blocks = (token_range.end + tpb - 1) // tpb
+                if block_ids.size > ctx_total_blocks:
+                    block_ids = block_ids[:ctx_total_blocks]
+
             window_size = lg.sliding_window_size
 
             if window_size is not None:
