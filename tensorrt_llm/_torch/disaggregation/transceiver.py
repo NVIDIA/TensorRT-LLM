@@ -1,5 +1,7 @@
+import os
 import uuid
 from collections import defaultdict
+from datetime import timedelta
 from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, cast
 
@@ -36,6 +38,7 @@ from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -333,6 +336,82 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             c, f, d = self._consensus_outcome(to_process, c, f, d, pp_allgather, True)
         return c, f, d, timed_out
 
+    @staticmethod
+    def _clock_offset_seconds() -> float:
+        offset = LlmRequest.global_steady_clock_offset
+        if offset is None:
+            return 0.0
+        if isinstance(offset, timedelta):
+            return offset.total_seconds()
+        return float(offset)
+
+    def _record_transfer_start(self, req: LlmRequest) -> None:
+        local_start = get_steady_clock_now_in_seconds()
+        req.set_kv_cache_transfer_start(timedelta(seconds=local_start))
+        req.set_kv_cache_size(0)
+
+    def _record_transfer_end(self, req: LlmRequest, session: Optional[Any] = None) -> None:
+        local_end = get_steady_clock_now_in_seconds()
+        if session is not None:
+            req.set_kv_cache_size(int(getattr(session, "transferred_kv_bytes", 0)))
+        req.set_kv_cache_transfer_end(timedelta(seconds=local_end))
+
+    def _set_transfer_metrics(
+        self, req: LlmRequest, start_s: float, end_s: float, size_bytes: int
+    ) -> None:
+        offset_s = self._clock_offset_seconds()
+        req.set_kv_cache_transfer_start(timedelta(seconds=start_s - offset_s))
+        req.set_kv_cache_transfer_end(timedelta(seconds=end_s - offset_s))
+        req.set_kv_cache_size(size_bytes)
+
+    @staticmethod
+    def _time_point_seconds(time_point: Any) -> float:
+        if time_point is None:
+            return 0.0
+        if isinstance(time_point, timedelta):
+            return time_point.total_seconds()
+        return float(time_point)
+
+    @staticmethod
+    def _get_transfer_metrics(req: LlmRequest) -> Optional[tuple[float, float, int]]:
+        start_s = KvCacheTransceiverV2._time_point_seconds(req.kv_cache_transfer_start)
+        end_s = KvCacheTransceiverV2._time_point_seconds(req.kv_cache_transfer_end)
+        if start_s <= 0.0 or end_s <= 0.0:
+            return None
+        return start_s, end_s, req.kv_cache_size
+
+    @staticmethod
+    def _should_aggregate_gen_transfer_metrics() -> bool:
+        return bool(os.environ.get("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", ""))
+
+    def _publish_gen_transfer_metrics(self, completed: list[int], consensus: set[int]) -> None:
+        if not self._should_aggregate_gen_transfer_metrics():
+            return
+
+        metric_rids = [rid for rid in completed if not self._gen_need_sync or rid in consensus]
+        if not metric_rids:
+            return
+
+        local_metrics = {
+            rid: self._get_transfer_metrics(self._recv_reqs[rid]) for rid in metric_rids
+        }
+        all_rank_metrics = (
+            self._gen_allgather(local_metrics) if self._gen_need_sync else [local_metrics]
+        )
+
+        for rid in metric_rids:
+            metrics = [
+                rank_metrics[rid]
+                for rank_metrics in all_rank_metrics
+                if rid in rank_metrics and rank_metrics[rid] is not None
+            ]
+            if not metrics:
+                continue
+            start_s = min(metric[0] for metric in metrics)
+            end_s = max(metric[1] for metric in metrics)
+            size_bytes = sum(metric[2] for metric in metrics)
+            self._set_transfer_metrics(self._recv_reqs[rid], start_s, end_s, size_bytes)
+
     def _collect_done(self, sessions: dict, reqs: dict):
         """Scan sessions and return (completed_rids, failed_rids)."""
         completed, failed = [], []
@@ -411,7 +490,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ever_had_send_session = True
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        session.send(self._create_kv_slice(req))
+        kv_slice = self._create_kv_slice(req)
+        self._record_transfer_start(req)
+        session.send(kv_slice)
         self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
@@ -428,10 +509,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._transfer_worker.create_rx_session(req)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
-            session.receive(self._create_kv_slice(req))
+            kv_slice = self._create_kv_slice(req)
+            self._record_transfer_start(req)
+            session.receive(kv_slice)
             result = session.wait_complete(blocking=True)
 
             if result == WaitResult.COMPLETED:
+                self._record_transfer_end(req, session)
+                self._publish_gen_transfer_metrics([rid], {rid})
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._trim_kv_to_prompt_history(req)
@@ -459,7 +544,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = self._transfer_worker.create_rx_session(req)
         self._recv_sessions[rid] = session
-        session.receive(self._create_kv_slice(req))
+        kv_slice = self._create_kv_slice(req)
+        self._record_transfer_start(req)
+        session.receive(kv_slice)
         self._recv_reqs[rid] = req
 
     def check_context_transfer_status(
@@ -486,6 +573,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if session.status == SessionStatus.CANCELLED:
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
+                self._record_transfer_end(self._send_reqs[rid], session)
                 completed.append(rid)
             elif result == WaitResult.TIMEOUT:
                 logger.warning(
@@ -546,6 +634,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # distinguish the two cases and set the appropriate state.
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
+                self._record_transfer_end(self._recv_reqs[rid], session)
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 failed.append(rid)
@@ -556,6 +645,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             to_process, cancelled, failed, completed
         )
 
+        self._publish_gen_transfer_metrics(completed, set(completed))
         cancelled_reqs = []
         for rid in cancelled:
             cancelled_reqs.append(self._recv_reqs[rid])
