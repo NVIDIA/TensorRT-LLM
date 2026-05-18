@@ -257,6 +257,24 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 },
             },
         ),
+        # Smoke test for NVIDIA/TensorRT-LLM#13321 — exercises the piecewise
+        # CUDA graph + multi_stream_moe path.  Multi-stream passthroughs are
+        # no-op'd on the piecewise path via ``disable_multi_stream`` so the
+        # static segment capture is safe; decode batches still overlap via
+        # the monolithic CG path.
+        (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+            {
+                "compile_backend": "torch-cudagraph",
+                "transforms": {
+                    "mlir_elementwise_fusion": {"enabled": True},
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+                    "compile_model": {"piecewise_enabled": True},
+                },
+            },
+        ),
     ],
 )
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):

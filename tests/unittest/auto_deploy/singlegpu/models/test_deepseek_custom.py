@@ -66,7 +66,7 @@ class TestDeepSeekV3RMSNorm:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -99,7 +99,7 @@ class TestDeepSeekV3RotaryEmbedding:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -139,7 +139,7 @@ class TestDeepSeekV3MLP:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -160,7 +160,7 @@ class TestDeepSeekV3Attention:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -220,7 +220,7 @@ class TestDeepSeekV3MoE:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -267,7 +267,7 @@ class TestDeepSeekV3DecoderLayer:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -313,7 +313,7 @@ class TestDeepSeekV3Model:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -349,7 +349,7 @@ class TestDeepSeekV3ForCausalLM:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -394,7 +394,7 @@ class TestMLAOpRegistration:
 
     def test_torch_mla_callable(self):
         """Test that torch_mla op is callable."""
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda"
         dtype = torch.bfloat16
 
         batch_size, seq_len, num_heads = 1, 2, 4
@@ -422,7 +422,7 @@ class TestMLAOpRegistration:
 
     def test_torch_cached_mla_callable(self):
         """Test that torch_cached_mla_with_cache op is callable."""
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda"
         dtype = torch.bfloat16
 
         batch_size, seq_len, num_heads = 1, 1, 4

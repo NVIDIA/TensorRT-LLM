@@ -21,13 +21,17 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     _args_kwargs_flatten_spec,
 )
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner, OutputInfo
-from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import SplitInfo, submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
     CompileModel,
     _generate_default_piecewise_num_tokens,
+)
+from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
+    begin_aux_stream_passthrough,
+    end_aux_stream_passthrough,
 )
 
 
@@ -895,3 +899,71 @@ class TestCompileModelGraphModuleTargetCollection:
                 backend=backend,
                 piecewise_enabled=True,
             )
+
+
+# ============================================================================
+# Smoke: passthrough nodes in a piecewise split stay inside their *static*
+# partition.  The piecewise path disables multi-stream at capture + replay
+# time (see ``utils.multi_stream_utils.disable_multi_stream``), so no
+# reclassification-as-dynamic and no extra wrapper is needed.
+# ============================================================================
+
+
+def _build_ms_static_submod():
+    root = nn.Module()
+    root.add_module("lin", nn.Linear(4, 4))
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    y = g.call_function(begin_aux_stream_passthrough, args=(x,))
+    y = g.call_module("lin", args=(y,))
+    out = g.call_function(end_aux_stream_passthrough, args=(y,))
+    g.output(out)
+    return torch.fx.GraphModule(root, g)
+
+
+def _build_plain_static_submod():
+    root = nn.Module()
+    root.add_module("lin", nn.Linear(4, 4))
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    out = g.call_module("lin", args=(x,))
+    g.output(out)
+    return torch.fx.GraphModule(root, g)
+
+
+class TestPiecewiseCapturedGraphMultiStreamWiring:
+    def _build_split_gm(self, ms_submod, plain_submod):
+        parent = nn.Module()
+        parent.add_module("submod_0", plain_submod)
+        parent.add_module("submod_1", ms_submod)
+
+        g = torch.fx.Graph()
+        x = g.placeholder("x")
+        call0 = g.call_module("submod_0", args=(x,))
+        call1 = g.call_module("submod_1", args=(call0,))
+        g.output(call1)
+        return torch.fx.GraphModule(parent, g)
+
+    def test_prepare_keeps_stream_switch_partition_as_static_runner(self, monkeypatch):
+        """Stream-switch partitions become ADPiecewiseRunner, not a dedicated wrapper."""
+        ms_submod = _build_ms_static_submod()
+        plain_submod = _build_plain_static_submod()
+        split_gm = self._build_split_gm(ms_submod, plain_submod)
+
+        fake_info = SplitInfo(
+            split_gm=split_gm,
+            num_submodules=2,
+            static_submod_indices=[0, 1],
+            dynamic_submod_indices=[],
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph."
+            "split_graph_at_dynamic_ops",
+            lambda _gm: fake_info,
+        )
+
+        pcg = PiecewiseCapturedGraph(split_gm, piecewise_num_tokens=[8, 16])
+        pcg.prepare()
+
+        assert isinstance(pcg.split_gm.submod_0, ADPiecewiseRunner)
+        assert isinstance(pcg.split_gm.submod_1, ADPiecewiseRunner)

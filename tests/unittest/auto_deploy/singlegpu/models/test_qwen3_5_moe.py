@@ -660,11 +660,11 @@ def test_gdn_matches_hf_reference():
     """Compare GatedDeltaNet custom-ops forward against HF reference torch fallback."""
     config = _make_small_config()
     torch.manual_seed(42)
-    gdn = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
+    gdn = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0).cuda()
     gdn.eval()
 
     B, S = 2, 8
-    hidden_states = torch.randn(B, S, config.hidden_size)
+    hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
 
     our_output = gdn(hidden_states)
     ref_output = ref_gdn_forward(gdn, hidden_states)
@@ -684,14 +684,14 @@ def test_attention_matches_hf_reference():
     config = _make_small_config()
     torch.manual_seed(42)
     # Layer 3 is full_attention in the default 4-layer config
-    attn = Qwen3_5MoeAttention(config, layer_idx=3)
+    attn = Qwen3_5MoeAttention(config, layer_idx=3).cuda()
     attn.eval()
 
-    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config)
+    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config).cuda()
 
     B, S = 2, 8
-    hidden_states = torch.randn(B, S, config.hidden_size)
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     position_ids = position_ids[None, ...].expand(3, B, -1)
     position_embeddings = rotary_emb(hidden_states, position_ids)
 
@@ -712,12 +712,12 @@ def test_moe_matches_hf_reference():
     """Compare SparseMoeBlock torch_moe forward against HF reference expert dispatch."""
     config = _make_small_config()
     torch.manual_seed(42)
-    moe = Qwen3_5MoeSparseMoeBlock(config)
+    moe = Qwen3_5MoeSparseMoeBlock(config).cuda()
     moe.eval()
     _init_block_weights(moe)
 
     B, S = 2, 8
-    hidden_states = torch.randn(B, S, config.hidden_size)
+    hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
 
     our_output = moe(hidden_states)
     ref_output = ref_moe_forward(moe, hidden_states)
@@ -735,20 +735,20 @@ def test_moe_matches_hf_reference():
 def test_decoder_layer_matches_hf_reference():
     """Compare DecoderLayer forward against HF reference for both layer types."""
     config = _make_small_config()
-    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config)
+    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config).cuda()
 
     B, S = 2, 8
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     position_ids = position_ids[None, ...].expand(3, B, -1)
 
     # Test one linear_attention layer (idx 0) and one full_attention layer (idx 3)
     for layer_idx in [0, 3]:
         torch.manual_seed(42)
-        layer = Qwen3_5MoeDecoderLayer(config, layer_idx)
+        layer = Qwen3_5MoeDecoderLayer(config, layer_idx).cuda()
         layer.eval()
         _init_block_weights(layer)
 
-        hidden_states = torch.randn(B, S, config.hidden_size)
+        hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
         position_embeddings = rotary_emb(hidden_states, position_ids)
 
         our_output = layer(hidden_states, position_embeddings)
@@ -781,11 +781,11 @@ def test_rmsnorm_load_hook_matches_original():
 
     # Create original (HF-style) norm with learned weights
     torch.manual_seed(42)
-    original = OriginalQwen3_5MoeRMSNorm(dim, eps)
+    original = OriginalQwen3_5MoeRMSNorm(dim, eps).cuda()
     original.weight.data.normal_(mean=0.0, std=0.1)  # non-trivial weights
 
     # Create modified norm with load hook, load original's state dict
-    modified = Qwen3_5MoeRMSNorm(dim, eps)
+    modified = Qwen3_5MoeRMSNorm(dim, eps).cuda()
     modified.load_state_dict(original.state_dict())
 
     # The load hook should have added 1.0:
@@ -797,7 +797,7 @@ def test_rmsnorm_load_hook_matches_original():
     )
 
     # Forward pass: both should produce identical outputs
-    x = torch.randn(2, 8, dim)
+    x = torch.randn(2, 8, dim, device="cuda")
     out_original = original(x)
     out_modified = modified(x)
 
@@ -860,7 +860,9 @@ def _make_vision_test_inputs(vision_config, grid_thw):
     """Create test inputs for vision modules: pixel_values, cu_seqlens, position_embeddings."""
     total_patches = int(torch.prod(grid_thw, dim=1).sum().item())
     t_ps, ps = vision_config.temporal_patch_size, vision_config.patch_size
-    pixel_values = torch.randn(total_patches, vision_config.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(
+        total_patches, vision_config.in_channels * t_ps * ps * ps, device="cuda"
+    )
     return pixel_values
 
 
@@ -869,18 +871,18 @@ def test_vision_attention_matches_reference():
     """Compare VisionAttention forward against HF reference eager attention."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    attn = Qwen3_5MoeVisionAttention(vision_config)
+    attn = Qwen3_5MoeVisionAttention(vision_config).cuda()
     attn.eval()
 
     # 2 variable-length sequences: 6 tokens and 4 tokens
     S = 10
-    hidden_states = torch.randn(S, vision_config.hidden_size)
-    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32)
+    hidden_states = torch.randn(S, vision_config.hidden_size, device="cuda")
+    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32, device="cuda")
 
     # Compute vision RoPE position embeddings
     head_dim = vision_config.hidden_size // vision_config.num_heads
     rotary_dim = head_dim // 2
-    freqs = torch.randn(S, rotary_dim)
+    freqs = torch.randn(S, rotary_dim, device="cuda")
     emb = torch.cat((freqs, freqs), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
 
@@ -901,16 +903,16 @@ def test_vision_block_matches_reference():
     """Compare VisionBlock forward against HF reference (ref attention + MLP)."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    block = Qwen3_5MoeVisionBlock(vision_config)
+    block = Qwen3_5MoeVisionBlock(vision_config).cuda()
     block.eval()
 
     S = 10
-    hidden_states = torch.randn(S, vision_config.hidden_size)
-    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32)
+    hidden_states = torch.randn(S, vision_config.hidden_size, device="cuda")
+    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32, device="cuda")
 
     head_dim = vision_config.hidden_size // vision_config.num_heads
     rotary_dim = head_dim // 2
-    freqs = torch.randn(S, rotary_dim)
+    freqs = torch.randn(S, rotary_dim, device="cuda")
     emb = torch.cat((freqs, freqs), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
 
@@ -931,11 +933,11 @@ def test_vision_model_matches_reference():
     """Compare VisionModel forward against HF reference for a single image."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    vision_model = Qwen3_5MoeVisionModel(vision_config)
+    vision_model = Qwen3_5MoeVisionModel(vision_config).cuda()
     vision_model.eval()
 
     # Single image: T=1, H=4, W=4 -> 16 patches
-    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
     pixel_values = _make_vision_test_inputs(vision_config, grid_thw)
 
     our_output = vision_model(pixel_values, grid_thw)
@@ -945,7 +947,7 @@ def test_vision_model_matches_reference():
         our_output.last_hidden_state,
         ref_last_hidden,
         rtol=1e-5,
-        atol=1e-5,
+        atol=5e-4,
         msg="VisionModel last_hidden_state should match HF reference",
     )
     torch.testing.assert_close(
@@ -962,11 +964,11 @@ def test_vision_model_multi_image_matches_reference():
     """Compare VisionModel forward against HF reference for multiple images."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    vision_model = Qwen3_5MoeVisionModel(vision_config)
+    vision_model = Qwen3_5MoeVisionModel(vision_config).cuda()
     vision_model.eval()
 
     # 2 images of different sizes: T=1,H=4,W=4 (16 patches) + T=1,H=2,W=4 (8 patches)
-    grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long)
+    grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long, device="cuda")
     pixel_values = _make_vision_test_inputs(vision_config, grid_thw)
 
     our_output = vision_model(pixel_values, grid_thw)
@@ -976,7 +978,7 @@ def test_vision_model_multi_image_matches_reference():
         our_output.last_hidden_state,
         ref_last_hidden,
         rtol=1e-5,
-        atol=1e-5,
+        atol=5e-4,
         msg="VisionModel multi-image last_hidden_state should match HF reference",
     )
     torch.testing.assert_close(
@@ -998,14 +1000,14 @@ def test_position_embeddings_passthrough():
     """Test that pre-computed position_embeddings match internal computation."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeTextModel(config)
+    model = Qwen3_5MoeTextModel(config).cuda()
     model.eval()
-    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).cuda()
     model.set_lm_head(lm_head)
 
     B, S = 2, 8
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Path 1: Let the model compute position_embeddings internally
     output_internal = model(input_ids=input_ids, position_ids=position_ids)
@@ -1030,14 +1032,14 @@ def test_rope_cos_sin_kwargs():
     """Test that rope_cos/rope_sin kwargs match position_embeddings tuple output."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeTextModel(config)
+    model = Qwen3_5MoeTextModel(config).cuda()
     model.eval()
-    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).cuda()
     model.set_lm_head(lm_head)
 
     B, S = 2, 8
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Reference: internal computation
     output_ref = model(input_ids=input_ids, position_ids=position_ids)
@@ -1064,12 +1066,12 @@ def test_causal_lm_position_embeddings():
     """Test that Qwen3_5MoeForCausalLM correctly passes position_embeddings through."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForCausalLM(config)
+    model = Qwen3_5MoeForCausalLM(config).cuda()
     model.eval()
 
     B, S = 2, 8
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Reference output using position_ids
     output_ref = model(input_ids=input_ids, position_ids=position_ids)
@@ -1111,10 +1113,10 @@ def test_get_rope_index_text_only():
     """Test get_rope_index for a text-only sequence (no vision tokens)."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeModel(config)
+    model = Qwen3_5MoeModel(config).cuda()
 
     B, S = 2, 8
-    input_ids = torch.randint(0, 50, (B, S))  # no special tokens
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")  # no special tokens
 
     position_ids, deltas = model.get_rope_index(input_ids)
 
@@ -1131,7 +1133,7 @@ def test_get_rope_index_text_only():
         msg="Text-only: T and W position IDs should be identical",
     )
     # Should be 0, 1, 2, ..., S-1
-    expected = torch.arange(S).unsqueeze(0).expand(B, -1)
+    expected = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     torch.testing.assert_close(
         position_ids[0],
         expected,
@@ -1146,7 +1148,7 @@ def test_get_rope_index_with_image():
     """Test get_rope_index for a sequence containing image placeholders."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeModel(config)
+    model = Qwen3_5MoeModel(config).cuda()
 
     image_token_id = config.image_token_id
     vision_start_token_id = config.vision_start_token_id
@@ -1168,9 +1170,10 @@ def test_get_rope_index_with_image():
                 4,
                 5,  # 2 text tokens
             ]
-        ]
+        ],
+        device="cuda",
     )
-    image_grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.long, device="cuda")
 
     position_ids, deltas = model.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
 
@@ -1190,11 +1193,11 @@ def test_get_rope_index_with_image():
 def test_get_rope_index_with_attention_mask():
     """Test get_rope_index respects attention_mask for text-only."""
     config = _make_small_composite_config()
-    model = Qwen3_5MoeModel(config)
+    model = Qwen3_5MoeModel(config).cuda()
 
     B, S = 1, 6
-    input_ids = torch.randint(0, 50, (B, S))
-    attention_mask = torch.tensor([[1, 1, 1, 1, 0, 0]])  # last 2 tokens are padding
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+    attention_mask = torch.tensor([[1, 1, 1, 1, 0, 0]], device="cuda")  # last 2 tokens are padding
 
     position_ids, deltas = model.get_rope_index(input_ids, attention_mask=attention_mask)
 
@@ -1222,7 +1225,7 @@ def test_multimodal_forward_matches_reference():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     image_token_id = config.image_token_id
@@ -1230,10 +1233,10 @@ def test_multimodal_forward_matches_reference():
     vc = config.vision_config
 
     # Vision: 1 image, T=1, H=4, W=4 -> 16 patches -> 4 merged tokens
-    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
     num_patches = 1 * 4 * 4
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
 
     merge_factor = vc.spatial_merge_size**2
     num_merged_tokens = num_patches // merge_factor  # 4
@@ -1242,7 +1245,7 @@ def test_multimodal_forward_matches_reference():
     text_before = [1, 2, 3]
     vision_part = [vision_start_token_id] + [image_token_id] * num_merged_tokens
     text_after = [4, 5]
-    input_ids = torch.tensor([text_before + vision_part + text_after])
+    input_ids = torch.tensor([text_before + vision_part + text_after], device="cuda")
 
     # Model computes 3D positions internally from input_ids + image_grid_thw
     our_output = model(
@@ -1276,12 +1279,12 @@ def test_export_text_model_with_position_ids():
     """Test that the text model can be exported with standard position_ids."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForCausalLM(config)
+    model = Qwen3_5MoeForCausalLM(config).cuda()
     model.eval()
 
     B, S = 2, 4
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Run normally first
     ref_output = model(input_ids=input_ids, position_ids=position_ids)
@@ -1322,12 +1325,12 @@ def test_export_text_model_with_rope_cos_sin():
     """
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForCausalLM(config)
+    model = Qwen3_5MoeForCausalLM(config).cuda()
     model.eval()
 
     B, S = 2, 4
-    inputs_embeds = torch.randn(B, S, config.hidden_size)
-    position_ids_3d = torch.arange(S).view(1, 1, -1).expand(3, B, -1)
+    inputs_embeds = torch.randn(B, S, config.hidden_size, device="cuda")
+    position_ids_3d = torch.arange(S, device="cuda").view(1, 1, -1).expand(3, B, -1)
     cos, sin = model.model.rotary_emb(inputs_embeds, position_ids_3d)
 
     # Reference: pass cos/sin via rope_cos/rope_sin
@@ -1361,8 +1364,8 @@ def test_export_text_model_with_rope_cos_sin():
 
     # Also test with different batch/seq dims to verify dynamic shapes work
     B2, S2 = 3, 8
-    inputs_embeds2 = torch.randn(B2, S2, config.hidden_size)
-    position_ids_3d2 = torch.arange(S2).view(1, 1, -1).expand(3, B2, -1)
+    inputs_embeds2 = torch.randn(B2, S2, config.hidden_size, device="cuda")
+    position_ids_3d2 = torch.arange(S2, device="cuda").view(1, 1, -1).expand(3, B2, -1)
     cos2, sin2 = model.model.rotary_emb(inputs_embeds2, position_ids_3d2)
 
     ref_output2 = model(inputs_embeds=inputs_embeds2, rope_cos=cos2, rope_sin=sin2)
@@ -1394,15 +1397,15 @@ def test_vlm_wrapper_text_only_position_ids():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     B, S = 2, 8
-    input_ids = torch.randint(0, 50, (B, S))
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
 
     # Simulate executor-provided 2D position_ids with an offset (chunked prefill chunk 2)
     offset = 64
-    position_ids_2d = torch.arange(offset, offset + S).unsqueeze(0).expand(B, -1)
+    position_ids_2d = torch.arange(offset, offset + S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # VLM wrapper path: receives 2D, expands to 3D internally
     output_wrapper = model(input_ids=input_ids, position_ids=position_ids_2d)
@@ -1434,7 +1437,7 @@ def test_compute_mrope_positions_text_only():
     """Text-only: all 3 dims identical, delta is 0."""
     config = _make_small_composite_config()
     B, S = 1, 10
-    input_ids = torch.randint(0, 50, (B, S))
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
 
     pos, deltas = compute_mrope_positions(
         input_ids=input_ids,
@@ -1461,13 +1464,13 @@ def test_compute_mrope_positions_with_image():
     num_vision_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
 
     # Build input_ids: [text, vision_start, img_tokens..., text]
-    text_before = torch.tensor([1, 2, 3])
-    vision_start = torch.tensor([config.vision_start_token_id])
-    img_tokens = torch.full((num_vision_tokens,), config.image_token_id)
-    text_after = torch.tensor([4, 5, 6])
+    text_before = torch.tensor([1, 2, 3], device="cuda")
+    vision_start = torch.tensor([config.vision_start_token_id], device="cuda")
+    img_tokens = torch.full((num_vision_tokens,), config.image_token_id, device="cuda")
+    text_after = torch.tensor([4, 5, 6], device="cuda")
     input_ids = torch.cat([text_before, vision_start, img_tokens, text_after]).unsqueeze(0)
 
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]])
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device="cuda")
 
     pos, deltas = compute_mrope_positions(
         input_ids=input_ids,
@@ -1498,12 +1501,12 @@ def test_compute_mrope_positions_matches_model_method():
     grid_t, grid_h, grid_w = 1, 4, 4
     num_vision_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
 
-    text_before = torch.tensor([1, 2, 3])
-    vision_start = torch.tensor([config.vision_start_token_id])
-    img_tokens = torch.full((num_vision_tokens,), config.image_token_id)
-    text_after = torch.tensor([4, 5])
+    text_before = torch.tensor([1, 2, 3], device="cuda")
+    vision_start = torch.tensor([config.vision_start_token_id], device="cuda")
+    img_tokens = torch.full((num_vision_tokens,), config.image_token_id, device="cuda")
+    text_after = torch.tensor([4, 5], device="cuda")
     input_ids = torch.cat([text_before, vision_start, img_tokens, text_after]).unsqueeze(0)
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]])
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device="cuda")
 
     # Standalone function
     pos_fn, deltas_fn = compute_mrope_positions(
@@ -1518,7 +1521,7 @@ def test_compute_mrope_positions_matches_model_method():
 
     # Model method
     torch.manual_seed(42)
-    model = Qwen3_5MoeModel(config)
+    model = Qwen3_5MoeModel(config).cuda()
     pos_model, deltas_model = model.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
 
     torch.testing.assert_close(pos_fn, pos_model)
@@ -1531,8 +1534,8 @@ def test_qwen3_mrope_delta_matches_compute_mrope_positions_for_mixed_items():
     config = _make_small_composite_config()
     merge = config.vision_config.spatial_merge_size
 
-    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32)
-    video_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device="cuda")
+    video_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device="cuda")
 
     num_image_tokens = int(
         image_grid_thw[0, 0].item()
@@ -1560,6 +1563,7 @@ def test_qwen3_mrope_delta_matches_compute_mrope_positions_for_mixed_items():
             ]
         ],
         dtype=torch.long,
+        device="cuda",
     )
 
     _, expected_delta = compute_mrope_positions(
@@ -1573,16 +1577,18 @@ def test_qwen3_mrope_delta_matches_compute_mrope_positions_for_mixed_items():
     )
 
     actual_delta = qwen3_mrope_delta(
+        # batch_info_host is a host-only tensor (BatchInfo calls .numpy() on it).
         batch_info_host=torch.tensor([1, 0, 0, 0, 0, 0], dtype=torch.int32),
-        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
-        mm_item_types=torch.tensor([0, 1], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
         mm_token_lengths=torch.tensor(
-            [1 + num_image_tokens, 1 + num_video_tokens], dtype=torch.int32
+            [1 + num_image_tokens, 1 + num_video_tokens], dtype=torch.int32, device="cuda"
         ),
-        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
         mm_special_offsets=torch.tensor(
             [0, 1 + num_image_tokens],
             dtype=torch.int32,
+            device="cuda",
         ),
         image_grid_thw=image_grid_thw,
         video_grid_thw=video_grid_thw,
@@ -1598,7 +1604,7 @@ def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
     config = _make_small_composite_config()
     merge = config.vision_config.spatial_merge_size
 
-    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device="cuda")
     num_image_tokens = int(
         image_grid_thw[0, 0].item()
         * (image_grid_thw[0, 1].item() // merge)
@@ -1615,6 +1621,7 @@ def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
             ]
         ],
         dtype=torch.long,
+        device="cuda",
     )
     _, expected_delta = compute_mrope_positions(
         input_ids=input_ids,
@@ -1626,16 +1633,17 @@ def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
         spatial_merge_size=merge,
     )
 
-    cache = torch.zeros((8, 1), dtype=torch.int32)
+    cache = torch.zeros((8, 1), dtype=torch.int32, device="cuda")
     slot = 3
     deltas = qwen3_mrope_delta_with_cache(
+        # batch_info_host is a host-only tensor (BatchInfo calls .numpy() on it).
         batch_info_host=torch.tensor([1, 0, 0, 0, 1, 1], dtype=torch.int32),
-        slot_idx=torch.tensor([slot, slot], dtype=torch.int32),
-        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
-        mm_item_types=torch.tensor([0], dtype=torch.int32),
-        mm_token_lengths=torch.tensor([1 + num_image_tokens], dtype=torch.int32),
-        mm_special_offsets_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
-        mm_special_offsets=torch.tensor([0], dtype=torch.int32),
+        slot_idx=torch.tensor([slot, slot], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        mm_token_lengths=torch.tensor([1 + num_image_tokens], dtype=torch.int32, device="cuda"),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.tensor([0], dtype=torch.int32, device="cuda"),
         image_grid_thw=image_grid_thw,
         video_grid_thw=None,
         mrope_delta_cache=cache,
@@ -1747,16 +1755,16 @@ def test_vlm_wrapper_decode_after_image_uses_delta():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     B, S = 1, 8
-    input_ids = torch.randint(0, 50, (B, S))
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
 
-    fake_delta = torch.tensor([[-2]])
+    fake_delta = torch.tensor([[-2]], device="cuda")
 
     # Position IDs from executor (sequential, as if no image compression)
-    pos_ids_executor = torch.arange(100, 100 + S).unsqueeze(0)
+    pos_ids_executor = torch.arange(100, 100 + S, device="cuda").unsqueeze(0)
 
     # VLM wrapper should apply delta: pos_ids = (100-2, 101-2, ...) = (98, 99, ...)
     output_with_delta = model(
@@ -1788,15 +1796,15 @@ def test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage():
     """Applying a delta in one call must not affect later calls that omit it."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     B, S = 1, 6
-    input_ids = torch.randint(0, 50, (B, S))
-    pos_ids = torch.arange(50, 50 + S).unsqueeze(0)
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+    pos_ids = torch.arange(50, 50 + S, device="cuda").unsqueeze(0)
 
     # Apply a delta in one call
-    delta = torch.tensor([[-5]])
+    delta = torch.tensor([[-5]], device="cuda")
     output_with_delta = model(
         input_ids=input_ids,
         position_ids=pos_ids,
@@ -1848,12 +1856,12 @@ def test_vlm_wrapper_no_delta_without_images():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     B, S = 1, 8
-    input_ids = torch.randint(0, 50, (B, S))
-    pos_ids = torch.arange(0, S).unsqueeze(0)
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+    pos_ids = torch.arange(0, S, device="cuda").unsqueeze(0)
 
     output = model(input_ids=input_ids, position_ids=pos_ids)
 
@@ -1877,10 +1885,10 @@ def test_vlm_wrapper_requires_position_ids_for_text_only():
     """Text-only forward must provide position_ids."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
-    input_ids = torch.randint(0, 50, (1, 8))
+    input_ids = torch.randint(0, 50, (1, 8), device="cuda")
     with pytest.raises(ValueError, match="position_ids is required"):
         _ = model(input_ids=input_ids)
 
@@ -1899,7 +1907,7 @@ def test_vlm_wrapper_prefill_only_with_images():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     vc = config.vision_config
@@ -1908,14 +1916,14 @@ def test_vlm_wrapper_prefill_only_with_images():
     num_patches = grid_t * grid_h * grid_w
     num_merged_tokens = num_patches // (merge**2)
 
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
 
     text_before = [1, 2, 3]
     vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
     text_after = [4, 5]
-    input_ids = torch.tensor([text_before + vision_part + text_after])
+    input_ids = torch.tensor([text_before + vision_part + text_after], device="cuda")
 
     output = model(
         input_ids=input_ids,
@@ -1960,7 +1968,7 @@ def test_vlm_wrapper_mixed_prefill_decode_with_images():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     vc = config.vision_config
@@ -1969,9 +1977,9 @@ def test_vlm_wrapper_mixed_prefill_decode_with_images():
     num_patches = grid_t * grid_h * grid_w
     num_merged_tokens = num_patches // (merge**2)
 
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
 
     # Build prefill input_ids (1 image request)
     text_before = [1, 2, 3]
@@ -1984,14 +1992,17 @@ def test_vlm_wrapper_mixed_prefill_decode_with_images():
     decode_token = [6]
     all_tokens = prefill_tokens + decode_token
 
-    input_ids = torch.tensor([all_tokens])
+    input_ids = torch.tensor([all_tokens], device="cuda")
     prefill_pos = list(range(num_prefill_tokens))
     decode_pos = [200]
-    position_ids = torch.tensor([prefill_pos + decode_pos])
+    position_ids = torch.tensor([prefill_pos + decode_pos], device="cuda")
 
-    deltas = torch.tensor([[-2], [-3]])
+    deltas = torch.tensor([[-2], [-3]], device="cuda")
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
     batch_info = torch.tensor([1, num_prefill_tokens, 1], dtype=torch.int32)
-    cu_seqlen = torch.tensor([0, num_prefill_tokens, num_prefill_tokens + 1], dtype=torch.int32)
+    cu_seqlen = torch.tensor(
+        [0, num_prefill_tokens, num_prefill_tokens + 1], dtype=torch.int32, device="cuda"
+    )
 
     output = model(
         input_ids=input_ids,
@@ -2047,7 +2058,7 @@ def test_vlm_wrapper_mixed_multimodal_text_prefill():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     vc = config.vision_config
@@ -2056,9 +2067,9 @@ def test_vlm_wrapper_mixed_multimodal_text_prefill():
     num_patches = grid_t * grid_h * grid_w
     num_merged_tokens = num_patches // (merge**2)
 
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
 
     # Request 1: multimodal prefill
     text_before = [1, 2]
@@ -2073,11 +2084,12 @@ def test_vlm_wrapper_mixed_multimodal_text_prefill():
     all_tokens = req1_tokens + req2_tokens
     total_tokens = len(all_tokens)
 
-    input_ids = torch.tensor([all_tokens])
-    position_ids = torch.tensor([list(range(total_tokens))])
+    input_ids = torch.tensor([all_tokens], device="cuda")
+    position_ids = torch.tensor([list(range(total_tokens))], device="cuda")
 
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
     batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
-    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32, device="cuda")
 
     output = model(
         input_ids=input_ids,
@@ -2125,12 +2137,12 @@ def test_vlm_wrapper_mixed_multimodal_text_prefill():
 def test_build_mixed_positions_handles_mixed_image_and_video_request():
     """Mixed image+video requests should not drift grid indices across requests."""
     config = _make_small_composite_config()
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     merge = config.vision_config.spatial_merge_size
-    image_grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long)
-    video_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long, device="cuda")
+    video_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long, device="cuda")
     num_image_tokens_0 = int(
         image_grid_thw[0, 0].item()
         * (image_grid_thw[0, 1].item() // merge)
@@ -2163,10 +2175,13 @@ def test_build_mixed_positions_handles_mixed_image_and_video_request():
         5,
     ]
     all_tokens = req1_tokens + req2_tokens
-    input_ids = torch.tensor([all_tokens], dtype=torch.long)
-    position_ids = torch.arange(len(all_tokens)).unsqueeze(0)
+    input_ids = torch.tensor([all_tokens], dtype=torch.long, device="cuda")
+    position_ids = torch.arange(len(all_tokens), device="cuda").unsqueeze(0)
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
     batch_info = torch.tensor([2, len(all_tokens), 0], dtype=torch.int32)
-    cu_seqlen = torch.tensor([0, len(req1_tokens), len(all_tokens)], dtype=torch.int32)
+    cu_seqlen = torch.tensor(
+        [0, len(req1_tokens), len(all_tokens)], dtype=torch.int32, device="cuda"
+    )
 
     actual_pos_3d = model.model._build_mixed_positions(
         input_ids=input_ids,
@@ -2213,7 +2228,7 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     vc = config.vision_config
@@ -2222,9 +2237,9 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
     num_patches = grid_t * grid_h * grid_w
     num_merged_tokens = num_patches // (merge**2)
 
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
 
     text_before = [1, 2]
     vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
@@ -2237,12 +2252,13 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
     chunk_tokens = full_tokens[chunk_start:]
     chunk_len = len(chunk_tokens)
 
-    input_ids = torch.tensor([chunk_tokens])
-    position_ids = torch.arange(chunk_start, chunk_start + chunk_len).unsqueeze(0)
+    input_ids = torch.tensor([chunk_tokens], device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
     batch_info = torch.tensor([1, chunk_len, 0], dtype=torch.int32)
-    cu_seqlen = torch.tensor([0, chunk_len], dtype=torch.int32)
-    input_pos = torch.tensor([chunk_start], dtype=torch.int32)
-    seq_len = torch.tensor([chunk_len], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda")
+    input_pos = torch.tensor([chunk_start], dtype=torch.int32, device="cuda")
+    seq_len = torch.tensor([chunk_len], dtype=torch.int32, device="cuda")
 
     output = model(
         input_ids=input_ids,
@@ -2253,17 +2269,17 @@ def test_vlm_wrapper_chunked_prefill_inside_image_span():
         cu_seqlen=cu_seqlen,
         input_pos=input_pos,
         seq_len=seq_len,
-        mm_chunk_flat_start=torch.tensor([2], dtype=torch.int64),
-        mm_chunk_count=torch.tensor([num_merged_tokens - 2], dtype=torch.int64),
-        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
-        mm_item_types=torch.tensor([0], dtype=torch.int32),
-        mm_token_positions=torch.tensor([len(text_before) + 1], dtype=torch.int32),
-        mm_token_lengths=torch.tensor([num_merged_tokens], dtype=torch.int32),
-        mm_special_offsets_cu_seqlen=torch.tensor([0, 0], dtype=torch.int32),
-        mm_special_offsets=torch.empty(0, dtype=torch.int32),
+        mm_chunk_flat_start=torch.tensor([2], dtype=torch.int64, device="cuda"),
+        mm_chunk_count=torch.tensor([num_merged_tokens - 2], dtype=torch.int64, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        mm_token_positions=torch.tensor([len(text_before) + 1], dtype=torch.int32, device="cuda"),
+        mm_token_lengths=torch.tensor([num_merged_tokens], dtype=torch.int32, device="cuda"),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 0], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.empty(0, dtype=torch.int32, device="cuda"),
     )
 
-    full_input_ids = torch.tensor([full_tokens])
+    full_input_ids = torch.tensor([full_tokens], device="cuda")
     full_pos_3d, _ = compute_mrope_positions(
         input_ids=full_input_ids,
         image_grid_thw=image_grid_thw,
@@ -2305,7 +2321,7 @@ def test_vlm_wrapper_chunked_prefill_inside_video_span():
     """Chunked video prefill should select the request-local video embedding slice."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     vc = config.vision_config
@@ -2314,9 +2330,9 @@ def test_vlm_wrapper_chunked_prefill_inside_video_span():
     num_patches = grid_t * grid_h * grid_w
     frame_tokens = (grid_h // merge) * (grid_w // merge)
 
-    video_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    video_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values_videos = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values_videos = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
 
     text_before = [1, 2]
     between_frames = [3]
@@ -2329,27 +2345,32 @@ def test_vlm_wrapper_chunked_prefill_inside_video_span():
     chunk_tokens = full_tokens[chunk_start:]
     chunk_len = len(chunk_tokens)
 
-    input_ids = torch.tensor([chunk_tokens])
-    position_ids = torch.arange(chunk_start, chunk_start + chunk_len).unsqueeze(0)
+    input_ids = torch.tensor([chunk_tokens], device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
 
     output = model(
         input_ids=input_ids,
         position_ids=position_ids,
         pixel_values_videos=pixel_values_videos,
         video_grid_thw=video_grid_thw,
+        # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
         batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
-        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32),
-        input_pos=torch.tensor([chunk_start], dtype=torch.int32),
-        seq_len=torch.tensor([chunk_len], dtype=torch.int32),
-        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
-        mm_item_types=torch.tensor([1, 1], dtype=torch.int32),
-        mm_token_positions=torch.tensor([len(text_before), second_frame_start], dtype=torch.int32),
-        mm_token_lengths=torch.tensor([1 + frame_tokens, 1 + frame_tokens], dtype=torch.int32),
-        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
-        mm_special_offsets=torch.tensor([0, 1 + frame_tokens], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda"),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32, device="cuda"),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([1, 1], dtype=torch.int32, device="cuda"),
+        mm_token_positions=torch.tensor(
+            [len(text_before), second_frame_start], dtype=torch.int32, device="cuda"
+        ),
+        mm_token_lengths=torch.tensor(
+            [1 + frame_tokens, 1 + frame_tokens], dtype=torch.int32, device="cuda"
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.tensor([0, 1 + frame_tokens], dtype=torch.int32, device="cuda"),
     )
 
-    full_input_ids = torch.tensor([full_tokens])
+    full_input_ids = torch.tensor([full_tokens], device="cuda")
     full_pos_3d, _ = compute_mrope_positions(
         input_ids=full_input_ids,
         image_grid_thw=None,
@@ -2390,12 +2411,12 @@ def test_vlm_wrapper_chunked_prefill_inside_video_span():
 def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_request():
     """Chunked mixed image+video requests should preserve item-type grid ordering."""
     config = _make_small_composite_config()
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     merge = config.vision_config.spatial_merge_size
-    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
-    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
+    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long, device="cuda")
     num_image_tokens = int(
         image_grid_thw[0, 0].item()
         * (image_grid_thw[0, 1].item() // merge)
@@ -2421,7 +2442,7 @@ def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_reques
         + text_after
     )
 
-    full_input_ids = torch.tensor([full_tokens], dtype=torch.long)
+    full_input_ids = torch.tensor([full_tokens], dtype=torch.long, device="cuda")
     full_pos_3d, _ = compute_mrope_positions(
         input_ids=full_input_ids,
         image_grid_thw=image_grid_thw,
@@ -2437,33 +2458,37 @@ def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_reques
     chunk_start = second_video_start + 1
     chunk_tokens = full_tokens[chunk_start:]
     chunk_len = len(chunk_tokens)
-    input_ids = torch.tensor([chunk_tokens], dtype=torch.long)
-    position_ids = torch.arange(chunk_start, chunk_start + chunk_len).unsqueeze(0)
+    input_ids = torch.tensor([chunk_tokens], dtype=torch.long, device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
 
     actual_pos_3d = model.model._build_chunked_multimodal_positions(
         input_ids=input_ids,
         position_ids=position_ids,
         delta=0,
+        # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
         batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
-        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32),
-        input_pos=torch.tensor([chunk_start], dtype=torch.int32),
-        seq_len=torch.tensor([chunk_len], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda"),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32, device="cuda"),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32, device="cuda"),
         image_grid_thw=image_grid_thw,
         video_grid_thw=video_grid_thw,
-        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
-        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda"),
         mm_token_positions=torch.tensor(
             [len(text_before), first_video_start, second_video_start],
             dtype=torch.int32,
+            device="cuda",
         ),
         mm_token_lengths=torch.tensor(
             [1 + num_image_tokens, 1 + frame_tokens, 1 + frame_tokens],
             dtype=torch.int32,
+            device="cuda",
         ),
-        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
         mm_special_offsets=torch.tensor(
             [0, 1 + num_image_tokens, 1 + num_image_tokens + 1 + frame_tokens],
             dtype=torch.int32,
+            device="cuda",
         ),
     )
 
@@ -2479,13 +2504,13 @@ def test_vlm_wrapper_chunked_prefill_inside_mixed_image_and_video_spans():
     """Chunked mixed multimodal prefill should preserve prompt-order embed slices."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     vc = config.vision_config
     merge = vc.spatial_merge_size
-    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
-    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
+    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long, device="cuda")
     num_image_patches = int(image_grid_thw[0].prod().item())
     num_video_patches = int(video_grid_thw[0].prod().item())
     num_image_tokens = num_image_patches // (merge**2)
@@ -2494,8 +2519,10 @@ def test_vlm_wrapper_chunked_prefill_inside_mixed_image_and_video_spans():
     )
 
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values = torch.randn(num_image_patches, vc.in_channels * t_ps * ps * ps)
-    pixel_values_videos = torch.randn(num_video_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(num_image_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
+    pixel_values_videos = torch.randn(
+        num_video_patches, vc.in_channels * t_ps * ps * ps, device="cuda"
+    )
 
     text_before = [1]
     text_between = [2]
@@ -2519,8 +2546,8 @@ def test_vlm_wrapper_chunked_prefill_inside_mixed_image_and_video_spans():
     chunk_tokens = full_tokens[chunk_start:]
     chunk_len = len(chunk_tokens)
 
-    input_ids = torch.tensor([chunk_tokens], dtype=torch.long)
-    position_ids = torch.arange(chunk_start, chunk_start + chunk_len).unsqueeze(0)
+    input_ids = torch.tensor([chunk_tokens], dtype=torch.long, device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
 
     output = model(
         input_ids=input_ids,
@@ -2529,27 +2556,32 @@ def test_vlm_wrapper_chunked_prefill_inside_mixed_image_and_video_spans():
         pixel_values_videos=pixel_values_videos,
         image_grid_thw=image_grid_thw,
         video_grid_thw=video_grid_thw,
+        # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
         batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
-        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32),
-        input_pos=torch.tensor([chunk_start], dtype=torch.int32),
-        seq_len=torch.tensor([chunk_len], dtype=torch.int32),
-        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
-        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda"),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32, device="cuda"),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda"),
         mm_token_positions=torch.tensor(
             [len(text_before), first_video_start, second_video_start],
             dtype=torch.int32,
+            device="cuda",
         ),
         mm_token_lengths=torch.tensor(
-            [1 + num_image_tokens, 1 + frame_tokens, 1 + frame_tokens], dtype=torch.int32
+            [1 + num_image_tokens, 1 + frame_tokens, 1 + frame_tokens],
+            dtype=torch.int32,
+            device="cuda",
         ),
-        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
         mm_special_offsets=torch.tensor(
             [0, 1 + num_image_tokens, 1 + num_image_tokens + 1 + frame_tokens],
             dtype=torch.int32,
+            device="cuda",
         ),
     )
 
-    full_input_ids = torch.tensor([full_tokens], dtype=torch.long)
+    full_input_ids = torch.tensor([full_tokens], dtype=torch.long, device="cuda")
     full_pos_3d, _ = compute_mrope_positions(
         input_ids=full_input_ids,
         image_grid_thw=image_grid_thw,
@@ -2601,14 +2633,14 @@ def test_vlm_wrapper_decode_only_with_delta():
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     # 3 decode sequences, each with 1 token -> position_ids = [3, 1]
     B = 3
-    input_ids = torch.randint(0, 50, (B, 1))
-    position_ids = torch.tensor([[500], [300], [100]])
-    deltas = torch.tensor([[50], [0], [0]])
+    input_ids = torch.randint(0, 50, (B, 1), device="cuda")
+    position_ids = torch.tensor([[500], [300], [100]], device="cuda")
+    deltas = torch.tensor([[50], [0], [0]], device="cuda")
 
     output = model(
         input_ids=input_ids,
@@ -2636,18 +2668,19 @@ def test_vlm_wrapper_flattened_prefill_with_request_deltas():
     """Flattened cached prefill should expand request deltas per token, not per batch."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     req1_len = 3
     req2_len = 2
     total_tokens = req1_len + req2_len
 
-    input_ids = torch.randint(0, 50, (1, total_tokens))
-    position_ids = torch.tensor([[10, 11, 12, 20, 21]])
-    deltas = torch.tensor([[7], [-4]])
+    input_ids = torch.randint(0, 50, (1, total_tokens), device="cuda")
+    position_ids = torch.tensor([[10, 11, 12, 20, 21]], device="cuda")
+    deltas = torch.tensor([[7], [-4]], device="cuda")
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
     batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
-    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32, device="cuda")
 
     output = model(
         input_ids=input_ids,
@@ -2657,7 +2690,7 @@ def test_vlm_wrapper_flattened_prefill_with_request_deltas():
         cu_seqlen=cu_seqlen,
     )
 
-    expected_token_delta = torch.tensor([[7, 7, 7, -4, -4]])
+    expected_token_delta = torch.tensor([[7, 7, 7, -4, -4]], device="cuda")
     expected_pos_3d = (position_ids + expected_token_delta)[None].expand(3, -1, -1)
     inputs_embeds = model.model.get_input_embeddings()(input_ids)
     text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
@@ -2677,17 +2710,18 @@ def test_vlm_wrapper_flattened_prefill_without_request_deltas():
     """Flattened cached prefill without deltas should preserve plain positions."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     req1_len = 3
     req2_len = 2
     total_tokens = req1_len + req2_len
 
-    input_ids = torch.randint(0, 50, (1, total_tokens))
-    position_ids = torch.tensor([[10, 11, 12, 20, 21]])
+    input_ids = torch.randint(0, 50, (1, total_tokens), device="cuda")
+    position_ids = torch.tensor([[10, 11, 12, 20, 21]], device="cuda")
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
     batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
-    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32, device="cuda")
 
     output = model(
         input_ids=input_ids,

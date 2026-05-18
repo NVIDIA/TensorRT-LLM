@@ -1970,6 +1970,10 @@ skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")
 
+skip_no_mxfp4_swizzle = pytest.mark.skipif(
+    check_device_contain(["H20"]) and not check_device_contain(["H200"]),
+    reason="nvbugs/5446119: MXFP4 swizzle not supported on H20")
+
 skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
                                    reason="This test is for SM120")
 
