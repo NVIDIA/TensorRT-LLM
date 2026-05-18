@@ -338,7 +338,7 @@ class PrefillOnlyEagleResourceManager:
         target_dtype: torch.dtype,
     ):
         # Buffer for hidden states from target model: [max_tokens, hidden_size * num_capture_layers]
-        # Uses flattened 2D format to match ADHiddenStateManager
+        # Uses the same flattened 2D format as hidden_states_cache_* runtime buffers.
         self.hidden_states = torch.empty(
             max_batch_size * (max_seq_len + max_draft_len),
             hidden_size * num_capture_layers,

@@ -287,8 +287,14 @@ class KvCacheCreator:
             effective_draft_config = self._get_effective_draft_config()
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
+                # Resolve draft manager class from draft config — may differ
+                # from target (e.g. hybrid target + plain transformer draft).
+                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+                    effective_draft_config,
+                    self._kv_cache_config,
+                    is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
-                    self._kv_cache_manager_cls, effective_draft_config)
+                    draft_kv_cache_manager_cls, effective_draft_config)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
@@ -1697,6 +1703,7 @@ def create_torch_sampler_args(
     disable_overlap_scheduler: bool,
     disable_flashinfer_sampling: bool,
     enable_async_worker: bool,
+    enable_speculative_beam_history_d2h: bool,
 ):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
@@ -1712,7 +1719,9 @@ def create_torch_sampler_args(
         max_beam_width=max_beam_width,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        enable_async_worker=enable_async_worker)
+        enable_async_worker=enable_async_worker,
+        enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
+    )
 
 
 def instantiate_sampler(
@@ -1741,6 +1750,8 @@ def instantiate_sampler(
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
         enable_async_worker=enable_async_worker,
+        enable_speculative_beam_history_d2h=llm_args.
+        enable_speculative_beam_history_d2h,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)

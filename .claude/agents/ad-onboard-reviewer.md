@@ -96,7 +96,7 @@ Mark as N/A with justification if the model doesn't have the relevant component.
 |---|-------|---------------|
 | G1 | **Block equivalence**: Tests individual blocks (MLP, Attention, MoE, Norm) comparing AD output vs HF output. Blocks with identical math (plain MLP, Norm) should use `torch.testing.assert_close` with tight tolerance. Blocks with fused custom ops (Attention with MLA/RoPE, MoE with fused routing) must use `assert_rmse_close` from `_model_test_utils` with appropriate `rmse_ratio_tol` (attention: 0.10, MoE: 0.02). | Look for per-block test functions loading same weights into both implementations; verify correct comparison function and tolerance |
 | G2 | **Layer equivalence**: Tests a full decoder layer (if model has heterogeneous layers like dense vs MoE, tests each type). Must use `assert_rmse_close` with `rmse_ratio_tol=0.05`. | Look for layer-level test with `assert_rmse_close` |
-| G3 | **Full model equivalence**: End-to-end logits comparison AD vs HF with same weights with minimum number layers. Must use `assert_rmse_close` with `rmse_ratio_tol=0.05`. Also, need to be able to run on CPU. | Look for full model test with logits `assert_rmse_close` |
+| G3 | **Full model equivalence**: End-to-end logits comparison AD vs HF with same weights with minimum number layers. Must use `assert_rmse_close` with `rmse_ratio_tol=0.05`. Must run on **GPU** (see section I). | Look for full model test with logits `assert_rmse_close` |
 | G4 | **Export test**: Uses `torch_export_to_gm` with `Dim.DYNAMIC` for both batch and sequence dimensions | Grep for `torch_export_to_gm` and `Dim.DYNAMIC` |
 | G6 | Export test runs a second forward with different shape to verify dynamic dims work | Look for a second input with different B, S values |
 
@@ -106,6 +106,18 @@ Mark as N/A with justification if the model doesn't have the relevant component.
 |---|-------|---------------|
 | H1 | If MoE model: has state_dict converter from HF stacked format to per-expert format | Look for conversion function |
 | H2 | Equivalence tests load identical weights into both HF and AD models before comparing | Check that `load_state_dict` is called with converted weights |
+
+### I. Test File — Device Placement
+
+| # | Check | How to verify |
+|---|-------|---------------|
+| I1 | Every model in a test is moved to GPU before forward | Grep for model construction; verify a follow-up `.cuda()` / `.to("cuda")` / `device="cuda"` kwarg |
+| I2 | Input tensors that feed a forward use `device="cuda"` | Grep `torch.tensor`/`zeros`/`ones`/`empty`/`full`/`arange`/`randn`/`rand`/`randint` in test bodies |
+| I3 | No `device = "cpu"`, no `torch.device("cpu")`, no `"cuda" if available else "cpu"` fallbacks | Grep for these patterns |
+| I4 | `@pytest.mark.parametrize("device", ...)` lists `"cuda"` only | Grep for `parametrize("device"` |
+| I5 | Host-metadata tensors that production keeps on CPU (e.g. `batch_info_host` and anything whose consumer calls `.numpy()`/`.item()`) stay on CPU. Tensors stored via `SequenceInfo._store_extra_arg(...)` are on `cuda` (it copies to device). | For each CPU tensor, find its consumer in `tensorrt_llm/_torch/auto_deploy/` and verify host-side access |
+| I6 | Reference tensors in `assert_close` / `assert_rmse_close` are on the same device as the model output | Inspect comparison call sites |
+| I7 | Only acceptable `.cpu()`: state-dict serialization | Grep `.cpu()` and verify each is on a state_dict op |
 
 ## Output Format
 
@@ -126,9 +138,18 @@ B3  PASS  modeling_foo.py:80 — AutoConfig.register("foo", FooConfig, exist_ok=
 === C. Ops & Compatibility ===
 ...
 
+=== I. Device Placement ===
+I1  PASS  models constructed with `.cuda()` (verified at lines 42, 78, 134)
+I2  PASS  forward inputs use `device="cuda"`
+I3  PASS  no CPU fallbacks
+I4  PASS  test_foo_modeling.py:340 — `parametrize("device", ["cuda"])`
+I5  N/A  no host-metadata tensors in this test
+I6  PASS  refs and outputs on cuda
+I7  N/A  no `.cpu()` calls
+
 === Summary ===
-PASSED: 22/26
-FAILED: 4/26
+PASSED: 29/33
+FAILED: 4/33
 
 Failed items requiring fixes:
 1. A3 — Forward signature missing position_ids parameter (modeling_foo.py:120)

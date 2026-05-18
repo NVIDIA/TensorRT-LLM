@@ -423,8 +423,13 @@ def submit_job(config, log_dir, dry_run):
     gen_pp_size = worker_config['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
-    ucx_warmup_requests = 2 * ctx_world_size * \
-        gen_world_size if benchmark_config['mode'] == "e2e" else 0
+
+    ctx_dp_size = ctx_tp_size if worker_config['ctx'].get(
+        'enable_attention_dp', False) else 1
+    gen_dp_size = gen_tp_size if worker_config['gen'].get(
+        'enable_attention_dp', False) else 1
+    ucx_warmup_requests = 2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size \
+        if benchmark_config['mode'] == "e2e" else 0
 
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node

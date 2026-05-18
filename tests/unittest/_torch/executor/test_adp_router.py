@@ -3,6 +3,8 @@
 Tests for:
 - RankState serialization/deserialization
 - ADPRouter interface and DefaultADPRouter
+- Piggybacking per-rank iter-stats payloads on the existing ADP allgather
+- Strict/relaxed attention-DP request routing while respecting rank capacity
 """
 
 from unittest.mock import MagicMock, Mock
@@ -16,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
     DefaultADPRouter,
     KVCacheAwareADPRouter,
+    RankIterStatsPayload,
     RankState,
 )
 
@@ -109,6 +112,8 @@ def all_ranks_num_active_tokens():
 
 
 class TestRankState:
+    # RankState is the wire payload shared across attention-DP ranks. Keep its
+    # serialization stable because iter-stats now ride on the same allgather.
     def test_creation(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
         assert state.rank == 0
@@ -117,7 +122,7 @@ class TestRankState:
 
     def test_serialize(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100]
+        assert state.serialize() == [0, 5, 100, 0, -1, 0, 0, 0, 0, 0, 0, 0]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -134,9 +139,22 @@ class TestRankState:
         state = RankState(rank=0)
         assert state.num_active_requests == 0
         assert state.num_active_tokens == 0
+        assert state.iter_stats.has_iter_stats == 0
+        assert state.iter_stats.iter_stats_iter == -1
+
+    def test_copy_iter_stats_from_clones_payload(self):
+        state = RankState(rank=0)
+        payload = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=7)
+
+        state.copy_iter_stats_from(payload)
+
+        assert state.iter_stats == payload
+        assert state.iter_stats is not payload
 
 
 class TestDefaultADPRouter:
+    # Router tests model strict placement, relaxed placement, and capacity
+    # handling so ADP ranks report consistent load and iter-stats state.
     def test_interface_compliance(self):
         router = DefaultADPRouter(dist=_mock_dist())
         assert isinstance(router, ADPRouter)
@@ -243,7 +261,39 @@ class TestDefaultADPRouter:
         assert len(states) == 2
         assert states[0] == RankState(rank=0, num_active_requests=1, num_active_tokens=10)
         assert states[1] == RankState(rank=1, num_active_requests=2, num_active_tokens=20)
-        dist.tp_allgather.assert_called_once_with([0, 1, 10])
+        dist.tp_allgather.assert_called_once_with(
+            RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
+        )
+
+    def test_gather_all_rank_states_piggybacks_iter_stats(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
+        pending = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=7,
+            num_context_requests=2,
+            num_ctx_tokens=128,
+            num_ctx_kv_tokens=16,
+            num_gen_requests=3,
+            num_gen_kv_tokens=1024,
+            num_paused_requests=1,
+            num_paused_kv_tokens=256,
+        )
+        expected_local = RankState(
+            rank=0,
+            num_active_requests=1,
+            num_active_tokens=10,
+            iter_stats=pending,
+        )
+        rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
+        dist.tp_allgather.return_value = [expected_local.serialize(), rank1.serialize()]
+
+        router = DefaultADPRouter(dist=dist)
+        req = Mock(py_orig_prompt_len=10)
+        states = router.gather_all_rank_states([req], iter_stats_payload=pending)
+
+        assert states[0] == expected_local
+        assert states[1] == rank1
+        dist.tp_allgather.assert_called_once_with(expected_local.serialize())
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(

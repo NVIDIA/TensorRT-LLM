@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import functools
 import os
 import platform
 import sys
@@ -352,8 +353,8 @@ class MnnvlMemory:
                 cls.current_mem_offset = 0
 
     @staticmethod
-    def support_nvlink(need_all_up: bool = True):
-        dev_id = torch.cuda.current_device()
+    @functools.cache
+    def support_nvlink(dev_id: int, need_all_up: bool = True):
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
@@ -381,7 +382,8 @@ class MnnvlMemory:
         # We check if it has all NVLink up now.
         # But it is not equivalent to MNNVL support.
         # May need better support check.
-        support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
+        dev_id = torch.cuda.current_device()
+        support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
 
 

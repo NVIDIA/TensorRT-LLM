@@ -350,15 +350,21 @@ def _find_inv_freq_tensor(
 
 
 def _unwrap_contiguous(node: Node) -> Node:
-    """Skip past any chain of ``contiguous`` calls, in either ``aten``
-    overload form or the Python-level ``Tensor.contiguous`` method form."""
+    """Skip past any chain of ``contiguous`` calls in any form the graph may
+    emit: the ``aten.contiguous.default`` overload, a ``call_function`` to
+    ``Tensor.contiguous``, or a ``call_method`` with target ``"contiguous"``
+    (which is what ``fuse_gemms_mixed_children`` emits via
+    ``graph.call_method("contiguous", ...)``)."""
     current = node
-    while isinstance(current, Node) and current.op == "call_function":
-        is_aten_contig = is_op(current, torch.ops.aten.contiguous.default)
-        is_method_contig = getattr(current.target, "__name__", "") == "contiguous"
-        if not (is_aten_contig or is_method_contig):
+    while isinstance(current, Node):
+        is_method_contig = current.op == "call_method" and current.target == "contiguous"
+        is_function_contig = current.op == "call_function" and (
+            is_op(current, torch.ops.aten.contiguous.default)
+            or getattr(current.target, "__name__", "") == "contiguous"
+        )
+        if not (is_method_contig or is_function_contig):
             break
-        if not isinstance(current.args[0], Node):
+        if not current.args or not isinstance(current.args[0], Node):
             break
         current = current.args[0]
     return current
@@ -392,6 +398,9 @@ def _try_trace_to_fused_qkv(
         view_shape = current.args[1] if len(current.args) > 1 else None
         if not isinstance(view_input, Node):
             return None
+        # The view may sit on top of a ``.contiguous()`` introduced by
+        # GEMM fusion; peel it off before checking for the getitem split.
+        view_input = _unwrap_contiguous(view_input)
         if not isinstance(view_shape, (list, tuple)) or len(view_shape) < 4:
             return None
         nh, hd = view_shape[2], view_shape[3]
@@ -427,6 +436,10 @@ def _try_trace_to_fused_qkv(
         view_shape = current.args[1] if len(current.args) > 1 else None
         if not isinstance(view_input, Node):
             return None
+        # ``fuse_gemms_mixed_children`` emits ``narrow → contiguous → view``,
+        # where the contiguous is a ``call_method`` node.  Peel any
+        # contiguous(s) sitting between the view and the narrow.
+        view_input = _unwrap_contiguous(view_input)
         if not isinstance(view_shape, (list, tuple)) or len(view_shape) < 4:
             return None
         hd = view_shape[3]

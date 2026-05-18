@@ -471,6 +471,17 @@ class TestComprehensiveSamplingParamsConversion:
         assert params.embedding_bias is not None
         assert len(params.embedding_bias) == 12
 
+    def test_embedding_bias_must_match_vocab_size(self):
+        """Embedding bias is rejected when it cannot match model vocabulary."""
+        with pytest.raises(ValueError, match="embedding_bias length"):
+            create_sampling_params_from_proto(
+                proto_config=pb2.SamplingConfig(),
+                output_config=pb2.OutputConfig(),
+                max_tokens=16,
+                embedding_bias=[0.0, 0.0, 0.0],
+                vocab_size=4,
+            )
+
     def test_ignore_eos_flag(self):
         """Test that ignore_eos=True correctly sets ignore_eos on SamplingParams."""
         proto_config = pb2.SamplingConfig(temperature=0.7)

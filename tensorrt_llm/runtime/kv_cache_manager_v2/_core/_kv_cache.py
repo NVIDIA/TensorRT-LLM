@@ -23,7 +23,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
-from .._block_radix_tree import Block, RootBlock, UselessBlockError
+from .._block_radix_tree import Block, ReuseScope, RootBlock, UselessBlockError
 from .._common import (
     BAD_BLOCK_ORDINAL,
     BAD_PAGE_INDEX,
@@ -171,7 +171,7 @@ class _KVCache:
     __slots__ = (
         "id",
         "_manager",
-        "_lora_task_id",
+        "_reuse_scope",
         "_get_priority",
         "_cuda_stream",
         "_status",
@@ -199,7 +199,7 @@ class _KVCache:
 
     id: int | None
     _manager: "KVCacheManager"
-    _lora_task_id: int | None
+    _reuse_scope: ReuseScope
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
     _status: _Status
@@ -240,14 +240,14 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
+        reuse_scope: ReuseScope,
         input_tokens: Sequence[TokenIdExt] | None,
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
     ):
         self.id = id
         self._manager = manager
-        self._lora_task_id = lora_task_id
+        self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
         self._status = self.Status.SUSPENDED
@@ -1040,7 +1040,7 @@ class _KVCache:
             raise LogicError("Cannot commit block that is not full except last block")
         prev: RootBlock | Block
         if ordinal == 0:
-            prev = self.manager._radix_tree.add_or_get_existing(self._lora_task_id)
+            prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
         try:
@@ -1394,10 +1394,9 @@ class _KVCache:
 
     def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]) -> None:
         manager = self.manager
-        lora_task_id = self._lora_task_id
         matched = list(
             manager._radix_tree.match(
-                lora_task_id, input_tokens or [], manager.enable_partial_match
+                self._reuse_scope, input_tokens or [], manager.enable_partial_match
             )
         )
         tokens_per_block = manager.tokens_per_block

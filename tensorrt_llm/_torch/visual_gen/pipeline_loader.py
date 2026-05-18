@@ -115,6 +115,7 @@ class PipelineLoader:
                 ring_size=self.args.parallel.dit_ring_size,
                 attn2d_row_size=self.args.parallel.dit_attn2d_row_size,
                 attn2d_col_size=self.args.parallel.dit_attn2d_col_size,
+                parallel_vae_size=self.args.parallel.parallel_vae_size,
                 order=self.args.parallel.dit_dim_order,
             )
         else:
@@ -225,7 +226,7 @@ class PipelineLoader:
         # =====================================================================
 
         t0 = time.time()
-        if config.enable_parallel_vae:
+        if config.parallel.parallel_vae_size > 1:
             pipeline.setup_parallel_vae()
 
         if hasattr(pipeline, "post_load_weights"):

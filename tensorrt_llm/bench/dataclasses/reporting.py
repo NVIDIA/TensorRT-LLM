@@ -85,7 +85,60 @@ class StatsKeeper:
         """Set the total energy for the benchmark."""
         self.total_energy = energy
 
-    def generate_statistics_summary(self, max_draft_tokens: int) -> None:
+    @staticmethod
+    def _compute_batch_full_output_throughput(
+            requests: List[RequestRecord], batch_size: int) -> Optional[float]:
+        """Estimate output token throughput while active requests fill a batch.
+
+        Request records do not carry per-token timestamps, so output tokens are
+        prorated uniformly over each request's start/end interval.  This keeps
+        the existing end-to-end throughput while adding a steady-state view that
+        excludes the final drain phase when active requests drop below
+        ``batch_size``.
+        """
+        if batch_size <= 0:
+            return None
+
+        events: Dict[int, tuple[int, float]] = {}
+        for request in requests:
+            start = request.start_timestamp
+            end = request.end_timestamp
+            if end <= start:
+                continue
+            token_rate = request.num_total_output_tokens / (end - start)
+            start_request_delta, start_rate_delta = events.get(start, (0, 0.0))
+            events[start] = (start_request_delta + 1,
+                             start_rate_delta + token_rate)
+            end_request_delta, end_rate_delta = events.get(end, (0, 0.0))
+            events[end] = (end_request_delta - 1, end_rate_delta - token_rate)
+
+        if not events:
+            return None
+
+        active_requests = 0
+        active_token_rate = 0.0
+        batch_full_duration_ns = 0
+        batch_full_output_tokens = 0.0
+        last_timestamp = None
+        for timestamp in sorted(events):
+            if (last_timestamp is not None and timestamp > last_timestamp
+                    and active_requests >= batch_size):
+                duration_ns = timestamp - last_timestamp
+                batch_full_duration_ns += duration_ns
+                batch_full_output_tokens += active_token_rate * duration_ns
+
+            request_delta, rate_delta = events[timestamp]
+            active_requests += request_delta
+            active_token_rate += rate_delta
+            last_timestamp = timestamp
+
+        if batch_full_duration_ns <= 0:
+            return None
+
+        return batch_full_output_tokens / batch_full_duration_ns
+
+    def generate_statistics_summary(self, max_draft_tokens: int,
+                                    batch_size: int) -> BenchmarkStatistics:
         """Generate summary statistics from internally stored statistics.
 
         Returns:
@@ -154,11 +207,14 @@ class StatsKeeper:
         acceptance_length_percentiles = PercentileStats.from_iterable(
             acceptance_length) if acceptance_length else None
 
+        requests = list(self.requests.values())
         stats = BenchmarkStatistics(
             num_requests=num_requests,
             total_latency_ns=end_time - start_time,
             total_output_tokens=sum(output_tokens),
             total_input_tokens=total_input_tokens,
+            batch_full_output_throughput_tok_ns=self.
+            _compute_batch_full_output_throughput(requests, batch_size),
             total_energy=self.total_energy,
             request_latency_percentiles=PercentileStats.from_iterable(
                 request_latencies),
@@ -209,7 +265,8 @@ class ReportUtility:
         self.kwargs = kwargs
         self.raw_statistics = statistics
         self.statistics = statistics.generate_statistics_summary(
-            self.get_max_draft_len())
+            self.get_max_draft_len(),
+            self.rt_cfg.settings_config.max_batch_size)
         self.streaming = streaming
 
     def _query_gpu_info(self) -> Dict[str, Any]:
@@ -273,6 +330,13 @@ class ReportUtility:
     def output_throughput_tok_s(self) -> float:
         """Output throughput in tokens per second."""
         return self.convert_rate_to_s(self.statistics.output_throughput_tok_ns)
+
+    @property
+    def batch_full_output_throughput_tok_s(self) -> Optional[float]:
+        """Estimated output throughput while active requests fill a batch."""
+        throughput = self.statistics.batch_full_output_throughput_tok_ns
+        return self.convert_rate_to_s(
+            throughput) if throughput is not None else None
 
     @property
     def total_token_throughput_tok_s(self) -> float:
@@ -428,6 +492,9 @@ class ReportUtility:
             # Output throughput (total output (OSL) tokens / end-to-end latency)
             "system_output_throughput_tok_s":
             self.output_throughput_tok_s,
+            # Estimated output throughput while active requests fill a batch.
+            "batch_full_output_throughput_tok_s":
+            self.batch_full_output_throughput_tok_s,
             # Output throughput per user (average per request output throughput)
             "system_total_throughput_tok_s":
             self.total_token_throughput_tok_s,
@@ -647,9 +714,15 @@ class ReportUtility:
             "= PERFORMANCE OVERVIEW \n"
             "===========================================================\n")
 
+        batch_full_output_throughput = perf[
+            "batch_full_output_throughput_tok_s"]
+        batch_full_output_throughput_text = (
+            f"{batch_full_output_throughput:.4f}"
+            if batch_full_output_throughput is not None else "N/A")
         perf_stats = (
             f"Request Throughput (req/sec):                     {perf['request_throughput_req_s']:.4f}\n"
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
+            f"Batch-Full Output Throughput (tokens/sec):        {batch_full_output_throughput_text}\n"
             f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"

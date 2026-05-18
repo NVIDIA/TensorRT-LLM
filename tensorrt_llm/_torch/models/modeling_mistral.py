@@ -1,6 +1,6 @@
 import copy
 import dataclasses
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 import torchvision
@@ -22,9 +22,10 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
     MistralWeightMapper
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalEncoderOutput, MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    _MULTIMODAL_ENV_NAME, _is_disagg, find_input_mm_embeds, fuse_input_embeds,
-    get_multimodal_embeddings)
+    _MULTIMODAL_ENV_NAME, _is_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -548,7 +549,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.STRING,
     ))
-class Mistral3VLM(PreTrainedModel):
+class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     """Mistral3VLM implementation for TRTLLM.
 
     NOTE: for the time being, image tokens are only placed after the text (see
@@ -662,6 +663,18 @@ class Mistral3VLM(PreTrainedModel):
         )
 
     @property
+    def language_model(self) -> torch.nn.Module:
+        return self.llm
+
+    @property
+    def multimodal_token_ids(self) -> torch.Tensor:
+        return self._image_token_ids
+
+    @property
+    def text_embedding_layer(self) -> torch.nn.Module:
+        return self.llm.model.embed_tokens
+
+    @property
     def draft_config(self):
         return self.llm.draft_config
 
@@ -680,49 +693,92 @@ class Mistral3VLM(PreTrainedModel):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
+    def encode_multimodal_inputs(
+        self,
+        multimodal_params: Sequence[MultimodalParams],
+        **encoder_kwargs: Any,
+    ) -> MultimodalEncoderOutput:
+        mm_embeds = self._vision_forward(list(multimodal_params))
+        if len(mm_embeds) != 1:
+            raise ValueError(
+                f"Expected Mistral vision encoder to return 1 tensor, got {len(mm_embeds)}."
+            )
+        return MultimodalEncoderOutput(embeddings=mm_embeds[0])
+
+    def get_language_model_forward_kwargs(
+        self,
+        *,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        mm_inputs: PreparedLlmInputs,
+        return_context_logits: bool,
+        spec_metadata: SpecMetadata | None,
+        resource_manager: Any | None,
+    ) -> dict[str, Any]:
+        return {
+            "attn_metadata": attn_metadata,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            "return_context_logits": return_context_logits,
+            "spec_metadata": spec_metadata,
+            "resource_manager": resource_manager,
+        }
+
     @torch.inference_mode()
     def forward(
         self,
         attn_metadata: AttentionMetadata,
         input_ids: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
         return_context_logits: bool = False,
         spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward method."""
-        num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
+        num_context_requests = attn_metadata.num_contexts
+        # multimodal_params is consumed by prepare_multimodal_inputs; remove it
+        # from passthrough kwargs to avoid rebinding it via **kwargs.
+        multimodal_params = kwargs.pop("multimodal_params", [])
 
-        multimodal_params = kwargs.get("multimodal_params", [])
-        mm_embeds = []
-        multimodal_params_len = len(multimodal_params)
-        if multimodal_params_len > 0:
-            mm_embeds = get_multimodal_embeddings(
-                encoder_forward_fn=self._vision_forward,
-                multimodal_params=multimodal_params[:num_context_requests],
-            )
-            mm_embeds = find_input_mm_embeds(
-                mm_embeds, multimodal_params[:num_context_requests])
-
-        with nvtx_range("[mistral] Fuse input embeds"):
-            input_ids, inputs_embeds = fuse_input_embeds(
-                embedding_layer=self.llm.model.embed_tokens,
-                input_ids=input_ids,
-                mm_embeds=mm_embeds,
-                mm_token_ids=self._image_token_ids,
-                **kwargs,
-            )
-
-        return self.llm.forward(
-            attn_metadata=attn_metadata,
+        mm_inputs = self.prepare_multimodal_inputs(
             input_ids=input_ids,
+            positions=position_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=num_context_requests,
+            attn_metadata=attn_metadata,
+            **kwargs,
+        )
+        if inputs_embeds is not None:
+            if mm_inputs.inputs_embeds is not None:
+                # The caller supplied pre-computed inputs_embeds while the
+                # multimodal pipeline also produced fused embeds. Refuse to
+                # silently drop one or the other; let the caller resolve it.
+                raise ValueError(
+                    "Mistral3VLM.forward received both caller-supplied inputs_embeds "
+                    "and multimodal-derived inputs_embeds. These paths are mutually "
+                    "exclusive; pass at most one.")
+            mm_inputs = PreparedLlmInputs(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                extra_embeds=mm_inputs.extra_embeds,
+            )
+
+        llm_kwargs = self.get_language_model_forward_kwargs(
+            attn_metadata=attn_metadata,
+            input_ids=mm_inputs.input_ids,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=mm_inputs.inputs_embeds,
+            mm_inputs=mm_inputs,
             return_context_logits=return_context_logits,
             spec_metadata=spec_metadata,
-            resource_manager=kwargs.get('resource_manager'),
+            resource_manager=kwargs.get("resource_manager"),
         )
+
+        return self.language_model.forward(**llm_kwargs)
 
     @staticmethod
     def _get_sub_model_config(
@@ -771,7 +827,7 @@ class Mistral3VLM(PreTrainedModel):
         return sub_model_config
 
     # NOTE: this is defined as a separate method with this specific signature in order to be compatible
-    # with `get_multimodal_embeddings`.
+    # with `get_multimodal_embeddings` callers.
     def _vision_forward(
             self,
             multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
