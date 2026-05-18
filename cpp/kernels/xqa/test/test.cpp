@@ -1162,7 +1162,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #if SPEC_DEC
                         for (uint32_t i = 0; i < runtimeHeadGrpSize; i++)
 #else
-                    for (uint32_t i = 0; i < headGrpSize; i++)
+                    uint32_t constexpr headsToCheck = IS_MLA ? runtimeHeadGrpSize : headGrpSize;
+                    for (uint32_t i = 0; i < headsToCheck; i++)
 #endif
                         {
                             for (uint32_t j = 0; j < validElemsPerVHead; j++)
@@ -1280,7 +1281,7 @@ TEST(RefCheck, mlaShortContextManySubSeq)
 {
     setenv("XQA_MLA_SEPARATE_REDUCE", "1", 1);
     setenv("XQA_NB_SUB_SEQ", "188", 1);
-    runTest<1>(1, 1, false, true, true);
+    runTest<1, 8>(1, 1, false, true, true);
     unsetenv("XQA_NB_SUB_SEQ");
     unsetenv("XQA_MLA_SEPARATE_REDUCE");
 }
