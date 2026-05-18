@@ -33,9 +33,10 @@ shared perf regression pipeline. It is responsible for:
 | `REGRESSION_METRICS` | `d_median_generation` |
 
 Latency and generation metrics are read from the VisualGen benchmark JSON in
-seconds. Latency includes media encoding and persistence overhead, while
-median generation tracks the typical engine-side generation time used for
-regression checks.
+seconds. Latency includes media encoding and persistence overhead, while median
+generation tracks the typical engine-side generation time used for regression
+checks. Online benchmarks receive generation timing from the VisualGen serving
+`Server-Timing` response header and store it in the result JSON.
 
 ## Match Keys
 

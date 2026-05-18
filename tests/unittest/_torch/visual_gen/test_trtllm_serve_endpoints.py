@@ -27,6 +27,7 @@ from PIL import Image
 
 from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
+from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 
@@ -66,6 +67,21 @@ def _run_async(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+def _make_dummy_metrics() -> VisualGenMetrics:
+    return VisualGenMetrics(
+        generation=1.25,
+        pre_denoise=0.125,
+        denoise=0.75,
+        post_denoise=0.375,
+    )
+
+
+def _assert_visual_gen_server_timing(headers) -> None:
+    server_timing = headers[SERVER_TIMING_HEADER]
+    assert "generation;dur=1250.000000" in server_timing
+    assert "denoise;dur=750.000000" in server_timing
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +137,7 @@ class MockVisualGen:
             image=self._maybe_batch(self._image, n),
             video=self._maybe_batch(self._video, n),
             audio=self._audio,
-            metrics=VisualGenMetrics(),
+            metrics=_make_dummy_metrics(),
         )
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
@@ -192,7 +208,7 @@ class MockVisualGenResult:
             image=self._image,
             video=self._video,
             audio=self._audio,
-            metrics=VisualGenMetrics(),
+            metrics=_make_dummy_metrics(),
         )
 
     def result(self, timeout=None):
@@ -203,7 +219,7 @@ class MockVisualGenResult:
             image=self._image,
             video=self._video,
             audio=self._audio,
-            metrics=VisualGenMetrics(),
+            metrics=_make_dummy_metrics(),
         )
 
 
@@ -329,6 +345,7 @@ class TestImageGeneration:
             },
         )
         assert resp.status_code == 200
+        _assert_visual_gen_server_timing(resp.headers)
         data = resp.json()
         assert "data" in data
         assert len(data["data"]) >= 1
@@ -614,6 +631,7 @@ class TestVideoGenerationSync:
         )
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "video/mp4"
+        _assert_visual_gen_server_timing(resp.headers)
         assert len(resp.content) > 0
 
     def test_sync_video_generation_with_params(self, video_client):

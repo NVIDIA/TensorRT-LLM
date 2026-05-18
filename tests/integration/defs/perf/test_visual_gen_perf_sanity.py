@@ -562,6 +562,11 @@ class VisualGenPerfSanityTestConfig:
                         f"Missing {percentile} {metric_name} in benchmark result {result_path}"
                     )
 
+        for latency_metric in ("mean_latency", "median_latency"):
+            latency_value = float(result_data[latency_metric])
+            if not math.isfinite(latency_value) or latency_value <= 0:
+                raise ValueError(f"Invalid {latency_metric} in benchmark result {result_path}")
+
         for generation_metric in ("mean_generation", "median_generation"):
             generation_value = float(result_data[generation_metric])
             if not math.isfinite(generation_value) or generation_value <= 0:
