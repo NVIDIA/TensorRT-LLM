@@ -564,7 +564,8 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "model_id",
         [
-            "bf16",
+            pytest.param("bf16",
+                         marks=pytest.mark.skip_less_device_memory(80000)),
             pytest.param("fp8", marks=skip_pre_hopper),
             pytest.param("nvfp4", marks=skip_pre_blackwell),
         ],
