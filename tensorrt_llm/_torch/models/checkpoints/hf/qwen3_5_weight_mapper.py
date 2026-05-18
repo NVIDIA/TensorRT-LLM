@@ -46,9 +46,6 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
     _SPLIT_PROJ_PATTERN = re.compile(r"^(.*\.linear_attn)\.in_proj_(qkv|q|k|v|z|b|a)\.(.+)$")
     _SUPPORTED_SUFFIXES = {"weight", "bias", "weight_scale_inv"}
-    _DENSE_MLP_PATTERN = re.compile(
-        r"^((?:model|mtp)\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj|gate_up_proj)(\..+)$"
-    )
 
     def _normalize_weight_names(self, weights: dict) -> dict:
         normalized_weights = {}
@@ -287,21 +284,6 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
         return packed_weights
 
-    def _remap_dense_mlp_weights(self, weights: dict) -> dict:
-        """Insert extra .mlp. into dense MLP weight keys.
-
-        _DenseMlpAdapter wraps GatedMLP as self.mlp, so named_modules() reports
-        model|mtp.layers.N.mlp.mlp.* while the checkpoint has model|mtp.layers.N.mlp.*.
-        """
-        remapped_weights = {}
-        for name, tensor in weights.items():
-            match = self._DENSE_MLP_PATTERN.match(name)
-            if match:
-                remapped_weights[f"{match.group(1)}.mlp.{match.group(2)}{match.group(3)}"] = tensor
-            else:
-                remapped_weights[name] = tensor
-        return remapped_weights
-
     def preprocess_weights(self, weights: dict) -> dict:
         normalized_weights = self._normalize_weight_names(weights)
         is_modelopt_ckpt, normalized_weights = self._preprocess_modelopt_ckpt(normalized_weights)
@@ -309,8 +291,5 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         packed_weights = self._pack_split_projections(normalized_weights)
         if not is_modelopt_ckpt:
             packed_weights = self._dequantize_linear_attn_fp8_qkvz(packed_weights)
-
-        if not getattr(self.config.pretrained_config, "num_experts", 0):
-            packed_weights = self._remap_dense_mlp_weights(packed_weights)
 
         return super().preprocess_weights(packed_weights)
