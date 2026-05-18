@@ -190,7 +190,7 @@ size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens, int max_num_sequences
         int const multi_block_count
             = computeMultiBlockCountForMLA(max_num_sequences, max_attention_window_size, mMultiProcessorCount);
         int const head_group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
-        int const kernel_head_group_size = getXqaMlaKernelHeadGrpSize(head_group_size);
+        int const kernel_head_group_size = getXqaMlaRuntimeKernelHeadGrpSize(head_group_size);
         kernel_scratch_size = static_cast<size_t>(multi_block_count) * max_num_tokens
             * (getXqaMlaCgaXBufSize(kernel_head_group_size) + getXqaMlaPartialResultSize(kernel_head_group_size));
         if (head_group_size < kernel_head_group_size)

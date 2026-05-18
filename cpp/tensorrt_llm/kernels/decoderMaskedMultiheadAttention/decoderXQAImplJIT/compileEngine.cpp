@@ -19,11 +19,13 @@
 #include "nvrtcWrapper/include/nvrtcWrapper.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -90,7 +92,7 @@ CubinObj CompileEngine::compile() const
     }
     bool const isMlaKernel = mXqaParams.isMLA();
     uint32_t const numQHeadsOverKv = static_cast<uint32_t>(mXqaParams.num_q_heads / mXqaParams.num_kv_heads);
-    uint32_t const kernelMlaHeadGrpSize = getXqaMlaKernelHeadGrpSize(numQHeadsOverKv);
+    uint32_t const kernelMlaHeadGrpSize = getXqaMlaRuntimeKernelHeadGrpSize(numQHeadsOverKv);
     tllmXqaJitContext context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
         /*num_q_heads=*/static_cast<uint32_t>(isMlaKernel ? kernelMlaHeadGrpSize : mXqaParams.num_q_heads),
@@ -119,6 +121,12 @@ CubinObj CompileEngine::compile() const
             && c.fp8_output == false && !c.use_input_kv && ropeStyle == TLLM_XQA_JIT_ROPE_NONE);
     }
 
+    auto const compileStart = std::chrono::steady_clock::now();
+    TLLM_LOG_DEBUG(
+        "Compiling JIT XQA cubin: sm=%d kernel_type=%d head_size=%u runtime_head_grp=%u kernel_head_grp=%u "
+        "tokens_per_block=%u q_seq_len=%u beam_width=%u",
+        mSM, static_cast<int>(context.kernel_type), context.head_size, numQHeadsOverKv, context.num_q_heads,
+        context.tokens_per_block, context.q_seq_len, context.beam_width);
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitCreateAndCompileProgram(&program, &context));
 
     size_t cubinSize;
@@ -127,6 +135,11 @@ CubinObj CompileEngine::compile() const
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitGetCUBIN(program, const_cast<char*>(cubinContent.c_str())));
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitDestroyProgram(&program));
+    auto const compileEnd = std::chrono::steady_clock::now();
+    auto const compileMs = std::chrono::duration_cast<std::chrono::milliseconds>(compileEnd - compileStart).count();
+    TLLM_LOG_DEBUG(
+        "Compiled JIT XQA cubin: sm=%d kernel_type=%d kernel_head_grp=%u cubin_size=%zu compile_ms=%lld",
+        mSM, static_cast<int>(context.kernel_type), context.num_q_heads, cubinSize, static_cast<long long>(compileMs));
 
     return CubinObj(cubinContent);
 }
