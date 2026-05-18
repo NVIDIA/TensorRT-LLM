@@ -32,6 +32,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..distributed.ops import allgather
 from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
@@ -117,55 +118,76 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             or _env_enabled("TLLM_DRAFT_RDMA_OFFLOAD_V2")
         )
         self._rdma_v2_offload_layer = None
+        self._rdma_offload_owner_tp_rank = 0
+        self._rdma_offload_is_owner = (
+            getattr(mapping, "tp_rank", 0) == self._rdma_offload_owner_tp_rank
+            and getattr(mapping, "pp_rank", 0) == 0
+            and getattr(mapping, "cp_rank", 0) == 0
+        )
         if self._rdma_offload_enabled:
-            if getattr(mapping, "tp_size", 1) != 1 or getattr(mapping, "pp_size", 1) != 1:
+            if getattr(mapping, "pp_size", 1) != 1 or getattr(mapping, "cp_size", 1) != 1:
                 raise RuntimeError(
                     "RDMA draft offload target path currently supports only "
-                    "single-rank TP/PP. Disable draft_offload_enabled for "
-                    "multi-rank runs."
+                    "single-rank PP/CP. TP is supported by routing draft "
+                    "offload through TP rank 0."
                 )
             if not self._rdma_offload_v2:
                 raise RuntimeError("RDMA draft offload requires draft_offload_v2=True")
-            from .ibverbs_draft_offload import IbverbsDraftOffloadConfig, IbverbsDraftOffloadLayer
-
-            self._rdma_v2_offload_layer = IbverbsDraftOffloadLayer(
-                IbverbsDraftOffloadConfig(
-                    nic_name=getattr(spec_config, "draft_offload_nic_name", "mlx5_0"),
-                    server_host=getattr(spec_config, "draft_offload_server_host", "127.0.0.1"),
-                    server_port=int(getattr(spec_config, "draft_offload_server_port", 47000)),
-                    remote_peer_name=getattr(
-                        spec_config, "draft_offload_v2_remote_peer_name", "draft_lpu"
-                    ),
-                    max_num_requests=int(
-                        getattr(spec_config, "draft_offload_v2_max_num_requests", 256)
-                    ),
-                    max_draft_len=int(spec_config.max_draft_len),
-                    transport=str(getattr(spec_config, "draft_offload_v2_transport", "ibverbs")),
-                    draft_model_path=getattr(spec_config, "draft_offload_v2_model_path", None),
-                    draft_model_dtype=str(
-                        getattr(spec_config, "draft_offload_v2_model_dtype", "bfloat16")
-                    ),
-                    draft_kv_cache_free_fraction=float(
-                        getattr(spec_config, "draft_offload_v2_kv_cache_free_fraction", 0.4)
-                    ),
-                    tcp_prompt_port=int(
-                        getattr(spec_config, "draft_offload_v2_tcp_prompt_port", 0)
-                    ),
+            if self._rdma_offload_is_owner:
+                from .ibverbs_draft_offload import (
+                    IbverbsDraftOffloadConfig,
+                    IbverbsDraftOffloadLayer,
                 )
-            )
+
+                self._rdma_v2_offload_layer = IbverbsDraftOffloadLayer(
+                    IbverbsDraftOffloadConfig(
+                        nic_name=getattr(spec_config, "draft_offload_nic_name", "mlx5_0"),
+                        server_host=getattr(spec_config, "draft_offload_server_host", "127.0.0.1"),
+                        server_port=int(getattr(spec_config, "draft_offload_server_port", 47000)),
+                        remote_peer_name=getattr(
+                            spec_config, "draft_offload_v2_remote_peer_name", "draft_lpu"
+                        ),
+                        max_num_requests=int(
+                            getattr(spec_config, "draft_offload_v2_max_num_requests", 256)
+                        ),
+                        max_draft_len=int(spec_config.max_draft_len),
+                        transport=str(
+                            getattr(spec_config, "draft_offload_v2_transport", "ibverbs")
+                        ),
+                        draft_model_path=getattr(spec_config, "draft_offload_v2_model_path", None),
+                        draft_model_dtype=str(
+                            getattr(spec_config, "draft_offload_v2_model_dtype", "bfloat16")
+                        ),
+                        draft_kv_cache_free_fraction=float(
+                            getattr(spec_config, "draft_offload_v2_kv_cache_free_fraction", 0.4)
+                        ),
+                        tcp_prompt_port=int(
+                            getattr(spec_config, "draft_offload_v2_tcp_prompt_port", 0)
+                        ),
+                    )
+                )
             logger.info(
                 "DraftTarget RDMA-v2 (izzy compatible) enabled: host=%s port=%s nic=%s "
-                "max_num_requests=%s max_draft_len=%s",
+                "max_num_requests=%s max_draft_len=%s owner_tp_rank=%s local_tp_rank=%s",
                 spec_config.draft_offload_server_host,
                 spec_config.draft_offload_server_port,
                 spec_config.draft_offload_nic_name,
                 spec_config.draft_offload_v2_max_num_requests,
                 spec_config.max_draft_len,
+                self._rdma_offload_owner_tp_rank,
+                getattr(mapping, "tp_rank", 0),
             )
 
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _tp_broadcast_offload_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if getattr(self.mapping, "tp_size", 1) == 1:
+            return tensor
+        gathered = allgather(tensor.contiguous(), self.mapping, dim=0)
+        rows = int(tensor.shape[0])
+        return gathered[:rows].contiguous()
 
     def _prepare_attn_metadata_for_draft_target(
         self,
@@ -291,6 +313,13 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                 next_draft_tokens = torch.zeros(
                     (batch_size, self.max_draft_len), dtype=torch.int32, device=logits.device
                 )
+            elif not self._rdma_offload_is_owner:
+                # In TP runs, only TP rank 0 owns the offload channel and talks
+                # to the draft server.  Other TP ranks participate in the
+                # collective below and receive rank 0's draft tokens.
+                next_draft_tokens = torch.zeros(
+                    (batch_size, self.max_draft_len), dtype=torch.int32, device=logits.device
+                )
             else:
                 next_draft_tokens = self._rdma_offload_draft_tokens(
                     accepted_tokens=accepted_tokens,
@@ -302,6 +331,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     input_ids=input_ids,
                     attn_metadata=attn_metadata,
                 )
+            next_draft_tokens = self._tp_broadcast_offload_tensor(next_draft_tokens)
             next_new_tokens = self._prepare_next_new_tokens(
                 accepted_tokens,
                 next_draft_tokens,

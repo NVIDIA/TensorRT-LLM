@@ -30,6 +30,7 @@ import json
 import os
 import socket
 import threading
+import time
 
 
 def main() -> int:
@@ -53,6 +54,12 @@ def main() -> int:
     )
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--max-draft-len", type=int, default=4)
+    ap.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Target model tensor parallel size.",
+    )
     ap.add_argument(
         "--transport",
         choices=["tcp", "ibverbs", "doca"],
@@ -243,6 +250,7 @@ def main() -> int:
             model=args.target_model,
             kv_cache_config=common_kv,
             cuda_graph_config=None,
+            tensor_parallel_size=args.tp_size,
         )
     else:
         spec_kwargs = dict(
@@ -268,6 +276,7 @@ def main() -> int:
             speculative_config=spec,
             kv_cache_config=common_kv,
             cuda_graph_config=None,
+            tensor_parallel_size=args.tp_size,
         )
 
     if early_init_thread is not None:
@@ -280,14 +289,25 @@ def main() -> int:
         temperature=0.0,
         top_p=1.0,
     )
+    start_time = time.perf_counter()
     outputs = llm.generate([generation_prompt], sampling_params=sampling)
+    elapsed = max(time.perf_counter() - start_time, 1e-9)
     out = outputs[0].outputs[0]
+    generated_tokens = len(out.token_ids)
+    tokens_per_sec = generated_tokens / elapsed
     pearl_trace_log(
         "target",
         "run_finish",
         generated_token_ids=[int(t) for t in out.token_ids],
         decoded_text=out.text,
+        generated_tokens=int(generated_tokens),
+        elapsed_sec=float(elapsed),
+        tokens_per_sec=float(tokens_per_sec),
     )
+    print("=== performance ===")
+    print(f"generated_tokens: {generated_tokens}")
+    print(f"elapsed_sec: {elapsed:.3f}")
+    print(f"tokens_per_sec: {tokens_per_sec:.2f}")
     print("=== generated token_ids ===")
     print(list(out.token_ids))
     print("=== decoded text ===")

@@ -44,6 +44,7 @@ from __future__ import annotations
 import socket
 import struct
 import threading
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -148,7 +149,11 @@ class _TcpRdmaBackend:
             self._recv_thread.start()
             self._started = True
             return EndpointStatus.kOk
-        except Exception:
+        except Exception as exc:
+            print(
+                "[tcp-endpoint] start failed: %r\n%s" % (exc, traceback.format_exc()),
+                flush=True,
+            )
             self._cleanup()
             return EndpointStatus.kError
 
