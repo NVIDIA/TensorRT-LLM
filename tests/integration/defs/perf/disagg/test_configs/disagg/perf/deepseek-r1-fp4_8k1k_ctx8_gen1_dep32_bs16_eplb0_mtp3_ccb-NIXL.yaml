@@ -81,7 +81,7 @@ worker_config:
     num_postprocess_workers: 4
     speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
   ctx:
     max_batch_size: 1
     max_num_tokens: 8448
@@ -102,4 +102,4 @@ worker_config:
       backend: NIXL
     speculative_config:
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      max_draft_len: 3

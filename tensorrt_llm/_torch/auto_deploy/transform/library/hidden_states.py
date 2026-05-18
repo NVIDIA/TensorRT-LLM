@@ -156,6 +156,7 @@ class DetectHiddenStatesForCapture(BaseTransform):
             The transformed graph module and transform info.
         """
         if getattr(gm, "is_draft", False):
+            # Draft models do not capture hidden states through this mechanism.
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -241,12 +242,12 @@ class CachedResidualAdd(AttentionDescriptor):
         return torch.ops.auto_deploy.residual_add_for_capture
 
     @classmethod
-    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
+    def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.cached_residual_add
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
+        cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
         hidden_size = source_attn_node.meta["val"].shape[-1]
         hidden_type = source_attn_node.meta["val"].dtype

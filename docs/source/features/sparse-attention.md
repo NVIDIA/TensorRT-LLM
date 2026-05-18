@@ -90,6 +90,15 @@ llm = LLM(
 )
 ```
 
+For DeepSeek-V3.2 style DSA decode on Blackwell GPUs, you can optionally enable Guess-Verify-Refine (GVR) Top-K. GVR reuses the previous decode step's Top-K indices as hints for the exact indexer Top-K selector. The current implementation supports `index_topk=2048`; `index_topk=512` and `index_topk=1024` are planned future extensions. Other `index_topk` values fall back automatically to the production CUDA C++ insertion/radix path, as do cases where the GVR prerequisites or hardware-aware dispatcher thresholds are not satisfied.
+
+```python
+sparse_attention_config = DeepSeekSparseAttentionConfig(
+    index_topk=2048,
+    enable_heuristic_topk=True,
+)
+```
+
 #### Skip Softmax Attention
 
 ```python
@@ -130,6 +139,17 @@ sparse_attention_config:
   algorithm: dsa
   index_topk: 64
 ```
+
+Optional GVR Top-K acceleration for DSA decode:
+
+```yaml
+sparse_attention_config:
+  algorithm: dsa
+  index_topk: 2048
+  enable_heuristic_topk: true
+```
+
+GVR is an opt-in PyTorch-backend DSA decode optimization for Blackwell (`sm_100+`) GPUs. Today the GVR fast path is enabled only for `index_topk=2048`; planned `512` and `1024` support should not be treated as available yet. The runtime uses a hardware-aware GVR dispatcher to route each `(batch size, sequence length)` cell between GVR and the original insertion/radix Top-K fallback. For benchmarking, `TRTLLM_HEURISTIC_NMIN` overrides the small-sequence lower bound, and `TRTLLM_SCHEMEX_DEBUG=1` prints the GVR dispatcher decision.
 
 **Skip Softmax Attention**
 ```yaml

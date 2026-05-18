@@ -1,4 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import operator
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,20 +27,25 @@ from _model_test_utils import (
 from pydantic import ValidationError
 from torch.fx import Graph, GraphModule
 
+from tensorrt_llm._torch.auto_deploy.compile import piecewise_runner as piecewise_runner_mod
 from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     CapturedGraph,
     DualModeCapturedGraph,
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
 )
-from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner
-from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner, OutputInfo
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import SplitInfo, submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
     CompileModel,
     _generate_default_piecewise_num_tokens,
+)
+from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
+    begin_aux_stream_passthrough,
+    end_aux_stream_passthrough,
 )
 
 
@@ -176,6 +196,36 @@ def test_cudagraph_capture_replay(
         )
 
 
+def test_cudagraph_replays_with_rectangular_seq_len_input():
+    """CapturedGraph can capture and replay inputs where seq_len > 1 (e.g. extend-only batches)."""
+
+    class SimpleModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, input_ids):
+            self.forward_calls += 1
+            return input_ids + 1
+
+    model = SimpleModel().eval().to("cuda")
+    compiled_model = CapturedGraph(model, num_batched_inputs=1)
+    bs = 4
+    seq_len = 5
+    input_ids = torch.randn(bs, seq_len, device="cuda")
+
+    def get_args_kwargs(batch_size):
+        return (input_ids[:batch_size],), {}
+
+    with torch.inference_mode():
+        compiled_model.capture_graph(get_args_kwargs, [bs])
+
+        calls_after_capture = model.forward_calls
+        compiled_model(input_ids)
+        # No eager fallback — graph was replayed.
+        assert model.forward_calls == calls_after_capture
+
+
 # ============================================================================
 # Tests for CapturedGraph capture-time truncation
 # ============================================================================
@@ -195,7 +245,7 @@ class TestCapturedGraphCapture:
         )
         captured_shapes = []
 
-        def fake_capture_one_graph(self, *args, **kwargs):
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             captured_shapes.append(tuple(arg.shape for arg in args))
             return object()
 
@@ -582,6 +632,61 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
 
 
 # ============================================================================
+# Tests for ADPiecewiseRunner capture-time output liveness
+# ============================================================================
+
+
+class TestADPiecewiseRunnerCapture:
+    """Tests for dynamic output buffers allocated during runner capture."""
+
+    def test_dynamic_out_buf_stays_strong_until_capture_finalized(self, monkeypatch):
+        @contextmanager
+        def fake_cuda_graph(*args, **kwargs):
+            yield
+
+        class FakeCudaGraph:
+            def pool(self):
+                return ("fake-pool",)
+
+        def fake_make_weak_ref(value):
+            if isinstance(value, torch.Tensor):
+                return ("weak", value.data_ptr())
+            return value
+
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeCudaGraph)
+        monkeypatch.setattr(torch.cuda, "graph", fake_cuda_graph)
+        monkeypatch.setattr(piecewise_runner_mod, "make_weak_ref", fake_make_weak_ref)
+
+        runner = ADPiecewiseRunner(nn.Identity())
+        runner.set_dynamic_out_info(
+            7,
+            OutputInfo(
+                shape=torch.Size([8, 4]),
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            ),
+        )
+
+        ADPiecewiseRunner.set_current_phase("capture")
+        ADPiecewiseRunner.set_current_num_tokens(8)
+        try:
+            runner(torch.zeros(8, 4))
+        finally:
+            ADPiecewiseRunner.set_current_phase("replay")
+            ADPiecewiseRunner.set_current_num_tokens(None)
+
+        entry = runner.entries[8]
+        out_buf = entry.dynamic_out_bufs[7]
+        assert isinstance(out_buf, torch.Tensor)
+
+        ptr = out_buf.data_ptr()
+        runner.finalize_capture(8)
+
+        assert entry.dynamic_out_bufs[7] == ("weak", ptr)
+
+
+# ============================================================================
 # Tests for _generate_default_piecewise_num_tokens (compile_model.py)
 # ============================================================================
 
@@ -808,3 +913,71 @@ class TestCompileModelGraphModuleTargetCollection:
                 backend=backend,
                 piecewise_enabled=True,
             )
+
+
+# ============================================================================
+# Smoke: passthrough nodes in a piecewise split stay inside their *static*
+# partition.  The piecewise path disables multi-stream at capture + replay
+# time (see ``utils.multi_stream_utils.disable_multi_stream``), so no
+# reclassification-as-dynamic and no extra wrapper is needed.
+# ============================================================================
+
+
+def _build_ms_static_submod():
+    root = nn.Module()
+    root.add_module("lin", nn.Linear(4, 4))
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    y = g.call_function(begin_aux_stream_passthrough, args=(x,))
+    y = g.call_module("lin", args=(y,))
+    out = g.call_function(end_aux_stream_passthrough, args=(y,))
+    g.output(out)
+    return torch.fx.GraphModule(root, g)
+
+
+def _build_plain_static_submod():
+    root = nn.Module()
+    root.add_module("lin", nn.Linear(4, 4))
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    out = g.call_module("lin", args=(x,))
+    g.output(out)
+    return torch.fx.GraphModule(root, g)
+
+
+class TestPiecewiseCapturedGraphMultiStreamWiring:
+    def _build_split_gm(self, ms_submod, plain_submod):
+        parent = nn.Module()
+        parent.add_module("submod_0", plain_submod)
+        parent.add_module("submod_1", ms_submod)
+
+        g = torch.fx.Graph()
+        x = g.placeholder("x")
+        call0 = g.call_module("submod_0", args=(x,))
+        call1 = g.call_module("submod_1", args=(call0,))
+        g.output(call1)
+        return torch.fx.GraphModule(parent, g)
+
+    def test_prepare_keeps_stream_switch_partition_as_static_runner(self, monkeypatch):
+        """Stream-switch partitions become ADPiecewiseRunner, not a dedicated wrapper."""
+        ms_submod = _build_ms_static_submod()
+        plain_submod = _build_plain_static_submod()
+        split_gm = self._build_split_gm(ms_submod, plain_submod)
+
+        fake_info = SplitInfo(
+            split_gm=split_gm,
+            num_submodules=2,
+            static_submod_indices=[0, 1],
+            dynamic_submod_indices=[],
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph."
+            "split_graph_at_dynamic_ops",
+            lambda _gm: fake_info,
+        )
+
+        pcg = PiecewiseCapturedGraph(split_gm, piecewise_num_tokens=[8, 16])
+        pcg.prepare()
+
+        assert isinstance(pcg.split_gm.submod_0, ADPiecewiseRunner)
+        assert isinstance(pcg.split_gm.submod_1, ADPiecewiseRunner)

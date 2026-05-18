@@ -11,6 +11,8 @@ IMAGE_MAPPING = {
     "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-__stage__-torch_skip",
     "LLM_SBSA_DOCKER_IMAGE":
     "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:sbsa-__stage__-torch_skip",
+    "LLM_SBSA_WHEEL_DOCKER_IMAGE":
+    "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:sbsa-ubuntu24-torch_skip-py312",
     "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE":
     "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/__stage__:x86_64-rockylinux8-torch_skip-py310",
     "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE":

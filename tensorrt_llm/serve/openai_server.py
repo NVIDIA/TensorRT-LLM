@@ -20,8 +20,7 @@ from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import (FileResponse, JSONResponse, Response,
-                               StreamingResponse)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -37,18 +36,19 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import MultimodalEncoder, tracing
+from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
+from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
-from tensorrt_llm.serve.media_storage import MediaStorage, resolve_video_format
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -66,9 +66,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ResponsesRequest,
                                                 ResponsesResponse,
                                                 UpdateWeightsRequest, UsageInfo,
-                                                VideoGenerationRequest,
-                                                VideoJob, VideoJobList,
                                                 to_llm_disaggregated_params)
+from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
     ResponsesAPIPostprocArgs, chat_harmony_post_processor,
@@ -85,10 +84,9 @@ from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
-from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
-                                                 parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
 from tensorrt_llm.version import __version__ as VERSION
-from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+from tensorrt_llm.visual_gen import VisualGen
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
@@ -182,7 +180,7 @@ def _normalize_image_output(image) -> list:
     return [image]
 
 
-class OpenAIServer:
+class OpenAIServer(_VideoRoutesMixin):
 
     def __init__(
             self,
@@ -216,6 +214,13 @@ class OpenAIServer:
         self.perf_metrics_lock = None
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
+        # Bounded snapshot of iteration stats for the GET /metrics handler.
+        # When the background Prometheus collector loop is active, it is the
+        # sole consumer of the engine's stats queue and appends each drained
+        # stat here; /metrics then serves from this buffer instead of racing
+        # the loop for the queue. Created lazily when the loop starts.
+        # See nvbug 6102381.
+        self._iteration_stats_buffer: Optional[deque] = None
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
@@ -225,6 +230,7 @@ class OpenAIServer:
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
+        self.resource_governor = None
 
         # Skip loading AutoProcessor and model_config for VISUAL_GEN models
         # These are LLM-specific and can cause unnecessary memory usage
@@ -276,6 +282,13 @@ class OpenAIServer:
                 # tensorrt backend does not have this attribute but it always has iter stats enabled.
                 if self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
+                    # The background loop becomes the sole consumer of the
+                    # engine stats queue; /metrics reads from a tee buffer
+                    # bounded by iter_stats_max_iterations to avoid racing
+                    # the loop for the queue (nvbug 6102381).
+                    max_buf = getattr(self.generator.args,
+                                      "iter_stats_max_iterations", 1000) or 1000
+                    self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
                     logger.info(
@@ -298,6 +311,8 @@ class OpenAIServer:
                 logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
             if self.disagg_cluster_worker:
                 await self.disagg_cluster_worker.deregister_worker()
+            if self.resource_governor is not None:
+                self.resource_governor.close()
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -332,7 +347,11 @@ class OpenAIServer:
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
-        hf_tokenizer_path = self.generator._hf_model_dir or self.tokenizer.tokenizer.name_or_path
+        hf_tokenizer_path = self.generator._hf_model_dir
+        if not hf_tokenizer_path:
+            hf_tokenizer_path = getattr(
+                self.tokenizer.tokenizer, "name_or_path", None) or getattr(
+                    self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
         try:
             self.processor = AutoProcessor.from_pretrained(
@@ -516,6 +535,12 @@ class OpenAIServer:
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
+    @property
+    def _vocab_size(self) -> Optional[int]:
+        if self.tokenizer is not None and self.tokenizer.tokenizer is not None:
+            return self.tokenizer.tokenizer.vocab_size
+        return None
+
     @staticmethod
     def create_error_response(
             message: str,
@@ -584,6 +609,32 @@ class OpenAIServer:
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
+        resource_governor_queue = self.generator._executor.resource_governor_queue
+        if resource_governor_queue is not None:
+            from .resource_governor import ResourceGovernor
+            self.resource_governor = ResourceGovernor(
+                resource_governor_queue=resource_governor_queue,
+                tokenizer=self.tokenizer,
+                model_config=self.model_config,
+                processor=self.processor,
+                harmony_adapter_factory=get_harmony_adapter
+                if self.use_harmony else None,
+            )
+            self.resource_governor.register_routes(self.app)
+        else:
+            # Resource governor is unavailable because the executor does not
+            # expose a resource_governor_queue. This is expected in RPC
+            # orchestrator mode (GenerationExecutorRpcProxy), non-PyExecutor
+            # backends, or when enable_resource_governor is false. The
+            # /_resource_governor/* endpoints will not be registered; clients
+            # that attempt to call them will receive 404.
+            logger.warning(
+                "Resource governor is disabled: the executor backend does "
+                "not provide a resource_governor_queue (e.g. RPC "
+                "orchestrator mode or explicit opt-out). Endpoints under "
+                "/_resource_governor/ will not be available.")
+            self.resource_governor = None
+
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -784,6 +835,18 @@ class OpenAIServer:
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
+        # When the background collector loop is active it is the sole
+        # consumer of the engine stats queue; serve /metrics from the tee
+        # buffer it populates so we do not race it for queue items. Racing
+        # caused >80% iteration loss and ~2s per-call latency (nvbug 6102381).
+        # The caller receives the stats accumulated since the previous /metrics
+        # call (up to iter_stats_max_iterations) and the buffer is cleared.
+        if self._iteration_stats_buffer is not None:
+            stats = list(self._iteration_stats_buffer)
+            self._iteration_stats_buffer.clear()
+            return JSONResponse(content=stats)
+
+        # Legacy path: no background collector -> read the queue directly.
         stats = []
         async for stat in self.generator.get_stats_async(2):
             stats.append(stat)
@@ -972,8 +1035,7 @@ class OpenAIServer:
         return chat_response
 
     async def _iteration_stats_collector_loop(self):
-        """
-        Background task that continuously collects iteration statistics from the LLM engine.
+        """Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
         stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
@@ -1003,6 +1065,11 @@ class OpenAIServer:
                     async for llm_stat in self.generator.get_stats_async(
                             timeout=0.5):
                         self.metrics_collector.log_iteration_stats(llm_stat)
+                        # Tee into the /metrics snapshot buffer so the HTTP
+                        # handler can serve without competing for the engine
+                        # queue (nvbug 6102381).
+                        if self._iteration_stats_buffer is not None:
+                            self._iteration_stats_buffer.append(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -1059,8 +1126,11 @@ class OpenAIServer:
             ]
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
+            vocab_size = getattr(self.tokenizer.tokenizer,
+                                 "vocab_size", None) or getattr(
+                                     self.tokenizer, "vocab_size", None)
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                vocab_size=vocab_size,
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1085,21 +1155,25 @@ class OpenAIServer:
 
             try:
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    request.messages, self.model_config,
-                    self.multimodal_server_config)
+                    request.messages,
+                    self.model_config,
+                    self.multimodal_server_config,
+                    request_media_io_kwargs=request.media_io_kwargs)
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    raw_messages, self.model_config,
-                    self.multimodal_server_config)
+                    raw_messages,
+                    self.model_config,
+                    self.multimodal_server_config,
+                    request_media_io_kwargs=request.media_io_kwargs)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1137,6 +1211,9 @@ class OpenAIServer:
             trace_headers = (None if raw_request is None else
                              tracing.extract_trace_headers(raw_request.headers))
 
+            scheduling_params = SchedulingParams(
+                agent_hierarchy=request.agent_hierarchy)
+
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
@@ -1154,6 +1231,7 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+                scheduling_params=scheduling_params,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -1227,21 +1305,25 @@ class OpenAIServer:
 
             try:
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    request.messages, self.model_config,
-                    self.multimodal_server_config)
+                    request.messages,
+                    self.model_config,
+                    self.multimodal_server_config,
+                    request_media_io_kwargs=request.media_io_kwargs)
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    raw_messages, self.model_config,
-                    self.multimodal_server_config)
+                    raw_messages,
+                    self.model_config,
+                    self.multimodal_server_config,
+                    request_media_io_kwargs=request.media_io_kwargs)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1394,7 +1476,7 @@ class OpenAIServer:
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                vocab_size=self._vocab_size,
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
@@ -1475,8 +1557,7 @@ class OpenAIServer:
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
-        """
-        Chat Completion API with harmony format support.
+        """Chat Completion API with harmony format support.
         Supports both streaming and non-streaming modes.
         """
 
@@ -1529,8 +1610,7 @@ class OpenAIServer:
                 request.stop_token_ids = harmony_stop_tokens
 
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
-                reasoning_parser="gpt_oss")
+                vocab_size=self._vocab_size, reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -1544,6 +1624,9 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
+            scheduling_params = SchedulingParams(
+                agent_hierarchy=request.agent_hierarchy)
+
             # Generate
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
@@ -1552,6 +1635,7 @@ class OpenAIServer:
                 if self.postproc_worker_enabled else None,
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,
+                scheduling_params=scheduling_params,
                 disaggregated_params=disaggregated_params,
                 trace_headers=trace_headers,
             )
@@ -1795,6 +1879,7 @@ class OpenAIServer:
                 f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
             )
 
+            image_gen_start = time.perf_counter()
             output = self.generator.generate(inputs=request.prompt,
                                              params=params)
             if output.image is None:
@@ -1811,8 +1896,7 @@ class OpenAIServer:
                 data = [
                     ImageObject(
                         b64_json=base64.b64encode(
-                            MediaStorage.convert_image_to_bytes(image)).decode(
-                                'utf-8'),
+                            image_to_bytes(image)).decode('utf-8'),
                         revised_prompt=request.prompt,
                     ) for image in output_images
                 ]
@@ -1824,13 +1908,16 @@ class OpenAIServer:
                 )
 
             elif request.response_format == "url":
-                MediaStorage.save_image(
-                    output_images[0],
-                    self.media_storage_path / f"{image_id}.png",
-                )
+                output.save(self.media_storage_path / f"{image_id}.png")
                 # TODO: Support URL mode
                 return self._create_not_supported_error(
                     "URL mode is not supported for image generation")
+
+            latency = time.perf_counter() - image_gen_start  # seconds
+            logger.info(
+                f"Image {image_id} generated and encoded: "
+                f"latency={latency:.3f}s generation={getattr(output.metrics, 'generation', 0.0):.3f}s "
+                f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s")
 
             return JSONResponse(content=response.model_dump())
 
@@ -1844,437 +1931,15 @@ class OpenAIServer:
 
         Follows the OpenAI Images API specification for image editing.
         Creates an edited or extended image given an original image and a prompt.
+
+        No in-tree pipeline implements image editing today: Flux/Flux2 are
+        text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+        video, not edited images. Return 501 here so callers get an honest
+        NotImplemented signal instead of a 500 from a downstream None check.
+        Re-enable the full handler when an edit-capable pipeline lands.
         """
-        try:
-            image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id, self.generator)
-            logger.info(
-                f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
-            )
-
-            output = self.generator.generate(inputs=request.prompt,
-                                             params=params)
-            if output.image is None:
-                return self.create_error_response(
-                    message="Image editing failed",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-
-            # Build response
-            output_images = _normalize_image_output(output.image)
-
-            response = ImageGenerationResponse(
-                created=int(time.time()),
-                data=[
-                    ImageObject(
-                        b64_json=base64.b64encode(
-                            MediaStorage.convert_image_to_bytes(image)).decode(
-                                'utf-8'),
-                        revised_prompt=request.prompt,
-                    ) for image in output_images
-                ],
-                size=f"{params.width}x{params.height}",
-            )
-
-            return JSONResponse(content=response.model_dump())
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(
-                message=str(e),
-                err_type="InternalServerError",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-
-    async def openai_video_generation_sync(self,
-                                           raw_request: Request) -> Response:
-        """Synchronous video generation endpoint.
-
-        Waits for video generation to complete before returning.
-        Compatible with simple use cases where waiting is acceptable.
-
-        Supports both JSON and multipart/form-data requests:
-        - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
-        """
-        try:
-            # Parse request based on content-type
-            request = await self._parse_video_generation_request(raw_request)
-
-            # Resolve the video encode format (mp4/avi/auto)
-            resolved_fmt, resolved_ext = resolve_video_format(
-                request.output_format)
-
-            video_id = f"video_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request,
-                                             video_id,
-                                             self.generator,
-                                             media_storage_path=str(
-                                                 self.media_storage_path))
-            logger.info(
-                f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
-            )
-
-            output = self.generator.generate(inputs=request.prompt,
-                                             params=params)
-            if output.video is None:
-                return self.create_error_response(
-                    message="Video generation failed",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-
-            actual_output_path = MediaStorage.save_video(
-                video=output.video,
-                output_path=self.media_storage_path /
-                f"{video_id}{resolved_ext}",
-                audio=output.audio,
-                frame_rate=request.fps or params.frame_rate,
-                format=resolved_fmt,
-            )
-
-            # Determine media type based on actual output file extension
-            actual_path = Path(actual_output_path)
-            media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
-
-            return FileResponse(
-                actual_output_path,
-                media_type=media_type,
-                filename=actual_path.name,
-            )
-
-        except ValueError as e:
-            logger.error(f"Request parsing error: {e}")
-            return self.create_error_response(str(e))
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
-
-    async def _parse_video_generation_request(
-        self,
-        raw_request: Request,
-    ) -> VideoGenerationRequest:
-        """Parse video generation request from either JSON or multipart/form-data.
-
-        Supports both:
-        - application/json: Standard JSON request with VideoGenerationRequest model
-        - multipart/form-data: Form fields + file upload for input_reference
-        """
-        content_type = raw_request.headers.get("content-type", "")
-
-        if "application/json" in content_type:
-            # Parse as JSON using Pydantic model
-            body = await raw_request.json()
-            return VideoGenerationRequest(**body)
-
-        if "multipart/form-data" in content_type:
-            # Parse multipart/form-data manually
-            form = await raw_request.form()
-
-            # Extract all fields and convert to proper types
-            data = {}
-
-            # Required field
-            if "prompt" in form:
-                data["prompt"] = form["prompt"]
-            else:
-                raise ValueError("'prompt' is required")
-
-            # Optional string fields
-            for field in ["model", "size", "negative_prompt", "output_format"]:
-                if field in form and form[field]:
-                    data[field] = form[field]
-
-            # Optional numeric fields
-            if "seconds" in form and form["seconds"]:
-                data["seconds"] = float(form["seconds"])
-            if "fps" in form and form["fps"]:
-                data["fps"] = int(form["fps"])
-            if "n" in form and form["n"]:
-                data["n"] = int(form["n"])
-            if "num_inference_steps" in form and form["num_inference_steps"]:
-                data["num_inference_steps"] = int(form["num_inference_steps"])
-            if "guidance_scale" in form and form["guidance_scale"]:
-                data["guidance_scale"] = float(form["guidance_scale"])
-            if "guidance_rescale" in form and form["guidance_rescale"]:
-                data["guidance_rescale"] = float(form["guidance_rescale"])
-            if "seed" in form and form["seed"]:
-                data["seed"] = int(form["seed"])
-
-            # Handle file upload for input_reference
-            if "input_reference" in form:
-                input_ref = form["input_reference"]
-                if hasattr(input_ref, "file"):  # It's an UploadFile
-                    data["input_reference"] = input_ref
-
-            return VideoGenerationRequest(**data)
-
-        else:
-            raise ValueError(
-                f"Unsupported content-type: {content_type}. Use 'application/json' or 'multipart/form-data'"
-            )
-
-    async def openai_video_generation_async(
-        self,
-        raw_request: Request,
-    ) -> Response:
-        """Asynchronous video generation endpoint (OpenAI Videos API compatible).
-
-        Creates a video generation job and returns immediately with job metadata.
-        The video is generated in the background and stored in media storage.
-        Client can poll GET /v1/videos/{video_id} to check status and retrieve the video.
-
-        Supports both JSON and multipart/form-data requests:
-        - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
-        """
-        try:
-            # Parse request based on content-type
-            request = await self._parse_video_generation_request(raw_request)
-
-            video_id = f"video_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request,
-                                             video_id,
-                                             self.generator,
-                                             media_storage_path=str(
-                                                 self.media_storage_path))
-            logger.info(
-                f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
-            )
-
-            # Start background generation task
-            self.video_gen_tasks[video_id] = asyncio.create_task(
-                self._generate_video_background(
-                    video_id=video_id,
-                    request=request,
-                    params=params,
-                ))
-
-            # Return job metadata immediately
-            video_job = VideoJob(
-                created_at=int(time.time()),
-                id=video_id,
-                model=request.model or self.model,
-                prompt=request.prompt,
-                status="queued",
-                duration=request.seconds,
-                fps=request.fps,
-                size=f"{params.width}x{params.height}",
-            )
-            await VIDEO_STORE.upsert(video_id, video_job)
-
-            return JSONResponse(content=video_job.model_dump(), status_code=202)
-
-        except ValueError as e:
-            logger.error(f"Request parsing error: {e}")
-            return self.create_error_response(str(e))
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
-
-    async def _generate_video_background(
-        self,
-        video_id: str,
-        request: VideoGenerationRequest,
-        params: VisualGenParams,
-    ):
-        """Background task to generate video and save to storage."""
-        try:
-            # Resolve the video encode format (mp4/avi/auto)
-            resolved_fmt, resolved_ext = resolve_video_format(
-                request.output_format)
-
-            future = self.generator.generate_async(inputs=request.prompt,
-                                                   params=params)
-            output = await future.result()
-
-            if output.video is None:
-                # Update job status to failed since we're in a background task
-                job = await VIDEO_STORE.get(video_id)
-                if job:
-                    job.status = "failed"
-                    job.completed_at = int(time.time())
-                    job.error = "Video generation failed: output.video is None"
-                    await VIDEO_STORE.upsert(video_id, job)
-                return
-
-            actual_output_path = MediaStorage.save_video(
-                video=output.video,
-                output_path=self.media_storage_path /
-                f"{video_id}{resolved_ext}",
-                audio=output.audio,
-                frame_rate=request.fps or params.frame_rate,
-                format=resolved_fmt,
-            )
-            job = await VIDEO_STORE.get(video_id)
-            if job:
-                job.status = "completed"
-                job.completed_at = int(time.time())
-                # Store actual file extension in case it differs from requested (.mp4 vs .avi)
-                job.output_path = str(actual_output_path)
-                await VIDEO_STORE.upsert(video_id, job)
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            job = await VIDEO_STORE.get(video_id)
-            if job:
-                job.status = "failed"
-                job.completed_at = int(time.time())
-                job.error = str(e)
-                await VIDEO_STORE.upsert(video_id, job)
-
-    async def list_videos(self, raw_request: Request) -> Response:
-        """List all generated videos.
-
-        GET /v1/videos
-        Returns a list of generated video metadata (job details).
-        """
-        try:
-            # List videos from storage
-            video_jobs = await VIDEO_STORE.list_values()
-
-            # Convert to API format
-            response = VideoJobList(data=video_jobs, )
-            return JSONResponse(content=response.model_dump())
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
-
-    async def get_video_metadata(self, video_id: str,
-                                 raw_request: Request) -> Response:
-        """Get video metadata by ID.
-
-        GET /v1/videos/{video_id}
-        Retrieves the metadata (job status and details) for a specific generated video.
-        """
-        try:
-            logger.info(f"Getting video metadata: {video_id}")
-            # Get metadata from storage
-            job = await VIDEO_STORE.get(video_id)
-            if not job:
-                return self.create_error_response(
-                    f"Video {video_id} not found",
-                    err_type="NotFoundError",
-                    status_code=HTTPStatus.NOT_FOUND)
-
-            # Ensure it's a video
-            if job.object != "video":
-                return self.create_error_response(
-                    f"Resource {video_id} is not a video",
-                    err_type="BadRequestError",
-                    status_code=HTTPStatus.BAD_REQUEST)
-
-            return JSONResponse(content=job.model_dump())
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
-
-    async def get_video_content(self, video_id: str,
-                                raw_request: Request) -> Response:
-        """Download video file by ID.
-
-        GET /v1/videos/{video_id}/content
-        Downloads the generated video file.
-        """
-        try:
-            # Get metadata first to check status
-            job = await VIDEO_STORE.get(video_id)
-            if not job:
-                return self.create_error_response(
-                    f"Video {video_id} not found",
-                    err_type="NotFoundError",
-                    status_code=HTTPStatus.NOT_FOUND)
-
-            # Ensure it's a video and completed
-            if job.object != "video":
-                return self.create_error_response(
-                    f"Resource {video_id} is not a video",
-                    err_type="BadRequestError",
-                    status_code=HTTPStatus.BAD_REQUEST)
-
-            if job.status != "completed":
-                return self.create_error_response(
-                    f"Video {video_id} is not ready (status: {job.status})",
-                    err_type="BadRequestError",
-                    status_code=HTTPStatus.BAD_REQUEST)
-
-            # Try to use stored output path, otherwise check for both .mp4 and .avi
-            video_path = None
-            if job.output_path and os.path.exists(job.output_path):
-                video_path = Path(job.output_path)
-            else:
-                # Fall back to checking common extensions
-                for ext in [".mp4", ".avi"]:
-                    candidate = self.media_storage_path / f"{video_id}{ext}"
-                    if os.path.exists(candidate):
-                        video_path = candidate
-                        break
-
-            if video_path and os.path.exists(video_path):
-                media_type = "video/mp4" if video_path.suffix == ".mp4" else "video/x-msvideo"
-                return FileResponse(
-                    video_path,
-                    media_type=media_type,
-                    filename=video_path.name,
-                )
-            else:
-                return self.create_error_response(
-                    f"Video {video_id} not found",
-                    err_type="NotFoundError",
-                    status_code=HTTPStatus.NOT_FOUND)
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
-
-    async def delete_video(self, video_id: str,
-                           raw_request: Request) -> Response:
-        """Delete a video by ID.
-
-        DELETE /v1/videos/{video_id}
-        Deletes a generated video by its ID.
-        """
-        try:
-            # Check if video exists
-            job = await VIDEO_STORE.get(video_id)
-            if not job:
-                return self.create_error_response(
-                    f"Video {video_id} not found",
-                    err_type="NotFoundError",
-                    status_code=HTTPStatus.NOT_FOUND)
-
-            # Ensure it's a video
-            if job.object != "video":
-                return self.create_error_response(
-                    f"Resource {video_id} is not a video",
-                    err_type="BadRequestError",
-                    status_code=HTTPStatus.BAD_REQUEST)
-
-            # Delete the video file(s) - check for both .mp4 and .avi
-            video_path = None
-            if job.output_path and os.path.exists(job.output_path):
-                video_path = job.output_path
-            else:
-                # Fall back to checking common extensions
-                for ext in [".mp4", ".avi"]:
-                    candidate = self.media_storage_path / f"{video_id}{ext}"
-                    if os.path.exists(candidate):
-                        video_path = candidate
-                        break
-
-            if video_path and os.path.exists(video_path):
-                os.remove(video_path)
-
-            # Delete from store
-            success = await VIDEO_STORE.pop(video_id)
-
-            return JSONResponse(content={"deleted": success is not None})
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+        return self._create_not_supported_error(
+            "Image editing is not supported by any in-tree pipeline yet.")
 
     async def __call__(self,
                        host,

@@ -41,7 +41,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -334,6 +334,24 @@ class DeepseekV3WeightLoader:
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
 
+        def detect_shared_mtp_weights() -> bool:
+            # Detect if MTP layers share checkpoint weights (model requests more
+            # MTP layers than the checkpoint provides). In this case, multiple
+            # model MTP layers map to the same checkpoint layer via modulo, and
+            # mark_consumed must be skipped to avoid deleting weights that later
+            # MTP layers still need.
+            ckpt_nextn = self.config.num_nextn_predict_layers or 0
+            spec_config = self.model_config.spec_config
+            if spec_config is not None and hasattr(
+                    spec_config, 'spec_dec_mode'
+            ) and spec_config.spec_dec_mode.is_mtp_one_model():
+                model_nextn = spec_config.num_nextn_predict_layers or 0
+            else:
+                model_nextn = 0
+            return model_nextn > ckpt_nextn > 0
+
+        has_shared_mtp_weights = detect_shared_mtp_weights()
+
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -343,14 +361,17 @@ class DeepseekV3WeightLoader:
             else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
+                is_shared_mtp_layer = False
                 if "model.layers" in name and int(
                         names[2]) >= self.config.num_hidden_layers:
+                    is_shared_mtp_layer = has_shared_mtp_weights
                     mtp_layer_idx = int(
                         names[2]) - self.config.num_hidden_layers
                     names[2] = str(mtp_layer_idx %
                                    self.config.num_nextn_predict_layers +
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
+                mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
                     dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
@@ -410,7 +431,7 @@ class DeepseekV3WeightLoader:
                                 ).view(*attn_module.v_b_proj_dequant.shape).to(
                                     attn_module.v_b_proj_dequant.dtype))
                     # Mark consumed kv_b_proj weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = self.model_config.get_quant_config(
@@ -535,7 +556,7 @@ class DeepseekV3WeightLoader:
                                 0:fused_a_scale.shape[0]].copy_(fused_a_scale)
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                     # Mark consumed kv_a_proj_with_mqa and q_a_proj weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         parent_prefix = '.'.join(names[:-1])
                         weights.mark_consumed(
                             f"{parent_prefix}.kv_a_proj_with_mqa")
@@ -549,7 +570,7 @@ class DeepseekV3WeightLoader:
                                            weights))
                     module.load_weights(weights=module_weights)
                     # Mark consumed source weights (e.g., gate_proj, up_proj)
-                    if can_mark_consumed:
+                    if mark_consumed:
                         for src_name in params_map[names[-1]]:
                             weights.mark_consumed('.'.join(names[:-1] +
                                                            [src_name]))
@@ -562,7 +583,7 @@ class DeepseekV3WeightLoader:
                     })
                     module.load_weights(weights=[module_weights])
                     # Mark consumed experts weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
@@ -580,7 +601,7 @@ class DeepseekV3WeightLoader:
                     })
                     module.load_weights(weights=[module_weights])
                     # Mark consumed MoE weights using parent name
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     continue
@@ -594,7 +615,7 @@ class DeepseekV3WeightLoader:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
                     # Mark consumed weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
 
 
@@ -821,8 +842,10 @@ class DeepseekV3Gate(nn.Module):
         fuse_routing_kernel: bool = True,
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
+        use_cute_dsl_bf16_gemm: bool = False,
     ):
         super().__init__()
+        self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
@@ -831,7 +854,6 @@ class DeepseekV3Gate(nn.Module):
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
-
         self.e_score_correction_bias = nn.Parameter(torch.empty(
             (num_experts), dtype=bias_dtype),
                                                     requires_grad=False)
@@ -847,10 +869,24 @@ class DeepseekV3Gate(nn.Module):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = torch.ops.trtllm.dsv3_router_gemm_op(hidden_states,
-                                                      self.weight.t(),
-                                                      bias=None,
-                                                      out_dtype=torch.float32)
+        if (self.use_cute_dsl_bf16_gemm and is_sm_100f()
+                and self.weight.dtype == torch.bfloat16):
+            input_2d = hidden_states.view(-1, hidden_states.shape[-1])
+            m, k = input_2d.shape
+            n = self.weight.shape[0]
+            output = torch.empty(m,
+                                 n,
+                                 dtype=torch.float32,
+                                 device=hidden_states.device)
+            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+                input_2d.contiguous(), self.weight, output)
+            logits = output.view(*hidden_states.shape[:-1], n)
+        else:
+            logits = torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states,
+                self.weight.t(),
+                bias=None,
+                out_dtype=torch.float32)
         return logits
 
     def load_weights(self, weights: List[Dict]):
@@ -907,16 +943,18 @@ class Deepseekv3MoE(nn.Module):
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
             gate_cls = model_config.pretrained_config.gate_cls
-        self.gate = gate_cls(hidden_size,
-                             num_experts,
-                             top_k=top_k,
-                             n_group=config.n_group,
-                             topk_group=config.topk_group,
-                             routed_scaling_factor=config.routed_scaling_factor,
-                             dtype=dtype,
-                             fuse_routing_kernel=True,
-                             apply_routing=False,
-                             moe_backend=model_config.moe_backend)
+        self.gate = gate_cls(
+            hidden_size,
+            num_experts,
+            top_k=top_k,
+            n_group=config.n_group,
+            topk_group=config.topk_group,
+            routed_scaling_factor=config.routed_scaling_factor,
+            dtype=dtype,
+            fuse_routing_kernel=True,
+            apply_routing=False,
+            moe_backend=model_config.moe_backend,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -1818,7 +1856,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         self.model_nextn = 0
         if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
@@ -1885,47 +1923,3 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
-
-
-@register_auto_model("KimiK25ForConditionalGeneration")
-class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
-    """Kimi-K2.5 multimodal model (text-only path).
-
-    Extracts the DeepSeek-V3 text backbone from the composite config
-    and strips the ``language_model.`` weight prefix so that the
-    standard DeepseekV3ForCausalLM loading path works unchanged.
-
-    NOTE: Kimi-K2.5's text backbone sets ``num_nextn_predict_layers = 0``,
-    so MTP-based speculative decoding is not applicable to this model.
-    """
-
-    _LANG_PREFIX = "language_model."
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        model_config = copy.copy(model_config)
-        assert hasattr(model_config.pretrained_config, 'text_config'), \
-            "Kimi K2.5 config must have text_config"
-        model_config._frozen = False
-        model_config.pretrained_config = model_config.pretrained_config.text_config
-        if model_config.quant_config.exclude_modules:
-            model_config.quant_config = copy.copy(model_config.quant_config)
-            p = self._LANG_PREFIX
-            mapped = []
-            for m in model_config.quant_config.exclude_modules:
-                if m.startswith(p):
-                    rest = m[len(p):]
-                    if rest.startswith('layers.'):
-                        rest = 'model.' + rest
-                    mapped.append(rest)
-                else:
-                    mapped.append(m)
-            model_config.quant_config.exclude_modules = mapped
-        model_config._frozen = True
-        super().__init__(model_config)
-
-    def load_weights(self, weights: ConsumableWeightsDict):
-        has_prefix = any(k.startswith("language_model.") for k in weights)
-        if has_prefix:
-            weights = filter_weights("language_model", weights)
-            weights = ConsumableWeightsDict(weights)
-        super().load_weights(weights)

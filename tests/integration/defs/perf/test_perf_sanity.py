@@ -50,11 +50,13 @@ MODEL_PATH_DICT = {
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
     "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
+    "super_bf16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
     "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
@@ -295,7 +297,12 @@ class ServerConfig:
         # speculative_config
         speculative_config = server_config_data.get("speculative_config", {})
         self.spec_decoding_type = speculative_config.get("decoding_type", "")
-        self.num_nextn_predict_layers = speculative_config.get("num_nextn_predict_layers", 0)
+        # MTP user config migrated from num_nextn_predict_layers to max_draft_len.
+        # Keep both DB field names populated for perf/baseline compatibility while
+        # the surrounding reporting pipeline transitions to l_max_draft_len.
+        self.max_draft_len = speculative_config.get(
+            "max_draft_len", speculative_config.get("num_nextn_predict_layers", 0)
+        )
         eagle3_value = speculative_config.get("eagle3_layers_to_capture", [])
         if isinstance(eagle3_value, int):
             self.eagle3_layers_to_capture = [eagle3_value]
@@ -303,7 +310,6 @@ class ServerConfig:
             self.eagle3_layers_to_capture = eagle3_value
         else:
             self.eagle3_layers_to_capture = []
-        self.max_draft_len = speculative_config.get("max_draft_len", 0)
         self.speculative_model = speculative_config.get("speculative_model", "")
         self.eagle3_one_model = speculative_config.get("eagle3_one_model", False)
 
@@ -371,8 +377,13 @@ class ServerConfig:
             # cache_transceiver_config
             "s_cache_transceiver_backend",
             # speculative_config
+            # Keep baseline matching on the legacy key during DB migration.
+            # l_max_draft_len is written to DB but not used for matching until
+            # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
+            # moe_config
+            "l_load_balancer_num_slots",
         ]
 
     def to_db_data(self) -> dict:
@@ -422,7 +433,7 @@ class ServerConfig:
             "l_cache_transceiver_max_tokens_in_buffer": self.cache_transceiver_max_tokens_in_buffer,
             # speculative_config
             "s_spec_decoding_type": self.spec_decoding_type,
-            "l_num_nextn_predict_layers": self.num_nextn_predict_layers,
+            "l_num_nextn_predict_layers": self.max_draft_len,
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
             "s_speculative_model_dir": self.speculative_model,
@@ -1170,7 +1181,9 @@ class PerfSanityTestConfig:
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 raise RuntimeError("Failed to get GPU type")
 
-        self.upload_to_db = "upload" in test_case_name.split("-")[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.gpu_type = get_gpu_type()
 
         # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode

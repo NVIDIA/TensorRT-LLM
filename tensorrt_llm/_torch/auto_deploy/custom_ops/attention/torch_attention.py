@@ -173,7 +173,9 @@ def torch_attention(
         attn_scores = attn_scores + attn_mask
 
     # Apply causal mask if specified and only during the context phase
-    if is_causal and s_q == s_k:  # Only apply causal mask during context processing
+    if (
+        attn_mask is None and is_causal and s_q == s_k
+    ):  # Only apply causal mask during context processing
         causal_mask = torch.triu(
             torch.ones(s_q, s_k, device=query.device, dtype=torch.bool),
             diagonal=1,  # Use diagonal=1 for standard causal masking
