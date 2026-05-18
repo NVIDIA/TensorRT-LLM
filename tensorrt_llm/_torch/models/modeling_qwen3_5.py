@@ -75,26 +75,26 @@ def _translate_mtp_pattern(name, n_hidden_layers):
 
 # --- Config adapters --------------------------------------------------------
 #
-# These run from ``load_pretrained_config`` in
-# ``tensorrt_llm/_torch/pyexecutor/config_utils.py`` via lazy import — the
+# These run from `load_pretrained_config` in
+# `tensorrt_llm/_torch/pyexecutor/config_utils.py` via lazy import — the
 # runtime layer asks the model module how to load its own config.
 #
 # There are two entry points:
-#   - ``_Qwen35ConfigCompat.normalize(config_dict)`` — for text-only
+#   - `_Qwen35ConfigCompat.normalize(config_dict)` — for text-only
 #     Qwen3.5 (MoE and dense). Returns a dict that
-#     ``transformers.Qwen3NextConfig.from_dict(...)`` can consume, so the
+#     `transformers.Qwen3NextConfig.from_dict(...)` can consume, so the
 #     existing Qwen3Next runtime is reused unchanged.
-#   - ``_normalize_qwen35_moe_vl_config(model_config)`` — for the
-#     Qwen3.5-MoE VLM. Mutates the HF-native ``transformers.Qwen3_5MoeConfig``
+#   - `_normalize_qwen35_moe_vl_config(model_config)` — for the
+#     Qwen3.5-MoE VLM. Mutates the HF-native `transformers.Qwen3_5MoeConfig`
 #     in place, attaching the runtime aliases the Qwen3Next-based LM expects
-#     while keeping ``text_config`` / ``vision_config`` composite.
+#     while keeping `text_config` / `vision_config` composite.
 
 
 class _Qwen35ConfigCompat:
     """Temporary shim for flattening Qwen3.5 text configs into Qwen3NextConfig.
 
-    We normalize to ``Qwen3NextConfig`` (rather than to a Qwen3.5-native
-    schema) so the runtime can reuse the existing ``Qwen3NextForCausalLM``
+    We normalize to `Qwen3NextConfig` (rather than to a Qwen3.5-native
+    schema) so the runtime can reuse the existing `Qwen3NextForCausalLM`
     model implementation unchanged — Qwen3.5 text is structurally identical
     to Qwen3Next, so matching the config schema lets the same code serve
     both.
