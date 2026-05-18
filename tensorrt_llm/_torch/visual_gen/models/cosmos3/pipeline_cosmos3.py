@@ -35,6 +35,8 @@ from tensorrt_llm.logger import logger
 
 from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
 from .guardrails import (
+    GUARDRAIL_HF_REPO,
+    GUARDRAIL_HF_REVISION,
     build_text_guardrail,
     build_video_guardrail,
     check_video_safety,
@@ -83,6 +85,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder="text_tokenizer",
             )
 
+        # Cosmos3 canonical defaults — overwritten if VAE is loaded
+        self.vae_scale_factor_temporal = 4
+        self.vae_scale_factor_spatial = 16
+
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
             self.vae = AutoencoderKLWan.from_pretrained(
@@ -91,8 +97,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
             ).to(device)
 
-            self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
-            self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 16)
+            self.vae_scale_factor_temporal = getattr(
+                self.vae.config, "scale_factor_temporal", self.vae_scale_factor_temporal
+            )
+            self.vae_scale_factor_spatial = getattr(
+                self.vae.config, "scale_factor_spatial", self.vae_scale_factor_spatial
+            )
             self.transformer.temporal_compression_factor = self.vae_scale_factor_temporal
 
         if PipelineComponent.SCHEDULER not in skip_components:
@@ -104,17 +114,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         self.text_guardrail = None
         self.video_guardrail = None
-        if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS and (
-            PipelineComponent.TEXT_GUARDRAIL not in skip_components
-            or PipelineComponent.VIDEO_GUARDRAIL not in skip_components
+        # Guardrails are only evaluated on rank 0; load them only there to avoid
+        # dead model weights occupying GPU memory on every other rank.
+        if (
+            self.rank == 0
+            and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
+            and (
+                PipelineComponent.TEXT_GUARDRAIL not in skip_components
+                or PipelineComponent.VIDEO_GUARDRAIL not in skip_components
+            )
         ):
-            if self.model_config.extra_attrs.get("guardrail_checkpoint_dir", None) is not None:
-                logger.info(
-                    f"Loading guardrails from {self.model_config.extra_attrs['guardrail_checkpoint_dir']}"
-                )
-                guardrail_ckpt_dir = self.model_config.extra_attrs["guardrail_checkpoint_dir"]
-            else:
-                guardrail_ckpt_dir = download_guardrail_checkpoint()
+            guardrail_ckpt_dir = self.model_config.extra_attrs.get(
+                "guardrail_checkpoint_dir"
+            ) or download_guardrail_checkpoint(GUARDRAIL_HF_REPO, GUARDRAIL_HF_REVISION)
+            logger.info(f"Loading guardrails from {guardrail_ckpt_dir}")
             if PipelineComponent.TEXT_GUARDRAIL not in skip_components:
                 self.text_guardrail = build_text_guardrail(guardrail_ckpt_dir)
             if PipelineComponent.VIDEO_GUARDRAIL not in skip_components:
@@ -458,10 +471,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 f"use a single image with multiple prompts instead."
             )
 
-        # Text guardrail
+        # Text guardrail — check both positive and user-supplied negative prompts.
+        # None negative_prompt means the hardcoded default will be used (safe); skip it.
         text_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
         if self.rank == 0 and use_guardrails and self.text_guardrail is not None:
-            for p in prompt:
+            prompts_to_check = list(prompt)
+            if negative_prompt is not None:
+                prompts_to_check.append(negative_prompt)
+            for p in prompts_to_check:
                 is_safe, msg = self.text_guardrail(p)
                 if not is_safe:
                     logger.warning(f"Text guardrail blocked prompt: {msg}")

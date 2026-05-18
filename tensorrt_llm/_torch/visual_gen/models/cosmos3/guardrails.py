@@ -80,24 +80,22 @@ def _pixelate_face(face_img: np.ndarray, blocks: int = 5) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Default guardrail builders
 # ---------------------------------------------------------------------------
-def download_guardrail_checkpoint() -> str:
+def download_guardrail_checkpoint(repo_url: str, revision: str | None = None) -> str:
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import GatedRepoError
 
     try:
         return snapshot_download(
-            GUARDRAIL_HF_REPO,
-            revision=GUARDRAIL_HF_REVISION,
+            repo_url,
+            revision=revision,
             local_files_only=True,
         )
     except FileNotFoundError:
-        logger.warning(
-            f"Guardrail checkpoint not found, downloading from {GUARDRAIL_HF_REPO} {GUARDRAIL_HF_REVISION}"
-        )
+        logger.warning(f"Guardrail checkpoint not found, downloading from {repo_url} {revision}")
         try:
             return snapshot_download(
-                GUARDRAIL_HF_REPO,
-                revision=GUARDRAIL_HF_REVISION,
+                repo_url,
+                revision=revision,
             )
         except GatedRepoError:
             raise ValueError(
@@ -147,11 +145,14 @@ def build_text_guardrail(guardrail_ckpt_dir: str) -> TextGuardrailFn:
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model_id = "Qwen/Qwen3Guard-Gen-0.6B"
-        qwen_tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model_dir = download_guardrail_checkpoint(
+            "Qwen/Qwen3Guard-Gen-0.6B",
+            revision="main",
+        )
+        qwen_tokenizer = AutoTokenizer.from_pretrained(model_dir)
         qwen_model = (
             AutoModelForCausalLM.from_pretrained(
-                model_id,
+                model_dir,
                 torch_dtype=torch.bfloat16,
             )
             .to("cuda")
@@ -182,7 +183,13 @@ def build_text_guardrail(guardrail_ckpt_dir: str) -> TextGuardrailFn:
     except (ImportError, OSError, RuntimeError, ValueError) as e:
         logger.warning("Could not load Qwen3Guard guardrail: %s", e)
 
-    def text_guardrail(prompt: str) -> None:
+    if not checkers:
+        raise RuntimeError(
+            "All text guardrail components failed to load. "
+            "Set TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 to explicitly disable guardrails."
+        )
+
+    def text_guardrail(prompt: str) -> tuple[bool, str]:
         for checker in checkers:
             is_safe, msg = checker(prompt)
             if not is_safe:
@@ -359,11 +366,15 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
         logger.warning("Could not load face blur filter: %s", e)
 
     def video_guardrail(frames: np.ndarray) -> np.ndarray | None:
-        if safety_checker is not None:
-            is_safe, msg = safety_checker(frames)
-            if not is_safe:
-                logger.warning(f"Video content safety: {msg}")
-                return None
+        if safety_checker is None:
+            raise RuntimeError(
+                "Video content safety classifier failed to load. "
+                "Set TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 to explicitly disable guardrails."
+            )
+        is_safe, msg = safety_checker(frames)
+        if not is_safe:
+            logger.warning(f"Video content safety: {msg}")
+            return None
         if face_blurrer is not None:
             frames = face_blurrer(frames)
         return frames

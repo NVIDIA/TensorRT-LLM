@@ -289,6 +289,13 @@ class Cosmos3CrossAttention(Attention):
         model_config: DiffusionModelConfig,
         layer_idx: int = 0,
     ):
+        original_backend = model_config.attention.backend
+        if model_config.attention.backend == "TRTLLM":
+            logger.warning(
+                "TRTLLM backend is not supported for Cosmos3CrossAttention. Falling back to VANILLA."
+            )
+            model_config.attention.backend = "VANILLA"
+
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -302,6 +309,8 @@ class Cosmos3CrossAttention(Attention):
             layer_idx=layer_idx,
             enable_ulysses=True,
         )
+        model_config.attention.backend = original_backend
+
         self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
         self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
 
@@ -684,10 +693,12 @@ class Cosmos3VFMTransformer(nn.Module):
             )
 
         if use_attn2d:
-            self.use_seq_parallel = True
-            self.seq_parallel_size = attn2d_mesh_size
-            self.seq_parallel_pg = vgm.attn2d_mesh_group
-            self.seq_parallel_rank = vgm.attn2d_mesh_rank
+            # Attention2D is not compatible with Cosmos3 cross-attention: its forward()
+            # TODO: Re-enable once Ring/Attn2D PRs with cross-attention support have landed.
+            raise NotImplementedError(
+                "Attention2D (Ring attention) is not supported for Cosmos3. "
+                "Use Ulysses sequence parallelism instead."
+            )
         elif use_ulysses:
             self.use_seq_parallel = True
             self.seq_parallel_size = ulysses_size
@@ -945,20 +956,23 @@ class Cosmos3VFMTransformer(nn.Module):
                 # This will cause minor noise in softmax due to padding.
                 hidden_gen = F.pad(hidden_gen, (0, 0, 0, pad))
                 cos, sin = self.cached_freqs_gen
-                self.cached_freqs_gen = (
-                    F.pad(cos, (0, 0, 0, 0, 0, pad)),
-                    F.pad(sin, (0, 0, 0, 0, 0, pad)),
-                )
+                cos_padded = F.pad(cos, (0, 0, 0, 0, 0, pad))
+                sin_padded = F.pad(sin, (0, 0, 0, 0, 0, pad))
+            else:
+                cos_padded, sin_padded = self.cached_freqs_gen
             padded_s_gen = S_gen + pad
             S_shard = padded_s_gen // self.seq_parallel_size
             hidden_gen = hidden_gen[
                 :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
             ]
             # Shard freqs_gen to match
-            cos, sin = self.cached_freqs_gen
             freqs_gen = (
-                cos[:, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard],
-                sin[:, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard],
+                cos_padded[
+                    :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
+                ],
+                sin_padded[
+                    :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
+                ],
             )
         else:
             freqs_gen = self.cached_freqs_gen
