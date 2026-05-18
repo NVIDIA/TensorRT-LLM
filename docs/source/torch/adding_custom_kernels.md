@@ -23,8 +23,8 @@ This guide focuses on source-level integration where the kernel ships as either:
 | Flavor | Source language | When it is built | Where it lives |
 | :---- | :---- | :---- | :---- |
 | CUDA C++ | `.cu` / `.h` | At wheel build time (CMake → `nvcc`) | [`cpp/tensorrt_llm/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels) |
-| CuTe DSL (Python) | Python using `cutlass.cute` / `@cute.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) |
-| cuTile (Python) | Python using `cuda.tile` / `@ct.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cuda_tile_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels) |
+| [CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) (Python) | Python using `cutlass.cute` / `@cute.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) |
+| [cuTile](https://docs.nvidia.com/cuda/cutile-python/) (Python) | Python using `cuda.tile` / `@ct.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cuda_tile_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels) |
 
 ---
 
