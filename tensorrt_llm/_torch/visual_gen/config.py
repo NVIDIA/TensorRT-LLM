@@ -537,7 +537,10 @@ class VisualGenArgs(StrictBaseModel):
             "When set, the pipeline bypasses random latent sampling and "
             "uses this tensor for all real inference calls (warmup uses "
             "random latents to avoid shape-mismatch when the warmup grid "
-            "differs from the latent shape)."
+            "differs from the latent shape). The env var "
+            "`TLLM_MLPERF_FIXED_LATENT_PATH` takes precedence over this "
+            "field so the path can be overridden per-run without editing "
+            "YAML configs."
         ),
     )
 
