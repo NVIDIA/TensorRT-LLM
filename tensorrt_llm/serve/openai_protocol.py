@@ -1440,8 +1440,9 @@ class VideoGenerationRequest(OpenAIBaseModel):
         default=None,
         ge=1,
         description=(
-            "Explicit number of frames to generate. When set, this overrides "
-            "the implicit `int(seconds * fps)` count. Wan-family models "
+            "Explicit number of frames to generate. When set, this takes "
+            "precedence over `seconds` and `fps` (both are ignored and the "
+            "pipeline uses exactly this frame count). Wan-family models "
             "require frame counts of the form 4n+1 (e.g. 81)."))
     negative_prompt: Optional[str] = Field(
         default=None,
