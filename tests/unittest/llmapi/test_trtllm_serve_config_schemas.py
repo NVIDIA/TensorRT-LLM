@@ -36,6 +36,14 @@ ALL_SERVE_CONFIGS = sorted(
     + collect_yaml_files(DATABASE_DIR, "**/*.yaml", exclude_names={"lookup.yaml"})
 )
 
+# Disagg orchestrator example YAMLs. etcd_config.yaml is a metadata-server config
+# (different YAML schema, passed via --metadata_server_config_file), so exclude it.
+DISAGG_EXAMPLES_DIR = REPO_ROOT / "examples" / "disaggregated"
+ALL_DISAGG_CONFIGS = sorted(
+    collect_yaml_files(DISAGG_EXAMPLES_DIR, "disagg_config.yaml")
+    + collect_yaml_files(DISAGG_EXAMPLES_DIR, "slurm/simple_example/disagg_config.yaml")
+)
+
 
 def _load_module(module_name: str, path: Path):
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -52,6 +60,7 @@ SCHEMA_GENERATOR = _load_module(
 )
 SERVE_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.SERVE_CONFIG_SCHEMA_FILENAME
 AUTODEPLOY_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.AUTODEPLOY_CONFIG_SCHEMA_FILENAME
+DISAGG_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.DISAGG_CONFIG_SCHEMA_FILENAME
 VISUAL_GEN_CONFIG_SCHEMA_FILENAME = SCHEMA_GENERATOR.VISUAL_GEN_CONFIG_SCHEMA_FILENAME
 
 
@@ -68,6 +77,11 @@ def serve_config_validator() -> jsonschema.Draft202012Validator:
 @pytest.fixture(scope="module")
 def autodeploy_config_validator() -> jsonschema.Draft202012Validator:
     return _validator(SCHEMA_GENERATOR.generate_autodeploy_config_schema())
+
+
+@pytest.fixture(scope="module")
+def disagg_config_validator() -> jsonschema.Draft202012Validator:
+    return _validator(SCHEMA_GENERATOR.generate_disagg_config_schema())
 
 
 @pytest.fixture(scope="module")
@@ -91,6 +105,37 @@ def test_serve_config_schema_accepts_serve_loader_aliases(serve_config_validator
 def test_serve_config_schema_rejects_typo(serve_config_validator):
     with pytest.raises(ValidationError):
         serve_config_validator.validate({"max_batch_szie": 8})
+
+
+def test_serve_config_schema_accepts_disagg_cluster_for_worker_registration(
+    serve_config_validator,
+):
+    # trtllm-serve serve pops disagg_cluster from the YAML before constructing
+    # the LLM (serve.py), so the regular config must accept it.
+    serve_config_validator.validate(
+        {
+            "disagg_cluster": {
+                "cluster_uri": "etcd://localhost:2379",
+                "cluster_name": "team-cluster",
+                "heartbeat_interval_sec": 5,
+            }
+        }
+    )
+
+
+def test_serve_config_schema_rejects_disagg_cluster_missing_uri(serve_config_validator):
+    with pytest.raises(ValidationError):
+        serve_config_validator.validate({"disagg_cluster": {"cluster_name": "no-uri"}})
+
+
+def test_autodeploy_config_schema_accepts_disagg_cluster(autodeploy_config_validator):
+    # Same disagg_cluster path applies to autodeploy workers.
+    autodeploy_config_validator.validate(
+        {
+            "backend": "_autodeploy",
+            "disagg_cluster": {"cluster_uri": "etcd://localhost:2379"},
+        }
+    )
 
 
 def test_serve_config_schema_accepts_unquoted_env_overrides_scalars(serve_config_validator):
@@ -145,6 +190,74 @@ def test_autodeploy_config_schema_rejects_typo(autodeploy_config_validator):
         autodeploy_config_validator.validate({"compile_backennd": "torch-opt"})
 
 
+def test_disagg_config_schema_accepts_minimal_yaml(disagg_config_validator):
+    disagg_config_validator.validate(
+        {
+            "context_servers": {"urls": ["ctx:8001"]},
+            "generation_servers": {"urls": ["gen:8002"]},
+        }
+    )
+
+
+def test_disagg_config_schema_accepts_inherited_torch_args(disagg_config_validator):
+    # Top-level TorchLlmArgs-style fields should validate; they're inherited
+    # into each server block by extract_disagg_cfg at runtime.
+    disagg_config_validator.validate(
+        {
+            "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "backend": "pytorch",
+            "disable_overlap_scheduler": True,
+            "free_gpu_memory_fraction": 0.25,
+            "context_servers": {
+                "num_instances": 1,
+                "tensor_parallel_size": 1,
+                "kv_cache_config": {"free_gpu_memory_fraction": 0.2},
+                "urls": ["localhost:8001"],
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"],
+            },
+        }
+    )
+
+
+def test_disagg_config_schema_accepts_gen_only_with_zero_instances(disagg_config_validator):
+    # gen-only configs set context_servers.num_instances = 0.
+    disagg_config_validator.validate(
+        {
+            "context_servers": {"num_instances": 0},
+            "generation_servers": {"urls": ["localhost:8002"]},
+        }
+    )
+
+
+def test_disagg_config_schema_rejects_top_level_typo(disagg_config_validator):
+    with pytest.raises(ValidationError):
+        disagg_config_validator.validate({"contextservers": {}})
+
+
+def test_disagg_config_schema_rejects_nested_typo(disagg_config_validator):
+    with pytest.raises(ValidationError):
+        disagg_config_validator.validate({"context_servers": {"num_instnces": 1}})
+
+
+def test_disagg_config_schema_rejects_bad_schedule_style(disagg_config_validator):
+    with pytest.raises(ValidationError):
+        disagg_config_validator.validate({"schedule_style": "round_robin"})
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    ALL_DISAGG_CONFIGS,
+    ids=lambda path: str(path.relative_to(REPO_ROOT / "examples")),
+)
+def test_existing_disagg_configs_validate_against_schema(
+    disagg_config_validator, config_path: Path
+):
+    disagg_config_validator.validate(load_yaml_dict(config_path))
+
+
 def test_visual_gen_config_schema_accepts_representative_yaml(visual_gen_config_validator):
     visual_gen_config_validator.validate(
         {
@@ -184,4 +297,5 @@ def test_docs_extension_writes_schema_assets(tmp_path):
     schema_dir = tmp_path / "_static" / "schemas"
     assert (schema_dir / SERVE_CONFIG_SCHEMA_FILENAME).is_file()
     assert (schema_dir / AUTODEPLOY_CONFIG_SCHEMA_FILENAME).is_file()
+    assert (schema_dir / DISAGG_CONFIG_SCHEMA_FILENAME).is_file()
     assert (schema_dir / VISUAL_GEN_CONFIG_SCHEMA_FILENAME).is_file()

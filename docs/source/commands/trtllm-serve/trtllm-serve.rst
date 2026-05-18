@@ -342,7 +342,7 @@ To configure the nested level arguments like ``moe_config.backend``, the yaml fi
    moe_config:
        backend: CUTLASS
 
-For IDE validation and completion, TensorRT-LLM publishes a `trtllm-serve config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json>`_. Add the schema directive at the top of a config file when using a YAML language server. For the AutoDeploy backend, use the `AutoDeploy config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-autodeploy-config.schema.json>`_ instead.
+For IDE validation and completion, TensorRT-LLM publishes a `trtllm-serve config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json>`_ for ``trtllm-serve serve --config``. Add the schema directive at the top of a config file when using a YAML language server. For the AutoDeploy backend, use the `AutoDeploy config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-autodeploy-config.schema.json>`_, and for the orchestrator config passed to ``trtllm-serve disaggregated --config``, use the `disaggregated orchestrator config schema <https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-disagg-config.schema.json>`_.
 
 .. code-block:: yaml
 

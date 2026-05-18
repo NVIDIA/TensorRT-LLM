@@ -55,6 +55,7 @@ SCHEMA_BASE_URL = f"{_DOCS_BASE_URL}/{_read_trtllm_version()}/_static/schemas"
 
 SERVE_CONFIG_SCHEMA_FILENAME = "trtllm-serve-config.schema.json"
 AUTODEPLOY_CONFIG_SCHEMA_FILENAME = "trtllm-serve-autodeploy-config.schema.json"
+DISAGG_CONFIG_SCHEMA_FILENAME = "trtllm-serve-disagg-config.schema.json"
 VISUAL_GEN_CONFIG_SCHEMA_FILENAME = "trtllm-serve-visual-gen-config.schema.json"
 
 _VALID_JSON_SCHEMA_TYPES = frozenset(
@@ -171,6 +172,27 @@ def _hf_revision_alias(schema: dict[str, Any]) -> dict[str, Any]:
     return revision_schema
 
 
+def _add_disagg_cluster_property(schema: dict[str, Any]) -> None:
+    """Allow ``disagg_cluster:`` at the top level of a single-worker config.
+
+    ``trtllm-serve serve`` (both pytorch and _autodeploy backends) pops
+    ``disagg_cluster`` from the parsed YAML before constructing the LLM
+    (see ``tensorrt_llm/commands/serve.py``), turning that worker into a
+    participant in a disagg cluster. It isn't a ``TorchLlmArgs`` field, so
+    add it explicitly here, sharing the ``DisaggClusterConfig`` shape.
+    """
+    from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig
+
+    defs = schema.setdefault("$defs", {})
+    cluster_schema = _typeadapter_subschema(DisaggClusterConfig, defs)
+    cluster_schema["description"] = (
+        "Optional cluster registration for a worker. When set, the worker "
+        "registers with a shared cluster store so a disaggregated orchestrator "
+        "can discover it. Same shape as the orchestrator's `disagg_cluster:`."
+    )
+    schema.setdefault("properties", {})["disagg_cluster"] = cluster_schema
+
+
 def _add_serve_config_aliases(schema: dict[str, Any]) -> None:
     properties = schema.setdefault("properties", {})
     properties["backend"] = {
@@ -182,6 +204,7 @@ def _add_serve_config_aliases(schema: dict[str, Any]) -> None:
         ),
     }
     properties["hf_revision"] = _hf_revision_alias(schema)
+    _add_disagg_cluster_property(schema)
 
 
 def _add_autodeploy_config_aliases(schema: dict[str, Any]) -> None:
@@ -190,6 +213,7 @@ def _add_autodeploy_config_aliases(schema: dict[str, Any]) -> None:
     # needs to be added here.
     properties = schema.setdefault("properties", {})
     properties["hf_revision"] = _hf_revision_alias(schema)
+    _add_disagg_cluster_property(schema)
 
 
 def _model_schema(
@@ -248,6 +272,184 @@ def generate_autodeploy_config_schema() -> dict[str, Any]:
     return schema
 
 
+def _typeadapter_subschema(cls: Any, defs: dict[str, Any]) -> dict[str, Any]:
+    """Build a property-level schema fragment from a dataclass via TypeAdapter.
+
+    Inlined $defs from the adapter are merged into ``defs`` so the returned
+    fragment can be embedded directly under ``properties``. Returns the
+    top-level schema with its own ``$defs`` removed.
+    """
+    from pydantic import TypeAdapter
+
+    schema = TypeAdapter(cls).json_schema()
+    inner_defs = schema.pop("$defs", {})
+    for name, body in inner_defs.items():
+        # Preserve existing definitions; in practice these dataclasses don't
+        # collide with TorchLlmArgs's $defs, but be defensive.
+        defs.setdefault(name, body)
+    return schema
+
+
+def generate_disagg_config_schema() -> dict[str, Any]:
+    _ensure_repo_root_on_syspath()
+    from tensorrt_llm.llmapi.disagg_utils import (
+        ConditionalDisaggConfig,
+        DisaggClusterConfig,
+        OtlpConfig,
+    )
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    # Start from the TorchLlmArgs schema — its properties are valid at the
+    # disagg YAML top level (they get inherited into every server block by
+    # extract_disagg_cfg) and its $defs are reused inside DisaggServerBlock.
+    schema = TorchLlmArgs.model_json_schema(
+        by_alias=True,
+        mode="validation",
+        schema_generator=TRTLLMServeSchemaGenerator,
+    )
+    defs = schema.setdefault("$defs", {})
+
+    # A context_servers / generation_servers block accepts the same TorchLlmArgs
+    # fields plus three routing-specific extras (num_instances, urls, router).
+    # max_batch_size / max_num_tokens are already in TorchLlmArgs and get
+    # forwarded into router args at runtime; no need to duplicate them.
+    server_block_properties = copy.deepcopy(schema["properties"])
+    server_block_properties["num_instances"] = {
+        "type": "integer",
+        "minimum": 0,
+        "default": 1,
+        "description": (
+            "Number of worker instances of this role to launch. Use 0 in one "
+            "block to deploy a single-role (ctx-only or gen-only) setup."
+        ),
+    }
+    server_block_properties["urls"] = {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "List of <host>:<port> URLs, one per instance, identifying the workers in this group."
+        ),
+    }
+    server_block_properties["router"] = {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {
+            "type": {
+                "type": "string",
+                "default": "round_robin",
+                "description": "Router policy (e.g. round_robin).",
+            },
+        },
+        "description": (
+            "Routing policy for this server group. Additional keys are "
+            "forwarded to the router as args."
+        ),
+    }
+
+    defs["DisaggServerBlock"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": server_block_properties,
+        "description": (
+            "Per-role (context or generation) worker block. Accepts the same "
+            "TorchLlmArgs fields as the trtllm-serve config, plus num_instances, "
+            "urls, and router."
+        ),
+    }
+
+    properties = schema["properties"]
+    # The disagg orchestrator accepts pytorch and _autodeploy backends; TRT is
+    # legacy and not exercised here.
+    properties["backend"] = {
+        "type": "string",
+        "enum": ["pytorch", "_autodeploy", "tensorrt", "trt"],
+        "default": "pytorch",
+        "description": (
+            "Backend used by every worker in this disagg deployment. Inherited "
+            "from the top level into each server block. pytorch is the default; "
+            "_autodeploy is supported; tensorrt/trt is legacy."
+        ),
+    }
+    # CLI alias not part of TorchLlmArgs: trtllm-serve's --free_gpu_memory_fraction
+    # is propagated into worker KvCacheConfig.
+    properties["free_gpu_memory_fraction"] = {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "description": (
+            "CLI alias inherited into each worker's KvCacheConfig.free_gpu_memory_fraction."
+        ),
+    }
+    properties["hostname"] = {
+        "type": "string",
+        "default": "localhost",
+        "description": "Bind address for the disaggregated orchestrator server.",
+    }
+    properties["port"] = {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65535,
+        "default": 8000,
+        "description": "Bind port for the disaggregated orchestrator server.",
+    }
+    properties["max_retries"] = {
+        "type": "integer",
+        "minimum": 0,
+        "default": 1,
+        "description": "Max attempts when forwarding a request to a worker.",
+    }
+    properties["perf_metrics_max_requests"] = {
+        "type": "integer",
+        "minimum": 0,
+        "default": 0,
+        "description": "Number of recent requests to retain perf metrics for.",
+    }
+    properties["node_id"] = {
+        "type": ["integer", "null"],
+        "default": None,
+        "description": (
+            "Node id for this orchestrator. Auto-derived from the host MAC "
+            "address if unset; valid range is [0, 1023]."
+        ),
+    }
+    properties["schedule_style"] = {
+        "type": "string",
+        "enum": ["context_first", "generation_first"],
+        "default": "context_first",
+        "description": "Order workers are scheduled in: context_first or generation_first.",
+    }
+    properties["context_servers"] = {
+        "$ref": "#/$defs/DisaggServerBlock",
+        "description": "Configuration for the context (prefill) worker group.",
+    }
+    properties["generation_servers"] = {
+        "$ref": "#/$defs/DisaggServerBlock",
+        "description": "Configuration for the generation (decode) worker group.",
+    }
+    properties["conditional_disagg_config"] = _typeadapter_subschema(ConditionalDisaggConfig, defs)
+    properties["conditional_disagg_config"]["description"] = (
+        "Optional override of the conditional-disaggregation policy."
+    )
+    properties["otlp_config"] = _typeadapter_subschema(OtlpConfig, defs)
+    properties["otlp_config"]["description"] = "OpenTelemetry tracing config."
+    properties["disagg_cluster"] = _typeadapter_subschema(DisaggClusterConfig, defs)
+    properties["disagg_cluster"]["description"] = (
+        "Optional disagg-cluster (shared metadata storage) configuration."
+    )
+
+    return _add_schema_metadata(
+        schema,
+        schema_id=_schema_id(DISAGG_CONFIG_SCHEMA_FILENAME),
+        title="TensorRT-LLM trtllm-serve disaggregated Config",
+        description=(
+            "YAML fragment accepted by trtllm-serve disaggregated --config. "
+            "Top-level fields are inherited into each context_servers / "
+            "generation_servers block at runtime; runtime validation remains "
+            "authoritative."
+        ),
+    )
+
+
 def generate_visual_gen_config_schema() -> dict[str, Any]:
     _ensure_repo_root_on_syspath()
     from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
@@ -270,6 +472,7 @@ def write_schemas(output_dir: Path) -> list[Path]:
     schemas = {
         SERVE_CONFIG_SCHEMA_FILENAME: generate_serve_config_schema(),
         AUTODEPLOY_CONFIG_SCHEMA_FILENAME: generate_autodeploy_config_schema(),
+        DISAGG_CONFIG_SCHEMA_FILENAME: generate_disagg_config_schema(),
         VISUAL_GEN_CONFIG_SCHEMA_FILENAME: generate_visual_gen_config_schema(),
     }
 
