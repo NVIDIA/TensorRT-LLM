@@ -1498,58 +1498,6 @@ static void launchMultiPassRadix(void* scratch, float const* logits, int const* 
     launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 3>), (int const*) candBuf1, candBuf2);
 }
 
-// Scheme X bound calculator — shared between fp32 and bf16/fp16 dispatchers.
-// Caches hardware attrs (SM count, L2 capacity) and the small-N threshold
-// once per process via std::call_once. Per-call cost is just two reads
-// from cached static variables plus a small arithmetic block, no syscalls.
-struct SchemeXBounds
-{
-    int smCount;
-    int l2Bytes;
-    int kBsWave;
-    int kBsL2;
-    int kBsLarge;
-    int kSeqSmall;
-};
-
-inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
-{
-    static std::once_flag sOnce;
-    static int sSm = 0;
-    static int sL2 = 0;
-    static int sNMin = 0;
-    std::call_once(sOnce,
-        []()
-        {
-            int dev = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&sSm, cudaDevAttrMultiProcessorCount, dev);
-            cudaDeviceGetAttribute(&sL2, cudaDevAttrL2CacheSize, dev);
-            constexpr int kSeqSmallDefault = 12288;
-            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
-            if (env != nullptr)
-            {
-                int const v = std::atoi(env);
-                sNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
-            }
-            else
-            {
-                sNMin = kSeqSmallDefault;
-            }
-        });
-
-    SchemeXBounds b;
-    b.smCount = sSm;
-    b.l2Bytes = sL2;
-    b.kBsWave = (sSm > 0) ? (sSm * 3 - sSm / 8) : 426;
-    b.kBsL2 = (sL2 > 0 && numColumns > 0)
-        ? static_cast<int>(static_cast<int64_t>(sL2) * 9 / 10 / (static_cast<int64_t>(numColumns) * bytesPerElem))
-        : b.kBsWave;
-    b.kBsLarge = std::min(b.kBsWave, b.kBsL2 > 0 ? b.kBsL2 : b.kBsWave);
-    b.kSeqSmall = sNMin;
-    return b;
-}
-
 } // anonymous namespace
 
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
@@ -1603,68 +1551,18 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
 
-    // ========================================================================
-    // Small-N dispatch axis.
-    //
-    // GVR Heuristic Top-K has a *fixed* per-launch overhead from Phase-1
-    // (preIdx stats reduction over M=2048) and Phase-4 (2048-bin histogram
-    // snap), totaling ~11 µs regardless of N. For small N (≤16K), this
-    // fixed cost dominates and the kernel loses to the existing
-    // insertion-sort/radix path. Empirically (random data, B200 BS=1):
-    //   N=8192   : Heuristic 16.5 µs vs Radix 11.2 µs (radix 1.47× faster)
-    //   N=16384  : Heuristic 21.9 µs vs Radix 22.0 µs (parity)
-    //   N=32768  : Heuristic 26.1 µs vs Radix 32.9 µs (heuristic 1.26× faster)
-    //   N=131072 : Heuristic 43.4 µs vs Radix 76.1 µs (heuristic 1.75× faster)
-    //
-    // Route N < kSeqSmall to the existing Radix/Insertion path (which itself
-    // splits at the numRows-aware kSortingAlgorithmThreshold computed above).
-    // kSeqSmall is set at the empirical crossover point.
-    //
-    // ========================================================================
-    // Architecture-derived BS-threshold dispatch — jointly bounded by
-    // occupancy AND L2 cache capacity.
-    //
-    // Two physical constraints bound when the per-row heuristic kernel
-    // remains faster than a radix streaming kernel:
-    //
-    //   (A) Occupancy bound — 3·SM − SM/8 (wave geometry + setup margin)
-    //        Each CTA uses ~58 KB SMEM (fixed, independent of N), so B200's
-    //        228 KB dynamic SMEM allows max 3 CTA/SM. Above 3·SM rows per
-    //        launch, tail-wave imbalance causes stragglers. The -SM/8 margin
-    //        (~1/8 wave) covers CTA setup + L2 ingestion overhead.
-    //        On B200(148 SM): 3×148 − 18 = 426.
-    //
-    //   (B) L2 cache bound — 0.9·L2 / (4·N) per-CTA logits fit
-    //        Each CTA streams its row (N×4B) through L2 per Phase-2 iter.
-    //        With num_concurrent_CTAs × N × 4B > L2, eviction dominates.
-    //        On B200(126 MB L2) with N=70K: 0.9·126MB/(4·70690) ≈ 440,
-    //        which is ~ equal to (A)=426 — the two constraints cross over
-    //        near the SWE-Bench data point.
-    //        For N > 73K the L2 bound tightens below (A) and must take
-    //        over; e.g. N=128K → kBsL2=238, N=196K → kBsL2=155.
-    //
-    // Dispatch threshold = min(kBsWave, kBsL2), still data-agnostic (only
-    // queries hardware attrs). At N≈70K both bounds produce ~426, so the
-    // L2 axis is a no-op there; for larger N it auto-tightens the threshold.
-    //
-    // Small-N lower bound `kSeqSmall` (default 12288) lets the Heuristic
-    // axis take over wherever the original Radix-radix branch would have
-    // triggered. Random-data benchmarks suggest the crossover is 16384,
-    // but workloads with strongly preIdx-correlated logits make P1 stats
-    // accurate and P2 converge in 1-2 iterations, shifting the real
-    // crossover into the [12288, 16384] band. Configurable via
-    // TRTLLM_HEURISTIC_NMIN env (>=1024).
-    // ========================================================================
-    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/4);
-    int const kBsWave = bounds.kBsWave;
-    int const kBsL2 = bounds.kBsL2;
-    int const kBsLarge = bounds.kBsLarge;
-    int const kSeqSmall = bounds.kSeqSmall;
-
+    // GVR ↔ TPR routing rule:
+    //   numColumns <= 16384  → TPR (small-N: GVR's fixed Phase-1/4 overhead
+    //                                ~11 µs dominates; insertion / single-block
+    //                                radix wins. 16K itself stays on TPR.)
+    //   numRows    <= 32     → TPR (low-BS: GVR can't recoup setup at any N;
+    //                                also keeps the multi-pass radix path
+    //                                eligibility zone (BS ≤ 32) reachable.)
+    //   otherwise            → GVR (when its eligibility predicate also holds;
+    //                                otherwise fall through to TPR).
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
-        && heuristicScratch != nullptr && numRows < kBsLarge;
+        && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns > 16384 && numRows > 32;
 
     // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
     {
@@ -1678,12 +1576,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
             });
         if (sDebug)
         {
-            fprintf(stderr,
-                "[Scheme X] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
-                "L2=%dMB -> %s path%s\n",
-                numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, bounds.smCount,
-                bounds.l2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
-                (numColumns < kSeqSmall) ? " (small-N route)" : "");
+            fprintf(stderr, "[Scheme X] numRows=%d numColumns=%d -> %s path\n", numRows, numColumns,
+                canUseHeuristic ? "Heuristic" : "Radix");
         }
     }
 
@@ -1858,16 +1752,15 @@ size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
 // ============================================================================
 // bf16 / fp16 dispatcher overloads
 // ============================================================================
-// Reuses the BS-threshold + small-N dispatch axes (kBsLarge, kSeqSmall) from
-// the fp32 dispatcher, except kBsL2 uses sizeof(InputT) bytes/element instead
-// of 4 — L2 footprint is half, so bf16/fp16 path remains valid for larger BS
-// than fp32 at the same N.
+// Uses the same GVR ↔ TPR routing rule as the fp32 dispatcher:
+//   numColumns <= 16384  → TPR (insertion-sort or single-block radix)
+//   numRows    <= 32     → TPR
+//   otherwise            → GVR (when its eligibility predicate also holds)
 //
-// Fallback chain when GVR-Heuristic preconditions are not met (preIdx
-// missing, BS too large, or numColumns < kSeqSmall):
-//   numColumns < kSortingAlgorithmThreshold (12288)            → insertion sort
+// Fallback chain when GVR-Heuristic preconditions are not met:
+//   numColumns < kSortingAlgorithmThreshold (12288)              → insertion sort
 //   kSortingAlgorithmThreshold ≤ numColumns < splitWorkThreshold → radix sort
-//   numColumns ≥ splitWorkThreshold (200K default)             → unsupported
+//   numColumns ≥ splitWorkThreshold (200K default)               → unsupported
 //
 // Insertion + radix tiers use the same topKPerRowDecode kernel as fp32 with
 // InputT propagated through; the histogram and sort steps operate on float
@@ -1895,15 +1788,10 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
-    // bf16/fp16: bytes_per_element = sizeof(InputT) = 2 → kBsL2 doubles vs fp32.
-    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/static_cast<int>(sizeof(InputT)));
-    int const kBsLarge = bounds.kBsLarge;
-    int const kSeqSmall = bounds.kSeqSmall;
-
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
+    // GVR ↔ TPR routing rule: see the comment block above.
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
-        && heuristicScratch != nullptr && numRows < kBsLarge;
+        && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns > 16384 && numRows > 32;
 
     if (canUseHeuristic)
     {
@@ -2005,16 +1893,18 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     sync_check_cuda_error(stream);
 }
 
-bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int bytesPerElem)
+bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int /*bytesPerElem*/)
 {
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     if (!isSupportedTopK)
     {
         return false;
     }
-    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
-    auto const bounds = getSchemeXBounds(numColumns, bytesPerElem);
-    return numColumns >= bounds.kSeqSmall && numColumns < kDefaultSplitWorkThreshold && numRows < bounds.kBsLarge;
+    // GVR ↔ TPR routing rule (see invokeIndexerTopKDecode): GVR is preferred
+    // for non-tiny seq lengths and non-tiny batch sizes; everything else
+    // routes to TPR. bytesPerElem is retained in the signature for source
+    // compatibility but no longer participates in the decision.
+    return numColumns > 16384 && numRows > 32;
 }
 
 } // namespace kernels
