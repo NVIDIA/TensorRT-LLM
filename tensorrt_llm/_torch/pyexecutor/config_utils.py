@@ -1,6 +1,4 @@
 import dataclasses
-import re
-from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -328,233 +326,6 @@ def extract_mamba_kv_cache_params(
     )
 
 
-class _Qwen35ConfigCompat:
-    """Temporary shim for flattening Qwen3.5 text configs into Qwen3NextConfig.
-
-    This is used for Qwen3.5 text-only configs and for shared helper logic such
-    as RoPE and quantization exclude-module normalization. Qwen3.5-MoE VLM
-    configs should stay composite and use transformers.Qwen3_5MoeConfig plus
-    _normalize_qwen35_moe_vl_config instead.
-
-    To remove: delete this class and the elif branch in
-    load_pretrained_config that flattens Qwen3.5 text configs.
-    """
-
-    @staticmethod
-    def normalize(config_dict: dict) -> dict:
-        """Entry point: raw config.json dict -> flat Qwen3NextConfig-compatible dict."""
-        text_config = _Qwen35ConfigCompat._extract_text_config(config_dict)
-        text_config = _Qwen35ConfigCompat._inherit_quantization_config(
-            config_dict, text_config)
-        text_config = _Qwen35ConfigCompat._flatten_rope(text_config)
-
-        # Detect dense vs MoE and set architecture + MoE defaults accordingly
-        is_moe = "num_experts" in text_config and text_config["num_experts"] > 0
-        if is_moe:
-            text_config["architectures"] = ["Qwen3_5MoeForCausalLM"]
-        else:
-            text_config["architectures"] = ["Qwen3_5ForCausalLM"]
-            # Ensure MoE fields are zeroed so Qwen3NextConfig defaults don't
-            # accidentally enable MoE for the dense model.
-            text_config.setdefault("num_experts", 0)
-            text_config.setdefault("num_experts_per_tok", 0)
-            text_config.setdefault("moe_intermediate_size", 0)
-            text_config.setdefault("shared_expert_intermediate_size", 0)
-        return text_config
-
-    _VLM_ARCHITECTURES = {
-        "Qwen3_5MoeForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-    }
-
-    @staticmethod
-    def _extract_text_config(config_dict: dict) -> dict:
-        """Pull nested text_config from VLM checkpoints, or use dict as-is."""
-        architectures = config_dict.get("architectures") or []
-        if architectures and architectures[
-                0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
-            text_config = dict(config_dict.get("text_config") or {})
-        else:
-            text_config = dict(config_dict)
-        if not text_config:
-            raise ValueError("Qwen3.5 config is missing a usable text_config")
-        return text_config
-
-    @staticmethod
-    def _inherit_quantization_config(config_dict: dict,
-                                     text_config: dict) -> dict:
-        """Copy top-level quantization_config into text_config with name normalization.
-
-        Also adds a temporary workaround that keeps packed linear-attention
-        in_proj_qkvz on the bf16 path until FP8 block-scale TP loading is
-        fixed for that layout.
-        """
-        if "quantization_config" in text_config:
-            return text_config
-        if "quantization_config" not in config_dict:
-            return text_config
-
-        quantization_config = dict(config_dict["quantization_config"])
-        if "modules_to_not_convert" in quantization_config:
-            modules = _Qwen35ConfigCompat._normalize_exclude_modules(
-                quantization_config["modules_to_not_convert"])
-            modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
-                text_config, modules)
-            quantization_config["modules_to_not_convert"] = sorted(set(modules))
-        text_config["quantization_config"] = quantization_config
-        return text_config
-
-    @staticmethod
-    def _normalize_exclude_modules(modules: list[str]) -> list[str]:
-        """Translate HF quantization exclude-module paths to TRT-LLM names.
-
-        - Strip model.language_model. prefix -> model.
-        - Drop model.visual.* and mtp.* entries
-        - Map split projection names to packed TRT-LLM names
-        """
-        normalized = set()
-        for name in modules:
-            if name.startswith("model.language_model."):
-                name = "model." + name[len("model.language_model."):]
-            if name.startswith("model.visual.") or name.startswith("mtp."):
-                continue
-            name = re.sub(r"\.in_proj_[ab]$", ".in_proj_ba", name)
-            name = re.sub(r"\.in_proj_(q|k|v|z|qkv)$", ".in_proj_qkvz", name)
-            normalized.add(name)
-        return sorted(normalized)
-
-    @staticmethod
-    def _add_qkvz_bf16_workaround(text_config: dict,
-                                  modules: list[str]) -> list[str]:
-        """Keep packed linear-attention qkvz on bf16 path for all linear-attention layers.
-
-        Temporary until FP8 block-scale TP loading is fixed for this layout.
-        """
-        try:
-            layer_types = get_qwen3_hybrid_layer_types(
-                SimpleNamespace(**text_config))
-        except (ValueError, AttributeError):
-            return modules
-        for layer_idx, layer_type in enumerate(layer_types):
-            if layer_type == "linear_attention":
-                modules.append(
-                    f"model.layers.{layer_idx}.linear_attn.in_proj_qkvz")
-        return modules
-
-    @staticmethod
-    def _flatten_rope(text_config: dict) -> dict:
-        """Flatten rope_parameters into top-level rope_theta / partial_rotary_factor / rope_scaling.
-
-        Qwen3.5 nests these inside a rope_parameters dict and uses rope_type
-        instead of type in rope_scaling.  Qwen3NextConfig expects them as
-        top-level fields with rope_scaling.type.
-        """
-        rope_parameters = dict(text_config.pop("rope_parameters", {}) or {})
-        rope_scaling = dict(text_config.get("rope_scaling") or {})
-        if rope_parameters:
-            rope_theta = rope_parameters.pop("rope_theta", None)
-            if rope_theta is not None:
-                text_config.setdefault("rope_theta", rope_theta)
-            partial_rotary_factor = rope_parameters.pop("partial_rotary_factor",
-                                                        None)
-            if partial_rotary_factor is not None:
-                text_config.setdefault("partial_rotary_factor",
-                                       partial_rotary_factor)
-            if rope_parameters:
-                rope_scaling = rope_parameters | rope_scaling
-        if rope_scaling:
-            has_mrope = ("mrope_section" in rope_scaling
-                         or rope_scaling.get("mrope_interleaved", False))
-            if has_mrope:
-                rope_scaling["type"] = "mrope"
-                rope_scaling.pop("rope_type", None)
-            elif "type" not in rope_scaling and "rope_type" in rope_scaling:
-                rope_type = rope_scaling.pop("rope_type")
-                # "default" means standard RoPE (no scaling) — don't set
-                # rope_scaling to avoid triggering scaling code paths.
-                if rope_type == "default":
-                    rope_scaling = {}
-                else:
-                    rope_scaling["type"] = rope_type
-            if rope_scaling:
-                text_config["rope_scaling"] = rope_scaling
-        return text_config
-
-
-def _normalize_qwen35_mrope_config(text_config) -> None:
-    """Materialize Qwen3.5 mRoPE aliases needed by the Qwen3-VL path.
-
-    HF stores RoPE metadata under ``rope_parameters``; the shared Qwen3-VL
-    wrapper reads ``rope_theta``, ``partial_rotary_factor``, and
-    ``rope_scaling`` directly on the text config.
-    """
-    rope_parameters = getattr(text_config, "rope_parameters", None)
-    if not rope_parameters:
-        return
-    if hasattr(rope_parameters, "to_dict"):
-        rope_parameters = rope_parameters.to_dict()
-    flattened = _Qwen35ConfigCompat._flatten_rope({
-        "rope_parameters":
-        dict(rope_parameters),
-        "rope_scaling":
-        dict(getattr(text_config, "rope_scaling", None) or {}),
-    })
-    for attr in ("rope_theta", "partial_rotary_factor", "rope_scaling"):
-        value = flattened.get(attr)
-        if value is not None:
-            setattr(text_config, attr, value)
-
-
-def _normalize_qwen35_qwen3next_text_aliases(text_config) -> None:
-    """Materialize Qwen3Next-style text aliases used by the shared runtime."""
-    if getattr(text_config, "intermediate_size", None) is None:
-        moe_intermediate_size = getattr(text_config, "moe_intermediate_size",
-                                        None)
-        num_experts_per_tok = getattr(text_config, "num_experts_per_tok", None)
-        shared_expert_intermediate_size = getattr(
-            text_config, "shared_expert_intermediate_size", 0) or 0
-        if (moe_intermediate_size is not None
-                and num_experts_per_tok is not None):
-            text_config.intermediate_size = (
-                num_experts_per_tok * moe_intermediate_size +
-                shared_expert_intermediate_size)
-
-
-def _normalize_qwen35_quantization_config(model_config) -> None:
-    quantization_config = getattr(model_config, "quantization_config", None)
-    if not isinstance(quantization_config, dict):
-        return
-
-    modules = quantization_config.get("modules_to_not_convert")
-    if modules is None:
-        return
-
-    text_config = getattr(model_config, "text_config", None)
-    normalized_modules = _Qwen35ConfigCompat._normalize_exclude_modules(modules)
-    if text_config is not None:
-        normalized_modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
-            text_config.to_dict(), normalized_modules)
-    quantization_config["modules_to_not_convert"] = sorted(
-        set(normalized_modules))
-
-
-def _normalize_qwen35_moe_vl_config(model_config) -> None:
-    """Adapt HF Qwen3.5-MoE VLM config to TRT-LLM runtime conventions."""
-    if not getattr(model_config, "architectures", None):
-        model_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
-
-    text_config = getattr(model_config, "text_config", None)
-    if text_config is None:
-        raise ValueError("Qwen3.5-MoE VLM config is missing text_config")
-
-    text_config.architectures = ["Qwen3_5MoeForCausalLM"]
-    _normalize_qwen35_qwen3next_text_aliases(text_config)
-    _normalize_qwen35_mrope_config(text_config)
-
-    model_config.get_text_config = lambda decoder=False: text_config
-    _normalize_qwen35_quantization_config(model_config)
-
-
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -588,6 +359,9 @@ def load_pretrained_config(model_name_or_path: str,
           (("text_config" in config_dict and "vision_config" in config_dict) or
            (architectures
             and architectures[0] == "Qwen3_5MoeForConditionalGeneration"))):
+        # Qwen3.5-MoE VLM: HF native composite config + model-side normalizer.
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            _normalize_qwen35_moe_vl_config
         model_config = transformers.Qwen3_5MoeConfig.from_pretrained(
             model_name_or_path, **kwargs)
         _normalize_qwen35_moe_vl_config(model_config)
@@ -603,6 +377,9 @@ def load_pretrained_config(model_name_or_path: str,
                                 "Qwen3_5ForCausalLM",
                                 "Qwen3_5ForConditionalGeneration",
                             )):
+        # Qwen3.5 text-only: flatten to Qwen3NextConfig via the model-side shim.
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            _Qwen35ConfigCompat
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
     elif (model_type == "exaone4" and config_dict.get("sliding_window") is None

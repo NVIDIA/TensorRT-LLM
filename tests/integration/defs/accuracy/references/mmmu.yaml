@@ -60,6 +60,7 @@ Qwen/Qwen3-VL-8B-Instruct:
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 57.0
 Qwen/Qwen3.5-35B-A3B:
+  # The default accuracy for `test_auto_dtype` tests.
   - accuracy: 59.0
   - dtype: bfloat16
     accuracy: 60.444
