@@ -508,6 +508,38 @@ class TestCapturedGraphCapture:
         assert model.forward_calls == calls_after_capture + 1
         torch.testing.assert_close(out, torch.full((5, 2), 2.0))
 
+    @pytest.mark.parametrize(
+        ("output_extents", "error_match"),
+        [
+            (None, "output extent metadata is missing"),
+            ((2, 2), "output extent metadata does not match captured outputs"),
+        ],
+    )
+    def test_forward_raises_for_inconsistent_output_extent_metadata(
+        self, monkeypatch, output_extents, error_match
+    ):
+        model = nn.Identity()
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del self, args, kwargs, refresh_args_static
+            return object(), (2,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (torch.ones(bs, 2),), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [2])
+        graph_key = (2, 2)
+        if output_extents is None:
+            del compiled_model._cudagraph_output_extents[graph_key]
+        else:
+            compiled_model._cudagraph_output_extents[graph_key] = output_extents
+
+        with pytest.raises(RuntimeError, match=error_match):
+            compiled_model(torch.ones(2, 2))
+
 
 # ============================================================================
 # Helpers for piecewise / submod_has_cuda_ops tests

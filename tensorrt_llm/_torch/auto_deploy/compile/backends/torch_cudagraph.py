@@ -358,18 +358,17 @@ class CapturedGraph(nn.Module):
 
         output_extents = self._cudagraph_output_extents.get(combined_shape)
         if output_extents is None:
-            return self.model(*args, **kwargs)
+            raise RuntimeError(
+                "CUDA graph output extent metadata is missing for captured input shape "
+                f"{combined_shape}."
+            )
 
         if len(output_extents) != len(self._out_buffer_flat):
-            return self.model(*args, **kwargs)
-
-        # A captured graph may still be selected for a runtime batch whose
-        # dynamic extent is larger than the buffers allocated during capture.
-        # Run eager instead of replaying into undersized graph buffers.
-        for i, input_tensor in enumerate(args_batched):
-            dim_i = self.dynamic_dims[i]
-            if input_tensor.shape[dim_i] > self._input_buffers[i].shape[dim_i]:
-                return self.model(*args, **kwargs)
+            raise RuntimeError(
+                "CUDA graph output extent metadata does not match captured outputs: "
+                f"num_extents={len(output_extents)}, num_outputs={len(self._out_buffer_flat)}, "
+                f"input_shape={combined_shape}."
+            )
 
         od = self._output_dynamic_dim
         if any(
