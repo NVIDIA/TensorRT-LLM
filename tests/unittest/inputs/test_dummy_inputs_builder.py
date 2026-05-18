@@ -16,7 +16,7 @@ path share that math.
 
 import pytest
 
-from tensorrt_llm.inputs import Modality
+from tensorrt_llm.inputs.modality import Modality
 from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
 
 

@@ -23,22 +23,18 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
-from tensorrt_llm.inputs import Modality
+from tensorrt_llm.inputs.modality import Modality
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
 
 def _make_subclass(
-    *,
-    deterministic: bool,
-    spatial_merge_unit_value: int = 1,
-    hf_post_merger_tokens: int = 999,
+    *, deterministic: bool, spatial_merge_unit_value: int = 1, hf_post_merger_tokens: int = 999
 ):
     """Build a concrete subclass with controlled deterministic + HF behavior.
 
     ``deterministic=True``: ``get_num_mm_tokens`` returns
-        ``width * height * num_frames`` (pre-merger) for IMAGE/VIDEO.
-        AUDIO returns ``audio_length``. This makes the expected
-        post-merger output predictable in tests.
+        ``width * height * num_frames`` (pre-merger). This makes the
+        expected post-merger output predictable in tests.
     ``deterministic=False``: ``get_num_mm_tokens`` falls through to the
         base-class default (NotImplementedError).
     """
@@ -73,23 +69,10 @@ def _make_subclass(
 
         if deterministic:
 
-            @property
-            def supported_modalities(self):
-                return (Modality.IMAGE, Modality.VIDEO)
-
             def get_num_mm_tokens(
-                self,
-                modality,
-                *,
-                width=None,
-                height=None,
-                num_frames=None,
-                audio_length=None,
-                **kwargs,
+                self, modality, *, width=None, height=None, num_frames=1, **kwargs
             ):
-                if modality in (Modality.IMAGE, Modality.VIDEO):
-                    return int(width) * int(height) * int(num_frames or 1)
-                raise NotImplementedError(modality)
+                return width * height * num_frames
 
     instance = _Sub.__new__(_Sub)
     # HF processor mock returning the configured post-merger count.
@@ -108,11 +91,6 @@ def _make_subclass(
 def test_spatial_merge_unit_defaults_to_one():
     sub = _make_subclass(deterministic=False)
     assert sub.spatial_merge_unit == 1
-
-
-def test_supported_modalities_defaults_empty():
-    sub = _make_subclass(deterministic=False)
-    assert sub.supported_modalities == ()
 
 
 def test_get_num_mm_tokens_default_raises_not_implemented():
