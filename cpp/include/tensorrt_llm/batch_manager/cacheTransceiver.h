@@ -286,8 +286,16 @@ private:
     std::unique_ptr<CacheReceiver> mCacheReceiver;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
-    std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
+
+    // First-timeout dedup sets for the kvTransferTimeoutMs enforcement,
+    // by role: mTimedOutSenderIds tracks context-side (mSenderFutures)
+    // and mTimedOutRequesterIds tracks generation-side (mRequesterFutures).
+    // Used to emit at most one timeout warning and at most one cancel
+    // request per request per role. Erased at every future-list cleanup
+    // site so the sets stay bounded.
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;

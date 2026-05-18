@@ -56,7 +56,8 @@ from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
-from .kv_cache_transceiver import KvCacheTransceiver
+from .kv_cache_transceiver import (KvCacheTransceiver,
+                                   is_disagg_inflight_cancel_enabled)
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .mamba_cache_manager import MambaHybridCacheManager
@@ -3277,24 +3278,33 @@ class PyExecutor:
             timeout_ms = configured_timeout_ms
             using_fallback = False
 
+        cancel_enabled = is_disagg_inflight_cancel_enabled()
+        observe_only_tail = "" if cancel_enabled else (
+            "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0; continuing to wait. "
+            "Set TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 to enable "
+            "cancellation and error surfacing.")
+
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
             current_time = time.time()
             if req.py_kv_transfer_start_time is None:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
-            if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
-                if using_fallback:
-                    logger.warning(
-                        f"Terminating {type} request {req.py_request_id} "
-                        f"after Python fallback deadline ({timeout_ms} ms); "
-                        "kv_transfer_timeout_ms is unset, so this is the "
-                        "only escalation path. Configure "
+            if elapsed_time <= timeout_ms or req.py_kv_transfer_timed_out:
+                return
+            # Build the "{req-id} {deadline-source}" body once, then
+            # prepend the verb chosen by the cancel-enable flag.
+            if using_fallback:
+                body = (f"{type} request {req.py_request_id} after "
+                        f"Python fallback deadline ({timeout_ms} ms); "
+                        "kv_transfer_timeout_ms is unset, so this is "
+                        "the only escalation path. Configure "
                         "kv_transfer_timeout_ms to surface failures sooner.")
-                else:
-                    logger.warning(
-                        f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                    )
-                req.py_kv_transfer_timed_out = True
+            else:
+                body = (f"{type} request {req.py_request_id} due to "
+                        "KV cache transfer timeout.")
+            verb = "Terminating" if cancel_enabled else "Observed timeout on"
+            logger.warning(f"{verb} {body} {observe_only_tail}")
+            req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
             flag_if_kv_transfer_timed_out(req, "context")

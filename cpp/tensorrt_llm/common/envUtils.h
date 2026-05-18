@@ -115,15 +115,13 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
-// Opt-in for the disagg mid-flight cancellation surface (Layer 1 send/recv
-// poll loop, Layer 2b sendHolder.poison() catch-block call, Layer 5 Python
-// fail-closed). Returns true when ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1``;
-// defaults to false (cancel chain dormant, behavior matches the pre-PR-13713
-// baseline). The orthogonal fixes (BufferIndexHolder RAII, shared_ptr<LlmRequest>
-// async lifetime, recv-side idempotency) remain always-on because they close
-// baseline races that exist regardless of mid-flight cancellation. See the
-// NVBug 6104831 investigation report section 10 for the empirical case for
-// enabling this surface in production deployments.
+// Opt-in for the disagg mid-flight cancellation surface. Gates the full
+// detection + cancellation + mark-as-error triple, which must move together
+// for memory safety, e.g., no UAF.
+// Returns true when ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1``; defaults to
+// false (cancel chain dormant: timeouts are still detected and logged once
+// per request, but no in-flight cancellation is issued and the future is left
+// to complete naturally).
 bool getEnvDisaggEnableInflightCancel();
 
 // Force deterministic behavior for all kernels.

@@ -67,6 +67,16 @@ inline int currentRankForLog()
 {
     return useMPI() ? mpi::MpiComm::world().getRank() : tensorrt_llm::pg_utils::get_world_pg()->getRank();
 }
+
+/// @brief Trailing-clause appended to kvTransferTimeoutMs warnings when the
+/// in-flight cancellation surface is disabled. The detection itself runs
+/// unconditionally so wedges are observable in logs even in flag-off mode;
+/// this clause names the knob operators must flip to actually cancel.
+/// See TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL in envUtils.h.
+constexpr char const* kObserveOnlyTimeoutTail
+    = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0; continuing to wait. "
+      "Set TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 to enable cancellation "
+      "and error surfacing.";
 } // namespace
 
 std::mutex CacheTransceiver::mDllMutex;
@@ -600,20 +610,37 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             auto elapsedMs = static_cast<long>(elapsed.count());
             if (elapsedMs > kvTransferTimeoutMs.value())
             {
-                TLLM_LOG_WARNING(
-                    "Context KV cache transfer for request %ld exceeded total timeout: "
-                    "elapsed %ld ms > limit %d ms. Marking as error.",
-                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
-                // Defense-in-depth sender-side cancel. Sender zombies empirically
-                // unwind on peer teardown (decode-pod restart), but in general
-                // CacheSender::cancelRequest clears mReadyResponses /
-                // mCancelledRequests bookkeeping so a subsequent re-enqueue
-                // or telemetry path doesn't see the stale request.
-                mCacheSender->cancelRequest(*request);
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                requestsStatus.errorRequestIds.insert(request->mRequestId);
-                it = mSenderFutures.erase(it);
-                continue;
+                // Dedup is shared with the inline wait_for re-check below
+                // so a single hung request produces at most one warning
+                // regardless of which site observes the expired deadline.
+                bool const firstTimeout = mTimedOutSenderIds.insert(request->mRequestId).second;
+                bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                if (firstTimeout)
+                {
+                    TLLM_LOG_WARNING(
+                        "Context KV cache transfer for request %ld exceeded total timeout: "
+                        "elapsed %ld ms > limit %d ms. %s",
+                        request->mRequestId, elapsedMs, kvTransferTimeoutMs.value(),
+                        inflightCancelEnabled ? "Marking as error." : kObserveOnlyTimeoutTail);
+                }
+                if (inflightCancelEnabled)
+                {
+                    // Defense-in-depth sender-side cancel. Sender zombies empirically
+                    // unwind on peer teardown (decode-pod restart), but in general
+                    // CacheSender::cancelRequest clears mReadyResponses /
+                    // mCancelledRequests bookkeeping so a subsequent re-enqueue
+                    // or telemetry path doesn't see the stale request.
+                    mCacheSender->cancelRequest(*request);
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    mTimedOutSenderIds.erase(request->mRequestId);
+                    it = mSenderFutures.erase(it);
+                    continue;
+                }
+                // Observe-only: cannot safely cancel the in-flight transfer
+                // (would risk a UAF on send buffers still touched by the
+                // network thread). Fall through to the readiness gate so a
+                // transfer that completes naturally is still detected.
             }
         }
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
@@ -648,6 +675,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     {
                         request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
                     }
+                    // Clear any observe-only timeout breadcrumb so the dedup
+                    // set does not leak across the request's lifetime.
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
@@ -665,14 +695,29 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     }
                     if (deadlineReached)
                     {
-                        TLLM_LOG_WARNING(
-                            "Context KV cache transfer for request %ld reached total timeout while waiting "
-                            "for sender future. Marking as error.",
-                            request->mRequestId);
-                        mCacheSender->cancelRequest(*request);
-                        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                        requestsStatus.errorRequestIds.insert(request->mRequestId);
-                        it = mSenderFutures.erase(it);
+                        bool const firstTimeout = mTimedOutSenderIds.insert(request->mRequestId).second;
+                        bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                        if (firstTimeout)
+                        {
+                            TLLM_LOG_WARNING(
+                                "Context KV cache transfer for request %ld reached total timeout "
+                                "while waiting for sender future. %s",
+                                request->mRequestId,
+                                inflightCancelEnabled ? "Marking as error." : kObserveOnlyTimeoutTail);
+                        }
+                        if (inflightCancelEnabled)
+                        {
+                            mCacheSender->cancelRequest(*request);
+                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                            requestsStatus.errorRequestIds.insert(request->mRequestId);
+                            mTimedOutSenderIds.erase(request->mRequestId);
+                            it = mSenderFutures.erase(it);
+                        }
+                        else
+                        {
+                            // Observe-only: continue waiting for natural completion.
+                            ++it;
+                        }
                     }
                     else
                     {
@@ -693,6 +738,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
@@ -706,6 +752,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 requestsStatus.errorRequestIds.insert(request->mRequestId);
+                mTimedOutSenderIds.erase(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
@@ -869,45 +916,58 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             if (elapsedMs > kvTransferTimeoutMs.value())
             {
                 bool const firstTimeout = mTimedOutRequesterIds.insert(request->mRequestId).second;
+                bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
                 if (firstTimeout)
                 {
                     TLLM_LOG_WARNING(
                         "Generation KV cache transfer for request %ld exceeded total timeout: "
-                        "elapsed %ld ms > limit %d ms. Requesting cancellation.",
-                        request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
-                    // cancelRequest requests worker unwind, but it is not a
-                    // quiescence proof. Keep the future tracked until the
-                    // worker future becomes ready, otherwise Python could
-                    // free KV resources while the worker/transport may still
-                    // reference the advertised buffers.
-                    mCacheReceiver->cancelRequest(*request);
+                        "elapsed %ld ms > limit %d ms. %s",
+                        request->mRequestId, elapsedMs, kvTransferTimeoutMs.value(),
+                        inflightCancelEnabled ? "Requesting cancellation." : kObserveOnlyTimeoutTail);
                 }
-                if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
-                {
-                    try
-                    {
-                        future.get();
-                    }
-                    catch (std::exception const& e)
-                    {
-                        TLLM_LOG_WARNING(
-                            "Generation KV cache transfer for timed-out request %ld finished with error: %s",
-                            request->mRequestId, e.what());
-                    }
-                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                    mTimedOutRequesterIds.erase(request->mRequestId);
-                    it = mRequesterFutures.erase(it);
-                    ++numErrored;
-                }
-                else
+                if (inflightCancelEnabled)
                 {
                     if (firstTimeout)
                     {
+                        // cancelRequest requests worker unwind, but it is not a
+                        // quiescence proof. Keep the future tracked until the
+                        // worker future becomes ready, otherwise Python could
+                        // free KV resources while the worker/transport may still
+                        // reference the advertised buffers.
+                        mCacheReceiver->cancelRequest(*request);
+                    }
+                    if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+                    {
+                        try
+                        {
+                            future.get();
+                        }
+                        catch (std::exception const& e)
+                        {
+                            TLLM_LOG_WARNING(
+                                "Generation KV cache transfer for timed-out request %ld finished with error: %s",
+                                request->mRequestId, e.what());
+                        }
+                        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                        mTimedOutRequesterIds.erase(request->mRequestId);
+                        it = mRequesterFutures.erase(it);
                         ++numErrored;
                     }
-                    ++it;
+                    else
+                    {
+                        if (firstTimeout)
+                        {
+                            ++numErrored;
+                        }
+                        ++it;
+                    }
+                    continue;
                 }
-                continue;
+                // Observe-only: memory safety forbids requesting a worker
+                // unwind here (the recv buffer pool may still be touched
+                // by the transport thread). Fall through to the readiness
+                // gate so a naturally completing transfer is still cleaned
+                // up normally.
             }
         }
         if (blockAll || toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end())
@@ -967,18 +1027,32 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     if (deadlineReached)
                     {
                         bool const firstTimeout = mTimedOutRequesterIds.insert(request->mRequestId).second;
+                        bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
                         if (firstTimeout)
                         {
                             TLLM_LOG_WARNING(
-                                "Generation KV cache transfer for request %ld reached total timeout while "
-                                "waiting for receiver future. Requesting cancellation and marking as error.",
-                                request->mRequestId);
-                            mCacheReceiver->cancelRequest(*request);
+                                "Generation KV cache transfer for request %ld reached total timeout "
+                                "while waiting for receiver future. %s",
+                                request->mRequestId,
+                                inflightCancelEnabled ? "Requesting cancellation and marking as error."
+                                                      : kObserveOnlyTimeoutTail);
                         }
-                        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                        mTimedOutRequesterIds.erase(request->mRequestId);
-                        it = mRequesterFutures.erase(it);
-                        ++numErrored;
+                        if (inflightCancelEnabled)
+                        {
+                            if (firstTimeout)
+                            {
+                                mCacheReceiver->cancelRequest(*request);
+                            }
+                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                            mTimedOutRequesterIds.erase(request->mRequestId);
+                            it = mRequesterFutures.erase(it);
+                            ++numErrored;
+                        }
+                        else
+                        {
+                            // Observe-only: continue waiting for natural completion.
+                            ++it;
+                        }
                     }
                     else
                     {
