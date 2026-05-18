@@ -189,14 +189,15 @@ size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens, int max_num_sequences
     {
         int const multi_block_count
             = computeMultiBlockCountForMLA(max_num_sequences, max_attention_window_size, mMultiProcessorCount);
-        kernel_scratch_size = static_cast<size_t>(multi_block_count) * max_num_tokens
-            * (xqaMlaCgaXBufSize + xqaMlaPartialResultSize);
         int const head_group_size = mFixedParams.numQHeads / mFixedParams.numKvHeads;
-        if (head_group_size < kXqaMlaKernelHeadGrpSize)
+        int const kernel_head_group_size = getXqaMlaKernelHeadGrpSize(head_group_size);
+        kernel_scratch_size = static_cast<size_t>(multi_block_count) * max_num_tokens
+            * (getXqaMlaCgaXBufSize(kernel_head_group_size) + getXqaMlaPartialResultSize(kernel_head_group_size));
+        if (head_group_size < kernel_head_group_size)
         {
-            size_t const padded_q_size = static_cast<size_t>(max_num_tokens) * kXqaMlaKernelHeadGrpSize
+            size_t const padded_q_size = static_cast<size_t>(max_num_tokens) * kernel_head_group_size
                 * mFixedParams.headSize * kXqaMlaQElemBytes;
-            size_t const padded_output_size = static_cast<size_t>(max_num_tokens) * kXqaMlaKernelHeadGrpSize
+            size_t const padded_output_size = static_cast<size_t>(max_num_tokens) * kernel_head_group_size
                 * kXqaMlaOutputHeadSize * kXqaMlaOutputElemBytes;
             kernel_scratch_size += roundUp<size_t>(padded_q_size, 128) + roundUp<size_t>(padded_output_size, 128);
         }

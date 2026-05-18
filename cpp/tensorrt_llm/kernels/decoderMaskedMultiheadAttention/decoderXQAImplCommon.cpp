@@ -54,9 +54,9 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
     unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
     if (supportMLA)
     {
-        kernel_num_q_heads_over_kv = kXqaMlaKernelHeadGrpSize;
+        kernel_num_q_heads_over_kv = getXqaMlaKernelHeadGrpSize(num_q_heads_over_kv);
     }
-    unsigned int kernel_m_tilesize = supportMLA ? kXqaMlaKernelHeadGrpSize
+    unsigned int kernel_m_tilesize = supportMLA ? kernel_num_q_heads_over_kv
                                                 : getKernelMTileSize(num_q_heads_over_kv,
                                                     xqaParams.multi_query_tokens, qSeqLen, isXqaJit, supportQGMMA,
                                                     supportMLA);

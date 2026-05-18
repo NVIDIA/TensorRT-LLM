@@ -403,11 +403,18 @@ struct SharedMemB
 
     // x and v are using gemmK=128 per iteration. If we see high pressure on shared memory capacity, we can change to 64
     // in the future.
+    static inline constexpr uint32_t outputSwizzleBytesPerRow
+        = sizeof(OutputElem) * exactDiv(gemm1V, 2U);
+    static inline constexpr uint32_t outputSwizzleAlignment = outputSwizzleBytesPerRow * nbMathWarpsB * 8U;
     struct XVBuffer
     {
         VBuffer v;
         CgaXBuffer x;
-        uint8_t pad[headGrpSize * 128 * 2 - sizeof(VBuffer) - sizeof(CgaXBuffer)]; // for output swizzling
+        static inline constexpr uint32_t storageBytes = roundUp<uint32_t>(
+            mha::max<uint32_t>(sizeof(VBuffer) + sizeof(CgaXBuffer), headGrpSize * 128U * sizeof(OutputElem)),
+            outputSwizzleAlignment);
+        static_assert(storageBytes >= sizeof(VBuffer) + sizeof(CgaXBuffer));
+        uint8_t pad[storageBytes - sizeof(VBuffer) - sizeof(CgaXBuffer)]; // for output swizzling
     };
 
     XVBuffer xv[nbXVBufs];

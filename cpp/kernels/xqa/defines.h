@@ -33,7 +33,7 @@
 #define HEAD_GRP_SIZE 8
 #endif
 
-#define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
+#define IS_MLA (HEAD_ELEMS == 576 && HEAD_GRP_SIZE >= 64)
 
 #if IS_MLA
 #define INPUT_ELEM __nv_fp8_e4m3

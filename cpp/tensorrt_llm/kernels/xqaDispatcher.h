@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
@@ -117,9 +118,9 @@ protected:
 
 // sizeof(Vec<CgaXBuffer, nbProducerCtasPerCga>) in cpp/kernels/xqa/mla_sm120.cu
 // for HEAD_GRP_SIZE=128, HEAD_ELEMS=576.
-constexpr uint32_t xqaMlaCgaXBufSize = 9216 * 2;
+constexpr uint32_t xqaMlaCgaXBufSize = getXqaMlaCgaXBufSize(kXqaMlaKernelHeadGrpSize);
 // sizeof(PartialResult) in cpp/kernels/xqa/mla_sm120.cu for HEAD_GRP_SIZE=128, HEAD_ELEMS=576.
-constexpr uint32_t xqaMlaPartialResultSize = 132096;
+constexpr uint32_t xqaMlaPartialResultSize = getXqaMlaPartialResultSize(kXqaMlaKernelHeadGrpSize);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
