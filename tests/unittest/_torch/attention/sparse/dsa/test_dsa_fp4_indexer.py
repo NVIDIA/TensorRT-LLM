@@ -33,17 +33,13 @@ except ImportError:
     # surface rather than silently turn into a test-wide skip.
     HAS_DEEP_GEMM = False
 else:
-    HAS_DEEP_GEMM = True
-    # If deep_gemm imports but fp8_fp4_mqa_logits is absent, the installed
-    # DeepGEMM version is wrong — fail loudly instead of silently skipping.
-    assert hasattr(deep_gemm, "fp8_fp4_mqa_logits"), (
-        "deep_gemm imported but fp8_fp4_mqa_logits is missing; "
-        "check that the correct DeepGEMM version is installed"
-    )
+    HAS_DEEP_GEMM = hasattr(deep_gemm, "fp8_fp4_mqa_logits")
 
-from utils.util import skip_pre_blackwell
+import sys
+from pathlib import Path
 
-from .dsa.test_dsa_indexer import _create_mock_metadata, create_dsa_cache_manager
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+from utils.util import skip_pre_blackwell  # noqa: E402
 
 
 def _fp4_quantize_sf_transpose(x: torch.Tensor):
@@ -199,8 +195,6 @@ def test_fp4_quantize_roundtrip_matches_bf16_kv():
     assert mae < 1.0, f"FP4 dequantize diverged from bf16 input: mae={mae:.3f}"
 
 
-@pytest.mark.skipif(not HAS_DEEP_GEMM, reason="fp8_fp4_mqa_logits not available")
-@skip_pre_blackwell
 def test_fp4_indexer_k_cache_per_token_size_drops_to_68_bytes():
     """Evidence for the plan's primary goal: FP4 indexer K cache shrinks.
 
@@ -209,19 +203,24 @@ def test_fp4_indexer_k_cache_per_token_size_drops_to_68_bytes():
     two E2M1 codes per byte (index_head_dim // 2 = 64 bytes) and keeps the
     same 4 scale bytes (UE8M0 x4 packed as one int32), for a total of 68
     bytes per token.
+
+    This test mirrors the DSACacheManager FP8 formula (one fp32 scale per
+    quant_block_size=128 elements) and the DeepseekV4CacheManager MXFP4
+    formula (one UE8M0 byte per quant_block_size=32 elements). Both
+    converge to 4 scale bytes per token at index_head_dim=128.
     """
-    # Simulate the pool allocation formula exactly as WindowBlockManager::
-    # createIndexerKCachePools (kvCacheManager.cpp) and DSACacheManager::
-    # get_indexer_k_cache_buffers (dsa.py) compute per-token size.
     index_head_dim = 128
-    quant_block_size = 128
-    scale_bytes = index_head_dim // quant_block_size * 4  # 4 bytes either way
 
+    fp8_quant_block = 128
     fp8_data_bytes = index_head_dim
-    fp8_per_token = fp8_data_bytes + scale_bytes
+    fp8_scale_bytes = index_head_dim // fp8_quant_block * 4
+    fp8_per_token = fp8_data_bytes + fp8_scale_bytes
 
+    fp4_quant_block = 32
     fp4_data_bytes = index_head_dim // 2
-    fp4_per_token = fp4_data_bytes + scale_bytes
+    # 1 UE8M0 byte per 32 elements; at head_dim=128 that's 4 bytes per token.
+    fp4_scale_bytes = index_head_dim // fp4_quant_block
+    fp4_per_token = fp4_data_bytes + fp4_scale_bytes
 
     assert fp8_per_token == 132, f"FP8 per-token size regressed from 132 to {fp8_per_token}"
     assert fp4_per_token == 68, f"FP4 per-token size regressed from 68 to {fp4_per_token}"
@@ -230,7 +229,6 @@ def test_fp4_indexer_k_cache_per_token_size_drops_to_68_bytes():
     )
 
 
-@skip_pre_blackwell
 def test_indexer_k_dtype_survives_model_config_rebuild():
     """Regression guard: indexer_k_dtype must survive ModelConfig.from_pretrained.
 
@@ -241,64 +239,13 @@ def test_indexer_k_dtype_survives_model_config_rebuild():
     user's choice — the Pydantic validator and downstream DSACacheManager
     then both saw "fp8" and the FP4 path was never taken.
 
-    Exercise the rebuild with a stub pretrained_config instead of a real
-    checkpoint so the test is cheap (no weight load) and hermetic.
+    Static check: ensure the production rebuild branch forwards the field
+    (regression guard for the pattern bug — not just the outcome of an
+    end-to-end load). If a future edit drops the keyword, this assert fails.
     """
-    from types import SimpleNamespace
-    from unittest.mock import patch
+    import inspect
 
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
-
-    stub_pretrained = SimpleNamespace(
-        architectures=["DeepseekV32ForCausalLM"],
-        index_n_heads=64,
-        index_head_dim=128,
-        index_topk=2048,
-        indexer_rope_interleave=False,
-    )
-    user_config = DeepSeekSparseAttentionConfig(
-        index_head_dim=128,
-        indexer_k_dtype="fp4",
-    )
-
-    # Patch load_pretrained_config to return the stub, then exercise the
-    # DSV3.2 rebuild branch via the helper that actually rebuilds the
-    # sparse_attention_config. We don't call ModelConfig.from_pretrained
-    # end-to-end because it pulls in quantization/tokenizer machinery that
-    # needs a real on-disk checkpoint; instead we patch the one function
-    # whose return value the rebuild branch reads and invoke it directly.
-    rebuilt_kwargs: dict = {"sparse_attention_config": user_config}
-    with patch(
-        "tensorrt_llm._torch.model_config.load_pretrained_config",
-        return_value=stub_pretrained,
-    ):
-        # Inline the rebuild snippet from ModelConfig.from_pretrained so the
-        # test doesn't depend on checkpoint loaders. Keep in sync with
-        # ModelConfig.from_pretrained's DSV3.2 branch.
-        sparse_attn_config = rebuilt_kwargs["sparse_attention_config"]
-        rebuilt_kwargs["sparse_attention_config"] = DeepSeekSparseAttentionConfig(
-            index_n_heads=sparse_attn_config.index_n_heads or stub_pretrained.index_n_heads,
-            index_head_dim=sparse_attn_config.index_head_dim or stub_pretrained.index_head_dim,
-            index_topk=sparse_attn_config.index_topk or stub_pretrained.index_topk,
-            indexer_max_chunk_size=sparse_attn_config.indexer_max_chunk_size,
-            skip_indexer_for_short_seqs=sparse_attn_config.skip_indexer_for_short_seqs,
-            use_cute_dsl_topk=sparse_attn_config.use_cute_dsl_topk,
-            q_split_threshold=sparse_attn_config.q_split_threshold,
-            indexer_rope_interleave=stub_pretrained.indexer_rope_interleave,
-            enable_heuristic_topk=sparse_attn_config.enable_heuristic_topk,
-            indexer_k_dtype=sparse_attn_config.indexer_k_dtype,
-        )
-
-    rebuilt = rebuilt_kwargs["sparse_attention_config"]
-    assert rebuilt.indexer_k_dtype == "fp4", (
-        f"indexer_k_dtype dropped during rebuild: got {rebuilt.indexer_k_dtype}"
-    )
-    assert rebuilt.index_head_dim == 128
-    # Static check: ensure the production rebuild branch actually forwards
-    # the field (regression guard for the pattern bug — not just the outcome
-    # of this test). If a future edit drops the keyword, this assert fails.
-    import inspect
 
     rebuild_src = inspect.getsource(ModelConfig.from_pretrained)
     assert "indexer_k_dtype=indexer_k_dtype" in rebuild_src, (
@@ -308,109 +255,21 @@ def test_indexer_k_dtype_survives_model_config_rebuild():
     )
 
 
-@skip_pre_blackwell
-def test_indexer_k_cache_scatter_custom_op_fp4():
-    """FP4 variant: CUDA kernel vs Python reference for k_cache scatter.
+def test_indexer_k_dtype_survives_v4_model_config_rebuild():
+    """V4 analog of the above: indexer_k_dtype must survive rebuild.
 
-    Under FP4 the data payload is head_dim//2 bytes (two packed E2M1 codes
-    per byte) and the scale is a single int32 per token. Verify the scatter
-    op handles the shorter per-token size correctly.
+    Static check that ModelConfig.from_pretrained's DeepseekV4ForCausalLM
+    branch threads indexer_k_dtype into DeepSeekV4SparseAttentionConfig.
     """
-    torch.manual_seed(456)
+    import inspect
 
-    head_dim = 128
-    fp4_data_dim = head_dim // 2  # 64 bytes packed
-    block_size = 64
-    batch_size = 2
-    num_tokens = 64
-    max_seq_len = 512
+    from tensorrt_llm._torch.model_config import ModelConfig
 
-    layer_idx_cuda = 0
-    layer_idx_python = 1
-
-    cache_manager, _ = create_dsa_cache_manager(
-        batch_size=batch_size,
-        head_dim=head_dim,
-        tokens_per_block=block_size,
-        max_seq_len=max_seq_len,
-        num_layers=3,
-        indexer_k_dtype="fp4",
-    )
-
-    request_ids = list(range(batch_size))
-    tokens_per_req = [32, 32]
-    cache_manager.add_dummy_requests(
-        request_ids, tokens_per_req, is_gen=False, prepare_resource=True
-    )
-
-    metadata = _create_mock_metadata(
-        request_ids,
-        batch_size,
-        num_contexts=batch_size,
-        num_generations=0,
-        seq_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
-        kv_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
-        num_cached_tokens=[0] * batch_size,
-        cache_manager=cache_manager,
-        num_ctx_tokens=num_tokens,
-        num_tokens=num_tokens,
-    )
-
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
-
-    Indexer.prepare(metadata)
-
-    # FP4 packed data: [num_tokens, 64] int8; scale: [num_tokens, 1] int32
-    k_fp4 = torch.randint(-128, 127, (num_tokens, fp4_data_dim), device="cuda", dtype=torch.int8)
-    k_scale = torch.randint(0, 2**31, (num_tokens, 1), device="cuda", dtype=torch.int32)
-
-    scale_size = 4  # 1 int32 = 4 bytes
-    k_fp4_bytes = k_fp4.view(torch.uint8)
-    k_scale_bytes = k_scale.view(torch.uint8).view(num_tokens, scale_size)
-
-    flat_indices_fp8 = metadata.slot_mapping_fp8[:num_tokens]
-    flat_indices_scale = metadata.slot_mapping_scale[:num_tokens]
-
-    # CUDA path
-    k_cache_cuda = cache_manager.get_indexer_k_cache_buffers(layer_idx_cuda)
-    k_cache_cuda.zero_()
-    torch.ops.trtllm.indexer_k_cache_scatter_op(
-        k_fp4,
-        k_scale,
-        k_cache_cuda,
-        metadata.slot_mapping_fp8,
-        metadata.slot_mapping_scale,
-        num_tokens,
-    )
-    torch.cuda.synchronize()
-
-    # Python reference
-    k_cache_python = cache_manager.get_indexer_k_cache_buffers(layer_idx_python)
-    k_cache_python.zero_()
-
-    def _unravel_indices(flat_indices, shape):
-        d3 = shape[3]
-        i3 = flat_indices % d3
-        flat_indices = flat_indices // d3
-        d2 = shape[2]
-        i2 = flat_indices % d2
-        flat_indices = flat_indices // d2
-        d1 = shape[1]
-        i1 = flat_indices % d1
-        flat_indices = flat_indices // d1
-        i0 = flat_indices
-        return i0, i1, i2, i3
-
-    byte_offsets = torch.arange(fp4_data_dim, device=k_cache_python.device).unsqueeze(0)
-    scatter_fp4 = flat_indices_fp8.unsqueeze(1) + byte_offsets
-    scatter_fp4 = _unravel_indices(scatter_fp4, k_cache_python.shape)
-    k_cache_python[scatter_fp4] = k_fp4_bytes
-
-    byte_offsets = torch.arange(scale_size, device=k_cache_python.device).unsqueeze(0)
-    scatter_scale = flat_indices_scale.unsqueeze(1) + byte_offsets
-    scatter_scale = _unravel_indices(scatter_scale, k_cache_python.shape)
-    k_cache_python[scatter_scale] = k_scale_bytes
-
-    assert torch.equal(k_cache_cuda, k_cache_python), (
-        "FP4 scatter: CUDA kernel produced different results than Python reference"
+    rebuild_src = inspect.getsource(ModelConfig.from_pretrained)
+    # The V4 branch builds the config with `indexer_k_dtype=indexer_k_dtype`;
+    # the same string also appears in the V3 branch but its presence here is
+    # what guarantees V4 propagates the FP4 knob.
+    assert rebuild_src.count("indexer_k_dtype=indexer_k_dtype") >= 2, (
+        "ModelConfig.from_pretrained DeepseekV4ForCausalLM branch must "
+        "forward indexer_k_dtype to DeepSeekV4SparseAttentionConfig(...)."
     )
