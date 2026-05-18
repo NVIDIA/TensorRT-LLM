@@ -844,14 +844,14 @@ files = [
 
 [[package]]
 name = "click"
-version = "8.3.3"
+version = "8.4.0"
 description = "Composable command line interface toolkit"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "click-8.3.3-py3-none-any.whl", hash = "sha256:a2bf429bb3033c89fa4936ffb35d5cb471e3719e1f3c8a7c3fff0b8314305613"},
-    {file = "click-8.3.3.tar.gz", hash = "sha256:398329ad4837b2ff7cbe1dd166a4c0f8900c3ca3a218de04466f38f6497f18a2"},
+    {file = "click-8.4.0-py3-none-any.whl", hash = "sha256:40c50b7c6c6adac2823d411041ec84f3f103f1b280d5e9ce0d7f998995832f81"},
+    {file = "click-8.4.0.tar.gz", hash = "sha256:638f1338fe1235c8f4e008e4a8a254fb5c5fbdcbb40ece3c9142ebb78e792973"},
 ]
 
 [package.dependencies]
@@ -3044,68 +3044,63 @@ dev = ["absl-py", "pyink", "pylint (>=2.6.0)", "pytest", "pytest-xdist"]
 
 [[package]]
 name = "mpi4py"
-version = "4.1.1"
+version = "4.1.2"
 description = "Python bindings for MPI"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "mpi4py-4.1.1-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:1586f5d1557abed9cba7e984d18f32e787b353be0986e599974db177ae36329a"},
-    {file = "mpi4py-4.1.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:ba85e4778d63c750226de95115c92b709f38d7e661be660a275da4f0992ee197"},
-    {file = "mpi4py-4.1.1-cp310-abi3-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:0a8332884626994d9ef48da233dc7a0355f4868dd7ff59f078d5813a2935b930"},
-    {file = "mpi4py-4.1.1-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6e0352860f0b3e18bc0dcb47e42e583ccb9472f89752d711a6fca46a38670554"},
-    {file = "mpi4py-4.1.1-cp310-abi3-win_amd64.whl", hash = "sha256:0f46dfe666a599e4bd2641116b2b4852a3ed9d37915edf98fae471d666663128"},
-    {file = "mpi4py-4.1.1-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:9082e04c8afcffa7d650a262d800af1a617c555d610810deeab265a4a5f7d42e"},
-    {file = "mpi4py-4.1.1-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:1d618e6a5a8f6f86c33a954356d8ed398bec31f34b63321570661ac157063bb6"},
-    {file = "mpi4py-4.1.1-cp310-cp310-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:d4c460609bd6decc22ad89cbfe48e4c5a2461ff52ada9345a4c19edee39f93da"},
-    {file = "mpi4py-4.1.1-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c04a388c7a945e751c82742c6bb277434d26a67768a01952f7494d1c25dff94b"},
-    {file = "mpi4py-4.1.1-cp310-cp310-win_amd64.whl", hash = "sha256:1ad4b225a5a1a02a2b89979ed8f328c6a2bc3bd6ad4a57e453727f90373fa5f8"},
-    {file = "mpi4py-4.1.1-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:a428ba96b992a8911cf932fa71dd8c0260d47ab7e5dee2b09239ad91fc540b79"},
-    {file = "mpi4py-4.1.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:fc0cf81445fac2ae2e5716c365fd72e1bb545df065f5a3f6731f64b3beed886e"},
-    {file = "mpi4py-4.1.1-cp311-cp311-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:a753d5d61b46f90260247f344a6c57c527a6a4e7bea126830120ab41c3d057e5"},
-    {file = "mpi4py-4.1.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:4a36ef9d7b2b6b62026dbf9b59b44efb5430f7b9ca5fb855bfbf8d403218e37c"},
-    {file = "mpi4py-4.1.1-cp311-cp311-win_amd64.whl", hash = "sha256:20bf4c0c65fd67287664f8b1b6dc7c7b341838f10bba34a2e452d47530ce8a5f"},
-    {file = "mpi4py-4.1.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:d4403a7cec985be9963efc626193e6df3f63f5ada0c26373c28e640e623e56c3"},
-    {file = "mpi4py-4.1.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:8a2ffccc9f3a8c7c957403faad594d650c60234ac08cbedf45beaa96602debe9"},
-    {file = "mpi4py-4.1.1-cp312-cp312-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:ed3d9b619bf197a290f7fd67eb61b1c2a5c204afd9621651a50dc0b1c1280d45"},
-    {file = "mpi4py-4.1.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:0699c194db5d95fc2085711e4e0013083bd7ae9a88438e1fd64ddb67e9b0cf9e"},
-    {file = "mpi4py-4.1.1-cp312-cp312-win_amd64.whl", hash = "sha256:0abf5490c3d49c30542b461bfc5ad88dd7d147a4bdb456b7163640577fdfef88"},
-    {file = "mpi4py-4.1.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:f3dd973c509f2dbb6904c035a4a071509cde98decf0528fa21e2e7d5db5cc988"},
-    {file = "mpi4py-4.1.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:c8c83a359e62dd7fdd030360f430e0e8986df029c0953ab216ff97a110038dc4"},
-    {file = "mpi4py-4.1.1-cp313-cp313-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:323ba354ba951c7736c033c5f2ad07bb1276f9696f0312ea6ff0a28cd0ab3e3d"},
-    {file = "mpi4py-4.1.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8c4ef9fe5fb211b1c5b6afe521397e3feb01e104024d6bc37aa4289c370605e2"},
-    {file = "mpi4py-4.1.1-cp313-cp313-win_amd64.whl", hash = "sha256:e13a1ba26604514a12c95b7d76058ce800d5740d5f5f3b50c4b782cfa0dfaa1f"},
-    {file = "mpi4py-4.1.1-cp313-cp313t-macosx_10_13_x86_64.whl", hash = "sha256:28ce1f7412f5e99a6b9fe2547203633431d0ee45670413a475a07e6c785e63b1"},
-    {file = "mpi4py-4.1.1-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:dd1e49b84a0651018517e87daf68085719eca25e5c9a7cd05d98a73418c88836"},
-    {file = "mpi4py-4.1.1-cp313-cp313t-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:dd869ea7758b591ffbb1483588a6fbf84952a5090e80a45ea89674d55cf25f3b"},
-    {file = "mpi4py-4.1.1-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:475da0797442cba723c0ad37da6a1c51d9624e697dd8bf89f23d0fad81e73eda"},
-    {file = "mpi4py-4.1.1-cp313-cp313t-win_amd64.whl", hash = "sha256:8d3bfa074776d9507ee957f5230d11ecd03da23f601a85349a1a333eaf55e5fa"},
-    {file = "mpi4py-4.1.1-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:1deb6f9df28ec6972305287cb2035c20d3f5af59f687f962080756374c16e48f"},
-    {file = "mpi4py-4.1.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:1bb1e3ad0b9047b0dbc7b4014160a7ab2a84f1627be665527c7445fc312f189b"},
-    {file = "mpi4py-4.1.1-cp314-cp314-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:5f757e3089abf2c9db69fac1665fa99c52ed392fdf799159f25cba9ee3b64f5a"},
-    {file = "mpi4py-4.1.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:807c6f1ed3adbc12952db52127e34cfbd6c48a05c3b3dd59deee2d2f09d78888"},
-    {file = "mpi4py-4.1.1-cp314-cp314-win_amd64.whl", hash = "sha256:2c85983d38d77e6302a242e32afd2a9a9b3adedd770e199a38e5b8957150e7ac"},
-    {file = "mpi4py-4.1.1-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:729c4f625ad60e5cfb6c260608d249dc35a33cc16605faff01c6adbbd7e8ce0f"},
-    {file = "mpi4py-4.1.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:3cca235d46009f54cb319c779c6ac53d41ce1eee3cf07f157995bc7739329b97"},
-    {file = "mpi4py-4.1.1-cp314-cp314t-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:2580fab891db492f32a6e02717e824f6fd5588be6560b08627c1e9322f7ccbfb"},
-    {file = "mpi4py-4.1.1-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6beec4841f9436d49ec9cabfd76a19df61c10b21ca14eddafa58fe7977802ee7"},
-    {file = "mpi4py-4.1.1-cp314-cp314t-win_amd64.whl", hash = "sha256:b4b3813da9a7a1fc37ffb8dad314cb396313a40cd3fe150854ab29e999a9eb8c"},
-    {file = "mpi4py-4.1.1-cp38-cp38-macosx_10_9_x86_64.whl", hash = "sha256:1f268af2bd476013e4a3de55d4c6baf3494be65a5214f2b6fa0842a21164082a"},
-    {file = "mpi4py-4.1.1-cp38-cp38-macosx_11_0_arm64.whl", hash = "sha256:d2cf47d511cd6518a37c72861e3043810d02ee4a9e33292275d1ea5d474866a1"},
-    {file = "mpi4py-4.1.1-cp38-cp38-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:2b3539be1173672c20cd378997e91e5290bd6847d03503bdd4c4716fa525258f"},
-    {file = "mpi4py-4.1.1-cp38-cp38-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:0a5634b0a115d7e2b84a05c7c5495d0093dfa855cc18a85cb50045ecbb2e766e"},
-    {file = "mpi4py-4.1.1-cp38-cp38-win_amd64.whl", hash = "sha256:20624f69a77369dd18d1b2af8c7107274a2263613111d5191df4af0fd08fd699"},
-    {file = "mpi4py-4.1.1-cp39-cp39-macosx_10_9_x86_64.whl", hash = "sha256:f1e0a6403ab921265d1e86d45c2996360d30fa7ad9a12de092ebc78ec8ec990c"},
-    {file = "mpi4py-4.1.1-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:391a9931a8f5fc532fc9178a5357212ba3a6dc8cca59284d47dc4b7c588a7268"},
-    {file = "mpi4py-4.1.1-cp39-cp39-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:45dfcc6ef235203cb192912b1a3f1fea741f94fff713db1bdb716e8c7897d823"},
-    {file = "mpi4py-4.1.1-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9c87127dceb2b46b7c99115dbf9de65535cecd77d5cb274bcfdc79fa07420fd9"},
-    {file = "mpi4py-4.1.1-cp39-cp39-win_amd64.whl", hash = "sha256:5a03993a1c08d68fe0b18ecdb3d13ab821ee2c2fda7c24bdb66a72329977249e"},
-    {file = "mpi4py-4.1.1-pp311-pypy311_pp73-macosx_10_15_x86_64.whl", hash = "sha256:95bb98d946eb88c9ae4dc6c42d11b3af8ce6b91e644c288cc3f85ec7596ffcd3"},
-    {file = "mpi4py-4.1.1-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:84e9eb2e609b0b94cd0e9a3e3b57d897f748fb0207c4f72e81e5a95aba033767"},
-    {file = "mpi4py-4.1.1-pp311-pypy311_pp73-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:027b1a1ff9d57afed10af6b79041b95f85fd11b2af74e4c34ef4866ce81ecc24"},
-    {file = "mpi4py-4.1.1-pp311-pypy311_pp73-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c1191856906967a48fdcc484b326c179747e68c186261d76480a75156bcc73bf"},
-    {file = "mpi4py-4.1.1-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:189d49b0ae963f8f6f5dd8ed0f5f37923285c97bc725476990ec0556972bb4b2"},
-    {file = "mpi4py-4.1.1.tar.gz", hash = "sha256:eb2c8489bdbc47fdc6b26ca7576e927a11b070b6de196a443132766b3d0a2a22"},
+    {file = "mpi4py-4.1.2-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:ceb3b6e6f27ba7a39f7721583c04514013b860b829e721769e77398dee97bfa3"},
+    {file = "mpi4py-4.1.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:251e8880f4cb98e9c8f63c6f6b2c7e819e22b5e4949d47767a0092eed6f814c2"},
+    {file = "mpi4py-4.1.2-cp310-abi3-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:2ef63b2e3083e6062fd90e4de8c4e3acbf81e0772406e0226eb8dde6a48cab8e"},
+    {file = "mpi4py-4.1.2-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6508e654b9c8ff9f611b19548b2a17d1e323b520a15168189f92221e6757b8ff"},
+    {file = "mpi4py-4.1.2-cp310-abi3-win_amd64.whl", hash = "sha256:eb69f6273ad155f191850a593deebdf52aed6722979ba0693e02db5663e59699"},
+    {file = "mpi4py-4.1.2-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:7a7efb74833dbb7b47f1fa8a251c4f59063f8f812dde499b9acf0856e26b8626"},
+    {file = "mpi4py-4.1.2-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:5b20f8a6fa573950ce77e8e8f98c24e3666c34b63c63732aff6fe874cc9fde61"},
+    {file = "mpi4py-4.1.2-cp310-cp310-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:1b3fc4f09e9be07a8ab9970a1f426e31b3dadb93f0bebb0559581b601aec9f7a"},
+    {file = "mpi4py-4.1.2-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:bd98d3322c1c3d21b00ed27567a9e4cdcb0d5daf277dc2160fb864721f72e71d"},
+    {file = "mpi4py-4.1.2-cp310-cp310-win_amd64.whl", hash = "sha256:3d9fe529ffcdadf3987c437c40be29dc1a558edf077cf8814d3329b3c9d06be1"},
+    {file = "mpi4py-4.1.2-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:7e62b4413430f18e342a19b3ebb6aa1b256939b9e09200f624b9dad7e5c8d9df"},
+    {file = "mpi4py-4.1.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:0040edc6d1255186d4b5e8b4d72ae013cacf68f1c3509d55a5a9ebdafa4b090e"},
+    {file = "mpi4py-4.1.2-cp311-cp311-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:de484475b80f9e1ffe98cb85e1b776eb9f42bb73ae4d79449d42953f80025bf4"},
+    {file = "mpi4py-4.1.2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a05ce06c564044d6a605f197ad81335af760f4294963263d953e46c38819f554"},
+    {file = "mpi4py-4.1.2-cp311-cp311-win_amd64.whl", hash = "sha256:f7069dbcd1bf2d25b9726866c882be1216fcd292ae0a2ddaf012a03aac0d0478"},
+    {file = "mpi4py-4.1.2-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:78983a9606e105af1af907878ec41627360344ea576c75afdaca4124db9d0b13"},
+    {file = "mpi4py-4.1.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4e5fdba71cf27d0d3b45e706736d6690060976345f45a6408b3594884bb0cc6e"},
+    {file = "mpi4py-4.1.2-cp312-cp312-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:00f4cce8999d19f35243c3442ea22debbe3336f69c309cd5d3176df4e51c717a"},
+    {file = "mpi4py-4.1.2-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:0a58e164776acb7b52414548b1bf0e5caafce0ee90345deff147873a64b6b2cc"},
+    {file = "mpi4py-4.1.2-cp312-cp312-win_amd64.whl", hash = "sha256:0a7227a53ba24102f2c4c2c1b226d028fabc473b20ceef5435f1a7ac8cbd508c"},
+    {file = "mpi4py-4.1.2-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:632a94e355cf1960eaae2b668d88399f53680207f5a4777e15fdaf7d96c72d09"},
+    {file = "mpi4py-4.1.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:0aedf3e6c937b48d244e7c6bb72d0b068a1b1adf99ec6001bc9c7e381c581806"},
+    {file = "mpi4py-4.1.2-cp313-cp313-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:085e0cb05427398fe2281856f27a87984b9f234cd6d98a2a384a6fbfe679a56f"},
+    {file = "mpi4py-4.1.2-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:429437883b4511583d56a57bc58ad0d02965fb6c19f84f39e30c0646e6c0cab9"},
+    {file = "mpi4py-4.1.2-cp313-cp313-win_amd64.whl", hash = "sha256:f984aa35d61fd95c7aa49829f94c3d61bb9ec2272bd8e404ae8d1ea84b620b58"},
+    {file = "mpi4py-4.1.2-cp313-cp313t-macosx_10_13_x86_64.whl", hash = "sha256:16ae4d0fac11e60056ec7c46ce101f70f4941634ad8165c54a24304820a816b0"},
+    {file = "mpi4py-4.1.2-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:364da611dda94e8a26e418ccfc4c8ff2a1492e74f4c28b24df09521fe888de3b"},
+    {file = "mpi4py-4.1.2-cp313-cp313t-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:85e332feaac3323d8ed1c71f17478fe3f529468f28f6f9bb4c9133ad2d3a3a6d"},
+    {file = "mpi4py-4.1.2-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3e05dba75f6ad17ae761bdc01ee5c5271d15cd296e8a508e22c99c91b540dc99"},
+    {file = "mpi4py-4.1.2-cp313-cp313t-win_amd64.whl", hash = "sha256:2d0a131a255f61a2d313623f91b496c345abd5976147f866b39383264f275449"},
+    {file = "mpi4py-4.1.2-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:0bfd4739cf1189d3d1f44b360e8fab203cbab91d762e581b32764e7dbe7e8c44"},
+    {file = "mpi4py-4.1.2-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:a8e9d25dd3b304ac2a57ab8ac4eca87f81411e535dc24ac0cd044f6f8304d9d7"},
+    {file = "mpi4py-4.1.2-cp314-cp314-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:d53e8f7182bf125b37155f679b301a21cd64e5ae6861ca0ab989c9d2b2073bbd"},
+    {file = "mpi4py-4.1.2-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7cbf982d3425fd06890fbcff79ba19a7435e93bc74e5711ca8ac0b64d0c3ece9"},
+    {file = "mpi4py-4.1.2-cp314-cp314-win_amd64.whl", hash = "sha256:50a1f5c5b210b8175860174fe670e058883df6f50e8998356dca5c73e6177d89"},
+    {file = "mpi4py-4.1.2-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:5f255ed29f4fc66bd1387956e5fe207cae19e418c7db5559f5d6a77370171389"},
+    {file = "mpi4py-4.1.2-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:d2704dfd19663200677a7c98b971a385d2ed58bb9deee544dbd38fbec1a91ef1"},
+    {file = "mpi4py-4.1.2-cp314-cp314t-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:db189238c37be98933eeb078a3e2b827eef969837e8fe0f3a2e6cdb7f4b1b05f"},
+    {file = "mpi4py-4.1.2-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d0fbf0bc100ed966c3d7f44231a19aef0025d523d1b813de468a1b114d0d9436"},
+    {file = "mpi4py-4.1.2-cp314-cp314t-win_amd64.whl", hash = "sha256:34d94bd254947d17033aa5a9b6b1872175bad7e73ccef6b0373f2b8054e30f2e"},
+    {file = "mpi4py-4.1.2-cp38-cp38-macosx_10_9_x86_64.whl", hash = "sha256:44cec9953900786d83945f2a5d34a34e4449a26582d2601b66abe9ec3a455a96"},
+    {file = "mpi4py-4.1.2-cp38-cp38-macosx_11_0_arm64.whl", hash = "sha256:2eacd4831b0c6f84614d93037e88a206421b700dc3348ea68e3ae9eee9030719"},
+    {file = "mpi4py-4.1.2-cp38-cp38-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:7021c5afa090967f31f841b1b1093f2929c9fb73595bacfb47d5ee32c4a66cf2"},
+    {file = "mpi4py-4.1.2-cp38-cp38-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:46f37568b7d74a0be8eeb6d7a01b08be73b31d645dc1698f53316a6e9406f938"},
+    {file = "mpi4py-4.1.2-cp38-cp38-win_amd64.whl", hash = "sha256:a1928dae518771b2bb87565068f5414a57329fb6e282797744a107de1ec831c9"},
+    {file = "mpi4py-4.1.2-cp39-cp39-macosx_10_9_x86_64.whl", hash = "sha256:c0dd838ade2bac9080d19ecc2ef2d2d4bd0ed09ef1a02d26bfb9cc4ea974bd84"},
+    {file = "mpi4py-4.1.2-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:75c15e854bf91364b604e13ed3a24cc384f1344de3b000698b747abf62da3f54"},
+    {file = "mpi4py-4.1.2-cp39-cp39-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:5eb46b74c0f0f354af441906dda452bbf8565821dae15373a78ab02c02c9f97c"},
+    {file = "mpi4py-4.1.2-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:12351f5ee42a4223451c8b43d3a91a42e3d5f60cf62c1330477caaad4508821f"},
+    {file = "mpi4py-4.1.2-cp39-cp39-win_amd64.whl", hash = "sha256:ccbd663de4eb0880250fb3a8aab797817a776cf65d1b921db79e75db43db5f73"},
+    {file = "mpi4py-4.1.2.tar.gz", hash = "sha256:56860286dc45f20e8821e93cb06669e30462348bf866f685553fa4b712d58d02"},
 ]
 
 [[package]]
@@ -3312,14 +3307,14 @@ dill = ">=0.3.8"
 
 [[package]]
 name = "narwhals"
-version = "2.21.0"
+version = "2.21.2"
 description = "Extremely lightweight compatibility layer between dataframe libraries"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "narwhals-2.21.0-py3-none-any.whl", hash = "sha256:1e6617d0fca68ae1fda29e5397c4eaacd3ffc9fffe6bcd6ded0c690475e853be"},
-    {file = "narwhals-2.21.0.tar.gz", hash = "sha256:7c6e7f50528e62b7a967dd864d7e117d2955d38d4f730653ce46a9861358e2dc"},
+    {file = "narwhals-2.21.2-py3-none-any.whl", hash = "sha256:7bb57c3700486039215455b9bf2d64261915cc0fd845cc30272d631df696b251"},
+    {file = "narwhals-2.21.2.tar.gz", hash = "sha256:5c5b2d0b47aef7c73ea412cfcbcd467f2f2d5be73e3c2ab19d78f4a97718790a"},
 ]
 
 [package.extras]
@@ -7313,4 +7308,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "f995c34efada799a15cda802504ec3e33c52269fc3aed31c3f8a21da20db6157"
+content-hash = "50b63bc978456b5dc1826b6e8856fe6e53eaa28135e3677ddcc38f5212c27b43"
