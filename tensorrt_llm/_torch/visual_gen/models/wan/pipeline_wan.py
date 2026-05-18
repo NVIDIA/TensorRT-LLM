@@ -109,9 +109,7 @@ class WanPipeline(BasePipeline):
             if hasattr(model_config, "extra_attrs")
             else None
         )
-        self.fixed_latent_path: Optional[str] = (
-            env_fixed_latent_path or cfg_fixed_latent_path
-        )
+        self.fixed_latent_path: Optional[str] = env_fixed_latent_path or cfg_fixed_latent_path
         self.fixed_latent: Optional[torch.Tensor] = None
 
         super().__init__(model_config)
