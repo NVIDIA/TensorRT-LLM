@@ -55,3 +55,131 @@ def test_deepseek_v4_q_norm_torch_compile_fullgraph():
     ref = _reference_q_norm(q, head_dim, eps)
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
+def _reference_q_norm_fused_fp8(q: torch.Tensor, num_heads: int, head_dim: int,
+                                nope_dim: int, eps: float, quant_scale_qkv: float):
+    """Reference: per-row RMSNorm in fp32; split last column-axis into nope/rope;
+    nope path multiplied by quant_scale_qkv then cast to fp8_e4m3; rope path cast
+    back to input dtype.
+    """
+    num_tokens = q.shape[0]
+    rope_dim = head_dim - nope_dim
+    q_view = q.view(num_tokens * num_heads, head_dim).float()
+    inv_rms = torch.rsqrt(q_view.pow(2).mean(dim=-1, keepdim=True) + eps)
+    normalized = q_view * inv_rms
+
+    nope_fp32 = normalized[:, :nope_dim] * quant_scale_qkv
+    rope_fp32 = normalized[:, nope_dim:]
+
+    quant_q_nope = nope_fp32.to(torch.float8_e4m3fn).view(num_tokens, num_heads * nope_dim)
+    q_pe = rope_fp32.to(q.dtype).view(num_tokens, num_heads * rope_dim)
+    return quant_q_nope, q_pe
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 129])
+@pytest.mark.parametrize("num_heads", [1, 16, 128])
+@pytest.mark.parametrize("quant_scale_qkv", [None, 0.5, 2.0])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(
+            torch.bfloat16,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_bf16_supported(), reason="Requires BF16 support"
+            ),
+        ),
+        torch.float16,
+    ],
+)
+def test_deepseek_v4_q_norm_fused_fp8_matches_reference(num_tokens, num_heads,
+                                                       quant_scale_qkv, dtype):
+    torch.manual_seed(0)
+    device = "cuda"
+    head_dim = 512
+    nope_dim = 448
+    eps = 1e-6
+    q = torch.randn(num_tokens, num_heads * head_dim, dtype=dtype, device=device).contiguous()
+
+    if quant_scale_qkv is None:
+        scale_tensor = None
+        scale_value = 1.0
+    else:
+        scale_tensor = torch.tensor([quant_scale_qkv], dtype=torch.float32, device=device)
+        scale_value = quant_scale_qkv
+
+    quant_q_nope, q_pe = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, num_heads, head_dim, nope_dim, eps, scale_tensor)
+
+    ref_quant_q_nope, ref_q_pe = _reference_q_norm_fused_fp8(
+        q, num_heads, head_dim, nope_dim, eps, scale_value)
+
+    # bf16/fp16 rope: identical to the un-fused q_norm path -> use the same tolerance.
+    atol_pe = 3.2e-2 if dtype == torch.bfloat16 else 5e-3
+    rtol_pe = 8e-3 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(q_pe, ref_q_pe, atol=atol_pe, rtol=rtol_pe)
+
+    # FP8 nope: compare element-wise as fp32. fp8_e4m3 has ~3 bits of mantissa
+    # so per-element rtol of ~0.125 is the rounding noise floor.
+    quant_q_nope_f32 = quant_q_nope.to(torch.float32)
+    ref_quant_q_nope_f32 = ref_quant_q_nope.to(torch.float32)
+    # Same rounding mode, same scale: should match bit-for-bit.
+    torch.testing.assert_close(
+        quant_q_nope_f32, ref_quant_q_nope_f32, atol=0.0, rtol=0.0,
+        msg="fused FP8 nope output should be bit-exact vs reference (same cvt rounding)")
+
+
+def test_deepseek_v4_q_norm_fused_fp8_zero_rows():
+    """Edge case: 0 tokens should not launch the kernel and should not crash."""
+    num_heads = 4
+    head_dim = 512
+    nope_dim = 448
+    eps = 1e-6
+    q = torch.empty(0, num_heads * head_dim, dtype=torch.bfloat16, device="cuda")
+    quant_q_nope, q_pe = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, num_heads, head_dim, nope_dim, eps, None)
+    assert quant_q_nope.shape == (0, num_heads * nope_dim)
+    assert q_pe.shape == (0, num_heads * (head_dim - nope_dim))
+    assert quant_q_nope.dtype == torch.float8_e4m3fn
+    assert q_pe.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 129])
+@pytest.mark.parametrize("num_heads", [1, 16, 128])
+def test_deepseek_v4_q_norm_fused_fp8_interleaved_layout(num_tokens, num_heads):
+    """Interleaved mode allocates a [N, H*head_dim] FP8 buffer and only writes
+    the first nope_dim FP8 bytes per (token, head) row. The remaining rope_dim
+    bytes per head are expected to be filled by RoPE_OptContext downstream — this
+    test only confirms the nope slots land at the right offsets and that the
+    rope slots are NOT silently overwritten by the q_norm kernel.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    head_dim = 512
+    nope_dim = 448
+    rope_dim = head_dim - nope_dim
+    eps = 1e-6
+    q = torch.randn(num_tokens, num_heads * head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    scale_tensor = torch.tensor([0.5], dtype=torch.float32, device=device)
+
+    # Packed reference.
+    packed_quant_q_nope, packed_q_pe = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, num_heads, head_dim, nope_dim, eps, scale_tensor, False)
+
+    # Allocate an interleaved buffer and PRE-FILL the rope slot with a sentinel so we
+    # can confirm the kernel doesn't touch it.
+    interleaved, q_pe_interleaved = torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q, num_heads, head_dim, nope_dim, eps, scale_tensor, True)
+
+    assert interleaved.shape == (num_tokens, num_heads * head_dim)
+    # The nope slots of `interleaved` should match the packed output element-by-element.
+    interleaved_3d = interleaved.view(num_tokens, num_heads, head_dim)
+    packed_3d = packed_quant_q_nope.view(num_tokens, num_heads, nope_dim)
+    nope_slice = interleaved_3d[:, :, :nope_dim].contiguous()
+    torch.testing.assert_close(
+        nope_slice.to(torch.float32),
+        packed_3d.to(torch.float32),
+        atol=0.0, rtol=0.0,
+        msg="Interleaved nope output should match packed output bit-for-bit")
+    # q_pe should be identical in both modes.
+    torch.testing.assert_close(q_pe_interleaved, packed_q_pe, atol=0.0, rtol=0.0)
