@@ -7,11 +7,10 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.models.modeling_utils import \
-    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -413,9 +412,15 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        # Route to the multimodal dummy path when the input processor declares
+        # itself multimodal — independent of *which* modality the model
+        # supports (audio-only, vision-only, or mixed). The previous
+        # arch-name lookup (``original_arch`` ∈ ``MODEL_CLASS_VISION_ENCODER_MAPPING``)
+        # was vision-biased and required every multimodal model to register
+        # through a vision-encoder decorator; using the InputProcessor's
+        # base class as the discriminator removes that coupling.
+        if isinstance(self._model_engine.input_processor,
+                      BaseMultimodalInputProcessor):
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case
