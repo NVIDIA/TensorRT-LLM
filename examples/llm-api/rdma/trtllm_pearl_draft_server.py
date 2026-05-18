@@ -6,12 +6,16 @@
 This wraps ``pearl_draft_server.py`` behind a stable service-oriented CLI:
 
     trtllm_pearl_draft_server.py
-      --model /path/to/draft
-      --backend pyexecutor
+      --backend trtllm
       --transport ibverbs
       --nic mlx5_0
       --control-port 47331
       --data-port 0
+
+By default the server lazy-loads the model requested by the target's
+``TcpModelInit``.  Passing ``--model`` pins the server to one model path;
+passing ``--strict-model-match`` additionally rejects mismatched target
+requests instead of overriding them.
 
 The target still connects through ``PEARLDecodingConfig`` /
 ``draft_offload_*``.  The draft process owns its runtime, networking, logs,
@@ -47,11 +51,7 @@ class ProductPEARLDraftServer(PEARLDraftServer):
                 )
             msg = dataclasses.replace(msg, model_path=configured_model)
 
-        backend = str(getattr(self._args, "backend", "pyexecutor"))
-        if backend == "pyexecutor":
-            backend = "trtllm-executor"
-        elif backend == "llm":
-            backend = "trtllm"
+        backend = str(getattr(self._args, "backend", "trtllm"))
 
         if backend == "mock":
             return _drs._MockBackend(max_draft_len=int(msg.max_draft_len))
@@ -62,11 +62,8 @@ class ProductPEARLDraftServer(PEARLDraftServer):
                 max_draft_len=int(msg.max_draft_len),
                 device=self._args.device,
             )
-        if backend in ("trtllm", "trtllm-executor"):
-            backend_cls = (
-                _drs._TrtLlmExecutorBackend if backend == "trtllm-executor" else _drs._TrtLlmBackend
-            )
-            return backend_cls(
+        if backend == "trtllm":
+            return _drs._TrtLlmExecutorBackend(
                 model_path=msg.model_path,
                 prompt=self._args.prompt,
                 max_draft_len=int(msg.max_draft_len),
@@ -82,16 +79,19 @@ def _parse_args():
     )
     ap.add_argument(
         "--model",
-        required=True,
-        help="Draft model path owned by this server.",
+        default="",
+        help=(
+            "Optional draft model path owned by this server. If omitted, "
+            "the target's TcpModelInit.model_path is used for lazy-load."
+        ),
     )
     ap.add_argument(
         "--backend",
-        choices=["pyexecutor", "llm", "transformers", "mock"],
-        default="pyexecutor",
+        choices=["trtllm", "transformers", "mock"],
+        default="trtllm",
         help=(
-            "Draft runtime backend. pyexecutor is the product path; llm keeps "
-            "the LLM.generate_async compatibility backend."
+            "Draft runtime backend. trtllm uses the PyExecutor/manual path "
+            "with resident KV state and rollback support."
         ),
     )
     ap.add_argument(
@@ -126,7 +126,7 @@ def _parse_args():
         "--allow-proxy-worker",
         action="store_true",
         help=(
-            "Do not force TLLM_WORKER_USE_SINGLE_PROCESS=1 for --backend pyexecutor. "
+            "Do not force TLLM_WORKER_USE_SINGLE_PROCESS=1 for --backend trtllm. "
             "Mostly useful for debugging; direct PyExecutor handles may be unavailable."
         ),
     )
@@ -159,8 +159,8 @@ def main():
     if args.trace_log:
         os.environ["PEARL_DRAFT_TRACE_PATH"] = args.trace_log
 
-    if args.backend == "pyexecutor" and not args.allow_proxy_worker:
-        # Product pyexecutor mode needs the local worker path so the server can
+    if args.backend == "trtllm" and not args.allow_proxy_worker:
+        # Product TRT-LLM mode needs the local worker path so the server can
         # inspect/own PyExecutor handles rather than seeing only an IPC proxy.
         os.environ.setdefault("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 

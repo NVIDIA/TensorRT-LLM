@@ -106,6 +106,13 @@ def main() -> int:
         default=True,
         help="Disable sending TcpModelInit before target LLM construction.",
     )
+    ap.add_argument(
+        "--no-chat-template",
+        dest="chat_template",
+        action="store_false",
+        default=True,
+        help="Use the raw --prompt string instead of tokenizer.apply_chat_template.",
+    )
     args = ap.parse_args()
     if args.trace_log:
         os.environ["PEARL_TARGET_TRACE_PATH"] = args.trace_log
@@ -163,12 +170,23 @@ def main() -> int:
         pearl_trace_log("target", "early_control_model_init_ack", ack=ack)
         return ack
 
+    generation_prompt = args.prompt
     prompt_tokens = []
+    used_chat_template = False
     try:
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
-        prompt_tokens = [int(t) for t in tokenizer.encode(args.prompt, add_special_tokens=True)]
+        if args.chat_template and getattr(tokenizer, "chat_template", None):
+            generation_prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": args.prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            used_chat_template = True
+        prompt_tokens = [
+            int(t) for t in tokenizer.encode(generation_prompt, add_special_tokens=True)
+        ]
     except Exception as exc:
         pearl_trace_log(
             "target",
@@ -180,8 +198,10 @@ def main() -> int:
         "target",
         "run_start",
         prompt_text=args.prompt,
+        generation_prompt=generation_prompt,
         prompt_tokens=prompt_tokens,
         prompt_token_count=len(prompt_tokens),
+        used_chat_template=bool(used_chat_template),
         target_model=args.target_model,
         draft_model=args.draft_model,
         transport=args.transport,
@@ -260,7 +280,7 @@ def main() -> int:
         temperature=0.0,
         top_p=1.0,
     )
-    outputs = llm.generate([args.prompt], sampling_params=sampling)
+    outputs = llm.generate([generation_prompt], sampling_params=sampling)
     out = outputs[0].outputs[0]
     pearl_trace_log(
         "target",
