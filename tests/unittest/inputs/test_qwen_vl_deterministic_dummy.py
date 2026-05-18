@@ -33,8 +33,10 @@ def _make_processor(
     spatial_merge_size: int = 2,
     temporal_patch_size: int = 2,
 ):
-    """Construct a processor stub with just the vision_config attrs the math
-    touches, bypassing the real __init__ (which loads tokenizers/processors).
+    """Construct a processor stub with stubbed vision_config attrs.
+
+    Bypasses the real ``__init__`` (which loads tokenizers/processors)
+    and pins just the fields the deterministic math reads.
     """
     instance = processor_cls.__new__(processor_cls)
     vision_config = SimpleNamespace(
@@ -103,8 +105,11 @@ def test_invertibility_fits_within_budget(processor_cls, budget):
 @pytest.mark.parametrize("processor_cls", _PROCESSORS)
 @pytest.mark.parametrize("budget", [256, 1024, 4096, 8192, 16384, 32768])
 def test_invertibility_saturates_budget(processor_cls, budget):
-    """When ``budget`` factors cleanly into the encoder's unit grid, the
-    returned size should hit it exactly (no wasted budget)."""
+    """Power-of-2 budgets fit the encoder's unit grid exactly.
+
+    When ``budget`` factors cleanly into the encoder's unit grid, the
+    returned size should hit it exactly (no wasted budget).
+    """
     proc = _make_processor(processor_cls)
     size = proc.get_size_with_most_features(max_tokens=budget)
     actual = proc.get_num_mm_tokens(
@@ -117,8 +122,11 @@ def test_invertibility_saturates_budget(processor_cls, budget):
 
 @pytest.mark.parametrize("processor_cls", _PROCESSORS)
 def test_aspect_ratio_is_bounded(processor_cls):
-    """Even for very large budgets the returned size should not be an
-    extreme stripe (the ``200x`` aspect bound mirrors HF's processor)."""
+    """The returned size stays within the model's aspect bound.
+
+    Even for very large budgets the returned size should not be an
+    extreme stripe — the ``200x`` aspect bound mirrors HF's processor.
+    """
     proc = _make_processor(processor_cls)
     size = proc.get_size_with_most_features(max_tokens=1_000_000)
     long_edge = max(size["width"], size["height"])
