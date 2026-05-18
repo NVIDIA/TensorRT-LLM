@@ -42,6 +42,7 @@ from ...utils import ActivationType, is_gated_activation
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    fclip_xorsign,
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -278,6 +279,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         raster_along_m: bool = False,
         b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
+        swiglu_limit: cutlass.Float32 = float('inf'),
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -407,6 +409,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.vectorized_f32 = vectorized_f32
+
+        self.swiglu_limit = swiglu_limit
+        self.has_swiglu_limit = (swiglu_limit != float('inf'))
 
         # Multi-B tensor configuration
         if b_tensor_l_sizes is None:
@@ -3008,6 +3013,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
                     (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
                 )
+                # SwiGLU clamp
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    gate_lo = fmin(acc_vec_gate_alpha[0], self.swiglu_limit)
+                    gate_hi = fmin(acc_vec_gate_alpha[1], self.swiglu_limit)
+                    acc_vec_gate_alpha = (gate_lo, gate_hi)
+                    up_lo = fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit)
+                    up_hi = fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit)
+                    acc_vec_up_alpha = (up_lo, up_hi)
                 tCompute_log2e = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
                     (-LOG2_E, -LOG2_E),
@@ -3042,6 +3055,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
+                    acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
 
     @cute.jit
