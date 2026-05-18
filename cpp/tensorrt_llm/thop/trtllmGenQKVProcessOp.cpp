@@ -259,7 +259,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     int64_t const layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
     int64_t const tokens_per_block, int64_t const mask_type, int64_t const kv_cache_quant_mode,
     int64_t const max_attention_window_size, int64_t const cyclic_attention_window_size,
-    int64_t const sink_token_length, int64_t const num_tokens, int64_t const batch_size, int64_t const input_seq_length,
+    int64_t const num_tokens, int64_t const batch_size, int64_t const input_seq_length,
     int64_t const max_past_kv_length, int64_t const rotary_embedding_dim, double const rotary_embedding_base,
     int64_t const rotary_embedding_scale_type, double const rotary_embedding_scale,
     int64_t const rotary_embedding_max_positions, int64_t const position_embedding_type, double const bmm1_scale,
@@ -308,7 +308,6 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     decoderInfoParams.maxQSeqLength = static_cast<int>(input_seq_length);
     decoderInfoParams.maxEncoderQSeqLength = 0;
     decoderInfoParams.attentionWindowSize = static_cast<int>(cyclic_attention_window_size);
-    decoderInfoParams.sinkTokenLength = static_cast<int>(sink_token_length);
     decoderInfoParams.numTokens = static_cast<int>(num_tokens);
     decoderInfoParams.removePadding = true;
     decoderInfoParams.attentionMaskType = static_cast<AttentionMaskType>(mask_type);
@@ -369,7 +368,6 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         qkvParams.max_input_seq_len = static_cast<int>(input_seq_length);
         qkvParams.max_kv_seq_len = static_cast<int>(max_past_kv_length);
         qkvParams.cyclic_kv_cache_len = static_cast<int>(cyclic_attention_window_size);
-        qkvParams.sink_token_len = static_cast<int>(sink_token_length);
         qkvParams.token_num = static_cast<int>(num_tokens);
         qkvParams.remove_padding = true;
         qkvParams.is_last_chunk = attention_chunk_size == 0 || input_seq_length == max_past_kv_length;
@@ -452,7 +450,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     std::optional<torch::Tensor> mrope_rotary_cos_sin, int64_t const layer_idx, int64_t const num_heads,
     int64_t const num_kv_heads, int64_t const head_size, int64_t const tokens_per_block, int64_t const mask_type,
     int64_t const kv_cache_quant_mode, int64_t const max_attention_window_size,
-    int64_t const cyclic_attention_window_size, int64_t const sink_token_length, int64_t const num_tokens,
+    int64_t const cyclic_attention_window_size, int64_t const num_tokens,
     int64_t const batch_size, int64_t const input_seq_length, int64_t const max_past_kv_length,
     int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
     double const rotary_embedding_scale, int64_t const rotary_embedding_max_positions,
@@ -515,7 +513,6 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
         qkvParams.max_input_seq_len = static_cast<int>(input_seq_length);
         qkvParams.max_kv_seq_len = static_cast<int>(max_past_kv_length);
         qkvParams.cyclic_kv_cache_len = static_cast<int>(cyclic_attention_window_size);
-        qkvParams.sink_token_len = static_cast<int>(sink_token_length);
         qkvParams.token_num = static_cast<int>(num_tokens);
         qkvParams.remove_padding = true;
         qkvParams.is_last_chunk = attention_chunk_size == 0 || input_seq_length == max_past_kv_length;
@@ -573,7 +570,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     std::optional<torch::Tensor> rotary_cos_sin, int64_t const layer_idx, int64_t const seq_offset,
     int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size, int64_t const tokens_per_block,
     int64_t const kv_cache_quant_mode, int64_t const max_attention_window_size,
-    int64_t const cyclic_attention_window_size, int64_t const sink_token_length, int64_t const num_tokens,
+    int64_t const cyclic_attention_window_size, int64_t const num_tokens,
     int64_t const batch_beam, int64_t const input_seq_length, int64_t const max_past_kv_length,
     int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
     double const rotary_embedding_scale, int64_t const rotary_embedding_max_positions,
@@ -695,7 +692,6 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         qkvParams.max_input_seq_len = static_cast<int>(input_seq_length);
         qkvParams.max_kv_seq_len = static_cast<int>(max_past_kv_length);
         qkvParams.cyclic_kv_cache_len = static_cast<int>(cyclic_attention_window_size);
-        qkvParams.sink_token_len = static_cast<int>(sink_token_length);
         qkvParams.token_num = static_cast<int>(num_tokens);
         qkvParams.remove_padding = true;
         qkvParams.is_last_chunk = false;
