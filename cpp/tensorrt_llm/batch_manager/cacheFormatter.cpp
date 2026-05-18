@@ -892,6 +892,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto& recvBlockManager = mCacheManager->getBlockManager();
     auto recvRecurrentStates = [&]()
     {
+        if (!selfConfig.hasRnnConfig() || !destConfig.hasRnnConfig())
+        {
+            return;
+        }
+
         auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
 
         bool const tpMismatch
