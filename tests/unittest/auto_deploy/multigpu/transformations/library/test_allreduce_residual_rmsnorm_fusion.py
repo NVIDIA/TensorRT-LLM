@@ -20,6 +20,9 @@ from _dist_test_utils import get_device_counts
 from torch.distributed import DistNetworkError
 from torch.export import export
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.distributed import (
+    cute_dist as _cute_dist_ops,  # noqa: F401
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
     is_trtllm_op_available,
 )
@@ -80,7 +83,19 @@ class AllreduceResidualNorm2(torch.nn.Module):
         return normed, y
 
 
-def _test_allreduce_fusion(port: int | None, ModuleCls, strategy: str, rmsnorm_op: str):
+def _get_expected_fused_op(fusion_backend: str):
+    if fusion_backend == "cute":
+        return torch.ops.auto_deploy.cute_dist_fused_allreduce_residual_rmsnorm
+    return torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm
+
+
+def _test_allreduce_fusion(
+    port: int | None,
+    ModuleCls,
+    strategy: str,
+    rmsnorm_op: str,
+    fusion_backend: str = "trtllm",
+):
     if not is_trtllm_op_available():
         pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
 
@@ -130,29 +145,35 @@ def _test_allreduce_fusion(port: int | None, ModuleCls, strategy: str, rmsnorm_o
             }
         optimizer_config["fuse_allreduce_residual_rmsnorm"] = {
             "stage": "post_load_fusion",
+            "backend": fusion_backend,
         }
 
         # Fuse ops with the specified strategy
         gm_transformed = InferenceOptimizer(None, optimizer_config)(None, gm)
 
-        # Run the fused graph
-        fused_outputs, residual_fused = gm_transformed(x, residual)
-
-        # Check if fused node in the graph and verify strategy
+        # Check if fused node in the graph and verify strategy when applicable.
         has_fused_node = False
         fused_node_strategy = None
+        expected_fused_op = _get_expected_fused_op(fusion_backend)
         for node in gm_transformed.graph.nodes:
-            if is_op(node, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm):
+            if is_op(node, expected_fused_op):
                 has_fused_node = True
-                # The fused node should have the strategy as the last argument
-                # args: (x, residual, weight, eps, strategy)
-                if len(node.args) >= 5:
+                # The TRT-LLM fused node should have the strategy as the last argument.
+                # args: (x, residual, weight, eps, strategy). The CuTe node is
+                # explicit and does not need an allreduce strategy argument.
+                if fusion_backend == "trtllm" and len(node.args) >= 5:
                     fused_node_strategy = node.args[4]
 
         assert has_fused_node, "Fused node not found."
+        if fusion_backend == "cute":
+            return
+
         assert fused_node_strategy == strategy, (
             f"Fused node strategy mismatch: expected '{strategy}', got '{fused_node_strategy}'"
         )
+
+        # Run the fused graph.
+        fused_outputs, residual_fused = gm_transformed(x, residual)
 
         # Verify outputs are consistent
         assert torch.allclose(residual_original, residual_fused, atol=1e-5), (
@@ -211,6 +232,50 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
                 ModuleCls=ModuleCls,
                 strategy=strategy,
                 rmsnorm_op=rmsnorm_op,
+            )
+            return
+        except DistNetworkError as e:
+            last_exc = e
+            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
+                raise
+        finally:
+            mpi_pool.shutdown()
+    raise RuntimeError(
+        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
+    ) from last_exc
+
+
+@pytest.mark.parametrize("device_count", get_device_counts())
+@pytest.mark.parametrize(
+    "ModuleCls",
+    [AllreduceResidualNorm, AllreduceResidualNorm2],
+    ids=["residual_plus_x", "x_plus_residual"],
+)
+@pytest.mark.parametrize(
+    "rmsnorm_op",
+    ["torch_rmsnorm", "triton_rms_norm"],
+    ids=["rmsnorm_torch", "rmsnorm_triton"],
+)
+def test_allreduce_fusion_cute_backend_selection(device_count, ModuleCls, rmsnorm_op):
+    # The CuTe backend path is validated at graph level here. Runtime coverage is
+    # kept in the local POC benchmark because the kernel is an eager-only bf16
+    # experiment and not CUDA-graph-safe.
+    if device_count <= 1:
+        pytest.skip("Require multi GPUs to run test_allreduce_fusion_cute_backend_selection.")
+
+    n_workers = device_count
+    max_retries = 5
+    last_exc: Exception | None = None
+    for _ in range(max_retries):
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
+        try:
+            mpi_pool.submit_sync(
+                _test_allreduce_fusion,
+                port=None,
+                ModuleCls=ModuleCls,
+                strategy="AUTO",
+                rmsnorm_op=rmsnorm_op,
+                fusion_backend="cute",
             )
             return
         except DistNetworkError as e:
