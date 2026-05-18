@@ -1139,11 +1139,23 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                              scale_data):
         new_weight, new_scale = swizzle_weight_and_scale(
             weight_data, scale_data)
+        replacement_storage_ptrs = {
+            new_weight.data.untyped_storage().data_ptr(),
+            new_scale.data.untyped_storage().data_ptr(),
+        }
         for name in (weight_name, scale_name):
             old_param = module._parameters.pop(name, None)
             assert old_param is not None, \
                 f"Expected {name} to be a registered parameter before swizzling MXFP4 weights."
-            old_param.data.storage().resize_(0)
+            old_storage = old_param.data.untyped_storage()
+            # H20 uses StridedLayout as an MXFP4 swizzle fallback. That
+            # conversion can alias the original scale storage, unlike the
+            # Hopper swizzled layout path, so only release storage that is no
+            # longer backing the replacement tensor.
+            old_storage_ptr = old_storage.data_ptr()
+            if (old_storage.nbytes() > 0
+                    and old_storage_ptr not in replacement_storage_ptrs):
+                old_storage.resize_(0)
         torch.cuda.empty_cache()
         setattr(module, weight_name, new_weight)
         setattr(module, scale_name, new_scale)

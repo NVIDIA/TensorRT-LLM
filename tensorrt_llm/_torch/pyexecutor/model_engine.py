@@ -425,8 +425,12 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
-            # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            # Parallel-draft modes (PARD, DFlash) size their per-request draft
+            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
+            # one slot per draft token the target will verify.  PARD still uses
+            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
+            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
+            # tokens_per_gen_step carries the per-algorithm width.
             # Runtime draft length is updated each iteration when dynamic draft length is enabled; otherwise stays fixed.
             if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
@@ -3964,9 +3968,10 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.runtime_tokens_per_gen_step = (
                 self.get_runtime_tokens_per_gen_step(self.runtime_draft_len))
 
-            # PARD/DFlash have 2K tokens per gen request, not K+1.  Pass 2K-1
-            # so generation_lengths = 2K and the XQA kernel computes
-            # the correct past_kv_len.
+            # Parallel-draft modes advertise a per-gen-step width via
+            # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass
+            # (tokens_per_gen_step - 1) so generation_lengths = tokens_per_gen_step
+            # and the XQA kernel computes the correct past_kv_len.
             if spec_metadata.spec_dec_mode.is_parallel_draft():
                 sd_max_draft_len = self.original_max_total_draft_tokens
                 sd_max_total = self.original_max_total_draft_tokens

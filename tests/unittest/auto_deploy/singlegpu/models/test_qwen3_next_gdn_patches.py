@@ -42,13 +42,17 @@ def test_torch_gated_delta_rule_op():
     v_head_dim = 16
 
     # Raw inputs in [B, S, H, D] layout (bsnd convention)
-    q_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
-    k_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
-    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.float32)
-    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
-    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
-    A_log = torch.randn(num_heads, dtype=torch.float32)
-    dt_bias = torch.randn(num_heads, dtype=torch.float32)
+    q_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32, device="cuda"
+    )
+    k_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32, device="cuda"
+    )
+    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.float32, device="cuda")
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32, device="cuda")
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32, device="cuda")
+    A_log = torch.randn(num_heads, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(num_heads, dtype=torch.float32, device="cuda")
 
     # Preprocess for HF reference: l2 norm + gating (must match _l2norm convention)
     q_norm = _l2norm(q_raw.float())
@@ -87,13 +91,17 @@ def test_torch_gated_delta_rule_op_bfloat16():
     k_head_dim = 8
     v_head_dim = 8
 
-    q_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
-    k_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
-    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.bfloat16)
-    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
-    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
-    A_log = torch.randn(num_heads, dtype=torch.bfloat16)
-    dt_bias = torch.randn(num_heads, dtype=torch.bfloat16)
+    q_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.randn(num_heads, dtype=torch.bfloat16, device="cuda")
+    dt_bias = torch.randn(num_heads, dtype=torch.bfloat16, device="cuda")
 
     q_norm = _l2norm(q_raw.float()).to(torch.bfloat16)
     k_norm = _l2norm(k_raw.float()).to(torch.bfloat16)

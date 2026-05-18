@@ -78,11 +78,11 @@ def test_qwen3_next_moe_patch():
     assert module is not None, "Failed to load Qwen3Next MoE layer"
 
     # Convert module to bfloat16 to match inference dtype
-    module = module.to(torch.bfloat16)
+    module = module.to(torch.bfloat16).cuda()
 
     # Create test input: (batch_size=2, seq_len=6, hidden_size=16)
     hidden_size = 16
-    inputs = torch.randn(2, 6, hidden_size, dtype=torch.bfloat16)
+    inputs = torch.randn(2, 6, hidden_size, dtype=torch.bfloat16, device="cuda")
 
     # Reference: original HF forward returns a single tensor in transformers 5.x
     with torch.no_grad():

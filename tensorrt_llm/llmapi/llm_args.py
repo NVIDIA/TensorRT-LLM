@@ -1810,12 +1810,16 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     @property
     def tokens_per_gen_step(self) -> int:
-        """DFlash needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
-        return 2 * self.max_draft_len
+        """DFlash only needs K+1 tokens per gen request (K drafts + 1 bonus).
+
+        The draft produces its own mask queries internally; passing mask
+        fillers through the target is pure wasted work at large batch size.
+        """
+        return self.max_draft_len + 1
 
     def get_runtime_tokens_per_gen_step(self, runtime_draft_len: int) -> int:
-        """DFlash needs 2K runtime tokens per gen request for logical draft length K."""
-        return 1 if runtime_draft_len == 0 else 2 * runtime_draft_len
+        """DFlash needs K+1 runtime tokens per gen request (K drafts + 1 bonus)."""
+        return 1 + runtime_draft_len
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -2014,6 +2018,17 @@ class ExecutorMemoryType(StrEnum):
     MODEL_WEIGHTS_DRAFT = "draft_model_weights"
 
 
+@dataclass
+class _SleepConfigDefaultFactory:
+    """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict.
+    """
+
+    default_mode: Any
+
+    def __call__(self) -> Any:
+        return self.default_mode
+
+
 class SleepConfig(StrictBaseModel):
     """Configuration for the LLM sleep/wakeup feature.
     """
@@ -2086,7 +2101,8 @@ class SleepConfig(StrictBaseModel):
             cls._normalize_restore_mode(value)
             for key, value in cases.items()
         }
-        return defaultdict(lambda: default_mode, normalized_cases)
+        factory = _SleepConfigDefaultFactory(default_mode)
+        return defaultdict(factory, normalized_cases)
 
     @field_validator('restore_modes', mode='plain')
     @classmethod

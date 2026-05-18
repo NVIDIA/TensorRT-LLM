@@ -38,8 +38,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
-    host_profiler_context
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
+    get_global_profiler, host_profiler_context)
 
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
@@ -1081,6 +1081,12 @@ class PyExecutor:
                 logger.info(
                     f"Profiling started at iteration {self.iter_counter}.")
                 enabled = True
+
+            # Notify host line profiler of iteration for iteration-aware profiling
+            host_profiler = get_global_profiler()
+            if host_profiler is not None:
+                host_profiler.notify_iteration(self.iter_counter)
+
             calibrator.pre_step(it)
             start_time = time.time()
             if it % 2 == 0:
@@ -2107,8 +2113,8 @@ class PyExecutor:
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             for request in scheduled_batch.generation_requests:
                 current_num_draft_tokens = len(request.py_draft_tokens)
-                if spec_dec_mode.is_parallel_draft():
-                    # special case: PARD/DFlash carry 2K-1 draft tokens per request
+                if spec_dec_mode.is_pard():
+                    # special case: PARD carries 2K-1 draft tokens per request
                     runtime_draft_token_buffer_width = (
                         self.model_engine.spec_config.
                         get_runtime_tokens_per_gen_step(runtime_draft_len) - 1)
