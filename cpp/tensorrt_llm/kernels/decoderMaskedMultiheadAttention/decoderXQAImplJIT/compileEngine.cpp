@@ -113,7 +113,8 @@ CubinObj CompileEngine::compile() const
     if (context.kernel_type == TLLM_XQA_JIT_MLA)
     {
         auto const& c = context;
-        TLLM_CHECK(c.head_size == 576 && (c.num_q_heads == 64 || c.num_q_heads == 128) && c.num_kv_heads == 1
+        TLLM_CHECK(c.head_size == 576 && (c.num_q_heads == 32 || c.num_q_heads == 64 || c.num_q_heads == 128)
+            && c.num_kv_heads == 1
             && c.beam_width == 1 && c.data_type == DATA_TYPE_E4M3 && c.kv_cache_data_type == DATA_TYPE_E4M3
             && c.fp8_output == false && !c.use_input_kv && ropeStyle == TLLM_XQA_JIT_ROPE_NONE);
     }

@@ -32,7 +32,7 @@ inline constexpr int kTargetWaveFactor = 8;
 inline constexpr int kXqaMlaCgaSize = 4;
 inline constexpr int kXqaMlaTokensPerTile = 64;
 inline constexpr int kXqaMlaMultiBlockMinTilesPerCta = 2;
-inline constexpr int kXqaMlaKernelMinHeadGrpSize = 64;
+inline constexpr int kXqaMlaKernelMinHeadGrpSize = 32;
 inline constexpr int kXqaMlaKernelHeadGrpSize = 128;
 inline constexpr int kXqaMlaQElemBytes = 1;
 inline constexpr int kXqaMlaOutputHeadSize = 512;
@@ -41,7 +41,7 @@ inline constexpr int kXqaMlaOutputElemBytes = 2;
 inline constexpr int getXqaMlaKernelHeadGrpSize(int runtimeHeadGrpSize)
 {
     return runtimeHeadGrpSize <= kXqaMlaKernelMinHeadGrpSize ? kXqaMlaKernelMinHeadGrpSize
-                                                            : kXqaMlaKernelHeadGrpSize;
+        : (runtimeHeadGrpSize <= 64 ? 64 : kXqaMlaKernelHeadGrpSize);
 }
 
 inline constexpr uint32_t getXqaMlaCgaXBufSize(int kernelHeadGrpSize)

@@ -321,10 +321,13 @@ struct PartialResult
     Chunk chunks[nbChunks];
 };
 
-constexpr uint32_t nbMathWarpsA = headGrpSize <= 64 ? 4 : 8;
+constexpr uint32_t nbMathWarpsA = headGrpSize <= 32 ? 2 : (headGrpSize <= 64 ? 4 : 8);
 constexpr uint32_t nbComputeWarpsB = headGrpSize <= 64 ? 4 : 8;
 constexpr uint32_t nbMathGrpsA = 2;
 constexpr uint32_t nbMathWarpsB = headGrpSize <= 64 ? 4 : 8;
+constexpr uint32_t consumerCtaShapeX = headGrpSize <= 32 ? 4 : 2;
+constexpr uint32_t consumerCtaShapeY = exactDiv(nbMathWarpsB, consumerCtaShapeX);
+constexpr uint32_t consumerWarpTileX = exactDiv(gemm1V, consumerCtaShapeX);
 
 constexpr uint32_t nbMultiBlockBufs = 2;
 constexpr uint32_t multiBlockMathWarps = 8;
@@ -404,7 +407,7 @@ struct SharedMemB
     // x and v are using gemmK=128 per iteration. If we see high pressure on shared memory capacity, we can change to 64
     // in the future.
     static inline constexpr uint32_t outputSwizzleBytesPerRow
-        = sizeof(OutputElem) * exactDiv(gemm1V, 2U);
+        = sizeof(OutputElem) * consumerWarpTileX;
     static inline constexpr uint32_t outputSwizzleRowsPerWarp = headGrpSize <= 64 ? warp_size : 16U;
     static inline constexpr uint32_t outputSwizzleAlignment
         = outputSwizzleBytesPerRow * nbMathWarpsB * outputSwizzleRowsPerWarp;
@@ -441,7 +444,7 @@ struct SharedMemB
         return xv[idx].x.rowMaxLog2e;
     }
 
-    static inline constexpr uint32_t nbAccRowMaxSumCopies = 2;
+    static inline constexpr uint32_t nbAccRowMaxSumCopies = consumerCtaShapeX;
     Vec<float, headGrpSize> accRowMaxLog2e[nbAccRowMaxSumCopies];
     Vec<float, headGrpSize> accRowSum[nbAccRowMaxSumCopies];
 
@@ -469,10 +472,9 @@ struct SharedMemB
     __device__ inline Vec<PartialResult::Chunk, nbMultiBlockBufs>& getMultiBlockBufs()
     {
 #ifndef __CUDACC_RTC__
-        if constexpr (headGrpSize >= 128)
-        {
-            static_assert(sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xBars));
-        }
+#if HEAD_GRP_SIZE >= 128
+        static_assert(sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xBars));
+#endif
 #endif
         return *reinterpret_cast<Vec<PartialResult::Chunk, nbMultiBlockBufs>*>(this);
     }
@@ -1156,8 +1158,8 @@ struct Consumer
 {
     static inline constexpr uint32_t nbMathWarps = nbMathWarpsB;
     static inline constexpr uint32_t nbMathThrds = warp_size * nbMathWarps;
-    static inline constexpr uint32_t ctaShapeX = 2;
-    static inline constexpr uint32_t ctaShapeY = headGrpSize <= 64 ? 2 : 4;
+    static inline constexpr uint32_t ctaShapeX = consumerCtaShapeX;
+    static inline constexpr uint32_t ctaShapeY = consumerCtaShapeY;
     static inline constexpr uint2 ctaShape = {ctaShapeX, ctaShapeY};
     static_assert(SharedMemB::nbAccRowMaxSumCopies == ctaShape.x);
     static_assert(ctaShape.x * ctaShape.y == nbMathWarps);
@@ -1590,8 +1592,10 @@ __device__ inline void Consumer::storeOutput(Vec<OutputHead, warpTile.y>& dst, u
     WarpOutputTile const& src, WarpOutSwizzleBuf& swizzleBuf, uint32_t lane)
 {
     using Dst = mha::decay_t<decltype(dst)>;
-    static_assert(Dst::size == WarpOutputTile::rows * 8 && Dst::size % WarpOutSwizzleBuf::rows == 0);
-    uint32_t const nbIters = exactDiv(Dst::size, WarpOutSwizzleBuf::rows);
+    static_assert(Dst::size == WarpOutputTile::rows * 8);
+    constexpr uint32_t swizzleRowsUsed = mha::min<uint32_t>(Dst::size, WarpOutSwizzleBuf::rows);
+    static_assert(Dst::size % swizzleRowsUsed == 0);
+    constexpr uint32_t nbIters = exactDiv(Dst::size, swizzleRowsUsed);
 
     uint32_t const rS = lane % 8;
     uint32_t const cS = lane / 8;
@@ -1620,7 +1624,7 @@ __device__ inline void Consumer::storeOutput(Vec<OutputHead, warpTile.y>& dst, u
         }
         __syncwarp();
 
-        uint32_t const dstRowsPerIter = WarpOutSwizzleBuf::rows;
+        uint32_t const dstRowsPerIter = swizzleRowsUsed;
         uint32_t const rowsPerOp = exactDiv(warp_size, thrdsPerRow);
         LdGrain* const baseDstPtr = reinterpret_cast<LdGrain*>(
             &dst[dstRowsPerIter * iter + rL][dstBaseCol + exactDiv(grainBytes, sizeof(OutputElem)) * cL]);
