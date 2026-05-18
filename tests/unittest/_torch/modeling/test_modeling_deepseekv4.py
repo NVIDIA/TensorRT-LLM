@@ -330,6 +330,7 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     from tensorrt_llm._torch.modules.attention import MLA
 
     init_src = inspect.getsource(MLA.__init__)
+    helper_src = inspect.getsource(MLA._deepseek_v4_q_b_layernorm)
     forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
 
     assert "self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim" in init_src
@@ -337,9 +338,15 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert "kv_a_layernorm_hidden_size = (" in init_src
     assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
     assert "self.kv_a_layernorm = RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src
-    assert "self.q_b_layernorm(q_proj.view(-1, self.qk_head_dim)).view_as(q_proj)" in _source_calls(
-        forward_src
-    )
+    assert "q.dim() == 2" in helper_src
+    assert "self.num_heads_tp * self.qk_head_dim" in helper_src
+    assert "torch.ops.trtllm.deepseek_v4_q_norm" in helper_src
+    assert ".is_cuda" not in helper_src
+    assert ".is_contiguous" not in helper_src
+    assert "q.dtype" not in helper_src
+    assert "total_rows" not in helper_src
+    assert "self.q_b_layernorm(" not in helper_src
+    assert "self._deepseek_v4_q_b_layernorm(q_proj)" in _source_calls(forward_src)
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
