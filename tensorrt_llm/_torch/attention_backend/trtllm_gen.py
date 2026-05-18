@@ -26,7 +26,7 @@ Example:
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -35,7 +35,17 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    AttentionSparseArgs,
+)
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention_backend.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import (
     get_size_in_bytes,
@@ -1438,107 +1448,174 @@ class FlashInferTrtllmGenAttention:
 
 
 def is_supported(
+    attn: "TrtllmAttention",
     q: torch.Tensor,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    out_dtype: Optional[torch.dtype] = None,
-    mask_type: Optional[int] = None,
-    has_alibi: bool = False,
-    is_padded: bool = False,
-    use_paged_kv_cache: bool = True,
-    tokens_per_block: Optional[int] = 64,
-    beam_width: int = 1,
-    position_shift_enabled: bool = False,
-    sink_token_length: int = 0,
-    cross_attention: bool = False,
-    is_spec_decoding: bool = False,
-    is_mla_enable: bool = False,
-    is_fused_qkv: bool = True,
-    update_kv_cache: bool = True,
-    has_cross_kv: bool = False,
-    quant_config: Optional[QuantConfig] = None,
-    kv_cache_manager: Optional[KVCacheManager] = None,
+    k: Optional[torch.Tensor],
+    metadata: "TrtllmAttentionMetadata",
+    fwd: AttentionForwardArgs,
+    sparse: AttentionSparseArgs,
     phase: str = "both",
-    sparse_kv_indices: Optional[torch.Tensor] = None,
-    sparse_attn_indices: Optional[torch.Tensor] = None,
-    skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
-    skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
 ) -> Tuple[bool, str]:
-    """
-    Check if trtllm-gen backend supports the given configuration.
-
-    This is the compatibility function that wraps TrtllmGenSupportChecker.
-
-    Args:
-        q: Query tensor.
-        num_heads: Number of query attention heads.
-        num_kv_heads: Number of KV attention heads.
-        head_size: Size of each attention head.
-        out_dtype: Output data type.
-        mask_type: Attention mask type.
-        has_alibi: Whether ALiBi is used.
-        is_padded: Whether input is padded.
-        use_paged_kv_cache: Whether paged KV cache is used.
-        tokens_per_block: Tokens per KV cache block.
-        beam_width: Beam search width.
-        position_shift_enabled: Whether position shift is enabled.
-        sink_token_length: Sink token length for StreamingLLM.
-        cross_attention: Whether cross attention is used.
-        is_spec_decoding: Whether speculative decoding is enabled.
-        is_mla_enable: Whether MLA is enabled.
-        is_fused_qkv: Whether QKV is fused.
-        update_kv_cache: Whether KV cache update is enabled.
-        has_cross_kv: Whether cross KV is provided.
-        quant_config: Quantization configuration (QuantConfig).
-        kv_cache_manager: KV cache manager (its .dtype provides KV cache DataType).
-        phase: Phase to check ("context", "generation", or "both").
-        sparse_kv_indices: Sparse KV indices tensor for context phase.
-        sparse_attn_indices: Sparse attention indices tensor for generation phase.
-        skip_softmax_threshold_scale_factor_prefill: Scale factor for the skip-softmax
-            threshold in prefill phase. Non-None indicates skip-softmax is enabled.
-        skip_softmax_threshold_scale_factor_decode: Scale factor for the skip-softmax
-            threshold in decode phase. Non-None indicates skip-softmax is enabled.
-
-    Returns:
-        Tuple of (is_supported, reason_if_not_supported).
-    """
+    """Source-attr public API: source every check input from the four rich
+    objects (``attn`` / ``metadata`` / ``fwd`` / ``sparse``). Delegates to
+    :class:`FlashInferTrtllmGenAttention.is_supported`."""
+    is_fused_qkv = not metadata.is_cross and k is None
+    update_kv_cache = not metadata.is_cross or k is not None
     kv_cache_dtype = torch_dtype_to_binding(q.dtype)
-    if kv_cache_manager is not None:
-        kv_cache_dtype = kv_cache_manager.dtype
+    if metadata.kv_cache_manager is not None:
+        kv_cache_dtype = metadata.kv_cache_manager.dtype
 
     return FlashInferTrtllmGenAttention(
-        kv_cache_manager=kv_cache_manager, quant_config=quant_config
+        kv_cache_manager=metadata.kv_cache_manager,
+        quant_config=attn.quant_config,
     ).is_supported(
         phase=phase,
         q_dtype=q.dtype,
         kv_cache_dtype=kv_cache_dtype,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        out_dtype=out_dtype,
-        mask_type=mask_type if mask_type is not None else 1,
-        beam_width=beam_width,
-        sink_token_length=sink_token_length,
-        tokens_per_block=tokens_per_block,
-        use_paged_kv_cache=use_paged_kv_cache,
-        is_mla_enable=is_mla_enable,
+        num_heads=attn.num_heads,
+        num_kv_heads=attn.num_kv_heads,
+        head_size=attn.head_dim,
+        out_dtype=fwd.output.dtype,
+        mask_type=fwd.mask_type,
+        beam_width=metadata.beam_width,
+        sink_token_length=0,
+        tokens_per_block=metadata.tokens_per_block,
+        use_paged_kv_cache=(metadata.kv_cache_block_offsets is not None),
+        is_mla_enable=attn.is_mla_enable,
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
-        cross_attention=cross_attention or has_cross_kv,
-        is_spec_decoding=is_spec_decoding,
-        has_alibi=has_alibi,
-        is_padded=is_padded,
-        position_shift_enabled=position_shift_enabled,
-        quant_config=quant_config,
-        sparse_kv_indices=sparse_kv_indices,
-        sparse_attn_indices=sparse_attn_indices,
-        skip_softmax_threshold_scale_factor_prefill=skip_softmax_threshold_scale_factor_prefill,
-        skip_softmax_threshold_scale_factor_decode=skip_softmax_threshold_scale_factor_decode,
+        cross_attention=False,
+        is_spec_decoding=metadata.is_spec_decoding_enabled,
+        has_alibi=(attn.position_embedding_type == 4 or attn.position_embedding_type == 5),
+        is_padded=False,
+        position_shift_enabled=False,
+        quant_config=attn.quant_config,
+        sparse_kv_indices=sparse.sparse_kv_indices,
+        sparse_attn_indices=sparse.sparse_attn_indices,
+        skip_softmax_threshold_scale_factor_prefill=attn.skip_softmax_threshold_scale_factor_prefill,
+        skip_softmax_threshold_scale_factor_decode=attn.skip_softmax_threshold_scale_factor_decode,
     )
 
 
 def trtllm_gen_attention(
+    attn: "TrtllmAttention",
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    metadata: "TrtllmAttentionMetadata",
+    fwd: AttentionForwardArgs,
+    sparse: AttentionSparseArgs,
+) -> None:
+    """Source-attr public API: source every kernel input from the four rich
+    objects (``attn`` / ``metadata`` / ``fwd`` / ``sparse``). Delegates to
+    the kwargs-style :func:`_trtllm_gen_attention_impl` which holds the
+    flashinfer call.
+    """
+    is_fused_qkv = not metadata.is_cross and k is None
+    update_kv_cache = not metadata.is_cross or k is not None
+    layer_idx = attn.get_local_layer_idx(metadata)
+    attention_window_size = fwd.attention_window_size or metadata.max_seq_len
+    kv_scale_orig_quant = (
+        attn.kv_scale_orig_quant if fwd.kv_scales_sf_inv is None else fwd.kv_scales_sf_inv
+    )
+    kv_scale_quant_orig = attn.kv_scale_quant_orig if fwd.kv_scales_sf is None else fwd.kv_scales_sf
+    spec_decoding_tensor_params = attn.spec_decoding_tensor_params(metadata)
+
+    _trtllm_gen_attention_impl(
+        # --- Inputs (per-call tensors) ---
+        q=q,
+        k=k,
+        v=v,
+        output=fwd.output,
+        output_sf=fwd.output_sf,
+        workspace=metadata.effective_workspace,
+        # --- Per-step batch state (TrtllmAttentionMetadata) ---
+        sequence_length=metadata.kv_lens_cuda_runtime,
+        host_past_key_value_lengths=metadata.kv_lens_runtime,
+        host_total_kv_lens=metadata.host_total_kv_lens,
+        context_lengths=metadata.prompt_lens_cuda_runtime,
+        host_context_lengths=metadata.prompt_lens_cpu_runtime,
+        host_request_types=metadata.host_request_types_runtime,
+        kv_cache_block_offsets=metadata.kv_cache_block_offsets,
+        host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
+        cache_indirection=metadata.cache_indirection,
+        block_ids_per_seq=metadata.block_ids_per_seq,
+        tokens_per_block=metadata.tokens_per_block,
+        max_num_requests=metadata.max_num_requests,
+        beam_width=metadata.beam_width,
+        use_paged_context_fmha=metadata.use_paged_context_fmha,
+        helix_tensor_params=metadata.helix_tensor_params,
+        spec_decoding_bool_params=metadata.spec_decoding_bool_params,
+        num_sparse_topk=metadata.num_sparse_topk,
+        num_contexts=metadata.num_contexts,
+        num_ctx_tokens=metadata.num_ctx_tokens,
+        max_context_length=metadata.max_context_length,
+        kv_cache_manager=metadata.kv_cache_manager,
+        # --- Per-call (AttentionForwardArgs) ---
+        kv_scale_orig_quant=kv_scale_orig_quant,
+        kv_scale_quant_orig=kv_scale_quant_orig,
+        out_scale=fwd.effective_out_scale,
+        latent_cache=fwd.latent_cache,
+        q_pe=fwd.q_pe,
+        attention_sinks=fwd.attention_sinks,
+        mask_type=fwd.mask_type,
+        attention_input_type=int(fwd.attention_input_type),
+        chunked_prefill_buffer_batch_size=fwd.chunked_prefill_buffer_batch_size,
+        mrope_rotary_cos_sin=fwd.mrope_rotary_cos_sin,
+        mrope_position_deltas=fwd.mrope_position_deltas,
+        softmax_stats_tensor=fwd.softmax_stats_tensor,
+        cu_q_seqlens=fwd.cu_q_seqlens,
+        cu_kv_seqlens=fwd.cu_kv_seqlens,
+        fmha_scheduler_counter=fwd.fmha_scheduler_counter,
+        mla_bmm1_scale=fwd.mla_bmm1_scale,
+        mla_bmm2_scale=fwd.mla_bmm2_scale,
+        quant_q_buffer=fwd.quant_q_buffer,
+        # --- Module config (TrtllmAttention) ---
+        rotary_inv_freq=attn.rotary_inv_freq,
+        rotary_cos_sin=attn.rotary_cos_sin,
+        predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
+        num_heads=attn.num_heads,
+        num_kv_heads=attn.num_kv_heads,
+        head_size=attn.head_dim,
+        quant_mode=attn.quant_mode,
+        q_scaling=attn.q_scaling,
+        position_embedding_type=attn.position_embedding_type,
+        rotary_embedding_dim=attn.rotary_embedding_dim,
+        rotary_embedding_base=attn.rotary_embedding_base,
+        rotary_embedding_scale_type=attn.rotary_embedding_scale_type,
+        rotary_embedding_scales=attn.rotary_embedding_scales,
+        rotary_embedding_max_position_info=attn.rotary_embedding_max_position_info,
+        is_mla_enable=attn.is_mla_enable,
+        q_lora_rank=attn.q_lora_rank,
+        kv_lora_rank=attn.kv_lora_rank,
+        qk_nope_head_dim=attn.qk_nope_head_dim,
+        qk_rope_head_dim=attn.qk_rope_head_dim,
+        v_head_dim=attn.v_head_dim,
+        attention_chunk_size=attn.attention_chunk_size,
+        skip_softmax_threshold_scale_factor_prefill=attn.skip_softmax_threshold_scale_factor_prefill,
+        skip_softmax_threshold_scale_factor_decode=attn.skip_softmax_threshold_scale_factor_decode,
+        skip_softmax_stat=attn.skip_softmax_stat,
+        quant_config=attn.quant_config,
+        global_layer_idx=attn.layer_idx,
+        # --- Sparse-specific (AttentionSparseArgs) ---
+        sparse_kv_indices=sparse.sparse_kv_indices,
+        sparse_kv_offsets=sparse.sparse_kv_offsets,
+        sparse_attn_indices=sparse.sparse_attn_indices,
+        sparse_attn_offsets=sparse.sparse_attn_offsets,
+        sparse_attn_indices_block_size=sparse.sparse_attn_indices_block_size,
+        # --- Per-call locals (computed above) ---
+        is_fused_qkv=is_fused_qkv,
+        update_kv_cache=update_kv_cache,
+        layer_idx=layer_idx,
+        attention_window_size=attention_window_size,
+        spec_decoding_tensor_params=spec_decoding_tensor_params,
+        # --- Literals ---
+        sink_token_length=0,
+    )
+
+
+def _trtllm_gen_attention_impl(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
