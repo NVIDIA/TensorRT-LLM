@@ -43,7 +43,7 @@ There are two ways to trigger skills and agents:
    sub-agent automatically.
 
 2. **Manual invoke** — type `/<skill-name>` (e.g. `/perf-analysis`,
-   `/serve-config-guide`) to explicitly run a skill. For sub-agents, type
+   `/trtllm-serve-config-guide`) to explicitly run a skill. For sub-agents, type
    `@"<agent-name>" (agent)` (e.g. `@"exec-compile-specialist (agent)"`) to
    delegate a task directly. This is useful when you know exactly which workflow you want.
 
