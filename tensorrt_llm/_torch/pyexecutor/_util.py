@@ -356,21 +356,25 @@ class KvCacheCreator:
 
         # First pass: one dummy per supported modality. Guarantees each
         # encoder in a multi-encoder model gets its workspace sized.
+        # Modalities that nominally share an encoder (e.g. Qwen-VL's
+        # image/video) still get separate dummies because a "shared"
+        # encoder may diverge later — e.g. video adding a temporal
+        # attention path that the image dummy would not exercise.
         modalities_to_run: list = [
             modality
             for modality, _ in budget.iter_modality_dummies(input_processor)
         ]
-        # Subsequent passes fill the remaining LLM batch budget with
-        # additional dummies (reusing the last supported modality as
-        # the worst-case proxy) so peak-memory measurement still reflects
-        # a full batch.
-        worst_case_modality = modalities_to_run[
-            -1] if modalities_to_run else None
+        # Subsequent passes fill the remaining LLM batch budget so
+        # peak-memory measurement still reflects a full batch. The choice
+        # of fill modality is immaterial for encoder workspace (already
+        # sized in the first pass); we reuse the last supported modality
+        # for simplicity.
+        fill_modality = modalities_to_run[-1] if modalities_to_run else None
 
         def _next_modality(idx: int):
             if idx < len(modalities_to_run):
                 return modalities_to_run[idx]
-            return worst_case_modality
+            return fill_modality
 
         iteration = 0
         while remaining_tokens > 0:
