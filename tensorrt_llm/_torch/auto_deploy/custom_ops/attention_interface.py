@@ -1431,6 +1431,9 @@ class SequenceInfo:
         use_initial_states[:] = input_pos > 0
 
         # --- Bulk device-to-host sync ---
+        # This ensures that the H2D copy done by InputBuffer.copy_to_device() has been executed
+        # before we update the host-side tensors.
+        # By gating this on sync_to_host, we ensure that we only sync when a custom op needs updated host arguments.
         # TODO: May need to dissect what fields are needed in the forward pass to reduce
         # data movement.
         if sync_to_host:
@@ -1466,8 +1469,16 @@ class SequenceInfo:
         the last position of each sequence for the metadata.
 
         NOTE: update device tensors first and mirror back to host only when an updated host-side
-        argument is active. This avoids rewriting inactive host staging buffers during the drafting
-        loop.
+        argument is active.
+
+        This prevents race conditions with the H2D copy done by InputBuffer.copy_to_device().
+        The H2D copy was queued before the forward pass, but may not have been executed yet.
+        If this copy has not been executed and we updated host arguments directly,
+        we would be overwriting them with new values which would lead to these new values getting copied
+        to device when we wanted to copy the old data. By updating via a D2H sync on the active stream,
+        we ensure that these host-side tensors are updated *after* the H2D copy has been executed.
+
+        Additionally, we make sure the D2H sync only happens only when a custom op needs updated host arguments.
         """
         # already in generate mode
         if self.is_generate_only:
