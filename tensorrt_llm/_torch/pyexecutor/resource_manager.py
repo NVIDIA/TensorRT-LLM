@@ -48,7 +48,7 @@ from tensorrt_llm.runtime.kv_cache_hash import (
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode)
+    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode, ReuseScope)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheIterationStatsDelta
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
@@ -3864,12 +3864,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
-        kv_cache = self.impl._create_kv_cache(
-            lora_task_id,
+        kv_cache = self.impl.create_kv_cache(
+            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
             input_tokens,
             id=request_id,
-            cache_salt_id=cache_salt_id,
-            expected_prompt_length=expected_prompt_length)
+            expected_prompt_length=expected_prompt_length,
+        )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:
             self.impl.mark_stats_excluded(request_id)
