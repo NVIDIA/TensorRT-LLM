@@ -193,9 +193,8 @@ class CudaGraphConfig(StrictBaseModel):
     @staticmethod
     def _merge_schedule_keys(batch_sizes: List[int],
                              schedule: dict[int, int]) -> List[int]:
-        """Merge draft_len_schedule keys into batch_sizes.
-
-        Each schedule threshold has a corresponding CUDA graph.
+        """Merge draft_len_schedule keys into batch_sizes so that each
+        schedule threshold has a corresponding CUDA graph.
 
         e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300
         into batch_sizes.
@@ -263,8 +262,6 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def supports_backend(self, backend: str) -> bool:
         """
-        Sparse-attention backend compatibility hook.
-
         Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
@@ -275,12 +272,10 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """
-        Whether to capture a dedicated CUDA graph for short-sequence-only batches.
-
-        If True, capture distinct graphs for short-only batches and general cases
-        (e.g., long or mixed batches). If False, capture a single unified CUDA graph
-        for all sequences regardless of length. The seq_len_threshold parameter
-        defines the cutoff boundary between short and long sequences.
+        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
+        If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
+        If False, capture a single unified CUDA graph for all sequences regardless of length.
+        The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
         """
         return False
 
@@ -395,9 +390,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """
         Whether to capture separate CUDA graphs for short and long sequences.
-
-        Use seq_len_threshold to determine the threshold for separating short and
-        long sequences.
+        Use seq_len_threshold to determine the threshold for separating short and long sequences.
         """
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
@@ -504,8 +497,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
         """
-        Initialize the runtime state of the configuration.
-
+        Initializes the runtime state of the configuration.
         This must be called before accessing properties like `num_local_slots`.
         """
         self._ep_rank = ep_rank
@@ -1013,8 +1005,6 @@ class DecodingBaseConfig(StrictBaseModel):
 
     def supports_backend(self, backend: str) -> bool:
         """
-        Speculative-decoding backend compatibility hook.
-
         Override if the speculation algorithm does not support
         a subset of the possible backends.
         """
@@ -1324,8 +1314,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     @functools.cached_property
     def num_capture_layers(self) -> int:
         """
-        Return the number of layers to capture from the target model.
-
+        Returns the number of layers to capture of the target model.
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
@@ -1442,8 +1431,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     @functools.cached_property
     def num_capture_layers(self):
         """
-        Return the number of layers whose hidden states are saved.
-
+        Returns the number of layers to save.
         The following hidden states are saved:
         - If eagle3_layers_to_capture is None, save the eagle3 base set plus
         the post norm last hidden state.
@@ -1922,7 +1910,6 @@ class PrometheusMetricsConfig(StrictBaseModel):
 class RayPlacementConfig(StrictBaseModel):
     """
     Configuration for Ray GPU workers placement.
-
     Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
@@ -2109,7 +2096,9 @@ class SleepConfig(StrictBaseModel):
 
 
 class PybindMirror(ABC):
-    """Utilities for mirroring Python classes to pybind classes."""
+    ''' A class containing the utilities for mirroring Python classes to
+    pybind classes.
+    '''
 
     @abstractmethod
     def _to_pybind(self):
