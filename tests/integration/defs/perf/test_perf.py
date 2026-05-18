@@ -485,6 +485,8 @@ PERF_METRIC_THRESHOLD = {
     ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT: (-0.1, 10),
     PerfMetricType.USER_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT: (-0.1, 10),
     PerfMetricType.SEQ_THROUGHPUT: (
         -0.1, 10
     ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
