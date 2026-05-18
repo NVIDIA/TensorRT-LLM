@@ -14,17 +14,40 @@
 # limitations under the License.
 
 import hashlib
-from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, chunked, filled_list, unwrap_rawref
+from ._utils import TypedIndexList, chunked, div_up, filled_list, unwrap_rawref
 
 if TYPE_CHECKING:
     from ._page import CommittedPage
 
 BlockKey = bytes
+
+
+class ReuseScope(NamedTuple):
+    """Per-request namespace for prefix reuse."""
+
+    lora_id: int | None = None
+    salt: int | None = None
+
+    def _mask(self) -> bytes:
+        return sum((value is not None) << i for i, value in enumerate(self)).to_bytes(
+            div_up(len(self), 8), "little", signed=False
+        )
+
+    def to_bytes(self) -> bytes:
+        ret = self._mask()
+        for value in self:
+            if type(value) is int:
+                ret += value.to_bytes(8, "little", signed=False)
+            else:
+                assert value is None, (
+                    "Did you forget to update to_bytes() when adding new non-int fields to ReuseScope?"
+                )
+        return ret
 
 
 # id_offset is usually vocab_size
@@ -75,9 +98,9 @@ TokenBlock = list[TokenIdExt]
 
 
 def sequence_to_blockchain_keys(
-    tokens_per_block: int, lora_task_id: int | None, tokens: Sequence[TokenIdExt]
+    tokens_per_block: int, reuse_scope: ReuseScope, tokens: Sequence[TokenIdExt]
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(lora_task_id).digest
+    digest = Hasher(reuse_scope.to_bytes()).digest
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -198,17 +221,17 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "lora_task_id", "__rawref__")
+    __slots__ = ("_prev", "key", "next", "reuse_scope", "__rawref__")
     key: BlockKey
-    lora_task_id: int | None
+    reuse_scope: ReuseScope
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
-    def __init__(self, lora_task_id: int | None, prev: "BlockRadixTree") -> None:
-        self.key = self.make_key(lora_task_id)
+    def __init__(self, reuse_scope: ReuseScope, prev: "BlockRadixTree") -> None:
+        self.key = self.make_key(reuse_scope)
         assert self.key not in prev.next, "Root block already exists"
-        self.lora_task_id = lora_task_id
+        self.reuse_scope = reuse_scope
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
@@ -234,8 +257,8 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(lora_task_id: int | None) -> BlockKey:
-        return Hasher(lora_task_id).digest
+    def make_key(reuse_scope: ReuseScope) -> BlockKey:
+        return Hasher(reuse_scope.to_bytes()).digest
 
 
 class Block:
@@ -373,11 +396,11 @@ class BlockRadixTree:
     def __del__(self) -> None:
         self.__rawref__.invalidate()
 
-    def add_or_get_existing(self, lora_task_id: int | None) -> RootBlock:
-        key = RootBlock.make_key(lora_task_id)
+    def add_or_get_existing(self, reuse_scope: ReuseScope) -> RootBlock:
+        key = RootBlock.make_key(reuse_scope)
         if key in self.next:
             return self.next[key]
-        return RootBlock(lora_task_id, self)
+        return RootBlock(reuse_scope, self)
 
     @property
     def tokens_per_block(self) -> int:
@@ -405,14 +428,14 @@ class BlockRadixTree:
     # tokens_per_block except the last one.
     def match(
         self,
-        lora_task_id: int | None,
+        reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
         for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, lora_task_id, tokens
+            self._tokens_per_block, reuse_scope, tokens
         ):
             if key in block.next:
                 block = block.next[key]

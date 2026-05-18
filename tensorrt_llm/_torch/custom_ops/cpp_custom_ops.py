@@ -1,5 +1,4 @@
-import threading
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -7,13 +6,6 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..._utils import get_sm_version
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-# Idempotency guard for warmup_heuristic_topk_decode — keyed by
-# (device_index, top_k, hint_size, num_cols). Prevents repeated allocations
-# and synchronizations when multiple Indexer modules invoke the warmup with
-# the same parameters during model construction.
-_HEURISTIC_TOPK_WARMUP_DONE: Set[Tuple[int, int, int, int]] = set()
-_HEURISTIC_TOPK_WARMUP_LOCK = threading.Lock()
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from .cute_dsl_custom_ops import GroupedGemmInputsHelper
@@ -629,6 +621,16 @@ def _register_fake():
         scale_out = pe.new_empty((M, 1), dtype=torch.float32)
         return fp8_out, scale_out
 
+    @torch.library.register_fake("trtllm::fused_cat_fp4")
+    def _(pe: torch.Tensor, nope: torch.Tensor):
+        pe_dim = pe.shape[-1]
+        nope_dim = nope.shape[-1]
+        head_dim = pe_dim + nope_dim
+        M = pe.numel() // pe_dim
+        packed = pe.new_empty((M, head_dim // 2), dtype=torch.int8)
+        scale = pe.new_empty((M, 1), dtype=torch.int32)
+        return packed, scale
+
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,
@@ -1082,6 +1084,7 @@ def _register_fake():
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
         v_head_dim: int,
+        rope_append: bool,
     ) -> None:
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place
@@ -1167,9 +1170,14 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
     def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,
-          slot_mapping_scale: torch.Tensor, k_token_start: int,
-          num_tokens: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        k_fp8 = k_cache.new_empty([num_tokens, 128], dtype=torch.float8_e4m3fn)
+          slot_mapping_scale: torch.Tensor, k_token_start: int, num_tokens: int,
+          head_dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # head_dim is payload bytes per token: 128 for FP8 or 64 for FP4
+        # (two packed E2M1 codes per byte). k_fp8 holds raw gathered bytes
+        # view-cast as float8_e4m3fn; the FP4 caller reinterprets as int8
+        # with two packed values.
+        k_fp8 = k_cache.new_empty([num_tokens, head_dim],
+                                  dtype=torch.float8_e4m3fn)
         k_scale = k_cache.new_empty([num_tokens, 1], dtype=torch.float32)
         return k_fp8, k_scale
 
@@ -1183,46 +1191,71 @@ def _register_fake():
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
 
+    @torch.library.register_fake("trtllm::compute_probs_from_logits_op")
+    def _(logits: torch.Tensor,
+          temperatures: torch.Tensor,
+          top_k: Optional[torch.Tensor] = None,
+          top_p: Optional[torch.Tensor] = None,
+          skip_temperature: bool = False) -> torch.Tensor:
+        return logits.new_empty(list(logits.shape), dtype=torch.float32)
 
-def warmup_heuristic_topk_decode(top_k: int = 2048,
-                                 hint_size: int = 2048,
-                                 num_cols: int = 4096) -> None:
-    """Pre-initialize cached hardware attributes in the C++ Scheme X dispatcher.
+    @torch.library.register_fake("trtllm::build_draft_prob_indices_out_op")
+    def _(topkScoreIndices: torch.Tensor, draftProbIndices: torch.Tensor,
+          topK: int, numDraftTokens: int) -> None:
+        return None
 
-    The dispatcher inside ``invokeIndexerTopKDecode`` lazily queries
-    ``cudaDeviceGetAttribute`` for ``MultiProcessorCount`` and
-    ``L2CacheSize`` on its first call. Those host-side queries must not
-    be issued during ``cudaStreamBeginCapture / EndCapture``: the values
-    captured there become frozen into the graph and cannot be refreshed
-    across replays on a different device.
+    @torch.library.register_fake("trtllm::verify_dynamic_tree_rejection_out_op")
+    def _(candidates: torch.Tensor, draftProbs: torch.Tensor,
+          targetProbs: torch.Tensor, targetSupportIndices: torch.Tensor,
+          targetSupportLengths: torch.Tensor, draftProbIndices: torch.Tensor,
+          retrieveNextToken: torch.Tensor, retrieveNextSibling: torch.Tensor,
+          treeValid: torch.Tensor, acceptIndex: torch.Tensor,
+          acceptTokenNum: torch.Tensor, acceptToken: torch.Tensor,
+          numSpecStep: int, seed: torch.Tensor, offset: torch.Tensor) -> None:
+        return None
 
-    This warmup issues one small heuristic decode call so the static
-    caches are populated before any CUDA Graph capture begins. Must be
-    called from the Indexer setup hook (``layer_idx == 0``) when
-    ``enable_heuristic_topk`` is true.
+    @torch.library.register_fake(
+        "trtllm::compute_draft_probs_for_dynamic_tree_rejection_op")
+    def _(draftLogits: torch.Tensor,
+          temperatures: torch.Tensor,
+          numDraftProbRows: int,
+          targetVocabSize: int,
+          top_k: Optional[torch.Tensor] = None,
+          top_p: Optional[torch.Tensor] = None,
+          skip_temperature: bool = False,
+          d2t: Optional[torch.Tensor] = None,
+          top_k_max: int = 0,
+          skip_all_sampling_params: bool = False) -> torch.Tensor:
+        batch_size = temperatures.shape[0]
+        return draftLogits.new_empty(
+            (batch_size, numDraftProbRows, targetVocabSize),
+            dtype=torch.float32)
 
-    Repeated invocations with the same ``(device, top_k, hint_size,
-    num_cols)`` key are short-circuited so that constructing many Indexer
-    modules in the same process does not re-allocate scratch tensors or
-    issue redundant synchronizations.
-    """
-    key = (torch.cuda.current_device(), top_k, hint_size, num_cols)
-    with _HEURISTIC_TOPK_WARMUP_LOCK:
-        if key in _HEURISTIC_TOPK_WARMUP_DONE:
-            return
-        _HEURISTIC_TOPK_WARMUP_DONE.add(key)
-
-    device = torch.device("cuda")
-    logits = torch.zeros((1, num_cols), dtype=torch.float32, device=device)
-    seq_lens = torch.tensor([num_cols], dtype=torch.int32, device=device)
-    indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
-    pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
-    scratch = torch.empty((top_k, ), dtype=torch.float32, device=device)
-    torch.ops.trtllm.indexer_topk_decode(logits,
-                                         seq_lens,
-                                         indices,
-                                         1,
-                                         top_k,
-                                         pre_idx=pre_idx,
-                                         heuristic_scratch=scratch)
-    torch.cuda.synchronize()
+    @torch.library.register_fake(
+        "trtllm::compute_target_probs_for_dynamic_tree_rejection_op")
+    def _(
+        targetLogits: torch.Tensor,
+        temperatures: torch.Tensor,
+        numDraftTokens: int,
+        top_k: Optional[torch.Tensor] = None,
+        top_p: Optional[torch.Tensor] = None,
+        skip_temperature: bool = False,
+        top_k_max: int = 0,
+        skip_all_sampling_params: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = temperatures.shape[0]
+        target_vocab_size = targetLogits.shape[-1]
+        target_probs = targetLogits.new_empty(
+            (batch_size, numDraftTokens, target_vocab_size),
+            dtype=torch.float32)
+        has_filtering = (top_k is not None) or (top_p is not None)
+        if skip_all_sampling_params or not has_filtering:
+            support_indices = targetLogits.new_empty((0, ), dtype=torch.int32)
+            support_lengths = targetLogits.new_empty((0, ), dtype=torch.int32)
+        else:
+            support_dim = top_k_max if top_k_max > 0 else target_vocab_size
+            support_indices = targetLogits.new_empty(
+                (batch_size, numDraftTokens, support_dim), dtype=torch.int32)
+            support_lengths = targetLogits.new_empty(
+                (batch_size, numDraftTokens), dtype=torch.int32)
+        return target_probs, support_indices, support_lengths

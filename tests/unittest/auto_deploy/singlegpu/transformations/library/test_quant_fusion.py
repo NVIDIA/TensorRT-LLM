@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import operator
 
 # test_quant_fusion.py
@@ -33,9 +47,17 @@ def _has_fused_linear_fp8(gm):
 
 
 def _has_fused_finegrained_fp8_linear(gm):
-    """Check if FineGrained FP8 fake quant ops were replaced with TRT-LLM ops."""
+    """Check if FineGrained FP8 fake quant ops were replaced with TRT-LLM ops.
+
+    On SM100f, the fuse_finegrained_fp8_linear transform additionally swaps
+    fused nodes to ``trtllm_fp8_deepgemm`` when the weight is 128x128-aligned.
+    Either fused target counts as "successfully fused" for this check.
+    """
+    deepgemm_op = getattr(torch.ops.auto_deploy, "trtllm_fp8_deepgemm", None)
     found_fused = any(
-        is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear) for n in gm.graph.nodes
+        is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear)
+        or (deepgemm_op is not None and is_op(n, deepgemm_op))
+        for n in gm.graph.nodes
     )
     found_ref = any(
         is_op(n, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear)

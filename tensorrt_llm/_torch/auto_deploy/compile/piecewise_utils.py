@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Utilities for piecewise CUDA graph: dynamic op registry, classification, and graph splitting.
 
 This module provides the logic to:
@@ -114,20 +128,6 @@ _DYNAMIC_OP_POLICIES: Dict[str, DynamicOpPolicy] = {
     "auto_deploy::cuda_cached_causal_conv1d": DynamicOpPolicy.EAGER,
 }
 
-# Multi-stream passthrough functions that switch the CUDA current stream.
-# Static partitions containing these functions cannot be captured as CUDA
-# graphs because the host-side stream synchronization required for
-# correctness (caller_stream.synchronize) is not capturable.  Such
-# partitions are reclassified as dynamic so they run eagerly.
-_STREAM_SWITCH_FUNCTION_NAMES = frozenset(
-    {
-        "begin_aux_stream_passthrough",
-        "end_aux_stream_passthrough",
-        "wait_aux_stream_passthrough",
-        "record_event_passthrough",
-    }
-)
-
 
 def _get_all_dynamic_op_names() -> Set[str]:
     """Return the full set of dynamic op qualified names."""
@@ -215,13 +215,14 @@ def submod_has_cuda_ops(submod: nn.Module) -> bool:
 
 
 def needs_out_buffer(submod: nn.Module) -> bool:
-    """Return True if this dynamic submodule needs DynamicOpWrapper out= buffering."""
+    """Return True if this dynamic submodule produces a NEW output tensor.
+
+    Inplace ops (mutate input, return None) don't produce new tensors.
+    Metadata prep ops are handled by MetadataWrapper (stable output addresses).
+    All of these are skipped — only OUT_BUFFER policy ops need out= buffers.
+    """
     if not isinstance(submod, GraphModule):
         return True
-
-    # Multi-stream partitions (reclassified from static) do not need out= buffers.
-    if _submod_has_stream_switch(submod):
-        return False
 
     has_dynamic_op = False
     for node in submod.graph.nodes:
@@ -248,16 +249,6 @@ def needs_metadata_wrapper(submod: nn.Module) -> bool:
 # ---------------------------------------------------------------------------
 # Graph splitting
 # ---------------------------------------------------------------------------
-
-
-def _submod_has_stream_switch(submod: GraphModule) -> bool:
-    """Return True if *submod* contains a multi-stream passthrough function."""
-    for node in submod.graph.nodes:
-        if node.op == "call_function":
-            func_name = getattr(node.target, "__name__", "")
-            if func_name in _STREAM_SWITCH_FUNCTION_NAMES:
-                return True
-    return False
 
 
 @dataclass
@@ -345,26 +336,6 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
             submod_names.append(name)
 
     submod_names.sort(key=lambda n: int(n.split("_")[1]))
-
-    # Reclassify static partitions that contain multi-stream passthrough
-    # functions as dynamic.  These partitions switch the CUDA current stream
-    # at runtime, which requires a host-side caller_stream.synchronize() for
-    # correctness with MLIR-fused Triton kernels.  Since synchronize() cannot
-    # be called during CUDA graph capture, such partitions must run eagerly.
-    num_reclassified = 0
-    for name in submod_names:
-        pid = int(name.split("_")[1])
-        if pid in dynamic_partitions:
-            continue
-        submod = getattr(split_gm, name)
-        if isinstance(submod, GraphModule) and _submod_has_stream_switch(submod):
-            dynamic_partitions.add(pid)
-            num_reclassified += 1
-    if num_reclassified:
-        ad_logger.info(
-            f"Piecewise split: reclassified {num_reclassified} static partition(s) "
-            "as dynamic (contain multi-stream passthrough ops)"
-        )
 
     dynamic_indices = []
     static_indices = []

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration for granite-4.0-tiny-preview (GraniteMoeHybrid with Mamba+MoE)
+# Uses flashinfer attention backend (trtllm backend produces garbled output with muP scaling)
+# dtype is missing from config for this model, so we provide it explicitly.
+attn_backend: flashinfer
+max_batch_size: 16
+kv_cache_config:
+  free_gpu_memory_fraction: 0.5
+model_kwargs:
+  torch_dtype: bfloat16

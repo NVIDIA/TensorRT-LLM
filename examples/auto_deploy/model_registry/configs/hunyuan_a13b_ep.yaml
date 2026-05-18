@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Hunyuan A13B MoE: replicate attention/dense layers and shard routed experts with EP.
+max_batch_size: 16
+kv_cache_config:
+  free_gpu_memory_fraction: 0.5
+transforms:
+  detect_sharding:
+    enable_attention_dp: true

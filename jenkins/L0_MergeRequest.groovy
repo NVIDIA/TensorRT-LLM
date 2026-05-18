@@ -38,6 +38,7 @@ def getContainerURIs()
     keys = [
         "LLM_DOCKER_IMAGE",
         "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_SBSA_WHEEL_DOCKER_IMAGE",
         "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
         "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
     ]
@@ -120,6 +121,8 @@ def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
+@Field
+def CBTS_RESULT = "cbts_result"
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -138,6 +141,7 @@ def testFilter = [
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (CBTS_RESULT): null,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -308,6 +312,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
@@ -696,6 +701,154 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     return autoTriggerTagList
 }
 
+// ============================================================================
+// CBTS (Change-Based Testing Selection)
+//
+// Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
+// a result map (or null = defer to existing filter chain). Result keys:
+// scope, affected_stages, reasons, test_db_dir_override, affected_stage_test_counts.
+// CBTS narrows test cases only — Build always runs. See cbts/README.md.
+// ============================================================================
+
+def getCbtsResult(pipeline, testFilter, globalVars)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
+        return null
+    }
+
+    // CBTS only activates on bare `/bot run`. If the user specified any
+    // stage-selection flag, defer entirely to their explicit choice.
+    def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
+    if (!triggeredFlags.isEmpty()) {
+        pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
+        return null
+    }
+
+    def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
+    if (!changedFiles) {
+        pipeline.echo("CBTS: deferring — no changed files detected")
+        return null
+    }
+
+    try {
+        // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
+        sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
+
+        // Ask Python which file patterns need diffs, fetch them.
+        def patternsOut = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
+            returnStdout: true,
+        ).trim()
+        def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
+        def diffs = [:]
+        for (f in changedFiles) {
+            if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
+                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f)
+            }
+        }
+
+        // Write INPUT_JSON; Python reads stages/yaml itself.
+        def inputJson = groovy.json.JsonOutput.toJson([
+            changed_files: changedFiles,
+            diffs: diffs,
+            post_merge: testFilter[(IS_POST_MERGE)] ?: false,
+        ])
+        def inputPath = "${LLM_ROOT}/cbts_input.json"
+        writeFile file: inputPath, text: inputJson
+
+        def output = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json",
+            returnStdout: true,
+        )
+
+        def result = _cbtsParseSelectionResult(output)
+        if (result.scope == null) {
+            pipeline.echo("CBTS: deferring — Python returned scope=null. " +
+                          "Reasons: ${result.reasons.join('; ')}")
+            return null
+        }
+        // Piggyback input JSON on testFilter so each L0_Test stage agent can
+        // re-run main.py and regenerate cbts_test_db/ locally. Capped at
+        // 256 KB; oversize → drop piggyback, Layer 3 falls back to source.
+        final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
+        def inputJsonSize = inputJson.length()
+        if (inputJsonSize <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
+            result.cbts_input_json = inputJson
+            pipeline.echo("CBTS Layer 3: cbts_input_json piggyback enabled (${inputJsonSize} bytes)")
+        } else {
+            pipeline.echo("CBTS Layer 3: cbts_input_json is ${inputJsonSize} bytes, " +
+                          "exceeds ${CBTS_INPUT_PIGGYBACK_MAX_BYTES}-byte piggyback limit; " +
+                          "downstream stages will fall back to source test-db " +
+                          "(Layer 2 stage filtering still applies)")
+        }
+        pipeline.echo("CBTS: scope=${result.scope}, " +
+                      "stages=${result.affected_stages.size()}")
+        return result
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS failed, falling back to full run: ${e}")
+        return null
+    }
+}
+
+// Translate an Ant-style glob to a regex:
+//   **/  zero or more path segments
+//   **   any chars (including /)
+//   *    any chars except /
+//   ?    single char except /
+def _cbtsGlobToRegex(String glob)
+{
+    def escaped = glob.collect { c ->
+        (c == '*' || c == '?') ? c
+            : ('.+()[]{}|^$\\'.contains(c) ? '\\' + c : c)
+    }.join('')
+    return '^' + escaped
+        .replace('**/', '__CBTSDOUBLESLASH__')
+        .replace('**',  '__CBTSDOUBLESTAR__')
+        .replace('*',   '[^/]*')
+        .replace('?',   '[^/]')
+        .replace('__CBTSDOUBLESLASH__', '(?:.*/)?')
+        .replace('__CBTSDOUBLESTAR__',  '.*') + '$'
+}
+
+def _cbtsMatchesAnyPattern(String filePath, List patterns)
+{
+    return patterns.any { filePath ==~ _cbtsGlobToRegex(it) }
+}
+
+// Returns user-set stage-selection flags that should force CBTS to defer.
+// IS_POST_MERGE and orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG, ...)
+// are intentionally absent.
+def _cbtsTriggeredUserFlags(testFilter)
+{
+    def deferFlags = [
+        ENABLE_SKIP_TEST, TEST_STAGE_LIST, EXTRA_STAGE_LIST, GPU_TYPE_LIST,
+        TEST_BACKEND, ADD_MULTI_GPU_TEST, ONLY_MULTI_GPU_TEST, DISABLE_MULTI_GPU_TEST,
+    ]
+    return deferFlags.findAll { testFilter[it] }
+                     .collect { "${it}=${testFilter[it]}" }
+}
+
+// Parse CBTS JSON stdout into a map. `scope == null` → no decision; caller
+// logs reasons and defers.
+def _cbtsParseSelectionResult(String text)
+{
+    def data = new groovy.json.JsonSlurper().parseText(text)
+    return [
+        scope: data.scope,
+        affected_stages: data.affected_stages ?: [],
+        reasons: data.reasons ?: [],
+        test_db_dir_override: data.test_db_dir_override,
+        affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
+        // Explicit null check preserves `false`; default True is safe.
+        sanity_required: data.sanity_required != null ? data.sanity_required : true,
+        perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
+    ]
+}
+
 def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
 {
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
@@ -764,21 +917,43 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
+        "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
+        "tensorrt_llm/_torch/visual_gen/modules/vae/",
+        "tensorrt_llm/_torch/visual_gen/modules/attention.py",
+        "tensorrt_llm/_torch/visual_gen/executor.py",
+        "tensorrt_llm/_torch/visual_gen/mapping.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline_loader.py",
+        "tensorrt_llm/_torch/visual_gen/models/wan/parallel_vae.py",
+        "tensorrt_llm/visual_gen/",
+        "tensorrt_llm/bench/benchmark/visual_gen.py",
         "tensorrt_llm/evaluate/json_mode_eval.py",
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
         "tensorrt_llm/functional.py",
-        "tensorrt_llm/llmapi/",
+        "tensorrt_llm/llmapi/disagg_utils.py",
+        "tensorrt_llm/llmapi/mgmn_leader_node.py",
+        "tensorrt_llm/llmapi/mgmn_worker_node.py",
+        "tensorrt_llm/llmapi/mpi_session.py",
+        "tensorrt_llm/llmapi/trtllm-llmapi-launch",
         "tensorrt_llm/mapping.py",
         "tensorrt_llm/models/llama/",
         "tensorrt_llm/parameter.py",
-        "tensorrt_llm/serve/",
+        "tensorrt_llm/serve/cluster_storage.py",
+        "tensorrt_llm/serve/disagg_auto_scaling.py",
+        "tensorrt_llm/serve/metadata_server.py",
+        "tensorrt_llm/serve/openai_client.py",
+        "tensorrt_llm/serve/openai_disagg_server.py",
+        "tensorrt_llm/serve/openai_disagg_service.py",
+        "tensorrt_llm/serve/openai_server.py",
+        "tensorrt_llm/serve/router.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
@@ -1072,6 +1247,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
+                // CBTS deliberately does NOT short-circuit at the arch / Build
+                // layer. Build always runs so a wheel exists for sanity checks
+                // and post-merge consumers; case-level narrowing happens later
+                // in L0_Test.groovy::launchTestJobs (Layer 2) and renderTestDB
+                // (Layer 3).
                 def testStageName = "[Build-x86_64] Remote Run"
                 stage(testStageName) {
                     def additionalParameters = [
@@ -1183,6 +1363,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
+                // CBTS deliberately does NOT short-circuit the SBSA Build —
+                // see x86 track above for the rationale.
 
                 def testStageName = "[Build-SBSA] Remote Run"
                 stage(testStageName) {
@@ -1209,6 +1391,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
@@ -1263,6 +1446,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
@@ -1295,11 +1479,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
                         }
 
+                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
+                        // instead of the BuildDockerImages helper job's own counter.
+                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                        def branchTag = branch.replaceAll('/', '_')
+                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
+
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
                             'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                             'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                            'defaultTag': defaultTag,
                         ]
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)

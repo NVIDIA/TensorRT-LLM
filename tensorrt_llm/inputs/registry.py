@@ -222,15 +222,44 @@ class BaseMultimodalInputProcessor(ABC):
 
         Resolution order:
         1) self.config.vocab_size
-        2) self.tokenizer.vocab_size
+        2) self.tokenizer.vocab_size (guarded with try/except because some
+           tokenizers in transformers 5.x raise ``NotImplementedError`` from
+           this property)
         """
         # 1) Model config
         if hasattr(self.config, 'vocab_size'):
             return int(self.config.vocab_size)
 
         # 2) Direct tokenizer on self
-        if hasattr(self.tokenizer, 'vocab_size'):
-            return int(self.tokenizer.vocab_size)
+        # Use try/except because transformers 5.x tokenizers may raise
+        # NotImplementedError from the vocab_size property even though
+        # hasattr sees the attribute on the class.
+        try:
+            vocab_size = self.tokenizer.vocab_size
+            if vocab_size is not None:
+                return int(vocab_size)
+        except (NotImplementedError, AttributeError):
+            pass
+
+        # 3) Fallback: len(tokenizer)
+        try:
+            return len(self.tokenizer)
+        except (TypeError, AttributeError, NotImplementedError):
+            pass
+
+        # 4) Fallback: inner tokenizer's vocab_size or get_vocab()
+        inner_tok = getattr(self.tokenizer, 'tokenizer', None)
+        if inner_tok is not None:
+            try:
+                vs = getattr(inner_tok, 'vocab_size', None)
+                if vs is not None:
+                    return int(vs)
+            except (NotImplementedError, AttributeError):
+                pass
+            try:
+                return len(inner_tok.get_vocab())
+            except (AttributeError, NotImplementedError):
+                pass
 
         logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
@@ -311,6 +340,7 @@ class BaseMultimodalInputProcessor(ABC):
         *,
         video: List[Union[Image.Image, torch.Tensor]],
         video_metadata: Optional[dict] = None,
+        video_audio: Optional[Any] = None,
         **kwargs,
     ):
         """
@@ -323,10 +353,9 @@ class BaseMultimodalInputProcessor(ABC):
         Example: for a video item, return the prompt-side token count for that
         one video unit, not the number of video frames.
 
-        `video_metadata` is consumed here (not forwarded into
-        `get_num_multimodal_tokens`) so subclasses that don't need are unaffected.
-        Subclasses that need `video_metadata` (e.g. Nemotron Nano
-        accounting for audio extracted from video) override this method.
+        `video_metadata` and `video_audio` are consumed here (not forwarded
+        into `get_num_multimodal_tokens`) so subclasses that don't need them
+        are unaffected.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """

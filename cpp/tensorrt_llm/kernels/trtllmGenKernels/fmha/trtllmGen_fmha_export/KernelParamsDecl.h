@@ -31,6 +31,8 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
   // The descriptor for O.
@@ -104,6 +106,9 @@ struct KernelParams {
   int32_t* ptrSkipSoftmaxStats;
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparseMla topK lengths with shape of [numTokensQ]
+  //  where each tokenQ has a corresponding topK length.
+  int32_t const* ptrSparseMlaTopKLens;
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;

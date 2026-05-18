@@ -133,7 +133,7 @@ from .python_plugin import PluginBase
 from .sampling_params import SamplingParams
 from .version import __version__
 from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
-                         VisualGenError, VisualGenParams, VisualGenParamsError,
+                         VisualGenMetrics, VisualGenOutput, VisualGenParams,
                          VisualGenResult)
 
 __all__ = [
@@ -184,8 +184,8 @@ __all__ = [
     'SamplingParams',
     'VisualGenArgs',
     'ExtraParamSchema',
-    'VisualGenError',
-    'VisualGenParamsError',
+    'VisualGenMetrics',
+    'VisualGenOutput',
     'VisualGenResult',
     'DisaggregatedParams',
     'KvCacheConfig',

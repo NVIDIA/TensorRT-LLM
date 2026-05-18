@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,11 +41,12 @@ struct MlaMetaParams
     int32_t v_head_dim = 0;
     int32_t predicted_tokens_per_seq = 1;
     int32_t num_layers = 0;
+    int32_t rope_append = 1;
 
     auto data() const
     {
         return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-            predicted_tokens_per_seq, num_layers);
+            predicted_tokens_per_seq, num_layers, rope_append);
     }
 };
 
@@ -137,6 +138,16 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+
+// Apply neox-style RoPE in-place to only the last rope_dim elements of each head,
+// leaving the first nope_dim elements untouched.
+// data shape: [num_tokens, num_heads, nope_dim + rope_dim]
+// cos_sin_cache shape: [max_positions, 2, rope_dim/2] (float)
+// position_ids shape: [num_tokens]
+template <typename T>
+void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos_sin_cache, int num_tokens,
+    int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

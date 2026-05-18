@@ -2,6 +2,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import get_hf_rope_theta
+
 
 class LlavaOnevisionUtils:
     # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_onevision/modeling_llava_onevision.py
@@ -129,7 +131,7 @@ class Qwen2VLUtils:
         self.max_position_embeddings = config.max_position_embeddings
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
-        self.rope_theta = config.rope_theta
+        self.rope_theta = get_hf_rope_theta(config, 10000.0)
 
     def get_rope_index(
         self,

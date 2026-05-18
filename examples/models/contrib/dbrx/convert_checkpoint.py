@@ -18,7 +18,7 @@ from transformers.pytorch_utils import Conv1D
 
 import tensorrt_llm
 from tensorrt_llm._deprecation import emit_engine_arch_deprecation
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._utils import get_hf_rope_theta, release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import (generate_int8,
@@ -557,7 +557,7 @@ if __name__ == '__main__':
             args.moe_top_k = 1
         args.clip_qkv = hf_config.attn_config.clip_qkv
         args.hidden_act = 'swiglu'
-        args.rotary_base = hf_config.attn_config.rope_theta
+        args.rotary_base = get_hf_rope_theta(hf_config.attn_config, 10000.0)
     args.moe_config = MoeConfig(
         num_experts=args.moe_num_experts,
         top_k=args.moe_top_k,

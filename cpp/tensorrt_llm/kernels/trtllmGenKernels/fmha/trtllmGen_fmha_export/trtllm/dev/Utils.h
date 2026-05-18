@@ -90,17 +90,78 @@ inline __device__ void cpAsync(T* dst,
     uint32_t* dstUInt32 = reinterpret_cast<uint32_t*>(dst + dstOffset);
     uint32_t const* srcUInt32 = reinterpret_cast<uint32_t const*>(src + srcOffset);
     uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt32));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dstU32), "l"(srcUInt32));
+    // .ca only (PTX: cp.async.cg requires size==16). L2::128B still promotes
+    // DRAM line fetches to 128B regardless of the .ca/.cg cache scope.
+    asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 4;\n" ::"r"(dstU32),
+                 "l"(srcUInt32));
   } else if (cpSize == 8) {
     uint64_t* dstUInt64 = reinterpret_cast<uint64_t*>(dst + dstOffset);
     uint64_t const* srcUInt64 = reinterpret_cast<uint64_t const*>(src + srcOffset);
     uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt64));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(dstU32), "l"(srcUInt64));
+    asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 8;\n" ::"r"(dstU32),
+                 "l"(srcUInt64));
+  } else if (cpSize == 16) {
+    // .cg (cache-global, L1 bypass) + L2::128B — matches CuteDSL's
+    // LDGSTS.E.BYPASS.LTC128B SASS. 16B is the only size .cg accepts.
+    uint4* dstUInt128 = reinterpret_cast<uint4*>(dst + dstOffset);
+    uint4 const* srcUInt128 = reinterpret_cast<uint4 const*>(src + srcOffset);
+    uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt128));
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(dstU32),
+                 "l"(srcUInt128));
+  } else {
+    assert(0 && "cpSize is not supported"); // The compiler will eliminate that code.
+  }
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Predicated cp.async. Same semantics as `if (pred) cpAsync(...)` but without an
+// enclosing C++ scope -- callers can issue a straight-line sequence of predicated
+// LDGSTSes and let nvcc CSE stride/pointer LDCs and address arithmetic across them.
+// 4B/8B variants use `.ca` (L1-cached); `.cg` is legal only at 16B.
+template <typename T>
+inline __device__ void cpAsyncPredicated(bool pred,
+                                         T* dst,
+                                         T const* src,
+                                         int32_t dstOffset = 0,
+                                         int64_t srcOffset = 0,
+                                         const int cpSize = sizeof(T)) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  int predI32 = static_cast<int>(pred);
+  if (cpSize == 4) {
+    uint32_t* dstUInt32 = reinterpret_cast<uint32_t*>(dst + dstOffset);
+    uint32_t const* srcUInt32 = reinterpret_cast<uint32_t const*>(src + srcOffset);
+    uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt32));
+    asm volatile("{\n"
+                 "  .reg .pred p;\n"
+                 "  setp.ne.s32 p, %2, 0;\n"
+                 "  @p cp.async.ca.shared.global.L2::128B [%0], [%1], 4;\n"
+                 "}\n" ::"r"(dstU32),
+                 "l"(srcUInt32),
+                 "r"(predI32));
+  } else if (cpSize == 8) {
+    uint64_t* dstUInt64 = reinterpret_cast<uint64_t*>(dst + dstOffset);
+    uint64_t const* srcUInt64 = reinterpret_cast<uint64_t const*>(src + srcOffset);
+    uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt64));
+    asm volatile("{\n"
+                 "  .reg .pred p;\n"
+                 "  setp.ne.s32 p, %2, 0;\n"
+                 "  @p cp.async.ca.shared.global.L2::128B [%0], [%1], 8;\n"
+                 "}\n" ::"r"(dstU32),
+                 "l"(srcUInt64),
+                 "r"(predI32));
   } else if (cpSize == 16) {
     uint4* dstUInt128 = reinterpret_cast<uint4*>(dst + dstOffset);
     uint4 const* srcUInt128 = reinterpret_cast<uint4 const*>(src + srcOffset);
     uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt128));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(dstU32), "l"(srcUInt128));
+    asm volatile("{\n"
+                 "  .reg .pred p;\n"
+                 "  setp.ne.s32 p, %2, 0;\n"
+                 "  @p cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+                 "}\n" ::"r"(dstU32),
+                 "l"(srcUInt128),
+                 "r"(predI32));
   } else {
     assert(0 && "cpSize is not supported"); // The compiler will eliminate that code.
   }
