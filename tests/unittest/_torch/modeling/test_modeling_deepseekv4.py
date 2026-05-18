@@ -31,6 +31,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
     DeepseekV4MTP,
+    _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
@@ -174,6 +175,35 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
 
     assert "model.layers.0.mlp.experts.0.w1.weight_scale_inv" in remapped
     assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
+
+
+def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(torch.empty((2048, 7168), dtype=torch.float8_e4m3fn))
+    module.weight_scale = torch.nn.Parameter(torch.empty((16, 16), dtype=torch.float32))
+    module.rebuild_tensor_metadata = {}
+    fused_a = torch.empty((2048, 7168), dtype=torch.float8_e4m3fn)
+    fused_a_scale = torch.ones((16, 56), dtype=torch.float32)
+
+    _copy_deepseek_v4_fused_a_weight_scale(module, fused_a, fused_a_scale)
+
+    assert module.weight_scale.shape == fused_a_scale.shape
+    assert torch.equal(module.weight_scale, fused_a_scale)
+
+
+def test_deepseek_v4_fused_a_weight_scale_keeps_oversized_slice():
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(torch.empty((2176, 7168), dtype=torch.float8_e4m3fn))
+    module.weight_scale = torch.nn.Parameter(torch.zeros((17, 56), dtype=torch.float32))
+    module.rebuild_tensor_metadata = {}
+    fused_a = torch.empty((2048, 7168), dtype=torch.float8_e4m3fn)
+    fused_a_scale = torch.ones((16, 56), dtype=torch.float32)
+
+    _copy_deepseek_v4_fused_a_weight_scale(module, fused_a, fused_a_scale)
+
+    assert module.weight_scale.shape == (17, 56)
+    assert torch.equal(module.weight_scale[:16], fused_a_scale)
+    assert torch.equal(module.weight_scale[16], torch.zeros(56))
 
 
 def test_deepseek_v4_kv_norm_keeps_full_head_dim():
