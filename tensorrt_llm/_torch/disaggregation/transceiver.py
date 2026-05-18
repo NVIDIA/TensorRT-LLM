@@ -181,7 +181,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         if token_range is None and req.prompt_len > 0:
-            token_range = TokenRange(start=0, end=req.prompt_len)
+            # Align with KV cache allocation (resize_context /
+            # _get_context_bytes), which reserves prompt_len +
+            # num_extra_kv_tokens slots for speculative decoding methods
+            # (e.g. EAGLE3) that consume extra KV positions per request.
+            num_extra_kv_tokens = getattr(self._kv_cache_manager, "num_extra_kv_tokens", 0) or 0
+            token_range = TokenRange(start=0, end=req.prompt_len + num_extra_kv_tokens)
 
         groups = []
         for idx, lg in enumerate(layer_groups):
@@ -523,7 +528,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
         # Skip the allgather in _gen_consensus when this transceiver never receives (pure CTX role).
         if not self._ever_had_recv_session:
-            return [], []
+            return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
