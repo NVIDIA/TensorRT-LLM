@@ -364,7 +364,18 @@ class DFlashWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
-        K = self.max_draft_len
+        K = spec_metadata.runtime_draft_len
+
+        if K == 0:
+            return self.skip_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
 
         # Lazy init buffers and attach worker reference for prepare()
         self._lazy_init_ctx_buffers(draft_model, spec_metadata)
@@ -481,7 +492,7 @@ class DFlashWorker(SpecWorkerBase):
                 )
 
                 vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
+                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
                 d2t = getattr(draft_model.model, "d2t", None)
                 gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
@@ -595,8 +606,8 @@ class DFlashWorker(SpecWorkerBase):
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
 
-            total_tokens_per_req = self._draft_tokens_per_req  # 2K
-            K = self.max_draft_len
+            K = spec_metadata.runtime_draft_len
+            total_tokens_per_req = 2 * K
 
             # Get captured multi-layer hidden states from spec_metadata
             captured_hs = spec_metadata.get_hidden_states(total_target_tokens)

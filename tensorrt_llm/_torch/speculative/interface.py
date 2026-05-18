@@ -296,7 +296,8 @@ class SpeculativeDecodingMode(IntEnum):
 
     def support_dynamic_draft_len(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_pard() or self.is_draft_target_one_model() or self.is_sa()
+        ) or self.is_pard() or self.is_dflash(
+        ) or self.is_draft_target_one_model() or self.is_sa()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()

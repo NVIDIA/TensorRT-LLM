@@ -432,8 +432,14 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 self.max_draft_len = spec_config.max_draft_len
             # Mutable per-iteration draft length (updated each iteration when
-            # dynamic draft length is enabled; otherwise stays fixed).
-            self.runtime_draft_len = self.max_draft_len
+            # dynamic draft length is enabled; otherwise stays fixed). For
+            # parallel-draft modes (PARD/DFlash), self.max_draft_len is the
+            # 2K-1 buffer width; the worker forward expects logical K, so
+            # initialize from spec_config.max_draft_len here.
+            if spec_config.spec_dec_mode.is_parallel_draft():
+                self.runtime_draft_len = spec_config.max_draft_len
+            else:
+                self.runtime_draft_len = self.max_draft_len
 
         else:
             self.without_logits = False

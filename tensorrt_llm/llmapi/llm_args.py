@@ -1813,6 +1813,10 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         """DFlash needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
         return 2 * self.max_draft_len
 
+    def get_runtime_tokens_per_gen_step(self, runtime_draft_len: int) -> int:
+        """DFlash needs 2K runtime tokens per gen request for logical draft length K."""
+        return 1 if runtime_draft_len == 0 else 2 * runtime_draft_len
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 

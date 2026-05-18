@@ -2107,8 +2107,8 @@ class PyExecutor:
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             for request in scheduled_batch.generation_requests:
                 current_num_draft_tokens = len(request.py_draft_tokens)
-                if spec_dec_mode.is_pard():
-                    # special case as PARD carries 2K-1 draft tokens per request
+                if spec_dec_mode.is_parallel_draft():
+                    # special case: PARD/DFlash carry 2K-1 draft tokens per request
                     runtime_draft_token_buffer_width = (
                         self.model_engine.spec_config.
                         get_runtime_tokens_per_gen_step(runtime_draft_len) - 1)

@@ -638,6 +638,35 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_dflash_dynamic_draft_len(self):
+        # DFlash uses a Qwen3-style draft with q/k_norm and 8K-wide cross-attn
+        # context, so the per-layer rmsnorm row count scales as
+        # B * max_ctx * num_kv_heads. Very large batches (e.g. 500) push that
+        # past the flashinfer rmsnorm kernel's stable range; cap at 200.
+        draft_len_schedule = {50: 4, 100: 3, 150: 2}
+        max_draft_len = 4
+        pytorch_config = dict(
+            max_batch_size=200,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=200,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+        dflash_model_dir = f"{llm_models_root()}/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
+        target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=dflash_model_dir,
+            draft_len_schedule=draft_len_schedule,
+        )
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_hopper
     def test_ngram(self):
         max_bs = 16
