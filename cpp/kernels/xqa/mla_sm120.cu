@@ -308,8 +308,8 @@ struct PingPongMutex
 
 struct PartialResult
 {
-    static constexpr uint32_t nbChunks = 4;
-    static constexpr uint32_t nbRowsPerChunk = exactDiv(headGrpSize, nbChunks);
+    static constexpr uint32_t nbRowsPerChunk = warp_size;
+    static constexpr uint32_t nbChunks = exactDiv(headGrpSize, nbRowsPerChunk);
 
     struct Chunk
     {
@@ -321,10 +321,10 @@ struct PartialResult
     Chunk chunks[nbChunks];
 };
 
-constexpr uint32_t nbMathWarpsA = 8;
-constexpr uint32_t nbComputeWarpsB = 8;
+constexpr uint32_t nbMathWarpsA = headGrpSize <= 64 ? 4 : 8;
+constexpr uint32_t nbComputeWarpsB = headGrpSize <= 64 ? 4 : 8;
 constexpr uint32_t nbMathGrpsA = 2;
-constexpr uint32_t nbMathWarpsB = 8;
+constexpr uint32_t nbMathWarpsB = headGrpSize <= 64 ? 4 : 8;
 
 constexpr uint32_t nbMultiBlockBufs = 2;
 constexpr uint32_t multiBlockMathWarps = 8;
@@ -405,7 +405,9 @@ struct SharedMemB
     // in the future.
     static inline constexpr uint32_t outputSwizzleBytesPerRow
         = sizeof(OutputElem) * exactDiv(gemm1V, 2U);
-    static inline constexpr uint32_t outputSwizzleAlignment = outputSwizzleBytesPerRow * nbMathWarpsB * 8U;
+    static inline constexpr uint32_t outputSwizzleRowsPerWarp = headGrpSize <= 64 ? warp_size : 16U;
+    static inline constexpr uint32_t outputSwizzleAlignment
+        = outputSwizzleBytesPerRow * nbMathWarpsB * outputSwizzleRowsPerWarp;
     struct XVBuffer
     {
         VBuffer v;
@@ -467,7 +469,10 @@ struct SharedMemB
     __device__ inline Vec<PartialResult::Chunk, nbMultiBlockBufs>& getMultiBlockBufs()
     {
 #ifndef __CUDACC_RTC__
-        static_assert(sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xBars));
+        if constexpr (headGrpSize >= 128)
+        {
+            static_assert(sizeof(Vec<PartialResult::Chunk, nbMultiBlockBufs>) < offsetof(SharedMemB, xBars));
+        }
 #endif
         return *reinterpret_cast<Vec<PartialResult::Chunk, nbMultiBlockBufs>*>(this);
     }
@@ -606,26 +611,26 @@ struct Producer
 
     __device__ inline void run()
     {
-        if (warpIdx.y == 2)
-        { // IO warps
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(nbRegsForIOWarps));
-            if (warpIdx.x == 0)
-            { // q
-                loadQ();
-            }
-            else if (warpIdx.x == 1)
-            { // k
-                loadK();
-            }
-            else if (warpIdx.x == 2)
-            { // x
-                sendX();
-            }
-        }
-        else
+        if (warpRank < nbMathWarps)
         { // Compute warps
             asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(nbRegsForMathWarps));
             compute();
+        }
+        else
+        { // IO and inactive warps
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(nbRegsForIOWarps));
+            if (warpIdx.y == 2 && warpIdx.x == 0)
+            { // q
+                loadQ();
+            }
+            else if (warpIdx.y == 2 && warpIdx.x == 1)
+            { // k
+                loadK();
+            }
+            else if (warpIdx.y == 2 && warpIdx.x == 2)
+            { // x
+                sendX();
+            }
         }
         if (nbSubSeq > 1 && args.semaphores != nullptr)
         {
@@ -706,8 +711,8 @@ private:
 
     __device__ inline void compute()
     {
-        uint32_t const grpIdx = warpIdx.y;
-        uint32_t const tileBaseRow = warpTile.y * warpIdx.x;
+        uint32_t const grpIdx = warpRank / warpsPerGrp;
+        uint32_t const tileBaseRow = warpTile.y * (warpRank - grpIdx * warpsPerGrp);
         PingPongMutex tensorCoreMutex{smem.tensorCoreMutex, grpIdx};
 
         constexpr uint32_t partNbInstK = exactDiv(partElemsK, qmmaShape.k);
@@ -1151,7 +1156,9 @@ struct Consumer
 {
     static inline constexpr uint32_t nbMathWarps = nbMathWarpsB;
     static inline constexpr uint32_t nbMathThrds = warp_size * nbMathWarps;
-    static inline constexpr uint2 ctaShape = {2, 4};
+    static inline constexpr uint32_t ctaShapeX = 2;
+    static inline constexpr uint32_t ctaShapeY = headGrpSize <= 64 ? 2 : 4;
+    static inline constexpr uint2 ctaShape = {ctaShapeX, ctaShapeY};
     static_assert(SharedMemB::nbAccRowMaxSumCopies == ctaShape.x);
     static_assert(ctaShape.x * ctaShape.y == nbMathWarps);
     static inline constexpr uint2 warpTile = {exactDiv(gemm1V, ctaShape.x), exactDiv(headGrpSize, ctaShape.y)};
@@ -1270,22 +1277,22 @@ struct Consumer
 
     __device__ inline void run()
     {
-        if (warpIdx.y == 2)
-        {
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(nbRegsForIOWarps));
-            if (warpIdx.x == 0)
-            {
-                loadX();
-            }
-            else if (warpIdx.x == 1)
-            {
-                loadV();
-            }
-        }
-        else
+        if (warpRank < nbMathWarps)
         {
             asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(nbRegsForMathWarps));
             compute();
+        }
+        else
+        {
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(nbRegsForIOWarps));
+            if (warpIdx.y == 2 && warpIdx.x == 0)
+            {
+                loadX();
+            }
+            else if (warpIdx.y == 2 && warpIdx.x == 1)
+            {
+                loadV();
+            }
         }
         if (nbSubSeq > 1 && args.semaphores != nullptr)
         {
@@ -1319,7 +1326,7 @@ struct Consumer
 
 __device__ inline void Consumer::compute()
 {
-    uint2 const tileIdx = {warpIdx.y, warpIdx.x};
+    uint2 const tileIdx = {warpRank / ctaShape.y, warpRank % ctaShape.y};
     uint2 const tileBase = {tileIdx.x * warpTile.x, tileIdx.y * warpTile.y};
 
     constexpr uint32_t tileNbInstK = exactDiv(tokensPerTile, qmmaShape.k);
@@ -1866,7 +1873,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, 1) void reduce_mla_flash_decode_p
     uint32_t const* __restrict__ const seqLenList, uint32_t const maxNbSubSeq, uint32_t const inputSeqLen)
 {
     static_assert(validElemsPerVHead == 512);
-    static_assert(PartialResult::nbChunks == 4);
+    static_assert(PartialResult::nbRowsPerChunk == warp_size);
     constexpr uint32_t colTileElems = 128;
     constexpr uint32_t nbColTiles = exactDiv(validElemsPerVHead, colTileElems);
     static_assert(nbColTiles == 4);
@@ -2012,7 +2019,7 @@ void launchMLA(cudaDeviceProp const& prop,
     bool const useSeparateReduce = []() -> bool
     {
         auto const env = std::getenv("XQA_MLA_SEPARATE_REDUCE");
-        return env != nullptr && std::stoi(env) != 0;
+        return headGrpSize < 128 || (env != nullptr && std::stoi(env) != 0);
     }();
     // printf("nbSubSeqPerSeq = %u\n", nbSubSeqPerSeq);
     // gridDim.z == nbKHeads * batchSize && gridDim.y == nbSubSeqPerSeq && gridDim.x == nbInputSeqSplit

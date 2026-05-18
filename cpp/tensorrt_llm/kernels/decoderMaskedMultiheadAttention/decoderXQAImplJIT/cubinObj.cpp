@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include <cuda_runtime_api.h>
 
@@ -162,7 +163,8 @@ void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kern
 }
 
 void CubinObj::launchMlaReduce(void* output, void const* partialResults, uint32_t const* seqLenList,
-    uint32_t maxNbSubSeq, uint32_t inputSeqLen, uint32_t totalNumInputTokens, CUstream hStream) const
+    uint32_t maxNbSubSeq, uint32_t inputSeqLen, uint32_t totalNumInputTokens, uint32_t kernelNumQHeads,
+    CUstream hStream) const
 {
     TLLM_CHECK(mInitialized);
     TLLM_CHECK(mReduceKernel != nullptr);
@@ -170,7 +172,7 @@ void CubinObj::launchMlaReduce(void* output, void const* partialResults, uint32_
     void* partialResultsArg = const_cast<void*>(partialResults);
     uint32_t const* seqLenListArg = seqLenList;
     void* kernelParams[] = {&output, &partialResultsArg, &seqLenListArg, &maxNbSubSeq, &inputSeqLen};
-    dim3 const gridDim{4, 4, totalNumInputTokens};
+    dim3 const gridDim{4, getXqaMlaPartialResultChunks(kernelNumQHeads), totalNumInputTokens};
     dim3 const blockDim{256, 1, 1};
     CUlaunchConfig const cfg{
         gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, 0, hStream, nullptr, 0};

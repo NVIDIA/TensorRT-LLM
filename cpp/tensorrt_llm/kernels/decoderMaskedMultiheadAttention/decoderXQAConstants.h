@@ -54,6 +54,11 @@ inline constexpr uint32_t getXqaMlaPartialResultSize(int kernelHeadGrpSize)
     return static_cast<uint32_t>(kernelHeadGrpSize) * 1032U;
 }
 
+inline constexpr uint32_t getXqaMlaPartialResultChunks(int kernelHeadGrpSize)
+{
+    return static_cast<uint32_t>(kernelHeadGrpSize / 32);
+}
+
 // For multi-block mode. We reserve workspace for this amount of sub-sequences.
 // This should be enough. Huge batch size may result in larger value, but for large batch size,
 // multi-block mode is not useful. For llama v2 70b, 6000 results in ~12MB multi-block

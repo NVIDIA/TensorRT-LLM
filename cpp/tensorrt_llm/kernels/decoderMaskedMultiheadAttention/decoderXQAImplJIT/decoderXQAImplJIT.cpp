@@ -47,6 +47,7 @@ using ::tensorrt_llm::kernels::kXqaMlaOutputHeadSize;
 using ::tensorrt_llm::kernels::kXqaMlaTokensPerTile;
 using ::tensorrt_llm::kernels::getXqaMlaCgaXBufSize;
 using ::tensorrt_llm::kernels::getXqaMlaKernelHeadGrpSize;
+using ::tensorrt_llm::kernels::getXqaMlaPartialResultChunks;
 using ::tensorrt_llm::kernels::getXqaMlaPartialResultSize;
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const& kernelMeta)
@@ -261,15 +262,15 @@ void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partial
         return;
     }
 
-    constexpr uint32_t kChunks = 4;
-    uint32_t const rowsPerChunk = context.kernelNumQHeads / kChunks;
+    uint32_t const chunks = getXqaMlaPartialResultChunks(context.kernelNumQHeads);
+    uint32_t const rowsPerChunk = context.kernelNumQHeads / chunks;
     constexpr size_t kOutputHeadBytes = static_cast<size_t>(kXqaMlaOutputHeadSize) * sizeof(uint16_t);
     size_t const chunkDataBytes = static_cast<size_t>(rowsPerChunk) * kOutputHeadBytes;
     size_t const chunkRowSumOffset = chunkDataBytes;
     size_t const chunkRowMaxOffset = chunkRowSumOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
     size_t const chunkBytes = chunkRowMaxOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
     size_t const partialResultSize = getXqaMlaPartialResultSize(context.kernelNumQHeads);
-    TLLM_CHECK_WITH_INFO(chunkBytes * kChunks == partialResultSize, "Invalid XQA MLA partial debug layout");
+    TLLM_CHECK_WITH_INFO(chunkBytes * chunks == partialResultSize, "Invalid XQA MLA partial debug layout");
 
     uint32_t seqLen0 = 0xffffffffU;
     if (context.sequenceLengths != nullptr)
@@ -279,7 +280,7 @@ void maybeCheckXqaMlaPartialsForInvalid(cudaStream_t stream, void const* partial
     }
 
     uint32_t const chunksToCheck = (headsToCheck + rowsPerChunk - 1) / rowsPerChunk;
-    TLLM_CHECK_WITH_INFO(chunksToCheck <= kChunks, "Invalid XQA MLA partial debug head count");
+    TLLM_CHECK_WITH_INFO(chunksToCheck <= chunks, "Invalid XQA MLA partial debug head count");
     size_t const copies = static_cast<size_t>(tokens) * maxNbSubSeq * chunksToCheck;
     std::vector<uint8_t> host(copies * chunkBytes);
     auto const* partialBytes = static_cast<uint8_t const*>(partialResults);
@@ -369,20 +370,20 @@ void maybeCheckXqaMlaReduceAgainstHostReference(cudaStream_t stream, void const*
         return;
     }
 
-    constexpr uint32_t kChunks = 4;
-    uint32_t const rowsPerChunk = context.kernelNumQHeads / kChunks;
+    uint32_t const chunks = getXqaMlaPartialResultChunks(context.kernelNumQHeads);
+    uint32_t const rowsPerChunk = context.kernelNumQHeads / chunks;
     constexpr size_t kOutputHeadBytes = static_cast<size_t>(kXqaMlaOutputHeadSize) * sizeof(uint16_t);
     size_t const chunkDataBytes = static_cast<size_t>(rowsPerChunk) * kOutputHeadBytes;
     size_t const chunkRowSumOffset = chunkDataBytes;
     size_t const chunkRowMaxOffset = chunkRowSumOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
     size_t const chunkBytes = chunkRowMaxOffset + static_cast<size_t>(rowsPerChunk) * sizeof(float);
     size_t const partialResultSize = getXqaMlaPartialResultSize(context.kernelNumQHeads);
-    TLLM_CHECK_WITH_INFO(chunkBytes * kChunks == partialResultSize, "Invalid XQA MLA reduce reference layout");
+    TLLM_CHECK_WITH_INFO(chunkBytes * chunks == partialResultSize, "Invalid XQA MLA reduce reference layout");
 
     TLLM_CHECK_WITH_INFO(inputSeqLen > 0, "Invalid XQA MLA reduce reference input sequence length");
     TLLM_CHECK_WITH_INFO(headsToCheck <= headPitch, "Invalid XQA MLA reduce reference head layout");
     uint32_t const chunksToCheck = (headsToCheck + rowsPerChunk - 1) / rowsPerChunk;
-    TLLM_CHECK_WITH_INFO(chunksToCheck <= kChunks, "Invalid XQA MLA reduce reference head count");
+    TLLM_CHECK_WITH_INFO(chunksToCheck <= chunks, "Invalid XQA MLA reduce reference head count");
 
     uint32_t const batchSize = (tokens + inputSeqLen - 1) / inputSeqLen;
     std::vector<uint32_t> seqLens(batchSize, 0xffffffffU);
@@ -959,7 +960,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&launchParams.batch_size);
         appendParam(&launchParams.kv_scale_quant_orig);
         appendParam(&launchParams.scratch);
-        bool const useSeparateReduce = tensorrt_llm::common::getBoolEnv("XQA_MLA_SEPARATE_REDUCE");
+        bool const useSeparateReduce = kernelMlaHeadGrpSize < 128
+            || tensorrt_llm::common::getBoolEnv("XQA_MLA_SEPARATE_REDUCE");
         uint32_t* semaphores = useSeparateReduce ? nullptr : reinterpret_cast<uint32_t*>(launchParams.semaphores);
         appendParam(&semaphores);
         appendParam(&partialResults);
@@ -983,15 +985,16 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             maybeCheckXqaMlaPartialsForInvalid(stream, partialResults, xqaParams.total_num_input_tokens, multi_block,
                 xqaParams.num_q_heads, "XQA MLA partials before separate reduce", debugContext);
             TLLM_LOG_DEBUG(
-                "Launching XQA MLA separate reduce: grid=(4,4,%u) block=(256,1,1) "
+                "Launching XQA MLA separate reduce: grid=(4,%u,%u) block=(256,1,1) "
                 "multi_block=%u input_seq_len=%u total_tokens=%u partial_result_bytes=%zu "
                 "cga_x_buf_bytes=%zu output=%p partial_results=%p seq_lens=%p",
-                xqaParams.total_num_input_tokens, multi_block, inputSeqLen, xqaParams.total_num_input_tokens,
-                partialResultBytes, cgaXBufBytes, static_cast<void*>(kernelOutput), static_cast<void*>(partialResults),
+                getXqaMlaPartialResultChunks(kernelXQAParams.num_q_heads), xqaParams.total_num_input_tokens,
+                multi_block, inputSeqLen, xqaParams.total_num_input_tokens, partialResultBytes, cgaXBufBytes,
+                static_cast<void*>(kernelOutput), static_cast<void*>(partialResults),
                 static_cast<void const*>(xqaParams.sequence_lengths));
             cubinObj->launchMlaReduce(kernelOutput, partialResults,
                 reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths), multi_block, inputSeqLen,
-                xqaParams.total_num_input_tokens, stream);
+                xqaParams.total_num_input_tokens, kernelXQAParams.num_q_heads, stream);
             maybeSyncXqaMlaDebug(stream, "XQA MLA separate reduce");
             maybeCheckXqaMlaReduceAgainstHostReference(stream, kernelOutput, partialResults,
                 xqaParams.total_num_input_tokens, multi_block, inputSeqLen, xqaParams.num_q_heads,
