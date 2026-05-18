@@ -47,6 +47,7 @@ class Attention(nn.Module):
         bias: bool = True,
         interleave: bool = True,
         fuse_qk_norm_rope: Optional[bool] = None,
+        qk_norm_rope_kernel: str = "fused_dit_qk_norm_rope",
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
     ):
@@ -70,6 +71,23 @@ class Attention(nn.Module):
         # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
         # Defaults to False; models that want the fused kernel must pass True explicitly.
         self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
+        # Which trtllm op backs the fused path. Value is the op name itself
+        # (1:1 with torch.ops.trtllm registrations):
+        #   "fused_dit_qk_norm_rope" (default)
+        #     — Per-head autodispatch for FLUX/Cosmos and full-dim path for
+        #       LTX-2. Bounded to num_heads<=32 and head_dim in {64,128}.
+        #   "fused_dit_cross_head_qk_norm_rope"
+        #     — PR #13052 cross-head kernel for WAN sizes outside the default
+        #       op's range (head_dim=256, or num_heads>32). fp32 head-broadcast
+        #       cos only.
+        assert qk_norm_rope_kernel in (
+            "fused_dit_qk_norm_rope",
+            "fused_dit_cross_head_qk_norm_rope",
+        ), (
+            f"qk_norm_rope_kernel must be 'fused_dit_qk_norm_rope' or "
+            f"'fused_dit_cross_head_qk_norm_rope', got {qk_norm_rope_kernel}"
+        )
+        self.qk_norm_rope_kernel = qk_norm_rope_kernel
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
@@ -267,6 +285,35 @@ class Attention(nn.Module):
         Op auto-detects via cos_emb.size(1) and dispatches the kernel template.
         """
         B, S, D = qkv.shape
+
+        if self.qk_norm_rope_kernel == "fused_dit_cross_head_qk_norm_rope":
+            # PR #13052 cross-head op path (WAN sizes that exceed the default
+            # op's num_heads<=32 / head_dim in {64,128} envelope). Op requires
+            # head-broadcast fp32 cos: [num_tokens, head_dim].
+            cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
+            sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
+            if cos_2d.shape[0] == S and B > 1:
+                cos_tiled = cos_2d.repeat(B, 1)
+                sin_tiled = sin_2d.repeat(B, 1)
+            else:
+                cos_tiled = cos_2d
+                sin_tiled = sin_2d
+            qkv_2d = qkv.view(B * S, D)
+            torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
+                qkv_2d,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                self.eps,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos_tiled,
+                sin_tiled,
+                self.interleave,
+            )
+            return
+
         # cos last-dim is fixed by qk_norm_mode:
         #   "full"     → num_heads * head_dim (LTX-2 / WAN per-head cos)
         #   "per_head" → head_dim             (FLUX / Cosmos shared-across-heads cos)

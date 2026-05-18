@@ -282,8 +282,10 @@ class WanBlock(nn.Module):
         )
 
         # Self-attention with fused QKV.
-        # fuse_qk_norm_rope=True: use fused cross-head QK Norm + RoPE CUDA kernel
-        # to eliminate extra global memory round-trip between separate norm and RoPE.
+        # WAN-14B is 40 heads × 128, which exceeds the default fused op's
+        # num_heads<=32 / head_dim in {64,128} envelope, so route to
+        # PR #13052's fused_dit_cross_head_qk_norm_rope op (validated for
+        # WAN-1.3B and WAN-14B sizes).
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -292,6 +294,7 @@ class WanBlock(nn.Module):
             qk_norm=True,
             eps=eps,
             fuse_qk_norm_rope=True,
+            qk_norm_rope_kernel="fused_dit_cross_head_qk_norm_rope",
             config=model_config,
             layer_idx=_layer_idx,
         )
