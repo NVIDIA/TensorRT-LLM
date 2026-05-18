@@ -77,6 +77,7 @@ class BenchmarkConfig:
     phases: list[str]
     methods: list[str]
     sync_cuda: bool
+    include_device_copy: bool
 
 
 @dataclass(frozen=True)
@@ -271,12 +272,18 @@ def _allocate_targets(
     requests: list[LlmRequest],
     phase: str,
     methods: list[str],
+    include_device_copy: bool,
 ) -> list[BenchmarkTarget]:
     request_ids = [request.py_request_id for request in requests]
     num_seqs = len(request_ids)
     num_contexts = num_seqs if phase == "context" else 0
     max_blocks = cache_manager.max_blocks_per_seq
     targets: list[BenchmarkTarget] = []
+    target_kwargs = (
+        {"device": "cuda"}
+        if include_device_copy
+        else {"device": "cpu", "pin_memory": prefer_pinned()}
+    )
 
     if "block_offsets" in methods:
         block_offsets = torch.empty(
@@ -285,13 +292,13 @@ def _allocate_targets(
             2,
             max_blocks,
             dtype=torch.int32,
-            device="cuda",
+            **target_kwargs,
         )
         targets.append(
             BenchmarkTarget(
                 name="copy_batch_block_offsets",
                 phase=phase,
-                uses_cuda=True,
+                uses_cuda=include_device_copy,
                 fn=lambda: cache_manager.copy_batch_block_offsets(
                     block_offsets,
                     request_ids,
@@ -309,13 +316,13 @@ def _allocate_targets(
             num_seqs,
             max_blocks,
             dtype=torch.int32,
-            device="cuda",
+            **target_kwargs,
         )
         targets.append(
             BenchmarkTarget(
                 name="copy_batch_sliding_block_tables",
                 phase=phase,
-                uses_cuda=True,
+                uses_cuda=include_device_copy,
                 fn=lambda: cache_manager.copy_batch_sliding_block_tables(
                     sliding_tables,
                     request_ids,
@@ -338,7 +345,7 @@ def _allocate_targets(
                 num_seqs,
                 max_blocks,
                 dtype=torch.int32,
-                device="cuda",
+                **target_kwargs,
             )
 
             def _copy_compress(compress_ratio=compress_ratio, compress_table=compress_table):
@@ -354,7 +361,7 @@ def _allocate_targets(
                 BenchmarkTarget(
                     name=f"copy_batch_compress_block_tables:{compress_ratio}",
                     phase=phase,
-                    uses_cuda=True,
+                    uses_cuda=include_device_copy,
                     fn=_copy_compress,
                 )
             )
@@ -441,7 +448,8 @@ def _print_results(results: list[BenchmarkResult], config: BenchmarkConfig) -> N
         "Config: "
         f"batch={config.batch_size}, seq_len={config.seq_len}, max_seq_len={config.max_seq_len}, "
         f"tokens_per_block={config.tokens_per_block}, layers={len(config.compress_ratios)}, "
-        f"max_gpu_total_bytes={config.max_gpu_total_bytes}, sync_cuda={config.sync_cuda}"
+        f"max_gpu_total_bytes={config.max_gpu_total_bytes}, sync_cuda={config.sync_cuda}, "
+        f"include_device_copy={config.include_device_copy}"
     )
     print(
         "Model fields: "
@@ -495,7 +503,13 @@ def _run_phase(config: BenchmarkConfig, phase: str) -> list[BenchmarkResult]:
         requests = _prepare_context_requests(cache_manager, config.batch_size, config.seq_len)
         if phase == "generation":
             _promote_to_generation(cache_manager, requests, config.seq_len)
-        targets = _allocate_targets(cache_manager, requests, phase, config.methods)
+        targets = _allocate_targets(
+            cache_manager,
+            requests,
+            phase,
+            config.methods,
+            config.include_device_copy,
+        )
         return [
             _benchmark_target(
                 target,
@@ -573,6 +587,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not synchronize CUDA after device-copy helpers; measures host enqueue overhead only.",
     )
+    parser.add_argument(
+        "--include-device-copy",
+        action="store_true",
+        help=(
+            "Include the final CPU-to-GPU copy into destination tensors. By default "
+            "destinations stay on CPU so timings exclude that transfer."
+        ),
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--csv", type=Path, default=None)
     return parser
@@ -614,6 +636,7 @@ def main() -> None:
         phases=args.phase,
         methods=args.methods,
         sync_cuda=not args.no_sync,
+        include_device_copy=args.include_device_copy,
     )
 
     all_results: list[BenchmarkResult] = []
