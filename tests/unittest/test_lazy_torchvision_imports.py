@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Modules in tensorrt_llm/_torch/models/ and tensorrt_llm/inputs/ must
-import cleanly without torchvision installed.
+"""Ensures models import cleanly without torchvision installed.
 
 torchvision is an optional dependency of TRT-LLM: only a handful of multimodal
 / image-preprocessing call sites need it, and those are expected to use
@@ -69,11 +68,12 @@ _AUDITED_DIRS = [
 
 
 def _enumerate_modules() -> list[str]:
-    """Glob ``*.py`` under each audited directory and return the
-    corresponding dotted module names.  ``__init__.py`` files are
-    excluded -- they are exercised transitively by any submodule
-    import in the same package, so adding them here would just
-    duplicate failures."""
+    """Glob ``*.py`` under each audited directory.
+
+    Returns the corresponding dotted module names. ``__init__.py`` files are
+    excluded -- they are exercised transitively by any submodule import in the
+    same package, so adding them here would just duplicate failures.
+    """
     out: list[str] = []
     for d in _AUDITED_DIRS:
         if not d.exists():
@@ -134,8 +134,7 @@ _PROBE = textwrap.dedent(
 
 @pytest.fixture(scope="session")
 def _module_import_results(tmp_path_factory):
-    """Run all audited imports in ONE subprocess and return a dict of
-    ``{module: error_traceback_or_None}``.
+    """Run all audited imports in a subprocss.
 
     Single-subprocess design is deliberate: the heavy ``import
     tensorrt_llm`` cost (transformers, torch, etc.) is paid once
@@ -158,7 +157,7 @@ def _module_import_results(tmp_path_factory):
     # process at exit even after the probe finished successfully, so
     # we trust the JSON file if it parses regardless of the subprocess
     # exit code.  Only treat the run as a hard probe failure when the
-    # tempfile is missing or unparseable.
+    # tempfile is missing or unparsable.
     if not outfile.exists():
         pytest.fail(
             "torchvision-hidden import probe did not produce a result "
@@ -170,7 +169,7 @@ def _module_import_results(tmp_path_factory):
         return json.loads(outfile.read_text())
     except json.JSONDecodeError as e:
         pytest.fail(
-            f"torchvision-hidden import probe wrote unparseable JSON: {e}\n"
+            f"torchvision-hidden import probe wrote unparsable JSON: {e}\n"
             f"file contents: {outfile.read_text()!r}\n"
             f"stderr:\n{result.stderr}\n"
             f"stdout:\n{result.stdout}"
