@@ -172,13 +172,16 @@ def is_supported(
     attn: "TrtllmAttention",
     q: torch.Tensor,
     k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],  # noqa: ARG001 — kept for signature parity
     metadata: "TrtllmAttentionMetadata",
     fwd: AttentionForwardArgs,
     sparse: AttentionSparseArgs,
-    phase: str = "both",
 ) -> tuple[bool, str]:
-    """Translates rich objects into the kwargs the underlying
-    FlashInferTrtllmGenAttention.is_supported expects."""
+    """Reads every check input from the four rich objects. ``phase`` is
+    derived from ``fwd.attention_input_type``
+    (``context_only``→``"context"``, ``generation_only``→``"generation"``,
+    ``mixed``→``"both"``). Delegates to
+    :class:`FlashInferTrtllmGenAttention.is_supported`."""
     ...
 
 def trtllm_gen_attention(
@@ -190,21 +193,31 @@ def trtllm_gen_attention(
     fwd: AttentionForwardArgs,
     sparse: AttentionSparseArgs,
 ) -> None:
-    """Mirrors :meth:`TrtllmAttention._call_thop_attention`'s shape, minus
-    thop-only kwargs and plus the trtllm-gen-only ones (``quant_config``,
-    ``kv_cache_manager``, ``global_layer_idx``). Delegates to the
-    private ``_trtllm_gen_attention_impl`` for the actual flashinfer call."""
+    """Reads every kernel input from the four rich objects. The flashinfer
+    body (~210 lines) is inlined — no separate kwargs-style impl, no
+    translation layer."""
     ...
 ```
 
-The previous kwarg-style public `trtllm_gen.trtllm_gen_attention` is kept as
-private `_trtllm_gen_attention_impl` (the kernel body is unchanged); only the
-public entry point changed. `trtllm_gen.is_supported` was inlined — it was a
-thin wrapper around `FlashInferTrtllmGenAttention.is_supported` and the new
-public function calls that class directly.
+Notes:
 
-The thop wrapper calls `thop.attention(...)`; the trtllm-gen wrappers call
-into the existing private `_trtllm_gen_attention_impl`. The kernel function
+- Both functions share the same `(attn, q, k, v, metadata, fwd, sparse)`
+  signature, so the dispatcher can use identical argument lists for the
+  support check and the kernel call. `is_supported` doesn't actually use
+  `v`; it's accepted for symmetry.
+- `phase` was a parameter on the old kwarg-style `is_supported` and is now
+  derived inside the function from `fwd.attention_input_type`. This also
+  tightens the check: a context-only call no longer demands the generation
+  kernel be supported.
+- There is no private `_*_impl` companion — the body of
+  `trtllm_gen_attention` reads `attn.X` / `metadata.Y` / `fwd.Z` / `sparse.W`
+  directly throughout, eliminating the kwargs translation step. About half
+  of the old impl parameters (`q_pe`, `host_total_kv_lens`,
+  `chunked_prefill_buffer_batch_size`, `helix_tensor_params`, the spec-
+  decoding kwargs, the sparse_mla_*, the skip_softmax_*, etc.) were never
+  actually used by the body and just drop out.
+
+The thop wrapper still calls `thop.attention(...)`. The kernel function
 signatures themselves are unchanged.
 
 ### 3.4 The dispatcher
@@ -306,7 +319,6 @@ The tests do NOT run the kernel — they fail purely on shape mismatches.
 
 ```python
 _THOP_EXCLUDED_FIELDS = frozenset({
-    "is_generation",        # consumed only by DSA
     "topk_indices",          # consumed only by DSA
     "attention_mask",       # input to ``mask_type`` @property
     "attention_mask_data",  # not used by thop (separate code path)
@@ -326,7 +338,7 @@ _THOP_LITERAL_NONE = frozenset({
 |---|---|---|
 | `tensorrt_llm/_torch/attention_backend/interface.py` | +~50 / -~5 | New `AttentionSparseArgs`, `_THOP_EXCLUDED_FIELDS`, `_THOP_LITERAL_NONE`, two `@property` (`mask_type`, `effective_out_scale`), `mrope_config` flatten, dead-field removal |
 | `tensorrt_llm/_torch/attention_backend/trtllm.py` | +~170 / -~250 | New `_call_thop_attention`, 12 derived `@property` methods, `_run` rewrite, `forward()` store-back |
-| `tensorrt_llm/_torch/attention_backend/trtllm_gen.py` | +~110 / -~5 | Rich-object public `is_supported` (inlined) and `trtllm_gen_attention` (wraps the renamed private `_trtllm_gen_attention_impl`) |
+| `tensorrt_llm/_torch/attention_backend/trtllm_gen.py` | net -~165 | Rich-object public `is_supported` and `trtllm_gen_attention` — both functions read `attn.X` / `metadata.Y` / `fwd.Z` / `sparse.W` directly throughout. No separate `_*_impl`; ~half of the old impl's kwargs were unused-for-interface-parity and just disappear. |
 | `tensorrt_llm/_torch/modules/attention.py` | +0 / -8 | Delete the dict-reconstruct (lines 721-727); change two `AttentionForwardArgs(mrope_config=…)` to flat-field form |
 | `tensorrt_llm/_torch/models/modeling_qwen.py` | 2 type fixes | `Tuple[torch.Tensor, int]` → `Optional[dict]` (lines 159, 220) |
 | `tensorrt_llm/_torch/models/modeling_seedoss.py` | 2 type fixes | same (lines 90, 154) |
@@ -340,10 +352,17 @@ _THOP_LITERAL_NONE = frozenset({
 4. `3d768c7c88` — `_call_thop_attention` wrapper. 89/89 kwarg match with the C++ binding verified by standalone AST cross-check.
 5. `70dc3b233b` — initially added the wrappers as `TrtllmAttention` methods. `_run` shrinks 250 → 85 lines. (Superseded by the follow-up below — the wrappers later moved into `trtllm_gen.py` itself.)
 6. `c11612f61e` — AST-based sync test + `_THOP_EXCLUDED_FIELDS` extension.
-7. *(follow-up)* — move the trtllm-gen wrappers from `TrtllmAttention`
+7. `d80a6e7a0e` — move the trtllm-gen wrappers from `TrtllmAttention`
    methods into `trtllm_gen.py` itself as the new public `is_supported` /
    `trtllm_gen_attention`. Eliminates two methods on `TrtllmAttention`;
    `_run` calls the module functions directly.
+8. `401d5f96c5` — final cleanup: inline `_trtllm_gen_attention_impl` into
+   `trtllm_gen_attention` (body now reads `attn.X`/`metadata.Y`/`fwd.Z`/
+   `sparse.W` directly throughout, ~half the impl's old kwargs were
+   unused and drop out); unify `is_supported`'s signature with
+   `trtllm_gen_attention`'s; derive `phase` from `fwd.attention_input_type`;
+   delete `AttentionForwardArgs.is_generation` and update the four call
+   sites in `attention.py` / `sparse/dsa.py`.
 
 ## 7. Tradeoffs and explicit non-goals
 
@@ -353,7 +372,7 @@ _THOP_LITERAL_NONE = frozenset({
 | `**dict` unpack vs. explicit kwargs | Explicit | Avoid `CALL_FUNCTION_EX` overhead on the hot path. |
 | Registry of (kwarg → owner) vs. wrapper-is-the-registry | Wrapper-is-the-registry | The wrapper has to exist anyway; a registry would be a duplicated source of truth. |
 | Protocol for `trtllm_gen`'s view of `TrtllmAttention` vs. concrete type | Concrete `TrtllmAttention` | Single internal codepath — Protocol adds maintenance for no gain. |
-| Rewrite `trtllm_gen.is_supported` / `trtllm_gen_attention` signatures vs. wrap them in `TrtllmAttention` | Rewrite the public signatures, keep an internal `_trtllm_gen_attention_impl` for the kernel body | Final form: `trtllm_gen.py`'s *public* API takes rich objects; the heavy `flashinfer` body is preserved as a private kwargs-style implementation. The user's "_run takes only rich objects" goal is met at the dispatch site without rewriting the impl body. |
+| Rewrite `trtllm_gen.is_supported` / `trtllm_gen_attention` signatures vs. wrap them in `TrtllmAttention` | Rewrite the public signatures **and** inline the body to read rich-object accessors directly | Final form: `trtllm_gen.py`'s public API takes rich objects, and the body uses `attn.X` / `metadata.Y` / `fwd.Z` / `sparse.W` throughout — no intermediate kwargs translation. About half of the old impl's parameters were unused-for-interface-parity and drop out entirely. |
 | Cached vs. uncached `@property` for derived views | Uncached | The properties are cheap (slicing, list comprehensions). `slots=True` on the dataclass blocks `cached_property` without extra machinery. |
 
 ### Explicit non-goals
@@ -362,9 +381,9 @@ _THOP_LITERAL_NONE = frozenset({
   decoder-layer kwarg-style API are intentionally untouched. A future PR may
   flatten them too; this one stops at the `AttentionForwardArgs` boundary.
 - ~~`trtllm_gen.is_supported` and `trtllm_gen.trtllm_gen_attention` keep their
-  kwarg-style internal signatures.~~ *Done as a follow-up in this PR.*
-  The public functions now take rich objects directly; only the private
-  `_trtllm_gen_attention_impl` retains the kwargs shape for the kernel body.
+  kwarg-style internal signatures.~~ *Done as a follow-up in this PR.* Both
+  public functions take rich objects, and the body reads them directly —
+  no `_*_impl` companion remains.
 - Type-name checking (e.g. `int64_t ↔ int`, `Optional[float] ↔
   std::optional<double>`) is not in the sync test. The test catches all
   name-level drift; type-level coercion bugs would have to surface via
