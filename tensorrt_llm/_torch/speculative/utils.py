@@ -24,6 +24,7 @@ from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
+from .pearl import PEARLOneModelSampler, PEARLOneModelWorker, PEARLSpecMetadata
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
@@ -104,6 +105,15 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
             spec_resource_manager=spec_resource_manager,
+        )
+    if spec_config.spec_dec_mode.is_pearl_one_model():
+        return PEARLSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
@@ -258,6 +268,8 @@ def get_spec_decoder(
                           nextn=spec_config.tokens_per_gen_step - 1)
     if spec_config.spec_dec_mode.is_sa():
         return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
+    if spec_config.spec_dec_mode.is_pearl_one_model():
+        return PEARLOneModelSampler(sampler_args)
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSampler(sampler_args)
     raise ValueError(
@@ -324,6 +336,9 @@ def get_spec_worker(spec_config,
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
+    if spec_dec_mode.is_pearl_one_model():
+        return PEARLOneModelWorker(spec_config, mapping,
+                                   use_separate_draft_kv_cache)
     if spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelWorker(spec_config, mapping,
                                          use_separate_draft_kv_cache)

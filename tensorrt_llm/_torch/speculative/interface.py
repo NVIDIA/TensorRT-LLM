@@ -161,6 +161,7 @@ class SpeculativeDecodingMode(IntEnum):
     SA = auto()
     DRAFT_TARGET = auto()
     DRAFT_TARGET_ONE_MODEL = auto()
+    PEARL_ONE_MODEL = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
@@ -210,11 +211,15 @@ class SpeculativeDecodingMode(IntEnum):
     def is_draft_target_one_model(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
 
+    def is_pearl_one_model(self):
+        return self == SpeculativeDecodingMode.PEARL_ONE_MODEL
+
     def is_save_hidden_states(self):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def is_external_drafter(self):
-        return self.is_pard() or self.is_draft_target_one_model()
+        return self.is_pard() or self.is_draft_target_one_model(
+        ) or self.is_pearl_one_model()
 
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(

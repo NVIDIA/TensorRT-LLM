@@ -51,6 +51,18 @@ class DraftApiProtocol:
     class MessageType(IntEnum):
         kDraftToTarget = 0
         kTargetToDraft = 1
+        # PEARL extensions (parallel speculative decoding with adaptive draft length).
+        # The 96-byte envelope is unchanged; only validation rules differ.
+        # tokens[0] carries gamma_next; tokens[1:1+num_to_verify] carries accepted tokens.
+        kPearlVerifyContinue = 2
+        # Single token emitted after draft-step #1 so target can begin pre-verify.
+        kPearlPreVerifyToken = 3
+        # All gamma draft tokens emitted after draft-step #gamma.
+        kPearlDraftBatch = 4
+        # Rollback signal: position carries rollback_count, tokens[0] carries correct_token.
+        kPearlRollback = 5
+        # Bidirectional probe used by adaptive-gamma profiling.
+        kPearlProbe = 6
 
     class Status(IntEnum):
         kOk = 0
@@ -125,7 +137,7 @@ class DraftApiProtocol:
         if message_type == DraftApiProtocol.MessageType.kTargetToDraft:
             if message.num_tokens != 1:
                 return DraftApiProtocol.Status.kInvalidNumTokens
-        else:
+        elif message_type == DraftApiProtocol.MessageType.kDraftToTarget:
             if message.num_tokens == 1:
                 # A single-token DraftToTarget reply is only legal when the
                 # draft bumped position to max (i.e. exhausted budget).
@@ -133,6 +145,23 @@ class DraftApiProtocol:
                     return DraftApiProtocol.Status.kInvalidNumTokens
             elif message.num_tokens < 2 or message.num_tokens > _MAX_TOKENS:
                 return DraftApiProtocol.Status.kInvalidNumTokens
+        elif message_type in (
+            DraftApiProtocol.MessageType.kPearlPreVerifyToken,
+            DraftApiProtocol.MessageType.kPearlRollback,
+        ):
+            if message.num_tokens != 1:
+                return DraftApiProtocol.Status.kInvalidNumTokens
+        elif message_type in (
+            DraftApiProtocol.MessageType.kPearlVerifyContinue,
+            DraftApiProtocol.MessageType.kPearlDraftBatch,
+        ):
+            if message.num_tokens < 1 or message.num_tokens > _MAX_TOKENS:
+                return DraftApiProtocol.Status.kInvalidNumTokens
+        elif message_type == DraftApiProtocol.MessageType.kPearlProbe:
+            if message.num_tokens > _MAX_TOKENS:
+                return DraftApiProtocol.Status.kInvalidNumTokens
+        else:
+            return DraftApiProtocol.Status.kInvalidMessageType
 
         if len(message.tokens) != _MAX_TOKENS:
             return DraftApiProtocol.Status.kInvalidNumTokens

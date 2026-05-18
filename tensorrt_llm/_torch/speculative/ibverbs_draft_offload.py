@@ -38,6 +38,8 @@ except Exception:  # pragma: no cover — kept importable without torch
     torch = None  # type: ignore
     _NN_MODULE_BASE = object  # type: ignore
 
+from .pearl_trace import log as _pearl_log
+from .pearl_trace import to_int_list as _pearl_to_int_list
 
 HEADER_NUM_FIELDS = 8
 HEADER_BYTES = HEADER_NUM_FIELDS * 4  # kept for parity with izzy / future use
@@ -396,11 +398,13 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                 }
             ),
         }
+        _pearl_log("target", "control_model_init_send", message=msg)
         port = int(self._tcp_prompt_port if self._tcp_prompt_port > 0 else self.config.server_port)
         sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         # Loading a model on the draft side can take 60s+ (8B model + KV
         # cache warmup), so the ack timeout is intentionally generous.
-        sock.settimeout(180.0)
+        # First-time JIT kernel compilation can push it past 5 min.
+        sock.settimeout(900.0)
         try:
             sock.connect((self._tcp_prompt_host, port))
             sock.sendall((_json.dumps(msg) + "\n").encode("utf-8"))
@@ -436,6 +440,7 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             ack.get("eos_token_id"),
             data_port,
         )
+        _pearl_log("target", "control_model_init_ack", ack=ack)
 
     def push_prompt(self, request_id, prompt_tokens):
         """Send a ``TcpPromptInit`` over TCP to the draft server.
@@ -477,6 +482,15 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             "prompt_tokens": [int(t) for t in prompt_tokens],
             "max_draft_len": int(self.config.max_draft_len),
         }
+        _pearl_log(
+            "target",
+            "prompt_init_send",
+            logical_request_id=int(request_id),
+            wire_request_id=wire_handle,
+            prompt_tokens=[int(t) for t in prompt_tokens],
+            prompt_token_count=len(prompt_tokens),
+            max_draft_len=int(self.config.max_draft_len),
+        )
         sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         sock.settimeout(self._tcp_prompt_timeout_s)
         try:
@@ -505,6 +519,13 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             len(prompt_tokens),
             ack.get("last_token_position", -1),
         )
+        _pearl_log(
+            "target",
+            "prompt_init_ack",
+            logical_request_id=int(request_id),
+            wire_request_id=wire_handle,
+            ack=ack,
+        )
 
     # ------------------------------------------------------------------
     # Per-request send / receive
@@ -530,6 +551,11 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
     def _build_target_to_draft_message(
         self, request_id, accepted_tokens, num_accepted_tokens, row, request_start_position
     ):
+        # One packet carries exactly the target-verified token for this
+        # position. Initially this is t_f from target prefill; later it is
+        # t_g/t_h/... from target verification. The draft side compares it
+        # against its already-generated token at position+1 and either keeps
+        # generating on that branch or rolls back before regenerating.
         tokens = [0] * self._protocol.kMaxTokens
         tokens[0] = self._extract_last_accepted_token(accepted_tokens, num_accepted_tokens, row)
         return self._protocol.Message(
@@ -568,6 +594,29 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                     % (request_id, self._channel_cls.to_string(status))
                 )
             self._pending_round_seq_by_request[request_id] = int(message.round_seq_num)
+            _pearl_log(
+                "target",
+                "send_target_to_draft",
+                request_id=int(request_id),
+                round_seq=int(message.round_seq_num),
+                position=int(message.position),
+                num_tokens=int(message.num_tokens),
+                last_token=int(message.tokens[0]),
+                accepted_token_count=int(num_accepted_tokens[row].item()),
+                accepted_tokens=_pearl_to_int_list(
+                    accepted_tokens[row],
+                    limit=int(
+                        max(0, min(accepted_tokens.shape[1], num_accepted_tokens[row].item()))
+                    ),
+                ),
+                packet={
+                    "message_type": int(self._protocol.MessageType.kTargetToDraft),
+                    "round_seq_num": int(message.round_seq_num),
+                    "position": int(message.position),
+                    "num_tokens": int(message.num_tokens),
+                    "tokens": [int(t) for t in message.tokens],
+                },
+            )
             _debug_trace(
                 "_send_requests req_id=%s round_seq=%s start=%s last_token=%s",
                 request_id,
@@ -678,6 +727,27 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                     dtype=torch.int32,
                     device=device,
                 )
+            _pearl_log(
+                "target",
+                "recv_draft_to_target",
+                request_id=int(request_id),
+                route={
+                    "stream_id": int(received.imm_data.stream_id),
+                    "slot": int(received.imm_data.slot),
+                    "msg_type": int(received.imm_data.msg_type),
+                },
+                round_seq=int(received.message.round_seq_num),
+                position=int(received.message.position),
+                num_tokens=int(received.message.num_tokens),
+                draft_tokens=[int(t) for t in received.message.tokens[:token_count]],
+                packet={
+                    "message_type": int(self._protocol.MessageType.kDraftToTarget),
+                    "round_seq_num": int(received.message.round_seq_num),
+                    "position": int(received.message.position),
+                    "num_tokens": int(received.message.num_tokens),
+                    "tokens": [int(t) for t in received.message.tokens],
+                },
+            )
             pending.discard(request_id)
 
         self.last_response_token_counts = next_draft_token_counts

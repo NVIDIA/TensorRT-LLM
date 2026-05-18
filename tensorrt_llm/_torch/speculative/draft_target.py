@@ -35,6 +35,9 @@ from ..attention_backend import AttentionMetadata
 from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
+from .pearl_trace import log as _pearl_log
+from .pearl_trace import tensor_rows as _pearl_tensor_rows
+from .pearl_trace import to_int_list as _pearl_to_int_list
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DraftTargetDecodingConfig
@@ -247,6 +250,37 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata
         )
+        if self._rdma_offload_enabled and not bool(is_warmup):
+            draft_tokens_for_log = None
+            if spec_metadata.draft_tokens is not None and num_gens > 0:
+                try:
+                    draft_tokens_for_log = spec_metadata.draft_tokens.reshape(
+                        num_gens, self.max_draft_len
+                    )
+                except Exception:
+                    draft_tokens_for_log = spec_metadata.draft_tokens
+            _pearl_log(
+                "target",
+                "verify_result",
+                request_ids=[int(r) for r in getattr(spec_metadata, "request_ids", [])],
+                batch_size=int(batch_size),
+                num_contexts=int(num_contexts),
+                num_generations=int(num_gens),
+                max_draft_len=int(self.max_draft_len),
+                input_draft_tokens=_pearl_tensor_rows(
+                    draft_tokens_for_log,
+                    int(num_gens),
+                    width=int(self.max_draft_len),
+                ),
+                accepted_token_counts=_pearl_to_int_list(
+                    num_accepted_tokens, limit=int(batch_size)
+                ),
+                accepted_tokens=_pearl_tensor_rows(
+                    accepted_tokens,
+                    int(batch_size),
+                    width=int(self.max_draft_len) + 1,
+                ),
+            )
 
         if self._rdma_offload_enabled:
             if bool(is_warmup):
@@ -443,6 +477,13 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             # context row. Batch_size==1 today (see the multi-request
             # caveat above); the multi-row generalization slices
             # ``input_ids`` by ``attn_metadata.seq_lens[:num_contexts]``.
+            #
+            # PEARL pre-verify timeline:
+            #   draft prompt_init precomputes d_f from the prompt;
+            #   target context prefill computes t_f from target logits;
+            #   the first data-plane round sends t_f to draft;
+            #   draft keeps its d_f branch if d_f == t_f, otherwise it
+            #   rolls back to the prompt and regenerates from t_f.
             if attn_metadata is not None and input_ids is not None:
                 num_contexts = int(getattr(attn_metadata, "num_contexts", 0))
                 if num_contexts > 0:

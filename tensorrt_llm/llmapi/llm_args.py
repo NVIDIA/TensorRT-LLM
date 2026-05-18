@@ -1549,6 +1549,40 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
 
+class PEARLDecodingConfig(DraftTargetDecodingConfig):
+    """Parallel spEculative decoding with Adaptive dRaft Length (PEARL).
+
+    Pipelines draft and target across two GPUs via RDMA. The draft and target
+    do not block on each other within a round: the target may begin verifying
+    a single early draft token (pre-verify) while the rest of the gamma batch
+    is still being generated, and the draft continues generating the next
+    gamma tokens while the target is verifying (post-verify).
+    """
+
+    decoding_type: Literal["PEARL"] = "PEARL"
+
+    pearl_enable_pre_verify: bool = True
+    pearl_enable_post_verify: bool = True
+    pearl_adaptive_gamma: bool = True
+    pearl_gamma_profile_batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]
+    pearl_gamma_profile_steps: int = 4
+
+    @model_validator(mode="after")
+    def validate_pearl_config(self):
+        # PEARL requires the v2 ibverbs/tcp draft-offload path.
+        if not self.draft_offload_enabled:
+            self.draft_offload_enabled = True
+        if not self.draft_offload_v2:
+            self.draft_offload_v2 = True
+        return self
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.PEARL_ONE_MODEL
+
+
 class MTPDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["MTP"] = "MTP"
     num_nextn_predict_layers: PositiveInt = Field(
@@ -2338,6 +2372,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
+        PEARLDecodingConfig,  # Must be before DraftTargetDecodingConfig (subclass)
         DraftTargetDecodingConfig,
         Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
