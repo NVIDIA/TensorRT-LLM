@@ -51,7 +51,7 @@ public:
     void launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams,
         dim3 clusterDim = dim3{1, 1, 1}) const;
     void launchMlaReduce(void* output, void const* partialResults, uint32_t const* seqLenList, uint32_t maxNbSubSeq,
-        uint32_t inputSeqLen, uint32_t totalNumInputTokens, CUstream hStream) const;
+        uint32_t inputSeqLen, uint32_t totalNumInputTokens, uint32_t kernelNumQHeads, CUstream hStream) const;
 
     // It is safe to call getSerializeSize()/serialize() before calling initialize().
     size_t getSerializationSize() const noexcept;
