@@ -2565,8 +2565,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     sink_token_length: Optional[int] = Field(
         default=None,
         description=
-        "Deprecated and ignored on the PyTorch backend; retained only to mirror "
-        "the executor `_KvCacheConfig` pybind type. StreamingLLM is not supported "
+        "Deprecated and ignored on the PyTorch backend. StreamingLLM is not supported "
         "by the PyTorch attention kernels — any non-None value has no effect and "
         "will be silently dropped before reaching the executor.",
         deprecated=True)

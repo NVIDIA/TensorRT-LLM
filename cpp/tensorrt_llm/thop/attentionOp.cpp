@@ -384,7 +384,6 @@ public:
         enqueueParams.max_attention_window_size = attention_window_size;
         enqueueParams.cyclic_attention_window_size = attention_window_size;
         enqueueParams.max_cyclic_attention_window_size = attention_window_size;
-        enqueueParams.sink_token_length = 0;
         enqueueParams.beam_width = beam_width;
         enqueueParams.num_requests = max_num_requests;
 
@@ -701,7 +700,6 @@ public:
         common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.can_use_one_more_block = can_use_one_more_block;
-        common_enqueue_params.sink_token_length = 0;
         common_enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
         common_enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig_ptr;
         common_enqueue_params.attention_output_orig_quant = out_scale_ptr;

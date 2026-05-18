@@ -121,6 +121,4 @@ Property ```use_uvm``` has been deprecated and will be removed in a future relea
 
 Property ```sink_token_length``` is deprecated and silently ignored on the PyTorch backend.
 The PyTorch attention kernels do not support StreamingLLM, so any non-``None`` value is
-dropped before reaching the executor. The field remains on ``KvCacheConfig`` only because
-the underlying C++ ``_KvCacheConfig`` pybind type still exposes it; setting it has no
-effect on the generated tokens.
+dropped before reaching the executor.
