@@ -390,19 +390,19 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """
-    Base class for generating dummy inputs. Specially for profiling
-    """
+    """Build deterministic dummy multimodal inputs for profiling.
 
-    DEFAULT_IMAGE_MAX_DIM = 16384
-    DEFAULT_IMAGE_MIN_DIM = 128
+    Subclasses provide the model-specific math relating image/video size to
+    encoder attention tokens, and this base class composes that math into a
+    dummy prompt sized exactly to the caller's budget. Token unit is
+    **encoder attention** (pre-merger), matching
+    ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
+    Callers expressing budgets in LLM-visible (post-merger) units convert
+    via ``spatial_merge_unit`` at the boundary.
+    """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.image_max_dim = kwargs.get('image_max_dim',
-                                        self.DEFAULT_IMAGE_MAX_DIM)
-        self.image_min_dim = kwargs.get('image_min_dim',
-                                        self.DEFAULT_IMAGE_MIN_DIM)
 
     @property
     @abstractmethod
@@ -419,14 +419,83 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     def model_path(self) -> str:
         ...
 
-    def get_dummy_image(self, max_width: int, max_height: int) -> Image.Image:
-        image = Image.new("RGB", (max_width, max_height),
-                          color=random.randint(0, 256))
-        return image
+    @property
+    def spatial_merge_unit(self) -> int:
+        """Encoder→LLM token ratio.
+
+        Default 1 (no spatial merging). Override on encoders that downsample
+        their output before the LLM (e.g. Qwen-VL family returns
+        ``spatial_merge_size ** 2``).
+        """
+        return 1
+
+    def get_num_mm_tokens(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+    ) -> int:
+        """Return encoder attention tokens (pre-merger) for given media size.
+
+        Result is in the same unit as ``encoder_max_num_tokens`` /
+        ``AttentionMetadata.max_num_tokens`` so callers can size buffers and
+        compare budgets directly without unit gymnastics.
+
+        Subclasses opting into deterministic dummy sizing override this; the
+        default raises ``NotImplementedError`` so :meth:`get_dummy_prompt`
+        falls back to a text-only dummy (its caller already handles
+        ``None``).
+        """
+        raise NotImplementedError
+
+    def get_size_with_most_features(
+        self,
+        *,
+        max_tokens: int,
+    ) -> Dict[str, int]:
+        """Inverse of :meth:`get_num_mm_tokens`.
+
+        Returns ``{'width', 'height', 'num_frames'}`` selecting the largest
+        media size whose attention-token count is ``<= max_tokens`` while
+        keeping the aspect ratio bounded. ``max_tokens`` is in pre-merger
+        units (same as ``get_num_mm_tokens``).
+
+        Default raises ``NotImplementedError`` matching
+        :meth:`get_num_mm_tokens`.
+        """
+        raise NotImplementedError
+
+    def get_dummy_image(self, *, width: int, height: int) -> Image.Image:
+        return Image.new("RGB", (width, height), color=random.randint(0, 256))
 
     def get_dummy_prompt(self, input_seq_len: int):
-        # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
-        # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
+        """Build a multimodal prompt that fits ``input_seq_len`` LLM tokens.
+
+        ``input_seq_len`` is in LLM-visible (post-merger) units. The encoder
+        budget that produces this many LLM tokens is
+        ``input_seq_len * spatial_merge_unit``; that's the value handed to
+        :meth:`get_size_with_most_features`, which deterministically picks
+        the dummy image dimensions in one shot — no iterative halving.
+        """
+        if input_seq_len <= 0:
+            return None
+
+        encoder_budget = input_seq_len * self.spatial_merge_unit
+        try:
+            size = self.get_size_with_most_features(max_tokens=encoder_budget)
+        except NotImplementedError:
+            # Model hasn't opted into deterministic dummy sizing yet.
+            # Returning None makes the caller (_create_dummy_mm_context_request)
+            # fall back to a text-only dummy with a warning. Migrating the model
+            # by implementing `get_num_mm_tokens` / `get_size_with_most_features`
+            # re-enables encoder workspace pre-allocation in KV cache profiling.
+            logger.debug(
+                f"[get_dummy_prompt] {type(self).__name__} has not implemented "
+                f"deterministic dummy sizing; falling back to text-only dummy.")
+            return None
+
+        image = self.get_dummy_image(width=size["width"], height=size["height"])
 
         # Use the registered model_type from the decorator if available,
         # otherwise fall back to HuggingFace config's model_type.
@@ -441,28 +510,14 @@ class BaseMultimodalDummyInputsBuilder(ABC):
             f"config.model_type={config_model_type}, using model_type={model_type}"
         )
 
-        while self.image_max_dim >= self.image_min_dim:
-            image = self.get_dummy_image(max_width=self.image_max_dim,
-                                         max_height=self.image_max_dim)
-
-            test_mm_prompt = tensorrt_llm.inputs.utils.default_multimodal_input_loader(
-                tokenizer=self.tokenizer,
-                model_dir=self.model_path,
-                model_type=model_type,
-                modality="image",
-                prompts=[""],
-                media=[[image]],
-                image_data_format="pt")[0]
-
-            prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
-
-            if len(prompt_token_ids_single_img) <= input_seq_len:
-                return test_mm_prompt
-
-            # reduce img resolution
-            self.image_max_dim = self.image_max_dim >> 1
-
-        return None
+        return tensorrt_llm.inputs.utils.default_multimodal_input_loader(
+            tokenizer=self.tokenizer,
+            model_dir=self.model_path,
+            model_type=model_type,
+            modality="image",
+            prompts=[""],
+            media=[[image]],
+            image_data_format="pt")[0]
 
 
 class MultimodalPlaceholderPlacement(enum.Enum):
