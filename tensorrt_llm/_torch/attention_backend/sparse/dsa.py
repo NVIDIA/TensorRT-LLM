@@ -2218,12 +2218,11 @@ class Indexer(nn.Module):
                 self.layer_idx]
             ctx_seq_lens = metadata.seq_lens[:num_contexts]
             # Per-sequence last context-token offset (exclusive cumsum minus 1).
-            last_ctx_idx = (torch.cumsum(ctx_seq_lens, dim=0) - 1).to(
-                dtype=torch.long)
+            last_ctx_idx = (torch.cumsum(ctx_seq_lens, dim=0) -
+                            1).to(dtype=torch.long)
             metadata.heuristic_prev_topk[
-                local_layer,
-                num_generations:num_generations + num_contexts].copy_(
-                    topk_indices_buffer[last_ctx_idx, :])
+                local_layer, num_generations:num_generations +
+                num_contexts].copy_(topk_indices_buffer[last_ctx_idx, :])
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
