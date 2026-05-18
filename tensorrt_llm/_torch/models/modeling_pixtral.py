@@ -7,7 +7,7 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import MmEncoderMixin
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp
 from tensorrt_llm._torch.modules import rms_norm as trtllm_rmsnorm
@@ -169,7 +169,7 @@ class PixtralTransformer(torch.nn.Module):
 # Original implementation:
 # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/pixtral/modeling_pixtral.py#L440
 @modeling_utils.register_auto_model("PixtralVisionModel")
-class PixtralVisionModel(torch.nn.Module, MmEncoderMixin):
+class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def __init__(
         self, model_config: model_config_lib.ModelConfig[transformers.PixtralVisionConfig]
     ):

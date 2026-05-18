@@ -13,7 +13,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_clip import CLIPEncoder
-from .modeling_multimodal_encoder import MmEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_utils import _load_weights_impl, register_auto_model
 
 SiglipEncoder = CLIPEncoder
@@ -67,7 +67,7 @@ class SiglipVisionTransformer(nn.Module):
 
 
 @register_auto_model("SiglipVisionModel")
-class SiglipVisionModel(nn.Module, MmEncoderMixin):
+class SiglipVisionModel(nn.Module, MultimodalEncoderMixin):
 
     def __init__(self,
                  model_config: ModelConfig[SiglipVisionConfig],
