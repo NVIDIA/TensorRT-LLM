@@ -22,7 +22,7 @@ from tensorrt_llm._torch.attention_backend import \
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
-    MmEncoderMixin
+    MultimodalEncoderMixin
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 from tensorrt_llm._utils import prefer_pinned
@@ -552,7 +552,7 @@ class Block(nn.Module):
         return x
 
 
-class VisionTransformer(nn.Module, MmEncoderMixin):
+class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     """ Vision Transformer.
 
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.

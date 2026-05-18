@@ -43,7 +43,7 @@ from ..modules.rotary_embedding import MRotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import MmEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
     bypass_processor_output_validation,
     find_input_mm_embeds,
@@ -610,7 +610,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
         return hidden_states
 
 
-class Qwen3VisionModel(torch.nn.Module, MmEncoderMixin):
+class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config

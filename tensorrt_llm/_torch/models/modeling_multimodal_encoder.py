@@ -25,15 +25,17 @@ from ..attention_backend.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
 
 
-class MmEncoderMixin:
-    """Marker + default `setup_attn_metadata` for multimodal encoders whose
-    AttentionMetadata is built by `PyTorchModelEngine` after model load using
-    runtime sizes (`max_batch_size`, `max_num_tokens`).
+class MultimodalEncoderMixin:
+    """Encoder-side counterpart to ``MultimodalModelMixin``.
 
-    Subclasses set `metadata_cls` in their own `__init__` (typically from
-    `get_attention_backend(model_config.attn_backend).Metadata`) and either
-    use the default `setup_attn_metadata` below or override it for custom
-    Metadata kwargs (e.g. FlashInfer `kv_layout`, multi-metadata encoders).
+    Marker + default ``setup_attn_metadata`` for multimodal encoders whose
+    ``AttentionMetadata`` is built by ``PyTorchModelEngine`` after model load
+    using runtime sizes (``max_batch_size``, ``max_num_tokens``).
+
+    Subclasses set ``metadata_cls`` in their own ``__init__`` (typically from
+    ``get_attention_backend(model_config.attn_backend).Metadata``) and either
+    use the default ``setup_attn_metadata`` below or override it for custom
+    Metadata kwargs (e.g. FlashInfer ``kv_layout``, multi-metadata encoders).
     """
     metadata_cls: Type[AttentionMetadata]
     attn_metadata: Optional[AttentionMetadata] = None

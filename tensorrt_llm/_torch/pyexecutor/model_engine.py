@@ -44,7 +44,7 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_multimodal_encoder import MmEncoderMixin
+from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -295,7 +295,7 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        self._set_up_mm_encoder_attn_metadata()
+        self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
@@ -1495,19 +1495,19 @@ class PyTorchModelEngine(ModelEngine):
 
         return self.attn_metadata
 
-    def _set_up_mm_encoder_attn_metadata(self) -> None:
+    def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the
         loaded model, using the engine's encoder runtime sizes
         (`encoder_max_batch_size` / `encoder_max_num_tokens`, falling back to
         the LLM-side `max_batch_size` / `max_num_tokens`).
 
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
-        by inheriting `MmEncoderMixin`, and the engine drives the construction
+        by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
         so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
         than being hardcoded inside each encoder's ``__init__``.
         """
         for module in self.model.modules():
-            if isinstance(module, MmEncoderMixin):
+            if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
                     max_num_requests=self.encoder_batch_size,
                     max_num_tokens=self.encoder_max_num_tokens)
