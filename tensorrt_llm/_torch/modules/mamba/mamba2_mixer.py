@@ -514,6 +514,12 @@ class Mamba2Mixer(nn.Module):
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
+                    # TODO: persistent-main replay should consume
+                    # attn_metadata.mamba_metadata.replay_work_items and
+                    # replay_n_writes. Each work item carries
+                    # position_in_decode_batch, cache_slot, PNAT, and
+                    # cache_buf_idx so the kernel can avoid repeated scalar
+                    # pointer chasing.
                     replay_selective_state_update(
                         ssm_states,
                         layer_cache.old_x,

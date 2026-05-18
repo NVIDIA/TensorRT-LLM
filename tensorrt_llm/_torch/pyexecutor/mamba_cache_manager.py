@@ -74,6 +74,12 @@ class BaseMambaCacheManager(ABC):
         """
         ...
 
+    def get_replay_state_update_metadata(
+        self
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+        """Return replay metadata tensors and fixed replay sizes."""
+        return None
+
     @abstractmethod
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         """Return conv states for specific layer.
@@ -603,6 +609,20 @@ class PythonMambaCacheManager(BaseResourceManager):
     def use_replay_state_update(self) -> bool:
         return self._use_replay_state_update
 
+    def get_replay_state_update_metadata(
+        self
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+        if (not self._use_replay_state_update
+                or not isinstance(self.mamba_cache, self.SpeculativeState)
+                or self.mamba_cache.prev_num_accepted_tokens is None
+                or self.mamba_cache.cache_buf_idx is None
+                or self.replay_step_width is None
+                or self.replay_history_size is None):
+            return None
+        return (self.mamba_cache.prev_num_accepted_tokens,
+                self.mamba_cache.cache_buf_idx, self.replay_step_width,
+                self.replay_history_size)
+
     def shutdown(self):
         """Release tensor memory."""
         # Clear mamba cache states
@@ -793,6 +813,15 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     @property
     def use_replay_state_update(self) -> bool:
         return getattr(self._impl, 'use_replay_state_update', False)
+
+    def get_replay_state_update_metadata(
+        self
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+        get_metadata = getattr(self._impl, 'get_replay_state_update_metadata',
+                               None)
+        if get_metadata is None:
+            return None
+        return get_metadata()
 
     def get_intermediate_ssm_states(self,
                                     layer_idx: int) -> Optional[torch.Tensor]:
@@ -1668,6 +1697,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     @property
     def use_replay_state_update(self) -> bool:
         return self._use_replay_state_update
+
+    def get_replay_state_update_metadata(
+        self
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+        if (not self._use_replay_state_update
+                or self.prev_num_accepted_tokens is None
+                or self.cache_buf_idx is None
+                or self.replay_step_width is None
+                or self.replay_history_size is None):
+            return None
+        return (self.prev_num_accepted_tokens, self.cache_buf_idx,
+                self.replay_step_width, self.replay_history_size)
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype
