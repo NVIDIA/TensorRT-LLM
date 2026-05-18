@@ -47,6 +47,7 @@ def _estimate_bytes_per_token(
     compress_ratios: List[int],
     has_fp8_kv_cache,
     attn_types: set[DeepseekV4AttentionType] | None = None,
+    indexer_k_dtype: str = "fp8",
 ) -> int:
     total_bytes = 0
     for ratio in compress_ratios:
@@ -60,6 +61,7 @@ def _estimate_bytes_per_token(
                     ratio,
                     attn,
                     has_fp8_kv_cache,
+                    indexer_k_dtype=indexer_k_dtype,
                 )
     return total_bytes
 
@@ -70,6 +72,7 @@ def _get_attn_bytes_per_token(
     compress_ratio: int,
     attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
+    indexer_k_dtype: str = "fp8",
 ) -> int:
     token_bytes = get_token_bytes(
         head_dim,
@@ -77,6 +80,7 @@ def _get_attn_bytes_per_token(
         compress_ratio,
         attn_type,
         has_fp8_kv_cache,
+        indexer_k_dtype=indexer_k_dtype,
     )
     if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
         token_bytes //= compress_ratio
@@ -163,20 +167,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             )
         self.compressed_block_sizes = [tokens_per_block // ratio for ratio in self._compress_ratios]
 
-        # Indexer compressor cache: FP8 blockwise (1 byte/value + per-128 fp32
-        # scale).  The bf16 / fp8_pertensor presets are reserved for the
-        # main-attention compressor and are not legal indexer dtypes.
-        self._indexer_cache_dtype = KVCacheDtype.FP8_BLOCKWISE
-        self._indexer_dtype = DataType.FP8
-        self.use_fp4 = False
-        self.quant_block_size = 128
-        self._indexer_data_size = self.index_head_dim
-        self._indexer_scale_size = get_size_in_bytes(
-            self.index_head_dim // self.quant_block_size, DataType.FLOAT
-        )
-        assert self.index_head_dim % self.quant_block_size == 0, (
-            f"indexer_head_dim {self.index_head_dim} must be divisible by {self.quant_block_size}"
-        )
+        self._init_indexer_dtype(sparse_attn_config)
 
         # _build_cache_config() needs them to build constraints
         self._max_input_len = max_input_len
@@ -490,6 +481,49 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             constraints=constraints,
         )
 
+    def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
+        # Indexer compressor cache layout. Two modes are supported:
+        #   - "fp8" (FP8 blockwise): 1 byte per value + 1 fp32 scale per 128
+        #     values.
+        #   - "fp4" (MXFP4 blockwise): ½ byte per value (two FP4 codes packed
+        #     per byte) + 1 ue8m0 byte per 32 values. At index_head_dim=128
+        #     this halves the per-token indexer-K footprint vs FP8.
+        self._indexer_k_dtype = sparse_attn_config.indexer_k_dtype
+        if self._indexer_k_dtype == "fp8":
+            self._indexer_cache_dtype = KVCacheDtype.FP8_BLOCKWISE
+            self._indexer_dtype = DataType.FP8
+            self.quant_block_size = 128
+            self._indexer_data_size = self.index_head_dim
+            self._indexer_scale_size = get_size_in_bytes(
+                self.index_head_dim // self.quant_block_size, DataType.FLOAT
+            )
+        elif self._indexer_k_dtype == "fp4":
+            assert self.index_head_dim == 128, (
+                f"FP4 indexer K cache requires index_head_dim=128, got {self.index_head_dim}."
+            )
+            self._indexer_cache_dtype = KVCacheDtype.MXFP4_BLOCKWISE
+            # Pool dtype is uint8 because PyTorch can't allocate float4
+            # backing storage; downstream consumers reinterpret these
+            # raw bytes as packed E2M1 + UE8M0 exponents.
+            self._indexer_dtype = DataType.UINT8
+            self.quant_block_size = 32
+            # Two E2M1 codes pack into one byte → half the data footprint.
+            self._indexer_data_size = self.index_head_dim // 2
+            # 1 UE8M0 byte per 32-element block.
+            self._indexer_scale_size = self.index_head_dim // self.quant_block_size
+        else:
+            raise ValueError(
+                f"Unsupported indexer_k_dtype "
+                f"{sparse_attn_config.indexer_k_dtype!r}; expected "
+                "'fp8' or 'fp4'."
+            )
+        # FP4 indexer flag mirrors `DSACacheManager.use_fp4` so the shared
+        # base Indexer can branch without knowing the V4-specific enum.
+        self.use_fp4 = self._indexer_k_dtype == "fp4"
+        assert self.index_head_dim % self.quant_block_size == 0, (
+            f"indexer_head_dim {self.index_head_dim} must be divisible by {self.quant_block_size}"
+        )
+
     def _assert_layer_pool_scale(self) -> None:
         attn_ratio_to_pool_id = defaultdict[DeepseekV4AttentionType, dict[int, int]](lambda: {})
         attn_ratio_to_scale = defaultdict[DeepseekV4AttentionType, dict[int, int]](lambda: {})
@@ -567,6 +601,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._compress_ratios[layer_idx],
             attn_type,
             has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
         )
 
         block_size = self.tokens_per_block
@@ -587,6 +622,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self.index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
         )
 
     def get_max_resource_count(self) -> int:
@@ -632,6 +668,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     compress_ratio,
                     attn_type,
                     has_fp8_kv_cache,
+                    indexer_k_dtype=self._indexer_k_dtype,
                 )
                 attn_tokens = total_tokens
                 if attn_type in self.fixed_size_attention:
@@ -785,11 +822,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache = quant_config.quant_mode.has_fp8_kv_cache()
         else:
             has_fp8_kv_cache = False
+        indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
         return _estimate_bytes_per_token(
             head_dim,
             index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+            indexer_k_dtype=indexer_k_dtype,
         )
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
