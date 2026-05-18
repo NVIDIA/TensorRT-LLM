@@ -6,6 +6,7 @@ from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .evs import (compute_retained_tokens_count,
                   compute_retained_tokens_from_tubelet_budget,
                   compute_retention_mask)
+from .modality import Modality
 from .multimodal import MultimodalInput
 from .multimodal_data import AudioData, BaseModalityData, VideoData
 # yapf and isort conflict on the following import blocks
@@ -55,6 +56,7 @@ __all__ = [
     "MultimodalPlaceholderMetadata",
     "MultimodalPlaceholderPlacement",
     "ConversationMessage",
+    "Modality",
     "MultimodalDataTracker",
     "MultimodalData",
     "MultimodalInput",
