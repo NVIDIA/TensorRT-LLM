@@ -35,3 +35,5 @@ transforms:
     enabled: true
   fuse_rope_into_trtllm_attention:
     enabled: true
+  fuse_add_rms_norm:
+    enabled: true
