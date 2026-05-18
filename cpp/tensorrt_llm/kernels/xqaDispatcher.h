@@ -115,7 +115,9 @@ protected:
         XQAParams params, KVCacheBuffer const& kv_cache_buffer, KVCacheBuffer const& kv_cache_block_scales_buffer);
 };
 
-constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
+// sizeof(Vec<CgaXBuffer, nbProducerCtasPerCga>) in cpp/kernels/xqa/mla_sm120.cu
+// for HEAD_GRP_SIZE=128, HEAD_ELEMS=576.
+constexpr uint32_t xqaMlaCgaXBufSize = 9216 * 2;
 // sizeof(PartialResult) in cpp/kernels/xqa/mla_sm120.cu for HEAD_GRP_SIZE=128, HEAD_ELEMS=576.
 constexpr uint32_t xqaMlaPartialResultSize = 132096;
 
