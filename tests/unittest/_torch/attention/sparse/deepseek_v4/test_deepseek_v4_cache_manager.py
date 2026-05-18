@@ -9,6 +9,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4C
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
+    compress_ratio_has_attention,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -494,6 +495,59 @@ class TestDeepseekV4CacheManager:
             attn_type.value,
             0,
         ]
+
+    def _prepare_mixed_copy_batch(
+        self,
+        cache_manager: DeepseekV4CacheManager,
+        prompt_len: int,
+    ) -> tuple[list[LlmRequest], int]:
+        requests = [self._create_request(request_id, prompt_len) for request_id in range(3)]
+        for req in requests:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(req, req.context_chunk_size)
+
+        gen_req = requests[-1]
+        scheduled_batch = ScheduledRequests()
+        scheduled_batch.context_requests_last_chunk = [gen_req]
+        gen_req.context_current_position = prompt_len
+        gen_req.add_new_token(prompt_len, 0)
+        cache_manager.update_context_resources(scheduled_batch)
+        cache_manager.update_resources(scheduled_batch)
+        assert cache_manager.try_allocate_generation(gen_req)
+        return requests, len(requests) - 1
+
+    def _reference_copy_batch_page_indices(
+        self,
+        cache_manager: DeepseekV4CacheManager,
+        request_ids: list[int],
+        num_contexts: int,
+        layer_idx: int,
+        attn_type: DeepseekV4AttentionType,
+        page_index_mode: PageIndexMode,
+    ) -> torch.Tensor:
+        layer_id = cache_manager._layer_attn_to_layer_id[layer_idx, attn_type]
+        pool_id = cache_manager.layer_to_pool_mapping_dict[layer_id]
+        converter = cache_manager.impl.get_page_index_converter(layer_id, attn_type.role)
+        copy_idx = cache_manager.index_mapper.get_copy_index(request_ids, num_contexts, 1)
+
+        expected = torch.full(
+            (len(request_ids), cache_manager.max_blocks_per_seq),
+            BAD_PAGE_INDEX,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        for row, request_id in enumerate(request_ids):
+            base_indices = cache_manager.host_kv_cache_block_offsets[
+                pool_id,
+                int(copy_idx[row]),
+                0,
+            ].tolist()
+            scratch = None
+            if row < num_contexts and page_index_mode == PageIndexMode.PER_LAYER:
+                scratch = cache_manager.kv_cache_map[request_id].get_scratch_desc(pool_id)
+            converted = converter(base_indices, page_index_mode, scratch)
+            expected[row, : len(converted)] = torch.tensor(converted, dtype=torch.int32)
+        return expected
 
     def _write_request_prefill(
         self,
@@ -1122,6 +1176,215 @@ class TestDeepseekV4CacheManager:
                 torch.testing.assert_close(layer1_buffer[layer1_offsets], layer1_values)
         finally:
             if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_block_offsets_matches_python_converter(self):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+            actual = torch.empty(
+                cache_manager.num_attention_op_pools,
+                len(request_ids),
+                2,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+
+            cache_manager.copy_batch_block_offsets(
+                actual,
+                request_ids,
+                beam_width=1,
+                num_contexts=num_contexts,
+                num_seqs=len(request_ids),
+            )
+
+            expected = torch.full_like(actual, BAD_PAGE_INDEX)
+            for local_layer_idx, pp_layer in enumerate(cache_manager.pp_layers):
+                ref = self._reference_copy_batch_page_indices(
+                    cache_manager,
+                    request_ids,
+                    num_contexts,
+                    pp_layer,
+                    DeepseekV4AttentionType.SWA,
+                    PageIndexMode.PER_LAYER,
+                )
+                expected[local_layer_idx, :, 0] = ref
+                expected[local_layer_idx, :, 1] = ref
+
+            torch.testing.assert_close(actual, expected)
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_sliding_block_tables_matches_python_converter(self):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+            actual = torch.empty(
+                cache_manager.num_local_layers,
+                len(DEEPSEEK_V4_SLIDING_ATTENTION),
+                len(request_ids),
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+
+            cache_manager.copy_batch_sliding_block_tables(
+                actual,
+                request_ids,
+                num_contexts=num_contexts,
+                num_seqs=len(request_ids),
+            )
+
+            expected = torch.full_like(actual, BAD_PAGE_INDEX)
+            for pp_layer in cache_manager.pp_layers:
+                compress_ratio = cache_manager._compress_ratios[pp_layer]
+                local_layer_idx = cache_manager.layer_offsets[pp_layer]
+                for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
+                    if not compress_ratio_has_attention(compress_ratio, attn_type):
+                        continue
+                    expected[local_layer_idx, attn_type.value] = (
+                        self._reference_copy_batch_page_indices(
+                            cache_manager,
+                            request_ids,
+                            num_contexts,
+                            pp_layer,
+                            attn_type,
+                            PageIndexMode.PER_LAYER,
+                        )
+                    )
+
+            torch.testing.assert_close(actual, expected)
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_compress_block_tables_matches_python_converter(self):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+
+            for compress_ratio in (4, 128):
+                actual = torch.empty(
+                    len(request_ids),
+                    cache_manager.max_blocks_per_seq,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+
+                cache_manager.copy_batch_compress_block_tables(
+                    actual,
+                    request_ids,
+                    compress_ratio=compress_ratio,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+
+                pp_layer = next(
+                    layer
+                    for layer in cache_manager.pp_layers
+                    if cache_manager._compress_ratios[layer] == compress_ratio
+                )
+                expected = self._reference_copy_batch_page_indices(
+                    cache_manager,
+                    request_ids,
+                    num_contexts,
+                    pp_layer,
+                    DeepseekV4AttentionType.COMPRESS,
+                    PageIndexMode.SHARED,
+                )
+                torch.testing.assert_close(actual, expected)
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_indexer_compress_block_tables_matches_python_converter(self):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+            actual = torch.empty(
+                len(request_ids),
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+
+            cache_manager.copy_batch_indexer_compress_block_tables(
+                actual,
+                request_ids,
+                num_seqs=len(request_ids),
+            )
+
+            pp_layer = next(
+                layer
+                for layer in cache_manager.pp_layers
+                if compress_ratio_has_attention(
+                    cache_manager._compress_ratios[layer],
+                    DeepseekV4AttentionType.INDEXER_COMPRESS,
+                )
+            )
+            expected = self._reference_copy_batch_page_indices(
+                cache_manager,
+                request_ids,
+                # The compatibility indexer table is shared and does not use scratch.
+                0,
+                pp_layer,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+                PageIndexMode.SHARED,
+            )
+            torch.testing.assert_close(actual, expected)
+            assert num_contexts == 2
+        finally:
+            for req in requests:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
