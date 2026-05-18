@@ -1725,6 +1725,13 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
+    def _deepseek_v4_q_b_layernorm(self, q: torch.Tensor) -> torch.Tensor:
+        assert (q.dim() == 2
+                and q.shape[1] == self.num_heads_tp * self.qk_head_dim)
+        return torch.ops.trtllm.deepseek_v4_q_norm(
+            q, self.num_heads_tp, self.qk_head_dim,
+            float(self.q_b_layernorm.variance_epsilon))
+
     def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
@@ -2214,10 +2221,7 @@ class MLA(nn.Module):
 
         def _q_branch():
             q_proj = self.q_b_proj(q)
-            # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm
-            # reduces per-head.
-            return self.q_b_layernorm(q_proj.view(
-                -1, self.qk_head_dim)).view_as(q_proj)
+            return self._deepseek_v4_q_b_layernorm(q_proj)
 
         def _compressor_branch():
             self.compressor(hidden_states, attn_metadata)
