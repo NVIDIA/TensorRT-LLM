@@ -16,6 +16,7 @@ path share that math.
 
 import pytest
 
+from tensorrt_llm.inputs import Modality
 from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
 
 
@@ -42,7 +43,7 @@ class _StubBuilder(BaseMultimodalDummyInputsBuilder):
 def test_get_size_with_most_features_default_raises_not_implemented():
     builder = _StubBuilder()
     with pytest.raises(NotImplementedError):
-        builder.get_size_with_most_features(max_tokens=1024)
+        builder.get_size_with_most_features(Modality.IMAGE, max_tokens=1024)
 
 
 def test_get_dummy_prompt_returns_none_when_subclass_did_not_implement():

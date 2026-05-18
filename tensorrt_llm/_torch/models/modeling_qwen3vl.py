@@ -31,6 +31,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
+from ...inputs.modality import Modality
 from ...inputs.multimodal import MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -127,6 +128,10 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
     # ``spatial_merge_unit`` at the boundary.
     # ------------------------------------------------------------------
     @property
+    def supported_modalities(self) -> Tuple[Modality, ...]:
+        return (Modality.IMAGE, Modality.VIDEO)
+
+    @property
     def spatial_merge_unit(self) -> int:
         """Encoder→LLM token ratio. Qwen3-VL applies a ``merge_size`` × ``merge_size`` spatial merger."""
         merge_size = self.config.vision_config.spatial_merge_size
@@ -134,20 +139,63 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
     def get_num_mm_tokens(
         self,
+        modality: Modality,
         *,
-        width: int,
-        height: int,
-        num_frames: int = 1,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        **kwargs,
     ) -> int:
-        """Return the encoder attention tokens (pre-merger) that result from
-        an image/video of the given pixel dimensions.
+        """Return encoder attention tokens (pre-merger) for image/video.
 
-        Mirrors HF Qwen3-VL's ``smart_resize`` + patchify: ``(width, height)``
-        is rounded to a multiple of ``patch_size * spatial_merge_size`` and
-        then divided into ``patch_size``-sized patches. The result equals
-        the number of tokens the encoder will run attention over for one
-        atomic forward.
+        Image and video flow through the same vision encoder in Qwen3-VL;
+        the only difference is the temporal dimension. ``modality`` is
+        accepted for interface uniformity but the math is shared — IMAGE
+        uses ``num_frames=1`` implicitly, VIDEO uses the caller-provided
+        value.
+
+        Mirrors HF Qwen3-VL's ``smart_resize`` + patchify: ``(width,
+        height)`` is rounded to a multiple of ``patch_size *
+        spatial_merge_size`` and then divided into ``patch_size``-sized
+        patches.
         """
+        if modality not in (Modality.IMAGE, Modality.VIDEO):
+            raise NotImplementedError(f"Qwen3-VL does not support modality={modality}")
+        if width is None or height is None:
+            raise ValueError("width and height are required")
+        return self._vision_tokens(
+            width=int(width),
+            height=int(height),
+            num_frames=int(num_frames) if num_frames is not None else 1,
+        )
+
+    def get_size_with_most_features(
+        self,
+        modality: Modality,
+        *,
+        max_tokens: int,
+    ) -> Dict[str, int]:
+        """Invert ``get_num_mm_tokens``: pick the size (within aspect-ratio
+        bounds) whose attention-token count is the largest value
+        ``<= max_tokens``.
+
+        Single-frame for both IMAGE and VIDEO — the caller scales
+        ``num_frames`` if they want to spend the budget on temporal extent
+        rather than spatial resolution.
+        """
+        if modality not in (Modality.IMAGE, Modality.VIDEO):
+            raise NotImplementedError(f"Qwen3-VL does not support modality={modality}")
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+
+        width, height = self._vision_size_for_budget(max_tokens)
+        size: Dict[str, int] = {"width": width, "height": height}
+        if modality == Modality.VIDEO:
+            size["num_frames"] = 1
+        return size
+
+    def _vision_tokens(self, *, width: int, height: int, num_frames: int) -> int:
+        """Encoder attention tokens for the shared image/video vision tower."""
         cfg = self.config.vision_config
         patch_size = cfg.patch_size
         merge_size = cfg.spatial_merge_size
@@ -168,21 +216,9 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
         return grid_t * grid_h * grid_w
 
-    def get_size_with_most_features(
-        self,
-        *,
-        max_tokens: int,
-    ) -> Dict[str, int]:
-        """Invert ``get_num_mm_tokens``: pick the ``(width, height)`` whose
-        attention-token count is the largest value ≤ ``max_tokens`` while
-        keeping the aspect ratio bounded.
-
-        ``max_tokens`` is in the same unit as ``get_num_mm_tokens`` /
-        ``encoder_max_num_tokens`` (pre-merger). Single image (``num_frames=1``)
-        for now; callers needing video can compose with the temporal dim.
-        """
-        if max_tokens <= 0:
-            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+    def _vision_size_for_budget(self, max_tokens: int) -> Tuple[int, int]:
+        """Largest ``(width, height)`` whose pre-merger token count
+        is ``<= max_tokens`` under the model's aspect-ratio bound."""
 
         def closest_factor_pair(n: int) -> Tuple[int, int]:
             """Closest ``h*w=n`` to square; keeps dummy aspect ratio near 1:1."""
@@ -208,11 +244,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
                 h_factor, w_factor = h_f, w_f
                 break
 
-        return {
-            "width": unit * w_factor,
-            "height": unit * h_factor,
-            "num_frames": 1,
-        }
+        return (unit * w_factor, unit * h_factor)
 
     @classmethod
     def get_rope_index(

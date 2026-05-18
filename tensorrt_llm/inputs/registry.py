@@ -19,6 +19,7 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
+from .modality import Modality
 from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
@@ -30,8 +31,7 @@ ExtraProcessedInputs = Dict[str, Any]
 
 
 class InputProcessor(Protocol):
-    """
-    Protocol for InputProcessor classes.
+    """Protocol for InputProcessor classes.
     InputProcessor's functions are more relevant to multimodal use cases:
         - Preprocess: extra steps to manipulate the prompts.
         - Forward: the main logic to process the inputs. In multimodal cases, this may run a multimodal encoder model.
@@ -122,8 +122,7 @@ class DefaultInputProcessor(InputProcessor):
 
 
 class BaseMultimodalInputProcessor(ABC):
-    """
-    Base class for multimodal input processors with default implementations
+    """Base class for multimodal input processors with default implementations
     of get_num_tokens_per_image and get_num_tokens_per_video methods.
 
     This class provides default implementations that work with most AutoProcessor-based
@@ -155,8 +154,7 @@ class BaseMultimodalInputProcessor(ABC):
         multimodal_embedding: Dict[str, List[torch.Tensor]],
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Handle externally provided multimodal input embeddings.
+        """Handle externally provided multimodal input embeddings.
 
         While inputs["multi_modal_data"] is handled by __call__, this method is intended to process
         inputs["multi_modal_embeddings"].
@@ -196,16 +194,14 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def use_fast(self) -> bool:
-        """
-        Whether to use fast tokenizer for AutoProcessor.
+        """Whether to use fast tokenizer for AutoProcessor.
         Default is True for most multimodal models.
         """
         return self._use_fast
 
     @property
     def multimodal_hashing_supported(self) -> Optional[bool]:
-        """
-        Whether multimodal hashing is supported for this processor.
+        """Whether multimodal hashing is supported for this processor.
 
         Returns None if unknown (will be detected at runtime),
         True if supported, False if not supported.
@@ -297,8 +293,7 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def get_num_multimodal_tokens(self):
-        """
-        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        """Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
         """
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
@@ -312,11 +307,13 @@ class BaseMultimodalInputProcessor(ABC):
     # Canonical encoder-side math.
     #
     # ``get_num_mm_tokens`` is the single source of truth for the
-    # input-size → token-count mapping. Two consumer paths share it:
+    # (modality, media-shape) → encoder-token-count mapping. Two consumer
+    # paths share it:
     #
-    #   * Dummy sizing (BaseMultimodalDummyInputsBuilder.get_dummy_prompt):
-    #       uses pre-merger tokens directly to size the encoder workspace
-    #       against ``encoder_max_num_tokens``.
+    #   * Dummy sizing (BaseMultimodalDummyInputsBuilder.get_dummy_prompt
+    #     and MultimodalEncoderBudget.iter_modality_dummies): uses
+    #     pre-merger tokens directly to size encoder workspaces against
+    #     ``encoder_max_num_tokens``.
     #   * Prompt-side hashing (get_num_tokens_per_image / _video):
     #       divides by ``spatial_merge_unit`` to get the placeholder count
     #       the prompt will carry.
@@ -325,6 +322,18 @@ class BaseMultimodalInputProcessor(ABC):
     # raises NotImplementedError and the hashing path falls back to the HF
     # processor delegation it already used.
     # ------------------------------------------------------------------
+    @property
+    def supported_modalities(self) -> Tuple[Modality, ...]:
+        """Modalities this processor handles end-to-end (encoder forward + dummy generation).
+
+        Override per model. Default empty — non-implementing processors
+        keep the legacy HF-processor delegation path in
+        :meth:`get_num_tokens_per_image` / :meth:`get_num_tokens_per_video`
+        and skip per-modality dummy iteration in
+        :class:`tensorrt_llm._torch.pyexecutor.multimodal_budget.MultimodalEncoderBudget`.
+        """
+        return ()
+
     @property
     def spatial_merge_unit(self) -> int:
         """Encoder→LLM token ratio.
@@ -337,21 +346,35 @@ class BaseMultimodalInputProcessor(ABC):
 
     def get_num_mm_tokens(
         self,
+        modality: Modality,
         *,
-        width: int,
-        height: int,
-        num_frames: int = 1,
+        # image / video
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        # audio
+        audio_length: Optional[int] = None,
+        **kwargs,
     ) -> int:
-        """Return encoder attention tokens (pre-merger) for given media size.
+        """Return encoder attention tokens (pre-merger) for one media item.
 
-        Single source of truth for the encoder-side math, in the same unit
-        as ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
-        Subclasses opt in by overriding this method; default raises
-        ``NotImplementedError`` so the legacy HF-processor delegation in
-        :meth:`get_num_tokens_per_image` / :meth:`get_num_tokens_per_video`
-        remains the fallback.
+        ``modality`` selects which kwargs the implementation reads:
+
+        * ``Modality.IMAGE`` — ``width``, ``height``
+        * ``Modality.VIDEO`` — ``width``, ``height``, ``num_frames``
+        * ``Modality.AUDIO`` — ``audio_length``
+        * future modalities — add modality-specific kwargs without
+          breaking this signature (``**kwargs`` is open-ended).
+
+        Result is in the same unit as ``encoder_max_num_tokens`` and
+        ``AttentionMetadata.max_num_tokens``. Subclasses opt in by
+        overriding; default raises ``NotImplementedError`` so the legacy
+        HF-processor delegation in :meth:`get_num_tokens_per_image` /
+        :meth:`get_num_tokens_per_video` remains the fallback.
         """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_num_mm_tokens "
+            f"for modality={modality}")
 
     def get_num_tokens_per_image(
         self,
@@ -359,8 +382,7 @@ class BaseMultimodalInputProcessor(ABC):
         image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
-        """
-        Calculate the number of tokens generated for an image.
+        """Calculate the number of tokens generated for an image.
 
         Tries the deterministic ``get_num_mm_tokens`` path first
         (encoder-side math, divided by ``spatial_merge_unit`` to land in
@@ -384,7 +406,8 @@ class BaseMultimodalInputProcessor(ABC):
             image_h, image_w = image.height, image.width
 
         try:
-            encoder_tokens = self.get_num_mm_tokens(width=image_w,
+            encoder_tokens = self.get_num_mm_tokens(Modality.IMAGE,
+                                                    width=image_w,
                                                     height=image_h,
                                                     num_frames=1)
             return encoder_tokens // self.spatial_merge_unit
@@ -400,8 +423,7 @@ class BaseMultimodalInputProcessor(ABC):
         video_audio: Optional[Any] = None,
         **kwargs,
     ):
-        """
-        Calculate the number of tokens generated for a video.
+        """Calculate the number of tokens generated for a video.
 
         Tries the deterministic ``get_num_mm_tokens`` path first (passing
         ``num_frames`` so subclasses can account for temporal patching).
@@ -431,7 +453,8 @@ class BaseMultimodalInputProcessor(ABC):
             frame_h, frame_w = first_frame.height, first_frame.width
 
         try:
-            encoder_tokens = self.get_num_mm_tokens(width=frame_w,
+            encoder_tokens = self.get_num_mm_tokens(Modality.VIDEO,
+                                                    width=frame_w,
                                                     height=frame_h,
                                                     num_frames=num_frames)
             return encoder_tokens // self.spatial_merge_unit
@@ -491,32 +514,84 @@ class BaseMultimodalDummyInputsBuilder(ABC):
 
     def get_size_with_most_features(
         self,
+        modality: Modality,
         *,
         max_tokens: int,
     ) -> Dict[str, int]:
         """Inverse of :meth:`get_num_mm_tokens`.
 
-        Returns ``{'width', 'height', 'num_frames'}`` selecting the largest
-        media size whose attention-token count is ``<= max_tokens`` while
-        keeping the aspect ratio bounded. ``max_tokens`` is in pre-merger
-        units (same as ``get_num_mm_tokens``).
+        Returns a modality-shaped dict (kwargs that can be passed straight
+        back into ``get_num_mm_tokens``):
+
+        * ``Modality.IMAGE`` → ``{"width", "height"}``
+        * ``Modality.VIDEO`` → ``{"width", "height", "num_frames"}``
+        * ``Modality.AUDIO`` → ``{"audio_length"}``
+
+        Picks the largest spec under the aspect-ratio / sample-rate bounds
+        the model uses in production. ``max_tokens`` is in pre-merger units
+        (same as ``get_num_mm_tokens``).
 
         Default raises ``NotImplementedError`` matching
         :meth:`get_num_mm_tokens`.
         """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement "
+            f"get_size_with_most_features for modality={modality}")
 
     def get_dummy_image(self, *, width: int, height: int) -> Image.Image:
         return Image.new("RGB", (width, height), color=random.randint(0, 256))
 
-    def get_dummy_prompt(self, input_seq_len: int):
-        """Build a multimodal prompt that fits ``input_seq_len`` LLM tokens.
+    def get_dummy_media(self, modality: Modality, size: Dict[str, int]) -> Any:
+        """Create a concrete dummy media instance for one item.
+
+        Default routes by modality:
+
+        * ``IMAGE`` → :meth:`get_dummy_image`
+        * ``VIDEO`` → list of ``num_frames`` dummy images
+        * ``AUDIO`` → zero-filled ``np.ndarray`` of length ``audio_length``
+
+        Override for model-specific dummies (non-RGB images, specific
+        sample rates, etc.).
+        """
+        if modality == Modality.IMAGE:
+            return self.get_dummy_image(width=size["width"],
+                                        height=size["height"])
+        if modality == Modality.VIDEO:
+            frames = max(int(size.get("num_frames", 1)), 1)
+            return [
+                self.get_dummy_image(width=size["width"], height=size["height"])
+                for _ in range(frames)
+            ]
+        if modality == Modality.AUDIO:
+            import numpy as np
+            length = int(size["audio_length"])
+            return np.zeros(length, dtype=np.float32)
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_dummy_media "
+            f"for modality={modality}")
+
+    def get_dummy_prompt(
+        self,
+        input_seq_len: int,
+        modality: Optional[Modality] = None,
+    ):
+        """Build a single-modality dummy prompt sized to fit ``input_seq_len``.
 
         ``input_seq_len`` is in LLM-visible (post-merger) units. The encoder
         budget that produces this many LLM tokens is
-        ``input_seq_len * spatial_merge_unit``; that's the value handed to
+        ``input_seq_len * spatial_merge_unit``; that value is handed to
         :meth:`get_size_with_most_features`, which deterministically picks
-        the dummy image dimensions in one shot — no iterative halving.
+        the media spec in one shot — no iterative halving.
+
+        ``modality`` selects which modality the dummy uses. When omitted,
+        picks the worst-case from ``supported_modalities`` — the one whose
+        max-sized item produces the most encoder tokens. Per-modality
+        dummy iteration (one dummy per supported modality, needed for
+        multi-encoder models) is driven externally by
+        :class:`MultimodalEncoderBudget.iter_modality_dummies`.
+
+        Returns ``None`` when the subclass has not opted into deterministic
+        sizing for any modality (caller falls back to text-only dummy).
         """
         if input_seq_len <= 0:
             return None
@@ -527,20 +602,31 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         # uses (e.g. unit tests) from crashing on no-merger setups.
         spatial_merge_unit = getattr(self, "spatial_merge_unit", 1)
         encoder_budget = input_seq_len * spatial_merge_unit
-        try:
-            size = self.get_size_with_most_features(max_tokens=encoder_budget)
-        except NotImplementedError:
-            # Model hasn't opted into deterministic dummy sizing yet.
-            # Returning None makes the caller (_create_dummy_mm_context_request)
-            # fall back to a text-only dummy with a warning. Migrating the model
-            # by implementing `get_num_mm_tokens` / `get_size_with_most_features`
-            # re-enables encoder workspace pre-allocation in KV cache profiling.
+
+        if modality is None:
+            modality, size = self._pick_worst_case_modality_and_size(
+                encoder_budget)
+        else:
+            try:
+                size = self.get_size_with_most_features(
+                    modality, max_tokens=encoder_budget)
+            except NotImplementedError:
+                modality, size = None, None
+
+        if modality is None or size is None:
+            # Subclass hasn't opted into deterministic sizing for any of its
+            # supported modalities yet. Returning None lets the caller
+            # (_create_dummy_mm_context_request) fall back to a text-only
+            # dummy with a warning. Migrating the model by implementing
+            # ``get_num_mm_tokens`` / ``get_size_with_most_features`` for at
+            # least one modality re-enables encoder workspace pre-allocation
+            # in KV cache profiling.
             logger.debug(
                 f"[get_dummy_prompt] {type(self).__name__} has not implemented "
                 f"deterministic dummy sizing; falling back to text-only dummy.")
             return None
 
-        image = self.get_dummy_image(width=size["width"], height=size["height"])
+        media = self.get_dummy_media(modality, size)
 
         # Use the registered model_type from the decorator if available,
         # otherwise fall back to HuggingFace config's model_type.
@@ -552,24 +638,48 @@ class BaseMultimodalDummyInputsBuilder(ABC):
 
         logger.debug(
             f"[get_dummy_prompt] registered_model_type={registered_model_type}, "
-            f"config.model_type={config_model_type}, using model_type={model_type}"
-        )
+            f"config.model_type={config_model_type}, "
+            f"modality={modality.value}, using model_type={model_type}")
 
         return tensorrt_llm.inputs.utils.default_multimodal_input_loader(
             tokenizer=self.tokenizer,
             model_dir=self.model_path,
             model_type=model_type,
-            modality="image",
+            modality=modality.value,
             prompts=[""],
-            media=[[image]],
+            media=[[media]],
             image_data_format="pt")[0]
+
+    def _pick_worst_case_modality_and_size(
+        self,
+        encoder_budget: int,
+    ) -> Tuple[Optional[Modality], Optional[Dict[str, int]]]:
+        """Return the worst-case ``(modality, size)`` under this processor.
+
+        Iterates ``supported_modalities`` and picks the pair whose
+        ``get_num_mm_tokens`` is largest. Skips modalities the subclass
+        hasn't implemented. Returns ``(None, None)`` if no supported
+        modality is deterministically sized.
+        """
+        modalities: Tuple[Modality, ...] = getattr(self, "supported_modalities",
+                                                   ())
+        best: Optional[Tuple[Modality, Dict[str, int], int]] = None
+        for modality in modalities:
+            try:
+                size = self.get_size_with_most_features(
+                    modality, max_tokens=encoder_budget)
+                tokens = self.get_num_mm_tokens(modality, **size)
+            except NotImplementedError:
+                continue
+            if best is None or tokens > best[2]:
+                best = (modality, size, tokens)
+        return (best[0], best[1]) if best is not None else (None, None)
 
 
 class MultimodalPlaceholderPlacement(enum.Enum):
-    """
-    The placement of the multimodal placeholder in the prompt. Valid values are:
-        - BEFORE_TEXT: the placeholders are placed before the text prompt.
-        - AFTER_TEXT: the placeholders are placed after the text prompt.
+    """The placement of the multimodal placeholder in the prompt. Valid values are:
+    - BEFORE_TEXT: the placeholders are placed before the text prompt.
+    - AFTER_TEXT: the placeholders are placed after the text prompt.
     """
     INVALID = -1
     BEFORE_TEXT = 0
@@ -578,31 +688,30 @@ class MultimodalPlaceholderPlacement(enum.Enum):
 
 @dataclass(frozen=True)
 class MultimodalPlaceholderMetadata:
-    """
-    Metadata for the multimodal placeholder. It has 5 components:
-        - placeholder_map:
-            A mapping from modality to placeholder string.
-            Modality can be "image", "video", "audio", etc.
-        - placeholder_placement:
-            The placement of the placeholders, e.g. before or after the text prompt.
-            Only used when interleave_placeholders is False (the default).
-            Ignored when interleave_placeholders is True.
-        - placeholders_separator:
-            The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
-        - content_format:
-            Optional override for the content format expected by the chat template.
-            ContentFormat.OPENAI means the template handles multimodal content dicts natively.
-            ContentFormat.STRING means the template expects plain string content.
-            ContentFormat.PASSTHROUGH skips chat template rendering entirely.
-            None means auto-detect at runtime via Jinja AST analysis.
-        - interleave_placeholders:
-            When True and content_parts is available, placeholders are inserted
-            at the exact media positions within the text (interleaved).
-            In this mode, placeholder_placement is ignored - the position of
-            each placeholder is determined by where the media appears in the
-            user's message.
-            When False (default), placeholders are bulk-prepended or appended
-            according to placeholder_placement.
+    """Metadata for the multimodal placeholder. It has 5 components:
+    - placeholder_map:
+        A mapping from modality to placeholder string.
+        Modality can be "image", "video", "audio", etc.
+    - placeholder_placement:
+        The placement of the placeholders, e.g. before or after the text prompt.
+        Only used when interleave_placeholders is False (the default).
+        Ignored when interleave_placeholders is True.
+    - placeholders_separator:
+        The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
+    - content_format:
+        Optional override for the content format expected by the chat template.
+        ContentFormat.OPENAI means the template handles multimodal content dicts natively.
+        ContentFormat.STRING means the template expects plain string content.
+        ContentFormat.PASSTHROUGH skips chat template rendering entirely.
+        None means auto-detect at runtime via Jinja AST analysis.
+    - interleave_placeholders:
+        When True and content_parts is available, placeholders are inserted
+        at the exact media positions within the text (interleaved).
+        In this mode, placeholder_placement is ignored - the position of
+        each placeholder is determined by where the media appears in the
+        user's message.
+        When False (default), placeholders are bulk-prepended or appended
+        according to placeholder_placement.
     """
     placeholder_map: Dict[str, str] = field(default_factory=dict)
     placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
@@ -612,8 +721,7 @@ class MultimodalPlaceholderMetadata:
 
 
 class MultimodalPlaceholderRegistry:
-    """
-    Registry for the multimodal models to keep track of the placeholder information.
+    """Registry for the multimodal models to keep track of the placeholder information.
     """
 
     def __init__(self) -> None:
@@ -729,8 +837,7 @@ INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
 
 def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
-    """
-    Model-class decorator to declare support for multimodal disaggregated inputs.
+    """Model-class decorator to declare support for multimodal disaggregated inputs.
 
     Apply this to a model class AFTER its input processor has been registered via
     @register_input_processor. The decorator will locate the processor class,
@@ -762,9 +869,9 @@ def register_input_processor(
         processor_cls: Type[InputProcessor],
         model_type: str,
         placeholder_metadata: MultimodalPlaceholderMetadata = None):
-    """
-    Register an input processor to a model class.
-    NOTE:
+    """Register an input processor to a model class.
+
+    Note:
         1. Since this API is only used for multimodal models, we are checking
            the model type only for that.
         2. If this is used for other models in the future, this logic needs to be
@@ -967,8 +1074,7 @@ def create_input_processor_with_hash(
     def tokenized_multimodal_process(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Process prompt_token_ids and multi_modal_data without detokenizing.
+        """Process prompt_token_ids and multi_modal_data without detokenizing.
 
         Runs the input processor with dummy text placeholders for multi-modal slots,
         then replaces placeholder token IDs with the actual feature token IDs and
@@ -1038,8 +1144,7 @@ def create_input_processor_with_hash(
         precomputed_extra: Optional[ExtraProcessedInputs] = None,
         precomputed_num_mm_tokens: Optional[List[int]] = None,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Process multimodal hashing for media tokens if possible.
+        """Process multimodal hashing for media tokens if possible.
 
         precomputed_token_ids and precomputed_extra must be provided together or
         both be None. When both are provided (tokenized+MM path), skips the
