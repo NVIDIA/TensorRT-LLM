@@ -690,6 +690,20 @@ class TritonMXFP4FusedMoEQuantScales(NamedTuple):
     fc2_input_dequant: torch.Tensor
 
 
+def is_swizzling_supported() -> bool:
+    """Return whether the MXFP4 swizzled value/scale layouts work on the current CUDA device.
+
+    The swizzled layouts produced by ``make_default_matmul_mxfp4_w_layout`` /
+    ``make_default_matmul_mxfp4_w_scale_layout`` are broken on the H20 family
+    (e.g. ``NVIDIA H20``, ``NVIDIA H20-3e``), so callers must fall back to
+    ``StridedLayout`` there. H200 uses substring exclusion because its device
+    name also contains ``H20``. This is a WAR. For proper fix, see nvbugs/6026676.
+    """
+    name = torch.cuda.get_device_name()
+    is_h20_family = "H20" in name and "H200" not in name
+    return not is_h20_family
+
+
 def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     # (num_experts, in_dim//2, out_dim)
     w_shape = w.shape
@@ -717,8 +731,7 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
         mx_axis=1)
     scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=1, num_warps=num_warps)
-    # swizzling path is broken for H20
-    if torch.cuda.get_device_name() == "NVIDIA H20":
+    if not is_swizzling_supported():
         from triton_kernels.tensor_details.layout_details.strided import \
             StridedLayout
         value_layout = StridedLayout
@@ -1126,11 +1139,23 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                              scale_data):
         new_weight, new_scale = swizzle_weight_and_scale(
             weight_data, scale_data)
+        replacement_storage_ptrs = {
+            new_weight.data.untyped_storage().data_ptr(),
+            new_scale.data.untyped_storage().data_ptr(),
+        }
         for name in (weight_name, scale_name):
             old_param = module._parameters.pop(name, None)
             assert old_param is not None, \
                 f"Expected {name} to be a registered parameter before swizzling MXFP4 weights."
-            old_param.data.storage().resize_(0)
+            old_storage = old_param.data.untyped_storage()
+            # H20 uses StridedLayout as an MXFP4 swizzle fallback. That
+            # conversion can alias the original scale storage, unlike the
+            # Hopper swizzled layout path, so only release storage that is no
+            # longer backing the replacement tensor.
+            old_storage_ptr = old_storage.data_ptr()
+            if (old_storage.nbytes() > 0
+                    and old_storage_ptr not in replacement_storage_ptrs):
+                old_storage.resize_(0)
         torch.cuda.empty_cache()
         setattr(module, weight_name, new_weight)
         setattr(module, scale_name, new_scale)

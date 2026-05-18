@@ -524,3 +524,5 @@ l0_h100:
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]
   - examples/test_ad_speculative_decoding.py::test_nemotron_mtp_model_with_weights
   - examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json
+  # ------------- AutoDeploy Perf Sanity ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-llama3_1_8b_fp8_ad_hopper-llama3_1_8b_ad_ws1_1k1k] TIMEOUT (120)

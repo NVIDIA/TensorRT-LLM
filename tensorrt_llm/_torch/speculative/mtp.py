@@ -248,7 +248,6 @@ class MTPSampler(SpecSamplerBase):
         pass
 
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        self._async_worker_init(args.enable_async_worker)
         super().__init__(args, draft_len=nextn)
 
     @override

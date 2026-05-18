@@ -938,7 +938,9 @@ class Attention(nn.Module):
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:
-            assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
+            assert self.attn_backend == "TRTLLM", (
+                f"Attention sinks are only supported with attn_backend='TRTLLM'. "
+                f"Current backend: {self.attn_backend}.")
 
         attn_output = self.forward_impl(q,
                                         k,

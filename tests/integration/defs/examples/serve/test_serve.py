@@ -250,14 +250,14 @@ def test_env_overrides_pdl(tmp_path):
 
 
 @skip_pre_blackwell
-def test_nemotron_super_nvfp4(serve_test_root):
+def test_nemotron3_super_120b_nvfp4(serve_test_root):
     """Test Nemotron 3 Super 120B NVFP4 with chunked prefill + MTP=3.
 
     Sends a mix of short and long prompts concurrently to verify that the server
     starts successfully and all requests complete without errors.
     """
     model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-    config_file = f"{serve_test_root}/test_configs/Nemotron-Super-120B-NVFP4.yml"
+    config_file = f"{serve_test_root}/test_configs/Nemotron3_Super_120B_NVFP4.yml"
 
     assert os.path.exists(model_path), f"Model not found: {model_path}"
     assert os.path.exists(config_file), f"Config not found: {config_file}"
@@ -368,4 +368,273 @@ def test_nemotron_super_nvfp4(serve_test_root):
             print_info(f"[{label}] reasoning: {msg.reasoning_content!r}")
             print_info(f"[{label}] content:   {msg.content!r}")
 
-    print_info("test_nemotron_super_nvfp4 PASSED")
+    print_info("test_nemotron3_super_120b_nvfp4 PASSED")
+
+
+_NEMOTRON3_NANO_OMNI_MODEL_DIR = "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"
+# Public stable media URLs for multimodal tests.
+_OMNI_IMAGE_URL = "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png"
+_OMNI_VIDEO_URL = "https://blogs.nvidia.com/wp-content/uploads/2023/04/nvidia-studio-itns-wk53-scene-in-omniverse-1280w.mp4"
+_NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+@pytest.fixture(scope="module")
+def _nemotron3_nano_omni_server():
+    """Start the Nemotron-3-Nano-Omni-30B NVFP4 server once for all omni tests.
+
+    Module-scoped so the server starts once and stays alive across all four
+    test cases (text_reasoning_on, text_reasoning_off, image, video),
+    avoiding the cost of four separate server startups.
+    """
+    from defs.conftest import get_llm_root
+    llm_root = get_llm_root()
+    model_path = f"{llm_models_root()}/{_NEMOTRON3_NANO_OMNI_MODEL_DIR}"
+    config_file = (f"{llm_root}/tests/integration/defs/examples/serve/"
+                   f"test_configs/Nemotron3_Nano_Omni_30B_NVFP4.yml")
+
+    assert os.path.exists(model_path), f"Model not found: {model_path}"
+    assert os.path.exists(config_file), f"Config not found: {config_file}"
+
+    port = get_free_port_in_ci()
+    env = os.environ.copy()
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--trust_remote_code",
+        "--reasoning_parser",
+        "nano-v3",
+        "--tool_parser",
+        "qwen3_coder",
+        "--extra_llm_api_options",
+        config_file,
+    ]
+
+    with popen(cmd, env=env) as proc:
+        _wait_for_server_ready(proc, http_port=port, timeout=7200)
+        print_info("Nemotron-3-Nano-Omni server ready.")
+        client = OpenAI(
+            base_url=f"http://localhost:{port}/v1",
+            api_key="tensorrt_llm",
+        )
+        yield client, os.path.basename(model_path)
+
+
+# See the step-by-step recipe for Nemotron-3-Nano-Omni inference in the official usage guide:
+# https://github.com/NVIDIA-NeMo/Nemotron/blob/main/usage-cookbook/Nemotron-3-Nano-Omni/trtllm_cookbook.ipynb
+@skip_pre_blackwell
+@pytest.mark.parametrize("modality", [
+    "text_reasoning_on",
+    "text_reasoning_off",
+    "text_streaming",
+    "tool_calling",
+    "image",
+    "video",
+])
+def test_nemotron3_nano_omni_nvfp4(modality, _nemotron3_nano_omni_server):
+    """Nemotron-3-Nano-Omni-30B NVFP4 multimodal functional tests.
+
+    Parametrized over six modality cases sharing a single server instance:
+      text_reasoning_on  — haiku prompt, thinking + answer both present.
+      text_reasoning_off — short prompt, no thinking step.
+      text_streaming     — streaming chat completion, token-by-token delivery.
+      tool_calling       — function calling via OpenAI tools schema.
+      image              — image URL, non-empty description.
+      video              — video URL, non-empty description (also exercises
+                           audio extraction from the video stream).
+    """
+    client, model_name = _nemotron3_nano_omni_server
+
+    if modality == "text_reasoning_on":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Write a haiku about GPUs"
+                },
+            ],
+            temperature=0.6,
+            max_completion_tokens=4096,
+            stream=False,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(msg.reasoning_content) > 0, \
+            "empty reasoning_content — thinking step did not run"
+        assert len(msg.content) > 0, "empty content — haiku response missing"
+        print_info(
+            f"[text_reasoning_on] thinking: {msg.reasoning_content[:500]!r}...")
+        print_info(f"[text_reasoning_on] content:  {msg.content[:500]!r}...")
+
+    elif modality == "text_reasoning_off":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Give me 3 bullet points about TensorRT-LLM."
+                },
+            ],
+            temperature=0.2,
+            max_completion_tokens=256,
+            stream=False,
+            extra_body=_NO_THINK,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(msg.content) > 0, "empty content — direct answer missing"
+        print_info(f"[text_reasoning_off] content: {msg.content[:500]!r}...")
+
+    elif modality == "text_streaming":
+        stream = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "What are the first 5 prime numbers?"
+                },
+            ],
+            temperature=0.6,
+            max_completion_tokens=1024,
+            stream=True,
+        )
+        chunks = []
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                chunks.append(chunk.choices[0].delta.content)
+        full_content = "".join(chunks)
+        assert len(chunks) > 1, "expected multiple streamed chunks"
+        assert len(full_content) > 0, "empty content — streaming failed"
+        print_info(f"[text_streaming] chunks={len(chunks)}, "
+                   f"content: {full_content[:500]!r}...")
+
+    elif modality == "tool_calling":
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "calculate_tip",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bill_total": {
+                            "type": "integer",
+                            "description": "The total amount of the bill"
+                        },
+                        "tip_percentage": {
+                            "type": "integer",
+                            "description": "The percentage of tip to be applied"
+                        },
+                    },
+                    "required": ["bill_total", "tip_percentage"],
+                },
+            },
+        }]
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": ""
+                },
+                {
+                    "role":
+                    "user",
+                    "content":
+                    "My bill is $50. What will be the amount for 15% tip?"
+                },
+            ],
+            tools=tools,
+            temperature=0.6,
+            top_p=0.95,
+            max_completion_tokens=512,
+            stream=False,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert msg.tool_calls is not None and len(msg.tool_calls) > 0, \
+            "no tool_calls — function calling failed"
+        tool_call = msg.tool_calls[0]
+        assert tool_call.function.name == "calculate_tip", \
+            f"expected calculate_tip, got {tool_call.function.name}"
+        print_info(f"[tool_calling] reasoning: "
+                   f"{msg.reasoning_content[:500]!r}...")
+        print_info(f"[tool_calling] function: {tool_call.function.name}, "
+                   f"args: {tool_call.function.arguments}")
+
+    elif modality == "image":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role":
+                "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Describe what you see in this image."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _OMNI_IMAGE_URL
+                        }
+                    },
+                ],
+            }],
+            temperature=0.2,
+            max_completion_tokens=512,
+            stream=False,
+            extra_body=_NO_THINK,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(
+            msg.content) > 0, "empty content — image understanding failed"
+        print_info(f"[image] content: {msg.content[:500]!r}...")
+
+    elif modality == "video":
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role":
+                "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Describe what happens in this video."
+                    },
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": _OMNI_VIDEO_URL
+                        }
+                    },
+                ],
+            }],
+            temperature=0.2,
+            max_completion_tokens=2048,
+            stream=False,
+            extra_body=_NO_THINK,
+        )
+        assert len(resp.choices) == 1
+        msg = resp.choices[0].message
+        assert len(
+            msg.content) > 0, "empty content — video understanding failed"
+        print_info(f"[video] content: {msg.content[:500]!r}...")
