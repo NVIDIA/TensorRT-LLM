@@ -2737,3 +2737,74 @@ def test_llm_api_draft_target():
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+
+class _FakeMMProcessor:
+    """Stand-in that passes the BaseMultimodalInputProcessor isinstance check."""
+
+
+class _FakeTextProcessor:
+    """Stand-in for a non-multimodal processor."""
+
+
+def test_maybe_disable_block_reuse_for_multimodal_default_flips():
+    from unittest.mock import patch
+
+    from tensorrt_llm.llmapi.llm import \
+        _maybe_disable_block_reuse_for_multimodal
+
+    cfg = KvCacheConfig()
+    assert cfg.enable_block_reuse is True
+    assert "enable_block_reuse" not in cfg.model_fields_set
+
+    with patch("tensorrt_llm.llmapi.llm.BaseMultimodalInputProcessor",
+               _FakeMMProcessor):
+        flipped = _maybe_disable_block_reuse_for_multimodal(
+            _FakeMMProcessor(), cfg)
+
+    assert flipped is True
+    assert cfg.enable_block_reuse is False
+
+
+def test_maybe_disable_block_reuse_for_multimodal_explicit_true_respected():
+    from unittest.mock import patch
+
+    from tensorrt_llm.llmapi.llm import \
+        _maybe_disable_block_reuse_for_multimodal
+
+    cfg = KvCacheConfig(enable_block_reuse=True)
+    assert "enable_block_reuse" in cfg.model_fields_set
+
+    with patch("tensorrt_llm.llmapi.llm.BaseMultimodalInputProcessor",
+               _FakeMMProcessor):
+        flipped = _maybe_disable_block_reuse_for_multimodal(
+            _FakeMMProcessor(), cfg)
+
+    assert flipped is False
+    assert cfg.enable_block_reuse is True
+
+
+def test_maybe_disable_block_reuse_for_multimodal_text_only_untouched():
+    from tensorrt_llm.llmapi.llm import \
+        _maybe_disable_block_reuse_for_multimodal
+
+    cfg = KvCacheConfig()
+    flipped = _maybe_disable_block_reuse_for_multimodal(
+        _FakeTextProcessor(), cfg)
+
+    assert flipped is False
+    assert cfg.enable_block_reuse is True
+
+
+def test_maybe_disable_block_reuse_for_multimodal_handles_none_config():
+    from unittest.mock import patch
+
+    from tensorrt_llm.llmapi.llm import \
+        _maybe_disable_block_reuse_for_multimodal
+
+    with patch("tensorrt_llm.llmapi.llm.BaseMultimodalInputProcessor",
+               _FakeMMProcessor):
+        flipped = _maybe_disable_block_reuse_for_multimodal(
+            _FakeMMProcessor(), None)
+
+    assert flipped is False
