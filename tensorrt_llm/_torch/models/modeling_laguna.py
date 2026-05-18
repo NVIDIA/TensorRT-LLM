@@ -285,6 +285,7 @@ class LagunaAttention(QKNormRoPEAttention):
                 dtype=config.torch_dtype,
                 mapping=model_config.mapping,
                 tensor_parallel_mode=g_tp_mode,
+                quant_config=model_config.get_quant_config(),
             )
 
     @staticmethod
