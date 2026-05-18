@@ -203,6 +203,22 @@ class TestDefaultADPRouter:
         assert len(result[0]) == 1
         assert len(result[1]) == 0
 
+    def test_none_attention_dp_relax_is_relaxed(self):
+        router = DefaultADPRouter(dist=_mock_dist())
+        states = [
+            RankState(rank=0, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
+        ]
+        req_relax = _make_request_item(1, target_dp_rank=0, attention_dp_relax=None)
+        req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
+
+        result, _ = router.route_requests(
+            states, [req_relax, req_strict], max_num_active_requests=1
+        )
+
+        assert result[0] == [req_strict]
+        assert req_relax in result[1]
+
     def test_favors_less_loaded_rank(self):
         router = DefaultADPRouter(dist=_mock_dist())
         states = [
@@ -925,6 +941,18 @@ class TestKVCacheAwareADPRouterRouting:
         result, _ = router.route_requests(self._rank_states(2), [req], max_num_active_requests=10)
         assert result[0] == []
         assert result[1] == [req]
+
+    def test_none_attention_dp_relax_is_relaxed(self):
+        router = self._make_router(tp_size=2)
+        req_relax = _make_request_item(1, target_dp_rank=0, attention_dp_relax=None)
+        req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
+
+        result, _ = router.route_requests(
+            self._rank_states(2), [req_relax, req_strict], max_num_active_requests=1
+        )
+
+        assert result[0] == [req_strict]
+        assert req_relax in result[1]
 
     def test_match_rate_threshold_gates_cache_affinity(self):
         """With rank 0 loaded but holding cache, and rank 1 idle with no
