@@ -113,8 +113,8 @@ NP=$NP ./mpi_launch.sh ./run.sh config_gen.yaml \
     --seq-len-kv-cache $((2049 + (BATCH_SIZE / 2 + 25) * 1)) \
     --balance-method NotModified \
     --replay-file-path "$PROFILE_DIR/calibration_data.json" \
-    --replay-start $((BATCH_SIZE + 10 + 5)) \
-    --replay-stop $((BATCH_SIZE + 35))
+    --replay-start-iter $((BATCH_SIZE + 10 + 5)) \
+    --replay-stop-iter $((BATCH_SIZE + 35))
 
 # Step 4
 

@@ -396,10 +396,6 @@ def test_SleepConfig_is_picklable():
     cfg_default = SleepConfig()
     rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
     assert rt.restore_modes == cfg_default.restore_modes
-    # Verify the default_factory still works after round-trip (i.e. missing
-    # keys return a RestoreMode, not raise KeyError).
-    missing_key = ExecutorMemoryType.SAMPLER
-    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
 
 
 @force_ampere
@@ -417,6 +413,25 @@ def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
         ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
     assert rt_custom.restore_modes[
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+
+
+@force_ampere
+def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
+    """The defaultdict default_factory must remain functional after pickle.
+
+    Missing keys should return a valid RestoreMode rather than raising
+    KeyError, proving the factory (not just the already-present entries)
+    was serialised correctly.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+
+    missing_key = ExecutorMemoryType.SAMPLER
+    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
+    assert rt.restore_modes[missing_key] == cfg_default.restore_modes[
+        missing_key]
 
 
 def test_DynamicBatchConfig_declaration():
@@ -1686,7 +1701,6 @@ class TestPydanticBestPractices:
             "checkpoint_loader",  # abstract base class type
         ],
         AutoDeployLlmArgs: [
-            "draft_checkpoint_loader",  # typed as object due to circular import
             "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
             "model_kwargs",  # typed as Dict[str, Any] for flexibility
             "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)

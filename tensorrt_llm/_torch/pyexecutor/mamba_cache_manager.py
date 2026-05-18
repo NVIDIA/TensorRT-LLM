@@ -891,7 +891,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
             execution_stream,
-            speculative_num_draft_tokens=(spec_config.max_draft_len
+            speculative_num_draft_tokens=(spec_config.tokens_per_gen_step - 1
                                           if spec_config is not None else None),
             model_type=model_type,
             use_replay_state_update=use_replay_state_update,
@@ -1534,7 +1534,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
         if self.spec_config is not None:
-            speculative_num_draft_tokens = self.spec_config.max_draft_len
+            # DFlash/PARD use 2K query tokens per gen, so size by tokens_per_gen_step.
+            speculative_num_draft_tokens = self.spec_config.tokens_per_gen_step - 1
             num_local_mamba_layers = len(self.mamba_pp_layers)
 
             # Legacy SSM intermediate buffer is only needed when replay is

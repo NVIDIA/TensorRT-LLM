@@ -6,7 +6,7 @@ This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1/D
 
 To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container.
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container.
 
 > [!NOTE]
 > This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.

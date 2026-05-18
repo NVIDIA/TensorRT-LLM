@@ -696,7 +696,8 @@ def test_trtllm_bench_sanity(llm_root, llm_venv, engine_dir, model_subdir,
                              model_name, quant, streaming, use_extra_config,
                              pytorch_backend_config,
                              temp_extra_llm_api_options_file):
-    """Sanity check on the new benchmark script to make sure it works
+    """Sanity check on the new benchmark script to make sure it works.
+
     - meta-llama/Llama-3.1-8B for baseline
     - fp16 and fp8 to test quantization
     """
@@ -806,7 +807,8 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
 @pytest.mark.parametrize("quant", [None, "FP8"], ids=["FP16", "FP8"])
 def test_trtllm_bench_latency_sanity(llm_root, llm_venv, engine_dir,
                                      model_subdir, model_name, quant):
-    """Sanity check on the new benchmark script to make sure it works
+    """Sanity check on the new benchmark script to make sure it works.
+
     - meta-llama/Llama-3.1-8B for baseline
     - fp16 and fp8 to test quantization
     """
@@ -1054,6 +1056,19 @@ def test_openai_misc_example(llm_root, llm_venv, backend: str):
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_misc.py"), "-k", backend
+    ])
+
+
+def test_openai_kv_cache_contamination(llm_root, llm_venv):
+    """NVBug 6025177 regression: cross-request KV-cache contamination on cancel-during-chunked-prefill.
+
+    PyTorch backend only — the bug lives in
+    the PyExecutor chunked-prefill / store_context_blocks path.
+    """
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest", "-v",
+        str(test_root / "_test_openai_kv_cache_contamination.py")
     ])
 
 
@@ -1772,6 +1787,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 @pytest.mark.skip_less_device(8)
 def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
     """Test DeepSeek-R1 FP4 with MTP speculative decoding using BenchRunner.
+
     The goal is to test the bug fix for https://nvbugs/5670108.
     Average input sequence length: 1k, average output sequence length: 10k.
     """

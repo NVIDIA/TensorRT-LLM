@@ -60,6 +60,7 @@ from _torch.modules.moe.moe_test_utils import (
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
+    skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -830,14 +831,14 @@ DTYPES = [
 # Set TRTLLM_TEST_MOE_CI=0 for the full local config matrix.
 CI_MOE_MODEL_CONFIGS = [
     MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
-    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
+    MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
 ]
 
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
-    MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
+    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(384, 8, 7168, 2048),  # Kimi-K2
     # === Boundary Tests: num_experts / top_k ===
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
@@ -1314,8 +1315,10 @@ def test_configurable_moe_single_gpu(
     4. swiglu_gptoss_style (SwiGLU with custom parameters) works correctly
     """
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    backend_type = MoeBackendType(moe_backend)
+    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
-        backend_type=MoeBackendType(moe_backend),
+        backend_type=backend_type,
         quant_algo=quant_algo,
         model_config=model_config,
         routing_method_cls=routing_method_cls,
@@ -1500,8 +1503,10 @@ def test_configurable_moe_multi_gpu(
     swiglu_limit,
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    backend_type = MoeBackendType(moe_backend)
+    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
-        backend_type=MoeBackendType(moe_backend),
+        backend_type=backend_type,
         quant_algo=quant_algo,
         model_config=model_config,
         routing_method_cls=routing_method_cls,
@@ -1854,6 +1859,8 @@ def test_configurable_moe_multi_gpu_eplb(
     num_slots,
     routing_method_cls,
 ):
+    skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
+
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
         model_config.hidden_size,

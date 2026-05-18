@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """LTX2 Text/Image-to-Video generation using TensorRT-LLM Visual Generation."""
 
 import argparse
@@ -201,9 +204,10 @@ def parse_args():
         type=str,
         default="",
         help=(
-            "Path to the learned LatentUpsampler checkpoint (.safetensors). "
-            "When provided, the pipeline uses two-stage generation: stage 1 "
-            "at half resolution, learned 2x upsample, stage 2 refinement."
+            "Optional path to the learned LatentUpsampler checkpoint (.safetensors). "
+            "If omitted, VisualGen tries to discover it next to the model checkpoint. "
+            "When available, the pipeline uses two-stage generation: stage 1 at half "
+            "resolution, learned 2x upsample, stage 2 refinement."
         ),
     )
     parser.add_argument(
@@ -211,8 +215,9 @@ def parse_args():
         type=str,
         default="",
         help=(
-            "Path to the distilled LoRA checkpoint (.safetensors) for "
-            "stage 2 refinement. The LoRA weights are merged into the "
+            "Optional path to the distilled LoRA checkpoint (.safetensors) for "
+            "stage 2 refinement. If omitted, VisualGen tries to discover it next "
+            "to the model checkpoint. The LoRA weights are merged into the "
             "transformer for stage 2 and un-merged afterwards."
         ),
     )
@@ -333,6 +338,7 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
 def _build_diffusion_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
     if args.enable_cache_dit:
+        logger.info("Cache DiT enabled; LTX2 will run as a one-stage pipeline.")
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
     else:
         cache_kwargs = {}
@@ -371,15 +377,6 @@ def _build_diffusion_args(args) -> VisualGenArgs:
 
 def main():
     args = parse_args()
-
-    if bool(args.spatial_upsampler_path) != bool(args.distilled_lora_path):
-        missing = (
-            "--distilled_lora_path" if args.spatial_upsampler_path else "--spatial_upsampler_path"
-        )
-        raise ValueError(
-            f"Two-stage pipeline requires both --spatial_upsampler_path and "
-            f"--distilled_lora_path, but {missing} was not provided."
-        )
 
     attn2d_size = args.attn2d_row_size * args.attn2d_col_size
     if attn2d_size > 1 and args.ulysses_size > 1:
