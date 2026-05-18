@@ -45,9 +45,9 @@ inline constexpr uint32_t nbKParts = exactDiv(validElemsPerKHead, partElemsK);
 inline constexpr uint32_t nbQParts = nbKParts;
 
 inline constexpr uint32_t tokensPerTile = 64;
-inline constexpr uint32_t partElemsV = 128;
 inline constexpr uint32_t nbVSplit = 2;
 inline constexpr uint32_t gemm1V = exactDiv(validElemsPerVHead, nbVSplit);
+inline constexpr uint32_t partElemsV = headGrpSize <= 32 ? exactDiv(gemm1V, 4U) : 128;
 inline constexpr uint32_t nbProducerCtasPerCga = nbVSplit;
 
 inline constexpr uint32_t multiBlockMinNbTilesPerCta = 2;
@@ -403,6 +403,7 @@ struct SharedMemB
 
     using VBuffer
         = Vec<Array2D<LdGrain, tokensPerTile, exactDiv(partElemsV, grainElems)>, exactDiv(gemm1V, partElemsV)>;
+    static_assert(VBuffer::size == consumerCtaShapeX);
 
     // x and v are using gemmK=128 per iteration. If we see high pressure on shared memory capacity, we can change to 64
     // in the future.
