@@ -39,21 +39,17 @@ class CacheReuseAdapter(ABC):
 
     @abstractmethod
     def _global_cached_token_count(self, req: LlmRequest) -> int:
-        """Block-aligned cached prefix length reported by the cache manager."""
+        """Block-aligned cached prefix length (always non-negative)."""
 
     def get_cached_token_count_per_layer_group(
         self,
         req: LlmRequest,
         layer_groups: Sequence[AttentionLayerGroup],
     ) -> List[int]:
-        """Per-layer-group cached prefix in tokens (block-aligned).
-
-        Returns the reuse-hit prefix only; SWA stale-region handling lives at
-        the transfer call site (it is a transport concern, not a cache one).
-        """
+        """Per-layer-group reuse-hit prefix (SWA stale handling lives at the transfer call site)."""
         if not self.enable_block_reuse:
             return [0] * len(layer_groups)
-        scalar = max(0, self._global_cached_token_count(req))
+        scalar = self._global_cached_token_count(req)
         return [scalar] * len(layer_groups)
 
     @abstractmethod
