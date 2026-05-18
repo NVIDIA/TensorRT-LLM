@@ -1571,16 +1571,37 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     bool const useMultiPassRadixPath
         = !is_prefill && multi_pass_radix_eligible(numRows, numColumns) && scratch != nullptr && scratchBytes > 0;
 
-    // INVARIANT: kSortingAlgorithmThreshold is the ORIGINAL TRT-LLM Radix-path
-    // internal boundary (Insertion vs Radix-radix). v1.2.X dispatcher leaves it
-    // at 12288 — the GVR Heuristic axis (kSeqSmall, see below) is INDEPENDENT,
-    // so when canUseHeuristic is false (e.g. preIdx missing, BS too large, or
-    // numColumns < kSeqSmall), this function falls back to BYTE-IDENTICAL
-    // original radix dispatcher behavior. Do not touch this constant.
-    constexpr int kSortingAlgorithmThreshold = 12288;
-    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
+    // kSortingAlgorithmThreshold (Insertion vs single-block radix boundary)
+    // and the default split-work threshold are now numRows + is_prefill
+    // aware. Behavior at the historical low-bs default (numRows < 1024,
+    // !is_prefill) is preserved at the original 12288 boundary. Cutoffs at
+    // higher BS were picked empirically (see PR description bake-off).
+    //
+    //   is_prefill:           force insertion-sort everywhere — per-row work
+    //                         is bounded by the small (1..bs) row lengths the
+    //                         prefill harness emits, so radix's BlockRadixSort
+    //                         overhead is wasted.
+    //   numRows >= 4096:      insertion-sort stretches up to the split-work
+    //                         boundary; the cheap path saturates the GPU.
+    //   numRows >= 1024:      insertion-sort to 100k (covers seq~64k-98k).
+    //   else:                 12288 (upstream default).
+    int const kSortingAlgorithmThreshold = is_prefill ? (1 << 30)
+        : (numRows >= 4096)                           ? 200 * 1000
+        : (numRows >= 1024)                           ? 100 * 1000
+                                                      : 12288;
+    // Split-work tier cutoff: callers can still override with `splitWorkThreshold > 0`.
+    //   numRows >= 128:       single-block always saturates; never split.
+    //   numRows >= 64:        single-block to ~524k.
+    //   numRows > 8:          200k (upstream default).
+    //   numRows <= 8:         fused split-work earlier (65k) — low-bs path
+    //                         under-uses the GPU otherwise.
+    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30)
+        : (numRows >= 128)                            ? (1 << 30)
+        : (numRows >= 64)                             ? 524 * 1024
+        : (numRows > 8)                               ? 200 * 1000
+                                                      : 65 * 1024;
+    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
-    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
     // ========================================================================
     // Small-N dispatch axis.
@@ -1596,8 +1617,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     //   N=131072 : Heuristic 43.4 µs vs Radix 76.1 µs (heuristic 1.75× faster)
     //
     // Route N < kSeqSmall to the existing Radix/Insertion path (which itself
-    // splits at kSortingAlgorithmThreshold=12288). kSeqSmall is set at the
-    // empirical crossover point.
+    // splits at the numRows-aware kSortingAlgorithmThreshold computed above).
+    // kSeqSmall is set at the empirical crossover point.
     //
     // ========================================================================
     // Architecture-derived BS-threshold dispatch — jointly bounded by
