@@ -158,9 +158,10 @@ def _maybe_disable_block_reuse_for_multimodal(input_processor,
         return False
     logger.warning(
         "Disabling kv_cache_config.enable_block_reuse for multimodal model. "
-        "Prefix-block reuse is not yet safe for multimodal inputs. Pass "
-        "kv_cache_config.enable_block_reuse=True explicitly via "
-        "--extra_llm_api_options to opt back in.")
+        "Prefix-block reuse is not yet safe for multimodal inputs. To opt "
+        "back in, pass KvCacheConfig(enable_block_reuse=True) to the LLM "
+        "API, or set kv_cache_config.enable_block_reuse=true in the YAML "
+        "passed to trtllm-serve --extra_llm_api_options.")
     kv_cache_config.enable_block_reuse = False
     return True
 
