@@ -133,39 +133,7 @@ def _inject_out_param(submod: GraphModule) -> None:
     with graph.inserting_after(last_placeholder):
         out_placeholder = graph.placeholder("out", default_value=None)
 
-    # If the target op has `out` in the *middle* of its schema (e.g.
-    # trtllm_attention_mha_with_cache: out_scale, out, rotary_cos_sin, ...),
-    # the cached-attn insertion in transform/library/kvcache.py will have
-    # passed `None` for `out` positionally to keep the positional ordering of
-    # the params after it. Setting `out=out_placeholder` as a kwarg on top of
-    # that produces a duplicate binding (PyTorch reports "received N+1
-    # arguments"). Convert any positional args at/after the schema `out`
-    # position into kwargs, then bind `out` as a kwarg.
-    schema_args = target_node.target._schema.arguments
-    schema_names = [a.name for a in schema_args]
-    try:
-        out_idx = schema_names.index("out")
-    except ValueError as e:
-        raise RuntimeError(
-            f"_inject_out_param: dynamic cached op {target_node.target} has no "
-            "'out' parameter in its schema; cannot wire pre-allocated buffer."
-        ) from e
-
-    new_args = list(target_node.args)
-    new_kwargs = dict(target_node.kwargs)
-    if len(new_args) > out_idx:
-        for i in range(out_idx, len(new_args)):
-            name = schema_names[i]
-            if name == "out":
-                # Will be set explicitly below; drop the positional None.
-                continue
-            # Don't overwrite an existing kwarg if for some reason it's already set.
-            new_kwargs.setdefault(name, new_args[i])
-        new_args = new_args[:out_idx]
-
-    new_kwargs["out"] = out_placeholder
-    target_node.args = tuple(new_args)
-    target_node.kwargs = new_kwargs
+    target_node.kwargs = {**dict(target_node.kwargs), "out": out_placeholder}
 
     with graph.inserting_after(target_node):
         coalesce_node = graph.call_function(_coalesce_output, args=(target_node, out_placeholder))
