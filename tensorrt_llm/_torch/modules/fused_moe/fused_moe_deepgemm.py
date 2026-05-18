@@ -377,7 +377,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
-    _SUPPORTED_SM_VERSIONS = {100, 103}
+    _SUPPORTED_SM_VERSIONS = (100, 103)
 
     @classmethod
     def can_implement(

@@ -5,6 +5,7 @@ from typing import Dict, Optional, Type
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -48,7 +49,6 @@ def get_moe_cls(
             )
             return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
-        from tensorrt_llm._utils import get_sm_version
         sm_version = get_sm_version()
         if sm_version not in DeepGemmFusedMoE._SUPPORTED_SM_VERSIONS:
             logger.warning(
@@ -64,7 +64,6 @@ def get_moe_cls(
             )
             return CutlassFusedMoE
         # DenseGEMM CuTe DSL kernels only support SM100/SM103.
-        from tensorrt_llm._utils import get_sm_version
         sm_version = get_sm_version()
         if sm_version not in DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS:
             logger.warning(
