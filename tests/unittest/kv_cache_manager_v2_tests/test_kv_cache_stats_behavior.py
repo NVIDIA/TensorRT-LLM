@@ -359,6 +359,49 @@ def test_reverted_generation_allocation_does_not_report_stats(resource_guard) ->
     _assert_iteration_delta(stats_report.by_window_size[manager.max_seq_len])
 
 
+def test_reverted_context_allocation_does_not_report_pending_stats(resource_guard) -> None:
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(_create_manager(gpu_bytes=8 << 20), request)
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    request.context_current_position = 4
+    request.context_remaining_length = 4
+    manager.update_context_resources(_context_batch(request))
+    first_chunk_stats = _commit_and_get_stats(manager, _context_batch(request))
+    _assert_iteration_delta(first_chunk_stats, alloc_total=1, alloc_new=1, missed=1)
+    assert request.kv_cache_perf_metric_calls == [
+        _metric_call(alloc_total=1, alloc_new=1, missed=1),
+    ]
+
+    request.is_first_context_chunk = False
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    manager.revert_allocate_context(request)
+    manager.commit_scheduled_kv_cache_stats(_context_batch(request))
+
+    reverted_stats_report = manager.get_iteration_stats()
+    assert reverted_stats_report is not None
+    _assert_iteration_delta(reverted_stats_report.by_window_size[manager.max_seq_len])
+    assert request.kv_cache_perf_metric_calls == [
+        _metric_call(alloc_total=1, alloc_new=1, missed=1),
+    ]
+    kv_stats = manager.get_kv_cache_stats()
+    assert kv_stats.alloc_total_blocks == 1
+    assert kv_stats.alloc_new_blocks == 1
+    assert kv_stats.missed_blocks == 1
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    _finish_context(manager, request)
+    second_chunk_stats = _commit_and_get_stats(manager, _context_batch(request))
+    _assert_iteration_delta(second_chunk_stats, alloc_total=1, alloc_new=1, missed=1)
+    assert request.kv_cache_perf_metric_calls == [
+        _metric_call(alloc_total=1, alloc_new=1, missed=1),
+        _metric_call(alloc_total=1, alloc_new=1, missed=1),
+    ]
+
+
 def test_chunked_context_reports_generation_alloc_only_in_generation(resource_guard) -> None:
     request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
     manager = resource_guard(_create_manager(gpu_bytes=8 << 20), request)
