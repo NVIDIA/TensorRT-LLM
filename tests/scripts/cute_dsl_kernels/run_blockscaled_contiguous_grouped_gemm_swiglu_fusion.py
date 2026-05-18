@@ -440,7 +440,7 @@ def run(
     use_cold_l2: bool = False,
     permuted_m: int = None,
     use_cupti: bool = False,
-    swiglu_limit: float = float('inf'),
+    swiglu_limit: float = float("inf"),
     **kwargs,
 ):
     """Prepare A/B/C tensors, launch GPU kernel, and reference checking.
@@ -628,7 +628,7 @@ def run(
         ref_up = ref.index_select(1, up_idx)
         ref_gate = ref.index_select(1, gate_idx)
         # SwiGLU clamp
-        if swiglu_limit != float('inf'):
+        if swiglu_limit != float("inf"):
             ref_gate = ref_gate.clamp(max=swiglu_limit)
             ref_up = ref_up.clamp(min=-swiglu_limit, max=swiglu_limit)
         ref_after_swiglu = ref_up * (ref_gate * torch.sigmoid(ref_gate))
@@ -1005,7 +1005,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--swiglu_limit",
         type=float,
-        default=float('inf'),
+        default=float("inf"),
         help="Swiglu clamp factor, +inf (default) disables clamp",
     )
 

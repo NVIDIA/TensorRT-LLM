@@ -181,7 +181,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
-        swiglu_limit: cutlass.Float32 = float('inf'),
+        swiglu_limit: cutlass.Float32 = float("inf"),
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with SwiGLU fusion.
 
@@ -269,7 +269,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         self.vectorized_f32 = vectorized_f32
 
         self.swiglu_limit = swiglu_limit
-        self.has_swiglu_limit = (swiglu_limit != float('inf'))
+        self.has_swiglu_limit = swiglu_limit != float("inf")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1822,7 +1822,9 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                             acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
                             if cutlass.const_expr(self.has_swiglu_limit):
                                 acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
-                                acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
+                                acc_vec_up_alpha = fclip_xorsign(
+                                    acc_vec_up_alpha, self.swiglu_limit
+                                )
                             tCompute[i] = acc_vec_up_alpha * silu_f32(
                                 acc_vec_gate_alpha, fastmath=True
                             )
