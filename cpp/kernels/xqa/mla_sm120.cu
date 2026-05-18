@@ -1879,34 +1879,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, 1) void reduce_mla_flash_decode_p
         return;
     }
 
-    __shared__ float finalRowMax[PartialResult::nbRowsPerChunk];
-    __shared__ float finalRowSum[PartialResult::nbRowsPerChunk];
-
     uint32_t const tid = threadIdx.x;
-    if (tid < PartialResult::nbRowsPerChunk)
-    {
-        float rowMax = safeInitRowMax;
-#pragma unroll 1
-        for (uint32_t idxSubSeq = 0; idxSubSeq < nbSubSeq; idxSubSeq++)
-        {
-            PartialResult::Chunk const& chunk
-                = partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[idxChunk];
-            rowMax = fmaxf(rowMax, chunk.rowMaxLog2e[tid]);
-        }
-
-        float rowSum = 0.F;
-#pragma unroll 1
-        for (uint32_t idxSubSeq = 0; idxSubSeq < nbSubSeq; idxSubSeq++)
-        {
-            PartialResult::Chunk const& chunk
-                = partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[idxChunk];
-            rowSum += chunk.rowSum[tid] * exp2f(chunk.rowMaxLog2e[tid] - rowMax);
-        }
-        finalRowMax[tid] = rowMax;
-        finalRowSum[tid] = rowSum;
-    }
-    __syncthreads();
-
     uint32_t constexpr elemsPerBlock = PartialResult::nbRowsPerChunk * colTileElems;
     uint32_t const colBase = idxColTile * colTileElems;
 #pragma unroll 1
@@ -1914,19 +1887,37 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, 1) void reduce_mla_flash_decode_p
     {
         uint32_t const row = elem / colTileElems;
         uint32_t const col = colBase + elem - row * colTileElems;
-        float const rowMax = finalRowMax[row];
-        float const rowSum = finalRowSum[row];
-        float acc = 0.F;
+
+        PartialResult::Chunk const& firstChunk = partialResults[maxNbSubSeq * idxInputTokenGlobal].chunks[idxChunk];
+        float accRowMaxLog2e = firstChunk.rowMaxLog2e[row];
+        float accRowSum = firstChunk.rowSum[row];
+        float acc = static_cast<float>(firstChunk.data[row][col]) * accRowSum;
 #pragma unroll 1
-        for (uint32_t idxSubSeq = 0; idxSubSeq < nbSubSeq; idxSubSeq++)
+        for (uint32_t idxSubSeq = 1; idxSubSeq < nbSubSeq; idxSubSeq++)
         {
             PartialResult::Chunk const& chunk
                 = partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[idxChunk];
-            float const weight = chunk.rowSum[row] * exp2f(chunk.rowMaxLog2e[row] - rowMax);
-            acc += static_cast<float>(chunk.data[row][col]) * weight;
+            float const chunkRowMaxLog2e = chunk.rowMaxLog2e[row];
+            float const chunkRowSum = chunk.rowSum[row];
+            float const chunkData = static_cast<float>(chunk.data[row][col]);
+            bool const newChunkGreater = (chunkRowMaxLog2e > accRowMaxLog2e);
+            if (newChunkGreater)
+            {
+                float const scale = exp2f(accRowMaxLog2e - chunkRowMaxLog2e);
+                acc = acc * scale + chunkData * chunkRowSum;
+                accRowSum = accRowSum * scale + chunkRowSum;
+                accRowMaxLog2e = chunkRowMaxLog2e;
+            }
+            else
+            {
+                float const scale = exp2f(chunkRowMaxLog2e - accRowMaxLog2e);
+                float const fusedScale = scale * chunkRowSum;
+                acc += chunkData * fusedScale;
+                accRowSum += chunkRowSum * scale;
+            }
         }
         OutputHead& dst = output[headGrpSize * idxInputTokenGlobal + idxChunk * PartialResult::nbRowsPerChunk + row];
-        dst[col] = __float2bfloat16_rn(acc / fmaxf(rowSum, 1e-20F));
+        dst[col] = __float2bfloat16_rn(acc / fmaxf(accRowSum, 1e-20F));
     }
 }
 
