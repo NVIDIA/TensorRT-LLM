@@ -1,4 +1,5 @@
 import copy
+import math
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -100,6 +101,119 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    # ------------------------------------------------------------------
+    # Deterministic dummy-input sizing for multimodal profiling.
+    #
+    # `get_num_mm_tokens` / `get_size_with_most_features` are the encoder-
+    # side counterpart to the LLM's `max_num_tokens`: they report (and
+    # invert) the exact number of attention tokens the vision encoder will
+    # process for a given input size. The unit is **pre-merger patches** so
+    # that values are directly comparable with ``encoder_max_num_tokens``
+    # and ``AttentionMetadata.max_num_tokens``. Callers working in
+    # LLM-visible (post-merger) units multiply/divide by
+    # ``spatial_merge_unit`` at the boundary.
+    # ------------------------------------------------------------------
+    @property
+    def spatial_merge_unit(self) -> int:
+        """Encoder→LLM token ratio. Qwen2/2.5-VL applies a ``merge_size`` × ``merge_size`` spatial merger."""
+        merge_size = self.config.vision_config.spatial_merge_size
+        return merge_size * merge_size
+
+    def get_num_mm_tokens(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+    ) -> int:
+        """Return the encoder attention tokens (pre-merger) that result from
+        an image/video of the given pixel dimensions.
+
+        Mirrors HF Qwen2/2.5-VL's ``smart_resize`` + patchify: ``(width, height)``
+        is rounded to a multiple of ``patch_size * spatial_merge_size`` and
+        then divided into ``patch_size``-sized patches. The result equals
+        the number of tokens the encoder will run attention over for one
+        atomic forward.
+        """
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+        factor = patch_size * merge_size
+
+        resized_w = max(self._round_to_factor(width, factor), factor)
+        resized_h = max(self._round_to_factor(height, factor), factor)
+        grid_h = resized_h // patch_size
+        grid_w = resized_w // patch_size
+
+        padded_frames = ((num_frames + temporal_patch_size - 1) //
+                         temporal_patch_size) * temporal_patch_size
+        grid_t = max(padded_frames // temporal_patch_size, 1)
+
+        return grid_t * grid_h * grid_w
+
+    def get_size_with_most_features(
+        self,
+        *,
+        max_tokens: int,
+    ) -> Dict[str, int]:
+        """Invert ``get_num_mm_tokens``: pick the ``(width, height)`` whose
+        attention-token count is the largest value ≤ ``max_tokens`` while
+        keeping the aspect ratio bounded.
+
+        ``max_tokens`` is in the same unit as ``get_num_mm_tokens`` /
+        ``encoder_max_num_tokens`` (pre-merger). Single image (``num_frames=1``)
+        for now; callers needing video can compose with the temporal dim.
+        """
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        unit = patch_size * merge_size
+
+        # Pre-merger tokens factor into (grid_h * grid_w) and each grid
+        # dimension is ``merge_size`` × the post-merger factor. Searching in
+        # post-merger units bounds the inner loop and lets us reuse the
+        # familiar near-square factor pair for aspect ratio bounds.
+        post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
+        h_factor, w_factor = self._closest_factor_pair(post_merger_budget)
+        for seq_len in range(post_merger_budget, 0, -1):
+            h_f, w_f = self._closest_factor_pair(seq_len)
+            if w_f / max(h_f, 1) <= 200:
+                h_factor, w_factor = h_f, w_f
+                break
+
+        return {
+            "width": unit * w_factor,
+            "height": unit * h_factor,
+            "num_frames": 1,
+        }
+
+    @staticmethod
+    def _round_to_factor(value: int, factor: int) -> int:
+        """Round ``value`` to the nearest multiple of ``factor`` (half-up).
+
+        Matches the canonical resize-to-grid behavior used by Qwen-VL image
+        processors when assembling fixed-size patches.
+        """
+        if factor <= 0:
+            raise ValueError(f"factor must be positive, got {factor}")
+        return ((value + factor // 2) // factor) * factor
+
+    @staticmethod
+    def _closest_factor_pair(n: int) -> Tuple[int, int]:
+        """Return ``(h, w)`` with ``h*w == n`` and the smaller-first ordering.
+
+        Picks the factorization that is closest to a square so that
+        ``get_size_with_most_features`` prefers near-square dummy images.
+        """
+        for d in range(math.isqrt(n), 0, -1):
+            if n % d == 0:
+                return d, n // d
+        return 1, n
 
     @classmethod
     def get_rope_index(
