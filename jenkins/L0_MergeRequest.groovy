@@ -1093,7 +1093,14 @@ def collectTestResults(pipeline, testFilter)
                 }
                 // if (currentBuild.currentResult == 'SUCCESS') {
                 if (true) {
-                    try {
+                    // Mark the stage UNSTABLE (yellow) on any failure inside this block
+                    // while keeping the overall build result SUCCESS. Without this, the
+                    // inner `try/echo` would swallow the exception and the stage would
+                    // still appear green. Same pattern as the Rerun Report stage below.
+                    catchError(
+                        buildResult: 'SUCCESS',
+                        stageResult: 'UNSTABLE',
+                        message: 'Auto-update test duration PR creation failed') {
                         // The Jenkins SCM step created ${LLM_ROOT}/.git on the host agent
                         // (owned by the `jenkins` user). This alpine container runs as
                         // root and uses a fresh apk-installed git, which enforces the
@@ -1121,8 +1128,6 @@ def collectTestResults(pipeline, testFilter)
                             prTitle:       "[None][chore] Auto-update test durations from post-merge",
                             prBody:        "Continuously refreshed by the post-merge pipeline: each run force-pushes the latest pytest-split test duration file onto this branch. See the branch's commit list for the originating build number.",
                         ])
-                    } catch (Exception e) {
-                        echo "An error occurred while creating test duration PR: ${e.toString()}"
                     }
                 } else {
                     echo "Skipping test duration PR creation because post-merge build result is ${currentBuild.currentResult}."
