@@ -110,7 +110,7 @@ def test_stop_profile_blocks_until_worker_acks():
     )
 
 
-def test_start_profile_blocks_until_worker_acks():
+def test_start_profile_blocks_until_worker_acks(tmp_path):
     """/start_profile blocks until the worker acks.
 
     Same contract as ``/stop_profile``: the handler should not return
@@ -136,7 +136,7 @@ def test_start_profile_blocks_until_worker_acks():
     threading.Thread(target=worker, daemon=True).start()
 
     t0 = time.monotonic()
-    proxy.start_profile(output_dir="/tmp/x", num_steps=5)
+    proxy.start_profile(output_dir=str(tmp_path), num_steps=5)
     elapsed = time.monotonic() - t0
 
     assert proxy.request_queue.put.call_count == 1
