@@ -4,7 +4,7 @@ accelerate>=1.7.0
 build
 colored
 cuda-python>=13
-diffusers>=0.37.1
+diffusers>=0.37.1,<0.41.0  # visual_gen auto path tested on 0.39-0.40 — see auto/auto_pipeline._check_diffusers_version
 ftfy
 lark
 mpi4py
