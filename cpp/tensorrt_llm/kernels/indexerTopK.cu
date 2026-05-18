@@ -595,6 +595,280 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
         }
     }
 }
+
+template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort>
+struct TopKSmem
+{
+    static constexpr int kNumFinalItems = 2048;
+    static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
+    using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
+    using FinalSortTempStorage = std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
+    using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+
+    struct FinalItems
+    {
+        int indices[kNumFinalItems];
+        float logits[kNumFinalItems];
+    };
+
+    struct Histogram
+    {
+        typename Scan::TempStorage scan;
+        int data[kNumBins];
+    };
+
+    union Final
+    {
+        FinalItems items;
+        FinalSortTempStorage finalSort;
+        Histogram histo;
+    };
+
+    Final smemFinal;
+    int smemThresholdBinIdx[1];
+    int smemFinalDstIdx[1];
+    int smemFinalBinSize[1];
+    int smemFoundTopKValues[1];
+};
+
+// Follows half - 11 - 11 - 10 bit iterations
+template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort, bool multipleBlocksPerRow = false,
+    bool mergeBlocks = false>
+static __device__ void topKPerRowJobWithSmem(int const* indices, float const* logits, int rowStart, int rowEnd,
+    int* outIndices, float* outLogits, int stride1, int topK,
+    TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort>& smem)
+{
+    static constexpr int kNumFinalItems = TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort>::kNumFinalItems;
+    static constexpr int kNumFinalItemsPerThread
+        = TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort>::kNumFinalItemsPerThread;
+    using FinalSort = typename TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort>::FinalSort;
+
+    auto& smemFinal = smem.smemFinal;
+    int* smemThresholdBinIdx = smem.smemThresholdBinIdx;
+    int* smemFinalDstIdx = smem.smemFinalDstIdx;
+    int* smemFinalBinSize = smem.smemFinalBinSize;
+    int* smemFoundTopKValues = smem.smemFoundTopKValues;
+
+    // Shared memory to store the selected indices.
+    // If we are processing using multiple blocks, we need to store the logits and
+    // indices.
+    extern __shared__ int32_t smemOutput[];
+
+    // The length of the row.
+    int rowLen = rowEnd - rowStart;
+
+    // Shortcut if the length of the row is smaller than Top-K. Indices are not
+    // sorted by their corresponding logit.
+    if (rowLen <= topK)
+    {
+        for (int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock)
+        {
+            if constexpr (multipleBlocksPerRow)
+            {
+                outIndices[rowIt] = rowIt + rowStart;
+                outLogits[rowIt] = logits[rowIt + rowStart];
+            }
+            else if constexpr (mergeBlocks)
+            {
+                // Pass through input pairs: the input indices already point
+                // into the original row, and (when outLogits != nullptr) we
+                // also copy the value-side so a downstream merge can keep
+                // ranking. The single-block fused-path final merge passes
+                // outLogits=nullptr and only the indices are written.
+                outIndices[rowIt] = indices[rowIt];
+                if (outLogits != nullptr)
+                {
+                    outLogits[rowIt] = logits[rowIt];
+                }
+            }
+            else
+            {
+                outIndices[rowIt] = rowIt;
+            }
+        }
+        for (int rowIt = rowLen + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock)
+        {
+            outIndices[rowIt] = -1;
+            if constexpr (multipleBlocksPerRow)
+            {
+                outLogits[rowIt] = -FLT_MAX;
+            }
+            else if constexpr (mergeBlocks)
+            {
+                if (outLogits != nullptr)
+                {
+                    outLogits[rowIt] = -FLT_MAX;
+                }
+            }
+        }
+
+        return;
+    }
+    // Initialize values
+    if (threadIdx.x == 0)
+    {
+        smemFinalDstIdx[0] = 0;
+        smemFoundTopKValues[0] = 0;
+    }
+    __syncthreads();
+    int thresholdBinIdx = -1;
+    uint32_t logitPattern = 0;
+
+    // Step 0: Process first 11 bits of half representation
+    bool continueToNextStep
+        = processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
+            indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx,
+            smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+
+    if (continueToNextStep)
+    {
+        // Step 1: Process next 11 bits
+        continueToNextStep
+            = processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
+                indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+                smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+    }
+
+    if (continueToNextStep)
+    {
+        // Step 2: Process next 11 bits
+        continueToNextStep
+            = processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
+                indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+                smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+    }
+
+    if (continueToNextStep)
+    {
+        // Step 3: Process last 10 bits
+        processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
+            indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx,
+            smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+    }
+
+    if (!continueToNextStep)
+    {
+        // The histogram did not proceed to the final 10 bits, therefore we need to
+        // sort the final items The logits of the elements to be sorted in the final
+        // pass.
+        if constexpr (useRadixSort)
+        {
+            // Sorting with radix sort
+            float finalLogits[kNumFinalItemsPerThread];
+            // The indices of the elements to be sorted in the final pass.
+            int finalIndices[kNumFinalItemsPerThread];
+
+#pragma unroll
+            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
+            {
+                finalLogits[ii] = -FLT_MAX;
+            }
+
+            // Read the elements from SMEM.
+#pragma unroll
+            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
+            {
+                int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+                if (srcIdx < smemFinalDstIdx[0])
+                {
+                    finalLogits[ii] = smemFinal.items.logits[srcIdx];
+                    finalIndices[ii] = smemFinal.items.indices[srcIdx];
+                }
+            }
+            // Make sure the shared memory has been read.
+            __syncthreads();
+
+            // Sort the elements.
+            FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
+
+            // Copy the data back to the shared memory storage.
+            int baseIdx = smemFoundTopKValues[0];
+
+#pragma unroll
+            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
+            {
+                int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+                int dstIdx = baseIdx + srcIdx;
+
+                if (dstIdx < topK)
+                {
+                    smemOutput[dstIdx] = finalIndices[ii];
+                    // For multipleBlocksPerRow, logits must be staged for global
+                    // write. For mergeBlocks, also stage logits whenever the
+                    // caller wants them (intermediate hierarchical-merge stage)
+                    // — the smemOutput allocation is sized for both halves
+                    // already (2*topK ints) at every fused/multi-block launch.
+                    if constexpr (multipleBlocksPerRow || mergeBlocks)
+                    {
+                        reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = finalLogits[ii];
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Sorting with insertion sort
+            auto baseIdx = smemFoundTopKValues[0];
+            for (int i = threadIdx.x; i < smemFinalDstIdx[0]; i += kNumThreadsPerBlock)
+            {
+                int outIndex = 0;
+                auto logit = smemFinal.items.logits[i];
+                for (int j = 0; j < smemFinalDstIdx[0]; j++)
+                {
+                    auto otherLogit = smemFinal.items.logits[j];
+                    if (logit < otherLogit || (logit == otherLogit && i < j))
+                    {
+                        outIndex++;
+                    }
+                }
+                // Store if outIndex is in bounds
+                if (outIndex + baseIdx < topK)
+                {
+                    smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
+                    if constexpr (multipleBlocksPerRow || mergeBlocks)
+                    {
+                        reinterpret_cast<float*>(smemOutput + topK)[outIndex + baseIdx] = smemFinal.items.logits[i];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store to global memory.
+    for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock)
+    {
+        if constexpr (multipleBlocksPerRow)
+        {
+            outIndices[i] = smemOutput[i];
+            outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
+        }
+        else if constexpr (mergeBlocks)
+        {
+            // Hierarchical merge: stage1 needs logits written so stage2 can
+            // read them; the final stage passes outLogits=nullptr and writes
+            // only the indices. The smemOutput second-half is staged either
+            // way (the launch sizes dynamicSmemBytes for both halves).
+            outIndices[i] = smemOutput[i];
+            if (outLogits != nullptr)
+            {
+                outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
+            }
+        }
+        else
+        {
+            if (stride1 == 1)
+            {
+                // stride1 == 1 will use vectorized_process, which indexes already skip the rowStart.
+                outIndices[i] = smemOutput[i];
+            }
+            else
+            {
+                outIndices[i] = smemOutput[i] - rowStart;
+            }
+        }
+    }
+}
 } // namespace
 
 template <int kNumThreadsPerBlock, bool useRadixSort, typename InputT = float>
@@ -674,8 +948,555 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 #endif
 }
 
+template <int kNumThreadsPerBlock, bool useRadixSort>
+static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFused(float const* logits,
+    int const* seqLens, int* outIndices, int* outIndicesAux, float* outLogitsAux, int* doneCounter, int stride0,
+    int stride1, int const topK, int const next_n, int const numBlocksPerRow)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+    static constexpr int kNumBins = 2048;
+
+    int rowIdx = blockIdx.x;
+    int blockInRow = blockIdx.y;
+
+    int seq_len = seqLens[rowIdx / next_n];
+    int rowEndFull = seq_len - next_n + (rowIdx % next_n) + 1;
+
+    float const* rowLogits = logits + static_cast<int64_t>(rowIdx) * stride0;
+
+    // One smem allocation shared between part1 and the merge phase. Both calls
+    // use the same kNumThreadsPerBlock/kNumBins/useRadixSort, and the
+    // multipleBlocksPerRow / mergeBlocks template flags don't affect smem
+    // layout, so the union/scratch can be reused (each call re-initializes
+    // its working slots at entry).
+    __shared__ TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort> smem;
+
+    // Short-row short-circuit: if the actual row is too small to benefit from
+    // multi-block fan-out (e.g. the prefill harness uses lengths=1..bs which
+    // are tiny no matter how large numColumns is), have block 0 do the full
+    // single-block top-k and have all other blocks bail without touching the
+    // atomic counter. Without this, fused-path overhead dominates for these
+    // configs.
+    constexpr int kFusedShortRowThreshold = 16384;
+    if (rowEndFull < kFusedShortRowThreshold)
+    {
+        if (blockInRow == 0)
+        {
+            int* mergedOut = outIndices + static_cast<int64_t>(rowIdx) * topK;
+            topKPerRowJobWithSmem<kNumThreadsPerBlock, kNumBins, useRadixSort,
+                /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false>(nullptr, rowLogits, /*rowStart=*/0, rowEndFull,
+                mergedOut,
+                /*outLogits=*/nullptr, stride1, topK, smem);
+        }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+        return;
+    }
+
+    int blockSize = rowEndFull / numBlocksPerRow;
+    int rowStart = blockSize * blockInRow;
+    int rowEnd = (blockInRow == numBlocksPerRow - 1) ? rowEndFull : rowStart + blockSize;
+
+    int64_t auxOffset = (static_cast<int64_t>(rowIdx) * numBlocksPerRow + blockInRow) * topK;
+    int* myOutIndicesAux = outIndicesAux + auxOffset;
+    float* myOutLogitsAux = outLogitsAux + auxOffset;
+
+    // Part 1: per-block top-k into aux buffers.
+    topKPerRowJobWithSmem<kNumThreadsPerBlock, kNumBins, useRadixSort, /*multipleBlocksPerRow=*/true,
+        /*mergeBlocks=*/false>(
+        nullptr, rowLogits, rowStart, rowEnd, myOutIndicesAux, myOutLogitsAux, stride1, topK, smem);
+
+    // Make sure all writes from this block to outIndicesAux/outLogitsAux are
+    // visible to every other block before we publish via the counter.
+    __threadfence();
+    __syncthreads();
+
+    __shared__ int s_isLast;
+    if (threadIdx.x == 0)
+    {
+        int prev = atomicAdd(&doneCounter[rowIdx], 1);
+        s_isLast = (prev == numBlocksPerRow - 1) ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (!s_isLast)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+        return;
+    }
+
+    // Reset the counter so the buffer is reusable on the next call without
+    // requiring an external memset.
+    if (threadIdx.x == 0)
+    {
+        doneCounter[rowIdx] = 0;
+    }
+
+    // Last block: merge the numBlocksPerRow per-block top-ks into the final
+    // top-k. Same shared-memory union is reused (the part1 phase already
+    // returned smemFinal/smemThresholdBinIdx/etc to a known-undefined state,
+    // and topKPerRowJob initializes them again at entry).
+    int64_t mergeBase = static_cast<int64_t>(rowIdx) * numBlocksPerRow * topK;
+    int* mergeIndicesIn = outIndicesAux + mergeBase;
+    float* mergeLogitsIn = outLogitsAux + mergeBase;
+    int* mergedOut = outIndices + static_cast<int64_t>(rowIdx) * topK;
+    int mergeRowEnd = numBlocksPerRow * topK;
+
+    topKPerRowJobWithSmem<kNumThreadsPerBlock, kNumBins, useRadixSort, /*multipleBlocksPerRow=*/false,
+        /*mergeBlocks=*/true>(mergeIndicesIn, mergeLogitsIn, /*rowStart=*/0, mergeRowEnd, mergedOut,
+        /*outLogits=*/nullptr,
+        /*stride1=*/1, topK, smem);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 namespace
 {
+
+// ===========================================================================
+// Multi-pass radix path (opt-in via scratch != nullptr).
+//
+// One launch per radix pass (top-11 half-precision bits, then bits [21..32),
+// [10..21), [0..10)). State per row lives in a small RadixState struct in
+// DRAM; the candidate data is two ping-pong buffers sized to the input row
+// length. After 4 passes any remaining bit-level ties are emitted directly
+// to fill the top-k.
+//
+// Eligibility (require !is_prefill): three nested tiers where the
+// single-block radix-final pass and the fused last-block-merge kernel both
+// under-use the GPU.
+//   inner: bs ≤  32 / seq ≥  65k
+//   mid  : bs ≤  64 / seq ≥ 131k
+//   high : bs ≤ 256 / seq ≥ 524k
+// ===========================================================================
+static constexpr int kMultiPassRadixLowMaxRows = 32;
+static constexpr int kMultiPassRadixLowMinSeqLen = 65536;
+static constexpr int kMultiPassRadixMidMaxRows = 64;
+static constexpr int kMultiPassRadixMidMinSeqLen = 131072;
+static constexpr int kMultiPassRadixHighMaxRows = 256;
+static constexpr int kMultiPassRadixHighMinSeqLen = 524288;
+
+static constexpr int kRadixBins = 2048;
+
+static inline bool multi_pass_radix_eligible(int numRows, int numColumns)
+{
+    if (numRows <= kMultiPassRadixLowMaxRows && numColumns >= kMultiPassRadixLowMinSeqLen)
+        return true;
+    if (numRows <= kMultiPassRadixMidMaxRows && numColumns >= kMultiPassRadixMidMinSeqLen)
+        return true;
+    if (numRows <= kMultiPassRadixHighMaxRows && numColumns >= kMultiPassRadixHighMinSeqLen)
+        return true;
+    return false;
+}
+
+// Per-row state for the multi-pass radix path (in DRAM scratch). Each pass's
+// last block (selected via the `finishedBlocks` atomic) prefix-scans the
+// global histogram and picks the threshold for the next pass — same pattern
+// as `topKPerRowDecodeFused`'s in-block merge, generalised across passes.
+struct alignas(64) RadixState
+{
+    int candCount;      // candidates entering current pass
+    int outIdx;         // running outIndices write position
+    int kRemaining;     // top-k slots remaining; equals topK - outIdx
+    int filterCnt;      // running candidate-buf write position
+    int thresholdBin;   // threshold bin from PRIOR pass (read at filter
+                        // time; overwritten at last-block stage with this
+                        // pass's threshold for the next pass to consume)
+    int finishedBlocks; // last-block atomic counter, reset between passes
+    int thresholdLess;  // cumsum prefix at thresholdBin (count of bins below it);
+                        // used by pass-3 final-emit to route ties (bin == threshold)
+                        // into a disjoint slot range so they don't race definite
+                        // top-k items on the output counter.
+    int padding[1];
+};
+
+// Common last-block trailer: prefix-scan the merged global histogram, locate
+// the bin where the running count crosses kRemaining, stash to state for the
+// next pass. step < 3 also resets the per-row global histogram. In step 1
+// the trailer writes st.candCount = full row length for pass 2 to consume
+// (pass 1 reads the length inline from seqLens, so no init kernel is needed).
+template <int kThreads, int step>
+__device__ __forceinline__ void radixLastBlockTrailer(int* gHist, RadixState& st, int topK, int rowFullLen)
+{
+    using Scan = cub::BlockScan<int, kThreads>;
+    __shared__ typename Scan::TempStorage scanStorage;
+    __shared__ int s_thresholdBin;
+    __shared__ int s_runningBefore;
+    __shared__ int s_thresholdCount;
+
+    if (threadIdx.x == 0)
+    {
+        s_thresholdBin = -1;
+        s_runningBefore = 0;
+        s_thresholdCount = 0;
+    }
+    __syncthreads();
+
+    // kRemaining for THIS pass:
+    //   step 1: topK (no auto-promotes have happened yet).
+    //   step 2/3: topK - outIdx (where outIdx was atomic-incremented during
+    //             the filter loop). The histogram for the next pass's
+    //             threshold pick must target this fresh value, not the
+    //             stale state.kRemaining left over from the previous pass.
+    int const kRem = (step == 1) ? topK : (topK - st.outIdx);
+    if (kRem <= 0)
+    {
+        // All top-k slots already filled by auto-promotes in this pass —
+        // no need for a next pass to emit anything.
+        if (threadIdx.x == 0)
+        {
+            st.thresholdBin = -1;
+            st.candCount = 0;
+            st.kRemaining = 0;
+            st.finishedBlocks = 0;
+            st.filterCnt = 0;
+            (void) rowFullLen;
+        }
+        if constexpr (step < 3)
+        {
+            __syncthreads();
+            for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
+                gHist[i] = 0;
+        }
+        return;
+    }
+    constexpr int kRoundsPerScan = kRadixBins / kThreads;
+    int running = 0;
+    for (int r = 0; r < kRoundsPerScan; ++r)
+    {
+        int bin = r * kThreads + threadIdx.x;
+        int c = gHist[bin];
+        int prefix, total;
+        Scan(scanStorage).ExclusiveSum(c, prefix, total);
+        prefix += running;
+        int next = prefix + c;
+        if (prefix < kRem && next >= kRem && s_thresholdBin == -1)
+        {
+            atomicCAS(&s_thresholdBin, -1, bin);
+            if (s_thresholdBin == bin)
+            {
+                s_runningBefore = prefix;
+                s_thresholdCount = c;
+            }
+        }
+        running += total;
+        __syncthreads();
+        if (s_thresholdBin != -1)
+            break;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        // If the cumsum over the whole histogram never reached kRem the row
+        // has fewer items than we still need (e.g. decode rows shorter than
+        // topK). Set thresholdBin to a sentinel above any valid bin so the
+        // next pass's `bin < thresholdBin` test accepts every surviving
+        // candidate as auto-promote.
+        st.thresholdBin = (s_thresholdBin == -1) ? kRadixBins : s_thresholdBin;
+        // s_runningBefore is the count of histogram items in bins < threshold.
+        // In the sentinel case it stays at its init 0; that's fine because
+        // pass-3's inline final-emit only uses thresholdLess to position the
+        // ties (bin == threshold) write base, and the sentinel branch has
+        // no items in the threshold bin (the sentinel is above all valid bins).
+        st.thresholdLess = s_runningBefore;
+        st.finishedBlocks = 0;
+        if constexpr (step == 1)
+        {
+            // Pass 2 also scans the full row from `logits`, so it reads
+            // st.candCount = full row length. Pass 1 did not write to it
+            // and the state struct started at zero (cudaMemsetAsync).
+            st.candCount = rowFullLen;
+            (void) s_thresholdCount;
+            (void) kRem;
+        }
+        else
+        {
+            st.candCount = st.filterCnt;
+            int newKRem = topK - st.outIdx;
+            if (newKRem < 0)
+                newKRem = 0;
+            st.kRemaining = newKRem;
+            st.filterCnt = 0;
+        }
+    }
+    if constexpr (step < 3)
+    {
+        __syncthreads();
+        for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
+            gHist[i] = 0;
+    }
+}
+
+// Fused histogram + filter pass kernel.
+//
+//   step == 1: pass 1, no filter, just histogram top-11 bits of the row.
+//   step == 2: pass 2 reads `logits` (pass 1 didn't write a candidate buffer),
+//              for each item:
+//                bin1 < thresholdBin1 → write to outIndices (auto-promote)
+//                bin1 == thresholdBin1 → append to candBufOut, count its bin2
+//                                        in the histogram for pass 2
+//                else                 → drop
+//   step == 3: same as step 2 but reads `candBufIn` (pass 2's output) and
+//              uses extractBinIdx<2> for the prior-bits check, extractBinIdx<3>
+//              for the histogram.
+//
+// Last block of every pass runs `radixLastBlockTrailer` to compute the
+// next pass's threshold and reset cross-pass state.
+template <int kThreads, int step>
+static __global__ __launch_bounds__(kThreads) void radixPassKernel(float const* logits, int const* seqLens,
+    int* outIndices, int const* candBufIn, int* candBufOut, int* histograms, RadixState* state, int stride0, int next_n,
+    int topK)
+{
+    int rowIdx = blockIdx.y;
+    int blockInRow = blockIdx.x;
+    int blocksPerRow = gridDim.x;
+
+    RadixState& st = state[rowIdx];
+    int* gHist = histograms + static_cast<int64_t>(rowIdx) * kRadixBins;
+
+    __shared__ int sHist[kRadixBins];
+    for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
+        sHist[i] = 0;
+    __syncthreads();
+
+    if constexpr (step == 1)
+    {
+        // Read seqLen inline so pass 1 does not depend on st.candCount being
+        // pre-initialised by a separate init kernel; the cudaMemsetAsync that
+        // zeroes state+histograms together is enough. Pass-1 trailer below
+        // writes st.candCount = seqLens[rowIdx] for pass 2 to consume.
+        int const rowEnd = seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1;
+        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        size_t threadRank = static_cast<size_t>(blockInRow) * kThreads + threadIdx.x;
+        size_t numThreads = static_cast<size_t>(blocksPerRow) * kThreads;
+        auto f = [&](float v, size_t /*idx*/)
+        {
+            uint32_t bin = extractBinIdx<step>(v);
+            atomicAdd(&sHist[bin], 1);
+        };
+        vectorized_process(threadRank, numThreads, in, static_cast<int>(rowEnd), f);
+    }
+    else if constexpr (step == 2)
+    {
+        int const rowEnd = st.candCount;
+        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
+        int* candArr = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
+        int const prevThresh = st.thresholdBin;
+        size_t threadRank = static_cast<size_t>(blockInRow) * kThreads + threadIdx.x;
+        size_t numThreads = static_cast<size_t>(blocksPerRow) * kThreads;
+        auto f = [&](float v, size_t i)
+        {
+            int bin1 = static_cast<int>(extractBinIdx<1>(v));
+            if (bin1 < prevThresh)
+            {
+                int pos = atomicAdd(&st.outIdx, 1);
+                if (pos < topK)
+                    outIdxArr[pos] = static_cast<int>(i);
+            }
+            else if (bin1 == prevThresh)
+            {
+                int pos = atomicAdd(&st.filterCnt, 1);
+                candArr[pos] = static_cast<int>(i);
+                uint32_t bin2 = extractBinIdx<step>(v);
+                atomicAdd(&sHist[bin2], 1);
+            }
+        };
+        vectorized_process(threadRank, numThreads, in, static_cast<int>(rowEnd), f);
+    }
+    else // step == 3
+    {
+        int const candCnt = st.candCount;
+        int const* candArrIn = candBufIn + static_cast<int64_t>(rowIdx) * stride0;
+        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
+        int* candArrOut = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
+        int const prevThresh = st.thresholdBin;
+        for (int i = blockInRow * kThreads + threadIdx.x; i < candCnt; i += blocksPerRow * kThreads)
+        {
+            int srcIdx = candArrIn[i];
+            float v = in[srcIdx];
+            int bin2 = static_cast<int>(extractBinIdx<2>(v));
+            if (bin2 < prevThresh)
+            {
+                int pos = atomicAdd(&st.outIdx, 1);
+                if (pos < topK)
+                    outIdxArr[pos] = srcIdx;
+            }
+            else if (bin2 == prevThresh)
+            {
+                int pos = atomicAdd(&st.filterCnt, 1);
+                candArrOut[pos] = srcIdx;
+                uint32_t bin3 = extractBinIdx<step>(v);
+                atomicAdd(&sHist[bin3], 1);
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
+    {
+        int c = sHist[i];
+        if (c)
+            atomicAdd(&gHist[i], c);
+    }
+
+    __threadfence();
+    __shared__ int isLast;
+    if (threadIdx.x == 0)
+    {
+        int prev = atomicAdd(&st.finishedBlocks, 1);
+        isLast = (prev == blocksPerRow - 1) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!isLast)
+        return;
+
+    int const rowFullLen = (step == 1) ? (seqLens[rowIdx / next_n] - next_n + (rowIdx % next_n) + 1) : 0;
+    radixLastBlockTrailer<kThreads, step>(gHist, st, topK, rowFullLen);
+
+    if constexpr (step == 3)
+    {
+        // Final emit, folded into the last block of pass 3. Scan candBufOut
+        // (top 22 bits == thresholdBin2) and route items into outIndices by
+        // bin3 vs thresholdBin3. Two-counter scheme so threshold-bin ties
+        // don't race definite top-k items on the same atomic:
+        //   bin3 <  thresh3  → slots [ltBase,           ltBase + prefix3)
+        //   bin3 == thresh3  → slots [ltBase + prefix3, topK)
+        __syncthreads();
+        int const filterCnt = st.candCount;
+        int const thresh3 = st.thresholdBin;
+        int const prefix3 = st.thresholdLess;
+        int const* candArr = candBufOut + static_cast<int64_t>(rowIdx) * stride0;
+        float const* in = logits + static_cast<int64_t>(rowIdx) * stride0;
+        int* outIdxArr = outIndices + static_cast<int64_t>(rowIdx) * topK;
+        int const ltBase = st.outIdx;    // already at outBase here
+        int const eqBase = ltBase + prefix3;
+        int const eqCap = topK - eqBase; // ≥ 0 by trailer invariant
+        __shared__ int sEqEmitted;
+        if (threadIdx.x == 0)
+            sEqEmitted = 0;
+        __syncthreads();
+        for (int i = threadIdx.x; i < filterCnt; i += kThreads)
+        {
+            int srcIdx = candArr[i];
+            float v = in[srcIdx];
+            int bin3 = static_cast<int>(extractBinIdx<3>(v));
+            if (bin3 < thresh3)
+            {
+                // atomicAdd on st.outIdx is safe: by construction exactly
+                // prefix3 items fall in this branch, so pos stays in
+                // [ltBase, eqBase) which is strictly inside [0, topK).
+                int pos = atomicAdd(&st.outIdx, 1);
+                outIdxArr[pos] = srcIdx;
+            }
+            else if (bin3 == thresh3)
+            {
+                int pos = atomicAdd(&sEqEmitted, 1);
+                if (pos < eqCap)
+                    outIdxArr[eqBase + pos] = srcIdx;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            int eq = sEqEmitted < eqCap ? sEqEmitted : eqCap;
+            int filled = eqBase + eq;
+            if (filled > topK)
+                filled = topK;
+            for (int i = filled; i < topK; ++i)
+                outIdxArr[i] = -1;
+        }
+        // Reset the per-row global histogram and st.outIdx so the next call
+        // sees a clean state without a per-call cudaMemsetAsync. Caller must
+        // zero-initialize the scratch buffer before the first call.
+        __syncthreads();
+        for (int i = threadIdx.x; i < kRadixBins; i += kThreads)
+            gHist[i] = 0;
+        if (threadIdx.x == 0)
+            st.outIdx = 0;
+    }
+}
+
+// Scratch layout (uint8 buffer, 64-byte aligned regions):
+//   RadixState[numRows]
+//   int histograms[numRows * kRadixBins]    (zeroed on first call by
+//                                           torch::zeros allocator; pass-3
+//                                           trailer zeroes for subsequent
+//                                           calls)
+//   int candBuf1[numRows * stride0]         (pass 2 → pass 3 input)
+//   int candBuf2[numRows * stride0]         (pass 3 → fused final filter)
+static size_t radixScratchBytes(int numRows, int numColumns)
+{
+    auto roundUp = [](size_t x) { return (x + 63) & ~size_t(63); };
+    size_t s = 0;
+    s += roundUp(sizeof(RadixState) * numRows);
+    s += roundUp(sizeof(int) * static_cast<size_t>(numRows) * kRadixBins);
+    s += roundUp(sizeof(int) * static_cast<size_t>(numRows) * numColumns);
+    s += roundUp(sizeof(int) * static_cast<size_t>(numRows) * numColumns);
+    return s;
+}
+
+static void launchMultiPassRadix(void* scratch, float const* logits, int const* seqLens, int* outIndices, int numRows,
+    int numColumns, int topK, int stride0, int next_n, cudaLaunchAttribute const* attrs, cudaStream_t stream)
+{
+    auto roundUp = [](size_t x) { return (x + 63) & ~size_t(63); };
+    char* base = static_cast<char*>(scratch);
+    RadixState* state = reinterpret_cast<RadixState*>(base);
+    base += roundUp(sizeof(RadixState) * numRows);
+    int* histograms = reinterpret_cast<int*>(base);
+    base += roundUp(sizeof(int) * static_cast<size_t>(numRows) * kRadixBins);
+    int* candBuf1 = reinterpret_cast<int*>(base);
+    base += roundUp(sizeof(int) * static_cast<size_t>(numRows) * numColumns);
+    int* candBuf2 = reinterpret_cast<int*>(base);
+
+    int sm_cnt = 132;
+    {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sm_cnt, cudaDevAttrMultiProcessorCount, dev);
+    }
+    // Block fan-out heuristic: target ~4 active blocks/SM (one wave at the
+    // achievable occupancy of radixPassKernel<512, 1>), with a per-block work
+    // floor of 2048 items (4 items/thread at 512-wide).
+    int targetTotalBlocks = sm_cnt * 4;
+    int numBlocksPerRow = (targetTotalBlocks + numRows - 1) / numRows;
+    int maxByCols = numColumns / 2048;
+    if (numBlocksPerRow > maxByCols)
+        numBlocksPerRow = maxByCols;
+    if (numBlocksPerRow < 1)
+        numBlocksPerRow = 1;
+
+    constexpr int kPassThreads = 512;
+
+    auto launchPass = [&](void const* kernel, int const* candIn, int* candOut)
+    {
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(numBlocksPerRow, numRows);
+        cfg.blockDim = kPassThreads;
+        cfg.dynamicSmemBytes = 0;
+        cfg.stream = stream;
+        cfg.numAttrs = 1;
+        cfg.attrs = const_cast<cudaLaunchAttribute*>(attrs);
+        void* args[] = {(void*) &logits, (void*) &seqLens, (void*) &outIndices, (void*) &candIn, (void*) &candOut,
+            (void*) &histograms, (void*) &state, (void*) &stride0, (void*) &next_n, (void*) &topK};
+        cudaLaunchKernelExC(&cfg, kernel, args);
+    };
+
+    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 1>), (int const*) nullptr, (int*) nullptr);
+    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 2>), (int const*) nullptr, candBuf1);
+    // Pass 3 emits the final top-K inline in its last-block trailer (see
+    // radixPassKernel<step=3>) instead of requiring a separate filter launch.
+    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 3>), (int const*) candBuf1, candBuf2);
+}
 
 // Scheme X bound calculator — shared between fp32 and bf16/fp16 dispatchers.
 // Caches hardware attrs (SM count, L2 capacity) and the small-N threshold
@@ -734,8 +1555,21 @@ inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, float* heuristicScratch, cudaStream_t const stream)
+    int const preIdxCount, float* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
+    size_t scratchBytes, bool is_prefill)
 {
+    // Opt-in fast paths (added in the TPRv2 port — see commit message):
+    //   - multi-pass radix path (low-bs/long-seq corner that the
+    //     single-block radix loses on). Requires the caller to provide
+    //     `scratch` of at least `indexerTopKDecodeScratchBytes(numRows,
+    //     numColumns, topK)` bytes. Suppressed when is_prefill (the prefill
+    //     entry handles tiny rows with its own short-row short-circuit).
+    //   - Fused single-launch multi-block + last-block-merge variant of the
+    //     `numColumns ≥ splitWorkThreshold` tier. Requires the caller to
+    //     provide `doneCounterScratch` (one int per row, zero-initialized).
+    //     When omitted, the original 2-launch split-work path is used.
+    bool const useMultiPassRadixPath
+        = !is_prefill && multi_pass_radix_eligible(numRows, numColumns) && scratch != nullptr && scratchBytes > 0;
 
     // INVARIANT: kSortingAlgorithmThreshold is the ORIGINAL TRT-LLM Radix-path
     // internal boundary (Insertion vs Radix-radix). v1.2.X dispatcher leaves it
@@ -837,6 +1671,16 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
             preIdxStride, preIdxCount, numRows, stream);
     }
+    else if (useMultiPassRadixPath)
+    {
+        TLLM_CHECK_WITH_INFO(scratchBytes >= radixScratchBytes(numRows, numColumns),
+            "indexer top-k multi-pass radix path: scratch buffer too small.");
+        cudaLaunchAttribute radixAttrs[1];
+        radixAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        radixAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        launchMultiPassRadix(
+            scratch, logits, seqLens, indices, numRows, numColumns, topK, stride0, next_n, radixAttrs, stream);
+    }
     else if (numColumns < kSortingAlgorithmThreshold)
     {
         // Use insertion sort
@@ -875,6 +1719,78 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         cudaLaunchKernelEx(
             &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
     }
+    else if (doneCounterScratch != nullptr)
+    {
+        // Fused multi-block path: per-block top-k followed by last-block
+        // in-kernel merge via a global atomic counter on doneCounterScratch.
+        // Single launch replaces the two-launch part1+part2 split-work below.
+        //
+        // numBlocksPerRow defaults to 10; bumped at the very-low-bs corners
+        // where 10 blocks/row leaves the GPU under-filled. The merge phase
+        // processes (numBlocksPerRow * topK) candidates in a single block, so
+        // we never bump past where the merge would dominate. Cutoffs below
+        // come from the mid-long-decode sweep.
+        int numBlocksPerRow = 10;
+        if (numRows == 1)
+        {
+            // 132 SMs / 1 row → cap at 32 (aux buffer max), gated so per-block
+            // scan stays >= 30k (the 1024-thread wide-block threshold).
+            int target = 32;
+            if (target > numColumns / 30000)
+                target = numColumns / 30000;
+            if (target > numBlocksPerRow)
+                numBlocksPerRow = target;
+        }
+        else if (numRows == 2 && numColumns >= 400000)
+            numBlocksPerRow = 16;
+        else if (numRows == 4 && numColumns >= 400000)
+            numBlocksPerRow = 14;
+        else if (numRows == 8 && numColumns >= 500000)
+            numBlocksPerRow = 12;
+
+        // 1024-thread variant wins once per-block scan is large enough to
+        // amortize block-scope syncs (~30k); below that the 512-thread
+        // narrow block hides sync cost better.
+        bool const useWideBlock = (numColumns / numBlocksPerRow) >= 30000;
+        constexpr int kFusedNarrowThreadsPerBlock = 512;
+        int const blockDim = useWideBlock ? 1024 : kFusedNarrowThreadsPerBlock;
+
+        auto* kernel_512 = &topKPerRowDecodeFused<kFusedNarrowThreadsPerBlock, true>;
+        auto* kernel_1024 = &topKPerRowDecodeFused<1024, true>;
+        static bool s_attr_512 = false;
+        static bool s_attr_1024 = false;
+        if (useWideBlock && !s_attr_1024)
+        {
+            cudaFuncSetAttribute(
+                reinterpret_cast<void const*>(kernel_1024), cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+            s_attr_1024 = true;
+        }
+        else if (!useWideBlock && !s_attr_512)
+        {
+            cudaFuncSetAttribute(
+                reinterpret_cast<void const*>(kernel_512), cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+            s_attr_512 = true;
+        }
+
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+
+        cudaLaunchConfig_t config{};
+        config.gridDim = dim3(numRows, numBlocksPerRow);
+        config.blockDim = blockDim;
+        config.dynamicSmemBytes = 2 * topK * sizeof(int32_t);
+        config.stream = stream;
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        if (useWideBlock)
+            cudaLaunchKernelEx(&config, kernel_1024, logits, seqLens, indices, outIndicesAux, outLogitsAux,
+                doneCounterScratch, stride0, stride1, topK, next_n, numBlocksPerRow);
+        else
+            cudaLaunchKernelEx(&config, kernel_512, logits, seqLens, indices, outIndicesAux, outLogitsAux,
+                doneCounterScratch, stride0, stride1, topK, next_n, numBlocksPerRow);
+    }
     else
     {
         // Long sequences are run in two steps
@@ -909,6 +1825,13 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
             multipleBlocksPerRowConfig * topK, 1, topK, next_n, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
     }
     sync_check_cuda_error(stream);
+}
+
+size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
+{
+    // Returns the bytes the multi-pass radix path needs (state +
+    // histograms + two candidate buffers).
+    return radixScratchBytes(numRows, numColumns);
 }
 
 // ============================================================================
