@@ -1276,6 +1276,15 @@ TEST(RefCheck, mla)
     runTest<1>(112, 2158, false, true);
 }
 
+TEST(RefCheck, mlaShortContextManySubSeq)
+{
+    setenv("XQA_MLA_SEPARATE_REDUCE", "1", 1);
+    setenv("XQA_NB_SUB_SEQ", "188", 1);
+    runTest<1>(1, 1, false, true, true);
+    unsetenv("XQA_NB_SUB_SEQ");
+    unsetenv("XQA_MLA_SEPARATE_REDUCE");
+}
+
 TEST(RefCheck, mlaSeparateReduce)
 {
     setenv("XQA_MLA_SEPARATE_REDUCE", "1", 1);
