@@ -1883,22 +1883,6 @@ def _make_aux_buffer(
     )
 
 
-def _deregister_registered_memory(transfer_agent, registered_memorys):
-    try:
-        if transfer_agent is None or not registered_memorys:
-            return
-        while registered_memorys:
-            register_memory = registered_memorys[0]
-            try:
-                logger.info(f"Deregistering transfer memory: {register_memory}")
-                transfer_agent.deregister_memory(register_memory)
-            except Exception:
-                logger.error("deregister memory failed in finalizer")
-            registered_memorys.pop(0)
-    except Exception:
-        logger.error("unexpected error in _deregister_registered_memory finalizer")
-
-
 @dataclass
 class TransferWorkerConfig:
     kv_cache_manager: KVCacheManager
@@ -1974,9 +1958,6 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
         self._registered_mem: list = []
-        self._finalizer = weakref.finalize(
-            self, _deregister_registered_memory, self._agent, self._registered_mem
-        )
         try:
             self._register_kv_cache()
             if self._aux_buffer is not None:
@@ -1986,7 +1967,11 @@ class TransferWorker:
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:
-            self._finalizer()
+            # shutdown()'s getattr guards handle whichever attrs got set before the failure.
+            try:
+                self.shutdown()
+            except Exception as e:
+                logger.warning(f"TransferWorker init-failure cleanup: {e}")
             raise
 
     def _register_kv_cache(self):
@@ -2042,14 +2027,17 @@ class TransferWorker:
         receiver = getattr(self, "_receiver", None)
         if receiver is not None:
             receiver.shutdown()
-        # Deregister NIXL memory before shutting down components, so that
-        # pinned GPU memory is released and can be re-allocated (e.g. when
-        # the KV cache manager is recreated after profiling).
-        finalizer = getattr(self, "_finalizer", None)
-        if finalizer is not None:
-            finalizer()
+        # Deregister NIXL memory before agent.shutdown so pinned GPU memory is released
+        # (e.g. when the KV cache manager is recreated after profiling).
         agent = getattr(self, "_agent", None)
         if agent is not None:
+            registered = getattr(self, "_registered_mem", [])
+            while registered:
+                desc = registered.pop(0)
+                try:
+                    agent.deregister_memory(desc)
+                except Exception as e:
+                    logger.warning(f"TransferWorker.shutdown: deregister_memory failed: {e}")
             try:
                 agent.shutdown()
             except Exception as e:
