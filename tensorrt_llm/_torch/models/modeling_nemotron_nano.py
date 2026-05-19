@@ -46,6 +46,7 @@ from .modeling_multimodal_utils import (
     _is_disagg,
     find_input_mm_embeds,
     fuse_input_embeds,
+    get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
     has_raw_multimodal_payload,
     is_disagg_context_role,
@@ -3115,6 +3116,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             if self.video_pruning_rate > 0:
                 self._validate_evs_context_batch(ctx_params, num_context_requests)
             raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
+            # Raw image/video/audio tensors: run local encoder.
             if raw_ctx_params:
                 if _is_disagg() and not is_disagg_context_role():
                     raise ValueError(
@@ -3144,6 +3146,9 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     encoder_forward_fn=self._encode_multimodal,
                     multimodal_params=ctx_params,
                 )
+            # E/P prefill: encoder already ran; use attached embeddings.
+            else:
+                mm_embedding = get_attached_multimodal_embeddings(ctx_params)
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
                 # Retrieve per-video count stashed by `_encode_multimodal`.

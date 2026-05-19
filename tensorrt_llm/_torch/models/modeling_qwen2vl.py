@@ -56,6 +56,7 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (bypass_processor_output_validation,
                                         find_input_mm_embeds, fuse_input_embeds,
+                                        get_attached_multimodal_embeddings,
                                         get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
@@ -1201,6 +1202,9 @@ class Qwen2VLModelBase(PreTrainedModel):
                     "Qwen2VLModel does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
+            else:
+                mm_embeds = get_attached_multimodal_embeddings(
+                    mm_multimodal_params)
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
 
         if not self.model_config.pretrained_config.disable_fuse_rope:

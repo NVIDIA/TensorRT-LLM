@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    find_input_mm_embeds, get_multimodal_embeddings)
+    find_input_mm_embeds, get_attached_multimodal_embeddings,
+    get_multimodal_embeddings)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _as_cpu_tensor, _compute_mm_masks,
@@ -45,7 +46,7 @@ def _make_multimodal_params(
 class TestFindInputMmEmbed:
     """Test cases for find_input_mm_embeds — slicing embeddings per chunk."""
 
-    def test_empty_mm_embeds_uses_cached_param_embeddings(self):
+    def test_attached_param_embeddings_can_feed_slicer(self):
         """Disagg prefill passes encoder outputs through multimodal params."""
         cached_emb1 = torch.randn(5, _EMBED_DIM)
         cached_emb2 = torch.randn(4, _EMBED_DIM)
@@ -58,11 +59,22 @@ class TestFindInputMmEmbed:
                 multimodal_runtime=_make_runtime(2, 2, [4])),
         ]
 
-        result = find_input_mm_embeds([], multimodal_params)
+        mm_embeds = get_attached_multimodal_embeddings(multimodal_params)
+        result = find_input_mm_embeds(mm_embeds, multimodal_params)
 
         assert len(result) == 1
         torch.testing.assert_close(
             result[0], torch.cat([cached_emb1[1:5], cached_emb2[2:4]], dim=0))
+
+    def test_empty_mm_embeds_rejected_for_active_tokens(self):
+        multimodal_params = [_make_multimodal_params(0, 3, [3])]
+
+        with pytest.raises(ValueError, match="No multimodal embeddings"):
+            find_input_mm_embeds([], multimodal_params)
+
+    def test_none_mm_embeds_rejected(self):
+        with pytest.raises(TypeError, match="mm_embeds must be a list"):
+            find_input_mm_embeds(None, [])
 
     def test_mm_embed_not_batched(self):
         """Individual batching: len(mm_embeds) == len(multimodal_params) > 1."""

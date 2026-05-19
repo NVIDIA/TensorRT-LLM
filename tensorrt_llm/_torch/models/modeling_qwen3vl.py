@@ -46,6 +46,7 @@ from .modeling_multimodal_utils import (
     bypass_processor_output_validation,
     find_input_mm_embeds,
     fuse_input_embeds,
+    get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
     is_disagg_context_role,
 )
@@ -1241,16 +1242,18 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts,
         # so we need to separate the mm_multimodal_params from the text-only prompts.
-        mm_multimodal_params = self._get_requests_with_mm_data(multimodal_params)
+        mm_multimodal_params, has_raw_image_or_video_data = self._get_requests_with_mm_data(
+            multimodal_params
+        )
         if len(mm_multimodal_params) > 0:
-            has_raw_mm_data = self._has_raw_multimodal_data(mm_multimodal_params)
-            has_cached_mm_embeds = self._has_cached_multimodal_embeddings(mm_multimodal_params)
-            if has_raw_mm_data and not has_cached_mm_embeds and hasattr(self, "mm_encoder"):
+            # Raw image/video tensors: run local encoder.
+            if has_raw_image_or_video_data and hasattr(self, "mm_encoder"):
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params,
                 )
-            elif has_raw_mm_data and not has_cached_mm_embeds:
+            # Raw image/video tensors on a worker with no encoder: bad route.
+            elif has_raw_image_or_video_data:
                 raise ValueError(
                     "Raw multimodal inputs require a local multimodal encoder on this "
                     "disaggregated worker. Set TRTLLM_DISAGG_ROLE=context for context "
@@ -1261,6 +1264,9 @@ class Qwen3VLModelBase(PreTrainedModel):
                     f"{type(self)} does not support disaggregated inference yet. Please unset "
                     "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
+            # E/P prefill: encoder already ran; use attached embeddings.
+            else:
+                mm_embeds = get_attached_multimodal_embeddings(mm_multimodal_params)
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
 
             if self.use_deepstack:
@@ -1298,39 +1304,20 @@ class Qwen3VLModelBase(PreTrainedModel):
         logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
 
-    @staticmethod
-    def _has_raw_multimodal_data(multimodal_params):
-        for multimodal_param in multimodal_params:
-            data = multimodal_param.multimodal_data
-            if (
-                data.get("image", {}).get("pixel_values") is not None
-                or data.get("video", {}).get("pixel_values_videos") is not None
-            ):
-                return True
-        return False
-
-    @staticmethod
-    def _has_cached_multimodal_embeddings(multimodal_params):
-        for multimodal_param in multimodal_params:
-            if multimodal_param.multimodal_data.get("multimodal_embedding") is not None:
-                return True
-        return False
-
     def _get_requests_with_mm_data(self, multimodal_params):
         mm_multimodal_params = []
+        has_raw_image_or_video_data = False
         for multimodal_param in multimodal_params:
             data = multimodal_param.multimodal_data
-            if (
-                # The first 2 conditions check whether there is input on which inference should be run.
+            has_raw_data = (
                 data.get("image", {}).get("pixel_values") is not None
                 or data.get("video", {}).get("pixel_values_videos") is not None
-                # This condition corresponds to when the embeddings are already populated, as is e.g.
-                # the case in EPD disagg in the prefill worker.
-                or data.get("multimodal_embedding") is not None
-            ):
+            )
+            has_raw_image_or_video_data |= has_raw_data
+            if has_raw_data or data.get("multimodal_embedding") is not None:
                 mm_multimodal_params.append(multimodal_param)
 
-        return mm_multimodal_params
+        return mm_multimodal_params, has_raw_image_or_video_data
 
 
 @support_multimodal_disaggregated

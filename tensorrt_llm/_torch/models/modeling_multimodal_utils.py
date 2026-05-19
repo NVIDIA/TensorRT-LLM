@@ -283,21 +283,32 @@ def get_multimodal_embeddings(
     return [all_embeddings]
 
 
-def _get_cached_multimodal_embeddings(
+def get_attached_multimodal_embeddings(
         multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-    cached_embeddings = []
+    """Gather embeddings already stored on MultimodalParams.
+
+    Use this on E/P prefill workers and cached-only paths. The encoder already
+    ran somewhere else. This only makes the tensor list that
+    find_input_mm_embeds slices.
+    """
+    attached_embeddings = []
     for param in multimodal_params:
         embeds = param.multimodal_data.get("multimodal_embedding")
+        # No attached embedding for this request.
         if embeds is None:
             continue
+        # Some paths stash chunks. Slicer expects one tensor.
         if isinstance(embeds, list):
             embeds = torch.cat(embeds, dim=0)
             param.multimodal_data["multimodal_embedding"] = embeds
-        cached_embeddings.append(embeds)
+        if not isinstance(embeds, torch.Tensor):
+            raise TypeError("multimodal_embedding must be a torch.Tensor")
+        attached_embeddings.append(embeds)
 
-    if not cached_embeddings:
+    if not attached_embeddings:
         return []
-    return [torch.cat(cached_embeddings, dim=0)]
+    # Match get_multimodal_embeddings output: one concatenated tensor.
+    return [torch.cat(attached_embeddings, dim=0)]
 
 
 def find_input_mm_embeds(
@@ -321,14 +332,14 @@ def find_input_mm_embeds(
     Note:
         - Supports both individual batching (len(mm_embeds) == len(multimodal_params))
           and pre-concatenated batching (len(mm_embeds) == 1)
-        - Supports disaggregated prefill where embeddings are already attached
-          to multimodal_params and mm_embeds is empty.
+        - Call get_attached_multimodal_embeddings before this helper when
+          embeddings are already attached to multimodal_params.
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
         - Example: if a request has 8 MM embed rows, 2 cached rows, and 3 rows
           in the current chunk, this keeps rows [2:5].
     """
-    if not mm_embeds:
-        mm_embeds = _get_cached_multimodal_embeddings(multimodal_params)
+    if not isinstance(mm_embeds, list):
+        raise TypeError("mm_embeds must be a list")
 
     # Current support two batching modes:
     # 1. Pre-concatenated mm_embeds for each batch, i.e., len(mm_embeds) == 1
