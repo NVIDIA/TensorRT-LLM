@@ -23,7 +23,7 @@ import random
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import MISSING, astuple, dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -450,6 +450,9 @@ class KVCacheAwareADPRouter(ADPRouter):
         self.match_rate_threshold = match_rate_threshold
         self.fair_share_multiplier = fair_share_multiplier
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+        # Cold-start warmup: ranks not yet targeted through this router.
+        # See ``route_requests``.
+        self._pending_warmup_ranks: Set[int] = set(range(self.dist.tp_size))
         # Requests still sending KV to GEN are invisible in active_requests;
         # fold them back in via the transfer manager (see create_rank_state).
         self.async_transfer_manager = async_transfer_manager
@@ -580,25 +583,37 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
+        # Strict ``attention_dp_rank`` is honoured first; relaxed requests
+        # fall back to the smallest unwarmed rank until every rank has been
+        # targeted, seeding the shared system prompt before scoring would
+        # otherwise pin all traffic to the first warm rank.
         remaining_unscheduled = []
         for req_item in sorted_requests:
             scheduled = False
+            target_dp_rank = None
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
             if scheduling_params is not None:
                 target_dp_rank = scheduling_params.attention_dp_rank
-                if (
-                    target_dp_rank is not None
-                    and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
-                ):
-                    all_ranks_num_active_requests[target_dp_rank] += 1
-                    # Keep token tally in sync with the soft-balancing phase.
-                    effective = max(
-                        self._req_tokens(req_item) - self._match_len(target_dp_rank, req_item.id),
-                        0,
-                    )
-                    all_ranks_num_active_tokens[target_dp_rank] += effective
-                    scheduled = True
-                    all_ranks_new_requests[target_dp_rank].append(req_item)
+            if target_dp_rank is None and self._pending_warmup_ranks:
+                # Smallest-first: deterministic across DP ranks.
+                target_dp_rank = min(self._pending_warmup_ranks)
+            if (
+                target_dp_rank is not None
+                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+            ):
+                all_ranks_num_active_requests[target_dp_rank] += 1
+                # Keep token tally in sync with the soft-balancing phase.
+                effective = max(
+                    self._req_tokens(req_item) - self._match_len(target_dp_rank, req_item.id),
+                    0,
+                )
+                all_ranks_num_active_tokens[target_dp_rank] += effective
+                scheduled = True
+                all_ranks_new_requests[target_dp_rank].append(req_item)
+            # Any targeted rank counts as warmed; cap-saturation also
+            # discards to avoid the synthesiser looping on a busy rank.
+            if target_dp_rank is not None:
+                self._pending_warmup_ranks.discard(target_dp_rank)
 
             if not scheduled:
                 remaining_unscheduled.append(req_item)
