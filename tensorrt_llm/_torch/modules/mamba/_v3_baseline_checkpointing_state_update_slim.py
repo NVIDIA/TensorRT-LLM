@@ -532,66 +532,61 @@ def _rectangle_precompute_impl(
     is_new_k = (k_new_idx >= 0) & (k_new_idx < T)
     safe_k_new = tl.where(is_new_k, k_new_idx, 0)
 
-    # Loop 1: per-head dt processing.  dt → dt_processed → dA_cumsum →
-    # decay_vec_new (= exp(cumAdt_new)).  Stored to write_buf for next step.
-    # decay_vec_full (= total_decay * decay_vec_new) is finalized in loop 2
-    # once total_decay is loaded; loop 1 stores raw decay_vec_new to scratch.
-    for h_local in range(HEADS_PER_BLOCK):
-        head_idx = first_head + h_local
+    # V2: Loop 1 vectorized across HEADS_PER_BLOCK — single (H, T) tile,
+    # no per-head loop.  Mirrors the replay precompute's pre-wait layout.
+    offs_h_lp1 = tl.arange(0, HEADS_PER_BLOCK)
+    heads_block_lp1 = first_head + offs_h_lp1  # (H,)
 
-        dt_base = dt_ptr + pid_b * stride_dt_batch + head_idx * stride_dt_head
-        dt = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt_bias = tl.load(dt_bias_ptr + head_idx * stride_dt_bias_head).to(tl.float32)
-            dt = dt + dt_bias
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
+    dt_addrs_v = (
+        dt_ptr + pid_b * stride_dt_batch
+        + heads_block_lp1[:, None] * stride_dt_head
+        + offs_t[None, :] * stride_dt_T
+    )
+    dt_v = tl.load(dt_addrs_v, mask=t_mask[None, :], other=0.0).to(tl.float32)
+    if HAS_DT_BIAS:
+        dt_bias_v = tl.load(dt_bias_ptr + heads_block_lp1 * stride_dt_bias_head).to(tl.float32)
+        dt_v = dt_v + dt_bias_v[:, None]
+    if DT_SOFTPLUS:
+        dt_v = softplus(dt_v)
 
-        A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
-        dA_cumsum = tl.cumsum(A * dt, axis=0)
+    A_v = tl.load(A_ptr + heads_block_lp1 * stride_A_head).to(tl.float32)  # (H,)
+    dA_cumsum_v = tl.cumsum(A_v[:, None] * dt_v, axis=1)  # (H, T)
 
-        # Cross-step continuity for old_dA_cumsum: rectangle precompute runs
-        # only on the nowrite path (write_buf == buf_active, write_offset == PNAT).
-        # Add the running tail from buf_active[head_idx, PNAT-1] so the buffer
-        # holds one continuous cumsum across back-to-back nowrites.  PNAT is
-        # scalar/uniform, use scalar if to short-circuit the load at PNAT=0.
-        if prev_num_accepted_tokens == 0:
-            prev_total = 0.0
-        else:
-            last_cumsum_ptr = (
-                old_dA_cumsum_ptr
-                + cache_batch_idx * stride_old_dA_cumsum_cache
-                + buf_active * stride_old_dA_cumsum_dbuf
-                + head_idx * stride_old_dA_cumsum_head
-                + (prev_num_accepted_tokens - 1) * stride_old_dA_cumsum_T
-            )
-            prev_total = tl.load(last_cumsum_ptr).to(tl.float32)
-
-        # Store dt and dA_cumsum to write_buf at [write_offset, write_offset+T)
-        # for next step's replay/rectangle use.
-        old_dt_base = (
-            old_dt_ptr
-            + cache_batch_idx * stride_old_dt_cache
-            + write_buf * stride_old_dt_dbuf
-            + head_idx * stride_old_dt_head
-        )
-        tl.store(
-            old_dt_base + (write_offset + offs_t) * stride_old_dt_T,
-            dt,
-            mask=t_mask,
-        )
-
-        old_dA_cumsum_base = (
+    # Cross-step continuity: hoisted (H,) prefix load.
+    if prev_num_accepted_tokens == 0:
+        prev_total_v = tl.zeros((HEADS_PER_BLOCK,), dtype=tl.float32)
+    else:
+        prev_total_ptrs_v = (
             old_dA_cumsum_ptr
             + cache_batch_idx * stride_old_dA_cumsum_cache
-            + write_buf * stride_old_dA_cumsum_dbuf
-            + head_idx * stride_old_dA_cumsum_head
+            + buf_active * stride_old_dA_cumsum_dbuf
+            + heads_block_lp1 * stride_old_dA_cumsum_head
+            + (prev_num_accepted_tokens - 1) * stride_old_dA_cumsum_T
         )
-        tl.store(
-            old_dA_cumsum_base + (write_offset + offs_t) * stride_old_dA_cumsum_T,
-            dA_cumsum + prev_total,
-            mask=t_mask,
-        )
+        prev_total_v = tl.load(prev_total_ptrs_v).to(tl.float32)
+
+    # Coalesced (H, T) stores — replaces HPB per-head scalar stores.
+    old_dt_addrs_v = (
+        old_dt_ptr
+        + cache_batch_idx * stride_old_dt_cache
+        + write_buf * stride_old_dt_dbuf
+        + heads_block_lp1[:, None] * stride_old_dt_head
+        + (write_offset + offs_t)[None, :] * stride_old_dt_T
+    )
+    tl.store(old_dt_addrs_v, dt_v, mask=t_mask[None, :])
+
+    old_dA_cumsum_addrs_v = (
+        old_dA_cumsum_ptr
+        + cache_batch_idx * stride_old_dA_cumsum_cache
+        + write_buf * stride_old_dA_cumsum_dbuf
+        + heads_block_lp1[:, None] * stride_old_dA_cumsum_head
+        + (write_offset + offs_t)[None, :] * stride_old_dA_cumsum_T
+    )
+    tl.store(
+        old_dA_cumsum_addrs_v,
+        dA_cumsum_v + prev_total_v[:, None],
+        mask=t_mask[None, :],
+    )
 
     # ---- Hoisted: cache-only loads independent of conv1d ----
     # old_B (group-level, BLOCK_K × BLOCK_DSTATE = ~8KB tile) and the
@@ -661,16 +656,12 @@ def _rectangle_precompute_impl(
         old_dA_cumsum_read_h[:, None] + safe_old_k[None, :] * stride_old_dA_cumsum_T,
         mask=hk_mask, other=0.0,
     ).to(tl.float32)
-    # (H, T) loads at [PNAT, PNAT+T) — this step's dA_cumsum_new from loop 1.
-    # With the cross-step continuity fix in loop 1, the values stored at
-    # [PNAT, PNAT+T) are the continuous cumsum (prefix + per-step new
-    # cumsum) — i.e., continuous_cumsum[PNAT..PNAT+T-1] in global indexing.
+    # V3: use loop-1 registers directly instead of reloading dA_cumsum_new
+    # from buffer.  dA_cumsum_v + prev_total_v[:, None] IS what the buffer
+    # holds at positions [PNAT, PNAT+T).  Saves an (H, T) DRAM round-trip
+    # per kernel call.
     ht_mask = t_mask[None, :]  # (1, T)
-    dA_cumsum_new = tl.load(
-        old_dA_cumsum_write_h[:, None]
-        + (write_offset + offs_t)[None, :] * stride_old_dA_cumsum_T,
-        mask=ht_mask, other=0.0,
-    ).to(tl.float32)
+    dA_cumsum_new = dA_cumsum_v + prev_total_v[:, None]  # (H, T)
     # (H, K) loads at K_NEW_SHIFT-shifted positions for new tokens.
     hkn_mask = is_new_k[None, :]
     dt_at_kn = tl.load(
