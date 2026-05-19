@@ -570,7 +570,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
         # Skip the allgather in _gen_consensus when this transceiver never receives (pure CTX role).
         if not self._ever_had_recv_session:
-            return [], []
+            return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
