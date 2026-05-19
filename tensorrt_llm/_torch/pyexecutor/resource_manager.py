@@ -2290,8 +2290,11 @@ class KVCacheManagerV2(BaseResourceManager):
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId,
                                               role: DataRole) -> str:
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
+        pool_group_id = self.impl._storage.get_pool_group_index(
+            attr.life_cycle_id)
         lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
-        return (f"role={str(role)}, pool_id={int(attr.life_cycle_id)}, "
+        return (f"role={str(role)}, pool_group_id={int(pool_group_id)}, "
+                f"lifecycle_id={int(attr.life_cycle_id)}, "
                 f"lifecycle={lifecycle}")
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
