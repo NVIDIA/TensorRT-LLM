@@ -26,9 +26,9 @@ transforms:
     enabled: false
   sharding_transform_executor:
     enabled: false
-  quantize_mxfp4_moe_trtllm_gen:
-    enabled: true
-    quant_act: mxfp8
+  quantize_mxfp4_moe:
+    backend: trtllm
+    trtllm_quant_act: mxfp8
   fuse_gemms_mixed_children:
     enabled: true
   fuse_gemms:

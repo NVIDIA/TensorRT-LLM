@@ -512,8 +512,11 @@ class InsertMXFP4MLP(BaseTransform):
         moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
         moe_ep_size = int(getattr(dc, "moe_ep_size", 1)) if dc is not None else 1
         moe_ep_rank = int(getattr(dc, "moe_ep_rank", 0)) if dc is not None else 0
+        # Cover MoE-EP as well: any distributed case (tp_size>1) needs the
+        # configured strategy. ``moe_tp_size > 1`` alone would miss EP-only.
+        _tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
         allreduce_strategy = (
-            str(dc.allreduce_strategy) if dc is not None and moe_tp_size > 1 else "NCCL"
+            str(dc.allreduce_strategy) if dc is not None and _tp_size > 1 else "NCCL"
         )
 
         # Pre-compute the same dist tuple for the load hook factory so it
@@ -716,11 +719,27 @@ class InsertMXFP4MLP(BaseTransform):
                 1,  # routing_method_type = RoutingMethodType.Renormalize
             )
 
-            # MoE-TP: insert an all_reduce after the downstream view so the
-            # ``MoE -> view -> AR -> add -> norm`` ordering matches
+            # Distributed MoE: insert an all_reduce after the downstream view so
+            # the ``MoE -> view -> AR -> add -> norm`` ordering matches
             # ``fuse_allreduce_residual_rmsnorm`` (see legacy transform's
             # rationale for the same placement).
-            if moe_tp_size > 1:
+            #
+            # Both MoE-TP and MoE-EP need an AR after the local MoE op:
+            #   - MoE-TP: each rank computes partial inner-product (summed
+            #     by AR to reconstruct the full intermediate-dim contraction).
+            #   - MoE-EP: each rank computes outputs only for its local
+            #     expert range (zero contribution from other experts);
+            #     AR sums per-token outputs across ranks.
+            # Use ``tp_size > 1`` (= ``moe_tp_size * moe_ep_size *
+            # moe_cluster_size > 1``) so the AR fires for any distributed
+            # configuration. Matches taylor's pre-refactor modeling code
+            # which emitted an unconditional AR placeholder at this exact
+            # spot (commit bad1871004 + 93f78e962c, validated EP=2 GSM8K
+            # 88.02%).
+            tp_size = (
+                int(getattr(dc, "tp_size", 1)) if dc is not None else 1
+            )
+            if tp_size > 1:
                 from .sharding import _get_dist_ops
 
                 _, all_reduce_op = _get_dist_ops("auto")

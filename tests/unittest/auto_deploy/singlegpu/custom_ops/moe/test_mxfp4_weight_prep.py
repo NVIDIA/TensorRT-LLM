@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ``prepare_mxfp4_weights_for_trtllm_gen``.
+"""Unit tests for ``prepare_mxfp4_weights_for_trtllm``.
 
 These tests mirror the gpt-oss-120b MoE/GEMM structure (small E/H/I) and pin
 the kernel-layout invariants the trtllm-gen ``bf16_mxe2m1_block_scale_moe_runner``
@@ -19,7 +19,7 @@ import torch
 # Permute helpers are CUDA-only because shuffle_matrix is registered there.
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="prepare_mxfp4_weights_for_trtllm_gen relies on torch.ops.trtllm.shuffle_matrix",
+    reason="prepare_mxfp4_weights_for_trtllm relies on torch.ops.trtllm.shuffle_matrix",
 )
 
 
@@ -61,7 +61,7 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
     bias to each output row.
     """
     from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_weight_prep import (
-        prepare_mxfp4_weights_for_trtllm_gen,
+        prepare_mxfp4_weights_for_trtllm,
     )
     from tensorrt_llm._torch.modules.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w3_w1_permute_indices,
@@ -76,7 +76,7 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
     # Reconstruct the pre-shuffle bias the prep helper builds (after pad +
     # de-interleave + cat([up | gate])). Then derive the expected shuffled
     # bias by reusing PT's permute helpers and compare against the actual
-    # output of ``prepare_mxfp4_weights_for_trtllm_gen``.
+    # output of ``prepare_mxfp4_weights_for_trtllm``.
     gate_b = gu_bias[:, 0::2].contiguous()  # [E, I]
     up_b = gu_bias[:, 1::2].contiguous()  # [E, I]
     pad_amount = (128 - GPTOSS_INTERMEDIATE_SIZE % 128) % 128
@@ -93,7 +93,7 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
         expected_fc1_bias_per_expert.append(torch.index_select(slc, 0, perm.to(slc.device)))
     expected_fc1_bias = torch.stack(expected_fc1_bias_per_expert, dim=0).contiguous()
 
-    prep = prepare_mxfp4_weights_for_trtllm_gen(
+    prep = prepare_mxfp4_weights_for_trtllm(
         gu_blocks,
         gu_scales,
         gu_bias,
@@ -119,7 +119,7 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
 def test_fc2_bias_is_shuffled_with_same_row_permutation_as_fc2_weights():
     """Regression: fc2 bias must follow the (non-gated) TMA row permute used by w2."""
     from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_weight_prep import (
-        prepare_mxfp4_weights_for_trtllm_gen,
+        prepare_mxfp4_weights_for_trtllm,
     )
     from tensorrt_llm._torch.modules.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w2_permute_indices,
@@ -143,7 +143,7 @@ def test_fc2_bias_is_shuffled_with_same_row_permutation_as_fc2_weights():
         expected_fc2_bias_per_expert.append(torch.index_select(slc, 0, perm.to(slc.device)))
     expected_fc2_bias = torch.stack(expected_fc2_bias_per_expert, dim=0).contiguous()
 
-    prep = prepare_mxfp4_weights_for_trtllm_gen(
+    prep = prepare_mxfp4_weights_for_trtllm(
         gu_blocks,
         gu_scales,
         gu_bias,
@@ -173,7 +173,7 @@ def test_prep_against_pt_reference_loader_byte_identical():
     helper must mirror.  Any divergence here is a kernel-layout bug.
     """
     from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_weight_prep import (
-        prepare_mxfp4_weights_for_trtllm_gen,
+        prepare_mxfp4_weights_for_trtllm,
     )
     from tensorrt_llm._torch.modules.fused_moe.quantization import (
         _get_weight_alignment,
@@ -278,7 +278,7 @@ def test_prep_against_pt_reference_loader_byte_identical():
     fc2_scale_ref_t = torch.stack(fc2_scale_ref, dim=0).contiguous()
     fc2_bias_ref_t = torch.stack(fc2_bias_ref, dim=0).contiguous()
 
-    prep = prepare_mxfp4_weights_for_trtllm_gen(
+    prep = prepare_mxfp4_weights_for_trtllm(
         gu_blocks,
         gu_scales,
         gu_bias,
