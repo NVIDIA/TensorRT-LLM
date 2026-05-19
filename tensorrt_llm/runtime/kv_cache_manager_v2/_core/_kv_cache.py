@@ -85,6 +85,7 @@ from .._utils import (
     value_or,
 )
 from ._moving_average import Average
+from ._pending_stats import _PendingStats, _PendingStatsDelta
 
 if TYPE_CHECKING:
     from ._kv_cache_manager import KVCacheManager, ScratchDesc
@@ -125,28 +126,6 @@ class SeqBlock:
     def __del__(self) -> None:
         self.tree_block = None
         self.pages.clear()
-
-
-@dataclass(slots=True)
-class _PendingAllocationSegment:
-    life_cycle: LifeCycleId
-    block_begin: BlockOrdinal
-    block_end: BlockOrdinal
-    beam_width: int
-    count_as_missed: bool
-    count_as_generation: bool
-
-
-@dataclass(slots=True)
-class _PendingStatsDelta:
-    global_stats: KVCacheStatsDelta
-    request_stats: KVCacheStatsDelta
-    iteration_stats: KVCacheIterationStatsDelta
-    life_cycle: LifeCycleId | None = None
-
-    @property
-    def empty(self) -> bool:
-        return self.global_stats.empty and self.request_stats.empty and self.iteration_stats.empty
 
 
 class _Status(enum.Enum):
@@ -218,10 +197,7 @@ class _KVCache:
         "_never_resumed",
         "_enable_swa_scratch_reuse",
         "_scratch_slots",
-        "_pending_request_stats",
-        "_pending_global_stats",
-        "_pending_iteration_stats_by_life_cycle",
-        "_pending_allocation_segments",
+        "_pending_stats",
         "__rawref__",
     )
 
@@ -270,10 +246,7 @@ class _KVCache:
     # Managed via delta in resize(): existing slots are reused across resize calls,
     # only the additional needed slots are allocated. Freed on teardown/suspend.
     _scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
-    _pending_request_stats: KVCacheStatsDelta
-    _pending_global_stats: KVCacheStatsDelta
-    _pending_iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
-    _pending_allocation_segments: list[_PendingAllocationSegment]
+    _pending_stats: _PendingStats
 
     def __init__(
         self,
@@ -320,10 +293,7 @@ class _KVCache:
         self._scratch_slots = make_typed(
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
-        self._pending_request_stats = KVCacheStatsDelta()
-        self._pending_global_stats = KVCacheStatsDelta()
-        self._pending_iteration_stats_by_life_cycle = {}
-        self._pending_allocation_segments = []
+        self._pending_stats = _PendingStats()
         self.__rawref__ = rawref.NULL
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
@@ -392,32 +362,19 @@ class _KVCache:
             self.discard_pending_stats()
             return KVCacheStatsDelta()
         self.manager.commit_stats(
-            self._pending_global_stats, self._pending_iteration_stats_by_life_cycle
+            self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
         )
-        request_stats = self._pending_request_stats.copy()
-        self._clear_pending_stats()
+        request_stats = self._pending_stats.request_stats.copy()
+        self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
         return request_stats
 
     def discard_pending_stats(self) -> None:
-        self._clear_pending_stats()
+        self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
 
-    def _clear_pending_stats(self) -> None:
-        self._pending_request_stats.clear()
-        self._pending_global_stats.clear()
-        self._pending_iteration_stats_by_life_cycle.clear()
-        self._pending_allocation_segments.clear()
-
-    def _has_pending_stats(self) -> bool:
-        return (
-            not self._pending_request_stats.empty
-            or not self._pending_global_stats.empty
-            or bool(self._pending_iteration_stats_by_life_cycle)
-        )
-
     def _refresh_stats_dirty_state(self) -> None:
-        if self._has_pending_stats():
+        if not self._pending_stats.empty:
             self.manager.mark_stats_dirty(self.id)
         else:
             self.manager.clear_stats_dirty(self.id)
@@ -436,81 +393,11 @@ class _KVCache:
     def _should_record_generation_alloc_stats(self, capacity: int) -> bool:
         return self._generation_alloc_ready and capacity > self._capacity
 
-    def _apply_pending_stats(self, delta: _PendingStatsDelta, *, subtract: bool = False) -> None:
-        if not subtract and not self._should_record_stats():
+    def _add_pending_stats(self, delta: _PendingStatsDelta) -> None:
+        if not self._should_record_stats():
             return
-        if delta.empty:
-            return
-        if subtract:
-            if not delta.global_stats.empty:
-                self._pending_global_stats.subtract(delta.global_stats)
-            if not delta.request_stats.empty:
-                self._pending_request_stats.subtract(delta.request_stats)
-            if delta.iteration_stats.empty:
-                return
-            assert delta.life_cycle is not None
-            pending = self._pending_iteration_stats_by_life_cycle.get(delta.life_cycle)
-            if pending is not None:
-                pending.subtract(delta.iteration_stats)
-                if pending.empty:
-                    del self._pending_iteration_stats_by_life_cycle[delta.life_cycle]
-            return
-        if not delta.global_stats.empty:
-            self._pending_global_stats.add(delta.global_stats)
-        if not delta.request_stats.empty:
-            self._pending_request_stats.add(delta.request_stats)
-        if not delta.iteration_stats.empty:
-            assert delta.life_cycle is not None
-            pending = self._pending_iteration_stats_by_life_cycle.setdefault(
-                delta.life_cycle, KVCacheIterationStatsDelta()
-            )
-            pending.add(delta.iteration_stats)
-        self.manager.mark_stats_dirty(self.id)
-
-    def _pending_allocation_delta(
-        self,
-        segment: _PendingAllocationSegment,
-        block_begin: BlockOrdinal,
-        block_end: BlockOrdinal,
-    ) -> _PendingStatsDelta:
-        num_blocks = max(0, int(block_end) - int(block_begin)) * segment.beam_width
-        stats = KVCacheStatsDelta(
-            alloc_total_blocks=num_blocks,
-            alloc_new_blocks=num_blocks,
-            missed_blocks=num_blocks if segment.count_as_missed else 0,
-        )
-        request_stats = stats.copy()
-        iteration_stats = KVCacheIterationStatsDelta(
-            iter_alloc_total_blocks=num_blocks,
-            iter_alloc_new_blocks=num_blocks,
-            iter_missed_blocks=num_blocks if segment.count_as_missed else 0,
-            iter_gen_alloc_blocks=num_blocks if segment.count_as_generation else 0,
-        )
-        return _PendingStatsDelta(stats, request_stats, iteration_stats, segment.life_cycle)
-
-    def _record_pending_allocation_range(
-        self,
-        life_cycle: LifeCycleId,
-        block_begin: BlockOrdinal,
-        block_end: BlockOrdinal,
-        *,
-        beam_width: int,
-        count_as_missed: bool,
-        count_as_generation: bool = False,
-    ) -> None:
-        life_cycle_key = self._stats_life_cycle_key(life_cycle)
-        if life_cycle_key is None or not self._should_record_stats() or block_begin >= block_end:
-            return
-        segment = _PendingAllocationSegment(
-            life_cycle=life_cycle_key,
-            block_begin=block_begin,
-            block_end=block_end,
-            beam_width=beam_width,
-            count_as_missed=count_as_missed,
-            count_as_generation=count_as_generation,
-        )
-        self._apply_pending_stats(self._pending_allocation_delta(segment, block_begin, block_end))
-        self._pending_allocation_segments.append(segment)
+        if self._pending_stats.add(delta):
+            self.manager.mark_stats_dirty(self.id)
 
     @staticmethod
     def _block_ranges_excluding(
@@ -538,11 +425,12 @@ class _KVCache:
         # V2 includes generation allocations in per-request alloc_total/new
         # metrics. This intentionally differs from the legacy V1 C++ manager,
         # where addToken() only updates manager-level generation counters.
+        changed = False
         for lc_idx, _ in self.manager._life_cycles.attention_life_cycles():
             for block_range in self._block_ranges_excluding(
                 block_begin, block_end, excluded_ranges[lc_idx]
             ):
-                self._record_pending_allocation_range(
+                changed |= self._pending_stats.record_allocation_range(
                     lc_idx,
                     block_range.beg,
                     block_range.end,
@@ -550,6 +438,8 @@ class _KVCache:
                     count_as_missed=not count_as_generation,
                     count_as_generation=count_as_generation,
                 )
+        if changed:
+            self.manager.mark_stats_dirty(self.id)
 
     @staticmethod
     def _has_reuse_source(page: BlockPage) -> bool:
@@ -588,7 +478,7 @@ class _KVCache:
             reused_blocks = full_reused_blocks + partial_reused_blocks
             if reused_blocks == 0:
                 continue
-            self._apply_pending_stats(
+            self._add_pending_stats(
                 _PendingStatsDelta(
                     global_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
                     request_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
@@ -604,31 +494,7 @@ class _KVCache:
     def _subtract_pending_allocation_range(
         self, block_begin: BlockOrdinal, block_end: BlockOrdinal
     ) -> None:
-        if block_begin >= block_end or not self._pending_allocation_segments:
-            return
-        changed = False
-        idx = len(self._pending_allocation_segments) - 1
-        while idx >= 0:
-            segment = self._pending_allocation_segments[idx]
-            if segment.block_end <= block_begin:
-                break
-            removed_begin = max(block_begin, segment.block_begin)
-            removed_end = min(block_end, segment.block_end)
-            if removed_begin >= removed_end:
-                idx -= 1
-                continue
-            changed = True
-            self._apply_pending_stats(
-                self._pending_allocation_delta(segment, removed_begin, removed_end),
-                subtract=True,
-            )
-            if removed_begin <= segment.block_begin:
-                del self._pending_allocation_segments[idx]
-            else:
-                assert removed_end == segment.block_end
-                segment.block_end = removed_begin
-            idx -= 1
-        if changed:
+        if self._pending_stats.subtract_allocation_range(block_begin, block_end):
             self._refresh_stats_dirty_state()
 
     def _record_direct_iteration_stats(
@@ -1285,13 +1151,17 @@ class _KVCache:
                         self.cuda_stream,
                     )
                 if lc_idx != ssm_lc_id:
-                    self._record_pending_allocation_range(
-                        lc_idx,
-                        last_ordinal,
-                        BlockOrdinal(last_ordinal + 1),
-                        beam_width=1,
-                        count_as_missed=not has_partial_reuse_source,
-                    )
+                    life_cycle_key = self._stats_life_cycle_key(lc_idx)
+                    if life_cycle_key is not None and self._should_record_stats():
+                        changed = self._pending_stats.record_allocation_range(
+                            life_cycle_key,
+                            last_ordinal,
+                            BlockOrdinal(last_ordinal + 1),
+                            beam_width=1,
+                            count_as_missed=not has_partial_reuse_source,
+                        )
+                        if changed:
+                            self.manager.mark_stats_dirty(self.id)
                     self._record_direct_iteration_stats(
                         lc_idx,
                         KVCacheIterationStatsDelta(
