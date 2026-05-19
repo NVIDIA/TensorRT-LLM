@@ -475,9 +475,9 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
 class Qwen3VLVisionAttention(Qwen2_5_VLVisionAttention):
     def __init__(self, model_config, layer_idx):
-        model_config.pretrained_config.max_position_embeddings = (
-            model_config.pretrained_config.text_config.max_position_embeddings
-        )
+        # Qwen3-VL keeps `torch_dtype` only on `text_config` under transformers 5.x
+        # strict mode; mirror it onto `vision_config` so the parent picks it up.
+        # `max_position_embeddings` is handled by the parent's text_config fallback.
         model_config.pretrained_config.vision_config.torch_dtype = (
             model_config.pretrained_config.text_config.dtype
         )
@@ -694,7 +694,10 @@ class Qwen3VisionModel(torch.nn.Module):
         self.pos_embed = nn.Embedding(self.config.num_position_embeddings, self.config.hidden_size)
         self.num_grid_per_side = int(self.config.num_position_embeddings**0.5)
 
-        self.config.max_position_embeddings = 8192
+        text_config = getattr(
+            model_config.pretrained_config, "text_config", model_config.pretrained_config
+        )
+        self.config.max_position_embeddings = text_config.max_position_embeddings
         self.config.partial_rotary_factor = 0.5
         self.config.num_attention_heads = self.config.num_heads
         self.head_dim = self.config.hidden_size // self.config.num_heads
