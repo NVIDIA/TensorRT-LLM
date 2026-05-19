@@ -257,10 +257,12 @@ class Gemma4VisionMLP(nn.Module):
 class Gemma4VisionAttention(Attention):
     """Bidirectional attention with q/k/v RMSNorms and 2D RoPE.
 
-    Inherits ``Attention`` to participate in the TRT-LLM backend dispatch
-    (default ``FLASHINFER``). Vision is context-only and runs through
-    ``forward_impl`` with ``PredefinedAttentionMask.FULL`` and a tower-local
-    ``attn_metadata`` (``kv_cache_manager=None``).
+    Inherits ``Attention`` to participate in the TRT-LLM backend dispatch.
+    Vision sub_config is forced to ``attn_backend="TRTLLM"`` in
+    ``modeling_gemma4mm.get_sub_model_config`` (same pattern Qwen2.5-VL uses).
+    Vision is context-only and runs through ``forward_impl`` with
+    ``PredefinedAttentionMask.FULL`` and a tower-local ``attn_metadata``
+    (``kv_cache_manager=None``).
 
     The ``Attention`` base class uses a fused ``qkv_proj`` and a vanilla
     ``o_proj``. To preserve HF Gemma4's ``ClippableLinear`` semantics we
@@ -650,10 +652,14 @@ class Gemma4VisionModel(nn.Module):
 
         # SigLip-style context-only metadata: kv_cache_manager=None, no decode
         # phase. Re-prepared each forward with the actual per-image seq lens.
+        # Vision tower runs one image per call (mm forward loops per-image),
+        # so bounds are vision-scale, not LLM-scale. Using LLM max_num_tokens
+        # here makes the C++ attn workspace resize to TB-range and OOM
+        # (sized as max_num_requests * heads * max_num_tokens^2 * bytes).
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         self.attn_metadata = self.metadata_cls(
-            max_num_requests=8192,
-            max_num_tokens=getattr(model_config, "max_num_tokens", 8192),
+            max_num_requests=1,
+            max_num_tokens=8192,
             kv_cache_manager=None,
         )
 
