@@ -94,6 +94,89 @@ def test_add_dummy_requests_returns_none_when_create_kv_cache_returns_none():
     create_kv_cache.assert_called_once()
 
 
+def test_kv_cache_creator_forwards_is_disagg():
+    # Regression: KvCacheCreator must forward is_disagg so the disagg-gen IndexMapper uses max_num_sequences*2+1, not *1+1.
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    creator = object.__new__(KvCacheCreator)
+    creator._is_disagg = True
+    creator._mapping = MagicMock()
+    creator._kv_cache_config = MagicMock()
+    creator._tokens_per_block = 128
+    creator._max_seq_len = 1024
+    creator._max_batch_size = 2
+    creator._speculative_config = None
+    creator._sparse_attention_config = None
+    creator._max_num_tokens = 8
+    creator._max_beam_width = 1
+    creator._llm_args = MagicMock(max_input_len=1024)
+    creator._kv_connector_manager = None
+    creator._execution_stream = None
+    creator._skip_est = True
+
+    model_engine = MagicMock()
+    model_engine.model.model_config.is_generation = True
+
+    with patch("tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+               return_value=None) as mod_create, patch.object(
+                   creator,
+                   "_get_model_kv_cache_manager_cls",
+                   return_value=KVCacheManagerV2), patch.object(
+                       creator,
+                       "_should_create_separate_draft_kv_cache",
+                       return_value=False):
+        creator._create_kv_cache_manager(model_engine)
+
+    assert mod_create.call_args.kwargs["is_disagg"] is True
+
+
+def test_kv_cache_creator_forwards_is_disagg_to_one_model_draft():
+    # Regression: same is_disagg propagation must hold for the one-model draft (MTP/Eagle) KV cache path.
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    creator = object.__new__(KvCacheCreator)
+    creator._is_disagg = True
+    creator._mapping = MagicMock()
+    creator._kv_cache_config = MagicMock()
+    creator._tokens_per_block = 128
+    creator._max_seq_len = 1024
+    creator._max_batch_size = 2
+    creator._speculative_config = MagicMock()
+    creator._speculative_config.spec_dec_mode.is_external_drafter.return_value = False
+    creator._max_num_tokens = 8
+    creator._max_beam_width = 1
+    creator._llm_args = MagicMock(max_input_len=1024)
+    creator._kv_connector_manager = None
+    creator._execution_stream = None
+    creator._skip_est = True
+
+    target_model_engine = MagicMock()
+    target_model_engine.model.model_config.pretrained_config.num_hidden_layers = 4
+    creator._model_engine = target_model_engine
+
+    draft_config = MagicMock()
+    draft_config.sparse_attention_config = None
+    draft_config.pretrained_config.torch_dtype = "bfloat16"
+
+    with patch.object(
+            creator, "_get_num_draft_layers", return_value=1
+    ), patch.object(
+            creator, "_get_effective_draft_config", return_value=draft_config
+    ), patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=KVCacheManagerV2
+    ), patch.object(creator, "_warn_if_unsupported_kv_cache_manager_v2"), patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+            return_value=None) as mod_create:
+        creator._create_one_model_draft_kv_cache_manager()
+
+    assert mod_create.call_args.kwargs["is_disagg"] is True
+
+
 class TestResourceManager(unittest.TestCase):
     CPP_RESOURCES_DIR = os.path.join(str(root_dir), "cpp", "tests", "resources")
     CPP_DATA_DIR = os.path.join(CPP_RESOURCES_DIR, "data")

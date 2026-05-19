@@ -718,6 +718,7 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
+            is_disagg=self._is_disagg,
         )
 
         if not self._skip_est:
@@ -851,6 +852,7 @@ class KvCacheCreator:
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
+            is_disagg=self._is_disagg,
             # One-model draft specific overrides
             model_config=effective_draft_config,
             dtype=effective_draft_config.pretrained_config.torch_dtype,
