@@ -595,34 +595,31 @@ public:
         KVBlockArray::DataType* block_offsets = nullptr;
         bool use_kv_cache = false;
         KvCachePoolPointers pool_pointers;
+        max_blocks_per_sequence
+            = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
+        pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
+            : 0;
+        layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
+            : 0;
+        block_offsets = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
+                ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                : nullptr);
+
+        // The cache element size in bits.
+        int cache_elem_bits = op.getKvCacheElemSizeInBits<T>();
+        auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
+        auto const bytes_per_block = block_size * cache_elem_bits / 8 /*bits*/;
+        int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
+        auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
+
+        // Build KV cache pool pointers from the host tensor.
+        use_kv_cache = op.useKVCache() && host_kv_cache_pool_pointers.has_value();
+        if (use_kv_cache)
         {
-            max_blocks_per_sequence
-                = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
-            pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
-                ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
-                : 0;
-            layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
-                ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
-                : 0;
-            block_offsets = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
-                    ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
-                    : nullptr);
-
-            // The cache element size in bits.
-            int cache_elem_bits = op.getKvCacheElemSizeInBits<T>();
-            auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
-            auto const bytes_per_block = block_size * cache_elem_bits / 8 /*bits*/;
-            int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
-            auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
-
-            // Build KV cache pool pointers from the host tensor.
-            use_kv_cache = op.useKVCache() && host_kv_cache_pool_pointers.has_value();
-            if (use_kv_cache)
-            {
-                pool_pointers
-                    = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), pool_index, intra_pool_offset,
-                        block_size, layer_idx_in_cache_pool, kv_factor, op.mKVCacheQuantMode.hasFp4KvCache());
-            }
+            pool_pointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), pool_index, intra_pool_offset,
+                block_size, layer_idx_in_cache_pool, kv_factor, op.mKVCacheQuantMode.hasFp4KvCache());
         }
 
         float const* kv_scale_orig_quant_ptr = nullptr;
@@ -761,34 +758,30 @@ public:
         {
             common_enqueue_params.input_seq_length = max_context_q_len;
             AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
+            enqueue_params.batch_size = num_seqs;
+            enqueue_params.k_ptr = k_ptr;
+            enqueue_params.v_ptr = v_ptr;
+            // Pass V's actual token stride so the FMHA runner handles both
+            // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
+            // kv.split() view) correctly.
+            if (v_ptr != nullptr && v.has_value())
             {
-                enqueue_params.batch_size = num_seqs;
-                enqueue_params.k_ptr = k_ptr;
-                enqueue_params.v_ptr = v_ptr;
-                // Pass V's actual token stride so the FMHA runner handles both
-                // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
-                // kv.split() view) correctly.
-                if (v_ptr != nullptr && v.has_value())
-                {
-                    enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
-                }
+                enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
+            }
 
-                if (op.isMLAEnabled())
-                {
-                    mla_params.cache_seq_lens = sequence_lengths_ptr;
-                    mla_params.max_input_seq_len = max_context_q_len;
-                    enqueue_params.mla_param = &mla_params;
-                }
-                if (op.isMRoPE() && mrope_rotary_cos_sin.has_value())
-                {
-                    enqueue_params.mrope_rotary_cos_sin
-                        = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
-                }
-                extractHelixParams(enqueue_params);
-            }
+            if (op.isMLAEnabled())
             {
-                op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
+                mla_params.cache_seq_lens = sequence_lengths_ptr;
+                mla_params.max_input_seq_len = max_context_q_len;
+                enqueue_params.mla_param = &mla_params;
             }
+            if (op.isMRoPE() && mrope_rotary_cos_sin.has_value())
+            {
+                enqueue_params.mrope_rotary_cos_sin
+                    = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
+            }
+            extractHelixParams(enqueue_params);
+            op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
         }
         else // generation stage
         {
@@ -802,73 +795,69 @@ public:
 
             common_enqueue_params.input_seq_length = input_seq_length;
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
-            {
-                enqueue_params.layer_idx = op.mLayerIdx;
-                enqueue_params.beam_width = beam_width;
-                enqueue_params.num_requests = num_requests;
-                enqueue_params.cache_indir = beam_width == 1
-                    ? nullptr
-                    : (cache_indirection.has_value() ? cache_indirection.value().data_ptr<int32_t>() : nullptr);
-                enqueue_params.semaphores = op.multiBlockSemaphores();
-                enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
-                enqueue_params.start_token_idx_sf = token_offset;
+            enqueue_params.layer_idx = op.mLayerIdx;
+            enqueue_params.beam_width = beam_width;
+            enqueue_params.num_requests = num_requests;
+            enqueue_params.cache_indir = beam_width == 1
+                ? nullptr
+                : (cache_indirection.has_value() ? cache_indirection.value().data_ptr<int32_t>() : nullptr);
+            enqueue_params.semaphores = op.multiBlockSemaphores();
+            enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
+            enqueue_params.start_token_idx_sf = token_offset;
 
-                if (op.isMRoPE() && mrope_position_deltas.has_value())
+            if (op.isMRoPE() && mrope_position_deltas.has_value())
+            {
+                enqueue_params.mrope_position_deltas = mrope_position_deltas.value().data_ptr<int32_t>();
+            }
+            if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding)
+            {
+                bool useTllmGen = tensorrt_llm::common::isSM100Family();
+                if (useTllmGen)
                 {
-                    enqueue_params.mrope_position_deltas = mrope_position_deltas.value().data_ptr<int32_t>();
+                    TORCH_CHECK(spec_decoding_tensor_params.size() == 6,
+                        "Expecting 6 tensors for spec-dec mode, spec_decoding_generation_lengths, "
+                        "spec_decoding_position_offsets, spec_decoding_packed_mask, "
+                        "spec_decoding_bl_tree_mask_offset, "
+                        "spec_decoding_bl_tree_mask and spec_bl_tree_first_sparse_mask_offset_kv.");
+                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
+                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
+                        "Expecting spec_decoding_position_offsets spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
+                        "Expecting spec_decoding_packed_mask spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[3].has_value(),
+                        "Expecting spec_decoding_bl_tree_mask_offset spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[4].has_value(),
+                        "Expecting spec_decoding_bl_tree_mask spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[5].has_value(),
+                        "Expecting spec_bl_tree_first_sparse_mask_offset_kv spec-dec mode.");
+                    enqueue_params.spec_decoding_bl_tree_mask_offset
+                        = spec_decoding_tensor_params[3].value().data_ptr<int64_t>();
+                    enqueue_params.spec_decoding_bl_tree_mask
+                        = spec_decoding_tensor_params[4].value().data_ptr<uint32_t>();
+                    enqueue_params.spec_bl_tree_first_sparse_mask_offset_kv
+                        = spec_decoding_tensor_params[5].value().data_ptr<int32_t>();
                 }
-                if (op.mIsSpecDecodingEnabled && op.mUseSpecDecoding)
+                else
                 {
-                    bool useTllmGen = tensorrt_llm::common::isSM100Family();
-                    if (useTllmGen)
-                    {
-                        TORCH_CHECK(spec_decoding_tensor_params.size() == 6,
-                            "Expecting 6 tensors for spec-dec mode, spec_decoding_generation_lengths, "
-                            "spec_decoding_position_offsets, spec_decoding_packed_mask, "
-                            "spec_decoding_bl_tree_mask_offset, "
-                            "spec_decoding_bl_tree_mask and spec_bl_tree_first_sparse_mask_offset_kv.");
-                        TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
-                            "Expecting spec_decoding_generation_lengths spec-dec mode.");
-                        TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
-                            "Expecting spec_decoding_position_offsets spec-dec mode.");
-                        TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
-                            "Expecting spec_decoding_packed_mask spec-dec mode.");
-                        TORCH_CHECK(spec_decoding_tensor_params[3].has_value(),
-                            "Expecting spec_decoding_bl_tree_mask_offset spec-dec mode.");
-                        TORCH_CHECK(spec_decoding_tensor_params[4].has_value(),
-                            "Expecting spec_decoding_bl_tree_mask spec-dec mode.");
-                        TORCH_CHECK(spec_decoding_tensor_params[5].has_value(),
-                            "Expecting spec_bl_tree_first_sparse_mask_offset_kv spec-dec mode.");
-                        enqueue_params.spec_decoding_bl_tree_mask_offset
-                            = spec_decoding_tensor_params[3].value().data_ptr<int64_t>();
-                        enqueue_params.spec_decoding_bl_tree_mask
-                            = spec_decoding_tensor_params[4].value().data_ptr<uint32_t>();
-                        enqueue_params.spec_bl_tree_first_sparse_mask_offset_kv
-                            = spec_decoding_tensor_params[5].value().data_ptr<int32_t>();
-                    }
-                    else
-                    {
-                        TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
-                            "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
-                            "spec_decoding_position_offsets and spec_decoding_packed_mask.");
-                        TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
-                            "Expecting spec_decoding_generation_lengths spec-dec mode.");
-                        TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
-                            "Expecting spec_decoding_position_offsets spec-dec mode.");
-                        TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
-                            "Expecting spec_decoding_packed_mask spec-dec mode.");
-                    }
-                    enqueue_params.spec_decoding_generation_lengths
-                        = spec_decoding_tensor_params[0].value().data_ptr<int32_t>();
-                    enqueue_params.spec_decoding_position_offsets
-                        = spec_decoding_tensor_params[1].value().data_ptr<int32_t>();
-                    enqueue_params.spec_decoding_packed_mask
-                        = spec_decoding_tensor_params[2].value().data_ptr<int32_t>();
-                    enqueue_params.spec_decoding_is_generation_length_variable = true;
-                    TLLM_CHECK(spec_decoding_tensor_params[1].value().dim() == 2); // [batch_size, max_draft_len + 1]
-                    enqueue_params.spec_decoding_max_generation_length
-                        = spec_decoding_tensor_params[1].value().sizes()[1];
+                    TORCH_CHECK(spec_decoding_tensor_params.size() == 3,
+                        "Expecting 3 tensors for spec-dec mode, spec_decoding_generation_lengths, "
+                        "spec_decoding_position_offsets and spec_decoding_packed_mask.");
+                    TORCH_CHECK(spec_decoding_tensor_params[0].has_value(),
+                        "Expecting spec_decoding_generation_lengths spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[1].has_value(),
+                        "Expecting spec_decoding_position_offsets spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_tensor_params[2].has_value(),
+                        "Expecting spec_decoding_packed_mask spec-dec mode.");
                 }
+                enqueue_params.spec_decoding_generation_lengths
+                    = spec_decoding_tensor_params[0].value().data_ptr<int32_t>();
+                enqueue_params.spec_decoding_position_offsets
+                    = spec_decoding_tensor_params[1].value().data_ptr<int32_t>();
+                enqueue_params.spec_decoding_packed_mask = spec_decoding_tensor_params[2].value().data_ptr<int32_t>();
+                enqueue_params.spec_decoding_is_generation_length_variable = true;
+                TLLM_CHECK(spec_decoding_tensor_params[1].value().dim() == 2); // [batch_size, max_draft_len + 1]
+                enqueue_params.spec_decoding_max_generation_length = spec_decoding_tensor_params[1].value().sizes()[1];
             }
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
