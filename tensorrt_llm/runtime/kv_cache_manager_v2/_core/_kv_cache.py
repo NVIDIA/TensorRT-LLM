@@ -85,7 +85,7 @@ from .._utils import (
     value_or,
 )
 from ._moving_average import Average
-from ._pending_stats import _PendingStats, _PendingStatsDelta
+from ._pending_stats import _PendingStats
 
 if TYPE_CHECKING:
     from ._kv_cache_manager import KVCacheManager, ScratchDesc
@@ -393,12 +393,6 @@ class _KVCache:
     def _should_record_generation_alloc_stats(self, capacity: int) -> bool:
         return self._generation_alloc_ready and capacity > self._capacity
 
-    def _add_pending_stats(self, delta: _PendingStatsDelta) -> None:
-        if not self._should_record_stats():
-            return
-        if self._pending_stats.add(delta):
-            self.manager.mark_stats_dirty(self.id)
-
     @staticmethod
     def _block_ranges_excluding(
         block_begin: BlockOrdinal,
@@ -446,50 +440,6 @@ class _KVCache:
         if page is None or not isinstance(page.page, CommittedPage):
             return False
         return page.page.block() is not None
-
-    def _record_initial_reuse_stats(self) -> None:
-        if not self._should_record_stats() or self.num_committed_tokens == 0:
-            return
-        tokens_per_block = self.tokens_per_block
-        full_reused_end = BlockOrdinal(self.num_committed_tokens // tokens_per_block)
-        has_partial_match = self.num_committed_tokens % tokens_per_block != 0
-        if full_reused_end == 0 and not has_partial_match:
-            return
-        beam_idx = DEFAULT_BEAM_INDEX
-        for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
-            stale_range = _KVCache._get_stale_range(tokens_per_block, self.num_committed_tokens, lc)
-            full_reused_blocks = 0
-            for ordinal in typed_range(full_reused_end):
-                if stale_range.beg <= ordinal < stale_range.end:
-                    continue
-                if ordinal >= len(self._blocks):
-                    break
-                if self._block(ordinal, beam_idx)[lc_idx] is not None:
-                    full_reused_blocks += 1
-            partial_reused_blocks = 0
-            if has_partial_match:
-                partial_ordinal = full_reused_end
-                if not (
-                    stale_range.beg <= partial_ordinal < stale_range.end
-                ) and partial_ordinal < len(self._blocks):
-                    block_page = self._block(partial_ordinal, beam_idx)[lc_idx]
-                    if self._has_reuse_source(block_page):
-                        partial_reused_blocks = 1
-            reused_blocks = full_reused_blocks + partial_reused_blocks
-            if reused_blocks == 0:
-                continue
-            self._add_pending_stats(
-                _PendingStatsDelta(
-                    global_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
-                    request_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
-                    iteration_stats=KVCacheIterationStatsDelta(
-                        iter_reused_blocks=reused_blocks,
-                        iter_full_reused_blocks=full_reused_blocks,
-                        iter_partial_reused_blocks=partial_reused_blocks,
-                    ),
-                    life_cycle=lc_idx,
-                )
-            )
 
     def _subtract_pending_allocation_range(
         self, block_begin: BlockOrdinal, block_end: BlockOrdinal
@@ -1764,6 +1714,8 @@ class _KVCache:
         self._committed_tokens = list(input_tokens[:num_tokens])
         self._history_length = num_tokens
         self._capacity = num_tokens
+        full_reused_end = BlockOrdinal(num_tokens // tokens_per_block)
+        has_partial_match = num_tokens % tokens_per_block != 0
         # fill self._blocks
         self._blocks = to_typed(
             BlockOrdinalT,
@@ -1781,12 +1733,15 @@ class _KVCache:
 
         beam_idx = DEFAULT_BEAM_INDEX
 
+        should_record_stats = self._should_record_stats()
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
             stale_start, stale_end = _KVCache._get_stale_range(
                 tokens_per_block, get_num_matched_tokens(matched), lc
             )
+            full_reused_blocks = 0
+            partial_reused_blocks = 0
             for ordinal in chain(
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
@@ -1795,6 +1750,23 @@ class _KVCache:
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
+                if should_record_stats and isinstance(lc, AttnLifeCycle):
+                    if ordinal < full_reused_end:
+                        full_reused_blocks += 1
+                    elif (
+                        has_partial_match
+                        and ordinal == full_reused_end
+                        and self._has_reuse_source(holder)
+                    ):
+                        partial_reused_blocks = 1
+            if should_record_stats and isinstance(lc, AttnLifeCycle):
+                changed = self._pending_stats.record_reuse(
+                    lc_idx,
+                    full_reused_blocks=full_reused_blocks,
+                    partial_reused_blocks=partial_reused_blocks,
+                )
+                if changed:
+                    self.manager.mark_stats_dirty(self.id)
         # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
         if ssm_lc_id is not None and matched:
             snapshot_block = matched[-1][0]
@@ -1804,7 +1776,6 @@ class _KVCache:
             )
             snapshot_holder = unwrap_rawref(snapshot_ref).hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
-        self._record_initial_reuse_stats()
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:

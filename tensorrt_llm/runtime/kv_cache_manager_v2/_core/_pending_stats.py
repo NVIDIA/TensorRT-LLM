@@ -142,6 +142,29 @@ class _PendingStats:
         self.allocation_segments.append(segment)
         return True
 
+    def record_reuse(
+        self,
+        life_cycle: LifeCycleId,
+        *,
+        full_reused_blocks: int,
+        partial_reused_blocks: int,
+    ) -> bool:
+        reused_blocks = full_reused_blocks + partial_reused_blocks
+        if reused_blocks == 0:
+            return False
+        return self.add(
+            _PendingStatsDelta(
+                global_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
+                request_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
+                iteration_stats=KVCacheIterationStatsDelta(
+                    iter_reused_blocks=reused_blocks,
+                    iter_full_reused_blocks=full_reused_blocks,
+                    iter_partial_reused_blocks=partial_reused_blocks,
+                ),
+                life_cycle=life_cycle,
+            )
+        )
+
     def subtract_allocation_range(self, block_begin: BlockOrdinal, block_end: BlockOrdinal) -> bool:
         if block_begin >= block_end or not self.allocation_segments:
             return False
