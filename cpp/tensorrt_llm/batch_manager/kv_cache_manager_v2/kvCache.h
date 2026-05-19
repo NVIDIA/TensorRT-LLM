@@ -173,7 +173,7 @@ public:
     // Priority callback: (blockOrdinal, lifeCycleId) → Priority.
     using PriorityCb = std::function<Priority(BlockOrdinal, LifeCycleId)>;
 
-    KvCache(KvCacheManager& manager, std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& inputTokens,
+    KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens,
         std::optional<int64_t> id, PriorityCb priorityCb);
 
     ~KvCache();
@@ -275,6 +275,11 @@ public:
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
+    }
+
+    ReuseScope const& reuseScope() const noexcept
+    {
+        return mReuseScope;
     }
 
     int historyLength() const noexcept
@@ -487,7 +492,7 @@ private:
     void _resizePageIndexBuffers(int newNumBlocks);
 
     std::shared_ptr<KvCacheManager> mManager;
-    std::optional<int64_t> mLoraTaskId;
+    ReuseScope mReuseScope;
     PriorityCb mPriorityCb;
     std::optional<CUstream> mCudaStream;
     Status mStatus;

@@ -646,6 +646,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 if uncommitted:
                     kv_cache.commit(uncommitted)
                 kv_cache.stop_committing()
+            stream_holder.take_finish_event()
             kv_cache.close()
 
         def num_reused(reuse_scope: ReuseScope | None) -> int:

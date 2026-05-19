@@ -129,9 +129,8 @@ public:
     // Create a new KvCache. Returned cache is SUSPENDED; call activate() with a stream.
     // input_tokens: optional sequence to match against existing cached blocks.
     // priorityCb:   optional priority override per block.
-    std::shared_ptr<KvCache> createKvCache(std::optional<int64_t> loraTaskId = std::nullopt,
-        std::vector<TokenIdExt> const& inputTokens = {}, std::optional<int64_t> id = std::nullopt,
-        KvCache::PriorityCb priorityCb = {});
+    std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {},
+        std::optional<int64_t> id = std::nullopt, KvCache::PriorityCb priorityCb = {});
 
     // ---- Memory pool queries -----------------------------------------------
 

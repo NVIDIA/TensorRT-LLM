@@ -39,6 +39,8 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 #include <optional>
+#include <string>
+#include <utility>
 
 namespace nb = nanobind;
 namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
@@ -99,6 +101,57 @@ static kv::KvCache::PriorityCb castPriorityCallback(kv::KvCacheManager const& ma
 static nb::tuple bufferIdTuple(kv::BufferId const& self)
 {
     return nb::make_tuple(self.layerId, self.role);
+}
+
+static nb::object optionalIntToObject(std::optional<int64_t> value)
+{
+    if (!value.has_value())
+    {
+        return nb::none();
+    }
+    return nb::cast(*value);
+}
+
+static nb::tuple reuseScopeTuple(kv::ReuseScope const& self)
+{
+    return nb::make_tuple(optionalIntToObject(self.loraId), optionalIntToObject(self.salt));
+}
+
+static std::optional<int64_t> castOptionalIntAttr(nb::handle obj, char const* attrName)
+{
+    nb::object attr = nb::steal(PyObject_GetAttrString(obj.ptr(), attrName));
+    if (!attr)
+    {
+        throw nb::python_error();
+    }
+    if (attr.is_none())
+    {
+        return std::nullopt;
+    }
+    return nb::cast<int64_t>(attr);
+}
+
+static kv::ReuseScope castReuseScope(nb::object reuseScope)
+{
+    if (reuseScope.is_none())
+    {
+        return {};
+    }
+    if (nb::isinstance<kv::ReuseScope>(reuseScope))
+    {
+        return nb::cast<kv::ReuseScope>(reuseScope);
+    }
+    // Backward-compatible bridge for old callers that still pass lora_task_id as the first argument.
+    if (PyLong_Check(reuseScope.ptr()))
+    {
+        return {nb::cast<int64_t>(reuseScope), std::nullopt};
+    }
+    if (PyObject_HasAttrString(reuseScope.ptr(), "lora_id") && PyObject_HasAttrString(reuseScope.ptr(), "salt"))
+    {
+        return {castOptionalIntAttr(reuseScope, "lora_id"), castOptionalIntAttr(reuseScope, "salt")};
+    }
+    throw std::invalid_argument(
+        "reuse_scope must be None, ReuseScope, an int lora_task_id, or an object with lora_id and salt");
 }
 
 void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
@@ -186,6 +239,68 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
               .def("close", &kv::CachedCudaEvent::close)
               .def("is_closed", &kv::CachedCudaEvent::isClosed);
     cachedCudaEvent.attr("NULL") = kv::CachedCudaEvent::makeNull();
+
+    // ---- ReuseScope --------------------------------------------------------
+    nb::class_<kv::ReuseScope>(m, "ReuseScope")
+        .def(nb::init<std::optional<int64_t>, std::optional<int64_t>>(), nb::arg("lora_id").none() = std::nullopt,
+            nb::arg("salt").none() = std::nullopt)
+        .def_ro("lora_id", &kv::ReuseScope::loraId)
+        .def_ro("salt", &kv::ReuseScope::salt)
+        .def("to_bytes",
+            [](kv::ReuseScope const& self)
+            {
+                auto bytes = self.toBytes();
+                return nb::bytes(reinterpret_cast<char const*>(bytes.data()), bytes.size());
+            })
+        .def("__len__", [](kv::ReuseScope const&) { return 2; })
+        .def(
+            "__getitem__",
+            [](kv::ReuseScope const& self, int index) -> nb::object
+            {
+                if (index < 0)
+                {
+                    index += 2;
+                }
+                if (index == 0)
+                {
+                    return optionalIntToObject(self.loraId);
+                }
+                if (index == 1)
+                {
+                    return optionalIntToObject(self.salt);
+                }
+                throw nb::index_error("ReuseScope index out of range");
+            },
+            nb::arg("index"))
+        .def("__iter__",
+            [](kv::ReuseScope const& self)
+            { return nb::steal<nb::iterator>(PyObject_GetIter(reuseScopeTuple(self).ptr())); })
+        .def("__hash__", [](kv::ReuseScope const& self) { return PyObject_Hash(reuseScopeTuple(self).ptr()); })
+        .def(
+            "__eq__",
+            [](kv::ReuseScope const& self, nb::object other) -> nb::object
+            {
+                if (nb::isinstance<kv::ReuseScope>(other))
+                {
+                    return nb::bool_(self == nb::cast<kv::ReuseScope>(other));
+                }
+                if (PyTuple_Check(other.ptr()) && PyTuple_GET_SIZE(other.ptr()) == 2)
+                {
+                    return nb::bool_(PyObject_RichCompareBool(reuseScopeTuple(self).ptr(), other.ptr(), Py_EQ) == 1);
+                }
+                return nb::not_implemented();
+            },
+            nb::arg("other"))
+        .def("__repr__",
+            [](kv::ReuseScope const& self)
+            {
+                std::string repr = "ReuseScope(lora_id=";
+                repr += self.loraId.has_value() ? std::to_string(*self.loraId) : "None";
+                repr += ", salt=";
+                repr += self.salt.has_value() ? std::to_string(*self.salt) : "None";
+                repr += ")";
+                return repr;
+            });
 
     // ---- BufferId ----------------------------------------------------------
     nb::class_<kv::BufferId>(m, "BufferId")
@@ -495,6 +610,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 return result;
             })
+        .def_prop_ro("_reuse_scope", &kv::KvCache::reuseScope)
         .def(
             "get_aggregated_page_indices",
             [](kv::KvCache const& self, kv::LayerGroupId lgId, kv::BeamIndex beamIdx, bool validOnly)
@@ -575,9 +691,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "create_kv_cache",
-            [](std::shared_ptr<kv::KvCacheManager> self, std::optional<int64_t> loraTaskId, nb::object inputTokens,
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<int64_t> id, nb::object customPriorityCallback)
             {
+                kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 std::vector<kv::TokenIdExt> tokens;
                 if (!inputTokens.is_none())
                 {
@@ -585,9 +702,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
                 nb::gil_scoped_release release;
-                return self->createKvCache(loraTaskId, tokens, id, std::move(priorityCb));
+                return self->createKvCache(std::move(reuseScope), tokens, id, std::move(priorityCb));
             },
-            nb::arg("lora_task_id") = std::nullopt, nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
+            nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none())
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
             nb::arg("data_role"), nb::arg("index_mode") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
@@ -741,6 +858,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- RootBlock (radix-tree root node) -----------------------------------
     nb::class_<kv::RootBlock>(m, "RootBlock")
+        .def_ro("reuse_scope", &kv::RootBlock::reuseScope)
         .def_prop_ro("next",
             [](kv::RootBlock const& self)
             {

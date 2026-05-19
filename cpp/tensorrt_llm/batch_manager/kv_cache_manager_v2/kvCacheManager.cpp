@@ -149,13 +149,13 @@ void KvCacheManager::clearReusableBlocks()
     mRadixTree->clear();
 }
 
-std::shared_ptr<KvCache> KvCacheManager::createKvCache(std::optional<int64_t> loraTaskId,
+std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
     std::vector<TokenIdExt> const& inputTokens, std::optional<int64_t> id, KvCache::PriorityCb priorityCb)
 {
     if (!priorityCb)
         priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };
 
-    return std::make_shared<KvCache>(*this, loraTaskId, inputTokens, std::move(id), std::move(priorityCb));
+    return std::make_shared<KvCache>(*this, std::move(reuseScope), inputTokens, std::move(id), std::move(priorityCb));
 }
 
 // ---- Memory pool queries --------------------------------------------------

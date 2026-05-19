@@ -26,10 +26,45 @@
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+// ---------------------------------------------------------------------------
+// ReuseScope
+// ---------------------------------------------------------------------------
+
+static void appendInt64Bytes(std::vector<uint8_t>& dst, int64_t value)
+{
+    auto const* bytes = reinterpret_cast<uint8_t const*>(&value);
+    dst.insert(dst.end(), bytes, bytes + sizeof(value));
+}
+
+std::vector<uint8_t> ReuseScope::toBytes() const
+{
+    std::vector<uint8_t> ret;
+    uint8_t mask = 0;
+    if (loraId.has_value())
+    {
+        mask |= 1U << 0;
+    }
+    if (salt.has_value())
+    {
+        mask |= 1U << 1;
+    }
+    ret.push_back(mask);
+    if (loraId.has_value())
+    {
+        appendInt64Bytes(ret, *loraId);
+    }
+    if (salt.has_value())
+    {
+        appendInt64Bytes(ret, *salt);
+    }
+    return ret;
+}
 
 // ---------------------------------------------------------------------------
 // Hasher
@@ -37,10 +72,12 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 static void hashInt64(blake3_hasher* h, int64_t v)
 {
-    // Little-endian 8-byte encoding — mirrors Python's int.to_bytes(8, 'little').
     uint8_t buf[8];
+    auto const unsignedValue = static_cast<uint64_t>(v);
     for (int i = 0; i < 8; ++i)
-        buf[i] = static_cast<uint8_t>((static_cast<uint64_t>(v) >> (8 * i)) & 0xFF);
+    {
+        buf[i] = static_cast<uint8_t>((unsignedValue >> (8 * i)) & 0xFFU);
+    }
     blake3_hasher_update(h, buf, sizeof(buf));
 }
 
@@ -49,11 +86,10 @@ Hasher::Hasher()
     blake3_hasher_init(&mState);
 }
 
-Hasher::Hasher(std::optional<int64_t> seed)
+Hasher::Hasher(ReuseScope const& seed)
 {
     blake3_hasher_init(&mState);
-    if (seed.has_value())
-        hashInt64(&mState, *seed);
+    update(seed.toBytes());
 }
 
 Hasher& Hasher::update(TokenId token)
@@ -65,6 +101,12 @@ Hasher& Hasher::update(TokenId token)
 Hasher& Hasher::update(BlockKey const& key)
 {
     blake3_hasher_update(&mState, reinterpret_cast<uint8_t const*>(key.data()), key.size());
+    return *this;
+}
+
+Hasher& Hasher::update(std::vector<uint8_t> const& bytes)
+{
+    blake3_hasher_update(&mState, bytes.data(), bytes.size());
     return *this;
 }
 
@@ -132,11 +174,11 @@ std::vector<TokenIdExt> genMultiModalTokens(
 // ---------------------------------------------------------------------------
 
 static auto makeBlockchainKeyGenerator(
-    int tokensPerBlock, std::optional<int64_t> loraTaskId, TokenIdExt const* tokens, size_t numTokens)
+    int tokensPerBlock, ReuseScope reuseScope, TokenIdExt const* tokens, size_t numTokens)
 {
     // digest carries the running hash from the previous block.
-    BlockKey digest = Hasher(loraTaskId).digest();
-    // ordinal = -1: next call yields root (loraTaskId digest).
+    BlockKey digest = Hasher(reuseScope).digest();
+    // ordinal = -1: next call yields root (reuseScope digest).
     // ordinal >= 0: next call yields key for tokens[ordinal*tpb .. (ordinal+1)*tpb).
     int ordinal = -1;
 
@@ -166,10 +208,10 @@ static auto makeBlockchainKeyGenerator(
 
 // Eager wrapper for callers that need all keys at once.
 std::vector<BlockKey> sequenceToBlockchainKeys(
-    int tokensPerBlock, std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens)
+    int tokensPerBlock, ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens)
 {
     std::vector<BlockKey> result;
-    auto gen = makeBlockchainKeyGenerator(tokensPerBlock, loraTaskId, tokens.data(), tokens.size());
+    auto gen = makeBlockchainKeyGenerator(tokensPerBlock, reuseScope, tokens.data(), tokens.size());
     while (auto key = gen())
         result.push_back(*key);
     return result;
@@ -179,14 +221,14 @@ std::vector<BlockKey> sequenceToBlockchainKeys(
 // RootBlock
 // ---------------------------------------------------------------------------
 
-BlockKey RootBlock::makeKey(std::optional<int64_t> loraTaskId)
+BlockKey RootBlock::makeKey(ReuseScope const& reuseScope)
 {
-    return Hasher(loraTaskId).digest();
+    return Hasher(reuseScope).digest();
 }
 
-RootBlock::RootBlock(std::optional<int64_t> loraTaskId, BlockRadixTree* treePtr)
-    : NodeBase(makeKey(loraTaskId))
-    , loraTaskId(loraTaskId)
+RootBlock::RootBlock(ReuseScope reuseScope_, BlockRadixTree* treePtr)
+    : NodeBase(makeKey(reuseScope_))
+    , reuseScope(std::move(reuseScope_))
     , tree(treePtr)
 {
 }
@@ -526,18 +568,18 @@ void BlockRadixTree::drainPendingRootErases() const
     }
 }
 
-RootBlock& BlockRadixTree::addOrGetExisting(std::optional<int64_t> loraTaskId)
+RootBlock& BlockRadixTree::addOrGetExisting(ReuseScope const& reuseScope)
 {
     drainPendingRootErases();
 
-    BlockKey key = RootBlock::makeKey(loraTaskId);
+    BlockKey key = RootBlock::makeKey(reuseScope);
     auto it = mRoots.find(key);
     if (it != mRoots.end())
     {
         return *it->second;
     }
 
-    auto rb = std::make_shared<RootBlock>(loraTaskId, this);
+    auto rb = std::make_shared<RootBlock>(reuseScope, this);
     auto [newIt, inserted] = mRoots.emplace(key, std::move(rb));
     return *newIt->second;
 }
@@ -566,14 +608,14 @@ std::pair<Block*, int> findBestPartialMatchInNextNodes(
 }
 
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
-    std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
+    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
     drainPendingRootErases();
 
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
-    auto gen = makeBlockchainKeyGenerator(mTokensPerBlock, loraTaskId, tokens.data(), tokens.size());
+    auto gen = makeBlockchainKeyGenerator(mTokensPerBlock, reuseScope, tokens.data(), tokens.size());
 
     // First key is the root key.
     auto rootKey = gen();

@@ -41,6 +41,23 @@ struct RootBlock;
 struct Block;
 
 // ---------------------------------------------------------------------------
+// ReuseScope — per-request namespace for prefix reuse.
+// Mirrors Python's ReuseScope(lora_id, salt).
+// ---------------------------------------------------------------------------
+struct ReuseScope
+{
+    std::optional<int64_t> loraId;
+    std::optional<int64_t> salt;
+
+    std::vector<uint8_t> toBytes() const;
+
+    bool operator==(ReuseScope const& other) const noexcept
+    {
+        return loraId == other.loraId && salt == other.salt;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // BlockKey — BLAKE3 digest (32 bytes), used as radix-tree node identifier.
 // (Replaces Python SHA-256 32-byte digest.)
 // ---------------------------------------------------------------------------
@@ -55,10 +72,11 @@ class Hasher
 {
 public:
     Hasher();
-    explicit Hasher(std::optional<int64_t> seed); // for lora_task_id
+    explicit Hasher(ReuseScope const& seed);
 
     Hasher& update(TokenId token);
     Hasher& update(BlockKey const& key);
+    Hasher& update(std::vector<uint8_t> const& bytes);
     Hasher& update(TokenIdExt const& tokenExt);
     Hasher& update(TokenIdExt const* tokens, size_t count);
 
@@ -70,11 +88,11 @@ private:
 
 // ---------------------------------------------------------------------------
 // Utility: convert a token sequence → list of BlockKeys.
-// First key is the root (loraTaskId digest), then one per token block.
+// First key is the root (reuseScope digest), then one per token block.
 // Mirrors Python's sequence_to_blockchain_keys().
 // ---------------------------------------------------------------------------
 std::vector<BlockKey> sequenceToBlockchainKeys(
-    int tokensPerBlock, std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens);
+    int tokensPerBlock, ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens);
 
 // Generate multi-modal token IDs (mirrors gen_multi_modal_tokens in Python).
 std::vector<TokenIdExt> genMultiModalTokens(
@@ -114,18 +132,18 @@ protected:
 };
 
 // ---------------------------------------------------------------------------
-// RootBlock — one root per (lora_task_id) in a BlockRadixTree.
+// RootBlock — one root per ReuseScope in a BlockRadixTree.
 // Holds a map of child Blocks keyed by BlockKey.
 // Mirrors Python's RootBlock.
 // ---------------------------------------------------------------------------
 struct RootBlock : NodeBase
 {
-    std::optional<int64_t> loraTaskId;
+    ReuseScope reuseScope;
     BlockRadixTree* tree; // back-reference (non-owning)
 
-    RootBlock(std::optional<int64_t> loraTaskId, BlockRadixTree* tree);
+    RootBlock(ReuseScope reuseScope, BlockRadixTree* tree);
 
-    static BlockKey makeKey(std::optional<int64_t> loraTaskId);
+    static BlockKey makeKey(ReuseScope const& reuseScope);
 
     Type type() const noexcept override
     {
@@ -203,7 +221,7 @@ private:
 
 // ---------------------------------------------------------------------------
 // BlockRadixTree — the global cache index.
-// next: loraTaskId → RootBlock.
+// next: reuseScope digest → RootBlock.
 // Mirrors Python's BlockRadixTree.
 // ---------------------------------------------------------------------------
 class BlockRadixTree
@@ -212,8 +230,8 @@ public:
     BlockRadixTree(LifeCycleRegistry const& lifeCycles, int tokensPerBlock);
     ~BlockRadixTree();
 
-    // Get (or create) the RootBlock for the given LoRA task ID.
-    RootBlock& addOrGetExisting(std::optional<int64_t> loraTaskId);
+    // Get (or create) the RootBlock for the given reuse scope.
+    RootBlock& addOrGetExisting(ReuseScope const& reuseScope);
 
     // Match tokens against the tree, yielding (block, numMatchedTokens) pairs.
     // Partial matching: if enablePartialMatch, also yields blocks with a partial
@@ -224,8 +242,8 @@ public:
         int numMatchedTokens;
     };
 
-    std::vector<MatchResult> match(std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens,
-        bool enablePartialMatch = false) const;
+    std::vector<MatchResult> match(
+        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch = false) const;
 
     // Clear all cached pages. ~Block() handles excludeFromEviction for DROPPABLE pages.
     void clear();

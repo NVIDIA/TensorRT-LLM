@@ -57,11 +57,11 @@ void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel sr
 // KvCache constructor
 // ---------------------------------------------------------------------------
 
-KvCache::KvCache(KvCacheManager& manager, std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& inputTokens,
+KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens,
     std::optional<int64_t> mId, PriorityCb priorityCb)
     : id(mId)
     , mManager(manager.shared_from_this())
-    , mLoraTaskId(loraTaskId)
+    , mReuseScope(std::move(reuseScope))
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
     , mStatus(Status::SUSPENDED)
     , mCommitState(CommitState::ALLOWED)
@@ -1097,7 +1097,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
         throw LogicError("Cannot commit block that is not full except last block");
 
     // Prev node lookup (root or previous committed block).
-    RootBlock& root = mManager->radixTree().addOrGetExisting(mLoraTaskId);
+    RootBlock& root = mManager->radixTree().addOrGetExisting(mReuseScope);
     int numLc = mManager->storage().numLifeCycles();
 
     NodeBase* prevNode = &root;
@@ -1373,7 +1373,7 @@ void KvCache::_onStopCommitting()
 
 void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 {
-    auto matched = mManager->radixTree().match(mLoraTaskId, inputTokens, mManager->enablePartialMatch());
+    auto matched = mManager->radixTree().match(mReuseScope, inputTokens, mManager->enablePartialMatch());
     // Assert all non-last matched blocks are full (mirrors Python line ~1113).
     if (!gNdebug && matched.size() > 1)
     {
