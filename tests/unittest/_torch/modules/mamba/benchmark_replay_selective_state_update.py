@@ -4008,6 +4008,8 @@ def _run_benchmark(args) -> None:
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     mtp_lengths = [int(x) for x in args.mtp_lengths.split(",")]
+    if args.mix_csv is not None and len(mtp_lengths) != 1:
+        sys.exit("--mix-csv requires exactly one --mtp-lengths value")
 
     dtype_map = {
         "bf16": torch.bfloat16,
@@ -4019,6 +4021,8 @@ def _run_benchmark(args) -> None:
     }
     state_dtypes = [dtype_map[s] for s in args.state_dtypes.split(",")]
     act_dtypes = [dtype_map[s] for s in args.act_dtypes.split(",")]
+    if args.json_output and len(act_dtypes) != 1:
+        sys.exit("--json-output requires exactly one --act-dtypes value")
 
     # Resolve baseline function.
     if args.baseline == "flashinfer_pr3324":
@@ -4157,8 +4161,12 @@ def _run_benchmark(args) -> None:
                         for mode in modes_list:
                             for rect in rect_list:
                                 can_sort = mix_samples_cpu is not None
+                                cell_list_active = bool(
+                                    getattr(args, "_cell_list_keys", ())
+                                )
                                 effective_hsort_list = (
-                                    hsort_list if can_sort else [False]
+                                    hsort_list if (can_sort or cell_list_active)
+                                    else [False]
                                 )
                                 for hardcode_sort in effective_hsort_list:
                                     _bench_config(
