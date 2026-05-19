@@ -34,7 +34,8 @@ from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
                          wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+                           skip_no_hopper, skip_no_nvls, skip_pre_blackwell,
+                           skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -1123,6 +1124,29 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+# Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
+# while the KV-cache pool itself is allocated from fabric (MNNVL-capable) VMM memory via
+# TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1. Skipped on hardware without NVLS / fabric memory
+# support so the env var fallback warning does not silently turn this into a non-fabric test.
+@skip_no_nvls
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,

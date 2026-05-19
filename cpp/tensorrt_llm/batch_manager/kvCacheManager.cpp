@@ -1094,7 +1094,17 @@ void WindowBlockManager::allocatePools(bool useUvm)
 {
     constexpr nvinfer1::DataType kScaleDtypeNVFP4 = nvinfer1::DataType::kFP8;
 
-    bool const useFabricMemory = tc::getEnvKVCachePoolUseFabricMemory() && FabricMemory::supportFbaricMemory();
+    bool const requestFabricMemory = tc::getEnvKVCachePoolUseFabricMemory();
+    bool const fabricMemorySupported = FabricMemory::supportFbaricMemory();
+    if (requestFabricMemory && !fabricMemorySupported)
+    {
+        TLLM_LOG_WARNING(
+            "[%s] TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 was set but fabric memory is not supported on this "
+            "platform (FabricMemory::supportFbaricMemory() returned false); falling back to standard GPU "
+            "allocation.",
+            mLogPrefix.c_str());
+    }
+    bool const useFabricMemory = requestFabricMemory && fabricMemorySupported;
 
     if (useFabricMemory)
     {
@@ -1142,9 +1152,12 @@ void WindowBlockManager::allocatePools(bool useUvm)
             auto const elementSize = tc::getDTypeSize(poolDtype);
             auto const totalBytes = static_cast<size_t>(numElements) * elementSize;
 
-            auto fabricMem = std::make_unique<FabricMemory>(totalBytes);
-            pool.primaryPtr = ITensor::wrap(fabricMem->getPtr(), poolDtype, cacheShape, numElements);
-            mFabricMemoryPools.push_back(std::move(fabricMem));
+            // Record ownership before exposing the raw pointer: if FabricMemory's ctor throws nothing
+            // is wrapped; if ITensor::wrap throws afterwards, the unique_ptr in mFabricMemoryPools
+            // still owns and will free the allocation.
+            mFabricMemoryPools.reserve(mFabricMemoryPools.size() + 1);
+            mFabricMemoryPools.emplace_back(std::make_unique<FabricMemory>(totalBytes));
+            pool.primaryPtr = ITensor::wrap(mFabricMemoryPools.back()->getPtr(), poolDtype, cacheShape, numElements);
         }
         else
         {
@@ -1173,6 +1186,10 @@ void BlockManager::releasePools()
 
 void WindowBlockManager::releasePools()
 {
+    if (mTransferManager)
+    {
+        mTransferManager->syncTransfers();
+    }
     mBufferManager.getStream().synchronize();
 
     for (auto& pool : mPools)
@@ -1186,7 +1203,7 @@ void WindowBlockManager::releasePools()
             pool.secondaryPtr->release();
         }
     }
-    // Release fabric memory backing (must happen after ITensor release)
+    // Release fabric memory backing (must happen after ITensor release).
     mFabricMemoryPools.clear();
     mBufferManager.memoryPoolTrimTo(0);
 }
