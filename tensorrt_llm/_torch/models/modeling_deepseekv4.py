@@ -1457,18 +1457,13 @@ class DeepseekV4MoE(nn.Module):
                 WideEPMoE,
                 DeepGemmFusedMoE,
             )
-            # The TRTLLM-Gen fp4-block-scale fused-MoE kernel only implements the
-            # GPT-OSS-style SwiGLU clamping path, which expects bias /
-            # swiglu_alpha / swiglu_beta to be set alongside swiglu_limit.
-            # DeepSeek-V4 has no expert bias (config.attention_bias == False
-            # and no FFN bias) so passing the limit through that kernel
-            # produces all-zero outputs. Until the kernel grows a no-bias
-            # clamp variant, drop the limit on this path; the shared experts
-            # already apply the clamp via the standard GatedMLP linear stack
-            # below.
-            qm = experts_quant_config.quant_mode
-            kernel_requires_bias_for_swiglu_limit = moe_cls in (TRTLLMGenFusedMoE, WideEPMoE) and (
-                qm.has_nvfp4() or qm.has_w4a16_mxfp4() or qm.has_w4a8_mxfp4_mxfp8()
+            # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
+            # cubin produces near-zero accuracy without bias even when
+            # swiglu_limit is supplied; drop the limit there until the cubin
+            # gains a no-bias clamp variant. MXFP4 variants are unaffected.
+            kernel_requires_bias_for_swiglu_limit = (
+                moe_cls in (TRTLLMGenFusedMoE, WideEPMoE)
+                and experts_quant_config.quant_mode.has_nvfp4()
             )
             if supports_swiglu_limit and not kernel_requires_bias_for_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
