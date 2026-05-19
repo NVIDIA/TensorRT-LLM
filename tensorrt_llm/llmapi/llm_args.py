@@ -3869,6 +3869,17 @@ class TorchLlmArgs(BaseLlmArgs):
         "irrespective of confidential compute state.",
         status="prototype")
 
+    enable_speculative_beam_history_d2h: bool = Field(
+        default=False,
+        description="Opt-in beam-search optimization: skip per-step "
+        "beam-history D2H copies on likely-non-terminal steps via a "
+        "host-side predictor and route the remaining copies through a "
+        "private side stream. Mispredictions fall back to a synchronous "
+        ".cpu(), preserving correctness but breaking overlap on that step. "
+        "Incompatible with the async D2H worker "
+        "(sampler_force_async_worker=True or confidential compute).",
+        status="prototype")
+
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
@@ -4398,6 +4409,16 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
                     f"supported on Blackwell (sm >= 100), but current device has "
                     f"sm {sm}.")
+        return self
+
+    @model_validator(mode='after')
+    def validate_speculative_beam_history_d2h(self) -> 'TorchLlmArgs':
+        if (self.enable_speculative_beam_history_d2h
+                and self.sampler_force_async_worker):
+            raise ValueError(
+                "enable_speculative_beam_history_d2h is incompatible with "
+                "sampler_force_async_worker=True; the speculative path "
+                "bypasses the sampler's async D2H worker.")
         return self
 
     def get_executor_config(

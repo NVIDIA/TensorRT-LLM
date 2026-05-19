@@ -1,5 +1,5 @@
 ---
-name: flashinfer-upgrade
+name: trtllm-flashinfer-upgrade
 description: >-
   Upgrade flashinfer-python version in TensorRT-LLM. Fetches the latest releases
   from GitHub (stable and nightly), compares with the current pinned version,

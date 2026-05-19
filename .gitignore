@@ -65,6 +65,7 @@ docs/source/**/*.rst
 !docs/source/examples/index.rst
 !docs/source/_includes/note_sections.rst
 *.swp
+.nfs*
 
 # Testing
 .coverage.*
