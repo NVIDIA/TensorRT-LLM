@@ -3044,27 +3044,18 @@ def _bench_config(
                                 "modes.  Re-run with --sort-slots 1 or "
                                 "--hardcode-sort 1."
                             )
-                        # n_writes plumbing: pure scenarios pass an int
-                        # (host knows the value, can host-skip empty halves);
-                        # mix scenarios pass a (1,) device tensor updated
-                        # per iter by the benchmark pre-iter path.
-                        # _persistent_skip_empty_halves=False on mix so both
-                        # halves always launch (kernel uses device n_writes
-                        # to derive its slot range).
+                        # n_writes plumbing: pure scenarios pass an int (host
+                        # knows the value, wrapper host-skips empty halves);
+                        # mix scenarios pass only a (1,) device tensor updated
+                        # per iter by the benchmark pre-iter path (wrapper
+                        # cannot host-skip since host_n_writes is unknown).
                         if scenario_n_writes_dev is not None:
-                            # Mix path: caller-allocated tensor, updated per
-                            # iter by scenario_pre_iter outside capture.
+                            # Mix: caller-allocated tensor, updated per iter.
                             extra_kwargs["_n_writes_dev"] = scenario_n_writes_dev
-                            extra_kwargs["_persistent_skip_empty_halves"] = False
                         elif mode == "persistent_main":
-                            # Pure: caller pre-allocated `_n_writes_dev_pure`
-                            # outside this lambda (so the alloc doesn't land
-                            # inside the captured graph).  Pass both the
-                            # tensor and the host int so the wrapper can use
-                            # host-skip when `_persistent_skip_empty_halves`.
+                            # Pure pm: pre-allocated tensor + host int.
                             extra_kwargs["_n_writes"] = _host_n_writes_pure
                             extra_kwargs["_n_writes_dev"] = _n_writes_dev_pure
-                            extra_kwargs["_persistent_skip_empty_halves"] = scenario_skip_empty
                         elif mode == "persistent_dynamic":
                             # persistent_dynamic pure: kernel ignores n_writes
                             # via IS_DYNAMIC DCE, but the wrapper needs a
