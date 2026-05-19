@@ -777,6 +777,97 @@ curl http://localhost:8000/v1/completions \
 NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
 Dynamo supports TensorRT LLM as one of its inference engine. For details on how to use TensorRT LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
 
+### Run Gemma 4
+
+Gemma 4 runs on the **PyTorch backend** — HuggingFace checkpoints are loaded directly. The legacy TensorRT engine flow (`convert_checkpoint.py` / `trtllm-build`) is not required and is not covered here.
+
+| HuggingFace checkpoint        | Modalities             | Notes                       |
+|-------------------------------|------------------------|-----------------------------|
+| `google/gemma-4-E2B-it`       | text + image + audio   | Single-GPU friendly         |
+| `google/gemma-4-E4B-it`       | text + image + audio   | Single-GPU friendly         |
+| `google/gemma-4-26B-A4B-it`   | text-only (MoE)        | Multi-GPU recommended       |
+| `google/gemma-4-31B-it`       | text-only              | Multi-GPU recommended       |
+
+The examples below use `google/gemma-4-E4B-it` (small, full multimodal). Swap the model name for the other variants; for the larger checkpoints bump `--tp_size` (e.g. `4` or `8`).
+
+#### Serve with `trtllm-serve` (OpenAI-compatible API)
+
+Launch the server:
+
+```bash
+trtllm-serve \
+    google/gemma-4-E4B-it \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --backend pytorch \
+    --tp_size 1 \
+    --max_batch_size 16
+```
+
+Query it with `curl`:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemma-4-E4B-it",
+    "messages": [
+      {"role": "user", "content": "Explain quantum tunneling in one paragraph."}
+    ],
+    "max_tokens": 256,
+    "temperature": 0
+  }'
+```
+
+The `/v1/chat/completions` endpoint applies the Gemma 4 chat template automatically.
+
+#### Multimodal inference (image / audio)
+
+`examples/llm-api/quickstart_multimodal.py` reads media URLs or local paths, applies the multimodal chat template, and prints generated text. Only the `E2B` and `E4B` checkpoints ship with the vision and audio towers; `26B-A4B` and `31B` are text-only.
+
+```bash
+# Image
+python examples/llm-api/quickstart_multimodal.py \
+    --model_dir google/gemma-4-E4B-it \
+    --modality image \
+    --media https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png \
+    --prompt "Describe the natural environment in the image."
+
+# Audio
+python examples/llm-api/quickstart_multimodal.py \
+    --model_dir google/gemma-4-E4B-it \
+    --modality audio \
+    --media https://huggingface.co/microsoft/Phi-4-multimodal-instruct/resolve/main/examples/what_is_the_traffic_sign_in_the_image.wav \
+    --prompt "Transcribe the audio clip into text, please don't add other text."
+```
+
+#### Accuracy evaluation with `trtllm-eval`
+
+`trtllm-eval` is the canonical entry point for accuracy benchmarks. Two tasks relevant to Gemma 4:
+
+```bash
+# MMMU (vision multiple-choice; works on E2B / E4B / 26B-A4B / 31B)
+trtllm-eval \
+    --model google/gemma-4-E4B-it \
+    --backend pytorch \
+    --tp_size 1 \
+    --max_batch_size 64 \
+    mmmu \
+    --num_samples 900
+
+# CoVoST 2 BLEU (English → Chinese speech translation; E2B / E4B only)
+trtllm-eval \
+    --model google/gemma-4-E4B-it \
+    --backend pytorch \
+    --tp_size 1 \
+    --max_batch_size 64 \
+    covost2 \
+    --lang_pair en_zh-CN \
+    --num_samples 500
+```
+
+`trtllm-eval mmmu` forces `apply_chat_template=True` internally (it is a multimodal benchmark); `trtllm-eval covost2` defaults `--apply_chat_template` to `True`. Both match the chat template Gemma 4 was trained with.
+
 ### Run Modelopt Quantization
 
 #### Requirements
