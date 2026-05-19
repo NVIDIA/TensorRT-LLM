@@ -855,6 +855,8 @@ class TestKVCacheAwareADPRouterRouting:
                 {0: 0, 1: 50},
             ]
         router._all_ranks_prefix_matches = prefix_matches
+        # Tests in this class exercise pure scoring; opt out of warmup.
+        router._pending_warmup_ranks = set()
         return router
 
     def _rank_states(self, tp_size, active_reqs=None, active_tokens=None):
