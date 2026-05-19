@@ -12,8 +12,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             PeftCacheManager)
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager, KVCacheManagerV2, PeftCacheManager,
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -24,6 +25,9 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1,
+                                                KV_CACHE_HASH_ALGO_V2)
 from tensorrt_llm.sampling_params import SamplingParams
 
 DataType = tensorrt_llm.bindings.DataType
@@ -33,6 +37,61 @@ current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
+
+
+def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    warning.assert_called_once()
+    assert KV_CACHE_HASH_ALGO_V1 in warning.call_args.args[0]
+    assert KV_CACHE_HASH_ALGO_V2 in warning.call_args.args[0]
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_v1():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    warning.assert_not_called()
+
+
+def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
+    with patch("tensorrt_llm._torch.pyexecutor.resource_manager.logger.warning"
+               ) as warning:
+        _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+            KV_CACHE_HASH_ALGO_AUTO)
+
+    warning.assert_not_called()
+
+
+def test_add_dummy_requests_returns_none_when_create_kv_cache_returns_none():
+    # Regression for the disagg crash:
+    #   File "resource_manager.py", line 2960, in add_dummy_requests
+    #     assert kv_cache.num_committed_tokens == 0
+    #   AttributeError: 'NoneType' object has no attribute 'num_committed_tokens'
+    # _create_kv_cache returns None when IndexMapper is saturated (e.g. all
+    # slots held by DISAGG_GENERATION_TRANS_IN_PROGRESS requests). The caller
+    # in cuda_graph_runner._get_padded_batch already handles a None return,
+    # so add_dummy_requests must propagate it instead of dereferencing.
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr.kv_cache_map = {}
+    mgr._allocated_draft_lens = {}
+    mgr.num_extra_kv_tokens = 0
+
+    with patch.object(mgr, "_create_kv_cache",
+                      return_value=None) as create_kv_cache:
+        result = mgr.add_dummy_requests(
+            request_ids=[0],
+            is_gen=True,
+            max_num_draft_tokens=0,
+            max_beam_width=1,
+            prepare_resource=True,
+        )
+
+    assert result is None
+    create_kv_cache.assert_called_once()
 
 
 class TestResourceManager(unittest.TestCase):
