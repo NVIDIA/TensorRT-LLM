@@ -280,6 +280,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.W4A8_NVFP4_FP8,
     QuantAlgo.W4A16_MXFP4,
+    QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
@@ -648,11 +649,14 @@ def test_moe_backend(
             activation_type=activation_type,
         )
 
-        # W4A8_MXFP4_MXFP8 requires backend-layout-aware weights. CUTLASS and
-        # MegaMoE use 128 hidden alignment; TRTLLMGen pads FC1 input to 512.
+        # W4A8_MXFP4_MXFP8 / W4A8_MXFP4_FP8 require backend-layout-aware
+        # weights. CUTLASS and MegaMoE use 128 hidden alignment; TRTLLMGen
+        # pads FC1 input to 512. MXFP4FP8QuantizeUtil inherits
+        # prepare_weights_from_backend from MXFP4MXFP8QuantizeUtil so the
+        # backend-vs-reference weight split applies to both variants.
         ref_cls = quant_kwargs.pop("ref_cls", None)
         ref_module_kwargs = {}
-        if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        if quant_algo in (QuantAlgo.W4A8_MXFP4_MXFP8, QuantAlgo.W4A8_MXFP4_FP8):
             weights, ref_weights, ref_module_kwargs = quantize_util.prepare_weights_from_backend(
                 backend, **quant_kwargs
             )
