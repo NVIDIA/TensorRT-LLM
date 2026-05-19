@@ -572,6 +572,23 @@ class TestPadAttentionDpDummyBenchmarkDisagg:
         ex._pad_attention_dp_dummy_request()
         ex.kv_cache_manager.add_dummy_requests.assert_called_once()
 
+    def test_skips_when_dummy_allocation_fails(self):
+        """A saturated KV cache should skip the ADP dummy for this iteration."""
+        ex = MockPadDummyExecutor(
+            is_benchmark_disagg=True,
+            benchmark_fill_phase_active=False,
+            kv_cache_transceiver=Mock(),
+            active_requests=[],
+            expected_num_active_requests=1,
+        )
+        ex.kv_cache_manager.add_dummy_requests.return_value = None
+
+        ex._pad_attention_dp_dummy_request()
+
+        ex.kv_cache_manager.add_dummy_requests.assert_called_once()
+        ex.resource_manager.get_resource_manager.assert_not_called()
+        assert ex.active_requests == []
+
     def test_no_dummy_needed_when_active_requests_ready(self):
         """Rank has ready requests: needs_dummy condition is False."""
         ready_req = _make_active_request(in_init=False, in_transfer=False)

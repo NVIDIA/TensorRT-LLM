@@ -3625,13 +3625,19 @@ class PyExecutor:
                     and self.kv_cache_transceiver is not None
                     and self.max_num_tokens is not None):
                 token_nums = [self.max_num_tokens]
-            llm_request = self.kv_cache_manager.add_dummy_requests(
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+            )
+            if dummy_requests is None:
+                logger.warning(
+                    "Skipping attention-DP dummy request because KV cache "
+                    "resources are unavailable; retrying next iteration.")
+                return
+            llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
