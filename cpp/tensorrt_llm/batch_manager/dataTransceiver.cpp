@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -986,6 +986,8 @@ public:
         }
 
         bool isCancelled = false;
+        std::unique_ptr<std::promise<void>> queuedPromise;
+        LlmRequest::RequestIdType cancelledId{0};
         auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
         {
             std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
@@ -994,12 +996,39 @@ public:
                 { return requestAndPromise.mRequest->mRequestId == llmRequest.mRequestId; });
             if (it != asyncResource->mRequestsQueue.end())
             {
+                cancelledId = it->mRequest->mRequestId;
+                queuedPromise = std::move(it->mPromise);
                 asyncResource->mRequestsQueue.erase(it);
                 isCancelled = true;
             }
             else
             {
                 TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            }
+        }
+        if (queuedPromise)
+        {
+            // The future returned by request_and_receive_async() is the only
+            // signal the disagg gen event loop has that this request is done.
+            // If we erase the queued (request, promise) pair here without
+            // first fulfilling the promise, the std::promise destructor sets
+            // a future_error: Broken promise on the future, which the polling
+            // loop in CacheTransceiver::checkGenTransferStatus() then surfaces
+            // as a generic exception with no actionable diagnostic. Mirror
+            // what the sender-side cancellation path in
+            // CacheSender::Impl::sendResponse() does: fulfil the promise with
+            // a structured kNETWORK_ERROR exception so the consumer sees a
+            // real cancellation instead of a broken promise.
+            try
+            {
+                auto cancelledException
+                    = TLLM_REQUEST_EXCEPTION(cancelledId, tensorrt_llm::common::RequestErrorCode::kNETWORK_ERROR,
+                        "Generation KV cache request cancelled before send for request %zu", cancelledId);
+                queuedPromise->set_exception(std::make_exception_ptr(cancelledException));
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_ERROR("Failed to fulfill cancelled gen request promise %zu: %s", cancelledId, e.what());
             }
         }
         return isCancelled;
