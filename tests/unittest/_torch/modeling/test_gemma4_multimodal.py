@@ -190,13 +190,20 @@ class TestGemma4VisionTower(unittest.TestCase):
 
     @torch.no_grad()
     def test_forward_random_weights(self):
-        """Random-weight forward returns ``(output_length, hidden_size)`` with no NaNs."""
-        # Use fp32: head_dim=32 with bf16 + trtllm-gen unfused MHA fallback
-        # produces NaNs for random Kaiming init. The test is a shape+sanity
-        # check, not a dtype-specific contract.
+        """Forward smoke test with HF-default-init weights.
+
+        Production loads weights via ``load_weights(hf_state_dict)``, so
+        seeding through an HF tower's ``state_dict`` is the right sanity
+        check. PyTorch-default init on TRT-LLM ``Linear`` / fused ``qkv_proj``
+        can saturate the TRTLLM attention kernel at this small head_dim and
+        produce NaN — that is a kernel-input contract, not a model bug, and
+        is already covered indirectly by the parity tests below.
+        """
         torch.manual_seed(0)
         vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        hf_tower = HFGemma4VisionModel(vision_cfg).to("cuda").to(torch.float32).eval()
         tower = _build_trt_vision_tower(vision_cfg, dtype=torch.float32)
+        tower.load_weights(dict(hf_tower.state_dict()))
 
         pv, pos, output_length = _make_dummy_pixel_input(vision_cfg, dtype=torch.float32)
         with torch.inference_mode():

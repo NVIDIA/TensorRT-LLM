@@ -3142,22 +3142,32 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
         must be instances of the HF-derived adapter, not TRT-LLM's
         ``RMSNorm`` (which dispatches to flashinfer_rmsnorm and rejects
         bf16 1152-wide SigLIP inputs)."""
+        import re
+
         import tensorrt_llm._torch.models.modeling_gemma4_vision as mv
 
         # Static structural check via source — building a real VisionAttention
         # requires a full SigLip config, but the call sites are simple.
         src = open(mv.__file__).read()
         # All q_norm/k_norm/v_norm/*_layernorm constructors should be the adapter.
-        forbidden_constructor = "RMSNorm(hidden_size=vision_config"
-        adapter_constructor = "_Gemma4VisionRMSNorm(hidden_size="
-        self.assertNotIn(
-            forbidden_constructor,
-            src,
+        # Use regex to tolerate the line-wrap that black/yapf inserts after the
+        # opening paren on long multi-arg calls.
+        forbidden_pattern = re.compile(
+            r"(?<!_Gemma4Vision)RMSNorm\s*\(\s*hidden_size=vision_config"
+        )
+        adapter_pattern = re.compile(r"_Gemma4VisionRMSNorm\s*\(\s*hidden_size=")
+        self.assertFalse(
+            forbidden_pattern.search(src),
             "Vision tower must not construct TRT-LLM RMSNorm directly "
             "— it dispatches to flashinfer_rmsnorm which rejects "
             "bf16/non-contiguous SigLip inputs.",
         )
-        self.assertIn(adapter_constructor, src)
+        self.assertTrue(
+            adapter_pattern.search(src),
+            "Vision tower must construct the HF-derived "
+            "``_Gemma4VisionRMSNorm`` adapter for q/k/v norms and "
+            "encoder layer norms.",
+        )
 
 
 class TestGemma4AudioTowerStructure(unittest.TestCase):
