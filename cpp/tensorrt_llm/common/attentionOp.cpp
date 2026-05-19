@@ -1635,10 +1635,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     decoder_params.rotaryEmbeddingInvFreqCache = params.rotary_inv_freq;
     decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
 
-    {
-        invokeBuildDecoderInfo(decoder_params, stream);
-        sync_check_cuda_error(stream);
-    }
+    invokeBuildDecoderInfo(decoder_params, stream);
+    sync_check_cuda_error(stream);
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
     // Override the attention mask produced by invokeBuildDecoderInfo().
@@ -1646,31 +1644,29 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // TODO: put this logic in the kernel above. currently not much concern because q_len is mostly = 1
     if (isUnfusedCrossAttention())
     {
-        {
-            std::vector<T> h_attention_mask(params.batch_size * params.input_seq_length * params.cross_kv_length, 1.);
-            std::vector<int32_t> h_encoder_input_lengths(params.batch_size);
-            tensorrt_llm::common::cudaMemcpyAsyncSanitized(h_encoder_input_lengths.data(), params.encoder_input_lengths,
-                sizeof(int32_t) * params.batch_size, cudaMemcpyDeviceToHost, stream);
-            sync_check_cuda_error(stream);
+        std::vector<T> h_attention_mask(params.batch_size * params.input_seq_length * params.cross_kv_length, 1.);
+        std::vector<int32_t> h_encoder_input_lengths(params.batch_size);
+        tensorrt_llm::common::cudaMemcpyAsyncSanitized(h_encoder_input_lengths.data(), params.encoder_input_lengths,
+            sizeof(int32_t) * params.batch_size, cudaMemcpyDeviceToHost, stream);
+        sync_check_cuda_error(stream);
 
-            for (int bi = 0; bi < params.batch_size; bi++)
+        for (int bi = 0; bi < params.batch_size; bi++)
+        {
+            int b_offset = bi * params.input_seq_length * params.cross_kv_length;
+            for (int qi = 0; qi < params.input_seq_length; qi++)
             {
-                int b_offset = bi * params.input_seq_length * params.cross_kv_length;
-                for (int qi = 0; qi < params.input_seq_length; qi++)
+                int q_offset = b_offset + qi * params.cross_kv_length;
+                if (h_encoder_input_lengths[bi] < params.cross_kv_length)
                 {
-                    int q_offset = b_offset + qi * params.cross_kv_length;
-                    if (h_encoder_input_lengths[bi] < params.cross_kv_length)
-                    {
-                        std::fill(h_attention_mask.begin() + q_offset + h_encoder_input_lengths[bi],
-                            h_attention_mask.begin() + q_offset + params.cross_kv_length, 0.f);
-                    }
+                    std::fill(h_attention_mask.begin() + q_offset + h_encoder_input_lengths[bi],
+                        h_attention_mask.begin() + q_offset + params.cross_kv_length, 0.f);
                 }
             }
-            cudaMemcpyAsync(workspaceViews.attentionMask, h_attention_mask.data(),
-                sizeof(T) * params.batch_size * params.cross_kv_length * params.input_seq_length,
-                cudaMemcpyHostToDevice, stream);
-            sync_check_cuda_error(stream);
         }
+        cudaMemcpyAsync(workspaceViews.attentionMask, h_attention_mask.data(),
+            sizeof(T) * params.batch_size * params.cross_kv_length * params.input_seq_length, cudaMemcpyHostToDevice,
+            stream);
+        sync_check_cuda_error(stream);
     }
 
     // FIXME: a temporary solution to make sure the padding part is 0.
@@ -2026,10 +2022,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
 
         // Run the fmha kernel.
-        {
-            mFmhaDispatcher->run(fmhaParams);
-            sync_check_cuda_error(stream);
-        }
+        mFmhaDispatcher->run(fmhaParams);
+        sync_check_cuda_error(stream);
 
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
