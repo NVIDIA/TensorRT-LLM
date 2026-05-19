@@ -36,7 +36,6 @@
       - [Dynamo](#dynamo)
     - [Run Gemma 4](#run-gemma-4)
       - [Serve with `trtllm-serve` (OpenAI-compatible API)](#serve-with-trtllm-serve-openai-compatible-api)
-      - [Multimodal inference (image / video / audio)](#multimodal-inference-image--video--audio)
       - [Accuracy evaluation with `trtllm-eval`](#accuracy-evaluation-with-trtllm-eval)
     - [Run Modelopt Quantization](#run-modelopt-quantization)
       - [Requirements](#requirements)
@@ -824,33 +823,6 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 The `/v1/chat/completions` endpoint applies the Gemma 4 chat template automatically.
-
-#### Multimodal inference (image / video / audio)
-
-`examples/llm-api/quickstart_multimodal.py` reads media URLs or local paths, applies the multimodal chat template, and prints generated text. All four variants accept `--modality image` and `--modality video`; only `E2B` / `E4B` accept `--modality audio` (the larger checkpoints do not ship an audio tower).
-
-```bash
-# Image (works on all four variants)
-python examples/llm-api/quickstart_multimodal.py \
-    --model_dir google/gemma-4-E4B-it \
-    --modality image \
-    --media https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png \
-    --prompt "Describe the natural environment in the image."
-
-# Video (works on all four variants)
-python examples/llm-api/quickstart_multimodal.py \
-    --model_dir google/gemma-4-E4B-it \
-    --modality video \
-    --media <path-or-url-to-mp4> \
-    --prompt "Describe the scene in the video briefly."
-
-# Audio (E2B / E4B only)
-python examples/llm-api/quickstart_multimodal.py \
-    --model_dir google/gemma-4-E4B-it \
-    --modality audio \
-    --media https://huggingface.co/microsoft/Phi-4-multimodal-instruct/resolve/main/examples/what_is_the_traffic_sign_in_the_image.wav \
-    --prompt "Transcribe the audio clip into text, please don't add other text."
-```
 
 #### Accuracy evaluation with `trtllm-eval`
 
