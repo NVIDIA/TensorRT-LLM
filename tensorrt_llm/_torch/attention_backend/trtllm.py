@@ -28,7 +28,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: on).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1") == "1")
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
 
 @functools.cache
