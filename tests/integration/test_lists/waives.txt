@@ -314,6 +314,7 @@ full:H20/accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[Tr
 full:H20/accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True] SKIP (https://nvbugs/6185173)
 full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto] SKIP (https://nvbugs/6026676)
 full:H20/accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash SKIP (https://nvbugs/6185182)
+full:L40S/accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False] SKIP (https://nvbugs/6187185)
 full:NVIDIA_B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] SKIP (https://nvbugs/5150255)
 full:NVIDIA_B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] SKIP (https://nvbugs/5150255)
 full:NVIDIA_B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-input_output_len:128,128-ep:8-tp:8-gpus:8] SKIP (https://nvbugs/5150255)
