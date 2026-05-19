@@ -29,10 +29,11 @@ supports only text-only export.
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import AutoTokenizer
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
@@ -44,6 +45,7 @@ from transformers.models.gemma3n.configuration_gemma3n import (
 )
 from transformers.utils import ModelOutput
 
+from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory
 
 
@@ -879,7 +881,21 @@ class Gemma3nForConditionalGeneration(Gemma3nPreTrainedModel, GenerationMixin):
         return Gemma3nConditionalOutput(logits=logits)
 
 
+@ModelFactoryRegistry.register("Gemma3nForConditionalGeneration")
+class Gemma3nForConditionalGenerationFactory(AutoModelForCausalLMFactory):
+    """Factory that wires native HF tokenizer support for Gemma 3n."""
+
+    def init_tokenizer(self) -> Optional[Any]:
+        if self.tokenizer is None:
+            return None
+        return AutoTokenizer.from_pretrained(self.tokenizer)
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
 AutoModelForCausalLMFactory.register_custom_model_cls("Gemma3nTextConfig", Gemma3nForCausalLM)
-AutoModelForCausalLMFactory.register_custom_model_cls(
+Gemma3nForConditionalGenerationFactory.register_custom_model_cls(
     "Gemma3nConfig", Gemma3nForConditionalGeneration
 )

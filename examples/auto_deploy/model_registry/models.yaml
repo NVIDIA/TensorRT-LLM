@@ -462,12 +462,15 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Gemma 3n (Jun 2025) - on-device VLM ---
 - name: google/gemma-3n-E2B-it
-  config_id: multimodal
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml']
+  config_id: gemma3n_e2b_it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3n_e2b_it.yaml']
 - name: google/gemma-3n-E4B-it
   config_id: multimodal
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- Gemma 4 (2026) - MoE with K=V attention ---
+- name: google/gemma-4-E2B-it
+  config_id: gemma4_e2b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_e2b.yaml']
 - name: google/gemma-4-26B-A4B
   config_id: gemma4_moe_base
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe_base.yaml']
