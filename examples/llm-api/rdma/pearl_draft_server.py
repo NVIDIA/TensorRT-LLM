@@ -45,6 +45,10 @@ from tensorrt_llm._torch.speculative.pearl_trace import log as _pearl_log  # noq
 from tensorrt_llm._torch.speculative.spec_decode_channel import SpecDecodeChannel  # noqa: E402
 
 
+class PrefetchWaitTimeout(RuntimeError):
+    """Raised when PEARL prefetch misses its wait budget."""
+
+
 class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
     """Draft server with post-verify pipelining.
 
@@ -368,7 +372,11 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                         else None
                     ),
                 )
-                return None, stale
+                raise PrefetchWaitTimeout(
+                    "PEARL prefetch timed out waiting for draft tokens "
+                    f"(request_id={int(rid)}, round_seq={int(round_seq)}, "
+                    f"timeout_s={timeout_s})"
+                )
 
             waited = True
             event = draft_ready if predicted is not None else bonus_ready
