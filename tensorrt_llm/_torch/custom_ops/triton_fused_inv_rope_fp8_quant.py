@@ -47,11 +47,11 @@ import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 
-# Lazy import of the CuTe DSL backend (preferred default on SM100). If the
-# cutlass DSL stack is unavailable in the build, the import returns None and
-# this file falls back to the Triton kernel below. Users can also force the
-# Triton fallback explicitly via `TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE=1`
-# (set inside `_fused_inv_rope_fp8_quant_impl`).
+# Lazy import of the CuTe DSL backend. Triton is the default path; CuTe DSL
+# is a perf-tied alternative (microbench-verified within ~0.05% of Triton at
+# M >= 2048, and within the cross-allocation noise floor at M <= 1024). Opt
+# in via `TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1` for future kernel work (TMA /
+# warp-spec V2 will build on this scaffold). Import failure is non-fatal.
 try:
     from ..cute_dsl_kernels.blackwell import (  # noqa: F401
         fused_inv_rope_fp8_quant as _cute_dsl_backend,
@@ -338,17 +338,15 @@ def _fused_inv_rope_fp8_quant_impl(
     quant_group_size: int,
     is_neox: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # CuTe DSL is the default backend on SM100. It matches Triton at the
-    # CTX-side memory-bound regime (M >= 2048) and beats it at small M
-    # (12-19% faster on DSv4-Pro DEP8 shape) thanks to register-prefetched
-    # multi-token pipelining (BTM=1/8/16/32). Falls through to the Triton
-    # kernel below if (a) the cutlass DSL stack is unavailable in this
-    # build, or (b) the user explicitly opts out via
-    # `TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE=1`.
+    # Optional CuTe DSL backend. Microbench-tied with the Triton kernel
+    # below (within 0.05 % at M >= 2048 and within the cross-allocation
+    # noise floor at M <= 1024 — 4-allocation median on B200 GB200). Kept
+    # in tree as an alternative implementation that future TMA / warp-spec
+    # work (V2) can build on. Opt in via `TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1`.
     if (
         _cute_dsl_backend is not None
         and _cute_dsl_backend._fused_inv_rope_fp8_quant_impl_cute_dsl is not None
-        and os.environ.get("TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE", "0") != "1"
+        and os.environ.get("TLLM_USE_CUTE_DSL_FUSED_INV_ROPE", "0") == "1"
     ):
         return _cute_dsl_backend._fused_inv_rope_fp8_quant_impl_cute_dsl(
             o,

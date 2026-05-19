@@ -42,10 +42,11 @@ Bit-equivalent to the Triton BTM=1 kernel
   register-prefetch V1.5 still bottlenecks on gmem latency.
 
 ## Activation
-- Default backend on SM100. Wired up in
-  `triton_fused_inv_rope_fp8_quant.py:_fused_inv_rope_fp8_quant_impl`, which
-  falls back to the Triton kernel if the cutlass DSL stack is unavailable
-  or `TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE=1` is set.
+- Optional / opt-in backend. Triton is the default in
+  `triton_fused_inv_rope_fp8_quant.py:_fused_inv_rope_fp8_quant_impl`; this
+  backend is selected when `TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1` is set and
+  the cutlass DSL stack is available in the build. Microbench-tied with the
+  Triton kernel; kept in tree as the scaffold for future TMA / warp-spec V2.
 """
 
 from __future__ import annotations
