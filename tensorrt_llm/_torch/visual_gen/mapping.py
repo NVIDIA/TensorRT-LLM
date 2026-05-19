@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Optional
 from socket import gethostname
+import os
 
 import torch
 import torch.distributed as dist
@@ -145,19 +146,36 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             self.build_mesh()
             self._build_vae_group()
 
+    def _get_host_id(self):
+        """Resolve node rank from whichever launcher is active.
+
+        torchrun sets GROUP_RANK.
+        SLURM srun sets SLURM_NODEID.
+        Plain mp.Process (single-node): no env var → 0.
+        """
+        for var in ("GROUP_RANK", "SLURM_NODEID"):
+            val = os.environ.get(var)
+            if val is not None:
+                logger.debug(f'[Rank {self._rank}] node id from env: {var} = {val}')
+                return int(val)
+
+        logger.debug(f'[Rank {self._rank}] node id from env: {var} = {val}')
+        return 0  # single-node mp.Process: all ranks are co-located
+
     def setup_communicators(self):
 
-        hostname = gethostname()
+        host = self._get_host_id()
 
         all_hosts = [ None for _ in range(self.world_size) ]
-        dist.all_gather_object(all_hosts, (self._rank, hostname))
+        dist.all_gather_object(all_hosts, (self._rank, host))
 
         host_to_ranks = {}
         for rank, host in all_hosts:
             host_to_ranks.setdefault(host, []).append(rank)
 
         self.local_comm = None
-        for ranks in host_to_ranks.values():
+        for host in sorted(host_to_ranks):
+            ranks = sorted(host_to_ranks[host])
             # All global ranks from the default process group to participate in the call,
             # even if some ranks are not part of the new process group being created
             pg = dist.new_group(ranks=ranks, backend='cuda:nccl,cpu:gloo')
