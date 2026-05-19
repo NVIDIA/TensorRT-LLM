@@ -372,6 +372,50 @@ def test_llm_with_kv_cache_retention_config():
         print(output)
 
 
+class _PrefixUnstableTokenizer:
+    all_special_tokens = []
+    clean_up_tokenization_spaces = False
+    is_fast = True
+
+    def get_added_vocab(self):
+        return {}
+
+    def convert_ids_to_tokens(self, ids, skip_special_tokens=False):
+        id_to_token = {1: 'C'}
+        return [id_to_token[id_] for id_ in ids]
+
+    def convert_tokens_to_string(self,
+                                 tokens,
+                                 skip_special_tokens=False,
+                                 spaces_between_special_tokens=True):
+        decoded_text = {
+            ('B', ): ' the',
+            ('B', 'C'): 'the cat',
+        }
+        return decoded_text[tuple(tokens)]
+
+    def clean_up_tokenization(self, out_string):
+        return out_string
+
+
+def test_trtllm_decode_incrementally_slices_from_previous_decoded_text():
+    tokenizer = TransformersTokenizer(_PrefixUnstableTokenizer())
+
+    decoded_text, states = tokenizer.trtllm_decode_incrementally(
+        [1],
+        prev_text='the',
+        states={
+            'last_new_tokens': ['B'],
+            'last_decoded_text': 'the',
+        },
+    )
+
+    assert decoded_text == 'the cat'
+    assert states['last_new_tokens'] == ['C']
+    assert states['pending_tokens'] == []
+    assert states['last_decoded_text'] == 'the cat'
+
+
 @pytest.mark.parametrize('backend', ["HF", "TRTLLM"])
 @pytest.mark.parametrize(
     'tokenizer_dir, clean_up_tokenization_spaces, threshold',

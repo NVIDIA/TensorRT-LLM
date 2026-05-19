@@ -412,14 +412,14 @@ class TransformersTokenizer(TokenizerBase):
             states = {}
         last_new_tokens = states.pop('last_new_tokens', [])
         pending_tokens = states.pop('pending_tokens', [])
-
-        if len(last_new_tokens) > 0:
-            last_new_text = self.convert_tokens_to_string(
-                last_new_tokens,
-                skip_special_tokens=skip_special_tokens,
-                spaces_between_special_tokens=spaces_between_special_tokens)
-        else:
-            last_new_text = ""
+        # Some BPE/tiktoken decoders can render a token differently by itself than
+        # in a longer token span. E.g. the tokenizer decodes token "B" as " the",
+        # but tokens "B", "C" together as "the cat". If the previous emitted text
+        # was "the", slicing "the cat" by len(" the") would produce "cat", and the
+        # stream would incorrectly assemble "thecat". The incremental delta must be
+        # sliced from the last emitted decoded text, not from a fresh standalone
+        # decode of last tokens.
+        last_decoded_text = states.pop('last_decoded_text', '')
 
         new_tokens = self.convert_ids_to_tokens(
             token_ids, skip_special_tokens=skip_special_tokens)
@@ -436,20 +436,25 @@ class TransformersTokenizer(TokenizerBase):
             last_new_tokens + pending_tokens,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens)
-        if not flush and (len(curr_new_text.rstrip()) <= len(
-                last_new_text.rstrip()) or curr_new_text.endswith("�")):
+        if not flush and (len(curr_new_text) <= len(last_decoded_text)
+                          or curr_new_text.endswith("�")):
             return prev_text, {
                 'last_new_tokens': last_new_tokens,
-                'pending_tokens': pending_tokens
+                'pending_tokens': pending_tokens,
+                'last_decoded_text': last_decoded_text,
             }
 
-        # Remove the part of last_new_text
-        curr_new_text = curr_new_text[len(last_new_text):]
+        raw_curr_new_text = curr_new_text
+        curr_new_text = curr_new_text[len(last_decoded_text):]
         if clean_up_tokenization_spaces is None:
             clean_up_tokenization_spaces = self.clean_up_tokenization_spaces
         if clean_up_tokenization_spaces:
             curr_new_text = self.clean_up_tokenization(curr_new_text)
-        return prev_text + curr_new_text, {'last_new_tokens': pending_tokens}
+        return prev_text + curr_new_text, {
+            'last_new_tokens': pending_tokens,
+            'pending_tokens': [],
+            'last_decoded_text': raw_curr_new_text,
+        }
 
     def hf_decode_incrementally(
         self,
