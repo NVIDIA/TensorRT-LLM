@@ -852,18 +852,6 @@ def getNodeArgs(int nodeCount, int gpuCount, boolean setSegment = false) {
     return args
 }
 
-def getSbatchPartitionAdditionalArgs(String additionalArgs, int nodeCount) {
-    if (nodeCount <= 1 || !additionalArgs) {
-        return additionalArgs ?: ""
-    }
-
-    def sanitizedArgs = additionalArgs
-    ["nodes", "gpus", "gpus-per-node", "ntasks", "ntasks-per-node"].each { argName ->
-        sanitizedArgs = sanitizedArgs.replaceAll("(^|\\s)--${argName}(=\\S+|\\s+\\S+)", " ")
-    }
-    return sanitizedArgs.replaceAll("\\s+", " ").trim()
-}
-
 def getPytestBaseCommandLine(
     String llmSrc,
     String stageName,
@@ -1205,8 +1193,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
                     exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
                 }
-                def partitionAdditionalArgs = getSbatchPartitionAdditionalArgs(partition.additionalArgs, nodeCount)
-                def partitionAdditionalArgsDirective = partitionAdditionalArgs ? "#SBATCH ${partitionAdditionalArgs}" : ""
 
                 def envExportStatements = envVarsToExport.collect { varName, varValue ->
                     def escapedValue = varValue?.toString() ?: ''
@@ -1222,7 +1208,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
-                    ${partitionAdditionalArgsDirective}
+                    #SBATCH ${partition.additionalArgs}
                     ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
 
@@ -3377,9 +3363,9 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        "GB200-8_GPUs-2_Nodes-PyTorch-DS-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 8, 2],
-        "GB200-16_GPUs-4_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 16, 4],
-        "GB200-24_GPUs-6_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_ds", 1, 1, 24, 6],
+        "GB200-8_GPUs-2_Nodes-PyTorch-DS-1": ["auto:gb200-flex", "l0_gb200_multi_gpus_ds", 1, 1, 8, 2],
+        "GB200-16_GPUs-4_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_gpus_ds", 1, 1, 16, 4],
+        "GB200-24_GPUs-6_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_gpus_ds", 1, 1, 24, 6],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
