@@ -45,9 +45,6 @@ MAP_BY_SOCKET = None
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
-    "llama_v2_7b": "llama-models-v2/llama-v2-7b-hf",  # not safetensors repo
-    "llama_v2_13b": "llama-models-v2/llama-v2-13b-hf",  # not safetensors repo
-    "llama_v2_70b": "llama-models-v2/llama-v2-70b-hf",  # not safetensors repo
     "llama_v3.1_8b": "llama-3.1-model/Meta-Llama-3.1-8B",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
@@ -88,20 +85,9 @@ MODEL_PATH_DICT = {
     "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
     "llama_v4_maverick_17b_128e_instruct_fp8":
     "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
-    "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
-    "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
-    "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
-    "mixtral_8x7b_v0.1_instruct_fp4":
-    "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
-    "mistral_nemo_12b_base": "Mistral-Nemo-Base-2407",
     "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
     "deepseek_r1_distill_llama_70b":
     "DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B/",
-    "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
-    "mistral_7b_v0.1": "mistral-7b-v0.1",
-    "ministral_8b": "Ministral-8B-Instruct-2410",
-    "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
-    "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "gemma_3_27b_it": "gemma/gemma-3-27b-it",
     "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
     "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
@@ -136,43 +122,15 @@ MODEL_PATH_DICT = {
     "qwen2_5_vl_7b_instruct_fp8": "multimodals/Qwen2.5-VL-7B-Instruct-FP8",
     "qwen2_5_vl_7b_instruct_fp4": "multimodals/Qwen2.5-VL-7B-Instruct-FP4",
     "starcoder2_3b": "starcoder2-3b",
-    "starcoder2_7b": "starcoder2-7b",
-    "starcoder2_15b": "starcoder2-15b",
-    "t5": "t5-small",  # not supported for trtllm-bench build config
-    "flan_t5_base":
-    "flan-t5-small",  # not supported for trtllm-bench build config
-    "flan_t5_large":
-    "flan-t5-xl",  # not supported for trtllm-bench build config
-    "whisper_large_v3":
-    "whisper-models/large-v3",  # not supported for trtllm-bench tokenizer
-    "bart_large_cnn": "bart-large-cnn",  # not safetensors repo
-    "mbart_large_50_many_to_one_mmt": "mbart-large-50-many-to-one-mmt",
-    "mamba_130m": "mamba/mamba-130m-hf",
-    "mamba_370m": "mamba/mamba-370m-hf",
-    "mamba_2.8b": "mamba/mamba-2.8b-hf",
-    "gpt_20b": "gpt-neox-20b",
-    "gpt_350m_moe": "gpt2-medium",
     "phi_4_mini_instruct": "Phi-4-mini-instruct",
     "phi_4_reasoning_plus": "Phi-4-reasoning-plus",
     "phi_4_reasoning_plus_fp8": "nvidia-Phi-4-reasoning-plus-FP8",
     "phi_4_reasoning_plus_fp4": "nvidia-Phi-4-reasoning-plus-NVFP4",
     "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
-    "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
-    "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_fp4":
     "multimodals/Phi-4-multimodal-instruct-FP4",
-    "phi_4_multimodal_instruct_fp4_image":
-    "multimodals/Phi-4-multimodal-instruct-FP4",
-    "phi_4_multimodal_instruct_fp4_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP4",
-    "phi_4_multimodal_instruct_fp8_image":
-    "multimodals/Phi-4-multimodal-instruct-FP8",
-    "phi_4_multimodal_instruct_fp8_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP8",
     "phi_4_multimodal_instruct_fp8":
     "multimodals/Phi-4-multimodal-instruct-FP8",
-    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
-    "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
@@ -202,7 +160,6 @@ MODEL_PATH_DICT = {
     # DeepSeek V3.2 (671B MoE)
     "deepseek_v3.2_fp8": "DeepSeek-V3.2-hf",
     "deepseek_v3.2_fp4": "DeepSeek-V3.2-NVFP4",
-    "deepseek_v3.2_exp_fp4_v2": "DeepSeek-V3.2-Exp-FP4-v2",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # Kimi K2.5 NVFP4 (~1T MoE multimodal)
@@ -210,15 +167,9 @@ MODEL_PATH_DICT = {
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
-    "llama_v2_7b_hf": "meta-llama/Llama-2-7b-hf",
-    "llama_v2_70b_hf": "meta-llama/Llama-2-70b-hf",
-    "falcon_180b_hf": "tiiuae/falcon-180B",
-    "gptj_6b_hf": "EleutherAI/gpt-j-6b",
-    "llama_v3_8b_hf": "meta-llama/Meta-Llama-3-8B",
     "llama_v3.1_8b_hf": "meta-llama/Llama-3.1-8B",
     "llama_v3.1_8b_instruct_hf": "nvidia/Llama-3.1-8B-Instruct-FP8",
     "llama_v3.1_70b_instruct_hf": "meta-llama/Meta-Llama-3.1-70B-Instruct",
-    "llama_v3_70b_hf": "meta-llama/Meta-Llama-3-70B",
     "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
     "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
     "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
@@ -230,37 +181,10 @@ HF_MODEL_PATH = {
     "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
     "llama_v3.1_nemotron_ultra_253b_fp8_hf":
     "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
-    "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
-    "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
-    "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
-    "flan_t5_base_hf": "google/flan-t5-small",
     "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
-    "gemma_3_1b_it_hf": "google/gemma-3-1b-it",
 }
 LORA_MODEL_PATH = {
-    "llama_v2_13b":
-    "llama-models-v2/chinese-llama-2-lora-13b",
-    "mixtral_8x7b_v0.1":
-    "chinese-mixtral-lora",
-    "llama_v3.1_8b_instruct_fp8":
-    "lora/llama-3-chinese-8b-instruct-v2-lora/",
-    "ministral_8b":
-    "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
-    "gemma_3_1b_it":
-    "lora/gemma/gemma-3-1b-it-dummy-lora",  # Dummy LoRA for Gemma-3-1B-Instruct
-    "phi_4_multimodal_instruct_image":
-    "multimodals/Phi-4-multimodal-instruct/vision-lora",
-    "phi_4_multimodal_instruct_audio":
-    "multimodals/Phi-4-multimodal-instruct/speech-lora",
-    "phi_4_multimodal_instruct_fp4_image":
-    "multimodals/Phi-4-multimodal-instruct-FP4/vision-lora",
-    "phi_4_multimodal_instruct_fp4_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP4/speech-lora",
-    "phi_4_multimodal_instruct_fp8_image":
-    "multimodals/Phi-4-multimodal-instruct-FP8/vision-lora",
-    "phi_4_multimodal_instruct_fp8_audio":
-    "multimodals/Phi-4-multimodal-instruct-FP8/speech-lora",
+    "llama_v3.1_8b_instruct_fp8": "lora/llama-3-chinese-8b-instruct-v2-lora/",
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
