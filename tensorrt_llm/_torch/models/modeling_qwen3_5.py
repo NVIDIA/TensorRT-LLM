@@ -80,7 +80,7 @@ def _translate_mtp_pattern(name, n_hidden_layers):
 # runtime layer asks the model module how to load its own config.
 #
 # There are two entry points:
-#   - `_Qwen35ConfigCompat.normalize(config_dict)` — for text-only
+#   - `Qwen35ConfigCompat.normalize(config_dict)` — for text-only
 #     Qwen3.5 (MoE and dense). Returns a dict that
 #     `transformers.Qwen3NextConfig.from_dict(...)` can consume, so the
 #     existing Qwen3Next runtime is reused unchanged.
@@ -90,7 +90,7 @@ def _translate_mtp_pattern(name, n_hidden_layers):
 #     while keeping `text_config` / `vision_config` composite.
 
 
-class _Qwen35ConfigCompat:
+class Qwen35ConfigCompat:
     """Temporary shim for flattening Qwen3.5 text configs into Qwen3NextConfig.
 
     We normalize to `Qwen3NextConfig` (rather than to a Qwen3.5-native
@@ -111,9 +111,9 @@ class _Qwen35ConfigCompat:
     @staticmethod
     def normalize(config_dict: dict) -> dict:
         """Entry point: raw config.json dict -> flat Qwen3NextConfig-compatible dict."""
-        text_config = _Qwen35ConfigCompat._extract_text_config(config_dict)
-        text_config = _Qwen35ConfigCompat._inherit_quantization_config(config_dict, text_config)
-        text_config = _Qwen35ConfigCompat._flatten_rope(text_config)
+        text_config = Qwen35ConfigCompat._extract_text_config(config_dict)
+        text_config = Qwen35ConfigCompat._inherit_quantization_config(config_dict, text_config)
+        text_config = Qwen35ConfigCompat._flatten_rope(text_config)
 
         # Detect dense vs MoE and set architecture + MoE defaults accordingly
         is_moe = "num_experts" in text_config and text_config["num_experts"] > 0
@@ -138,7 +138,7 @@ class _Qwen35ConfigCompat:
     def _extract_text_config(config_dict: dict) -> dict:
         """Pull nested text_config from VLM checkpoints, or use dict as-is."""
         architectures = config_dict.get("architectures") or []
-        if architectures and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
+        if architectures and architectures[0] in Qwen35ConfigCompat._VLM_ARCHITECTURES:
             text_config = dict(config_dict.get("text_config") or {})
         else:
             text_config = dict(config_dict)
@@ -161,10 +161,10 @@ class _Qwen35ConfigCompat:
 
         quantization_config = dict(config_dict["quantization_config"])
         if "modules_to_not_convert" in quantization_config:
-            modules = _Qwen35ConfigCompat._normalize_exclude_modules(
+            modules = Qwen35ConfigCompat._normalize_exclude_modules(
                 quantization_config["modules_to_not_convert"]
             )
-            modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(text_config, modules)
+            modules = Qwen35ConfigCompat._add_qkvz_bf16_workaround(text_config, modules)
             quantization_config["modules_to_not_convert"] = sorted(set(modules))
         text_config["quantization_config"] = quantization_config
         return text_config
@@ -254,7 +254,7 @@ def _normalize_qwen35_mrope_config(text_config) -> None:
         return
     if hasattr(rope_parameters, "to_dict"):
         rope_parameters = rope_parameters.to_dict()
-    flattened = _Qwen35ConfigCompat._flatten_rope(
+    flattened = Qwen35ConfigCompat._flatten_rope(
         {
             "rope_parameters": dict(rope_parameters),
             "rope_scaling": dict(getattr(text_config, "rope_scaling", None) or {}),
@@ -290,9 +290,9 @@ def _normalize_qwen35_quantization_config(model_config) -> None:
         return
 
     text_config = getattr(model_config, "text_config", None)
-    normalized_modules = _Qwen35ConfigCompat._normalize_exclude_modules(modules)
+    normalized_modules = Qwen35ConfigCompat._normalize_exclude_modules(modules)
     if text_config is not None:
-        normalized_modules = _Qwen35ConfigCompat._add_qkvz_bf16_workaround(
+        normalized_modules = Qwen35ConfigCompat._add_qkvz_bf16_workaround(
             text_config.to_dict(), normalized_modules
         )
     quantization_config["modules_to_not_convert"] = sorted(set(normalized_modules))
@@ -390,7 +390,7 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
 
     Same reuse pattern as Qwen3_5MoeForCausalLM, but for the dense 27B
     variant which uses GatedMLP instead of SparseMoeBlock.  The config
-    normalizer (_Qwen35ConfigCompat) sets num_experts=0 so that
+    normalizer (Qwen35ConfigCompat) sets num_experts=0 so that
     Qwen3NextModel selects GatedMLP for the feed-forward layers.
     """
 
@@ -399,6 +399,7 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         super().__init__(model_config)
 
 
+# TODO: Add tests for disaggregated support.
 @support_multimodal_disaggregated
 @register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VisionModel)
 @register_auto_model("Qwen3_5MoeForConditionalGeneration")

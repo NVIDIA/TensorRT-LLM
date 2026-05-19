@@ -379,9 +379,9 @@ def load_pretrained_config(model_name_or_path: str,
                             )):
         # Qwen3.5 text-only: flatten to Qwen3NextConfig via the model-side shim.
         from tensorrt_llm._torch.models.modeling_qwen3_5 import \
-            _Qwen35ConfigCompat
+            Qwen35ConfigCompat
         model_config = transformers.Qwen3NextConfig.from_dict(
-            _Qwen35ConfigCompat.normalize(config_dict))
+            Qwen35ConfigCompat.normalize(config_dict))
     elif (model_type == "exaone4" and config_dict.get("sliding_window") is None
           and config_dict.get("layer_types") is None):
         # transformers 5.5.x Exaone4Config.__post_init__ first forces

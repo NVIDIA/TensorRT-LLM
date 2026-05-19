@@ -325,13 +325,9 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
         model = model_class(model_config, **kwargs).to("cuda")
 
         if load_weights:
-            weight_mapper_class = self.get_weight_mapper_class()
-            if weight_mapper_class is not None:
-                weight_mapper = weight_mapper_class()
-                weight_mapper.init_model_and_config(model, trtllm_config)
-                model.load_weights(hf_model_state_dict, weight_mapper)
-            else:
-                model.load_weights(hf_model_state_dict)
+            weight_mapper = self.get_weight_mapper_class()()
+            weight_mapper.init_model_and_config(model, trtllm_config)
+            model.load_weights(hf_model_state_dict, weight_mapper)
 
             for module in model.modules():
                 if hasattr(module, "post_load_weights") and not getattr(
@@ -345,6 +341,13 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
         """Qwen3.5-VL uses mRoPE; the cache manager needs the mRoPE
         position-id buffer allocated at dummy-request time."""
         return {"use_mrope": True}
+
+    def get_tolerance(self):
+        """Tighten `rtol` to `0.1` (4x tighter than the base 0.4
+        default) while keeping `atol` at `0.4` to absorb single-logit
+        tail outliers seen on `multiple_image` / `video`.
+        """
+        return 0.4, 0.1
 
     def get_trtllm_inputs(
         self,
