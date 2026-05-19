@@ -3760,18 +3760,19 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
 
     @pytest.mark.skip_less_mpi_world_size(4)
-    def test_auto_dtype(self):
+    @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS"])
+    def test_auto_dtype(self, moe_backend):
         # Aggregate (non-disagg, non-EPLB) smoke test. NVFP4 weights are ~71
         # GB/rank at TP=2, ~36 GB/rank at TP=4 — TP=4 fits comfortably on
-        # 4x B200 178GB. TRTLLM backend required because V4-Flash MXFP4
-        # routed experts are unsupported by WIDEEP (raises "Unsupported
-        # quantization mode: [65536]"). is_integration_test=True keeps this
-        # to a 1-sample smoke.
+        # 4x B200 178GB. WIDEEP is unsupported because V4-Flash MXFP4 routed
+        # experts have no MXFP4 branch (raises "Unsupported quantization
+        # mode: [65536]"). is_integration_test=True keeps this to a 1-sample
+        # smoke.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
-                 moe_config=MoeConfig(backend="TRTLLM"),
+                 moe_config=MoeConfig(backend=moe_backend),
                  enable_attention_dp=True,
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:
