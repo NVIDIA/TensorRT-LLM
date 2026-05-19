@@ -12,18 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-from typing import Literal, Tuple, Type
+from typing import Literal, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from ..._compat import get_sm_version
+from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+
+# Backend selection for MXFP4 MoE quantization.
+# - "triton": use the triton_mxfp4_moe kernel (Ampere/Hopper compatible).
+# - "trtllm": use the trtllm-gen MXFP4 MoE kernel (Blackwell SM>=100 only).
+# When ``backend`` is left unset (``None``) on the transform config, the
+# default is auto-resolved from the current SM: ``trtllm`` on SM>=100,
+# ``triton`` otherwise. ``backend="trtllm"`` on SM<100 falls back to
+# ``triton`` with a warning (silent fallback, not an error).
+MxFP4Backend = Literal["triton", "trtllm"]
 
 
 def _moe_dense_mlp_pattern(
@@ -226,14 +236,76 @@ def _register_mxfp4_expert_params(
     )
 
 
+class InsertMXFP4MLPConfig(TransformConfig):
+    """Configuration for ``quantize_mxfp4_moe``."""
+
+    backend: Optional[MxFP4Backend] = Field(
+        default=None,
+        description=(
+            "MXFP4 MoE kernel backend selection. When unset (``None``), the "
+            "default is SM-based: ``trtllm`` on SM>=100 (Blackwell), ``triton`` "
+            "otherwise. Explicit ``triton`` or ``trtllm`` overrides the default. "
+            "``trtllm`` on SM<100 silently falls back to ``triton`` with a warning."
+        ),
+    )
+    trtllm_quant_act: Literal["bf16", "mxfp8"] = Field(
+        default="mxfp8",
+        description=(
+            "Only used when ``backend='trtllm'``. Activation precision for the "
+            "trtllm-gen MoE GEMM: ``bf16`` dispatches to "
+            "``trtllm_mxfp4_w4a16_moe_fused`` (bf16 input), ``mxfp8`` "
+            "pre-quantizes the activation to MXFP8 and dispatches to "
+            "``trtllm_mxfp4_w4a8_moe_fused`` (faster cubin family). "
+            "Default ``mxfp8`` matches the modeling-side default."
+        ),
+    )
+
+
 @TransformRegistry.register("quantize_mxfp4_moe")
 class InsertMXFP4MLP(BaseTransform):
-    """
-    Replace (torch_moe_router -> torch_moe_dense_mlp) with a single auto_deploy::triton_mxfp4_moe op,
-    and register MXFP4 expert params (blocks + scales) on the experts module.
+    """Quantize MXFP4 MoE: dispatch to triton or trtllm-gen backend.
+
+    Replaces ``(torch_moe_router -> torch_moe_dense_mlp)`` with a single fused
+    MoE op. The chosen backend determines the destination op and the parameter
+    layout registered on the experts module:
+
+    * ``backend="triton"`` → ``auto_deploy::triton_mxfp4_moe`` with raw HF
+      MXFP4 layout (``_blocks`` / ``_scales`` / ``_bias``). Lazy weight
+      swizzling happens inside the Triton kernel on first forward.
+    * ``backend="trtllm"`` → ``auto_deploy::trtllm_mxfp4_*_moe_fused`` with
+      trtllm-gen prepared layout (``fc1_w_trtllm`` / ``fc1_w_scale_trtllm`` /
+      ...). Weight preparation (shuffle + interleave) is done on CPU inside
+      a state-dict pre-hook registered by this transform, so the raw HF
+      tensors are converted before being moved to GPU.
     """
 
     algo_name: str = "mxfp4"
+    config: InsertMXFP4MLPConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return InsertMXFP4MLPConfig
+
+    def _resolve_backend(self) -> MxFP4Backend:
+        """Resolve the effective backend from config + runtime SM.
+
+        - ``config.backend is None`` → SM-based default
+            * SM>=100 → ``trtllm``
+            * SM<100  → ``triton``
+        - ``config.backend="trtllm"`` + SM<100 → warn + fallback to ``triton``
+        - Otherwise honour the explicit config value.
+        """
+        requested = self.config.backend
+        sm = get_sm_version()
+        if requested is None:
+            return "trtllm" if sm >= 100 else "triton"
+        if requested == "trtllm" and sm < 100:
+            ad_logger.warning(
+                f"quantize_mxfp4_moe: backend='trtllm' requires SM>=100 (Blackwell), "
+                f"but current SM={sm}. Falling back to backend='triton'."
+            )
+            return "triton"
+        return requested
 
     def _apply(
         self,
@@ -242,20 +314,51 @@ class InsertMXFP4MLP(BaseTransform):
         factory,
         shared_config,
     ) -> Tuple[GraphModule, TransformInfo]:
+        """Dispatcher: pick a backend and delegate to the corresponding method.
+
+        The actual graph rewrite + parameter swap lives in
+        :meth:`_apply_triton` / :meth:`_apply_trtllm`. This method only:
+        1. Skips if quant_method != "mxfp4".
+        2. Resolves the backend (``triton`` | ``trtllm``) and dispatches.
+        """
         qcfg = factory.get_quant_config()
         if not qcfg or qcfg.get("quant_method", "") != self.algo_name:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-        # MXFP4 + trtllm-gen modeling-side path: the modeling code already
-        # registers the prepared-shape parameters and calls the fused op
-        # directly, so this transform has nothing to do. The graph won't have
-        # ``torch_moe_dense_mlp`` calls in that mode (the modeling forward
-        # routes through ``trtllm_mxfp4_w4a*_moe_fused`` op directly).
-        if os.environ.get("AD_MXFP4_TRTLLM_GEN_MODELING", "1") == "1":
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+
+        backend = self._resolve_backend()
+        ad_logger.info(f"quantize_mxfp4_moe: dispatching to backend={backend!r}")
+
+        if backend == "triton":
+            return self._apply_triton(gm, cm, factory, shared_config)
+        elif backend == "trtllm":
+            return self._apply_trtllm(gm, cm, factory, shared_config)
+        else:
+            # _resolve_backend should only return "triton" or "trtllm".
+            raise ValueError(f"Unexpected backend resolved: {backend!r}")
+
+    def _apply_triton(
+        self,
+        gm: GraphModule,
+        cm,
+        factory,
+        shared_config,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        """Triton backend: graph rewrite to ``triton_mxfp4_moe``.
+
+        Replaces ``(torch_moe_router -> torch_moe_dense_mlp)`` with a single
+        ``auto_deploy::triton_mxfp4_moe`` op and registers raw HF-layout
+        MXFP4 params (``_blocks`` / ``_scales``) on the experts module via
+        :func:`_register_mxfp4_expert_params`. The bf16 placeholders
+        (``gate_up_proj`` / ``down_proj``) are deleted; biases are kept.
+
+        Weight swizzling for the Triton kernel happens lazily inside the
+        kernel on first forward (see ``_prepare_weights_scales_cached`` in
+        ``custom_ops/fused_moe/mxfp4_moe.py``) -- no load hook needed
+        because the HF state-dict keys already match the registered param
+        names (``gate_up_proj_blocks``, ``gate_up_proj_scales``, etc.).
+        """
         num_matches = 0
 
         for n in list(gm.graph.nodes):
@@ -356,290 +459,267 @@ class InsertMXFP4MLP(BaseTransform):
         )
         return gm, info
 
-
-# ============================================================================
-# Step-3: rewrite triton_mxfp4_moe -> trtllm_mxfp4_w4a16_moe_fused (V4)
-# ============================================================================
-#
-# Runs in `post_load_fusion` stage (after weights are loaded). Picks up the
-# MXFP4 params that quantize_mxfp4_moe registered, runs the trtllm-gen
-# weight prep (pad + shuffle), registers prepared params on the experts
-# module, and replaces the triton_mxfp4_moe call with the new op that
-# dispatches to torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner.
-#
-# Step-3 scope: supports the non-EP triton_mxfp4_moe path only (tp_size=1).
-# triton_mxfp4_moe_ep is left untouched -- TP for the new op arrives in
-# step 5 alongside MXFP4TRTLLMGenSharding.
-
-
-_GPTOSS_GLU_ALPHA: float = 1.702
-_GPTOSS_GLU_BETA: float = 1.0
-_GPTOSS_GLU_LIMIT: float = 7.0
-
-
-def _make_swiglu_param(
-    num_local_experts: int, value: float, *, dtype=torch.float32
-) -> nn.Parameter:
-    return nn.Parameter(
-        torch.full((num_local_experts,), value, dtype=dtype),
-        requires_grad=False,
-    )
-
-
-def _delete_module_attr(module: nn.Module, name: str) -> None:
-    """Remove a parameter/buffer/attr from a Module if present."""
-    if name in module._parameters:
-        del module._parameters[name]
-    elif name in module._buffers:
-        del module._buffers[name]
-    elif hasattr(module, name):
-        delattr(module, name)
-
-
-class QuantizeMXFP4MoETrtllmGenConfig(TransformConfig):
-    """Configuration for ``quantize_mxfp4_moe_trtllm_gen``."""
-
-    quant_act: Literal["bf16", "mxfp8"] = Field(
-        default="bf16",
-        description=(
-            "Activation precision for the trtllm-gen MoE GEMM. ``bf16`` (default) "
-            "dispatches to ``trtllm_mxfp4_w4a16_moe_fused`` (bf16 input, "
-            "``bmm_Bfloat16_MxE2m1Bfloat16`` cubin family). ``mxfp8`` pre-quantizes "
-            "the activation via ``torch.ops.trtllm.mxfp8_quantize`` and dispatches "
-            "to ``trtllm_mxfp4_w4a8_moe_fused`` (MXFP8 input, "
-            "``bmm_MxE4m3_MxE2m1MxE4m3`` cubin family — matches PT's "
-            "``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod`` path)."
-        ),
-    )
-
-
-@TransformRegistry.register("quantize_mxfp4_moe_trtllm_gen")
-class QuantizeMXFP4MoETrtllmGen(BaseTransform):
-    """Replace ``triton_mxfp4_moe`` with the trtllm-gen MXFP4-weight MoE op.
-
-    Mirrors PT's TRTLLMGen MoE path for gpt-oss-120b on B200: ``W4A16``
-    by default (bf16 activation); set ``quant_act: mxfp8`` to switch to
-    ``W4A8MXFP4MXFP8`` (MXFP8 activation) for the faster cubin family.
-    Requires that ``quantize_mxfp4_moe`` has already run (so the MXFP4
-    ``_blocks``/``_scales``/``_bias`` params exist) and that weights
-    have been loaded.
-
-    TP-MoE (V6, Step 5 of MOE_TRTLLM_GEN_PLAN.md): when the runtime
-    ``shared_config.dist_config`` reports ``moe_tp_size > 1``, the prep
-    helper is invoked with ``tp_size`` / ``tp_rank`` so the per-rank
-    op holds only its ``I/tp`` slice of the intermediate dim, and an
-    ``auto_deploy.all_reduce`` placeholder is inserted after the
-    downstream ``aten.view`` so post-MoE partial outputs sum across
-    ranks and ``fuse_allreduce_residual_rmsnorm`` collapses the AR +
-    add + norm into one fused kernel (see §5.1 O1 / §3.10 of the
-    cc_reports gpt-oss-120b report).
-    """
-
-    algo_name: str = "mxfp4"
-    config: QuantizeMXFP4MoETrtllmGenConfig
-
-    @classmethod
-    def get_config_class(cls) -> Type[TransformConfig]:
-        return QuantizeMXFP4MoETrtllmGenConfig
-
-    def _apply(
+    def _apply_trtllm(
         self,
         gm: GraphModule,
         cm,
         factory,
         shared_config,
     ) -> Tuple[GraphModule, TransformInfo]:
-        qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_method", "") != self.algo_name:
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+        """TRT-LLM-Gen backend: graph rewrite + CPU-side weight prep hook.
 
-        # MXFP4 + trtllm-gen modeling-side path: the modeling code already
-        # registers prepared-shape parameters and emits ``trtllm_mxfp4_w4a*``
-        # op calls in its forward, so there is no ``triton_mxfp4_moe`` graph
-        # node to retarget. Nothing to do.
-        if os.environ.get("AD_MXFP4_TRTLLM_GEN_MODELING", "1") == "1":
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+        Per MoE node:
 
-        # Local import: weight-prep helper from step 2.
-        from ...custom_ops.fused_moe.mxfp4_weight_prep import prepare_mxfp4_weights_for_trtllm_gen
+        1. Find ``torch_moe_dense_mlp`` + its upstream ``torch_moe_router``.
+        2. Look up the experts module that owns the bf16 placeholder params.
+        3. Compute prepared-shape MXFP4 params via
+           :func:`prepare_mxfp4_weights_for_trtllm` on shape-only zero
+           tensors (so ``init_empty_weights`` / meta-device context is
+           preserved). Register them on the experts module:
+           ``fc1_w_trtllm`` / ``fc1_w_scale_trtllm`` / ``fc1_bias_trtllm`` /
+           ``fc2_*`` + SwiGLU constants. Tag the experts module with
+           ``_dtype_protected_params`` so ``model.to(dtype)`` doesn't
+           corrupt the uint8 / fp32 dtypes.
+        4. Delete the bf16 placeholders (``gate_up_proj`` / ``down_proj``).
+        5. Rewrite the ``torch_moe_dense_mlp`` node to
+           ``trtllm_mxfp4_w4a{8,16}_moe_fused`` (selected by
+           ``config.trtllm_quant_act``).
+        6. If ``moe_tp_size > 1`` insert an ``auto_deploy.all_reduce`` node
+           after the downstream view (matches the modeling-side path).
 
-        # MoE-TP info (default: no TP) — read from runtime DistConfig.
+        Then once for the whole module:
+
+        7. Register a top-level ``load_state_dict`` pre-hook
+           (:func:`make_mxfp4_trtllm_load_hook`) that converts raw HF
+           MXFP4 state-dict entries into prepared values on CPU before
+           they reach ``param.copy_()``.
+        """
+        import re
+
+        from ...custom_ops.fused_moe.mxfp4_weight_prep import (
+            make_mxfp4_trtllm_load_hook,
+            make_swiglu_param_tensors,
+            prepare_mxfp4_weights_for_trtllm,
+        )
+
+        # MoE topology: prefer the build-time ``DistConfig`` set on
+        # ``shared_config`` (mirrors the legacy transform path). The
+        # ``_resolve_moe_dist_info`` analogue from modeling code lives in
+        # mxfp4_weight_prep.py as ``_get_default_dist_info``; here we trust
+        # the explicit shared_config first.
         dc = getattr(shared_config, "dist_config", None)
         moe_tp_size = int(getattr(dc, "moe_tp_size", 1)) if dc is not None else 1
         moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
+        moe_ep_size = int(getattr(dc, "moe_ep_size", 1)) if dc is not None else 1
+        moe_ep_rank = int(getattr(dc, "moe_ep_rank", 0)) if dc is not None else 0
         allreduce_strategy = (
             str(dc.allreduce_strategy) if dc is not None and moe_tp_size > 1 else "NCCL"
         )
 
+        # Pre-compute the same dist tuple for the load hook factory so it
+        # honours this transform's view of the MoE topology rather than
+        # falling back to ``_get_default_dist_info`` at hook-fire time.
+        def _hook_dist_info_fn():
+            return (moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank)
+
+        quant_act = self.config.trtllm_quant_act
+        if quant_act == "mxfp8":
+            target_op = torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused.default
+        else:
+            target_op = torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default
+
+        # Module-level info needed once for the load hook factory.
+        hidden_size_global: Optional[int] = None
+        intermediate_size_global: Optional[int] = None
+        num_experts_global: Optional[int] = None
+        layer_indices: list = []
+
+        layer_re = re.compile(r"\.layers\.(\d+)\.")
         num_matches = 0
 
         for n in list(gm.graph.nodes):
-            if not is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe):
+            if not is_op(n, torch.ops.auto_deploy.torch_moe_dense_mlp):
                 continue
-            # Step-3 V4 scope: skip the EP variant (covered by step 5).
-            if is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe_ep):
+            # Expect: torch_moe_dense_mlp(hidden, routing, gu_w, gu_b, dn_w, dn_b, alpha, limit)
+            if len(n.args) < 6:
                 continue
 
-            # triton_mxfp4_moe(
-            #   hidden, router_w, router_b, top_k,
-            #   gate_up_blocks, gate_up_bias, gate_up_scales,
-            #   alpha, limit,
-            #   down_blocks, down_bias, down_scales,
-            #   layer_type="moe")
-            args = n.args
-            if len(args) < 12:
+            hidden_node = n.args[0]
+            routing_node = n.args[1]
+            gate_up_w_node = n.args[2]
+            gate_up_b_node = n.args[3]
+            down_w_node = n.args[4]
+            down_b_node = n.args[5]
+
+            if not isinstance(routing_node, Node) or not is_op(
+                routing_node, torch.ops.auto_deploy.torch_moe_router
+            ):
                 continue
-            (
-                hidden_node,
-                router_w_node,
-                router_b_node,
-                top_k_arg,
-                gu_blocks_node,
-                gu_bias_node,
-                gu_scales_node,
-                _alpha,
-                _limit,
-                dn_blocks_node,
-                dn_bias_node,
-                dn_scales_node,
-            ) = args[:12]
+            if (
+                gate_up_w_node.op != "get_attr"
+                or gate_up_b_node.op != "get_attr"
+                or down_w_node.op != "get_attr"
+                or down_b_node.op != "get_attr"
+            ):
+                continue
 
-            # Resolve param names
-            for nm, nd in [
-                ("gu_blocks", gu_blocks_node),
-                ("gu_bias", gu_bias_node),
-                ("gu_scales", gu_scales_node),
-                ("dn_blocks", dn_blocks_node),
-                ("dn_bias", dn_bias_node),
-                ("dn_scales", dn_scales_node),
-            ]:
-                if not isinstance(nd, Node) or nd.op != "get_attr":
-                    raise ValueError(f"Expected {nm} arg to be a get_attr node, got {nd!r}")
+            router_weight_node = routing_node.args[1]
+            router_bias_node = routing_node.args[2]
+            top_k = _get_topk_from_router(routing_node)
 
-            # Fetch loaded tensors and run the prep
-            gu_blocks_t = gm.get_parameter(gu_blocks_node.target)
-            gu_bias_t = gm.get_parameter(gu_bias_node.target)
-            gu_scales_t = gm.get_parameter(gu_scales_node.target)
-            dn_blocks_t = gm.get_parameter(dn_blocks_node.target)
-            dn_bias_t = gm.get_parameter(dn_bias_node.target)
-            dn_scales_t = gm.get_parameter(dn_scales_node.target)
+            gu_w_name = gate_up_w_node.target
+            gu_b_name = gate_up_b_node.target
+            dn_w_name = down_w_node.target
+            dn_b_name = down_b_node.target
 
-            # Infer hidden / intermediate from down: [E, H, I/32, 16] or [E, H, I/2]
-            hidden_size = int(dn_blocks_t.shape[1])
-            two_i = int(gu_blocks_t.shape[1])
-            intermediate_size = two_i // 2
+            # Shapes from the bf16 placeholders (meta is fine — only .shape is read).
+            # gu_w shape: [E, H, 2I]; dn_w shape: [E, I, H] (we infer I from gu_w).
+            gu_w_t = gm.get_parameter(gu_w_name)
+            E_full = int(gu_w_t.shape[0])
+            H = int(gu_w_t.shape[1])
+            two_I = int(gu_w_t.shape[2])
+            i_size = two_I // 2
 
-            prep = prepare_mxfp4_weights_for_trtllm_gen(
-                gu_blocks_t,
-                gu_scales_t,
-                gu_bias_t,
-                dn_blocks_t,
-                dn_scales_t,
-                dn_bias_t,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
+            # Cross-layer consistency check (the load hook is registered once
+            # for the whole module, so all layers must share these).
+            if hidden_size_global is None:
+                hidden_size_global = H
+                intermediate_size_global = i_size
+                num_experts_global = E_full
+            else:
+                if (H, i_size, E_full) != (
+                    hidden_size_global,
+                    intermediate_size_global,
+                    num_experts_global,
+                ):
+                    raise ValueError(
+                        f"quantize_mxfp4_moe(backend=trtllm): inconsistent MoE shapes "
+                        f"across layers (got H={H}, I={i_size}, E={E_full}; previously "
+                        f"H={hidden_size_global}, I={intermediate_size_global}, "
+                        f"E={num_experts_global}). All MoE layers must share shape."
+                    )
+
+            if E_full % moe_ep_size != 0:
+                raise ValueError(
+                    f"num_experts ({E_full}) must be divisible by moe_ep_size ({moe_ep_size})"
+                )
+            e_local = E_full // moe_ep_size
+
+            # Locate the experts module via the gate_up param path.
+            experts_mod, experts_path, _ = get_submodule_of_param(gm, gu_w_name)
+
+            # Compute prepared shapes by running the prep helper on shape-only
+            # zero tensors (CPU). We only keep ``prep.<>.shape``/``.dtype`` --
+            # actual data is filled by the load hook at load time.
+            h_blk = max(1, H // 32)
+            i_blk = max(1, i_size // 32)
+            zero_kw = {"device": "cpu"}
+            prep = prepare_mxfp4_weights_for_trtllm(
+                torch.zeros((e_local, 2 * i_size, h_blk, 16), dtype=torch.uint8, **zero_kw),
+                torch.zeros((e_local, 2 * i_size, h_blk), dtype=torch.uint8, **zero_kw),
+                torch.zeros((e_local, 2 * i_size), dtype=torch.bfloat16, **zero_kw),
+                torch.zeros((e_local, H, i_blk, 16), dtype=torch.uint8, **zero_kw),
+                torch.zeros((e_local, H, i_blk), dtype=torch.uint8, **zero_kw),
+                torch.zeros((e_local, H), dtype=torch.bfloat16, **zero_kw),
+                hidden_size=H,
+                intermediate_size=i_size,
                 tp_size=moe_tp_size,
                 tp_rank=moe_tp_rank,
             )
 
-            # Locate the experts module that owned the original MXFP4 params,
-            # so we can register the new ones in the same place.
-            experts_mod, experts_path, _ = get_submodule_of_param(gm, gu_blocks_node.target)
             num_local_experts = int(prep.fc1_weights_mxfp4.shape[0])
+            local_expert_offset = moe_ep_rank * e_local
+            valid_hidden_size = int(prep.valid_hidden_size)
+            valid_intermediate_size = int(prep.valid_intermediate_size)
 
-            new_param_specs = [
-                ("fc1_w_trtllm_gen", prep.fc1_weights_mxfp4),
-                ("fc2_w_trtllm_gen", prep.fc2_weights_mxfp4),
-                ("fc1_w_scale_trtllm_gen", prep.fc1_weights_scale_ue8m0),
-                ("fc2_w_scale_trtllm_gen", prep.fc2_weights_scale_ue8m0),
-                ("fc1_bias_trtllm_gen", prep.fc1_bias_f32),
-                ("fc2_bias_trtllm_gen", prep.fc2_bias_f32),
+            # Register prepared-shape params (zero-init, meta-aware via
+            # ``torch.empty(shape, dtype=...)`` without ``device=``).
+            def _empty_like(t):
+                return torch.empty(t.shape, dtype=t.dtype)
+
+            prepared_specs = [
+                ("fc1_w_trtllm", prep.fc1_weights_mxfp4),
+                ("fc1_w_scale_trtllm", prep.fc1_weights_scale_ue8m0),
+                ("fc1_bias_trtllm", prep.fc1_bias_f32),
+                ("fc2_w_trtllm", prep.fc2_weights_mxfp4),
+                ("fc2_w_scale_trtllm", prep.fc2_weights_scale_ue8m0),
+                ("fc2_bias_trtllm", prep.fc2_bias_f32),
             ]
-            new_attr_paths = []
-            for short, tensor in new_param_specs:
+            for short, ref in prepared_specs:
                 experts_mod.register_parameter(
-                    short, nn.Parameter(tensor.contiguous(), requires_grad=False)
+                    short,
+                    nn.Parameter(_empty_like(ref), requires_grad=False),
                 )
-                new_attr_paths.append((experts_path + "." if experts_path else "") + short)
 
-            sa_short, sb_short, sl_short = (
-                "swiglu_alpha_trtllm_gen",
-                "swiglu_beta_trtllm_gen",
-                "swiglu_limit_trtllm_gen",
+            a, b, c = make_swiglu_param_tensors(num_local_experts)
+            experts_mod.register_parameter(
+                "swiglu_alpha_trtllm", nn.Parameter(a, requires_grad=False)
             )
             experts_mod.register_parameter(
-                sa_short, _make_swiglu_param(num_local_experts, _GPTOSS_GLU_ALPHA)
+                "swiglu_beta_trtllm", nn.Parameter(b, requires_grad=False)
             )
             experts_mod.register_parameter(
-                sb_short, _make_swiglu_param(num_local_experts, _GPTOSS_GLU_BETA)
+                "swiglu_limit_trtllm", nn.Parameter(c, requires_grad=False)
             )
-            experts_mod.register_parameter(
-                sl_short, _make_swiglu_param(num_local_experts, _GPTOSS_GLU_LIMIT)
-            )
-            sa_path = (experts_path + "." if experts_path else "") + sa_short
-            sb_path = (experts_path + "." if experts_path else "") + sb_short
-            sl_path = (experts_path + "." if experts_path else "") + sl_short
 
-            # Build get_attr nodes for the new params.
+            # Tell ``GptOssExperts._apply`` (and any analogous override) which
+            # params must keep their kernel-required dtype across ``.to(dtype)``
+            # walks. Generic mechanism: any module that inspects this attribute
+            # can opt into dtype protection without hard-coding names.
+            experts_mod._dtype_protected_params = tuple(name for name, _ in prepared_specs) + (
+                "swiglu_alpha_trtllm",
+                "swiglu_beta_trtllm",
+                "swiglu_limit_trtllm",
+            )
+
+            # Track layer index so the load hook iterates the right range.
+            m = layer_re.search(experts_path or "")
+            if m:
+                layer_indices.append(int(m.group(1)))
+
+            # Build get_attr nodes for the new prepared params.
+            prefix_path = (experts_path + ".") if experts_path else ""
             with gm.graph.inserting_before(n):
-                attr_nodes = [gm.graph.create_node("get_attr", p) for p in new_attr_paths]
-                sa_node = gm.graph.create_node("get_attr", sa_path)
-                sb_node = gm.graph.create_node("get_attr", sb_path)
-                sl_node = gm.graph.create_node("get_attr", sl_path)
-            (fc1_w_n, fc2_w_n, fc1_s_n, fc2_s_n, fc1_b_n, fc2_b_n) = attr_nodes
+                fc1_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_trtllm")
+                fc2_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_trtllm")
+                fc1_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_scale_trtllm")
+                fc2_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_scale_trtllm")
+                fc1_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_bias_trtllm")
+                fc2_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_bias_trtllm")
+                sa_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_alpha_trtllm")
+                sb_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_beta_trtllm")
+                sl_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_limit_trtllm")
 
-            # Rewrite the op call. Op target is selected by self.config.quant_act:
-            #   - "bf16"  -> trtllm_mxfp4_w4a16_moe_fused (bf16 input act)
-            #   - "mxfp8" -> trtllm_mxfp4_w4a8_moe_fused  (MXFP8 input act)
-            # Both ops accept identical args; only the runtime kernel differs.
-            if self.config.quant_act == "mxfp8":
-                n.target = torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused.default
-            else:
-                n.target = torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default
+            # Rewrite the op call. Op target is chosen by ``trtllm_quant_act``.
+            #   - "bf16"  -> trtllm_mxfp4_w4a16_moe_fused (bf16 input)
+            #   - "mxfp8" -> trtllm_mxfp4_w4a8_moe_fused  (MXFP8 input)
+            n.target = target_op
             n.kwargs = {}
             n.args = (
                 hidden_node,
-                router_w_node,
-                router_b_node,
-                int(top_k_arg),
-                fc1_w_n,
-                fc2_w_n,
-                fc1_s_n,
-                fc2_s_n,
-                fc1_b_n,
-                fc2_b_n,
-                sa_node,
-                sb_node,
-                sl_node,
-                int(prep.valid_hidden_size),
-                int(prep.valid_intermediate_size),
-                0,  # local_expert_offset
+                router_weight_node,
+                router_bias_node,
+                int(top_k),
+                fc1_w_attr,
+                fc2_w_attr,
+                fc1_s_attr,
+                fc2_s_attr,
+                fc1_b_attr,
+                fc2_b_attr,
+                sa_attr,
+                sb_attr,
+                sl_attr,
+                valid_hidden_size,
+                valid_intermediate_size,
+                local_expert_offset,
                 num_local_experts,
                 1,  # routing_method_type = RoutingMethodType.Renormalize
             )
 
-            # MoE-TP: insert an all_reduce so partial ``[..., hidden]``
-            # outputs from each rank sum to the full hidden output before
-            # the residual add.  The ``fc2_bias`` was already divided by
-            # ``tp_size`` inside the prep helper, so the post-AR sum
-            # reproduces the unsharded bias.
-            #
-            # Placement: insert AR *after* the immediately-following
-            # ``aten.view`` (if any) rather than directly after the MoE
-            # op.  The downstream sequence is ``MoE → view → add → norm``
-            # and ``fuse_allreduce_residual_rmsnorm`` matches
-            # ``AR → add → norm`` only when AR is the immediate
-            # predecessor of ``add``.  Inserting AR after the view
-            # gives ``MoE → view → AR → add → norm`` so the fusion
-            # matcher catches all 36 post-MoE ARs (instead of 0/36 in
-            # the legacy ``MoE → AR → view → add → norm`` ordering,
-            # which matched only post-attn ARs).  Numerically
-            # equivalent: ``view`` is a free reshape and AR is
-            # element-wise across ranks.  See cc_reports §5.1 O1.
+            # MoE-TP: insert an all_reduce after the downstream view so the
+            # ``MoE -> view -> AR -> add -> norm`` ordering matches
+            # ``fuse_allreduce_residual_rmsnorm`` (see legacy transform's
+            # rationale for the same placement).
             if moe_tp_size > 1:
                 from .sharding import _get_dist_ops
 
@@ -661,27 +741,63 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
                     anchor.replace_all_uses_with(red)
                     red.replace_input_with(red, anchor)
 
-            # Free original MXFP4 params + erase their get_attr nodes.
-            for old_node in [
-                gu_blocks_node,
-                gu_bias_node,
-                gu_scales_node,
-                dn_blocks_node,
-                dn_bias_node,
-                dn_scales_node,
-            ]:
-                old_name = old_node.target
-                owner_mod, _path, attr_short = get_submodule_of_param(gm, old_name)
+            # Erase old router node + stale bf16 get_attr nodes if unused.
+            if len(routing_node.users) == 0:
+                gm.graph.erase_node(routing_node)
+            for stale_node in (
+                gate_up_w_node,
+                gate_up_b_node,
+                down_w_node,
+                down_b_node,
+            ):
+                if len(stale_node.users) == 0:
+                    gm.graph.erase_node(stale_node)
+
+            # Free bf16 placeholders from the experts module so they don't
+            # linger as orphaned attributes (and don't get loaded from HF
+            # via the standard load_state_dict path).
+            for stale_name in (gu_w_name, gu_b_name, dn_w_name, dn_b_name):
+                owner_mod, _path, attr_short = get_submodule_of_param(gm, stale_name)
                 _delete_module_attr(owner_mod, attr_short)
-                if len(old_node.users) == 0:
-                    gm.graph.erase_node(old_node)
 
             num_matches += 1
+
+        # Register top-level load hook once for the whole module so the
+        # raw HF MXFP4 state_dict entries are converted to prepared layout
+        # BEFORE ``param.copy_()`` -- avoids the legacy POST_LOAD_FUSION
+        # raw/prepared double-allocation cycle.
+        if num_matches > 0:
+            assert hidden_size_global is not None  # for type checker
+            num_layers = (max(layer_indices) + 1) if layer_indices else num_matches
+            gm._register_load_state_dict_pre_hook(
+                make_mxfp4_trtllm_load_hook(
+                    num_layers=num_layers,
+                    hidden_size=hidden_size_global,
+                    intermediate_size=intermediate_size_global,
+                    num_experts=num_experts_global,
+                    dist_info_fn=_hook_dist_info_fn,
+                )
+            )
+            ad_logger.info(
+                f"quantize_mxfp4_moe (backend=trtllm, quant_act={quant_act}): "
+                f"rewrote {num_matches} MoE node(s); registered load hook for "
+                f"{num_layers} layer slots."
+            )
 
         info = TransformInfo(
             skipped=(num_matches == 0),
             num_matches=num_matches,
-            is_clean=num_matches == 0,
-            has_valid_shapes=num_matches == 0,
+            is_clean=(num_matches == 0),
+            has_valid_shapes=(num_matches == 0),
         )
         return gm, info
+
+
+def _delete_module_attr(module: nn.Module, name: str) -> None:
+    """Remove a parameter/buffer/attr from a Module if present."""
+    if name in module._parameters:
+        del module._parameters[name]
+    elif name in module._buffers:
+        del module._buffers[name]
+    elif hasattr(module, name):
+        delattr(module, name)

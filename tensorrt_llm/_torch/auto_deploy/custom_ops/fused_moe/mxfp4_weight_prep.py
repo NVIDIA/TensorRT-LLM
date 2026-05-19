@@ -76,7 +76,7 @@ _EPILOGUE_TILE_M: int = 128
 
 @dataclass(frozen=True)
 class PreparedMXFP4Weights:
-    """Output of :func:`prepare_mxfp4_weights_for_trtllm_gen`."""
+    """Output of :func:`prepare_mxfp4_weights_for_trtllm`."""
 
     fc1_weights_mxfp4: torch.Tensor  # [E, 2I_pad, H_pad/2]  uint8 (shuffled)
     fc1_weights_scale_ue8m0: torch.Tensor  # [E, 2I_pad, H_pad/32] uint8 (shuffled)
@@ -214,7 +214,7 @@ def _shuffle_per_expert_bias_w2(stacked: torch.Tensor) -> torch.Tensor:
     return torch.stack(out, dim=0).contiguous()
 
 
-def prepare_mxfp4_weights_for_trtllm_gen(
+def prepare_mxfp4_weights_for_trtllm(
     gate_up_blocks: torch.Tensor,  # [E, 2I, H/32, 16]  or  [E, 2I, H/2]   uint8
     gate_up_scales: torch.Tensor,  # [E, 2I, H/32]                         uint8
     gate_up_bias: torch.Tensor,  # [E, 2I]                               bf16
@@ -539,7 +539,7 @@ def make_swiglu_param_tensors(
 # Motivation: the previous flow allocated raw HF MXFP4 expert weights
 # (gate_up_proj_blocks / _scales / _bias and down_proj_blocks / _scales /
 # _bias) on each experts module, then a post-load transform read those raw
-# tensors, ran ``prepare_mxfp4_weights_for_trtllm_gen``, registered NEW
+# tensors, ran ``prepare_mxfp4_weights_for_trtllm``, registered NEW
 # prepared-shape parameters (fc1_weights_mxfp4 etc.), retargeted the FX op,
 # and deleted the raw parameters. Peak memory included both raw + prepared
 # tensors briefly (~150 GB on gpt-oss-120b 128 experts × 36 layers).
@@ -571,7 +571,7 @@ def _get_default_dist_info() -> Tuple[int, int, int, int]:
     return 1, 0, 1, 0
 
 
-def make_mxfp4_trtllm_gen_load_hook(
+def make_mxfp4_trtllm_load_hook(
     *,
     num_layers: int,
     hidden_size: int,
@@ -593,17 +593,17 @@ def make_mxfp4_trtllm_gen_load_hook(
     1. Selects this rank's expert subset on the leading axis using
        ``moe_ep_size`` / ``moe_ep_rank`` from ``dist_info_fn``. When
        ``moe_ep_size == 1`` the full expert set is kept.
-    2. Calls :func:`prepare_mxfp4_weights_for_trtllm_gen` on the
+    2. Calls :func:`prepare_mxfp4_weights_for_trtllm` on the
        EP-sliced tensors with ``tp_size=moe_tp_size`` / ``tp_rank=moe_tp_rank``
        to apply intermediate-axis TP slicing + the trtllm-gen layout
        transforms.
     3. Pops the six raw keys (``gate_up_proj_{blocks,scales,bias}``,
        ``down_proj_{blocks,scales,bias}``) from the state dict.
-    4. Inserts the six prepared keys (``fc1_w_trtllm_gen``,
-       ``fc1_w_scale_trtllm_gen``, ``fc1_bias_trtllm_gen``,
-       ``fc2_w_trtllm_gen``, ``fc2_w_scale_trtllm_gen``,
-       ``fc2_bias_trtllm_gen``) at the same experts subpath, plus the three
-       SwiGLU constants (``swiglu_alpha_trtllm_gen`` / beta / limit).
+    4. Inserts the six prepared keys (``fc1_w_trtllm``,
+       ``fc1_w_scale_trtllm``, ``fc1_bias_trtllm``,
+       ``fc2_w_trtllm``, ``fc2_w_scale_trtllm``,
+       ``fc2_bias_trtllm``) at the same experts subpath, plus the three
+       SwiGLU constants (``swiglu_alpha_trtllm`` / beta / limit).
 
     Args:
         num_layers: number of decoder layers to scan.
@@ -633,16 +633,16 @@ def make_mxfp4_trtllm_gen_load_hook(
         "down_proj_scales",
         "down_proj_bias",
     )
-    # Names match those registered by ``quantize_mxfp4_moe_trtllm_gen`` so
-    # state_dict load resolves to the prepared-shape parameters allocated by
-    # the transform.
+    # Names match those registered by ``quantize_mxfp4_moe`` (backend=trtllm)
+    # so the standard state_dict load path resolves to the prepared-shape
+    # parameters that the transform allocated at PATTERN_MATCHER time.
     _PREPARED_SUFFIXES = (
-        "fc1_w_trtllm_gen",
-        "fc1_w_scale_trtllm_gen",
-        "fc1_bias_trtllm_gen",
-        "fc2_w_trtllm_gen",
-        "fc2_w_scale_trtllm_gen",
-        "fc2_bias_trtllm_gen",
+        "fc1_w_trtllm",
+        "fc1_w_scale_trtllm",
+        "fc1_bias_trtllm",
+        "fc2_w_trtllm",
+        "fc2_w_scale_trtllm",
+        "fc2_bias_trtllm",
     )
     # SwiGLU constants. These are NOT in HF safetensors, but the modeling code
     # registers them as parameters expected by the trtllm-gen op call. Under
@@ -652,9 +652,9 @@ def make_mxfp4_trtllm_gen_load_hook(
     # correctly. Constants match gpt-oss config (alpha=1.702, beta=1.0,
     # limit=7.0).
     _SWIGLU_SUFFIXES = (
-        ("swiglu_alpha_trtllm_gen", 1.702),
-        ("swiglu_beta_trtllm_gen", 1.0),
-        ("swiglu_limit_trtllm_gen", 7.0),
+        ("swiglu_alpha_trtllm", 1.702),
+        ("swiglu_beta_trtllm", 1.0),
+        ("swiglu_limit_trtllm", 7.0),
     )
 
     def hook(state_dict, prefix, *args, local_metadata=None, **kwargs):
@@ -714,7 +714,7 @@ def make_mxfp4_trtllm_gen_load_hook(
             dn_scales = state_dict[dn_scales_key][ep_start:ep_stop]
             dn_bias = state_dict[dn_bias_key][ep_start:ep_stop]
 
-            prepared = prepare_mxfp4_weights_for_trtllm_gen(
+            prepared = prepare_mxfp4_weights_for_trtllm(
                 gu_blocks,
                 gu_scales,
                 gu_bias,
