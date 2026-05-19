@@ -32,15 +32,50 @@ aggregate them into a single timeline.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import signal
 import sys
 import time
+import types
 from typing import Any
 
 # Stubs live in the same package as this script.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.insert(0, _REPO_ROOT)
+
+
+def _load_ep_group_health() -> Any:
+    """Load EPGroupHealth without triggering the broken tensorrt_llm package init.
+
+    The full ``tensorrt_llm`` package init pulls in ``transformers`` symbols
+    that don't exist in this dev environment (see audit notes); a clean
+    ``from tensorrt_llm... import EPGroupHealth`` blows up before we ever
+    reach EPGroupHealth. Workaround: load the single module file by absolute
+    path and stub the package chain.
+    """
+    src = os.path.join(_REPO_ROOT, "tensorrt_llm/_torch/modules/fused_moe/ep_group_health.py")
+    spec = importlib.util.spec_from_file_location("_loaded_ep_group_health", src)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    for name in (
+        "tensorrt_llm",
+        "tensorrt_llm._torch",
+        "tensorrt_llm._torch.modules",
+        "tensorrt_llm._torch.modules.fused_moe",
+    ):
+        if name not in sys.modules:
+            pkg = types.ModuleType(name)
+            pkg.__path__ = []  # type: ignore[attr-defined]
+            sys.modules[name] = pkg
+    sys.modules["tensorrt_llm._torch.modules.fused_moe.ep_group_health"] = module
+    return module
+
+
+_egh = _load_ep_group_health()
+EPGroupHealth = _egh.EPGroupHealth
 
 from prototypes.wide_ep_ft_mvp.stubs.alltoall_watchdog import (  # noqa: E402
     AlltoAllWatchdog,
@@ -58,37 +93,9 @@ from prototypes.wide_ep_ft_mvp.stubs.mpi_ft_subcomm import MpiFtSubcommStub  # n
 from prototypes.wide_ep_ft_mvp.stubs.nccl_async_error_monitor import (  # noqa: E402
     configure_nccl_async_error_handling,
 )
-from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth  # noqa: E402
-
-# -------------------------------------------------------------------------
-# Pseudo completion-flag table
-# -------------------------------------------------------------------------
-#
-# In production this is MNNVL fabric memory shared across all ranks. The
-# prototype substitutes a per-rank monotonic counter advanced once per
-# iteration; the watchdog reads its peers' counters via MPI Allgather. A
-# rank that's been SIGKILL'd stops advancing its counter; the watchdog sees
-# no progress for ``timeout_sec`` and presumes it dead.
-
-
-class _PseudoCompletionFlagTable:
-    """A per-rank monotonic counter, exchanged via MPI Allgather."""
-
-    def __init__(self, ep_size: int, local_rank: int, comm: Any) -> None:
-        self._ep_size = ep_size
-        self._local_rank = local_rank
-        self._comm = comm
-        self._local_value = 0
-
-    def advance(self) -> None:
-        self._local_value += 1
-
-    def snapshot(self) -> list[int]:
-        from mpi4py import MPI  # noqa: F401  (sanity check that mpi4py is loaded)
-
-        gathered = self._comm.allgather(self._local_value)
-        return [int(v) for v in gathered]
-
+from prototypes.wide_ep_ft_mvp.stubs.shm_completion_flags import (  # noqa: E402
+    ShmCompletionFlagTable,
+)
 
 # -------------------------------------------------------------------------
 # Event log (one JSON line per event)
@@ -136,6 +143,12 @@ def main() -> int:
         default=2,
         help="Number of layers to register with the EPLB stub (1-2 per spec)",
     )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        required=True,
+        help="Unique per-run identifier for the shared-memory completion-flag dir",
+    )
     args = parser.parse_args()
 
     configure_nccl_async_error_handling()
@@ -151,7 +164,11 @@ def main() -> int:
     _emit(local_rank, "worker_start", pid=pid, ep_size=ep_size)
 
     health = EPGroupHealth(ep_size)
-    flags = _PseudoCompletionFlagTable(ep_size, local_rank, comm)
+    flags = ShmCompletionFlagTable(ep_size, local_rank, run_id=args.run_id)
+    # Barrier so every rank has created its counter file before any watchdog
+    # opens its peers' files (otherwise a fast rank could mmap a not-yet-
+    # created peer file and get an empty/garbage view).
+    comm.Barrier()
     eplb = EplbSlotRemapStub(ep_size)
     for layer_idx in range(args.num_layers):
         slot_to_rank = list(range(ep_size))  # one slot per rank, identity mapping
@@ -224,9 +241,18 @@ def main() -> int:
     finally:
         broadcast.stop()
         watchdog.stop()
+        flags.close()
 
     _emit(local_rank, "loop_end", final_active_count=health.get_active_count())
-    return 0
+    # Bypass mpi4py's atexit (which would call MPI_Finalize — a collective
+    # that hangs forever because the dead victim cannot participate). This is
+    # exactly the audit-1a Day 2 F4 finding ("survivors hang in their next
+    # collective") manifesting at process-shutdown time. Production: PR 1d.0
+    # + 1c.3 will install a coordinated shutdown path that detects the
+    # poisoned world and skips MPI_Finalize.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

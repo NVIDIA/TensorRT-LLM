@@ -55,7 +55,7 @@ def _find_mpirun() -> str:
     return mpirun
 
 
-def _build_argv(args: argparse.Namespace, worker_path: str) -> list[str]:
+def _build_argv(args: argparse.Namespace, worker_path: str, run_id: str) -> list[str]:
     """Construct the mpirun command line.
 
     Per audit-1a Day 2 finding (and the prototype plan §3): without
@@ -78,6 +78,8 @@ def _build_argv(args: argparse.Namespace, worker_path: str) -> list[str]:
         str(args.iterations),
         "--iter-sleep-sec",
         str(args.iter_sleep_sec),
+        "--run-id",
+        run_id,
     ]
 
 
@@ -113,7 +115,15 @@ def main() -> int:
         "--kill-after-iter",
         type=int,
         default=3,
-        help="SIGKILL the victim after their N-th heartbeat (which fires every 20 iter)",
+        help="SIGKILL the victim after their N-th heartbeat (every 20 iter); "
+        "ignored if --kill-at-iteration is set",
+    )
+    parser.add_argument(
+        "--kill-at-iteration",
+        type=int,
+        default=None,
+        help="SIGKILL the victim once it reaches exactly iteration N (deterministic; "
+        "preferred over --kill-after-iter for reproducible measurements)",
     )
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--iter-sleep-sec", type=float, default=0.05)
@@ -144,7 +154,8 @@ def main() -> int:
         )
 
     worker_path = os.path.join(os.path.dirname(__file__), "kill_and_survive_worker.py")
-    cmd = _build_argv(args, worker_path)
+    run_id = f"pid{os.getpid()}-{int(time.time())}"
+    cmd = _build_argv(args, worker_path, run_id)
 
     print(f"$ {' '.join(cmd)}", file=sys.stderr)
     proc = subprocess.Popen(
@@ -159,12 +170,28 @@ def main() -> int:
     raw_events: list[dict[str, Any]] = []
     pid_by_rank: dict[int, int] = {}
     loop_start_by_rank: dict[int, float] = {}
+    victim_iter: int = 0
     watchdog_fired_at: Optional[tuple[int, float]] = None  # (discoverer, monotonic_sec)
     propagated_to: set[int] = set()
     reconfigure_done_at: dict[int, float] = {}
     first_post_reconfigure_iter_at: dict[int, float] = {}
     kill_at_monotonic: Optional[float] = None
     killed = False
+
+    def _maybe_kill_victim() -> None:
+        nonlocal kill_at_monotonic, killed
+        if killed:
+            return
+        victim_pid = pid_by_rank.get(args.victim_rank)
+        if victim_pid is None:
+            return
+        kill_at_monotonic = time.monotonic()
+        os.kill(victim_pid, signal.SIGKILL)
+        killed = True
+        sys.stderr.write(
+            f"[driver] SIGKILL pid={victim_pid} (rank={args.victim_rank}) at "
+            f"victim_iteration={victim_iter}\n"
+        )
 
     assert proc.stdout is not None
     try:
@@ -183,20 +210,13 @@ def main() -> int:
                 pid_by_rank[rank] = int(evt["pid"])
             elif etype == "loop_start":
                 loop_start_by_rank[rank] = float(wt)
-                # Inject the SIGKILL once enough iterations have run on the
-                # victim. The worker emits heartbeats every 20 iterations;
-                # we kill after its (kill_after_iter)-th heartbeat to make
-                # the kill point reproducible across runs.
             elif etype == "heartbeat" and rank == args.victim_rank and not killed:
-                if int(evt.get("iteration", 0)) >= args.kill_after_iter * 20:
-                    victim_pid = pid_by_rank.get(args.victim_rank)
-                    if victim_pid is not None:
-                        kill_at_monotonic = time.monotonic()
-                        os.kill(victim_pid, signal.SIGKILL)
-                        killed = True
-                        sys.stderr.write(
-                            f"[driver] SIGKILL pid={victim_pid} (rank={args.victim_rank})\n"
-                        )
+                victim_iter = int(evt.get("iteration", 0))
+                if args.kill_at_iteration is not None:
+                    if victim_iter >= args.kill_at_iteration:
+                        _maybe_kill_victim()
+                elif victim_iter >= args.kill_after_iter * 20:
+                    _maybe_kill_victim()
             elif etype == "watchdog_marked_failed":
                 if watchdog_fired_at is None:
                     watchdog_fired_at = (rank, float(wt))
@@ -248,6 +268,7 @@ def main() -> int:
 
     timeline = {
         "config": vars(args),
+        "run_id": run_id,
         "events": {
             "t_kill": _rel(kill_at_monotonic),
             "t_watchdog_fires": _rel(watchdog_fired_at[1] if watchdog_fired_at else None),
@@ -259,7 +280,19 @@ def main() -> int:
         "raw_events": raw_events,
         "exit_codes": {"mpirun": rc},
         "victim_rank": args.victim_rank,
+        "victim_iteration_at_kill": victim_iter,
     }
+
+    # Clean up the shared-mem counter files left behind by the workers.
+    try:
+        sys.path.insert(
+            0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        )
+        from prototypes.wide_ep_ft_mvp.stubs.shm_completion_flags import ShmCompletionFlagTable
+
+        ShmCompletionFlagTable.cleanup_run(run_id)
+    except Exception as e:  # noqa: BLE001 — best-effort cleanup
+        sys.stderr.write(f"[driver] shm cleanup warning: {e}\n")
 
     if args.output:
         os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
