@@ -299,7 +299,7 @@ class ModelConfig(Generic[TConfig]):
         is_fp8_block_scales = quant_algo in (QuantAlgo.FP8_BLOCK_SCALES,
                                              "FP8_BLOCK_SCALES")
         if is_fp8_block_scales and is_sm_100f():
-            return "DEEPGEMM"
+            return "TRTLLM"
 
         return "CUTLASS"
 
