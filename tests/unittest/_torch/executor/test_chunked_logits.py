@@ -5,10 +5,25 @@ This module tests the chunked logits storage system that provides memory-efficie
 logits handling through device-side fragments and batched host transfers.
 """
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest, LlmResult,
                                                         LogitsStorage, PyResult)
 from tensorrt_llm.bindings import SamplingConfig
 
@@ -107,6 +122,38 @@ class TestPyResult:
         assert result._generation_logits is not None
         assert result._log_probs is not None
         assert result._mm_embeddings is None
+
+    def test_multimodal_shared_handles_keep_source_tensors_alive(self):
+        """Test PyResult retains tensors backing multimodal shared handles"""
+        result = PyResult(prompt_len=5, max_new_tokens=10)
+        mm_embeddings = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+
+        result.append_mm_embeddings(mm_embeddings, [2, 4])
+
+        assert result._mm_embedding_tensors is not None
+        assert len(result._mm_embedding_tensors) == 2
+        assert torch.equal(result._mm_embedding_tensors[0], mm_embeddings[:2])
+        assert torch.equal(result._mm_embedding_tensors[1], mm_embeddings[2:])
+        assert result.mm_embedding_handles == result.diff.mm_embeddings
+        assert result.mm_embedding_tensors == result._mm_embedding_tensors
+        llm_result = LlmResult(result=object(), py_result=result)
+        assert llm_result.mm_embedding_tensors is result.mm_embedding_tensors
+
+    def test_mrope_shared_handles_keep_source_tensors_alive(self):
+        """Test PyResult retains tensors backing mRoPE shared handles"""
+        result = PyResult(prompt_len=5, max_new_tokens=10)
+        position_ids = torch.arange(6, dtype=torch.int32).reshape(3, 1, 2)
+        position_deltas = torch.tensor([[3]], dtype=torch.int32)
+
+        result.set_mrope_position(position_ids, position_deltas)
+
+        assert result._mrope_position_tensors == (position_ids, position_deltas)
+        assert result.mrope_position_ids_handle == result.diff.mrope_position_ids
+        assert (result.mrope_position_deltas_handle ==
+                result.diff.mrope_position_deltas)
+        assert result.mrope_position_tensors == (position_ids, position_deltas)
+        llm_result = LlmResult(result=object(), py_result=result)
+        assert llm_result.mrope_position_tensors is result.mrope_position_tensors
 
     def test_append_logits_no_storage(self, sample_logits):
         """Test append methods when storage is not enabled"""

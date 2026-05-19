@@ -113,37 +113,6 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypat
     assert handoff.special_token_offsets == [0, 3, 4, 7]
 
 
-def test_nemotron_nano_vl_init_allows_disaggregated_context_role(monkeypatch):
-    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
-
-    fake_llm = SimpleNamespace(config=SimpleNamespace())
-
-    def init_pretrained_model(self, config):
-        torch.nn.Module.__init__(self)
-        self.config = config
-
-    monkeypatch.setattr(
-        nemotron_nano.transformers.PreTrainedModel,
-        "__init__",
-        init_pretrained_model,
-    )
-    monkeypatch.setattr(
-        nemotron_nano.NemotronH_Nano_VL_V2,
-        "_update_config_for_quantization",
-        staticmethod(lambda llm_model_config: None),
-    )
-    monkeypatch.setattr(
-        nemotron_nano.AutoModelForCausalLM,
-        "from_config",
-        lambda llm_model_config: fake_llm,
-    )
-
-    model = NemotronH_Nano_VL_V2(_make_minimal_nano_model_config())
-
-    assert model.vision_encoder is None
-
-
 def test_nemotron_nano_loads_multimodal_encoder_on_disagg_context_role(monkeypatch):
     monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")

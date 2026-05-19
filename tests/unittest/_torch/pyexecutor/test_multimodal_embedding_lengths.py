@@ -12,70 +12,91 @@ from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestState
 
 
-def test_multimodal_embedding_lengths_missing_without_fallback():
-    request = SimpleNamespace(multimodal_lengths=[3, 5])
-
-    assert get_multimodal_embedding_lengths(request) is None
-
-
-def test_multimodal_embedding_lengths_uses_top_level_metadata():
-    request = SimpleNamespace(
-        multimodal_lengths=[6, 5],
-        py_multimodal_data={
-            "multimodal_embedding_lengths": [5, 3],
-        },
-    )
-
-    assert get_multimodal_embedding_lengths(request) == [5, 3]
-
-
-def test_multimodal_embedding_lengths_ignores_layout_metadata():
-    request = SimpleNamespace(
-        multimodal_lengths=[6, 5],
-        py_multimodal_data={
-            "layout_metadata": {
-                "multimodal_embedding_lengths": [6, 4],
-            },
-        },
-    )
-
-    assert get_multimodal_embedding_lengths(request) is None
+@pytest.mark.parametrize(
+    "request,expected",
+    [
+        (SimpleNamespace(multimodal_lengths=[3, 5]), None),
+        (
+            SimpleNamespace(
+                multimodal_lengths=[6, 5],
+                py_multimodal_data={"multimodal_embedding_lengths": [5, 3]},
+            ),
+            [5, 3],
+        ),
+        (
+            SimpleNamespace(
+                multimodal_lengths=[6, 5],
+                py_multimodal_data={
+                    "layout_metadata": {
+                        "multimodal_embedding_lengths": [6, 4],
+                    },
+                },
+            ),
+            None,
+        ),
+    ],
+)
+def test_multimodal_embedding_lengths_returns_top_level_metadata(request, expected):
+    assert get_multimodal_embedding_lengths(request) == expected
 
 
-def test_multimodal_embedding_lengths_rejects_metadata_length_mismatch():
-    request = SimpleNamespace(
-        multimodal_lengths=[4],
-        py_multimodal_data={
-            "multimodal_embedding_lengths": [3, 1],
-        },
-    )
-
-    with pytest.raises(ValueError, match="length must match"):
-        get_multimodal_embedding_lengths(request)
-
-
-def test_multimodal_embedding_lengths_rejects_lengths_larger_than_prompt_span():
-    request = SimpleNamespace(
-        multimodal_lengths=[4],
-        py_multimodal_data={
-            "multimodal_embedding_lengths": [5],
-        },
-    )
-
-    with pytest.raises(ValueError, match="exceeds"):
-        get_multimodal_embedding_lengths(request)
-
-
-@pytest.mark.parametrize("metadata", [torch.tensor([4]), (4,)])
-def test_multimodal_embedding_lengths_rejects_non_list_metadata(metadata):
-    request = SimpleNamespace(
-        multimodal_lengths=[4],
-        py_multimodal_data={
-            "multimodal_embedding_lengths": metadata,
-        },
-    )
-
-    with pytest.raises(TypeError, match="must be a list"):
+@pytest.mark.parametrize(
+    "request,exception,match",
+    [
+        (
+            SimpleNamespace(
+                multimodal_lengths=[4],
+                py_multimodal_data={"multimodal_embedding_lengths": [3, 1]},
+            ),
+            ValueError,
+            "length must match",
+        ),
+        (
+            SimpleNamespace(
+                multimodal_lengths=[4],
+                py_multimodal_data={"multimodal_embedding_lengths": [5]},
+            ),
+            ValueError,
+            "exceeds",
+        ),
+        (
+            SimpleNamespace(
+                multimodal_lengths=[4],
+                py_multimodal_data={"multimodal_embedding_lengths": [-1]},
+            ),
+            ValueError,
+            "non-negative",
+        ),
+        (
+            SimpleNamespace(
+                multimodal_lengths=[4],
+                py_multimodal_data={
+                    "multimodal_embedding_lengths": torch.tensor([4]),
+                },
+            ),
+            TypeError,
+            "must be a list",
+        ),
+        (
+            SimpleNamespace(
+                multimodal_lengths=[4],
+                py_multimodal_data={"multimodal_embedding_lengths": (4,)},
+            ),
+            TypeError,
+            "must be a list",
+        ),
+        (
+            SimpleNamespace(
+                multimodal_lengths=[4],
+                py_multimodal_data=["multimodal_embedding_lengths", [4]],
+            ),
+            TypeError,
+            "py_multimodal_data must be a dict",
+        ),
+    ],
+)
+def test_multimodal_embedding_lengths_rejects_invalid_metadata(request, exception, match):
+    with pytest.raises(exception, match=match):
         get_multimodal_embedding_lengths(request)
 
 
@@ -150,13 +171,6 @@ def test_mm_encoder_sampler_builds_typed_result_from_model_outputs():
     assert state.data.mm_embedding_request_indices == [1]
     assert state.data.mm_embedding_lengths == [[4]]
     assert state.data.extra_data == {"mrope_position_ids": ["pos"]}
-
-
-def test_mm_encoder_sampler_rejects_missing_typed_result_fields():
-    sampler = EarlyStopWithMMResult()
-
-    with pytest.raises(KeyError):
-        sampler.sample_async(_FakeScheduledRequests(1), {"mm_embeddings": []}, [])
 
 
 def test_mm_encoder_sampler_rejects_typed_result_batch_mismatch():

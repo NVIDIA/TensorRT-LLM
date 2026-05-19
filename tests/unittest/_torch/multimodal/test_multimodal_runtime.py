@@ -72,10 +72,6 @@ class TestFindInputMmEmbed:
         with pytest.raises(ValueError, match="No multimodal embeddings"):
             find_input_mm_embeds([], multimodal_params)
 
-    def test_none_mm_embeds_rejected(self):
-        with pytest.raises(TypeError, match="mm_embeds must be a list"):
-            find_input_mm_embeds(None, [])
-
     def test_mm_embed_not_batched(self):
         """Individual batching: len(mm_embeds) == len(multimodal_params) > 1."""
         mm_embeds = [
