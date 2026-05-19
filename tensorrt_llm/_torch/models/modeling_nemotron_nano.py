@@ -2611,6 +2611,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # to be the LLM-only config and no longer has vision_config /
         # sound_config / force_image_size / etc.
         mm_pretrained = self._mm_model_config.pretrained_config
+        # Normal worker and context worker own encoders. MM E/P prefill uses attached embeddings.
         is_multimodal_encoder_worker = not _is_mm_disagg() or is_disagg_context_role()
         if self.vision_encoder is None and is_multimodal_encoder_worker:
             self.vision_encoder = NanoV2VLVisionEncoder(self._mm_model_config).eval().to("cuda")
@@ -3118,6 +3119,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
             # Raw image/video/audio tensors: run local encoder.
             if raw_ctx_params:
+                # Decode-side prefill should receive handles, not raw payloads.
                 if _is_mm_disagg() and not is_disagg_context_role():
                     raise ValueError(
                         "Raw multimodal inputs require a local multimodal encoder on the "

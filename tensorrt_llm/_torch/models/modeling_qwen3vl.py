@@ -1112,6 +1112,8 @@ class Qwen3VLModelBase(PreTrainedModel):
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
+        self.mm_encoder = None
+        # Normal worker and context worker own encoder. MM E/P prefill uses attached embeddings.
         if not _is_mm_disagg() or is_disagg_context_role():
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
@@ -1247,7 +1249,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         )
         if len(mm_multimodal_params) > 0:
             # Raw image/video tensors: run local encoder.
-            if has_raw_image_or_video_data and hasattr(self, "mm_encoder"):
+            if has_raw_image_or_video_data and self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params,
@@ -1350,7 +1352,7 @@ class Qwen3VLModel(Qwen3VLModelBase):
         return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if hasattr(self, "mm_encoder"):
+        if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         weight_mapper = Qwen3VLHfWeightMapper()

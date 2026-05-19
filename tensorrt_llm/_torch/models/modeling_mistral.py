@@ -567,6 +567,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         model_config: ModelConfig[Mistral3Config],
     ):
+        # No MM E/P handoff here yet. Fail before partial model setup.
         if _is_mm_disagg():
             raise NotImplementedError(
                 "Mistral3VLM does not support disaggregated inference yet. Please unset "

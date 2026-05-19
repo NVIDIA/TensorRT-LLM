@@ -1077,6 +1077,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
+        # Normal worker owns encoder. MM E/P prefill worker gets attached embeddings.
         if not _is_mm_disagg():
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Qwen2VisionModelBase(
@@ -1193,7 +1194,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         mm_multimodal_params = self._get_requests_with_mm_data(
             multimodal_params)
         if len(mm_multimodal_params) > 0:
-            if not _is_mm_disagg():
+            # Local encoder present: raw pixels/videos become embeddings here.
+            if self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params)
@@ -1202,6 +1204,7 @@ class Qwen2VLModelBase(PreTrainedModel):
                     "Qwen2VLModel does not support disaggregated inference yet. Please unset "
                     f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
+            # E/P prefill: encoder already ran; use attached embeddings.
             else:
                 mm_embeds = get_attached_multimodal_embeddings(
                     mm_multimodal_params)
@@ -1272,7 +1275,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
-        if not _is_mm_disagg():
+        if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights, weight_mapper)
@@ -1400,7 +1403,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
         if isinstance(weight_mapper, Qwen2VLHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)
 
-        if not _is_mm_disagg():
+        if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights)
