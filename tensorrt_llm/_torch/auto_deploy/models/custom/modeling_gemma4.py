@@ -2297,7 +2297,6 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         return Gemma4ConditionalOutput(logits=outputs.logits)
 
 
-
 # ---------------------------------------------------------------------------
 # Gemma4 processor helpers
 # ---------------------------------------------------------------------------
