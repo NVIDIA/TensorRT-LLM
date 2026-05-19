@@ -425,19 +425,8 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # Parallel-draft modes (PARD, DFlash) size their per-request draft
-            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
-            # one slot per draft token the target will verify.  PARD still uses
-            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
-            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
-            # tokens_per_gen_step carries the per-algorithm width.
-            # Runtime draft length is updated each iteration when dynamic draft length is enabled; otherwise stays fixed.
-            if spec_config.spec_dec_mode.is_parallel_draft():
-                self.max_draft_len = self.max_total_draft_tokens
-                self.runtime_draft_len = self.max_total_draft_tokens
-            else:
-                self.max_draft_len = spec_config.max_draft_len
-                self.runtime_draft_len = spec_config.max_draft_len
+            self.max_draft_len = spec_config.max_draft_len
+            self.runtime_draft_len = spec_config.max_draft_len
 
         else:
             self.without_logits = False
