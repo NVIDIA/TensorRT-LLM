@@ -214,7 +214,7 @@ public:
             {
             case ConvSectionLayout::kXBC: return {dInner, ngDs, ngDs};
             case ConvSectionLayout::kQKV: return {ngDs, ngDs, dInner};
-            default: TLLM_THROW("Invalid conv section layout");
+            default: return {0, 0, 0};
             }
         }
 
