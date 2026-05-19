@@ -3942,7 +3942,18 @@ class PyExecutor:
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+            )
+            if llm_request is None:
+                # Slot allocation failed (e.g., all IndexMapper slots held by
+                # in-flight DISAGG_GENERATION_TRANS_IN_PROGRESS requests).
+                # Skip dummy insertion this iteration; this rank will then
+                # also skip forward, which other ranks tolerate when they
+                # detect a globally empty schedule.
+                logger.warning(
+                    "Skipping attention-DP dummy request: no free KV cache slot."
+                )
+                return
+            llm_request = llm_request[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
