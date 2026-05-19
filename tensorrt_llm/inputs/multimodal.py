@@ -29,6 +29,131 @@ _MULTIMODAL_RUN_METADATA_KEYS = (
 )
 
 
+def _validate_int_list(values: Any, field_name: str) -> None:
+    """Boundary metadata must be owned Python list[int]. No tensor/tuple."""
+    if not isinstance(values, list):
+        raise TypeError(f"{field_name} must be a list")
+    if not all(isinstance(value, int) for value in values):
+        raise TypeError(f"{field_name} must contain only integers")
+
+
+def _validate_multimodal_positions_and_lengths(
+    multimodal_positions: List[int],
+    multimodal_lengths: List[int],
+    expected_num_items: int,
+    expected_num_items_name: str,
+) -> None:
+    """Validate one prompt span per MM item.
+
+    expected_num_items is owner count: hashes for MultimodalInput,
+    embedding lengths for E/P handoff. Positions are prompt offsets. Lengths
+    are prompt token counts.
+    """
+    _validate_int_list(multimodal_positions, "multimodal_positions")
+    _validate_int_list(multimodal_lengths, "multimodal_lengths")
+
+    if len(multimodal_positions) != len(multimodal_lengths):
+        raise ValueError(f"Position and length arrays must match in size: "
+                         f"positions={len(multimodal_positions)}, "
+                         f"lengths={len(multimodal_lengths)}")
+    if len(multimodal_positions) != expected_num_items:
+        raise ValueError(
+            f"{expected_num_items_name}, multimodal_positions, and "
+            "multimodal_lengths must all have the same length")
+
+    if any(position < 0 for position in multimodal_positions):
+        raise ValueError("multimodal_positions must be non-negative")
+    if any(length <= 0 for length in multimodal_lengths):
+        raise ValueError("multimodal_lengths must be positive")
+
+
+def _validate_multimodal_runs(
+    num_items: int,
+    multimodal_lengths: List[int],
+    multimodal_item_run_cu_offsets: Optional[List[int]],
+    multimodal_run_positions: Optional[List[int]],
+    multimodal_run_lengths: Optional[List[int]],
+    item_count_name: str,
+) -> None:
+    """Validate exact runs when they are present.
+
+    Either no run fields, or all three. Offsets length is num_items + 1.
+    Runs for each item must sum to multimodal_lengths[i]. Values must fit
+    int32 for executor/KV-cache code.
+    """
+    run_fields = (
+        multimodal_item_run_cu_offsets,
+        multimodal_run_positions,
+        multimodal_run_lengths,
+    )
+    if all(field is None for field in run_fields):
+        return
+    if any(field is None for field in run_fields):
+        raise ValueError(
+            "multimodal_item_run_cu_offsets, multimodal_run_positions, "
+            "and multimodal_run_lengths must be provided together")
+
+    assert multimodal_item_run_cu_offsets is not None
+    assert multimodal_run_positions is not None
+    assert multimodal_run_lengths is not None
+
+    for field_name, values in (
+        ("multimodal_item_run_cu_offsets", multimodal_item_run_cu_offsets),
+        ("multimodal_run_positions", multimodal_run_positions),
+        ("multimodal_run_lengths", multimodal_run_lengths),
+    ):
+        _validate_int_list(values, field_name)
+        if any(value > _INT32_MAX for value in values):
+            raise ValueError(f"{field_name} values must fit in int32")
+
+    if len(multimodal_item_run_cu_offsets) != num_items + 1:
+        raise ValueError("multimodal_item_run_cu_offsets length must be "
+                         f"len({item_count_name}) + 1")
+    if multimodal_item_run_cu_offsets[0] != 0:
+        raise ValueError("multimodal_item_run_cu_offsets must start at 0")
+    if len(multimodal_run_positions) != len(multimodal_run_lengths):
+        raise ValueError(
+            "multimodal_run_positions and multimodal_run_lengths must "
+            "have the same length")
+    if multimodal_item_run_cu_offsets[-1] != len(multimodal_run_positions):
+        raise ValueError(
+            "multimodal_item_run_cu_offsets[-1] must equal the number of "
+            "flat multimodal runs")
+    if not all(multimodal_item_run_cu_offsets[i] <=
+               multimodal_item_run_cu_offsets[i + 1]
+               for i in range(len(multimodal_item_run_cu_offsets) - 1)):
+        raise ValueError(
+            "multimodal_item_run_cu_offsets must be non-decreasing")
+    if any(pos < 0 for pos in multimodal_run_positions):
+        raise ValueError("multimodal_run_positions must be non-negative")
+    if any(length <= 0 for length in multimodal_run_lengths):
+        raise ValueError("multimodal_run_lengths must be positive")
+    for run_idx, (position, length) in enumerate(
+            zip(multimodal_run_positions, multimodal_run_lengths)):
+        if position + length > _INT32_MAX:
+            raise ValueError(
+                f"multimodal run {run_idx} end position exceeds int32 "
+                f"range: position={position}, length={length}, "
+                f"max={_INT32_MAX}")
+
+    for item_idx, expected_length in enumerate(multimodal_lengths):
+        run_begin = multimodal_item_run_cu_offsets[item_idx]
+        run_end = multimodal_item_run_cu_offsets[item_idx + 1]
+        actual_length = sum(multimodal_run_lengths[run_begin:run_end])
+        if actual_length != expected_length:
+            raise ValueError(
+                f"multimodal run lengths for item {item_idx} sum to "
+                f"{actual_length}, expected {expected_length}")
+        item_positions = multimodal_run_positions[run_begin:run_end]
+        item_lengths = multimodal_run_lengths[run_begin:run_end]
+        for prev_pos, prev_len, pos in zip(item_positions, item_lengths,
+                                           item_positions[1:]):
+            if pos < prev_pos + prev_len:
+                raise ValueError(
+                    "multimodal runs must be ordered and non-overlapping "
+                    "within each item")
+
+
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     """Clear `mm_data` in place, retaining only `mrope_config.mrope_position_deltas`.
 
@@ -129,23 +254,12 @@ class MultimodalInput:
                 f"All hash arrays must have the same length, got lengths: {hash_lengths}"
             )
 
-        # Check that positions and lengths are valid
-        if not all(isinstance(x, int) for x in self.multimodal_positions):
-            raise TypeError("multimodal_positions must contain only integers")
-
-        if not all(isinstance(x, int) for x in self.multimodal_lengths):
-            raise TypeError("multimodal_lengths must contain only integers")
-
-        # Check position and length arrays match in size
-        if len(self.multimodal_positions) != len(self.multimodal_lengths):
-            raise ValueError(
-                f"Position and length arrays must match in size: "
-                f"positions={len(self.multimodal_positions)}, lengths={len(self.multimodal_lengths)}"
-            )
-        if len(self.multimodal_hashes) != len(self.multimodal_positions):
-            raise ValueError(
-                "multimodal_hashes, multimodal_positions, and multimodal_lengths "
-                "must all have the same length")
+        _validate_multimodal_positions_and_lengths(
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            len(self.multimodal_hashes),
+            "multimodal_hashes",
+        )
 
         # Validate multimodal_uuids if provided
         if self.multimodal_uuids is not None:
@@ -161,90 +275,14 @@ class MultimodalInput:
                         f"multimodal_uuids[{i}] must be a string or None, got {type(uuid)}"
                     )
 
-        self._validate_multimodal_runs()
-
-    def _validate_multimodal_runs(self) -> None:
-        run_fields = (
+        _validate_multimodal_runs(
+            len(self.multimodal_hashes),
+            self.multimodal_lengths,
             self.multimodal_item_run_cu_offsets,
             self.multimodal_run_positions,
             self.multimodal_run_lengths,
+            "multimodal_hashes",
         )
-        if all(field is None for field in run_fields):
-            return
-        if any(field is None for field in run_fields):
-            raise ValueError(
-                "multimodal_item_run_cu_offsets, multimodal_run_positions, "
-                "and multimodal_run_lengths must be provided together")
-
-        assert self.multimodal_item_run_cu_offsets is not None
-        assert self.multimodal_run_positions is not None
-        assert self.multimodal_run_lengths is not None
-
-        if len(self.multimodal_item_run_cu_offsets) != len(
-                self.multimodal_hashes) + 1:
-            raise ValueError("multimodal_item_run_cu_offsets length must be "
-                             "len(multimodal_hashes) + 1")
-        if self.multimodal_item_run_cu_offsets[0] != 0:
-            raise ValueError("multimodal_item_run_cu_offsets must start at 0")
-        if len(self.multimodal_run_positions) != len(
-                self.multimodal_run_lengths):
-            raise ValueError(
-                "multimodal_run_positions and multimodal_run_lengths must "
-                "have the same length")
-        if self.multimodal_item_run_cu_offsets[-1] != len(
-                self.multimodal_run_positions):
-            raise ValueError(
-                "multimodal_item_run_cu_offsets[-1] must equal the number of "
-                "flat multimodal runs")
-
-        for field_name, values in (
-            ("multimodal_item_run_cu_offsets",
-             self.multimodal_item_run_cu_offsets),
-            ("multimodal_run_positions", self.multimodal_run_positions),
-            ("multimodal_run_lengths", self.multimodal_run_lengths),
-        ):
-            if not isinstance(values, list):
-                raise TypeError(f"{field_name} must be a list")
-            if not all(isinstance(x, int) for x in values):
-                raise TypeError(f"{field_name} must contain only integers")
-            if any(value > _INT32_MAX for value in values):
-                raise ValueError(f"{field_name} values must fit in int32")
-
-        if not all(
-                self.multimodal_item_run_cu_offsets[i] <=
-                self.multimodal_item_run_cu_offsets[i + 1]
-                for i in range(len(self.multimodal_item_run_cu_offsets) - 1)):
-            raise ValueError(
-                "multimodal_item_run_cu_offsets must be non-decreasing")
-        if any(pos < 0 for pos in self.multimodal_run_positions):
-            raise ValueError("multimodal_run_positions must be non-negative")
-        if any(length <= 0 for length in self.multimodal_run_lengths):
-            raise ValueError("multimodal_run_lengths must be positive")
-        for run_idx, (position, length) in enumerate(
-                zip(self.multimodal_run_positions,
-                    self.multimodal_run_lengths)):
-            if position + length > _INT32_MAX:
-                raise ValueError(
-                    f"multimodal run {run_idx} end position exceeds int32 "
-                    f"range: position={position}, length={length}, "
-                    f"max={_INT32_MAX}")
-
-        for item_idx, expected_length in enumerate(self.multimodal_lengths):
-            run_begin = self.multimodal_item_run_cu_offsets[item_idx]
-            run_end = self.multimodal_item_run_cu_offsets[item_idx + 1]
-            actual_length = sum(self.multimodal_run_lengths[run_begin:run_end])
-            if actual_length != expected_length:
-                raise ValueError(
-                    f"multimodal run lengths for item {item_idx} sum to "
-                    f"{actual_length}, expected {expected_length}")
-            item_positions = self.multimodal_run_positions[run_begin:run_end]
-            item_lengths = self.multimodal_run_lengths[run_begin:run_end]
-            for prev_pos, prev_len, pos in zip(item_positions, item_lengths,
-                                               item_positions[1:]):
-                if pos < prev_pos + prev_len:
-                    raise ValueError(
-                        "multimodal runs must be ordered and non-overlapping "
-                        "within each item")
 
     @classmethod
     def from_components(
@@ -290,22 +328,66 @@ class MultimodalInput:
         return executor_module.MultimodalInput(**kwargs)
 
 
-def add_multimodal_run_metadata(
-        multimodal_data: Optional[Dict[str, Any]],
-        multimodal_input: Optional[MultimodalInput]
-) -> Optional[Dict[str, Any]]:
-    if multimodal_input is None:
-        return multimodal_data
+@dataclass
+class DisaggPrefillMultimodalInputs:
+    """Typed multimodal metadata returned by E/P disagg prefill processors."""
 
-    run_metadata = multimodal_input.run_metadata()
-    if not run_metadata:
-        return multimodal_data
+    prompt_token_ids: List[int]
+    multimodal_lengths: List[int]
+    multimodal_positions: List[int]
+    multimodal_embedding_lengths: List[int]
+    multimodal_item_run_cu_offsets: Optional[List[int]] = None
+    multimodal_run_positions: Optional[List[int]] = None
+    multimodal_run_lengths: Optional[List[int]] = None
+    special_token_offsets: Optional[List[int]] = None
+    item_types: Optional[List[int]] = None
 
-    if multimodal_data is None:
-        multimodal_data = {}
-    for key, value in run_metadata.items():
-        multimodal_data.setdefault(key, value)
-    return multimodal_data
+    def __post_init__(self) -> None:
+        _validate_int_list(self.prompt_token_ids, "prompt_token_ids")
+        _validate_int_list(self.multimodal_embedding_lengths,
+                           "multimodal_embedding_lengths")
+        _validate_multimodal_positions_and_lengths(
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            len(self.multimodal_embedding_lengths),
+            "multimodal_embedding_lengths",
+        )
+
+        if any(length <= 0 for length in self.multimodal_embedding_lengths):
+            raise ValueError("multimodal_embedding_lengths must be positive")
+
+        _validate_multimodal_runs(
+            len(self.multimodal_lengths),
+            self.multimodal_lengths,
+            self.multimodal_item_run_cu_offsets,
+            self.multimodal_run_positions,
+            self.multimodal_run_lengths,
+            "multimodal_lengths",
+        )
+        self._validate_optional_metadata()
+
+    def _validate_optional_metadata(self) -> None:
+        if self.special_token_offsets is not None:
+            _validate_int_list(self.special_token_offsets,
+                               "special_token_offsets")
+            if any(offset < 0 for offset in self.special_token_offsets):
+                raise ValueError("special_token_offsets must be non-negative")
+        if self.item_types is not None:
+            _validate_int_list(self.item_types, "item_types")
+            if len(self.item_types) != len(self.multimodal_lengths):
+                raise ValueError("item_types length must match "
+                                 "multimodal_lengths")
+
+    def to_multimodal_input(self,
+                            mm_hashes: List[List[int]]) -> MultimodalInput:
+        return MultimodalInput.from_components(
+            mm_hashes,
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            mm_item_run_cu_offsets=self.multimodal_item_run_cu_offsets,
+            mm_run_positions=self.multimodal_run_positions,
+            mm_run_lengths=self.multimodal_run_lengths,
+        )
 
 
 @dataclass
@@ -370,7 +452,6 @@ class MultimodalRuntimeData:
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
-    *_MULTIMODAL_RUN_METADATA_KEYS,
 })
 
 
@@ -942,7 +1023,6 @@ _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
-    *_MULTIMODAL_RUN_METADATA_KEYS,
     "special_token_offsets",
     "layout_metadata",
 })

@@ -84,12 +84,7 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
 from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
-from .llm_request import (
-    LlmRequest,
-    LlmRequestState,
-    get_draft_token_length,
-    get_multimodal_embedding_lengths,
-)
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
@@ -296,24 +291,43 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
 @dataclass(kw_only=True)
 class MultimodalResult:
     mm_embeddings: List[torch.Tensor]
+    mm_embedding_lengths: List[List[int]]
+    mm_embedding_request_indices: List[int]
     # Can be used to include e.g. `mrope_position_ids`, etc.
     extra_data: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if len(self.mm_embedding_lengths) != len(self.mm_embeddings):
+            raise ValueError("mm_embedding_lengths batch size does not match mm_embeddings")
+        if len(self.mm_embedding_request_indices) != len(self.mm_embeddings):
+            raise ValueError("mm_embedding_request_indices batch size does not match mm_embeddings")
+        for mm_embedding, mm_embedding_lengths in zip(
+            self.mm_embeddings, self.mm_embedding_lengths
+        ):
+            if len(mm_embedding) != sum(mm_embedding_lengths):
+                raise ValueError(
+                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(mm_embedding_lengths)}"
+                )
+
+    @classmethod
+    def from_model_outputs(
+        cls, model_outputs: Dict[str, Any], num_context_requests: int
+    ) -> "MultimodalResult":
+        result = cls(
+            mm_embeddings=model_outputs.pop("mm_embeddings"),
+            mm_embedding_lengths=model_outputs.pop("mm_embedding_lengths"),
+            mm_embedding_request_indices=model_outputs.pop("mm_embedding_request_indices"),
+            extra_data={**model_outputs},
+        )
+        for request_index in result.mm_embedding_request_indices:
+            if request_index < 0 or request_index >= num_context_requests:
+                raise ValueError("mm_embedding_request_indices contains an invalid request index")
+        return result
 
 
 @dataclass(kw_only=True)
 class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors]):
     data: MultimodalResult
-
-
-def _get_multimodal_embedding_lengths_for_request(
-    request: LlmRequest, extra_data: Dict[str, Any], request_index: int
-) -> Optional[List[int]]:
-    batch_lengths = extra_data.get("multimodal_embedding_lengths")
-    if batch_lengths is not None:
-        if request_index >= len(batch_lengths):
-            raise ValueError("multimodal_embedding_lengths batch size does not match mm_embeddings")
-        return [int(length) for length in batch_lengths[request_index]]
-    return get_multimodal_embedding_lengths(request)
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)
@@ -352,11 +366,10 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleState:
         # from model_outputs to MultimodalResult
-        data = MultimodalResult(
-            mm_embeddings=model_outputs.pop("mm_embeddings"),
-            extra_data={**model_outputs},
-        )
         assert not scheduled_requests.generation_requests
+        data = MultimodalResult.from_model_outputs(
+            model_outputs, scheduled_requests.num_context_requests
+        )
         return self.SampleState(requests=scheduled_requests.context_requests, data=data)
 
     @override
@@ -372,25 +385,24 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         extra_data = state.data.extra_data or {}
         mrope_position_ids = extra_data.get("mrope_position_ids", None)
         mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
-        for i, (request, mm_embedding) in enumerate(zip(requests, mm_embeddings)):
+        for request in requests:
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            multimodal_embedding_lengths = _get_multimodal_embedding_lengths_for_request(
-                request, extra_data, i
-            )
-            assert multimodal_embedding_lengths is not None
-            if len(mm_embedding) != sum(multimodal_embedding_lengths):
-                raise ValueError(
-                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(multimodal_embedding_lengths)}"
-                )
 
-            request.py_result.append_mm_embeddings(mm_embedding, multimodal_embedding_lengths)
+        request_indices = state.data.mm_embedding_request_indices
+        for result_index, (request_index, mm_embedding) in enumerate(
+            zip(request_indices, mm_embeddings)
+        ):
+            request = requests[request_index]
+            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
+
+            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
                 request.py_result.set_mrope_position(
-                    mrope_position_ids[i], mrope_position_deltas[i]
+                    mrope_position_ids[result_index], mrope_position_deltas[result_index]
                 )
 
     @override

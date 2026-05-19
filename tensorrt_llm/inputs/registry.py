@@ -819,10 +819,11 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
         raise TypeError(
             f"{processor_cls.__name__} must inherit from BaseMultimodalInputProcessor to support multimodal disagg"
         )
-    method = getattr(processor_cls, "get_prompt_token_ids", None)
+    method = getattr(processor_cls, "build_disagg_prefill_multimodal_inputs",
+                     None)
     if method is None or not callable(method):
         raise TypeError(
-            f"{processor_cls.__name__} must implement a callable method `get_prompt_token_ids` to support multimodal disagg"
+            f"{processor_cls.__name__} must implement a callable method `build_disagg_prefill_multimodal_inputs` to support multimodal disagg"
         )
 
     setattr(processor_cls, "support_mm_disagg", True)

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import _expand_prompt_token_ids_for_mm_handoff
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs
 
 
 def test_qwen3vl_disagg_video_prompt_layout_includes_non_embedding_start():
@@ -15,7 +16,7 @@ def test_qwen3vl_disagg_video_prompt_layout_includes_non_embedding_start():
     placeholder_id = 200000
     input_ids = torch.tensor([11, vision_start_token_id, video_token_id, vision_end_token_id, 12])
 
-    expanded, lengths, positions, layout = _expand_prompt_token_ids_for_mm_handoff(
+    handoff = _expand_prompt_token_ids_for_mm_handoff(
         input_ids,
         [{"tensor_size": (3, 16)}],
         image_token_id=image_token_id,
@@ -24,7 +25,8 @@ def test_qwen3vl_disagg_video_prompt_layout_includes_non_embedding_start():
         placeholder_id=placeholder_id,
     )
 
-    assert expanded == [
+    assert isinstance(handoff, DisaggPrefillMultimodalInputs)
+    assert handoff.prompt_token_ids == [
         11,
         vision_start_token_id,
         placeholder_id,
@@ -33,14 +35,14 @@ def test_qwen3vl_disagg_video_prompt_layout_includes_non_embedding_start():
         vision_end_token_id,
         12,
     ]
-    assert lengths == [4]
-    assert positions == [1]
-    assert layout["multimodal_item_run_cu_offsets"] == [0, 1]
-    assert layout["multimodal_run_positions"] == [1]
-    assert layout["multimodal_run_lengths"] == [4]
-    assert layout["multimodal_embedding_lengths"] == [3]
-    assert layout["special_token_offsets"] == [0]
-    assert layout["item_types"] == [1]
+    assert handoff.multimodal_lengths == [4]
+    assert handoff.multimodal_positions == [1]
+    assert handoff.multimodal_item_run_cu_offsets == [0, 1]
+    assert handoff.multimodal_run_positions == [1]
+    assert handoff.multimodal_run_lengths == [4]
+    assert handoff.multimodal_embedding_lengths == [3]
+    assert handoff.special_token_offsets == [0]
+    assert handoff.item_types == [1]
 
 
 def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
@@ -61,7 +63,7 @@ def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
         ]
     )
 
-    expanded, lengths, positions, layout = _expand_prompt_token_ids_for_mm_handoff(
+    handoff = _expand_prompt_token_ids_for_mm_handoff(
         input_ids,
         [{"tensor_size": (2, 16)}, {"tensor_size": (3, 16)}],
         image_token_id=image_token_id,
@@ -70,7 +72,7 @@ def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
         placeholder_id=placeholder_id,
     )
 
-    assert expanded == [
+    assert handoff.prompt_token_ids == [
         vision_start_token_id,
         placeholder_id,
         placeholder_id,
@@ -82,14 +84,14 @@ def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
         placeholder_id,
         vision_end_token_id,
     ]
-    assert lengths == [3, 4]
-    assert positions == [0, 5]
-    assert layout["multimodal_item_run_cu_offsets"] == [0, 1, 2]
-    assert layout["multimodal_run_positions"] == [0, 5]
-    assert layout["multimodal_run_lengths"] == [3, 4]
-    assert layout["multimodal_embedding_lengths"] == [2, 3]
-    assert layout["special_token_offsets"] == [0, 3]
-    assert layout["item_types"] == [0, 1]
+    assert handoff.multimodal_lengths == [3, 4]
+    assert handoff.multimodal_positions == [0, 5]
+    assert handoff.multimodal_item_run_cu_offsets == [0, 1, 2]
+    assert handoff.multimodal_run_positions == [0, 5]
+    assert handoff.multimodal_run_lengths == [3, 4]
+    assert handoff.multimodal_embedding_lengths == [2, 3]
+    assert handoff.special_token_offsets == [0, 3]
+    assert handoff.item_types == [0, 1]
 
 
 def test_qwen3vl_disagg_prompt_layout_requires_handle_per_placeholder():

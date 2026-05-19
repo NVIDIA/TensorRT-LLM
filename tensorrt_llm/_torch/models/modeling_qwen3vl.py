@@ -29,7 +29,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MultimodalParams
+from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -48,7 +48,6 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
     is_disagg_context_role,
-    make_multimodal_layout_metadata,
 )
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
 from .modeling_utils import (
@@ -69,7 +68,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
     video_token_id: int,
     vision_start_token_id: int,
     placeholder_id: int,
-) -> Tuple[List[int], List[int], List[int], Dict[str, List[int]]]:
+) -> DisaggPrefillMultimodalInputs:
     """Expand Qwen3-VL image/video placeholders and emit sparse MM layout."""
     placeholder_positions = [
         pos
@@ -131,19 +130,16 @@ def _expand_prompt_token_ids_for_mm_handoff(
     if write_pos != final_length:
         raise RuntimeError(f"Write position mismatch: {write_pos} != {final_length}")
 
-    layout_metadata = make_multimodal_layout_metadata(
-        item_run_cu_offsets,
-        run_positions,
-        run_lengths,
-        multimodal_embedding_lengths,
+    return DisaggPrefillMultimodalInputs(
+        prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+        multimodal_lengths=mm_token_lengths,
+        multimodal_positions=mm_token_offsets,
+        multimodal_embedding_lengths=multimodal_embedding_lengths,
+        multimodal_item_run_cu_offsets=item_run_cu_offsets,
+        multimodal_run_positions=run_positions,
+        multimodal_run_lengths=run_lengths,
         special_token_offsets=special_token_offsets,
         item_types=item_types,
-    )
-    return (
-        expanded_ids.to(torch.int32).tolist(),
-        mm_token_lengths,
-        mm_token_offsets,
-        layout_metadata,
     )
 
 
@@ -484,22 +480,20 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             "multimodal_data": multimodal_data,
         }
 
-    def get_prompt_token_ids(
+    def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
-    ) -> Tuple[List[int], List[int], List[int], Dict[str, List[int]]]:
+    ) -> DisaggPrefillMultimodalInputs:
         """
-        Build input token ids with multimodal placeholders expanded to the number of MM tokens.
+        Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
             mm_handles: List of multimodal embedding handles.
 
         Returns:
-            Tuple[List[int], List[int], List[int], Dict[str, List[int]]]:
-                - expanded_ids: token ids with each image/video token expanded to placeholder slots
-                - mm_token_length: per-item prompt-side MM token lengths
-                - mm_token_offsets: start offsets for each item's MM tokens within expanded_ids
-                - layout metadata for exact runs and encoder-output lengths
+            DisaggPrefillMultimodalInputs containing expanded token IDs,
+            prompt-side MM positions/lengths, exact runs, and encoder-output
+            embedding lengths.
         """
         # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")

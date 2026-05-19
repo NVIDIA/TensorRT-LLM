@@ -6,10 +6,10 @@ import pytest
 import torch
 
 from tensorrt_llm.inputs.multimodal import (
+    DisaggPrefillMultimodalInputs,
     MultimodalInput,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
-    add_multimodal_run_metadata,
 )
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
@@ -41,26 +41,6 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
     )
 
 
-def test_add_multimodal_run_metadata_preserves_item_runs_in_py_data():
-    mm_input = MultimodalInput.from_components(
-        [[1, 2, 3, 4, 5, 6, 7, 8]],
-        [2],
-        [4],
-        mm_item_run_cu_offsets=[0, 1],
-        mm_run_positions=[2],
-        mm_run_lengths=[4],
-    )
-
-    multimodal_data = add_multimodal_run_metadata({"image": {}}, mm_input)
-
-    assert multimodal_data == {
-        "image": {},
-        "multimodal_item_run_cu_offsets": [0, 1],
-        "multimodal_run_positions": [2],
-        "multimodal_run_lengths": [4],
-    }
-
-
 def test_multimodal_embedding_lengths_exclude_special_tokens():
     """Embedding lengths omit multimodal wrapper tokens used only in prompts."""
     mm_mask = torch.tensor([False, True, True, True, True, True, False, True, True, True, True])
@@ -83,6 +63,39 @@ def test_multimodal_embedding_lengths_exclude_special_tokens():
     embedding_lengths = _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask, [5, 4])
 
     assert embedding_lengths == [3, 3]
+
+
+def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
+    handoff = DisaggPrefillMultimodalInputs(
+        prompt_token_ids=[10, 1001, 1002, 2000, 1003, 20],
+        multimodal_lengths=[4],
+        multimodal_positions=[1],
+        multimodal_embedding_lengths=[3],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[1],
+        multimodal_run_lengths=[4],
+        special_token_offsets=[2],
+        item_types=[0],
+    )
+
+    multimodal_input = handoff.to_multimodal_input([[1, 2, 3, 4]])
+
+    assert multimodal_input.multimodal_positions == [1]
+    assert multimodal_input.multimodal_lengths == [4]
+    assert multimodal_input.multimodal_item_run_cu_offsets == [0, 1]
+    assert multimodal_input.multimodal_run_positions == [1]
+    assert multimodal_input.multimodal_run_lengths == [4]
+    assert handoff.multimodal_embedding_lengths == [3]
+    assert handoff.special_token_offsets == [2]
+    assert handoff.item_types == [0]
+
+
+def test_multimodal_input_rejects_invalid_prompt_spans():
+    with pytest.raises(ValueError, match="multimodal_positions must be non-negative"):
+        MultimodalInput.from_components([[1, 2, 3, 4]], [-1], [1])
+
+    with pytest.raises(ValueError, match="multimodal_lengths must be positive"):
+        MultimodalInput.from_components([[1, 2, 3, 4]], [0], [0])
 
 
 def test_runtime_data_cumsum_math_simplest():

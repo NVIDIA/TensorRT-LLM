@@ -33,7 +33,6 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..inputs.multimodal import add_multimodal_run_metadata
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -469,10 +468,6 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                request.multimodal_params.multimodal_data = (
-                    add_multimodal_run_metadata(
-                        request.multimodal_params.multimodal_data,
-                        request.multimodal_params.multimodal_input))
                 multimodal_input = request.multimodal_params.multimodal_input.to_executor(
                     tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field

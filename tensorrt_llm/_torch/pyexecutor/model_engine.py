@@ -4695,21 +4695,28 @@ class PyTorchModelEngine(ModelEngine):
         multimodal_params = inputs.get("multimodal_params", [])
         if not multimodal_params or len(multimodal_params) == 0:
             # Return empty embeddings if no multimodal data
-            return {'mm_embeddings': []}
-        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
-                   None) is None:
-            multimodal_chunks = None
-            multimodal_embedding_lengths_list = None
-        else:
-            multimodal_chunks = []
-            multimodal_embedding_lengths_list = []
-            for request in scheduled_requests.context_requests:
-                multimodal_embedding_lengths = (
-                    get_multimodal_embedding_lengths(request))
-                if multimodal_embedding_lengths is not None:
-                    multimodal_chunks.append(sum(multimodal_embedding_lengths))
-                    multimodal_embedding_lengths_list.append(
-                        multimodal_embedding_lengths)
+            return {
+                'mm_embeddings': [],
+                'mm_embedding_request_indices': [],
+                'mm_embedding_lengths': [],
+            }
+        active_multimodal_requests = [(request_idx, request)
+                                      for request_idx, request in enumerate(
+                                          scheduled_requests.context_requests)
+                                      if request.py_multimodal_data is not None]
+        if len(multimodal_params) != len(active_multimodal_requests):
+            raise ValueError(
+                "mm_encoder_only expects one multimodal payload per active "
+                "multimodal context request")
+        mm_embedding_lengths = []
+        for _, request in active_multimodal_requests:
+            multimodal_embedding_lengths = get_multimodal_embedding_lengths(
+                request)
+            if multimodal_embedding_lengths is None:
+                raise ValueError(
+                    "mm_encoder_only active multimodal requests must provide "
+                    "multimodal_embedding_lengths")
+            mm_embedding_lengths.append(multimodal_embedding_lengths)
         # For mm_encoder_only mode, we only run the vision encoder part
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
         mm_embeddings = self.model.forward(multimodal_params)
@@ -4717,15 +4724,13 @@ class PyTorchModelEngine(ModelEngine):
             mm_embeddings
         ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
 
-        if multimodal_chunks is None or len(multimodal_chunks) != len(
-                multimodal_params):
-            mm_embeddings = list(
-                torch.chunk(mm_embeddings[0],
-                            scheduled_requests.num_context_requests,
-                            dim=0))
-        else:
-            mm_embeddings = list(
-                torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
+        split_lengths = [sum(lengths) for lengths in mm_embedding_lengths]
+        mm_embeddings = list(torch.split(mm_embeddings[0], split_lengths,
+                                         dim=0))
+        if len(mm_embeddings) != len(mm_embedding_lengths):
+            raise ValueError(
+                "mm_encoder_only produced an embedding batch that does not "
+                "match mm_embedding_lengths")
 
         # Extract mrope position data from multimodal_params if available
         mrope_position_ids_list = []
@@ -4740,11 +4745,16 @@ class PyTorchModelEngine(ModelEngine):
             if mrope_position_deltas is not None:
                 mrope_position_deltas_list.append(mrope_position_deltas)
 
-        result = {'mm_embeddings': mm_embeddings, 'logits': None}
-        if (multimodal_embedding_lengths_list is not None and
-                len(multimodal_embedding_lengths_list) == len(mm_embeddings)):
-            result[
-                'multimodal_embedding_lengths'] = multimodal_embedding_lengths_list
+        result = {
+            'mm_embeddings':
+            mm_embeddings,
+            'logits':
+            None,
+            'mm_embedding_request_indices':
+            [request_idx for request_idx, _ in active_multimodal_requests],
+            'mm_embedding_lengths':
+            mm_embedding_lengths,
+        }
         if mrope_position_ids_list:
             result['mrope_position_ids'] = mrope_position_ids_list
         if mrope_position_deltas_list:

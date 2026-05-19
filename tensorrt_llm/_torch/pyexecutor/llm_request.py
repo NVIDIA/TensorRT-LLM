@@ -395,15 +395,17 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             multimodal_lengths: List[int]):
+                             mm_embedding_lengths: List[int]):
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
-            multimodal_lengths: Per-item encoder-output embedding lengths.
+            mm_embedding_lengths: Per-item encoder-output embedding lengths.
         """
-        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+        split_embeddings = torch.split(mm_embeddings,
+                                       mm_embedding_lengths,
+                                       dim=0)
 
         # Create a SharedTensorContainer handle for each split
         self._mm_embeddings = [
@@ -938,59 +940,35 @@ def convert_wordlist(word_list) -> List[List[int]]:
     return [tokens, offsets]
 
 
-def _optional_int_list(values: Any, field_name: str) -> Optional[List[int]]:
+def _validate_optional_int_list(values: Any,
+                                field_name: str) -> Optional[List[int]]:
     if values is None:
         return None
-    if torch.is_tensor(values):
-        values = values.detach().cpu().tolist()
-    try:
-        return [int(value) for value in values]
-    except TypeError as exc:
-        raise TypeError(f"{field_name} must be iterable") from exc
-
-
-def _get_multimodal_embedding_lengths_metadata(request: Any) -> Any:
-    py_multimodal_data = getattr(request, "py_multimodal_data", None)
-    if not isinstance(py_multimodal_data, dict):
-        return None
-
-    value = py_multimodal_data.get("multimodal_embedding_lengths")
-    if value is not None:
-        return value
-
-    layout_metadata = py_multimodal_data.get("layout_metadata")
-    if isinstance(layout_metadata, dict):
-        return layout_metadata.get("multimodal_embedding_lengths")
-    return None
-
-
-def _get_py_multimodal_metadata(request: Any, field_name: str) -> Any:
-    py_multimodal_data = getattr(request, "py_multimodal_data", None)
-    if not isinstance(py_multimodal_data, dict):
-        return None
-
-    value = py_multimodal_data.get(field_name)
-    if value is not None:
-        return value
-
-    layout_metadata = py_multimodal_data.get("layout_metadata")
-    if isinstance(layout_metadata, dict):
-        return layout_metadata.get(field_name)
-    return None
+    if not isinstance(values, list):
+        raise TypeError(f"{field_name} must be a list")
+    if not all(isinstance(value, int) for value in values):
+        raise TypeError(f"{field_name} must contain only integers")
+    return values
 
 
 def get_multimodal_embedding_lengths(request: Any) -> Optional[List[int]]:
-    """Return per-item encoder-output lengths for a multimodal request."""
-    multimodal_lengths = _optional_int_list(
-        getattr(request, "multimodal_lengths", None), "multimodal_lengths")
-    multimodal_embedding_lengths = _optional_int_list(
-        _get_multimodal_embedding_lengths_metadata(request),
+    """Return explicit per-item encoder-output lengths for a multimodal request."""
+    py_multimodal_data = getattr(request, "py_multimodal_data", None)
+    if py_multimodal_data is not None and not isinstance(
+            py_multimodal_data, dict):
+        raise TypeError("py_multimodal_data must be a dict")
+    # `multimodal_embedding_lengths` is Python-side layout metadata, not a
+    # nanobind request field, so validate the flat handoff contract here.
+    multimodal_embedding_lengths = _validate_optional_int_list(
+        py_multimodal_data.get("multimodal_embedding_lengths")
+        if py_multimodal_data is not None else None,
         "multimodal_embedding_lengths")
     if multimodal_embedding_lengths is None:
-        return multimodal_lengths
+        return None
 
     if any(length < 0 for length in multimodal_embedding_lengths):
         raise ValueError("multimodal_embedding_lengths must be non-negative")
+    multimodal_lengths = getattr(request, "multimodal_lengths", None)
     if multimodal_lengths is not None:
         if len(multimodal_embedding_lengths) != len(multimodal_lengths):
             raise ValueError("multimodal_embedding_lengths length must match "
@@ -1036,25 +1014,10 @@ def executor_request_to_llm_request(
         multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
         multimodal_item_run_cu_offsets = (
             executor_request.multimodal_input.multimodal_item_run_cu_offsets)
-        multimodal_run_positions = getattr(executor_request.multimodal_input,
-                                           "multimodal_run_positions", None)
-        multimodal_run_lengths = getattr(executor_request.multimodal_input,
-                                         "multimodal_run_lengths", None)
-
-    multimodal_item_run_cu_offsets = _optional_int_list(
-        multimodal_item_run_cu_offsets if multimodal_item_run_cu_offsets
-        is not None else _get_py_multimodal_metadata(
-            executor_request, "multimodal_item_run_cu_offsets"),
-        "multimodal_item_run_cu_offsets")
-    multimodal_run_positions = _optional_int_list(
-        multimodal_run_positions if multimodal_run_positions
-        is not None else _get_py_multimodal_metadata(
-            executor_request, "multimodal_run_positions"),
-        "multimodal_run_positions")
-    multimodal_run_lengths = _optional_int_list(
-        multimodal_run_lengths if multimodal_run_lengths is not None else
-        _get_py_multimodal_metadata(executor_request, "multimodal_run_lengths"),
-        "multimodal_run_lengths")
+        multimodal_run_positions = (
+            executor_request.multimodal_input.multimodal_run_positions)
+        multimodal_run_lengths = (
+            executor_request.multimodal_input.multimodal_run_lengths)
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None

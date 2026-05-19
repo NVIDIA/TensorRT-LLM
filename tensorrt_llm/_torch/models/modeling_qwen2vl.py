@@ -27,7 +27,8 @@ from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalParams)
 
 from ..._utils import nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1275,22 +1276,20 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
-    def get_prompt_token_ids(
-        self, inputs: TextPrompt,
-        mm_handles: List[Dict[str,
-                              Any]]) -> Tuple[List[int], List[int], List[int]]:
+    def build_disagg_prefill_multimodal_inputs(
+            self, inputs: TextPrompt,
+            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
         """
-        Build input token ids with multimodal placeholders expanded to the number of MM tokens.
+        Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
             mm_handles: List of multimodal embedding handles.
 
         Returns:
-            Tuple[List[int], List[int], List[int]]:
-                - expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
-                - mm_token_length: per-image MM token lengths
-                - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
+            DisaggPrefillMultimodalInputs containing expanded token IDs,
+            prompt-side MM positions/lengths, exact runs, and encoder-output
+            embedding lengths.
         """
         # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
@@ -1347,8 +1346,18 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
         assert mm_token_length[-1] + mm_token_offsets[
             -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return expanded_ids.to(
-            torch.int32).tolist(), mm_token_length, mm_token_offsets
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+            multimodal_lengths=mm_token_length,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=[
+                mm_handle["tensor_size"][0] for mm_handle in mm_handles
+            ],
+            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
+                                                      1)),
+            multimodal_run_positions=mm_token_offsets,
+            multimodal_run_lengths=mm_token_length,
+        )
 
 
 @support_multimodal_disaggregated

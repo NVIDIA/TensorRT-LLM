@@ -95,7 +95,7 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypat
     )
 
     video = VideoData(frames=[object()], metadata={}, audio=None)
-    expanded_ids, mm_lengths, mm_offsets, layout = processor.get_prompt_token_ids(
+    handoff = processor.build_disagg_prefill_multimodal_inputs(
         {
             "prompt": "Question <video> answer",
             "multi_modal_data": {"video": [video]},
@@ -103,14 +103,14 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypat
         [{"tensor_size": (4, 16)}],
     )
 
-    assert expanded_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
-    assert mm_lengths == [8]
-    assert mm_offsets == [1]
-    assert layout["multimodal_embedding_lengths"] == [4]
-    assert layout["multimodal_item_run_cu_offsets"] == [0, 2]
-    assert layout["multimodal_run_positions"] == [1, 6]
-    assert layout["multimodal_run_lengths"] == [4, 4]
-    assert layout["special_token_offsets"] == [0, 3, 4, 7]
+    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert handoff.multimodal_lengths == [8]
+    assert handoff.multimodal_positions == [1]
+    assert handoff.multimodal_embedding_lengths == [4]
+    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
+    assert handoff.multimodal_run_positions == [1, 6]
+    assert handoff.multimodal_run_lengths == [4, 4]
+    assert handoff.special_token_offsets == [0, 3, 4, 7]
 
 
 def test_nemotron_nano_vl_init_allows_disaggregated_context_role(monkeypatch):

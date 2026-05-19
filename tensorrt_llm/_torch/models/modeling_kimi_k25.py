@@ -49,7 +49,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -1492,12 +1492,12 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             "multimodal_data": multimodal_data,
         }
 
-    def get_prompt_token_ids(
+    def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Build token IDs with multimodal placeholders expanded for disaggregated serving.
+    ) -> DisaggPrefillMultimodalInputs:
+        """Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container.
@@ -1505,7 +1505,9 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 context phase, each containing ``tensor_size``.
 
         Returns:
-            Tuple of (expanded_ids, mm_token_lengths, mm_token_offsets).
+            DisaggPrefillMultimodalInputs containing expanded token IDs,
+            prompt-side MM positions/lengths, exact runs, and encoder-output
+            embedding lengths.
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -1556,7 +1558,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 expanded_ids[write_pos] = input_ids[read_pos]
                 write_pos += 1
 
-        return (expanded_ids.to(torch.int32).tolist(), mm_token_length, mm_token_offsets)
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+            multimodal_lengths=mm_token_length,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=[mm_handle["tensor_size"][0] for mm_handle in mm_handles],
+            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
+            multimodal_run_positions=mm_token_offsets,
+            multimodal_run_lengths=mm_token_length,
+        )
 
 
 # ---------------------------------------------------------------------------

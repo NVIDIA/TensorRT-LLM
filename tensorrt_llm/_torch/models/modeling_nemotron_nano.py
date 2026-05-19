@@ -14,6 +14,7 @@ from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import (
+    DisaggPrefillMultimodalInputs,
     MultimodalParams,
     _as_cpu_tensor,
     _compute_mm_masks,
@@ -48,7 +49,6 @@ from .modeling_multimodal_utils import (
     get_multimodal_embeddings,
     has_raw_multimodal_payload,
     is_disagg_context_role,
-    make_multimodal_layout_metadata,
 )
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
@@ -2260,9 +2260,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "multimodal_data": multimodal_data,
         }
 
-    def get_prompt_token_ids(
+    def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
-    ) -> Tuple[List[int], List[int], List[int], Dict[str, List[int]]]:
+    ) -> DisaggPrefillMultimodalInputs:
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
@@ -2336,14 +2336,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             mm_mask, num_mm_tokens
         )
 
-        layout_metadata = make_multimodal_layout_metadata(
-            item_run_cu_offsets,
-            run_positions,
-            run_lengths,
-            multimodal_embedding_lengths,
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids,
+            multimodal_lengths=num_mm_tokens,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=multimodal_embedding_lengths,
+            multimodal_item_run_cu_offsets=item_run_cu_offsets,
+            multimodal_run_positions=run_positions,
+            multimodal_run_lengths=run_lengths,
             special_token_offsets=special_token_offsets,
         )
-        return expanded_ids, num_mm_tokens, mm_token_offsets, layout_metadata
 
     def _prepare_audio_features(
         self,

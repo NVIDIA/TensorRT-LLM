@@ -4,15 +4,18 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
-from tensorrt_llm._torch.pyexecutor.sampler import _get_multimodal_embedding_lengths_for_request
+from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, MultimodalResult
+from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequestState
 
 
-def test_multimodal_embedding_lengths_legacy_without_metadata():
+def test_multimodal_embedding_lengths_missing_without_fallback():
     request = SimpleNamespace(multimodal_lengths=[3, 5])
 
-    assert get_multimodal_embedding_lengths(request) == [3, 5]
+    assert get_multimodal_embedding_lengths(request) is None
 
 
 def test_multimodal_embedding_lengths_uses_top_level_metadata():
@@ -26,7 +29,7 @@ def test_multimodal_embedding_lengths_uses_top_level_metadata():
     assert get_multimodal_embedding_lengths(request) == [5, 3]
 
 
-def test_multimodal_embedding_lengths_uses_layout_metadata_fallback():
+def test_multimodal_embedding_lengths_ignores_layout_metadata():
     request = SimpleNamespace(
         multimodal_lengths=[6, 5],
         py_multimodal_data={
@@ -36,7 +39,7 @@ def test_multimodal_embedding_lengths_uses_layout_metadata_fallback():
         },
     )
 
-    assert get_multimodal_embedding_lengths(request) == [6, 4]
+    assert get_multimodal_embedding_lengths(request) is None
 
 
 def test_multimodal_embedding_lengths_rejects_metadata_length_mismatch():
@@ -63,8 +66,134 @@ def test_multimodal_embedding_lengths_rejects_lengths_larger_than_prompt_span():
         get_multimodal_embedding_lengths(request)
 
 
-def test_sampler_prefers_encoder_output_embedding_lengths():
-    request = SimpleNamespace(multimodal_lengths=[6])
-    extra_data = {"multimodal_embedding_lengths": [[4]]}
+@pytest.mark.parametrize("metadata", [torch.tensor([4]), (4,)])
+def test_multimodal_embedding_lengths_rejects_non_list_metadata(metadata):
+    request = SimpleNamespace(
+        multimodal_lengths=[4],
+        py_multimodal_data={
+            "multimodal_embedding_lengths": metadata,
+        },
+    )
 
-    assert _get_multimodal_embedding_lengths_for_request(request, extra_data, 0) == [4]
+    with pytest.raises(TypeError, match="must be a list"):
+        get_multimodal_embedding_lengths(request)
+
+
+class _FakePyResult:
+    def __init__(self):
+        self.mm_embeddings = []
+
+    def append_mm_embeddings(self, mm_embedding, mm_embedding_lengths):
+        self.mm_embeddings.append((mm_embedding, mm_embedding_lengths))
+
+
+class _FakeRequest:
+    def __init__(self, multimodal_lengths=None):
+        self.multimodal_lengths = multimodal_lengths
+        self.py_result = _FakePyResult()
+        self.state = None
+        self.finished_reason = None
+
+    def set_finished_reason(self, reason, beam):
+        self.finished_reason = (reason, beam)
+
+
+def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
+    text_request = _FakeRequest()
+    mm_request = _FakeRequest(multimodal_lengths=[4])
+    sampler = EarlyStopWithMMResult()
+    state = sampler.SampleState(
+        requests=[text_request, mm_request],
+        data=MultimodalResult(
+            mm_embeddings=[torch.ones(4, 2)],
+            mm_embedding_request_indices=[1],
+            mm_embedding_lengths=[[4]],
+            extra_data={},
+        ),
+    )
+
+    sampler.update_requests(state)
+
+    assert text_request.state == LlmRequestState.GENERATION_COMPLETE
+    assert mm_request.state == LlmRequestState.GENERATION_COMPLETE
+    assert text_request.finished_reason == (FinishReason.LENGTH, 0)
+    assert mm_request.finished_reason == (FinishReason.LENGTH, 0)
+    assert len(text_request.py_result.mm_embeddings) == 0
+    [(mm_embedding, mm_embedding_lengths)] = mm_request.py_result.mm_embeddings
+    assert mm_embedding.shape == (4, 2)
+    assert mm_embedding_lengths == [4]
+
+
+class _FakeScheduledRequests:
+    def __init__(self, num_context_requests):
+        self.generation_requests = []
+        self.context_requests = [_FakeRequest() for _ in range(num_context_requests)]
+
+    @property
+    def num_context_requests(self):
+        return len(self.context_requests)
+
+
+def test_mm_encoder_sampler_builds_typed_result_from_model_outputs():
+    sampler = EarlyStopWithMMResult()
+    state = sampler.sample_async(
+        _FakeScheduledRequests(2),
+        {
+            "mm_embeddings": [torch.ones(4, 2)],
+            "mm_embedding_request_indices": [1],
+            "mm_embedding_lengths": [[4]],
+            "mrope_position_ids": ["pos"],
+        },
+        [],
+    )
+
+    assert state.data.mm_embedding_request_indices == [1]
+    assert state.data.mm_embedding_lengths == [[4]]
+    assert state.data.extra_data == {"mrope_position_ids": ["pos"]}
+
+
+def test_mm_encoder_sampler_rejects_missing_typed_result_fields():
+    sampler = EarlyStopWithMMResult()
+
+    with pytest.raises(KeyError):
+        sampler.sample_async(_FakeScheduledRequests(1), {"mm_embeddings": []}, [])
+
+
+def test_mm_encoder_sampler_rejects_typed_result_batch_mismatch():
+    sampler = EarlyStopWithMMResult()
+
+    with pytest.raises(ValueError, match="batch size"):
+        sampler.sample_async(
+            _FakeScheduledRequests(2),
+            {
+                "mm_embeddings": [torch.ones(4, 2)],
+                "mm_embedding_request_indices": [1],
+                "mm_embedding_lengths": [],
+            },
+            [],
+        )
+
+
+def test_mm_encoder_sampler_rejects_invalid_request_index():
+    sampler = EarlyStopWithMMResult()
+
+    with pytest.raises(ValueError, match="invalid request index"):
+        sampler.sample_async(
+            _FakeScheduledRequests(1),
+            {
+                "mm_embeddings": [torch.ones(4, 2)],
+                "mm_embedding_request_indices": [1],
+                "mm_embedding_lengths": [[4]],
+            },
+            [],
+        )
+
+
+def test_multimodal_result_rejects_embedding_shape_mismatch():
+    with pytest.raises(ValueError, match="shape mismatch"):
+        MultimodalResult(
+            mm_embeddings=[torch.ones(4, 2)],
+            mm_embedding_request_indices=[0],
+            mm_embedding_lengths=[[3]],
+            extra_data={},
+        )

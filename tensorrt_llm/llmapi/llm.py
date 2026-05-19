@@ -17,8 +17,11 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.inputs.data import TextPrompt
+from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalParams)
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          DefaultInputProcessor)
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
@@ -574,20 +577,14 @@ class BaseLLM:
             # TODO(TRTLLM-xxxxx): Pass encoder-side MM layout through
             # DisaggregatedParams so prefill does not rebuild prompt tokens,
             # positions, lengths, runs, special offsets, and cumsum here.
-            prompt_token_result = self.input_processor.get_prompt_token_ids(
-                inputs, mm_handles)
-            if len(prompt_token_result) == 3:
-                prompt_token_ids, mm_token_length, mm_token_positions = (
-                    prompt_token_result)
-                mm_layout_metadata = {}
-            elif len(prompt_token_result) == 4:
-                prompt_token_ids, mm_token_length, mm_token_positions, mm_layout_metadata = (
-                    prompt_token_result)
-            else:
-                raise ValueError(
-                    "get_prompt_token_ids must return either "
-                    "(prompt_token_ids, mm_token_length, mm_token_positions) "
-                    "or those values plus multimodal layout metadata")
+            disagg_mm_inputs = (
+                self.input_processor.build_disagg_prefill_multimodal_inputs(
+                    inputs, mm_handles))
+            if not isinstance(disagg_mm_inputs, DisaggPrefillMultimodalInputs):
+                raise TypeError(
+                    "build_disagg_prefill_multimodal_inputs must return "
+                    "DisaggPrefillMultimodalInputs")
+            prompt_token_ids = disagg_mm_inputs.prompt_token_ids
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
@@ -596,34 +593,25 @@ class BaseLLM:
                 )
             else:
                 mm_hashes = disaggregated_params.multimodal_hashes
-                multimodal_input = MultimodalInput.from_components(
-                    mm_hashes,
-                    mm_token_positions,
-                    mm_token_length,
-                    mm_item_run_cu_offsets=mm_layout_metadata.get(
-                        "multimodal_item_run_cu_offsets"),
-                    mm_run_positions=mm_layout_metadata.get(
-                        "multimodal_run_positions"),
-                    mm_run_lengths=mm_layout_metadata.get(
-                        "multimodal_run_lengths"))
+                multimodal_input = disagg_mm_inputs.to_multimodal_input(
+                    mm_hashes)
                 # E/P handoff carries SharedTensorContainer dicts. Park them under the
                 # embedding key so BaseWorker's recursive to_tensor("multimodal_data")
                 # restores local tensor views before PyTorch forward. Until then this
                 # key holds handles, not tensors.
-                multimodal_data = {"multimodal_embedding": mm_handles}
-                if "multimodal_embedding_lengths" in mm_layout_metadata:
-                    multimodal_data["multimodal_embedding_lengths"] = (
-                        mm_layout_metadata["multimodal_embedding_lengths"])
-                if "special_token_offsets" in mm_layout_metadata:
-                    multimodal_data["special_token_offsets"] = (
-                        mm_layout_metadata["special_token_offsets"])
-                layout_metadata = {
-                    key: mm_layout_metadata[key]
-                    for key in ("item_types", "special_token_offsets")
-                    if key in mm_layout_metadata
+                multimodal_data = {
+                    "multimodal_embedding":
+                    mm_handles,
+                    "multimodal_embedding_lengths":
+                    (disagg_mm_inputs.multimodal_embedding_lengths),
                 }
-                if layout_metadata:
-                    multimodal_data["layout_metadata"] = layout_metadata
+                if disagg_mm_inputs.special_token_offsets is not None:
+                    multimodal_data["special_token_offsets"] = (
+                        disagg_mm_inputs.special_token_offsets)
+                if disagg_mm_inputs.item_types is not None:
+                    multimodal_data["layout_metadata"] = {
+                        "item_types": disagg_mm_inputs.item_types
+                    }
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None
