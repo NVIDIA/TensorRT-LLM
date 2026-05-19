@@ -2895,7 +2895,11 @@ REUSED_TESTS_EOF
 // Build-scoped: ${UPLOAD_PATH} is per-build, so unswept progress tars are
 // garbage-collected with the rest of the build's artifacts anyway.
 def deleteProgressArtifact(stageName) {
-    def targetUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/results-${stageName}-progress.tar.gz"
+    // UPLOAD_PATH points to the virtual repo `sw-tensorrt-generic`, which
+    // accepts GET/PUT but returns 404 on DELETE. Rewrite to the backing
+    // local repo so the delete actually lands.
+    def deletePath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+    def targetUrl = "https://urm.nvidia.com/artifactory/${deletePath}/test-results-progress/results-${stageName}-progress.tar.gz"
     try {
         withCredentials([usernamePassword(
                 credentialsId: 'urm-artifactory-creds',
