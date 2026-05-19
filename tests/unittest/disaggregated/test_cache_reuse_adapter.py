@@ -155,7 +155,7 @@ def _lg(window=None):
 
 
 class TestAdapterPerLayerGroup:
-    """Per-layer cached prefix: SWA groups are clamped up to stale_end*tpb."""
+    """Per-layer cached prefix: adapter reports only the reuse-hit scalar."""
 
     TPB = 8
 
@@ -164,38 +164,100 @@ class TestAdapterPerLayerGroup:
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
         assert out == [0, 0]
 
-    def test_zero_scalar_clamps_swa_stale_prefix(self):
+    def test_zero_scalar(self):
+        # No reuse hit: every group reports 0 — SWA stale handling is the
+        # transfer call site's concern, not the adapter's.
         ad = _StubAdapter(scalar=0, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
-        # full-attn has no cached prefix; SWA treats evicted stale blocks as already skipped.
-        assert out == [0, 192]
+        assert out == [0, 0]
 
     def test_full_attn_passthrough(self):
-        # full-attn group: scalar is returned as-is.
         ad = _StubAdapter(scalar=64, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg()])
         assert out == [64, 64]
 
-    def test_swa_scalar_inside_window_no_clamp(self):
-        # prompt_len=32, window=16, tpb=8 → stale_end=2 → stale_end*tpb=16.
-        # scalar=24 ≥ 16 → no clamp.
+    def test_swa_passthrough_above_stale(self):
+        # SWA layer: adapter passes scalar through unchanged regardless of stale_end.
         ad = _StubAdapter(scalar=24, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
         assert out == [24]
 
-    def test_swa_scalar_below_stale_clamped_up(self):
-        # stale_end*tpb = 16; scalar=8 → clamped up to 16.
+    def test_swa_passthrough_below_stale(self):
+        # scalar=8 is below stale_end*tpb=16; adapter still returns the raw
+        # scalar — the call site reconciles with stale_end via max(0, ...).
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
-        assert out == [16]
+        assert out == [8]
 
     def test_mixed_groups(self):
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
         out = ad.get_cached_token_count_per_layer_group(
             _FakeReq(32), [_lg(), _lg(window=16), _lg(window=32)]
         )
-        # full-attn=8, swa(window=16) clamped to 16, swa(window=32) stale_end=0 → 8.
-        assert out == [8, 16, 8]
+        # All groups see the same reuse-hit scalar.
+        assert out == [8, 8, 8]
+
+
+# ---------------------------------------------------------------------------
+# _create_kv_slice CTX-side over-allocation guard (MTP / spec-decoding).
+# ---------------------------------------------------------------------------
+
+
+def _ctx_overalloc_trim(block_ids, token_range_end, tpb, is_gen_only=False):
+    """Replicate the CTX-side over-allocation guard in _create_kv_slice.
+
+    The KV cache manager may reserve trailing blocks for MTP /
+    speculative-decoding draft positions that hold no useful context
+    state. The receiver computes total_blocks from token_range.end in
+    Sender._build_kv_write_meta, so extra src blocks would violate the
+    protocol invariant ``src.size <= total_blocks`` and cause the
+    Sender to silently drop the response. GEN-side extra blocks are
+    legitimate (draft tokens) and are handled by the receiver's
+    ``block_diff == 1`` branch in transfer.py.
+    """
+    block_ids = np.array(block_ids, dtype=np.int64)
+    if not is_gen_only:
+        ctx_total_blocks = (token_range_end + tpb - 1) // tpb
+        if block_ids.size > ctx_total_blocks:
+            block_ids = block_ids[:ctx_total_blocks]
+    return block_ids
+
+
+class TestCtxOverAllocationTrim:
+    """Regression for DSv4 + MTP=3 disagg KV transfer (1024-token prompt,
+    tpb=128): cache manager allocates 9 blocks but token_range.end=1024
+    only covers 8, so the trailing MTP scratch block must be dropped.
+    """
+
+    TPB = 128
+
+    def test_mtp_extra_block_dropped(self):
+        # prompt_len=1024 → total_blocks=8; manager exposed 9 blocks.
+        out = _ctx_overalloc_trim(list(range(9)), token_range_end=1024, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(8)))
+
+    def test_no_overalloc_unchanged(self):
+        # mtp0 path: block_ids.size == total_blocks → no-op.
+        out = _ctx_overalloc_trim(list(range(8)), token_range_end=1024, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(8)))
+
+    def test_gen_only_skipped(self):
+        # GEN-side extra block is the draft-token block; guard must not fire.
+        out = _ctx_overalloc_trim(
+            list(range(9)), token_range_end=1024, tpb=self.TPB, is_gen_only=True
+        )
+        np.testing.assert_array_equal(out, list(range(9)))
+
+    def test_partial_block_prompt_rounds_up(self):
+        # prompt_len=1025 → ceil → total_blocks=9; nothing to drop.
+        out = _ctx_overalloc_trim(list(range(9)), token_range_end=1025, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(9)))
+
+    def test_chunked_prefill_slice(self):
+        # Chunked prefill: token_range carries a sub-range (end=512).
+        # total_blocks=4, manager exposed 9 blocks → trim to 4.
+        out = _ctx_overalloc_trim(list(range(9)), token_range_end=512, tpb=self.TPB)
+        np.testing.assert_array_equal(out, list(range(4)))
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +265,14 @@ class TestAdapterPerLayerGroup:
 # ---------------------------------------------------------------------------
 
 
-def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens, is_gen_only=True):
+def _swa_trim(block_ids, prompt_len, tpb, window_size, cached_tokens, is_gen_only=True):
     """Replicate the SWA branch of KvCacheTransceiverV2._create_kv_slice.
 
     Inputs:
       block_ids: list possibly containing stale entries (V1 pre-eviction view).
-      scalar_cached_tokens: the cache-manager scalar BEFORE adapter SWA clamp.
-      is_gen_only: True mirrors the gen-side path (adapter-clamped cached_lg);
-        False mirrors the ctx-side path where the adapter is not invoked and
-        cache_skip must stay 0 regardless of ``stale_end``.
+      cached_tokens: reuse-hit prefix reported by the adapter (token-aligned).
+      is_gen_only: True mirrors the gen-side path; False mirrors the ctx-side
+        path where ``cached_per_lg`` is synthetically 0.
     """
     block_ids = np.array(block_ids, dtype=np.int64)
     total_blocks = (prompt_len + tpb - 1) // tpb
@@ -221,12 +282,10 @@ def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens, is_
         block_ids = (
             block_ids[-expected_valid:] if expected_valid > 0 else np.array([], dtype=np.int64)
         )
-    if is_gen_only:
-        # Adapter clamps cached_lg ≥ stale_end*tpb.
-        cached_lg = max(scalar_cached_tokens, stale_end * tpb)
-        cache_skip = cached_lg // tpb - stale_end
-    else:
-        cache_skip = 0
+    # Ctx side bypasses adapter (cached=0); gen side uses adapter scalar.
+    cached_lg = cached_tokens if is_gen_only else 0
+    # Reuse-hit blocks beyond the already-pruned stale region.
+    cache_skip = max(0, cached_lg // tpb - stale_end)
     if cache_skip > 0:
         block_ids = (
             block_ids[cache_skip:] if cache_skip < block_ids.size else np.array([], dtype=np.int64)
@@ -262,17 +321,15 @@ class TestSwaTrim:
         # scalar=32 → cache_skip=2, list size=2 → empty.
         assert self._trim([20, 21], scalar=32).size == 0
 
-    def test_window_offset_skip_uses_clamped_value(self):
-        # window=24 → stale_end=1; scalar=16 (2 blocks) → cached_lg=16, cache_skip=1.
+    def test_window_offset_skip_subtracts_stale(self):
+        # window=24 → stale_end=1; scalar=16 (2 blocks) → cache_skip=2-1=1.
         # Naive block_ids[scalar//tpb:] would skip 2 from a 3-block list and return 1 block.
-        out = _swa_trim([10, 11, 12], prompt_len=32, tpb=8, window_size=24, scalar_cached_tokens=16)
+        out = _swa_trim([10, 11, 12], prompt_len=32, tpb=8, window_size=24, cached_tokens=16)
         np.testing.assert_array_equal(out, [11, 12])
 
     def test_window_covers_all_no_stale(self):
         # window=prompt_len → stale_end=0; behaves like full-attn.
-        out = _swa_trim(
-            [10, 11, 12, 13], prompt_len=32, tpb=8, window_size=32, scalar_cached_tokens=8
-        )
+        out = _swa_trim([10, 11, 12, 13], prompt_len=32, tpb=8, window_size=32, cached_tokens=8)
         np.testing.assert_array_equal(out, [11, 12, 13])
 
     def test_v1_pre_eviction_includes_stale(self):
@@ -282,9 +339,7 @@ class TestSwaTrim:
 
     def test_ctx_side_no_adapter_no_skip(self):
         # Ctx-side path: adapter not invoked, cached_per_lg synthetically 0.
-        # With stale_end>0, the gen-side formula would produce negative cache_skip
-        # and trip the SWA assertion; ctx side must clamp cache_skip to 0 and
-        # send the full valid window. Regression for PR #13937 follow-up.
+        # cache_skip = max(0, 0 - stale_end) = 0 — full valid window is sent.
         out = _swa_trim([20, 21], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False)
         np.testing.assert_array_equal(out, [20, 21])
 
@@ -295,6 +350,12 @@ class TestSwaTrim:
             [10, 11, 12, 13], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False
         )
         np.testing.assert_array_equal(out, [12, 13])
+
+    def test_gen_side_reuse_inside_stale_no_skip(self):
+        # gen side with reuse-hit fully inside the stale region: cache_skip = 0.
+        # Regression for SWA + reuse-hit < stale_end*tpb (no adapter clamp).
+        out = _swa_trim([20, 21], self.PROMPT_LEN, self.TPB, self.WINDOW, 8, is_gen_only=True)
+        np.testing.assert_array_equal(out, [20, 21])
 
 
 # ---------------------------------------------------------------------------
