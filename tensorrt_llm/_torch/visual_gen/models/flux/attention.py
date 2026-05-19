@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj, FluxJointQKVMLPProj
 
 # =============================================================================
 # Joint Attention (shared by FLUX.1 and FLUX.2 dual-stream blocks)
@@ -66,7 +67,7 @@ class FluxJointAttention(Attention):
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        self.tp_size = getattr(config.mapping, 'tp_size', 1)
+        self.tp_size = config.mapping.tp_size if config else 1
 
         if self.pre_only:
             del self.to_out
@@ -289,6 +290,13 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
     This is a key architectural difference from FLUX.1:
     - FLUX.1: Separate attention and FFN
     - FLUX.2: Fused QKV+MLP projection for efficiency
+
+    Dimension lifecycle (important for TP correctness):
+    - Before super().__init__(): q_dim/kv_dim/mlp_hidden_dim are FULL (pre-TP)
+    - _init_qkv_proj() is called during super().__init__() with FULL dims
+    - After super().__init__(): q_dim/kv_dim are LOCAL (divided by tp_size)
+    - We divide mlp_hidden_dim to match, then construct to_out with FULL dims
+      (FluxJointAttnMLPProj uses ROW parallel which divides internally)
     """
 
     def __init__(
@@ -306,6 +314,10 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp_mult_factor = 2  # SwiGLU doubles input
 
+        # Save full (pre-TP) dims — super().__init__() divides q_dim/kv_dim
+        full_q_dim = num_attention_heads * head_dim
+        full_mlp_hidden_dim = self.mlp_hidden_dim
+
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -318,29 +330,43 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             layer_idx=layer_idx,
         )
 
-        # Combined output: [q_dim + mlp_hidden_dim] -> [hidden_size]
-        self.to_out = Linear(
-            self.q_dim + self.mlp_hidden_dim,
-            hidden_size,
+        # After super().__init__(): self.q_dim/kv_dim are LOCAL (divided by tp_size).
+        # Divide mlp_hidden_dim to match for forward path consistency.
+        if self.tp_size > 1:
+            self.mlp_hidden_dim //= self.tp_size
+
+        # Output projection needs FULL dims (ROW parallel divides internally)
+        self.to_out = FluxJointAttnMLPProj(
+            attn_dim=full_q_dim,
+            mlp_dim=full_mlp_hidden_dim,
+            out_dim=hidden_size,
             bias=bias,
             dtype=self.dtype,
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            config=config,
         )
 
     def _init_qkv_proj(self):
-        """Override: fused QKV+MLP projection instead of standard QKV."""
-        qkv_dim = 3 * self.q_dim
+        """Override: fused QKV+MLP projection instead of standard QKV.
+
+        Called during Attention.__init__() BEFORE TP division, so
+        self.q_dim/kv_dim/mlp_hidden_dim are all FULL here — correct
+        for FluxJointQKVMLPProj which needs full dims for Linear construction.
+        """
         mlp_in_dim = self.mlp_hidden_dim * self.mlp_mult_factor
-        self.to_qkv_mlp_proj = Linear(
-            self.hidden_size,
-            qkv_dim + mlp_in_dim,
+        self.to_qkv_mlp_proj = FluxJointQKVMLPProj(
+            in_dim=self.hidden_size,
+            q_dim=self.q_dim,
+            kv_dim=self.kv_dim,
+            mlp_dim=mlp_in_dim,
             bias=self.bias,
             dtype=self.dtype,
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            mapping=self.mapping,
         )
 
     def _apply_norm_rope_unfused(
@@ -408,10 +434,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             hidden_states [batch, seq, dim]
         """
         # Fused QKV + MLP projection
-        proj_out = self.to_qkv_mlp_proj(hidden_states)
-        qkv, mlp_hidden = torch.split(
-            proj_out, [3 * self.q_dim, self.mlp_hidden_dim * self.mlp_mult_factor], dim=-1
-        )
+        qkv, mlp_hidden = self.to_qkv_mlp_proj(hidden_states)
 
         q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
 
@@ -423,4 +446,4 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         mlp_out = swiglu(mlp_hidden.reshape(-1, shape[-1])).reshape(*shape[:-1], -1)
 
         # Concatenate + project
-        return self.to_out(torch.cat([attn_out, mlp_out], dim=-1))
+        return self.to_out(attn_out, mlp_out)
