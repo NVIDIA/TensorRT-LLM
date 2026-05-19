@@ -540,75 +540,66 @@ def _rectangle_precompute_impl(
     is_new_k = (k_new_idx >= 0) & (k_new_idx < T)
     safe_k_new = tl.where(is_new_k, k_new_idx, 0)
 
-    # Loop 1: per-head dt processing.  dt → dt_processed → dA_cumsum →
-    # decay_vec_new (= exp(cumAdt_new)).  Stored to write_buf for next step.
-    # decay_vec_full (= total_decay * decay_vec_new) is finalized in loop 2
-    # once total_decay is loaded; loop 1 stores raw decay_vec_new to scratch.
-    for h_local in range(HEADS_PER_BLOCK):
-        head_idx = first_head + h_local
+    offs_h = tl.arange(0, HEADS_PER_BLOCK)
+    heads_block = first_head + offs_h
 
-        dt_base = dt_ptr + pid_b * stride_dt_batch + head_idx * stride_dt_head
-        dt = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt_bias = tl.load(dt_bias_ptr + head_idx * stride_dt_bias_head).to(tl.float32)
-            dt = dt + dt_bias
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
+    # Precompute this step's (H, T) dt and continuous dA_cumsum tiles.
+    # Keep them in registers for the rectangle path below; reloading from
+    # global memory after storing would create a same-kernel write/read race.
+    dt_addrs = (
+        dt_ptr
+        + pid_b * stride_dt_batch
+        + heads_block[:, None] * stride_dt_head
+        + offs_t[None, :] * stride_dt_T
+    )
+    dt_new = tl.load(dt_addrs, mask=t_mask[None, :], other=0.0).to(tl.float32)
 
-        A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
-        dA_cumsum = tl.cumsum(A * dt, axis=0)
+    if HAS_DT_BIAS:
+        dt_bias_heads = tl.load(dt_bias_ptr + heads_block * stride_dt_bias_head).to(tl.float32)
+        dt_new = dt_new + dt_bias_heads[:, None]
+    if DT_SOFTPLUS:
+        dt_new = softplus(dt_new)
 
-        # Cross-step continuity for old_dA_cumsum: rectangle precompute runs
-        # only on the nowrite path (write_buf == buf_active, write_offset == PNAT).
-        # Add the running tail from buf_active[head_idx, PNAT-1] so the buffer
-        # holds one continuous cumsum across back-to-back nowrites.  PNAT is
-        # scalar/uniform, use scalar if to short-circuit the load at PNAT=0.
-        if prev_num_accepted_tokens == 0:
-            prev_total = 0.0
-        else:
-            last_cumsum_ptr = (
-                old_dA_cumsum_ptr
-                + cache_batch_idx * stride_old_dA_cumsum_cache
-                + buf_active * stride_old_dA_cumsum_dbuf
-                + head_idx * stride_old_dA_cumsum_head
-                + (prev_num_accepted_tokens - 1) * stride_old_dA_cumsum_T
-            )
-            prev_total = tl.load(last_cumsum_ptr).to(tl.float32)
+    A_heads = tl.load(A_ptr + heads_block * stride_A_head).to(tl.float32)
+    dA_cumsum_step = tl.cumsum(A_heads[:, None] * dt_new, axis=1)
 
-        # Store dt and dA_cumsum to write_buf at [write_offset, write_offset+T)
-        # for next step's replay/rectangle use.
-        old_dt_base = (
-            old_dt_ptr
-            + cache_batch_idx * stride_old_dt_cache
-            + write_buf * stride_old_dt_dbuf
-            + head_idx * stride_old_dt_head
-        )
-        tl.store(
-            old_dt_base + (write_offset + offs_t) * stride_old_dt_T,
-            dt,
-            mask=t_mask,
-        )
-
-        old_dA_cumsum_base = (
+    if prev_num_accepted_tokens == 0:
+        dA_cumsum_prefix = tl.zeros((HEADS_PER_BLOCK,), dtype=tl.float32)
+    else:
+        dA_cumsum_prefix_ptrs = (
             old_dA_cumsum_ptr
             + cache_batch_idx * stride_old_dA_cumsum_cache
-            + write_buf * stride_old_dA_cumsum_dbuf
-            + head_idx * stride_old_dA_cumsum_head
+            + buf_active * stride_old_dA_cumsum_dbuf
+            + heads_block * stride_old_dA_cumsum_head
+            + (prev_num_accepted_tokens - 1) * stride_old_dA_cumsum_T
         )
-        tl.store(
-            old_dA_cumsum_base + (write_offset + offs_t) * stride_old_dA_cumsum_T,
-            dA_cumsum + prev_total,
-            mask=t_mask,
-        )
+        dA_cumsum_prefix = tl.load(dA_cumsum_prefix_ptrs).to(tl.float32)
 
-    # ---- Hoisted: cache-only loads independent of conv1d ----
-    # old_B (group-level, BLOCK_K × BLOCK_DSTATE = ~8KB tile) and the
-    # decay_vec_full per-head pre-compute (which writes to DRAM and doesn't
-    # need cross-gdc_wait variables) are issued BEFORE gdc_wait so their
-    # HBM latency overlaps with conv1d.  Per-head factor_dt/exp_diff stay
-    # below gdc_wait — they need cross-iteration spans, which Triton can't
-    # express without a DRAM round-trip; the per-head LOADS in the post-
-    # wait loop are small and cheap, so leave them.
+    old_dt_write_addrs = (
+        old_dt_ptr
+        + cache_batch_idx * stride_old_dt_cache
+        + write_buf * stride_old_dt_dbuf
+        + heads_block[:, None] * stride_old_dt_head
+        + (write_offset + offs_t)[None, :] * stride_old_dt_T
+    )
+    tl.store(old_dt_write_addrs, dt_new, mask=t_mask[None, :])
+
+    old_dA_cumsum_write_addrs = (
+        old_dA_cumsum_ptr
+        + cache_batch_idx * stride_old_dA_cumsum_cache
+        + write_buf * stride_old_dA_cumsum_dbuf
+        + heads_block[:, None] * stride_old_dA_cumsum_head
+        + (write_offset + offs_t)[None, :] * stride_old_dA_cumsum_T
+    )
+    tl.store(
+        old_dA_cumsum_write_addrs,
+        dA_cumsum_step + dA_cumsum_prefix[:, None],
+        mask=t_mask[None, :],
+    )
+
+    # ---- Work independent of conv1d ----
+    # Load historical cache and build combo_block before gdc_wait so this
+    # work can overlap the upstream conv1d latency.
     group_idx = first_head // nheads_ngroups_ratio
 
     # Group-level: old B from active buffer at [0, PNAT) of the K-axis.
@@ -626,14 +617,10 @@ def _rectangle_precompute_impl(
         other=0.0,
     )
 
-    # Pre-wait: vectorized across HEADS_PER_BLOCK heads.  Compute decay_vec_full
-    # (H, T) and combo = factor_dt * exp_diff (H, T, K).  Store decay_vec_full;
-    # combo_block stays in registers across gdc_wait — used directly post-wait
-    # to compute rect_CB_scaled without a global memory roundtrip.
-    offs_h = tl.arange(0, HEADS_PER_BLOCK)
-    heads_block = first_head + offs_h  # (H,)
+    # combo_block stays in registers across gdc_wait and is used directly
+    # after the wait to compute rect_CB_scaled.
 
-    # Per-head bases (H,) — broadcast with offs_k or offs_t for 2D loads.
+    # Per-head read bases (H,) - broadcast with offs_k for 2D loads.
     old_dt_read_h = (
         old_dt_ptr
         + cache_batch_idx * stride_old_dt_cache
@@ -644,18 +631,6 @@ def _rectangle_precompute_impl(
         old_dA_cumsum_ptr
         + cache_batch_idx * stride_old_dA_cumsum_cache
         + buf_active * stride_old_dA_cumsum_dbuf
-        + heads_block * stride_old_dA_cumsum_head
-    )
-    old_dt_write_h = (
-        old_dt_ptr
-        + cache_batch_idx * stride_old_dt_cache
-        + write_buf * stride_old_dt_dbuf
-        + heads_block * stride_old_dt_head
-    )
-    old_dA_cumsum_write_h = (
-        old_dA_cumsum_ptr
-        + cache_batch_idx * stride_old_dA_cumsum_cache
-        + write_buf * stride_old_dA_cumsum_dbuf
         + heads_block * stride_old_dA_cumsum_head
     )
 
@@ -669,34 +644,29 @@ def _rectangle_precompute_impl(
         old_dA_cumsum_read_h[:, None] + safe_old_k[None, :] * stride_old_dA_cumsum_T,
         mask=hk_mask, other=0.0,
     ).to(tl.float32)
-    # (H, T) loads at [PNAT, PNAT+T) — this step's dA_cumsum_new from loop 1.
-    # With the cross-step continuity fix in loop 1, the values stored at
-    # [PNAT, PNAT+T) are the continuous cumsum (prefix + per-step new
-    # cumsum) — i.e., continuous_cumsum[PNAT..PNAT+T-1] in global indexing.
+    # Use loop-1 registers for this step's newly appended tokens.  These are
+    # exactly the values stored above at [PNAT, PNAT+T); reloading them here
+    # would read bytes this same kernel just wrote, which Triton does not
+    # guarantee to fence.
     ht_mask = t_mask[None, :]  # (1, T)
-    dA_cumsum_new = tl.load(
-        old_dA_cumsum_write_h[:, None]
-        + (write_offset + offs_t)[None, :] * stride_old_dA_cumsum_T,
-        mask=ht_mask, other=0.0,
-    ).to(tl.float32)
-    # (H, K) loads at PNAT-shifted positions for new tokens.
-    hkn_mask = is_new_k[None, :]
-    dt_at_kn = tl.load(
-        old_dt_write_h[:, None]
-        + (write_offset + safe_k_new)[None, :] * stride_old_dt_T,
-        mask=hkn_mask, other=0.0,
-    ).to(tl.float32)
-    dA_cumsum_at_kn = tl.load(
-        old_dA_cumsum_write_h[:, None]
-        + (write_offset + safe_k_new)[None, :] * stride_old_dA_cumsum_T,
-        mask=hkn_mask, other=0.0,
-    ).to(tl.float32)
+    dA_cumsum_new = dA_cumsum_step + dA_cumsum_prefix[:, None]  # (H, T)
 
-    # decay_vec_full[t] = exp(continuous_cumsum[PNAT+t]) — directly the
-    # continuous value now stored at buffer position write_offset+t.  Was
-    # decomposed as total_decay * exp(per_step_new[t]) when the buffer held
-    # per-step (non-continuous) cumsum; with the continuity fix the value
-    # IS continuous_cumsum[PNAT+t] so no decomposition is needed.
+    new_token_gather_idx = tl.broadcast_to(
+        safe_k_new[None, :], (HEADS_PER_BLOCK, BLOCK_SIZE_K)
+    )
+    dt_at_kn = tl.where(
+        is_new_k[None, :],
+        tl.gather(dt_new, new_token_gather_idx, axis=1),
+        0.0,
+    )  # (H, K)
+    dA_cumsum_at_kn = tl.where(
+        is_new_k[None, :],
+        tl.gather(dA_cumsum_new, new_token_gather_idx, axis=1),
+        0.0,
+    )  # (H, K)
+
+    # The write buffer stores continuous cumsum, so decay_vec_full[t] is
+    # exp(continuous_cumsum[PNAT+t]) directly.
     decay_vec_full_block = tl.exp(dA_cumsum_new)  # (H, T)
     decay_vec_addrs = (
         decay_vec_ptr
@@ -706,22 +676,9 @@ def _rectangle_precompute_impl(
     )  # (H, T)
     tl.store(decay_vec_addrs, decay_vec_full_block, mask=ht_mask)
 
-    # combo_block = factor_dt * exp_diff — (H, T, K).  Stays in registers
-    # across gdc_wait.  With continuous cumsum in the buffer, s_k for any k
-    # (old or new) is simply -continuous_cumsum[k]; exp_diff[t, k] then
-    # equals exp(continuous_cumsum[PNAT+t] - continuous_cumsum[k]) — the
-    # decay weight for token k's contribution to the output at position
-    # PNAT+t.  No need to subtract any "total" — the dA_cumsum_new[t] term
-    # already carries the full prefix.
-    #
-    # Numerical note: pre-fix this kernel computed `total - old_dA[k]`
-    # (small-minus-small) then summed `+ dA_cumsum_new[t]` (also small,
-    # per-step).  Post-fix `s_k = -old_dA[k]` is large-magnitude positive
-    # and `dA_cumsum_new[t]` is large-magnitude negative; their sum
-    # cancels back to the same small value.  Cancellation error is bounded
-    # by ulp(max_magnitude) ≈ 2^-23 · |continuous_cumsum| — negligible
-    # for max_window ≤ ~1024.  Still one exp on the sum (not two muls of
-    # exps), so no overflow regression vs the original formulation.
+    # combo_block[t, k] = dt[k] * exp(cumsum[t] - cumsum[k]).
+    # Old and new K positions share the same formula because both halves use
+    # continuous cumsum values.
     factor_dt = tl.where(is_old_k[None, :], old_dt_all, dt_at_kn)  # (H, K)
     s_k = tl.where(
         is_old_k[None, :],
