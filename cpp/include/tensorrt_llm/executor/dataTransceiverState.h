@@ -182,13 +182,13 @@ public:
         /// Conv state = [section0 | section1 | section2], always 3 sections.
         /// Each section is independently TP-sharded, so TP mismatch requires per-section split.
         /// Section dims are derived from mHiddenSize (= d_inner) and mNGroups * mDState (= ng_ds):
-        ///   kNEMOTRON: [d_inner, ng_ds, ng_ds]  (x | B | C)
-        ///   kQWEN3_NEXT: [ng_ds, ng_ds, d_inner] (Q | K | V)
+        ///   kXBC: [d_inner, ng_ds, ng_ds]  (x | B | C)
+        ///   kQKV: [ng_ds, ng_ds, d_inner] (Q | K | V)
         enum class ConvSectionLayout : SizeType32
         {
-            kNONE = 0,       // Legacy / unknown — no section-aware split
-            kNEMOTRON = 1,   // [d_inner, ng_ds, ng_ds]
-            kQWEN3_NEXT = 2, // [ng_ds, ng_ds, d_inner]
+            kNONE = 0, // Legacy / unknown — no section-aware split
+            kXBC = 1,  // [d_inner, ng_ds, ng_ds]
+            kQKV = 2,  // [ng_ds, ng_ds, d_inner]
         };
 
         static constexpr SizeType32 kNumConvSections = 3;
@@ -212,9 +212,9 @@ public:
             SizeType32 const ngDs = mNGroups * mDState; // n_groups * d_state
             switch (mConvSectionLayout)
             {
-            case ConvSectionLayout::kNEMOTRON: return {dInner, ngDs, ngDs};
-            case ConvSectionLayout::kQWEN3_NEXT: return {ngDs, ngDs, dInner};
-            default: return {0, 0, 0};
+            case ConvSectionLayout::kXBC: return {dInner, ngDs, ngDs};
+            case ConvSectionLayout::kQKV: return {ngDs, ngDs, dInner};
+            default: TLLM_THROW("Invalid conv section layout");
             }
         }
 

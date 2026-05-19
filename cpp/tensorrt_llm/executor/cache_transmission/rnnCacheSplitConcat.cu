@@ -1433,7 +1433,7 @@ void splitUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<S
     int const effectiveDomainTP = domainTPSize / targetRankInfo.mPeerDupHeadFactor;
 
     TLLM_CHECK_WITH_INFO(
-        selfModelConfig.hasConvSections(), "splitUnifiedPoolConv requires conv section info (hasConvSections)");
+        selfModelConfig.hasConvSections(), "Failed to get conv state info, please double check the model type");
 
     static constexpr int numConvSections = kv_cache::CacheState::RnnModelConfig::kNumConvSections;
     auto const globalSectionDims = selfModelConfig.getConvSectionDims();
@@ -1674,10 +1674,10 @@ void concatUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<
     int const effectiveDomainTP = domainTPSize / targetRankInfo.mPeerDupHeadFactor;
 
     TLLM_CHECK_WITH_INFO(
-        selfModelConfig.hasConvSections(), "concatUnifiedPoolConv requires conv section info (hasConvSections)");
+        selfModelConfig.hasConvSections(), "Failed to get conv state info, please double check the model type");
 
     static constexpr int numConvSections = kv_cache::CacheState::RnnModelConfig::kNumConvSections;
-    auto const globalSectionDims = selfModelConfig.getConvSectionDims();
+    auto const globalSectionDims = selfModelConfig.getConvSectionDisms();
 
     std::array<int, numConvSections> sectionDimsLocal;
     std::array<int, numConvSections> sectionDimsDomainTP;
