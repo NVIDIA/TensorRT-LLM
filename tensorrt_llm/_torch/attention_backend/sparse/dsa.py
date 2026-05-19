@@ -1296,6 +1296,26 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV, self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
+            # DSL atom-split path: mirror the prepare()-time build so that
+            # overlap-scheduler / spec-dec runtime corrections to kv_lens_cuda
+            # propagate into kv_lens_expanded_cuda and the matching schedule.
+            # Reuse the cached (dsl_expand_factor, dsl_atom) — re-running the
+            # picker here would let the split decision drift between prepare
+            # and forward, breaking CUDA graph capture.
+            if self.expand_for_dsl and self.dsl_expand_factor > 1:
+                expand_factor = self.dsl_expand_factor
+                num_tokens = self.num_generations * expand_factor
+                gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(
+                    expand_factor)
+                self.kv_lens_expanded_cuda[:num_tokens].copy_(
+                    gen_kv_lens_expanded)
+                kv_lens_expanded_2d = self.kv_lens_expanded_cuda[:
+                                                                 num_tokens].view(
+                                                                     -1, 1)
+                scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                    kv_lens_expanded_2d, _DG_SCHEDULE_BLOCK_KV, self.num_sms)
+                self.scheduler_metadata_buffer_expanded.copy_(
+                    scheduler_metadata_buffer_expanded, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
