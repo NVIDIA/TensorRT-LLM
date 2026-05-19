@@ -22,7 +22,6 @@ from typing import Callable
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 
 from tensorrt_llm.logger import logger
 
@@ -31,39 +30,6 @@ VideoGuardrailFn = Callable[[np.ndarray], np.ndarray]
 
 GUARDRAIL_HF_REPO = "nvidia/Cosmos-Guardrail1"
 GUARDRAIL_HF_REVISION = "d6d4bfa899a71454a700907664f3e88f503950cf"
-CUTOFF_UNSAFE_FRAMES_PERCENT = 10
-
-
-# ---------------------------------------------------------------------------
-# Video safety classifier (matches reference: SigLIP so400m + 3-layer head)
-# ---------------------------------------------------------------------------
-class SafetyClassifier(nn.Module):
-    """3-layer classifier with BatchNorm (1152 → 512 → 256 → 7)."""
-
-    def __init__(self, input_size: int = 1152, num_classes: int = 7):
-        super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(input_size, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
-
-
-CLASS_IDX_TO_NAME = {
-    0: "Safe",
-    1: "Sexual_Content",
-    3: "Drugs",
-    4: "Child_Abuse",
-    5: "Hate_and_Harassment",
-    6: "Self-Harm",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -200,64 +166,9 @@ def build_text_guardrail(guardrail_ckpt_dir: str) -> TextGuardrailFn:
 
 
 def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
-    safety_checker: Callable[[np.ndarray], tuple[bool, str]] | None = None
     face_blurrer: Callable[[np.ndarray], np.ndarray] | None = None
 
-    # 1. Video content safety filter: SigLIP so400m + SafetyClassifier
-    try:
-        from PIL import Image
-        from transformers import SiglipModel, SiglipProcessor
-
-        siglip_dir = os.path.join(
-            guardrail_ckpt_dir,
-            "video_content_safety_filter",
-            "models--google--siglip-so400m-patch14-384/snapshots/9fdffc58afc957d1a03a25b10dba0329ab15c2a3",
-        )
-        if not os.path.exists(siglip_dir):
-            raise FileNotFoundError(siglip_dir)
-
-        siglip_model = (
-            SiglipModel.from_pretrained(siglip_dir).to("cuda", dtype=torch.float32).eval()
-        )
-        siglip_processor = SiglipProcessor.from_pretrained(siglip_dir)
-
-        classifier = SafetyClassifier(input_size=1152, num_classes=7)
-        ckpt_path = os.path.join(
-            guardrail_ckpt_dir, "video_content_safety_filter", "safety_filter.pt"
-        )
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        state = {k.removeprefix("network."): v for k, v in checkpoint["model"].items()}
-        classifier.load_state_dict(state)
-        classifier = classifier.to("cuda", dtype=torch.float32).eval()
-
-        def _safety_check(frames: np.ndarray) -> tuple[bool, str]:
-            unsafe_count = 0
-            total = len(frames)
-            for frame in frames:
-                img = Image.fromarray(frame)
-                inputs = siglip_processor(images=img, return_tensors="pt").to(
-                    "cuda", dtype=torch.float32
-                )
-                with torch.no_grad():
-                    siglip_out = siglip_model.get_image_features(**inputs)
-                    features = siglip_out.pooler_output
-                    features = features / features.norm(dim=-1, keepdim=True)
-                    logits = classifier(features)
-                    pred = logits.argmax(dim=-1).item()
-                class_name = CLASS_IDX_TO_NAME.get(pred, "Unknown")
-                if class_name != "Safe":
-                    unsafe_count += 1
-
-            if unsafe_count / total > CUTOFF_UNSAFE_FRAMES_PERCENT / 100:
-                return False, f"Video content safety: {unsafe_count}/{total} frames unsafe"
-            return True, ""
-
-        safety_checker = _safety_check
-        logger.info("Video content safety filter loaded (SigLIP so400m + classifier)")
-    except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError) as e:
-        logger.warning("Could not load video safety filter: %s", e)
-
-    # 2. Face blur: RetinaFace + pixelation
+    # Face blur: RetinaFace + pixelation
     try:
         from retinaface.data import cfg_re50
         from retinaface.layers.functions.prior_box import PriorBox
@@ -365,19 +276,13 @@ def build_video_guardrail(guardrail_ckpt_dir: str) -> VideoGuardrailFn:
     except (ImportError, FileNotFoundError, OSError, RuntimeError, ValueError) as e:
         logger.warning("Could not load face blur filter: %s", e)
 
-    def video_guardrail(frames: np.ndarray) -> np.ndarray | None:
-        if safety_checker is None:
+    def video_guardrail(frames: np.ndarray) -> np.ndarray:
+        if face_blurrer is None:
             raise RuntimeError(
-                "Video content safety classifier failed to load. "
+                "Face blur filter not loaded. "
                 "Set TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 to explicitly disable guardrails."
             )
-        is_safe, msg = safety_checker(frames)
-        if not is_safe:
-            logger.warning(f"Video content safety: {msg}")
-            return None
-        if face_blurrer is not None:
-            frames = face_blurrer(frames)
-        return frames
+        return face_blurrer(frames)
 
     return video_guardrail
 

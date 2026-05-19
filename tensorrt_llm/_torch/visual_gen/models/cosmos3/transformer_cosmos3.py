@@ -1006,9 +1006,9 @@ class Cosmos3VFMTransformer(nn.Module):
                 remapped[k] = value
                 continue
 
-            if k.startswith("time_embedder.mlp."):
-                k = k.replace("time_embedder.mlp.0.", "time_embedder.mlp.linear_1.")
-                k = k.replace("time_embedder.mlp.2.", "time_embedder.mlp.linear_2.")
+            if k.startswith("time_embedder.linear"):
+                k = k.replace("time_embedder.linear_1.", "time_embedder.mlp.linear_1.")
+                k = k.replace("time_embedder.linear_2.", "time_embedder.mlp.linear_2.")
                 remapped[k] = value
                 continue
 

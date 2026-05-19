@@ -616,24 +616,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         video = self.decode_latents(latents, self._decode_latents)
 
-        # Video guardrail
-        video_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
+        # Video guardrails
         if self.rank == 0:
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
             if use_guardrails and self.video_guardrail is not None:
                 video = check_video_safety(video, self.video_guardrail)
-                if video is None:
-                    logger.warning("Video guardrail blocked video generation")
-                    video_blocked.fill_(1)
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.broadcast(video_blocked, src=0)
-
-        if video_blocked.item():
-            timer.mark_end()
-            return timer.fill(PipelineOutput())
 
         timer.mark_end()
         return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
