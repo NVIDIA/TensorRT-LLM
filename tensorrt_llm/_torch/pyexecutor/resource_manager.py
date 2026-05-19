@@ -57,6 +57,7 @@ from .scheduler import ScheduledRequests
 
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
+PoolConfigurationCpp = tensorrt_llm.bindings.internal.batch_manager.PoolConfiguration
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfigCpp = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -615,6 +616,18 @@ class KVCacheManager(BaseResourceManager):
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
         logger.info(f"[KVCacheManager] blocks_per_window: {blocks_per_window}")
+
+        # The Python @dataclass PoolConfiguration is a distinct type from the
+        # nanobind C++ PoolConfiguration (Python uses ``head_dim``; C++ uses
+        # ``size_per_head``).  Translate at the C++ boundary so nanobind can
+        # dispatch the ctor.
+        pool_configurations_cpp = [
+            PoolConfigurationCpp(window_size=pc.window_size,
+                                 size_per_head=pc.head_dim,
+                                 dtype=pc.dtype)
+            for pc in self.pool_configurations
+        ]
+
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -641,7 +654,7 @@ class KVCacheManager(BaseResourceManager):
             'linear_attention_metadata': linear_attention_metadata,
             # Forward the (possibly remapped) per-pool configurations.
             # window_size values are aligned with the post-clamp sizes.
-            'pool_configurations': self.pool_configurations,
+            'pool_configurations': pool_configurations_cpp,
         }
 
         if self.event_buffer_max_size > 0:
