@@ -2216,6 +2216,31 @@ class Indexer(nn.Module):
             topk_indices_buffer[:num_ctx_tokens, :] = \
                 metadata.topk_indices_buffer[:num_ctx_tokens, :]
 
+        # Prefill→decode GVR handoff: seed each finishing-prefill sequence's
+        # heuristic_prev_topk slot with its own last-context-token top-K, so
+        # the FIRST decode step of that sequence gets a warm-started preIdx
+        # (~60-75% set-overlap with the eventual decode top-K on this
+        # workload) instead of the all-zero / all-(-1) cold start that the
+        # default `heuristic_prev_topk.zero_()` initialization leaves behind.
+        # Without this, GVR P2 secant on decode step 0 runs from a benign
+        # but uninformative seed (kernel +1 offset on zeros → all indices
+        # point at compressed-token position 1), wasting iterations.
+        # Slot convention (mirrors the existing decode write-back at the
+        # bottom of the decode block): new gens from finishing prefill
+        # append after currently-active gens, i.e., slots
+        # [num_generations : num_generations + num_contexts].
+        if (self._enable_heuristic_topk and has_prefill
+                and not metadata.skip_indexer_for_ctx_reqs):
+            local_layer = metadata.kv_cache_manager.layer_offsets[
+                self.layer_idx]
+            ctx_seq_lens = metadata.seq_lens[:num_contexts]
+            # Per-sequence last context-token offset (exclusive cumsum minus 1).
+            last_ctx_idx = (torch.cumsum(ctx_seq_lens, dim=0) -
+                            1).to(dtype=torch.long)
+            metadata.heuristic_prev_topk[
+                local_layer, num_generations:num_generations +
+                num_contexts].copy_(topk_indices_buffer[last_ctx_idx, :])
+
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
