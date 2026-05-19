@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@create_PR']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1079,11 +1079,7 @@ def collectTestResults(pipeline, testFilter)
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
-            // TEMP(testing): post-merge + SUCCESS gates disabled so this draft PR's
-            // pre-merge pipeline exercises the createAutoUpdatePR path end-to-end.
-            // REVERT BEFORE MERGE: restore the two `if` conditions shown below.
-            // if (testFilter[(IS_POST_MERGE)]) {
-            if (true) {
+            if (testFilter[(IS_POST_MERGE)]) {
                 try {
                     sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
                     trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
@@ -1091,8 +1087,7 @@ def collectTestResults(pipeline, testFilter)
                     // No need to fail the stage if the duration file generation fails
                     echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
                 }
-                // if (currentBuild.currentResult == 'SUCCESS') {
-                if (true) {
+                if (currentBuild.currentResult == 'SUCCESS') {
                     // Mark the stage UNSTABLE (yellow) on any failure inside this block
                     // while keeping the overall build result SUCCESS. Without this, the
                     // inner `try/echo` would swallow the exception and the stage would
@@ -1124,8 +1119,8 @@ def collectTestResults(pipeline, testFilter)
                             dstFile:       "tests/integration/defs/.test_durations",
                             branchName:    "auto/update_test_durations",
                             forcePush:     true,
-                            commitMessage: "[None][chore] Auto-update test durations from post-merge #${BUILD_NUMBER}",
-                            prTitle:       "[None][chore] Auto-update test durations from post-merge",
+                            commitMessage: "[None][infra] Auto-update test durations from post-merge #${BUILD_NUMBER}",
+                            prTitle:       "[None][infra] Auto-update test durations from post-merge",
                             prBody:        "Continuously refreshed by the post-merge pipeline: each run force-pushes the latest pytest-split test duration file onto this branch. See the branch's commit list for the originating build number.",
                         ])
                     }

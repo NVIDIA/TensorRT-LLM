@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import csv
 import glob
@@ -67,14 +82,14 @@ for report_csv in all_csv_files:
 
                 test_durations[test_name] = duration
                 passed_count += 1
-    except Exception as e:
+    except (OSError, csv.Error) as e:
         print(f"  Warning: Failed to process {report_csv}: {e}")
 
 # Write the test durations to the output file
 with open(NEW_TEST_DURATION, 'w') as file:
     json.dump(test_durations, file, indent=3)
 
-print(f"\nSummary:")
+print("\nSummary:")
 print(f"  CSV files processed : {len(all_csv_files)}")
 print(f"  Passed rows collected : {passed_count}")
 print(f"  Non-passed rows skipped: {skipped_count}")
