@@ -110,12 +110,6 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 // shared-lib PATTERN_CATALOG.
 SLURM_INFRA_RETRY_MAX = 2
 
-// Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
-// Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
-// independently as production telemetry comes in. Patterns tagged scope=K8S
-// or BOTH in the shared-lib PATTERN_CATALOG.
-K8S_INFRA_RETRY_MAX = 2
-
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -2818,7 +2812,7 @@ REUSED_TESTS_EOF
  * Decode a postTag into the postTags used by prior attempts of the same
  * stage in this build.
  *
- * The retry runner (runKubernetesPodWithInfraRetry, runLLMTestlistOnSlurm)
+ * The retry runner (trtllm_utils.runKubernetesPodWithInfraRetry, runLLMTestlistOnSlurm)
  * composes postTag as ``${callerSuppliedBase}-attempt-${N}`` for retries
  * (and the bare base for attempt 1, e.g. ``""`` or ``"-SubJob-RunTest"``).
  * This function inverts that composition to enumerate the postTags of
@@ -3196,12 +3190,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
 
 // Single-attempt test path. The infra-failure retry loop now lives one layer up
-// in `runKubernetesPodWithInfraRetry` so that retries get a fresh K8s pod
-// (recovering from ImagePullBackOff, pod eviction, OOMKilled, JNLP disconnect,
-// etc.). Callers that want pod-level retry pass through `postTag` (already
-// composed with an attempt tag by the helper) and `isFinalAttempt` (so this
-// function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
-// and junit() for intermediate retryable failures).
+// in `trtllm_utils.runKubernetesPodWithInfraRetry` so that retries get a fresh
+// K8s pod (recovering from ImagePullBackOff, pod eviction, OOMKilled, JNLP
+// disconnect, etc.). Callers that want pod-level retry pass through `postTag`
+// (already composed with an attempt tag by the helper) and `isFinalAttempt`
+// (so this function's `cacheErrorAndUploadResult` can suppress synthetic
+// stage-fail XML and junit() for intermediate retryable failures).
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true)
 {
     def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
@@ -3490,96 +3484,6 @@ def runInKubernetes(pipeline, podSpec, containerName)
     }
 }
 
-// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification
-// (classify(ex, InfraFailure.K8S)), budget (K8S_INFRA_RETRY_MAX), and backoff,
-// but operates at the pod-launch level so transient pod failures
-// (ImagePullBackOff, eviction, OOMKilled, JNLP disconnect, node NotReady) get
-// a fresh pod on each retry rather than
-// retrying the test body inside a dying pod.
-//
-// `runner` is invoked with `(attemptTag, isFinalAttempt)`. Callers append
-// `attemptTag` to any postTag they pass into cacheErrorAndUploadResult so each
-// attempt's tar and ensureStageResultNotUploaded guard key are unique;
-// `isFinalAttempt` lets cacheErrorAndUploadResult suppress synthetic stage-fail
-// XML and junit() for intermediate retryable failures so the per-build test
-// report isn't poisoned by transient infra blips that the next attempt
-// recovers from.
-def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stageName, Closure runner)
-{
-    // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
-    // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
-    if (testFilter[(DEBUG_MODE)]) {
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true) })
-        return
-    }
-
-    def attempt = 0
-    // Severity of the previous attempt's classification, or null on first attempt.
-    // Used to compute isFinalAttempt for the next attempt: a PERSISTENT prior
-    // failure caps the budget at 1 retry (attempt 2 is final), so the next
-    // attempt must not suppress synthetic stage-fail XML / junit().
-    def lastSeverity = null
-    while (true) {
-        attempt++
-        try {
-            if (attempt > 1) {
-                echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${K8S_INFRA_RETRY_MAX + 1}"
-            }
-            // Attempt 1 keeps the caller-supplied postTag verbatim so the
-            // canonical artifact name is unchanged for downstream consumers.
-            // Retries append "-attempt-N" to dodge the upload-once guard and
-            // preserve every attempt's tarball in Artifactory.
-            def attemptTag = (attempt == 1) ? "" : "-attempt-${attempt}"
-            // For attempt 1 we don't yet know whether the failure (if any) will
-            // be PERSISTENT, so use the worst-case multi-retry budget. From
-            // attempt 2 onward we know the prior classification — if it was
-            // PERSISTENT, effectiveMax for THIS attempt is 1, meaning attempt
-            // 2 IS the final attempt; pass isFinalAttempt=true so the inner
-            // cacheErrorAndUploadResult does not suppress synthetic stage-fail
-            // XML / junit() on what would otherwise look (to it) like just
-            // another intermediate attempt.
-            def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
-            boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner(attemptTag, isFinalAttempt) })
-            if (attempt > 1) {
-                echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
-            }
-            return
-        } catch (InterruptedException e) {
-            // User abort / pipeline timeout -- never retry
-            throw e
-        } catch (Exception e) {
-            // classify() handles FlowInterruptedException + exit-code-143 +
-            // typed throws + cause-chain pattern matching, returning one of
-            // PipelineInterruption / InfraFailure / UserFailure. Scope=K8S
-            // ensures we only match catalog rows tagged K8S or BOTH; the new
-            // scope-isolation guard inside classify() also prevents a typed
-            // SLURM-scoped InfraFailure (e.g. from an inner SLURM retry that
-            // exhausted its own budget) from being treated as K8s infra here.
-            def c = FailureClassifier.classify(e, InfraFailure.K8S)
-            if (c instanceof PipelineInterruption) throw e
-            if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
-
-            def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
-
-            if (attempt > effectiveMax) {
-                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
-                     "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
-                throw e
-            }
-
-            echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
-                 "${c.detectedPattern}"
-            echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
-            echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
-
-            // Remember severity so the next attempt's isFinalAttempt is correct.
-            lastSeverity = c.severity
-            sleep(60)
-        }
-    }
-}
-
 def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false) {
     def configs = [:]
     for (int k = 1; k <= testCount; k++) {
@@ -3764,7 +3668,7 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += x86SlurmTestConfigs.keySet()
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt ->
-        // attemptTag/isFinalAttempt come from runKubernetesPodWithInfraRetry
+        // attemptTag/isFinalAttempt come from trtllm_utils.runKubernetesPodWithInfraRetry
         // for the outer dispatcher pod; the inner SLURM job runs its own
         // retry loop (runLLMTestlistOnSlurm) so we don't thread these through.
         def config = VANILLA_CONFIG
@@ -4157,7 +4061,7 @@ def launchTestJobs(pipeline, testFilter)
             if (checkPipStage) {
                 stage("Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
-                    runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt ->
+                    trtllm_utils.runKubernetesPodWithInfraRetry(singleAttempt: testFilter[(DEBUG_MODE)], pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt ->
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
@@ -4403,7 +4307,7 @@ def launchTestJobs(pipeline, testFilter)
                     echo "Skip - Passed in the previous pipelines."
                 }
             } else if (values instanceof List) {
-                runKubernetesPodWithInfraRetry(pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt ->
+                trtllm_utils.runKubernetesPodWithInfraRetry(singleAttempt: testFilter[(DEBUG_MODE)], pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt ->
                     values[1](attemptTag, isFinalAttempt)
                 })
             } else {
@@ -4477,7 +4381,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
-                runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt ->
+                trtllm_utils.runKubernetesPodWithInfraRetry(singleAttempt: testFilter[(DEBUG_MODE)], pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
                     runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt)
