@@ -1431,8 +1431,11 @@ class SequenceInfo:
         use_initial_states[:] = input_pos > 0
 
         # --- Bulk device-to-host sync ---
-        # TODO: we have to continue thinking about this and dissect more what fields are needed in
-        # the forward pass if we use cudagraph...
+        # This ensures that the H2D copy done by InputBuffer.copy_to_device() has been executed
+        # before we update the host-side tensors.
+        # By gating this on sync_to_host, we ensure that we only sync when a custom op needs updated host arguments.
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
         if sync_to_host:
             self._input_buffer.copy_to_host()
 
@@ -1465,12 +1468,17 @@ class SequenceInfo:
         an all-decode layout where each sequence has exactly 1 token. We assume that we just take
         the last position of each sequence for the metadata.
 
-        NOTE: right now, we always update both host and device tensor to ensure this does not
-        interfere with the device-to-host sync in offset_pos_and_cache_.
+        NOTE: update device tensors first and mirror back to host only when an updated host-side
+        argument is active.
 
-        NOTE: we assume the same structure as in nest_sequences for when to update the arguments.
-        In particular, arguments that are always updated in nest_sequences are also updated here.
-        Others are updated optionally depending on the argument being active.
+        This prevents race conditions with the H2D copy done by InputBuffer.copy_to_device().
+        The H2D copy was queued before the forward pass, but may not have been executed yet.
+        If this copy has not been executed and we updated host arguments directly,
+        we would be overwriting them with new values which would lead to these new values getting copied
+        to device when we wanted to copy the old data. By updating via a D2H sync on the active stream,
+        we ensure that these host-side tensors are updated *after* the H2D copy has been executed.
+
+        Additionally, we make sure the D2H sync only happens only when a custom op needs updated host arguments.
         """
         # already in generate mode
         if self.is_generate_only:
@@ -1483,31 +1491,49 @@ class SequenceInfo:
         self.batch_info.update([0, 0, 0, 0, num_seq, num_seq])
         self.batch_info.update_tokens_gather_info(num_seq, False)
 
-        for device, suffix in (
-            (self.host_device, self._host_suffix),
-            (self.device, ""),
-        ):
-            # --- input_ids ---
-            # use cu_seqlen as heuristic to get the input_ids if available
-            input_ids_flat = self.get_arg(f"input_ids{suffix}", truncate=False, unflatten=False)
-            extraction_indices = (self.get_arg(f"cu_seqlen{suffix}", truncate=True)[1:] - 1).long()
-            self.copy_(f"input_ids{suffix}", input_ids_flat[extraction_indices], strict=False)
+        # check if we need a d2h sync
+        _REQUIRES_UPDATE = {
+            "input_ids",
+            "input_pos",
+            "cu_seqlen",
+            "seq_len",
+            "position_ids",
+            "use_initial_states",
+        }
+        needs_d2h_sync = [
+            k + self._host_suffix
+            for k in _REQUIRES_UPDATE
+            if self._is_active(k + self._host_suffix, check_both=False)
+        ]
+        sync_to_host = any(needs_d2h_sync)
 
-            # --- input_pos ---
-            input_pos = self.get_arg(f"input_pos{suffix}", truncate=True)
-            input_pos += self.get_arg(f"seq_len{suffix}", truncate=True) - 1
+        # --- input_ids (device) ---
+        # use cu_seqlen as heuristic to get the input_ids if available
+        input_ids_flat = self.get_arg("input_ids", truncate=False, unflatten=False)
+        extraction_indices = (self.get_arg("cu_seqlen", truncate=True)[1:] - 1).long()
+        self.copy_("input_ids", input_ids_flat[extraction_indices], strict=False)
 
-            # --- cu_seqlen ---
-            cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=device)
-            self.copy_(f"cu_seqlen{suffix}", cu_seqlen)
+        # --- input_pos (device) ---
+        input_pos = self.get_arg("input_pos", truncate=True)
+        input_pos += self.get_arg("seq_len", truncate=True) - 1
 
-            # --- seq_len ---
-            seq_len = self.get_arg(f"seq_len{suffix}", truncate=True)
-            seq_len.fill_(1)
+        # --- cu_seqlen (device) ---
+        cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=self.device)
+        self.copy_("cu_seqlen", cu_seqlen)
 
-            # --- update derivative metadata that change in generate-only mode if active ---
-            self.copy_(f"position_ids{suffix}", input_pos, strict=False)
-            self.copy_(f"use_initial_states{suffix}", input_pos > 0)
+        # --- seq_len (device) ---
+        seq_len = self.get_arg("seq_len", truncate=True)
+        seq_len.fill_(1)
+
+        # ---  update derivative metadata that change in generate-only mode if active (device) ---
+        self.copy_("position_ids", input_pos, strict=False)
+        self.copy_("use_initial_states", input_pos > 0)
+
+        # --- Bulk device-to-host sync ---
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
+        if sync_to_host:
+            self._input_buffer.copy_to_host()
 
     def copy_(self, name: str, src: torch.Tensor, strict: bool = True) -> None:
         """Copy a tensor into the buffer. USE WITH CAUTION!

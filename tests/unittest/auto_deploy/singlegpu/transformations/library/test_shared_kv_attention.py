@@ -12,6 +12,9 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention i
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_backend_attention import (
     TorchBackendAttention,
 )
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+    TritonPagedAttention,
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
@@ -347,6 +350,266 @@ def test_flashinfer_cached_attention_is_dynamic_for_piecewise():
     assert is_dynamic_cached_op(
         _FakeNode(torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default)
     )
+
+
+def test_triton_paged_backend_attention_metadata_for_shared_kv_node():
+    module = _TinySharedKVModule().eval()
+    gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
+    source_nodes = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target == torch.ops.auto_deploy.torch_attention.default
+    ]
+    regular = next(
+        node
+        for node in source_nodes
+        if node.target == torch.ops.auto_deploy.torch_attention.default
+    )
+    shared = next(node for node in source_nodes if TritonPagedAttention.get_layer_idx(node) == 1)
+
+    assert TritonPagedAttention.get_layer_idx(regular) == 0
+    assert TritonPagedAttention.get_layer_idx(shared) == 1
+    assert TritonPagedAttention.get_shared_kv_source_layer_idx(regular) is None
+    assert TritonPagedAttention.get_shared_kv_source_layer_idx(shared) == 0
+    assert TritonPagedAttention.get_cached_attention_op() == (
+        torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    )
+
+
+def test_shared_kv_transform_aliases_source_cache_placeholders_for_triton_paged():
+    module = _TinySharedKVModule().eval()
+    gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
+
+    cm = CachedSequenceInterface(
+        max_seq_len=16,
+        max_batch_size=2,
+        max_num_tokens=16,
+        device="cpu",
+    )
+    transform = _InsertCachedOperator(
+        InsertCachedAttentionConfig(stage=Stages.CACHE_INIT, backend="triton_paged")
+    )
+    gm, info = transform._apply(gm, cm, factory=None, shared_config=SharedConfig())
+
+    assert info.num_matches == 2
+
+    placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
+    assert placeholder_names.count("r0_kv_cache") == 1
+    assert "r1_kv_cache" not in placeholder_names
+    assert set(cm._resource_lookup).issubset(set(placeholder_names))
+
+    cached_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
+    regular_node = next(
+        node
+        for node in cached_nodes
+        if node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+        and node.args[-1] is False
+    )
+    shared_node = next(
+        node
+        for node in cached_nodes
+        if node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+        and node.args[-1] is True
+    )
+
+    assert regular_node.args[13] is shared_node.args[13]
+    assert regular_node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    assert shared_node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    assert regular_node.args[-1] is False
+    assert shared_node.args[-1] is True
+
+
+@torch.no_grad()
+def test_triton_paged_shared_kv_cached_attention_reads_aliased_cache_without_writing():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for triton_paged shared-KV runtime coverage")
+
+    device = torch.device("cuda")
+    head_dim = 16
+
+    q = torch.tensor([[[[1.0] * head_dim]]], dtype=torch.float16, device=device)
+    dummy_k = torch.full((1, 1, 1, head_dim), 7.0, dtype=torch.float16, device=device)
+    dummy_v = torch.full((1, 1, 1, head_dim), -3.0, dtype=torch.float16, device=device)
+
+    owner_k = torch.tensor(
+        [[[[1.0] * head_dim], [[0.0] * head_dim], [[0.5] * head_dim]]],
+        dtype=torch.float16,
+        device=device,
+    )
+    owner_v = torch.tensor(
+        [[[[10.0] * head_dim], [[20.0] * head_dim], [[30.0] * head_dim]]],
+        dtype=torch.float16,
+        device=device,
+    )
+
+    kv_cache = torch.zeros((1, 2, 1, 32, head_dim), dtype=torch.float16, device=device)
+    kv_cache[0, 0, 0, :3, :] = owner_k[0, :, 0, :]
+    kv_cache[0, 1, 0, :3, :] = owner_v[0, :, 0, :]
+    kv_cache_before = kv_cache.clone()
+    owner_write_cache = torch.zeros_like(kv_cache)
+    owner_write_cache[0, 0, 0, :2, :] = owner_k[0, :2, 0, :]
+    owner_write_cache[0, 1, 0, :2, :] = owner_v[0, :2, 0, :]
+
+    batch_info_host = BatchInfo()
+    batch_info_host.update([0, 0, 0, 0, 1, 1])
+    cu_seqlen_host = torch.tensor([0, 1], dtype=torch.int32)
+    cu_num_pages = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    cu_num_pages_host = torch.tensor([0, 1], dtype=torch.int32)
+    cache_loc = torch.tensor([0], dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([3], dtype=torch.int32, device=device)
+    last_page_len_host = torch.tensor([3], dtype=torch.int32)
+    seq_len_with_cache_host = torch.tensor([3], dtype=torch.int32)
+    position_ids = torch.tensor([[0]], dtype=torch.int32, device=device)
+
+    triton_batch_indices, triton_positions = torch.ops.auto_deploy.triton_paged_prepare_metadata(
+        position_ids,
+        batch_info_host.serialize(),
+        cu_seqlen_host.to(device),
+        seq_len_with_cache_host.to(device),
+    )
+
+    output = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+        q,
+        dummy_k,
+        dummy_v,
+        batch_info_host.serialize(),
+        cu_seqlen_host,
+        cu_num_pages,
+        cu_num_pages_host,
+        cache_loc,
+        last_page_len,
+        last_page_len_host,
+        seq_len_with_cache_host,
+        triton_batch_indices,
+        triton_positions,
+        kv_cache,
+        1.0 / (head_dim**0.5),
+        None,
+        True,
+    )
+    expected = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+        q,
+        owner_k[:, 2:3],
+        owner_v[:, 2:3],
+        batch_info_host.serialize(),
+        cu_seqlen_host,
+        cu_num_pages,
+        cu_num_pages_host,
+        cache_loc,
+        last_page_len,
+        last_page_len_host,
+        seq_len_with_cache_host,
+        triton_batch_indices,
+        triton_positions,
+        owner_write_cache,
+        1.0 / (head_dim**0.5),
+        None,
+        False,
+    )
+
+    torch.testing.assert_close(kv_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(owner_write_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(output, expected, rtol=0.0, atol=0.0)
+
+
+@torch.no_grad()
+def test_triton_paged_shared_kv_prefill_sdpa_reads_aliased_cache_without_writing():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for triton_paged shared-KV SDPA runtime coverage")
+
+    from unittest.mock import patch
+
+    device = torch.device("cuda")
+    dtype = torch.float16
+    seq_len = 512
+    page_size = 32
+    num_pages = seq_len // page_size
+    n_heads = 4
+    n_kv_heads = 2
+    head_dim = 64
+
+    torch.manual_seed(0)
+    q = torch.randn(1, seq_len, n_heads, head_dim, dtype=dtype, device=device)
+    dummy_k = torch.full((1, seq_len, n_kv_heads, head_dim), 7.0, dtype=dtype, device=device)
+    dummy_v = torch.full((1, seq_len, n_kv_heads, head_dim), -3.0, dtype=dtype, device=device)
+    owner_k = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=dtype, device=device)
+    owner_v = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=dtype, device=device)
+
+    kv_cache = torch.zeros(
+        (num_pages, 2, n_kv_heads, page_size, head_dim), dtype=dtype, device=device
+    )
+    owner_k_pages = owner_k[0].view(num_pages, page_size, n_kv_heads, head_dim)
+    owner_v_pages = owner_v[0].view(num_pages, page_size, n_kv_heads, head_dim)
+    kv_cache[:, 0] = owner_k_pages.permute(0, 2, 1, 3)
+    kv_cache[:, 1] = owner_v_pages.permute(0, 2, 1, 3)
+    kv_cache_before = kv_cache.clone()
+    owner_write_cache = torch.zeros_like(kv_cache)
+
+    batch_info_host = BatchInfo()
+    batch_info_host.update([1, seq_len, 0, 0, 0, 0])
+    cu_seqlen_host = torch.tensor([0, seq_len], dtype=torch.int32)
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    cu_num_pages_host = torch.tensor([0, num_pages], dtype=torch.int32)
+    cache_loc = torch.arange(num_pages, dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([page_size], dtype=torch.int32, device=device)
+    last_page_len_host = torch.tensor([page_size], dtype=torch.int32)
+    seq_len_with_cache_host = torch.tensor([seq_len], dtype=torch.int32)
+    batch_indices = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int32, device=device)
+
+    sdpa_calls = 0
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    def tracking_sdpa(*args, **kwargs):
+        nonlocal sdpa_calls
+        sdpa_calls += 1
+        return original_sdpa(*args, **kwargs)
+
+    with patch.object(torch.nn.functional, "scaled_dot_product_attention", tracking_sdpa):
+        output = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+            q,
+            dummy_k,
+            dummy_v,
+            batch_info_host.serialize(),
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            batch_indices,
+            positions,
+            kv_cache,
+            None,
+            None,
+            True,
+        )
+        expected = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+            q,
+            owner_k,
+            owner_v,
+            batch_info_host.serialize(),
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            batch_indices,
+            positions,
+            owner_write_cache,
+            None,
+            None,
+            False,
+        )
+
+    assert sdpa_calls == 2
+    torch.testing.assert_close(kv_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(owner_write_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
 @torch.no_grad()

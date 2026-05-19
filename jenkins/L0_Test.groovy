@@ -1462,7 +1462,7 @@ def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
     return [skip: false, splits: 1, splitId: 1]
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="")
 {
   def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
   if (collapse.skip) {
@@ -1487,7 +1487,14 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // clobbered and the ensureStageResultNotUploaded guard does not trip on
       // the retry. First attempt keeps the canonical unsuffixed name so existing
       // downstream consumers (dashboards, the JIRA bot, etc.) are unaffected.
-      def postTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+      //
+      // outerAttemptTag is the K8s outer dispatcher pod's tag ("" for outer
+      // attempt 1, "-pod-${N}" for outer attempt N>=2). Prefixing the inner
+      // postTag with it ensures the new dispatcher pod's inner attempt 1
+      // upload doesn't collide with the dead pod's already-recorded upload
+      // in GlobalState.uploadResultStageNames.
+      def innerSuffix = (attempt == 1) ? "" : "-attempt-${attempt}"
+      def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
         runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
@@ -2818,24 +2825,37 @@ REUSED_TESTS_EOF
  * Decode a postTag into the postTags used by prior attempts of the same
  * stage in this build.
  *
- * The retry runner (runKubernetesPodWithInfraRetry, runLLMTestlistOnSlurm)
- * composes postTag as ``${callerSuppliedBase}-attempt-${N}`` for retries
- * (and the bare base for attempt 1, e.g. ``""`` or ``"-SubJob-RunTest"``).
+ * The retry runners compose postTag from two retry layers:
+ *   - runKubernetesPodWithInfraRetry (outer K8s pod retry) contributes
+ *     ``"-pod-${P}"`` for outer attempt P>=2 (and ``""`` for P=1).
+ *   - runLLMTestlistOnSlurm (inner SLURM retry) appends ``"-attempt-${I}"``
+ *     for inner attempt I>=2 (and ``""`` for I=1).
+ * The two suffixes nest: full postTag = ``${base}${outerTag}${innerSuffix}``
+ * where base is the caller-supplied prefix (e.g. ``""`` or
+ * ``"-SubJob-RunTest"``). The ``-pod-`` and ``-attempt-`` separators are
+ * distinct so the nested form is unambiguous.
+ *
  * This function inverts that composition to enumerate the postTags of
  * earlier attempts so reusePassedTestResults() can locate their uploaded
  * tarballs.
  *
  * Returns an empty list when ``postTag`` does not encode a retry — either
- * attempt 1 (``postTag == ""``), or a caller-supplied tag that never went
- * through the retry loop (e.g. ``"-SubJob-RunTest"``).
+ * attempt 1 of attempt 1 (``postTag == ""``), or a caller-supplied tag that
+ * never went through the retry loop (e.g. ``"-SubJob-RunTest"``).
  *
- * Examples:
+ * For nested cases we don't know how many inner attempts each prior outer
+ * pod attempt completed, so we over-enumerate up to SLURM_INFRA_RETRY_MAX+1;
+ * the HTTP probe in reusePassedTestResults handles 404 for absent tarballs.
+ *
+ * Examples (with default SLURM_INFRA_RETRY_MAX=2):
  *
  *   ""                            -> []
  *   "-attempt-2"                  -> [""]
  *   "-attempt-3"                  -> ["", "-attempt-2"]
- *   "-SubJob-RunTest-attempt-2"   -> ["-SubJob-RunTest"]
+ *   "-pod-2"                      -> ["", "-attempt-2", "-attempt-3"]
+ *   "-pod-2-attempt-2"            -> ["", "-attempt-2", "-attempt-3", "-pod-2"]
  *   "-SubJob-RunTest"             -> []
+ *   "-SubJob-RunTest-pod-2"       -> ["-SubJob-RunTest", "-SubJob-RunTest-attempt-2", "-SubJob-RunTest-attempt-3"]
  *
  * @param postTag the current attempt's full tar suffix.
  * @return List of postTag strings, ordered oldest-attempt-first.
@@ -2843,13 +2863,42 @@ REUSED_TESTS_EOF
 @NonCPS
 def priorAttemptTags(String postTag) {
     if (!postTag) return []
-    def m = postTag =~ /^(.*)-attempt-(\d+)$/
-    if (!m.matches()) return []
-    String base = m[0][1]
-    int currentAttempt = (m[0][2] as Integer)
-    def priors = [base]   // attempt 1 used the caller's base tag, e.g. "" or "-SubJob-RunTest"
-    for (int n = 2; n < currentAttempt; n++) {
-        priors << "${base}-attempt-${n}"
+    // Peel "-attempt-N" suffix (inner SLURM retry counter) if present.
+    String remaining = postTag
+    Integer innerAttempt = null
+    def mInner = remaining =~ /^(.*)-attempt-(\d+)$/
+    if (mInner.matches()) {
+        innerAttempt = (mInner[0][2] as Integer)
+        remaining = mInner[0][1]
+    }
+    // Peel "-pod-P" suffix (outer K8s retry counter) if present.
+    Integer podAttempt = null
+    def mPod = remaining =~ /^(.*)-pod-(\d+)$/
+    if (mPod.matches()) {
+        podAttempt = (mPod[0][2] as Integer)
+        remaining = mPod[0][1]
+    }
+    String base = remaining
+    if (innerAttempt == null && podAttempt == null) return []   // no retry encoded
+    int outerN = podAttempt ?: 1
+    int innerN = innerAttempt ?: 1
+    int maxInner = SLURM_INFRA_RETRY_MAX + 1
+    def priors = []
+    // Earlier outer attempts (1..outerN-1) with all possible inner attempts.
+    for (int p = 1; p < outerN; p++) {
+        String podSuffix = (p == 1) ? "" : "-pod-${p}"
+        priors << "${base}${podSuffix}".toString()                          // inner attempt 1
+        for (int i = 2; i <= maxInner; i++) {
+            priors << "${base}${podSuffix}-attempt-${i}".toString()
+        }
+    }
+    // Current outer attempt's earlier inner attempts (1..innerN-1).
+    String thisPodSuffix = (outerN == 1) ? "" : "-pod-${outerN}"
+    if (innerN > 1) {
+        priors << "${base}${thisPodSuffix}".toString()                      // inner attempt 1
+        for (int i = 2; i < innerN; i++) {
+            priors << "${base}${thisPodSuffix}-attempt-${i}".toString()
+        }
     }
     return priors
 }
@@ -3527,9 +3576,12 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             }
             // Attempt 1 keeps the caller-supplied postTag verbatim so the
             // canonical artifact name is unchanged for downstream consumers.
-            // Retries append "-attempt-N" to dodge the upload-once guard and
-            // preserve every attempt's tarball in Artifactory.
-            def attemptTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+            // Retries append "-pod-N" to dodge the upload-once guard and
+            // preserve every attempt's tarball in Artifactory. The "-pod-"
+            // separator is distinct from the inner SLURM retry's "-attempt-"
+            // suffix so the two nest unambiguously: outer-pod 2 / inner-attempt
+            // 2 yields "-pod-2-attempt-2" rather than colliding with "-attempt-2".
+            def attemptTag = (attempt == 1) ? "" : "-pod-${attempt}"
             // For attempt 1 we don't yet know whether the failure (if any) will
             // be PERSISTENT, so use the worst-case multi-retry budget. From
             // attempt 2 onward we know the prior classification — if it was
@@ -3764,9 +3816,12 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += x86SlurmTestConfigs.keySet()
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt ->
-        // attemptTag/isFinalAttempt come from runKubernetesPodWithInfraRetry
-        // for the outer dispatcher pod; the inner SLURM job runs its own
-        // retry loop (runLLMTestlistOnSlurm) so we don't thread these through.
+        // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
+        // dispatcher pod and is threaded into runLLMTestlistOnSlurm so the
+        // inner SLURM retry can prefix its postTag with the outer attempt's
+        // tag. Without this, a new dispatcher pod's inner attempt 1 would
+        // compute postTag="" and collide with the dead pod's already-recorded
+        // upload in GlobalState.uploadResultStageNames.
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3774,7 +3829,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
     }]]}
 
     parallelJobs += parallelSlurmJobs
@@ -3982,8 +4037,10 @@ def launchTestJobs(pipeline, testFilter)
 
         // Add SBSA Slurm jobs
         parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt ->
-            // SLURM dispatchers run their own retry loop (runLLMTestlistOnSlurm);
-            // the outer pod-level retry args are accepted but unused here.
+            // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
+            // dispatcher pod's tag so the inner SLURM retry's postTag can't
+            // collide with a previous dispatcher pod's upload. See the x86
+            // SLURM closure for the full rationale.
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
@@ -3991,7 +4048,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
         }]]}
         parallelJobs += parallelSlurmJobs
 
@@ -4004,7 +4061,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag)
         }]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
