@@ -465,24 +465,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     # Sound generation
     # =========================================================================
 
-    def encode_sound(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Encode audio waveform into latent tokens.
-
-        Args:
-            waveform: Audio tensor of shape (C, N). A batch dim is added/removed
-                      internally since AVAE expects (B, C, N).
-                      Mono audio is duplicated to stereo if the tokenizer expects 2 channels.
-        """
-        # Ensure correct number of channels (AVAE typically expects stereo)
-        expected_channels = self.sound_tokenizer.audio_channels
-        if waveform.shape[0] == 1 and expected_channels == 2:
-            waveform = waveform.repeat(2, 1)  # mono → stereo
-        elif waveform.shape[0] > expected_channels:
-            waveform = waveform[:expected_channels]
-        # AVAE expects (B, C, N)
-        latent = self.sound_tokenizer.encode(waveform.unsqueeze(0))  # [1,sound_channels,T_sound]
-        return latent.squeeze(0)  # [sound_channels,T_sound]
-
     def decode_sound(self, latent: torch.Tensor) -> torch.Tensor:
         """Decode sound latent tokens back to waveform.
 
