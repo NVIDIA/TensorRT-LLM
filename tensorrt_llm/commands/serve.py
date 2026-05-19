@@ -53,6 +53,9 @@ from tensorrt_llm.visual_gen import VisualGen
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
 
+# Bound gRPC messages while leaving room for multimodal image payloads.
+_GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
+
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
@@ -187,6 +190,8 @@ def get_llm_args(
         enable_attention_dp: bool = False,
         video_pruning_rate: Optional[float] = None,
         telemetry: bool = True,
+        agent_percentage: float = 0.0,
+        agent_types: Optional[str] = None,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -277,6 +282,10 @@ def get_llm_args(
         _telemetry_config.TelemetryConfig(
             disabled=not telemetry,
             usage_context=_telemetry_config.UsageContext.CLI_SERVE),
+        "agent_percentage":
+        agent_percentage,
+        "agent_types":
+        agent_types,
     }
 
     llm_args = {
@@ -411,8 +420,10 @@ def launch_grpc_server(host: str,
         # Create gRPC server
         server = grpc.aio.server(
             options=[
-                ("grpc.max_send_message_length", -1),  # Unlimited
-                ("grpc.max_receive_message_length", -1),  # Unlimited
+                ("grpc.max_send_message_length",
+                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
+                ("grpc.max_receive_message_length",
+                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
                 ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
                 ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
                 ("grpc.keepalive_permit_without_calls", True),
@@ -827,6 +838,19 @@ class ChoiceWithAlias(click.Choice):
               help=help_info_with_stability_tag(
                   "Path to a YAML file with extra VISUAL_GEN model options.",
                   "prototype"))
+@click.option(
+    "--agent_percentage",
+    type=float,
+    default=0.0,
+    help=
+    "The percentage of agent requests to schedule. Defaults to 0.0. Should be between 0.0 and 1.0."
+)
+@click.option(
+    "--agent_types",
+    type=str,
+    default=None,
+    help=
+    "Types of agents to schedule. Now Only Support Open Deep Research agent.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -842,7 +866,8 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-        media_io_kwargs: Optional[str], video_pruning_rate: Optional[float],
+        media_io_kwargs: Optional[str], agent_percentage: float,
+        agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
         served_model_name: Optional[str],
@@ -886,7 +911,8 @@ def serve(
                 f"Cannot auto-detect reasoning parser for model '{model}'. "
                 f"Supported model types for auto-detection: qwen3, qwen3_moe, "
                 f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
-                f"deepseek_v32 (R1 only), nemotron_h. "
+                f"deepseek_v32 (R1 only), nemotron_h, gemma4, "
+                f"kimi_k2, kimi_k25. "
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
                 param_hint="--reasoning_parser")
@@ -932,7 +958,9 @@ def serve(
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
             video_pruning_rate=video_pruning_rate,
-            telemetry=telemetry)
+            telemetry=telemetry,
+            agent_percentage=agent_percentage,
+            agent_types=agent_types)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:

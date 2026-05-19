@@ -1,0 +1,26 @@
+# Validates chunked prefill + MTP speculative decoding running together.
+
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.9
+  mamba_ssm_cache_dtype: float16
+  mamba_ssm_stochastic_rounding: true
+  mamba_ssm_philox_rounds: 5
+
+moe_config:
+  backend: CUTLASS
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+
+enable_attention_dp: false
+enable_chunked_prefill: true
+stream_interval: 1
+print_iter_log: true
+
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3
+  allow_advanced_sampling: true

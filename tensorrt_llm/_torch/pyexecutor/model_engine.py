@@ -420,8 +420,12 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
-            # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            # Parallel-draft modes (PARD, DFlash) size their per-request draft
+            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
+            # one slot per draft token the target will verify.  PARD still uses
+            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
+            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
+            # tokens_per_gen_step carries the per-algorithm width.
             if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
             else:
@@ -1365,6 +1369,8 @@ class PyTorchModelEngine(ModelEngine):
             "Cannot fuse drafting loop. Not enough KV cache space for all draft tokens."
         )
         token_num -= num_extra_decoding_steps
+        token_num = int(
+            token_num)  # Ensure int for range() in add_dummy_requests
 
         max_seq_len_request = kv_cache_manager.add_dummy_requests(
             request_ids=[batch_size - 1],
@@ -1636,8 +1642,14 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] += (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
@@ -1677,8 +1689,14 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] -= (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
@@ -2968,9 +2986,8 @@ class PyTorchModelEngine(ModelEngine):
                     )
                 if segment.shape[0] != 3 and segment.shape[-1] == 3:
                     logger.warning(
-                        "Transposing unexpected mrope_position_ids shape from %s",
-                        tuple(segment.shape),
-                    )
+                        "Transposing unexpected mrope_position_ids shape from "
+                        f"{tuple(segment.shape)}")
                     segment = segment.transpose(0, 2).contiguous()
                 if segment.shape[:2] != (3, 1):
                     raise RuntimeError(
@@ -3886,9 +3903,10 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # PARD/DFlash have 2K tokens per gen request, not K+1.  Pass 2K-1
-            # so generation_lengths = 2K and the XQA kernel computes
-            # the correct past_kv_len.
+            # Parallel-draft modes advertise a per-gen-step width via
+            # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass
+            # (tokens_per_gen_step - 1) so generation_lengths = tokens_per_gen_step
+            # and the XQA kernel computes the correct past_kv_len.
             if spec_metadata.spec_dec_mode.is_parallel_draft():
                 sd_max_draft_len = self.original_max_total_draft_tokens
                 sd_max_total = self.original_max_total_draft_tokens
