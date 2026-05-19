@@ -642,7 +642,7 @@ class FP4MQALogitsKernel:
         #                              [SF   phys_block_kv*4         bytes (= phys_block_kv int32)]
         phys_block_kv = self.phys_block_kv
         half_head_dim = self.head_dim // 2  # FP4 packed bytes per row
-        phys_block_bytes = phys_block_kv * (half_head_dim + 4)
+        # phys_block_bytes = phys_block_kv * (half_head_dim + 4)
         scale_offset_bytes = phys_block_kv * half_head_dim  # to SF region of each phys block
 
         # Recast the fused buffer to FP4. Each uint8 byte becomes 2 FP4 elements,
@@ -653,23 +653,31 @@ class FP4MQALogitsKernel:
         # type inference and TMA descriptors are correct.
         b = cute.recast_tensor(b, Float4E2M1FN)
 
+        # Read the real per-block stride (bytes) from the input tensor.
+        # When KV is the indexer K-cache pool view, the pool is laid out as
+        # [num_blocks, num_layers, kvFactor, blockSize], so dim-0 stride =
+        # num_layers * kvFactor * phys_block_bytes (not phys_block_bytes).
+        # Using the input stride keeps both the contiguous test path and
+        # the strided prod path correct.
+        kv_block_stride_bytes = kv_fused.layout.stride[0]
+
         # KV data view: [phys_block_kv, head_dim, num_phys_blocks] FP4 elements.
         # Innermost stride 1 = consecutive FP4 elem = packed pair share a byte.
         # Per-row stride = head_dim FP4 elem = head_dim/2 bytes.
-        # Per-block stride = phys_block_bytes * 2 FP4 elem (data + SF region).
+        # Per-block stride (FP4 elem) = kv_block_stride_bytes * 2 (uint8→FP4 doubles).
         kv_layout = cute.make_layout(
             (phys_block_kv, self.head_dim, num_phys_blocks),
-            stride=(self.head_dim, 1, phys_block_bytes * 2),
+            stride=(self.head_dim, 1, kv_block_stride_bytes * 2),
         )
         a = cute.make_tensor(kv_fp4.iterator, kv_layout)
 
         # SF KV view: int32 (4 UE8M0 packed). Build a uint8 view at the SF
         # offset, then recast to int32.
-        # Layout in bytes: (phys_block_kv * 4, num_phys_blocks) stride (1, phys_block_bytes)
-        # After recast int32: (phys_block_kv, num_phys_blocks) stride (1, phys_block_bytes/4)
+        # Layout in bytes: (phys_block_kv * 4, num_phys_blocks) stride (1, kv_block_stride_bytes)
+        # After recast int32: (phys_block_kv, num_phys_blocks) stride (1, kv_block_stride_bytes/4)
         sf_kv_uint8_layout = cute.make_layout(
             (phys_block_kv * 4, num_phys_blocks),
-            stride=(1, phys_block_bytes),
+            stride=(1, kv_block_stride_bytes),
         )
         sf_kv_uint8 = cute.make_tensor(kv_fused.iterator + scale_offset_bytes, sf_kv_uint8_layout)
         sf_kv = cute.recast_tensor(sf_kv_uint8, cutlass.Int32)

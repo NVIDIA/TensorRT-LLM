@@ -5986,9 +5986,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_blocks_per_seq = cute.sym_int()
             num_ctas = cute.sym_int()
 
-            kv_fake = cute.runtime.make_fake_compact_tensor(
+            # KV may come from the indexer K-cache pool view, which is
+            # strided in dim 0 (pool layout interleaves layers:
+            # [num_blocks, num_layers, kvFactor, blockSize]). Declare outer
+            # stride as sym so the actual per-block stride is read at
+            # runtime; innermost stride is fixed to 1 (byte-contig within a
+            # logical block view).
+            kv_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
-                stride_order=(1, 0))
+                stride=(cute.sym_int64(), 1))
 
             q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8,
                                                            (N, head_dim, sym_B),
@@ -6800,9 +6806,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_blocks_per_seq = cute.sym_int()
             num_ctas = cute.sym_int()
 
-            kv_fake = cute.runtime.make_fake_compact_tensor(
+            # KV may come from the indexer K-cache pool view, which is
+            # strided in dim 0 (pool layout interleaves layers:
+            # [num_blocks, num_layers, kvFactor, blockSize]). Declare outer
+            # stride as sym so the actual per-block stride is read at
+            # runtime; innermost stride is fixed to 1 (byte-contig within a
+            # logical block view).
+            kv_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
-                stride_order=(1, 0))
+                stride=(cute.sym_int64(), 1))
 
             # Q is FP4 packed bytes: head_dim/2 bytes per row
             q_fake = cute.runtime.make_fake_compact_tensor(
