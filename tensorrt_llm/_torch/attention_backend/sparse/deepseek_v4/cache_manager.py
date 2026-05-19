@@ -54,16 +54,6 @@ DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV = "TRTLLM_DSV4_ENABLE_SWA_SCRATCH_REUSE"
 
 
 @dataclass(frozen=True)
-class _SwaCopyConstants:
-    pool_id: int
-    scale: int
-    scratch_pages: int
-    layer_offsets: torch.Tensor
-    layer_offsets_i64: torch.Tensor
-    layer_ids: torch.Tensor
-
-
-@dataclass(frozen=True)
 class _SlidingCopyGroup:
     attention_type_value: int
     pool_id: int
@@ -73,12 +63,6 @@ class _SlidingCopyGroup:
     layer_offsets: torch.Tensor
     layer_offsets_i64: torch.Tensor
     layer_ids: torch.Tensor
-
-
-@dataclass(frozen=True)
-class _SharedCopyConstants:
-    pool_id: int
-    scale: int
 
 
 def _estimate_bytes_per_token(
@@ -394,63 +378,41 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
-        self._host_attention_op_block_offsets_staging = torch.empty(
-            self.num_attention_op_pools,
-            index_mapper_capacity * self.max_beam_width,
-            2,  # key and value
-            self.max_blocks_per_seq,
+        self._host_attention_op_block_offsets_staging = torch.full(
+            (
+                self.num_attention_op_pools,
+                self.max_batch_size * self.max_beam_width,
+                2,
+                self.max_blocks_per_seq,
+            ),
+            BAD_PAGE_INDEX,
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
             device="cpu",
         )
-        self._host_per_layer_block_tables_staging = torch.empty(
-            self.num_local_layers,
-            len(DEEPSEEK_V4_SLIDING_ATTENTION),
-            index_mapper_capacity * self.max_beam_width,
-            self.max_blocks_per_seq,
+        self._host_per_layer_block_tables_staging = torch.full(
+            (
+                self.num_local_layers,
+                len(DEEPSEEK_V4_SLIDING_ATTENTION),
+                index_mapper_capacity * self.max_beam_width,
+                self.max_blocks_per_seq,
+            ),
+            BAD_PAGE_INDEX,
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
             device="cpu",
         )
         self._host_compress_block_tables_staging = {
-            compress_ratio: torch.empty(
-                index_mapper_capacity * self.max_beam_width,
-                self.max_blocks_per_seq,
+            compress_ratio: torch.full(
+                (index_mapper_capacity * self.max_beam_width, self.max_blocks_per_seq),
+                BAD_PAGE_INDEX,
                 dtype=torch.int32,
                 pin_memory=prefer_pinned(),
                 device="cpu",
             )
-            for compress_ratio in sorted(set(self._compress_ratios))
+            for compress_ratio in set(self._compress_ratios)
             if compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS)
         }
-
-        # Page-index converter metadata is fixed once the page tables are
-        # prepared. Cache the tensor forms here so copy_batch_* only handles
-        # per-request base indices and scratch ranges.
-        first_swa_layer_id = self._layer_attn_to_layer_id[
-            self.pp_layers[0], DeepseekV4AttentionType.SWA
-        ]
-        first_swa_converter = self.impl.get_page_index_converter(
-            first_swa_layer_id, DeepseekV4AttentionType.SWA.role
-        )
-        swa_offsets = [first_swa_converter.layer_offset]
-        for pp_layer in self.pp_layers[1:]:
-            layer_id = self._layer_attn_to_layer_id[pp_layer, DeepseekV4AttentionType.SWA]
-            converter = self.impl.get_page_index_converter(
-                layer_id, DeepseekV4AttentionType.SWA.role
-            )
-            swa_offsets.append(converter.layer_offset)
-        swa_layer_offsets = torch.tensor(swa_offsets, dtype=torch.int32, device="cpu").view(
-            -1, 1, 1
-        )
-        self._swa_copy_constants = _SwaCopyConstants(
-            pool_id=self.layer_to_pool_mapping_dict[first_swa_layer_id],
-            scale=first_swa_converter.scale,
-            scratch_pages=first_swa_converter.scratch_pages_per_block,
-            layer_offsets=swa_layer_offsets,
-            layer_offsets_i64=swa_layer_offsets.to(dtype=torch.int64),
-            layer_ids=torch.arange(len(swa_offsets), dtype=torch.long, device="cpu").view(-1, 1, 1),
-        )
 
         layer_groups: Dict[Tuple[int, int, int, int], List[Tuple[int, int]]] = defaultdict(list)
         for pp_layer in self.pp_layers:
@@ -502,49 +464,57 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 )
             )
 
-        self._compress_copy_constants = {}
-        for compress_ratio in self._host_compress_block_tables_staging:
-            pp_layer = next(
-                (
-                    layer
-                    for layer in self.pp_layers
-                    if self._compress_ratios[layer] == compress_ratio
-                ),
-                None,
-            )
-            if pp_layer is None:
-                continue
-            layer_id = self._layer_attn_to_layer_id[pp_layer, DeepseekV4AttentionType.COMPRESS]
-            converter = self.impl.get_page_index_converter(
-                layer_id, DeepseekV4AttentionType.COMPRESS.role
-            )
-            self._compress_copy_constants[compress_ratio] = _SharedCopyConstants(
-                pool_id=self.layer_to_pool_mapping_dict[layer_id],
-                scale=converter.scale,
-            )
-
-        indexer_layer = next(
-            (
-                layer
-                for layer in self.pp_layers
-                if compress_ratio_has_attention(
-                    self._compress_ratios[layer], DeepseekV4AttentionType.INDEXER_COMPRESS
-                )
-            ),
-            None,
+        # scales per pool, shape [num_pools].
+        self._pool_scales = torch.empty(self.num_pools, dtype=torch.int32, device="cpu")
+        # layer offsets per layer and attn, shape [num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)].
+        self._layer_offsets = torch.full(
+            (self.num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)),
+            -1,
+            dtype=torch.int32,
+            device="cpu",
         )
-        self._indexer_compress_copy_constants = None
-        if indexer_layer is not None:
-            layer_id = self._layer_attn_to_layer_id[
-                indexer_layer, DeepseekV4AttentionType.INDEXER_COMPRESS
-            ]
-            converter = self.impl.get_page_index_converter(
-                layer_id, DeepseekV4AttentionType.INDEXER_COMPRESS.role
-            )
-            self._indexer_compress_copy_constants = _SharedCopyConstants(
-                pool_id=self.layer_to_pool_mapping_dict[layer_id],
-                scale=converter.scale,
-            )
+        # scratch pages per block per pool, shape [num_pools].
+        self._scratch_pages = torch.empty(self.num_pools, dtype=torch.int32, device="cpu")
+        # last CSA layer (i.e. last layer with compress ratio 4)
+        self._csa_layer_idx = None
+        # pool id of CSA compress attention
+        self._csa_compress_pool_id = None
+        # last HCA layer (i.e. last layer with compress ratio 128)
+        self._hca_layer_idx = None
+        # pool id of HCA compress attention
+        self._hca_compress_pool_id = None
+        # pool id of SWA attention
+        first_layer = self.pp_layers[0]
+        swa_layer_id = self._layer_attn_to_layer_id[first_layer, DeepseekV4AttentionType.SWA]
+        self._swa_pool_id = self.impl.get_layer_group_id(swa_layer_id)
+
+        for layer_idx in self.pp_layers:
+            compress_ratio = self._compress_ratios[layer_idx]
+            if compress_ratio == 4:
+                self._csa_layer_idx = layer_idx
+                compress_layer_id = self._layer_attn_to_layer_id[
+                    layer_idx, DeepseekV4AttentionType.COMPRESS
+                ]
+                compress_pool_id = self.impl.get_layer_group_id(compress_layer_id)
+                self._csa_compress_pool_id = compress_pool_id
+            elif compress_ratio == 128:
+                self._hca_layer_idx = layer_idx
+                compress_layer_id = self._layer_attn_to_layer_id[
+                    layer_idx, DeepseekV4AttentionType.COMPRESS
+                ]
+                compress_pool_id = self.impl.get_layer_group_id(compress_layer_id)
+                self._hca_compress_pool_id = compress_pool_id
+
+            local_layer_idx = self.layer_offsets[layer_idx]
+            for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
+                if not compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type):
+                    continue
+                layer_id = self._layer_attn_to_layer_id[layer_idx, attn_type]
+                pool_id = self.impl.get_layer_group_id(layer_id)
+                converter = self.impl.get_page_index_converter(layer_id, attn_type.role)
+                self._pool_scales[pool_id] = converter.scale
+                self._layer_offsets[local_layer_idx, attn_type.value] = converter.layer_offset
+                self._scratch_pages[pool_id] = converter.scratch_pages_per_block
 
     @property
     def blocks_in_primary_pool(self) -> int:
@@ -967,6 +937,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         buffer = self.get_buffers(layer_idx, DeepseekV4AttentionType.INDEXER_COMPRESS).unsqueeze(2)
         return buffer.view(torch.uint8)
 
+    def _compute_shared_block_table(
+        self, pool_ids: List[int], copy_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Get the shared offset for a specific pool and copy index.
+        Return shape: [num_pools, num_seqs, max_blocks_per_seq]
+        """
+        base = self.host_kv_cache_block_offsets[pool_ids, copy_idx, 0, :]
+        scale = self._pool_scales[pool_ids, None, None]
+        return torch.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale)
+
     def _get_batch_base_indices(
         self,
         pool_id: int,
@@ -1063,75 +1044,61 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         num_seqs: int,
     ) -> None:
         """For compatibility with AttentionOp, copy only the SWA block offsets."""
-        assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
-        assert copy_idx.shape[0] == num_seqs
-        assert self._host_attention_op_block_offsets_staging is not None
-
+        assert beam_width == 1, "DSV4 only supports beam width 1 now"
         staging = self._host_attention_op_block_offsets_staging
-        staging[: self.num_attention_op_pools, :num_seqs].fill_(BAD_PAGE_INDEX)
-        request_ids = request_ids[:num_seqs]
-        # Only leading context rows can have scratch reuse enabled; generation
-        # rows must keep the normal base page indices.
-        context_request_ids = request_ids[:num_contexts]
-        base_indices_cache: Dict[int, torch.Tensor] = {}
-        scratch_tensors_cache: Dict[int, Optional[Tuple[torch.Tensor, ...]]] = {}
-        constants = self._swa_copy_constants
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        num_tables = copy_idx.size(0)
 
-        base_indices = self._get_batch_base_indices(
-            constants.pool_id, copy_idx, num_seqs, base_indices_cache
+        # shape: [num_local_layers]
+        swa_offsets = self._layer_offsets[:, DeepseekV4AttentionType.SWA.value]
+        # shape: [num_seqs, max_blocks_per_seq]
+        base = self._compute_shared_block_table([self._swa_pool_id], copy_idx)[0]
+        # shape: [num_local_layers, num_seqs, max_blocks_per_seq]
+        base_per_layer = torch.where(
+            base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base + swa_offsets[:, None, None]
         )
-        scratch_tensors = None
-        if context_request_ids:
-            scratch_tensors = self._get_batch_scratch_tensors(
-                context_request_ids,
-                constants.pool_id,
-                base_indices.size(1),
-                base_indices.device,
-                scratch_tensors_cache,
+        staging[:, :num_tables, 0, :] = base_per_layer
+
+        if self.enable_swa_scratch_reuse and num_contexts > 0:
+            # only context requests have scratch blocks, and they stays in the front of request_ids
+            scratch_descs = [
+                self.kv_cache_map[req].get_scratch_desc(self._swa_pool_id)
+                for req in request_ids[:num_contexts]
+            ]
+            # shape [num_contexts]
+            scratch_begs = torch.tensor(
+                [desc.range.beg for desc in scratch_descs], dtype=torch.int32, device="cpu"
             )
-        # Broadcast [layers, 1, 1] layer offsets over [1, seqs, blocks] base
-        # indices, building all SWA layer tables in one tensor operation.
-        layer_base_indices = base_indices.unsqueeze(0)
-        converted = torch.where(
-            layer_base_indices != BAD_PAGE_INDEX,
-            layer_base_indices * constants.scale + constants.layer_offsets,
-            layer_base_indices.expand(constants.layer_offsets.size(0), -1, -1),
-        )
-        if scratch_tensors is not None:
-            # Scratch blocks replace a range of base indices. block_pos maps each
-            # scratch block to a scratch slot and sub-page offset, then the
-            # boolean mask scatters those scratch indices back into converted.
-            slot_ids, block_pos, active, rows, columns = scratch_tensors
-            total_offset = block_pos * constants.scratch_pages
-            slot_idx = total_offset // constants.scale
-            selected_slot_ids = slot_ids.gather(
-                1,
-                slot_idx.expand(slot_ids.size(0), -1).clamp(max=slot_ids.size(1) - 1),
+            # shape [num_contexts]
+            scratch_ends = torch.tensor(
+                [desc.range.end for desc in scratch_descs], dtype=torch.int32, device="cpu"
             )
+            # shape [num_contexts, num_slots]
+            scratch_slots = torch.tensor(
+                [desc.slot_ids for desc in scratch_descs], dtype=torch.int32, device="cpu"
+            )
+            index = torch.arange(self.max_blocks_per_seq, dtype=torch.int32, device="cpu")
+            # shape [num_contexts, max_blocks_per_seq]
+            mask = (index >= scratch_begs[:, None]) & (index < scratch_ends[:, None])
+            scratch_lens = scratch_ends - scratch_begs
+            # shape [num_contexts, max_blocks_per_seq]
+            range_index = (
+                (index - scratch_begs[:, None]).clamp(min=0).clamp(max=scratch_lens[:, None] - 1)
+            )
+            total_offset = range_index * self._scratch_pages[self._swa_pool_id]
+            slot_idx = total_offset // self._pool_scales[self._swa_pool_id]
+            offset = total_offset % self._pool_scales[self._swa_pool_id]
+            slot_id = scratch_slots.gather(1, slot_idx)
             scratch_index = (
-                selected_slot_ids.unsqueeze(0) * constants.scale
-                + (total_offset.view(1, 1, -1) % constants.scale + constants.layer_offsets_i64)
-                % constants.scale
+                slot_id * self._pool_scales[self._swa_pool_id]
+                + (offset + swa_offsets[:, None, None]) % self._pool_scales[self._swa_pool_id]
             )
-            active = active.unsqueeze(0).expand(constants.layer_offsets.size(0), -1, -1)
-            converted[
-                constants.layer_ids.expand_as(active)[active],
-                rows.unsqueeze(0).expand_as(active)[active],
-                columns.unsqueeze(0).expand_as(active)[active],
-            ] = scratch_index[active].to(dtype=converted.dtype)
-        if converted.size(2) > self.max_blocks_per_seq:
-            raise ValueError(
-                f"Converted page indices length {converted.size(2)} exceeds "
-                f"max_blocks_per_seq {self.max_blocks_per_seq}"
-            )
-        staging[: self.num_attention_op_pools, :num_seqs, 0, : converted.size(2)].copy_(converted)
-        staging[: self.num_attention_op_pools, :num_seqs, 1, :] = staging[
-            : self.num_attention_op_pools, :num_seqs, 0, :
-        ]
-        dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
-            staging[: self.num_attention_op_pools, :num_seqs], non_blocking=True
-        )
+
+            mask = mask.expand(self.num_attention_op_pools, -1, -1)
+            staging[:, :num_contexts, 0, :][mask] = scratch_index.expand_as(mask)[mask]
+
+        # copy async to GPU tensor
+        dst_tensor.copy_(staging, non_blocking=True)
 
     @nvtx_range("dsv4_copy_batch_sliding_block_tables")
     def copy_batch_sliding_block_tables(
@@ -1219,35 +1186,24 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         dst_tensor: torch.Tensor,
         request_ids: List[int],
         compress_ratio: int,
+        beam_width: int,
         num_contexts: int,
         num_seqs: int,
     ) -> None:
         """Build the COMPRESS block table for one compression ratio and copy it to the destination."""
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, 1)
-        assert copy_idx.shape[0] == num_seqs
-        staging = self._host_compress_block_tables_staging[compress_ratio]
-        staging[:num_seqs].fill_(BAD_PAGE_INDEX)
-
-        constants = self._compress_copy_constants.get(compress_ratio)
-        if constants is None:
-            dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
-            return
-
-        base_indices = self._get_batch_base_indices(constants.pool_id, copy_idx, num_seqs)
-        # COMPRESS uses shared page indices in DSV4. No layer offset or
-        # scratch-page replacement is needed, so the conversion stays 2D.
-        converted = torch.where(
-            base_indices != BAD_PAGE_INDEX,
-            base_indices * constants.scale,
-            base_indices,
-        )
-        if converted.size(1) > self.max_blocks_per_seq:
+        assert beam_width == 1, "DSV4 only supports beam width 1 now"
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        if compress_ratio == 4:
+            pool_id = self._csa_compress_pool_id
+        elif compress_ratio == 128:
+            pool_id = self._hca_compress_pool_id
+        else:
             raise ValueError(
-                f"Converted page indices length {converted.size(1)} exceeds "
-                f"max_blocks_per_seq {self.max_blocks_per_seq}"
+                f"Unsupported compress ratio {compress_ratio} for copy_batch_compress_block_tables"
             )
-        staging[:num_seqs, : converted.size(1)].copy_(converted)
 
+        staging = self._host_compress_block_tables_staging[compress_ratio]
+        staging[:num_seqs] = self._compute_shared_block_table([pool_id], copy_idx)[0]
         dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
 
     @nvtx_range("dsv4_copy_batch_indexer_compress_block_tables")
@@ -1255,32 +1211,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self,
         host_block_table: torch.Tensor,
         request_ids: List[int],
+        beam_width: int,
+        num_contexts: int,
         num_seqs: int,
     ) -> None:
         """Build the shared INDEXER_COMPRESS compatibility block table."""
-        copy_idx = self.index_mapper.get_copy_index(request_ids, 0, 1)
-        assert copy_idx.shape[0] == num_seqs
-        assert host_block_table.device.type == "cpu"
-        host_block_table[:num_seqs].fill_(BAD_PAGE_INDEX)
-
-        constants = self._indexer_compress_copy_constants
-        if constants is None:
-            return
-
-        base_indices = self._get_batch_base_indices(constants.pool_id, copy_idx, num_seqs)
-        # INDEXER_COMPRESS is also a shared table and does not use scratch
-        # pages in DSV4.
-        converted = torch.where(
-            base_indices != BAD_PAGE_INDEX,
-            base_indices * constants.scale,
-            base_indices,
-        )
-        if converted.size(1) > self.max_blocks_per_seq:
-            raise ValueError(
-                f"Converted page indices length {converted.size(1)} exceeds "
-                f"max_blocks_per_seq {self.max_blocks_per_seq}"
-            )
-        host_block_table[:num_seqs, : converted.size(1)].copy_(converted)
+        assert beam_width == 1, "DSV4 only supports beam width 1 now"
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        layer_id = self._layer_attn_to_layer_id[
+            self._csa_layer_idx, DeepseekV4AttentionType.INDEXER_COMPRESS
+        ]
+        pool_id = self.impl.get_layer_group_id(layer_id)
+        host_block_table[:num_seqs] = self._compute_shared_block_table([pool_id], copy_idx)[0]
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):

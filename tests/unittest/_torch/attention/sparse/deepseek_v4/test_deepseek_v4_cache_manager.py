@@ -463,6 +463,7 @@ class TestDeepseekV4CacheManager:
                 compress_block_tables,
                 [req.py_request_id],
                 compress_ratio=cache_manager._compress_ratios[layer_idx],
+                beam_width=1,
                 num_contexts=num_contexts,
                 num_seqs=1,
             )
@@ -478,6 +479,8 @@ class TestDeepseekV4CacheManager:
             cache_manager.copy_batch_indexer_compress_block_tables(
                 host_block_table,
                 [req.py_request_id],
+                beam_width=1,
+                num_contexts=num_contexts,
                 num_seqs=1,
             )
             return host_block_table[0]
@@ -1127,12 +1130,15 @@ class TestDeepseekV4CacheManager:
                 compress_block_table,
                 [req.py_request_id],
                 compress_ratio=4,
+                beam_width=1,
                 num_contexts=1,
                 num_seqs=1,
             )
             cache_manager.copy_batch_indexer_compress_block_tables(
                 host_indexer_compress_block_table,
                 [req.py_request_id],
+                beam_width=1,
+                num_contexts=1,
                 num_seqs=1,
             )
             for attn_type in attention_types:
@@ -1217,7 +1223,7 @@ class TestDeepseekV4CacheManager:
                 num_seqs=len(request_ids),
             )
 
-            expected = torch.full_like(actual, BAD_PAGE_INDEX)
+            expected = torch.full_like(actual[:, :, 0], BAD_PAGE_INDEX)
             for local_layer_idx, pp_layer in enumerate(cache_manager.pp_layers):
                 ref = self._reference_copy_batch_page_indices(
                     cache_manager,
@@ -1227,10 +1233,11 @@ class TestDeepseekV4CacheManager:
                     DeepseekV4AttentionType.SWA,
                     PageIndexMode.PER_LAYER,
                 )
-                expected[local_layer_idx, :, 0] = ref
-                expected[local_layer_idx, :, 1] = ref
+                expected[local_layer_idx] = ref
 
-            torch.testing.assert_close(actual, expected)
+            # DSV4 AttentionOp only consumes the key table. The value table is
+            # intentionally left untouched to avoid extra CPU work.
+            torch.testing.assert_close(actual[:, :, 0], expected)
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
@@ -1319,6 +1326,7 @@ class TestDeepseekV4CacheManager:
                     actual,
                     request_ids,
                     compress_ratio=compress_ratio,
+                    beam_width=1,
                     num_contexts=num_contexts,
                     num_seqs=len(request_ids),
                 )
@@ -1367,6 +1375,8 @@ class TestDeepseekV4CacheManager:
             cache_manager.copy_batch_indexer_compress_block_tables(
                 actual,
                 request_ids,
+                beam_width=1,
+                num_contexts=num_contexts,
                 num_seqs=len(request_ids),
             )
 
@@ -1381,8 +1391,7 @@ class TestDeepseekV4CacheManager:
             expected = self._reference_copy_batch_page_indices(
                 cache_manager,
                 request_ids,
-                # The compatibility indexer table is shared and does not use scratch.
-                0,
+                num_contexts,
                 pp_layer,
                 DeepseekV4AttentionType.INDEXER_COMPRESS,
                 PageIndexMode.SHARED,

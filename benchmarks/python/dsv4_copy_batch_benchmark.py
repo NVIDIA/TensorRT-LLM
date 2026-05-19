@@ -286,9 +286,14 @@ def _allocate_targets(
     )
 
     if "block_offsets" in methods:
+        block_offsets_num_seqs = (
+            cache_manager._host_attention_op_block_offsets_staging.shape[1]
+            if include_device_copy
+            else num_seqs
+        )
         block_offsets = torch.empty(
             cache_manager.num_attention_op_pools,
-            num_seqs,
+            block_offsets_num_seqs,
             2,
             max_blocks,
             dtype=torch.int32,
@@ -353,6 +358,7 @@ def _allocate_targets(
                     compress_table,
                     request_ids,
                     compress_ratio=compress_ratio,
+                    beam_width=1,
                     num_contexts=num_contexts,
                     num_seqs=num_seqs,
                 )
@@ -385,6 +391,8 @@ def _allocate_targets(
                 fn=lambda: cache_manager.copy_batch_indexer_compress_block_tables(
                     indexer_table,
                     request_ids,
+                    beam_width=1,
+                    num_contexts=num_contexts,
                     num_seqs=num_seqs,
                 ),
             )

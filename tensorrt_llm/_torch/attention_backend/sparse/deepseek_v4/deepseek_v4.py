@@ -446,7 +446,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.kv_cache_manager.copy_batch_indexer_compress_block_tables(
             self.host_indexer_k_cache_block_offsets,
             self.request_ids,
-            self.num_seqs,
+            beam_width=self.beam_width,
+            num_contexts=self.num_contexts,
+            num_seqs=self.num_seqs,
         )
         self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
             self.host_indexer_k_cache_block_offsets[: self.num_seqs],
@@ -466,6 +468,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 compress_block_table,
                 self.request_ids,
                 compress_ratio=compress_ratio,
+                beam_width=self.beam_width,
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
