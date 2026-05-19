@@ -753,7 +753,7 @@ def main():
     )
     ap.add_argument(
         "--backend",
-        choices=["mock", "transformers", "trtllm", "trtllm-executor"],
+        choices=["mock", "transformers", "trtllm"],
         default="trtllm",
     )
     ap.add_argument(

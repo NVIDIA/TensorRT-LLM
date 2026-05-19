@@ -261,14 +261,15 @@ class DraftExecutorRunner:
 
 
 class _TrtLlmBackend:
-    """Real per-request inference using a resident TRT-LLM decode stream.
+    """Direct PyExecutor draft backend with explicit request/KV ownership.
 
-    This backend keeps one long-lived ``generate_async(streaming=True)``
-    request per draft request.  Normal ``step()`` calls only consume the
-    next token(s) from that stream, so the TRT-LLM executor keeps the decode
-    request and its KV state resident across draft rounds.  If the target
-    reports a rollback or a different token than the stream predicted, we
-    abort the stale stream and restart it from the corrected target prefix.
+    This path creates a resident ``LlmRequest`` for every draft request, drives
+    the local ``PyExecutor`` manually, and rewinds the KV cache by setting
+    ``request.py_rewind_len`` before calling ``ResourceManager.update_resources``.
+
+    The LLM worker thread is still created by ``LLM(...)``.  We use
+    ``PyExecutor.control_action()`` around each manual forward so the event loop
+    is paused while the draft server touches model/KV/sampler internals.
     """
 
     def __init__(
@@ -298,7 +299,6 @@ class _TrtLlmBackend:
                 enable_block_reuse=True,
                 free_gpu_memory_fraction=0.4,
             ),
-            cuda_graph_config=None,
             max_batch_size=8,
         )
         self.executor_runner = DraftExecutorRunner(self.llm)
@@ -318,370 +318,6 @@ class _TrtLlmBackend:
             backend="trtllm",
             runner=self.executor_runner.describe(),
         )
-
-    def _make_sampling_params(self):
-        return self._SamplingParams(
-            max_tokens=max(1, self.stream_max_tokens),
-            temperature=0.0,
-            top_p=1.0,
-            ignore_eos=True,
-            detokenize=False,
-        )
-
-    def reset_sessions(self):
-        for sess in list(self._sessions.values()):
-            self._abort_stream(sess)
-        self._sessions.clear()
-
-    def matches_model_init(self, msg):
-        return self.model_path == str(msg.model_path) and int(self.max_draft_len) == int(
-            msg.max_draft_len
-        )
-
-    def init_session(self, request_id, prompt_tokens):
-        self._sessions.pop(int(request_id), None)
-        sess = {
-            "tokens": list(prompt_tokens),
-            "stream": None,
-            "stream_iter": None,
-            "stream_start_len": 0,
-            "stream_consumed": 0,
-            "stream_generation": 0,
-            "stream_buffer": [],
-        }
-        self._sessions[int(request_id)] = sess
-
-        # PEARL pre-verify timeline used by this server:
-        #
-        #   prompt: a b c d e
-        #   draft prefill -> d_f
-        #   target prefill -> t_f
-        #
-        # We generate d_f immediately after prompt prefill and keep the
-        # streaming branch alive.  When the target's first data-plane packet
-        # arrives with t_f, _sync_to_target compares that token against this
-        # already-generated d_f:
-        #
-        #   if d_f == t_f:
-        #       keep the stream branch and continue generating d_g, d_h, ...
-        #   else:
-        #       rollback to the prompt, append t_f, and regenerate from t_f
-        #
-        # The current TRT-LLM target path is synchronous, so d_f is not sent
-        # as an unsolicited packet during prompt_init.  It is nevertheless
-        # generated before target->draft verification, which gives the draft
-        # side the same keep-or-rollback decision point as the PEARL diagram.
-        preverify_token = self._pull_stream_token(sess)
-        _pearl_log(
-            "draft",
-            "prompt_session_init",
-            backend="trtllm",
-            runner="stream",
-            request_id=int(request_id),
-            prompt_tokens=[int(t) for t in prompt_tokens],
-            prompt_token_count=len(prompt_tokens),
-            preverify_token=int(preverify_token),
-            last_token_position=len(prompt_tokens) - 1,
-            session_tokens_after=list(sess["tokens"]),
-        )
-        return len(prompt_tokens) - 1
-
-    def _ensure_session(self, request_id):
-        rid = int(request_id)
-        sess = self._sessions.get(rid)
-        if sess is not None:
-            return sess
-        if self.fixed_prompt_ids is None:
-            raise RuntimeError(
-                "no session for request %d and no fixed prompt set; "
-                "send a TcpPromptInit first" % rid
-            )
-        sess = {
-            "tokens": list(self.fixed_prompt_ids),
-            "stream": None,
-            "stream_iter": None,
-            "stream_start_len": 0,
-            "stream_consumed": 0,
-            "stream_generation": 0,
-            "stream_buffer": [],
-        }
-        self._sessions[rid] = sess
-        return sess
-
-    def _abort_stream(self, sess):
-        stream = sess.get("stream")
-        if stream is not None and not getattr(stream, "finished", True):
-            try:
-                stream.abort()
-            except Exception:
-                pass
-        sess["stream"] = None
-        sess["stream_iter"] = None
-        sess["stream_start_len"] = 0
-        sess["stream_consumed"] = 0
-        sess["stream_buffer"] = []
-
-    def _new_session_from_tokens(self, tokens):
-        return {
-            "tokens": list(tokens),
-            "stream": None,
-            "stream_iter": None,
-            "stream_start_len": 0,
-            "stream_consumed": 0,
-            "stream_generation": 0,
-            "stream_buffer": [],
-        }
-
-    def _start_stream(self, sess):
-        self._abort_stream(sess)
-        sess["stream_generation"] = int(sess.get("stream_generation", 0)) + 1
-        sess["stream_start_len"] = len(sess["tokens"])
-        sess["stream_consumed"] = 0
-        sess["stream_buffer"] = []
-        stream = self.llm.generate_async(
-            {"prompt_token_ids": list(sess["tokens"])},
-            sampling_params=self._make_sampling_params(),
-            streaming=True,
-        )
-        sess["stream"] = stream
-        sess["stream_iter"] = iter(stream)
-        return stream
-
-    def create_speculative_branch(self, request_id):
-        """Fork a lightweight speculative decode branch from current tokens.
-
-        TRT-LLM's public LLM API does not expose in-place KV rollback for an
-        active streaming request.  PEARL prefetch therefore runs on a separate
-        streaming request.  On cache hit we adopt it; on miss we abort it and
-        the main stream remains at the last verified path.
-        """
-        sess = self._ensure_session(request_id)
-        branch = self._new_session_from_tokens(sess["tokens"])
-        branch["branch_id"] = self._next_branch_id
-        self._next_branch_id += 1
-        branch["request_id"] = int(request_id)
-        return branch
-
-    def discard_speculative_branch(self, branch):
-        if branch is not None:
-            self._abort_stream(branch)
-
-    def commit_speculative_branch(self, request_id, branch):
-        if branch is None:
-            return
-        old = self._sessions.get(int(request_id))
-        if old is not None and old is not branch:
-            self._abort_stream(old)
-        self._sessions[int(request_id)] = branch
-
-    def step_branch(
-        self,
-        branch,
-        request_id,
-        last_token,
-        position,
-        round_seq,
-        num_tokens=None,
-        on_token=None,
-        cancel_event=None,
-    ):
-        before_tokens = list(branch["tokens"])
-        sync_info = self._sync_to_target(branch, last_token, position)
-        compute_prefix = list(branch["tokens"])
-        n = int(num_tokens or self.max_draft_len)
-        draft_tokens = []
-        cancelled = False
-        for idx in range(n):
-            if cancel_event is not None and cancel_event.is_set():
-                cancelled = True
-                break
-            token = self._pull_stream_token(branch)
-            draft_tokens.append(token)
-            if on_token is not None:
-                keep_going = on_token(int(token), idx, branch)
-                if keep_going is False:
-                    cancelled = True
-                    break
-            if cancel_event is not None and cancel_event.is_set():
-                cancelled = True
-                break
-        _pearl_log(
-            "draft",
-            "backend_step",
-            backend="trtllm",
-            runner="stream_branch",
-            request_id=int(request_id),
-            branch_id=int(branch.get("branch_id", 0)),
-            round_seq=int(round_seq),
-            received_last_token=int(last_token),
-            received_position=int(position),
-            requested_num_tokens=n,
-            stream_generation=int(branch.get("stream_generation", 0)),
-            stream_consumed=int(branch.get("stream_consumed", 0)),
-            stream_restart_reason=sync_info["restart_reason"],
-            pearl_preverify_match=bool(sync_info["pearl_preverify_match"]),
-            sync_prefix_len_before_last=int(sync_info["prefix_len_before_last"]),
-            sync_desired_len=int(sync_info["desired_len"]),
-            cancelled=cancelled,
-            session_tokens_before=before_tokens,
-            compute_prefix_tokens=compute_prefix,
-            generated_draft_tokens=[int(t) for t in draft_tokens],
-            session_tokens_after=list(branch["tokens"]),
-        )
-        return draft_tokens
-
-    def _pull_stream_token(self, sess):
-        if sess.get("stream_buffer"):
-            token = int(sess["stream_buffer"].pop(0))
-            sess["stream_consumed"] = int(sess.get("stream_consumed", 0)) + 1
-            sess["tokens"].append(token)
-            return token
-
-        if sess.get("stream_iter") is None or getattr(sess.get("stream"), "finished", False):
-            self._start_stream(sess)
-
-        try:
-            chunk = next(sess["stream_iter"])
-        except StopIteration:
-            self._start_stream(sess)
-            chunk = next(sess["stream_iter"])
-
-        token_diff = list(chunk.outputs[0].token_ids_diff)
-        if not token_diff:
-            # A final/metadata-only streaming response can happen at request
-            # boundaries.  Restart once from the current prefix and pull again.
-            self._start_stream(sess)
-            chunk = next(sess["stream_iter"])
-            token_diff = list(chunk.outputs[0].token_ids_diff)
-        if not token_diff:
-            raise RuntimeError("TRT-LLM streaming step produced no token")
-
-        sess["stream_buffer"].extend(int(t) for t in token_diff)
-        token = int(sess["stream_buffer"].pop(0))
-        sess["stream_consumed"] = int(sess.get("stream_consumed", 0)) + 1
-        sess["tokens"].append(token)
-        return token
-
-    def _sync_to_target(self, sess, last_token, position):
-        restart_reason = None
-        before_len = len(sess["tokens"])
-        pos = int(position)
-        token = int(last_token)
-        tokens = sess["tokens"]
-
-        # PEARL pre/post-verify alignment.
-        #
-        # Suppose prompt is "a b c d e".  Draft has already produced d_f
-        # during prompt_init while target independently produced t_f.
-        #
-        # First verification:
-        #   target -> draft: t_f, position=e
-        #   if existing token at position+1 is d_f == t_f:
-        #       keep the branch and the next pulls become d_g, d_h, ...
-        #   else:
-        #       trim back to the prompt, append t_f, restart generation.
-        #
-        # Later verification is the same shape:
-        #   target -> draft: t_g, position=f
-        #   if buffered/streamed d_g == t_g, keep going;
-        #   otherwise roll back from d_g and regenerate after t_g.
-        # Target sends the position immediately before ``last_token``.  For
-        # example, after prompt prefill the first generated token arrives with
-        # position == prompt_last_position.  Keep the prefix through that
-        # position, then align/append ``last_token`` at position + 1.
-        prefix_len_before_last = max(0, pos + 1)
-        already_has_last_at_next = (
-            0 <= prefix_len_before_last < len(tokens)
-            and int(tokens[prefix_len_before_last]) == token
-        )
-        # Be permissive for older traces/callers that may have sent the
-        # position of last_token itself.
-        already_has_last_at_pos = 0 <= pos < len(tokens) and int(tokens[pos]) == token
-        if already_has_last_at_next:
-            desired_len = prefix_len_before_last + 1
-        elif already_has_last_at_pos:
-            desired_len = pos + 1
-        else:
-            desired_len = prefix_len_before_last
-        pearl_preverify_match = bool(already_has_last_at_next)
-
-        if desired_len < len(sess["tokens"]):
-            sess["tokens"] = sess["tokens"][:desired_len]
-            self._abort_stream(sess)
-            restart_reason = "rollback"
-
-        if not sess["tokens"] or sess["tokens"][-1] != token:
-            aligned_from_stream = False
-            if restart_reason is None and sess.get("stream_iter") is not None:
-                try:
-                    predicted = self._pull_stream_token(sess)
-                    aligned_from_stream = predicted == token
-                    if not aligned_from_stream:
-                        sess["tokens"].pop()
-                except Exception:
-                    aligned_from_stream = False
-
-            if not aligned_from_stream:
-                self._abort_stream(sess)
-                sess["tokens"].append(token)
-                restart_reason = restart_reason or "target_token_mismatch"
-
-        return {
-            "before_len": before_len,
-            "after_len": len(sess["tokens"]),
-            "prefix_len_before_last": prefix_len_before_last,
-            "desired_len": desired_len,
-            "restart_reason": restart_reason,
-            "pearl_preverify_match": pearl_preverify_match,
-        }
-
-    def step(self, request_id, last_token, position, round_seq, num_tokens=None):
-        sess = self._ensure_session(request_id)
-        before_tokens = list(sess["tokens"])
-        sync_info = self._sync_to_target(sess, last_token, position)
-        compute_prefix = list(sess["tokens"])
-        n = int(num_tokens or self.max_draft_len)
-        draft_tokens = [self._pull_stream_token(sess) for _ in range(n)]
-        _pearl_log(
-            "draft",
-            "backend_step",
-            backend="trtllm",
-            runner="stream",
-            request_id=int(request_id),
-            round_seq=int(round_seq),
-            received_last_token=int(last_token),
-            received_position=int(position),
-            requested_num_tokens=n,
-            stream_generation=int(sess.get("stream_generation", 0)),
-            stream_consumed=int(sess.get("stream_consumed", 0)),
-            stream_restart_reason=sync_info["restart_reason"],
-            pearl_preverify_match=bool(sync_info["pearl_preverify_match"]),
-            sync_prefix_len_before_last=int(sync_info["prefix_len_before_last"]),
-            sync_desired_len=int(sync_info["desired_len"]),
-            session_tokens_before=before_tokens,
-            compute_prefix_tokens=compute_prefix,
-            generated_draft_tokens=[int(t) for t in draft_tokens],
-            session_tokens_after=list(sess["tokens"]),
-        )
-        return draft_tokens
-
-
-class _TrtLlmExecutorBackend(_TrtLlmBackend):
-    """Direct PyExecutor draft backend with explicit request/KV ownership.
-
-    Unlike ``_TrtLlmBackend``, this path does not ask the public LLM API to
-    start a fresh streaming generation when the target diverges.  It creates a
-    resident ``LlmRequest`` for every draft request, drives the local
-    ``PyExecutor`` manually, and rewinds the KV cache by setting
-    ``request.py_rewind_len`` before calling ``ResourceManager.update_resources``.
-
-    The LLM worker thread is still created by ``LLM(...)``.  We use
-    ``PyExecutor.control_action()`` around each manual forward so the event loop
-    is paused while the draft server touches model/KV/sampler internals.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
         if not self.executor_runner.available:
             raise RuntimeError(
                 "failed to initialize PyExecutor-backed draft runner; "
@@ -705,8 +341,22 @@ class _TrtLlmExecutorBackend(_TrtLlmBackend):
         _pearl_log(
             "draft",
             "draft_executor_runner_ready",
-            backend="trtllm-executor",
+            backend="trtllm",
             runner=self.executor_runner.describe(),
+        )
+
+    def _make_sampling_params(self):
+        return self._SamplingParams(
+            max_tokens=max(1, self.stream_max_tokens),
+            temperature=0.0,
+            top_p=1.0,
+            ignore_eos=True,
+            detokenize=False,
+        )
+
+    def matches_model_init(self, msg):
+        return self.model_path == str(msg.model_path) and int(self.max_draft_len) == int(
+            msg.max_draft_len
         )
 
     def reset_sessions(self):
@@ -742,7 +392,7 @@ class _TrtLlmExecutorBackend(_TrtLlmBackend):
             _pearl_log(
                 "draft",
                 "prompt_session_init",
-                backend="trtllm-executor",
+                backend="trtllm",
                 runner="manual_pyexecutor",
                 request_id=rid,
                 prompt_tokens=[int(t) for t in prompt_tokens],
@@ -977,7 +627,7 @@ class _TrtLlmExecutorBackend(_TrtLlmBackend):
             _pearl_log(
                 "draft",
                 "backend_step",
-                backend="trtllm-executor",
+                backend="trtllm",
                 runner="manual_pyexecutor",
                 request_id=int(request_id),
                 round_seq=int(round_seq),
@@ -1064,7 +714,7 @@ class _TrtLlmExecutorBackend(_TrtLlmBackend):
             _pearl_log(
                 "draft",
                 "backend_step",
-                backend="trtllm-executor",
+                backend="trtllm",
                 runner="manual_pyexecutor_branch",
                 request_id=int(request_id),
                 branch_id=int(branch.get("branch_id", 0)) if branch else 0,
@@ -1369,13 +1019,8 @@ class IzzyCompatibleDraftServer:
                 max_draft_len=int(msg.max_draft_len),
                 device=self._args.device,
             )
-        if self._args.backend in ("trtllm", "trtllm-executor"):
-            backend_cls = (
-                _TrtLlmExecutorBackend
-                if self._args.backend == "trtllm-executor"
-                else _TrtLlmBackend
-            )
-            return backend_cls(
+        if self._args.backend == "trtllm":
+            return _TrtLlmBackend(
                 model_path=msg.model_path,
                 prompt=self._args.prompt,
                 max_draft_len=int(msg.max_draft_len),
@@ -1623,7 +1268,7 @@ def main():
     )
     ap.add_argument(
         "--backend",
-        choices=["mock", "transformers", "trtllm", "trtllm-executor"],
+        choices=["mock", "transformers", "trtllm"],
         default="trtllm",
     )
     ap.add_argument(

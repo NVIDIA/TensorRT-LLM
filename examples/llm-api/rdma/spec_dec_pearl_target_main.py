@@ -53,6 +53,15 @@ def main() -> int:
         help="Draft control-plane port (TcpModelInit / TcpPromptInit)",
     )
     ap.add_argument("--max-tokens", type=int, default=64)
+    ap.add_argument(
+        "--warmup-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Run one unmeasured PEARL request with this many max tokens after both "
+            "target and draft models are loaded. 0 disables application-level warmup."
+        ),
+    )
     ap.add_argument("--max-draft-len", type=int, default=4)
     ap.add_argument(
         "--tp-size",
@@ -211,9 +220,7 @@ def main() -> int:
             prompt_text=args.prompt,
             error=repr(exc),
         )
-    pearl_trace_log(
-        "target",
-        "run_start",
+    run_metadata = dict(
         prompt_text=args.prompt,
         generation_prompt=generation_prompt,
         prompt_tokens=prompt_tokens,
@@ -227,6 +234,7 @@ def main() -> int:
         max_draft_len=int(args.max_draft_len),
         baseline=bool(args.baseline),
     )
+    pearl_trace_log("target", "setup_start", **run_metadata)
 
     early_init_result = {"ack": None, "error": None}
     early_init_thread = None
@@ -259,7 +267,6 @@ def main() -> int:
         llm = LLM(
             model=args.target_model,
             kv_cache_config=common_kv,
-            cuda_graph_config=None,
             tensor_parallel_size=args.tp_size,
         )
     else:
@@ -294,12 +301,44 @@ def main() -> int:
         if early_init_result["error"] is not None:
             raise RuntimeError("early draft model init failed") from early_init_result["error"]
 
+    generation_input = {"prompt_token_ids": prompt_tokens} if prompt_tokens else generation_prompt
+    if int(args.warmup_tokens) > 0:
+        warmup_sampling = SamplingParams(
+            max_tokens=int(args.warmup_tokens),
+            temperature=0.0,
+            top_p=1.0,
+            ignore_eos=True,
+        )
+        pearl_trace_log(
+            "target",
+            "warmup_start",
+            warmup_tokens=int(args.warmup_tokens),
+            **run_metadata,
+        )
+        warmup_start = time.perf_counter()
+        warmup_outputs = llm.generate([generation_input], sampling_params=warmup_sampling)
+        warmup_elapsed = max(time.perf_counter() - warmup_start, 1e-9)
+        warmup_out = warmup_outputs[0].outputs[0]
+        warmup_generated_tokens = len(warmup_out.token_ids)
+        pearl_trace_log(
+            "target",
+            "warmup_finish",
+            generated_tokens=int(warmup_generated_tokens),
+            elapsed_sec=float(warmup_elapsed),
+            tokens_per_sec=float(warmup_generated_tokens / warmup_elapsed),
+        )
+        print("=== warmup ===")
+        print(f"warmup_tokens: {int(args.warmup_tokens)}")
+        print(f"generated_tokens: {warmup_generated_tokens}")
+        print(f"elapsed_sec: {warmup_elapsed:.3f}")
+        print(f"tokens_per_sec: {warmup_generated_tokens / warmup_elapsed:.2f}")
+
     sampling = SamplingParams(
         max_tokens=int(args.max_tokens),
         temperature=0.0,
         top_p=1.0,
     )
-    generation_input = {"prompt_token_ids": prompt_tokens} if prompt_tokens else generation_prompt
+    pearl_trace_log("target", "run_start", **run_metadata)
     start_time = time.perf_counter()
     outputs = llm.generate([generation_input], sampling_params=sampling)
     elapsed = max(time.perf_counter() - start_time, 1e-9)

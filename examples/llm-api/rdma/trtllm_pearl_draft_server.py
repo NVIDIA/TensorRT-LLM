@@ -63,7 +63,7 @@ class ProductPEARLDraftServer(PEARLDraftServer):
                 device=self._args.device,
             )
         if backend == "trtllm":
-            return _drs._TrtLlmExecutorBackend(
+            return _drs._TrtLlmBackend(
                 model_path=msg.model_path,
                 prompt=self._args.prompt,
                 max_draft_len=int(msg.max_draft_len),
