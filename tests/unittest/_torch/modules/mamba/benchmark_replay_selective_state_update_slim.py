@@ -196,7 +196,9 @@ def _import_mamba_kernels_fast():
     _load("softplus", "softplus.py")
     # 3. The actual kernels
     replay_mod = _load("replay_selective_state_update", "replay_selective_state_update.py")
-    checkpoint_mod = _load("checkpointing_state_update", "checkpointing_state_update.py")
+    # _slim variant: bench loads the slim kernel file to match the bench
+    # filename suffix.  --full-import path also loads slim (line 214).
+    checkpoint_mod = _load("checkpointing_state_update_slim", "checkpointing_state_update_slim.py")
     base_mod = _load("selective_state_update", "selective_state_update.py")
     conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
 
@@ -625,8 +627,14 @@ def _kernels_per_iter_incremental(
         k = 2  # 1 dynamic_precomp + 1 persistent_main
     elif mode == "persistent_main":
         k = 2 if persistent_skip_empty else 3  # see docstring
-    else:
-        raise ValueError(f"_kernels_per_iter_incremental: unknown mode {mode!r}")
+    elif mode is None:
+        # mode=None: wrapper resolves from _DEFAULT_TUNING per-cell.  Most
+        # tuning entries pick persistent_main (3 kernels: precompute +
+        # write-main + nowrite-main; slim no longer host-skips empty halves),
+        # so default to pm's count.  pd-picking cells will skip on K mismatch
+        # (CUPTI sees only 2); their results land in the skipped sidecar
+        # rather than as bench rows.  Acceptable for an audit run.
+        k = 3
     if with_conv1d:
         k += 1
     return k
@@ -2944,13 +2952,21 @@ def _bench_config(
             # it once here.
             _n_writes_dev_pure: torch.Tensor | None = None
             _host_n_writes_pure: int | None = None
-            if mode in ("persistent_main", "persistent_dynamic") and scenario_n_writes_dev is None:
+            # mode=None means the wrapper resolves from the tuning table —
+            # we don't know whether it'll pick pm or pd at this point, so
+            # pre-allocate as if pm (which needs the value).  pd will
+            # ignore it via IS_DYNAMIC DCE.
+            if mode in ("persistent_main", "persistent_dynamic", None) and scenario_n_writes_dev is None:
                 _n_writes_dev_pure = torch.zeros(1, dtype=torch.int32, device=state_work.device)
-                if mode == "persistent_main":
+                if mode in ("persistent_main", None):
                     scn_fill = scn["fill"]
-                    is_write_scenario_local = (scn_fill + mtp_len) > max_window
-                    _host_n_writes_pure = batch if is_write_scenario_local else 0
-                    _n_writes_dev_pure.fill_(_host_n_writes_pure)
+                    if scn_fill is not None:
+                        is_write_scenario_local = (scn_fill + mtp_len) > max_window
+                        _host_n_writes_pure = batch if is_write_scenario_local else 0
+                        _n_writes_dev_pure.fill_(_host_n_writes_pure)
+                    # else: mix scenario — n_writes varies per iter, set per-iter
+                    # later by the mix replay path; leave _n_writes_dev_pure as
+                    # zeros placeholder.
 
             def _run_incr(
                 block_size_m=block_size_m,
@@ -2985,8 +3001,15 @@ def _bench_config(
                     extra_kwargs["write_checkpoint"] = write_checkpoint
                     extra_kwargs["rectangle_for_nowrite"] = rectangle_for_nowrite
                     extra_kwargs["mode"] = mode
-                    if sort_slots:
-                        extra_kwargs["slot_perm"] = slot_perm_buf
+                    # slim wrapper REQUIRES n_writes (1,) int32 device tensor
+                    # and slot_perm (batch,) int32 device tensor.  Always pass
+                    # them (pd will ignore the count internally, pm splits).
+                    extra_kwargs["slot_perm"] = slot_perm_buf
+                    extra_kwargs["n_writes"] = (
+                        scenario_n_writes_dev
+                        if scenario_n_writes_dev is not None
+                        else _n_writes_dev_pure
+                    )
                     # reverse_nowrite kwarg dropped from the slim kernel
                     # wrapper (was a maindl/dlgrouped feature).  The sweep
                     # axis is retained here only so cell-list cells emitted
@@ -3008,11 +3031,14 @@ def _bench_config(
                     # n_writes is either 0 (all nowrite) or batch (all
                     # write) depending on whether PNAT+T overflows the
                     # window.  Mix scenarios are skipped earlier.
-                    if mode in ("persistent_main", "persistent_dynamic"):
+                    if mode in ("persistent_main", "persistent_dynamic", None):
                         # Per-cell sweep values for persistent-only knobs.
                         # Apply to both persistent variants.  _parse_sweep
                         # returns [None] when the user didn't pass the flag,
                         # in which case we leave the wrapper's defaults.
+                        # mode=None means "let the wrapper resolve from the
+                        # tuning table" — wrapper picks pm or pd, both consume
+                        # these knobs, so propagate caller-explicit overrides.
                         if cta_per_sm is not None:
                             extra_kwargs["_cta_per_sm"] = cta_per_sm
                         if num_loop_stages is not None:
@@ -3044,24 +3070,10 @@ def _bench_config(
                                 "modes.  Re-run with --sort-slots 1 or "
                                 "--hardcode-sort 1."
                             )
-                        # n_writes plumbing: pure scenarios pass an int (host
-                        # knows the value, wrapper host-skips empty halves);
-                        # mix scenarios pass only a (1,) device tensor updated
-                        # per iter by the benchmark pre-iter path (wrapper
-                        # cannot host-skip since host_n_writes is unknown).
-                        if scenario_n_writes_dev is not None:
-                            # Mix: caller-allocated tensor, updated per iter.
-                            extra_kwargs["_n_writes_dev"] = scenario_n_writes_dev
-                        elif mode == "persistent_main":
-                            # Pure pm: pre-allocated tensor + host int.
-                            extra_kwargs["_n_writes"] = _host_n_writes_pure
-                            extra_kwargs["_n_writes_dev"] = _n_writes_dev_pure
-                        elif mode == "persistent_dynamic":
-                            # persistent_dynamic pure: kernel ignores n_writes
-                            # via IS_DYNAMIC DCE, but the wrapper needs a
-                            # valid (1,) tensor pointer.  Pass the pre-allocated
-                            # zero tensor to avoid any in-capture alloc.
-                            extra_kwargs["_n_writes_dev"] = _n_writes_dev_pure
+                        # n_writes is now always passed as the slim wrapper's
+                        # required `n_writes=` kwarg above; the legacy
+                        # `_n_writes` (host int) / `_n_writes_dev` (device
+                        # tensor) plumbing is no longer needed.
                 variant_fn(
                     state_work,
                     old_x_work,
@@ -3107,61 +3119,56 @@ def _bench_config(
                 )
 
             parts = []
+            # Every tag knob emits its value or "auto" when unset (i.e. the
+            # bench-level value is None, meaning the wrapper resolves from
+            # the _DEFAULT_TUNING table per-cell).  Uniform key set across
+            # all cells keeps the JSONL keys stable and prevents collisions
+            # between "I didn't set this" and "I explicitly set this to 0".
+            def _val(v):
+                return "auto" if v is None else v
+
             # When tied (not _any_split), emit the shared single-value tag
             # (M=8 etc).  When split, emit explicit Mw / Mnw tags so cells
             # with the same shared value but different per-main values get
             # unique JSON keys.
             def _emit_split(name_w, name_nw, val_w, val_nw):
                 if val_w is None and val_nw is None:
+                    parts.append(f"{name_w[:-1]}=auto")  # tied form, both auto
                     return
                 if not _any_split or val_w == val_nw:
-                    parts.append(f"{name_w[:-1]}={val_w}")  # strip the 'w' suffix
+                    parts.append(f"{name_w[:-1]}={_val(val_w)}")
                 else:
-                    parts.append(f"{name_w}={val_w}")
-                    parts.append(f"{name_nw}={val_nw}")
+                    parts.append(f"{name_w}={_val(val_w)}")
+                    parts.append(f"{name_nw}={_val(val_nw)}")
             _emit_split("Mw", "Mnw", block_size_m_w, block_size_m_nw)
             _emit_split("Ww", "Wnw", num_warps_w, num_warps_nw)
             _emit_split("Sw", "Snw", num_stages_w, num_stages_nw)
-            if precompute_num_warps is not None:
-                parts.append(f"pW={precompute_num_warps}")
-            if precompute_num_stages is not None:
-                parts.append(f"pS={precompute_num_stages}")
-            if heads_per_block is not None:
-                parts.append(f"H={heads_per_block}")
-            if maxnreg is not None:
-                parts.append(f"R={maxnreg}")
-            if num_ctas is not None:
-                parts.append(f"CT={num_ctas}")
+            parts.append(f"pW={_val(precompute_num_warps)}")
+            parts.append(f"pS={_val(precompute_num_stages)}")
+            parts.append(f"H={_val(heads_per_block)}")
+            parts.append(f"R={_val(maxnreg)}")
+            parts.append(f"CT={_val(num_ctas)}")
             # Persistent-only knobs (only meaningful when MODE=persistent_main;
             # printed unconditionally so output rows are uniformly comparable
             # across modes when the user passed these sweeps).
             _emit_split("CPSw", "CPSnw", cta_per_sm_w, cta_per_sm_nw)
             _emit_split("LSw", "LSnw", num_loop_stages_w, num_loop_stages_nw)
-            if flatten is not None:
-                parts.append(f"FL={flatten}")
-            if warp_specialize is not None:
-                parts.append(f"WS={warp_specialize}")
+            parts.append(f"FL={_val(flatten)}")
+            parts.append(f"WS={_val(warp_specialize)}")
             # TMA sweep tags.  Four wrapper-level flags map to three
             # kernel-level constexprs (rect-load and replay-nowrite-load
             # share `USE_TMA_LOAD_NOWRITE`, picked by the wrapper based on
             # RECTANGLE).  TMARL specifically gates the rectangle path's
             # state load; TMANL specifically gates the replay-style
-            # nowrite path's state load.  Distinct because their measured
-            # perf profiles differ (see CHECKPOINTING_DESIGN.md item #17:
-            # rect TMA is "not a win" while replay-nowrite TMA is the
-            # biggest measured win at int8 b>=64).
-            if use_tma_rect_load is not None:
-                parts.append(f"TMARL={use_tma_rect_load}")    # rect path load
-            if use_tma_replay_write_load is not None:
-                parts.append(f"TMAWL={use_tma_replay_write_load}")    # replay-write load
-            if use_tma_replay_nowrite_load is not None:
-                parts.append(f"TMANL={use_tma_replay_nowrite_load}")  # replay-NOWRITE load (NOT rect)
-            if use_tma_replay_write_store is not None:
-                parts.append(f"TMAWS={use_tma_replay_write_store}")   # replay-write store
+            # nowrite path's state load.
+            parts.append(f"TMARL={_val(use_tma_rect_load)}")
+            parts.append(f"TMAWL={_val(use_tma_replay_write_load)}")
+            parts.append(f"TMANL={_val(use_tma_replay_nowrite_load)}")
+            parts.append(f"TMAWS={_val(use_tma_replay_write_store)}")
             parts.append(f"SR={1 if use_philox else 0}")
-            parts.append(f"RECT={1 if rectangle_for_nowrite else 0}")
+            parts.append(f"RECT={'auto' if rectangle_for_nowrite is None else (1 if rectangle_for_nowrite else 0)}")
             parts.append(f"WC={1 if write_checkpoint else 0}")
-            parts.append(f"MODE={mode}")
+            parts.append(f"MODE={_val(mode)}")
             parts.append(f"SORT={1 if sort_slots else 0}")
             parts.append(f"REVN={1 if reverse_nowrite else 0}")
             parts.append(f"HSORT={1 if hardcode_sort else 0}")
@@ -4495,12 +4502,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rectangle-for-nowrite",
         type=str,
-        default="0",
+        default=None,
         help="Comma-separated 0/1 values: 0 = replay-style nowrite kernel, "
         "1 = dedicated rectangle nowrite kernel.  Sweep both with '0,1' to "
         "compare in one invocation.  Silently no-op for write cells (the "
         "write path always uses replay-style).  Only applies to the "
-        "checkpointing variant.",
+        "checkpointing variant.  When unset (default), the wrapper resolves "
+        "from the _DEFAULT_TUNING lookup per (batch, dtype, sr) cell.",
     )
     parser.add_argument(
         "--use-tma-rect-load",
@@ -4538,14 +4546,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modes",
         type=str,
-        default="persistent_dynamic",
+        default=None,
         help="Comma-separated dispatch modes to sweep, any of "
         "{persistent_dynamic, persistent_main}.  "
         "persistent_dynamic = single persistent-CTA kernel that dispatches "
         "per-slot at runtime based on PNAT.  "
         "persistent_main = persistent-CTA kernel with two halves (write + "
         "nowrite), requires caller-provided _n_writes and a write-first "
-        "sorted slot_perm.  Both modes ignore --write-modes (per-slot from PNAT).",
+        "sorted slot_perm.  Both modes ignore --write-modes (per-slot from PNAT).  "
+        "When unset (default), the wrapper resolves from the _DEFAULT_TUNING "
+        "lookup per (batch, dtype, sr) cell.",
     )
     parser.add_argument(
         "--mix-csv",
@@ -4713,12 +4723,20 @@ def _parse_args() -> argparse.Namespace:
             parser.error(f"--sr-modes value must be RN or SR, got {m!r}")
     args.sr_modes_list = sr_modes
 
-    rect_modes = [v.strip() for v in args.rectangle_for_nowrite.split(",") if v.strip()]
-    rect_list = []
-    for v in rect_modes:
-        if v not in ("0", "1"):
-            parser.error(f"--rectangle-for-nowrite value must be 0 or 1, got {v!r}")
-        rect_list.append(v == "1")
+    # rectangle_for_nowrite=None means "let the wrapper resolve from
+    # _DEFAULT_TUNING".  Empty/unset argparse default produces [None] in the
+    # sweep list; the kernel call passes None and the wrapper picks per-cell.
+    if args.rectangle_for_nowrite is None:
+        rect_list = [None]
+    else:
+        rect_modes = [v.strip() for v in args.rectangle_for_nowrite.split(",") if v.strip()]
+        rect_list = []
+        for v in rect_modes:
+            if v not in ("0", "1"):
+                parser.error(f"--rectangle-for-nowrite value must be 0 or 1, got {v!r}")
+            rect_list.append(v == "1")
+        if not rect_list:
+            rect_list = [None]
     args.rectangle_for_nowrite_list = rect_list
 
     sort_modes = [v.strip() for v in (args.sort_slots or "0").split(",") if v.strip()]
@@ -4756,16 +4774,21 @@ def _parse_args() -> argparse.Namespace:
     else:
         args.write_modes_list = [args.write_checkpoint]
 
-    modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
-    valid_modes = {
-        "persistent_main", "persistent_dynamic",
-    }
-    for m in modes_raw:
-        if m not in valid_modes:
-            parser.error(
-                f"--modes value must be one of {sorted(valid_modes)}, got {m!r}"
-            )
-    args.modes_list = modes_raw or ["persistent_dynamic"]
+    # mode=None means "let the wrapper resolve from _DEFAULT_TUNING".  Same
+    # convention as --rectangle-for-nowrite.
+    if args.modes is None:
+        args.modes_list = [None]
+    else:
+        modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
+        valid_modes = {
+            "persistent_main", "persistent_dynamic",
+        }
+        for m in modes_raw:
+            if m not in valid_modes:
+                parser.error(
+                    f"--modes value must be one of {sorted(valid_modes)}, got {m!r}"
+                )
+        args.modes_list = modes_raw if modes_raw else [None]
     return args
 
 
