@@ -363,239 +363,6 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
     return smemFinalBinSize[0] > kNumFinalItems;
 }
 
-// Follows half - 11 - 11 - 10 bit iterations
-template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort, bool multipleBlocksPerRow = false,
-    bool mergeBlocks = false, typename InputT = float>
-static __device__ void topKPerRowJob(int const* indices, InputT const* logits, int rowStart, int rowEnd,
-    int* outIndices, float* outLogits, int stride1, int topK)
-{
-    // The number of slots for the final pass.
-    static constexpr int kNumFinalItems = 2048;
-    // The number of elements per thread for the final sort.
-    static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
-    // The class to sort the elements during the final pass.
-    using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
-    using FinalSortTempStorage = std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
-    // The class to compute the inclusive prefix-sum over the histogram.
-    using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
-
-    // The structure to store the final items (for the final pass).
-    struct FinalItems
-    {
-        // Shared memory to store the indices for the final pass.
-        int indices[kNumFinalItems];
-        // Shared memory to store the logits for the final pass.
-        float logits[kNumFinalItems];
-    };
-
-    struct Histogram
-    {
-        typename Scan::TempStorage scan;
-        int data[kNumBins];
-    };
-
-    // Shared memory to compute the block sort.
-    __shared__ union
-    {
-        FinalItems items;
-        FinalSortTempStorage finalSort;
-        Histogram histo;
-    } smemFinal;
-
-    // Shared memory to store the selected indices.
-    // If we are processing using multiple blocks, we need to store the logits and
-    // indices.
-    extern __shared__ int32_t smemOutput[];
-
-    // Shared memory to store the threshold bin.
-    __shared__ int smemThresholdBinIdx[1];
-    // Shared memory counter to register the candidates for the final phase.
-    __shared__ int smemFinalDstIdx[1];
-    // Shared memory to determine if the threshold bin fits in the final items.
-    __shared__ int smemFinalBinSize[1];
-    // Shared memory to keep track of the top-k values found so far by the
-    // previous iterations
-    __shared__ int smemFoundTopKValues[1];
-
-    // The length of the row.
-    int rowLen = rowEnd - rowStart;
-
-    // Shortcut if the length of the row is smaller than Top-K. Indices are not
-    // sorted by their corresponding logit.
-    if (rowLen <= topK)
-    {
-        for (int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock)
-        {
-            if constexpr (multipleBlocksPerRow)
-            {
-                outIndices[rowIt] = rowIt + rowStart;
-                outLogits[rowIt] = static_cast<float>(logits[rowIt + rowStart]);
-            }
-            else
-            {
-                outIndices[rowIt] = rowIt;
-            }
-        }
-        for (int rowIt = rowLen + threadIdx.x; rowIt < topK; rowIt += kNumThreadsPerBlock)
-        {
-            outIndices[rowIt] = -1;
-            if constexpr (multipleBlocksPerRow)
-            {
-                outLogits[rowIt] = -FLT_MAX;
-            }
-        }
-
-        return;
-    }
-    // Initialize values
-    if (threadIdx.x == 0)
-    {
-        smemFinalDstIdx[0] = 0;
-        smemFoundTopKValues[0] = 0;
-    }
-    __syncthreads();
-    int thresholdBinIdx = -1;
-    uint32_t logitPattern = 0;
-
-    // Step 0: Process first 11 bits of half representation
-    bool continueToNextStep
-        = processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-            indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx,
-            smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
-
-    if (continueToNextStep)
-    {
-        // Step 1: Process next 11 bits
-        continueToNextStep
-            = processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-                indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
-                smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
-    }
-
-    if (continueToNextStep)
-    {
-        // Step 2: Process next 11 bits
-        continueToNextStep
-            = processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-                indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
-                smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
-    }
-
-    if (continueToNextStep)
-    {
-        // Step 3: Process last 10 bits
-        processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-            indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx,
-            smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
-    }
-
-    if (!continueToNextStep)
-    {
-        // The histogram did not proceed to the final 10 bits, therefore we need to
-        // sort the final items The logits of the elements to be sorted in the final
-        // pass.
-        if constexpr (useRadixSort)
-        {
-            // Sorting with radix sort
-            float finalLogits[kNumFinalItemsPerThread];
-            // The indices of the elements to be sorted in the final pass.
-            int finalIndices[kNumFinalItemsPerThread];
-
-#pragma unroll
-            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
-            {
-                finalLogits[ii] = -FLT_MAX;
-            }
-
-            // Read the elements from SMEM.
-#pragma unroll
-            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
-            {
-                int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-                if (srcIdx < smemFinalDstIdx[0])
-                {
-                    finalLogits[ii] = smemFinal.items.logits[srcIdx];
-                    finalIndices[ii] = smemFinal.items.indices[srcIdx];
-                }
-            }
-            // Make sure the shared memory has been read.
-            __syncthreads();
-
-            // Sort the elements.
-            FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
-
-            // Copy the data back to the shared memory storage.
-            int baseIdx = smemFoundTopKValues[0];
-
-#pragma unroll
-            for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
-            {
-                int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-                int dstIdx = baseIdx + srcIdx;
-
-                if (dstIdx < topK)
-                {
-                    smemOutput[dstIdx] = finalIndices[ii];
-                    if constexpr (multipleBlocksPerRow)
-                    {
-                        reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = finalLogits[ii];
-                    }
-                }
-            }
-        }
-        else
-        {
-            // Sorting with insertion sort
-            auto baseIdx = smemFoundTopKValues[0];
-            for (int i = threadIdx.x; i < smemFinalDstIdx[0]; i += kNumThreadsPerBlock)
-            {
-                int outIndex = 0;
-                auto logit = smemFinal.items.logits[i];
-                for (int j = 0; j < smemFinalDstIdx[0]; j++)
-                {
-                    auto otherLogit = smemFinal.items.logits[j];
-                    if (logit < otherLogit || (logit == otherLogit && i < j))
-                    {
-                        outIndex++;
-                    }
-                }
-                // Store if outIndex is in bounds
-                if (outIndex + baseIdx < topK)
-                {
-                    smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
-                    if constexpr (multipleBlocksPerRow)
-                    {
-                        reinterpret_cast<float*>(smemOutput + topK)[outIndex + baseIdx] = smemFinal.items.logits[i];
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    // Store to global memory.
-    for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock)
-    {
-        if constexpr (multipleBlocksPerRow)
-        {
-            outIndices[i] = smemOutput[i];
-            outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
-        }
-        else
-        {
-            if (stride1 == 1)
-            {
-                // stride1 == 1 will use vectorized_process, which indexes already skip the rowStart.
-                outIndices[i] = smemOutput[i];
-            }
-            else
-            {
-                outIndices[i] = smemOutput[i] - rowStart;
-            }
-        }
-    }
-}
-
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort>
 struct TopKSmem
 {
@@ -634,7 +401,7 @@ struct TopKSmem
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort, bool multipleBlocksPerRow = false,
     bool mergeBlocks = false, typename InputT = float>
-static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* logits, int rowStart, int rowEnd,
+static __device__ void topKPerRowJob(int const* indices, InputT const* logits, int rowStart, int rowEnd,
     int* outIndices, float* outLogits, int stride1, int topK,
     TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort>& smem)
 {
@@ -658,7 +425,8 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* l
     int rowLen = rowEnd - rowStart;
 
     // Shortcut if the length of the row is smaller than Top-K. Indices are not
-    // sorted by their corresponding logit.
+    // sorted by their corresponding logit. Unreachable when mergeBlocks=true:
+    // both merge callers pass rowLen = numBlocksPerRow * topK > topK.
     if (rowLen <= topK)
     {
         for (int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock)
@@ -667,19 +435,6 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* l
             {
                 outIndices[rowIt] = rowIt + rowStart;
                 outLogits[rowIt] = static_cast<float>(logits[rowIt + rowStart]);
-            }
-            else if constexpr (mergeBlocks)
-            {
-                // Pass through input pairs: the input indices already point
-                // into the original row, and (when outLogits != nullptr) we
-                // also copy the value-side so a downstream merge can keep
-                // ranking. The single-block fused-path final merge passes
-                // outLogits=nullptr and only the indices are written.
-                outIndices[rowIt] = indices[rowIt];
-                if (outLogits != nullptr)
-                {
-                    outLogits[rowIt] = static_cast<float>(logits[rowIt]);
-                }
             }
             else
             {
@@ -692,13 +447,6 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* l
             if constexpr (multipleBlocksPerRow)
             {
                 outLogits[rowIt] = -FLT_MAX;
-            }
-            else if constexpr (mergeBlocks)
-            {
-                if (outLogits != nullptr)
-                {
-                    outLogits[rowIt] = -FLT_MAX;
-                }
             }
         }
 
@@ -793,12 +541,7 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* l
                 if (dstIdx < topK)
                 {
                     smemOutput[dstIdx] = finalIndices[ii];
-                    // For multipleBlocksPerRow, logits must be staged for global
-                    // write. For mergeBlocks, also stage logits whenever the
-                    // caller wants them (intermediate hierarchical-merge stage)
-                    // — the smemOutput allocation is sized for both halves
-                    // already (2*topK ints) at every fused/multi-block launch.
-                    if constexpr (multipleBlocksPerRow || mergeBlocks)
+                    if constexpr (multipleBlocksPerRow)
                     {
                         reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = finalLogits[ii];
                     }
@@ -825,7 +568,7 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* l
                 if (outIndex + baseIdx < topK)
                 {
                     smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
-                    if constexpr (multipleBlocksPerRow || mergeBlocks)
+                    if constexpr (multipleBlocksPerRow)
                     {
                         reinterpret_cast<float*>(smemOutput + topK)[outIndex + baseIdx] = smemFinal.items.logits[i];
                     }
@@ -845,15 +588,7 @@ static __device__ void topKPerRowJobWithSmem(int const* indices, InputT const* l
         }
         else if constexpr (mergeBlocks)
         {
-            // Hierarchical merge: stage1 needs logits written so stage2 can
-            // read them; the final stage passes outLogits=nullptr and writes
-            // only the indices. The smemOutput second-half is staged either
-            // way (the launch sizes dynamicSmemBytes for both halves).
             outIndices[i] = smemOutput[i];
-            if (outLogits != nullptr)
-            {
-                outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
-            }
         }
         else
         {
@@ -893,8 +628,9 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
     outIndices += static_cast<int64_t>(rowIdx) * topK;
     logits += static_cast<int64_t>(rowIdx) * stride0;
 
+    __shared__ TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort> smem;
     topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort>(
-        nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
+        nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK, smem);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -941,8 +677,9 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     }
     logits += static_cast<int64_t>(rowIdx) * stride0;
 
+    __shared__ TopKSmem<kNumThreadsPerBlock, kNumBins, useRadixSort> smem;
     topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, multipleBlocksPerRow, mergeBlocks>(
-        indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
+        indices, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK, smem);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -985,7 +722,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFu
         if (blockInRow == 0)
         {
             int* mergedOut = outIndices + static_cast<int64_t>(rowIdx) * topK;
-            topKPerRowJobWithSmem<kNumThreadsPerBlock, kNumBins, useRadixSort,
+            topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort,
                 /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false>(nullptr, rowLogits, /*rowStart=*/0, rowEndFull,
                 mergedOut,
                 /*outLogits=*/nullptr, stride1, topK, smem);
@@ -1005,7 +742,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFu
     float* myOutLogitsAux = outLogitsAux + auxOffset;
 
     // Part 1: per-block top-k into aux buffers.
-    topKPerRowJobWithSmem<kNumThreadsPerBlock, kNumBins, useRadixSort, /*multipleBlocksPerRow=*/true,
+    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, /*multipleBlocksPerRow=*/true,
         /*mergeBlocks=*/false>(
         nullptr, rowLogits, rowStart, rowEnd, myOutIndicesAux, myOutLogitsAux, stride1, topK, smem);
 
@@ -1047,7 +784,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFu
     int* mergedOut = outIndices + static_cast<int64_t>(rowIdx) * topK;
     int mergeRowEnd = numBlocksPerRow * topK;
 
-    topKPerRowJobWithSmem<kNumThreadsPerBlock, kNumBins, useRadixSort, /*multipleBlocksPerRow=*/false,
+    topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, /*multipleBlocksPerRow=*/false,
         /*mergeBlocks=*/true>(mergeIndicesIn, mergeLogitsIn, /*rowStart=*/0, mergeRowEnd, mergedOut,
         /*outLogits=*/nullptr,
         /*stride1=*/1, topK, smem);
