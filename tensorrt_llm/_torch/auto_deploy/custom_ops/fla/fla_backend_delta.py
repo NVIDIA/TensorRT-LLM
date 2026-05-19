@@ -1,3 +1,7 @@
+# Copyright (c) 2023-2025 Songlin Yang
+# Licensed under the MIT License.
+# Original source: https://github.com/fla-org/flash-linear-attention
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
