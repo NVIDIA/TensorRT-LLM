@@ -13,8 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+KV_CACHE_ITERATION_STATS_REUSE_KEYS = (
+    "iterReusedBlocks",
+    "iterFullReusedBlocks",
+    "iterPartialReusedBlocks",
+    "iterMissedBlocks",
+    "iterCacheHitRate",
+)
+
+KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS = (
+    "primaryMaxNumBlocks",
+    "primaryFreeNumBlocks",
+    "primaryUsedNumBlocks",
+    "secondaryMaxNumBlocks",
+    "secondaryFreeNumBlocks",
+    "secondaryUsedNumBlocks",
+    "iterAllocTotalBlocks",
+    "iterAllocNewBlocks",
+    "iterGenAllocBlocks",
+    "iterOnboardBlocks",
+    "iterOnboardBytes",
+    "iterOffloadBlocks",
+    "iterOffloadBytes",
+    "iterIntraDeviceCopyBlocks",
+    "iterIntraDeviceCopyBytes",
+)
 
 
 @dataclass(slots=True)
@@ -26,13 +52,23 @@ class KVCacheV2PoolGroupIterationStats:
 
 
 @dataclass(slots=True)
+class KVCacheV2LifeCycleIterationStats:
+    life_cycle_id: int
+    pool_group_id: int
+    window_size: int | None
+    kind: str
+    stats: Any
+
+
+@dataclass(slots=True)
 class KVCacheV2IterationStatsReport:
     by_window_size: dict[int, Any]
     by_pool_group: dict[int, KVCacheV2PoolGroupIterationStats]
+    by_life_cycle: dict[int, KVCacheV2LifeCycleIterationStats] = field(default_factory=dict)
 
 
-def serialize_kv_cache_iteration_stats(stats) -> dict:
-    return {
+def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
+    fields = {
         "primaryMaxNumBlocks": stats.primary_max_num_blocks,
         "primaryFreeNumBlocks": stats.primary_free_num_blocks,
         "primaryUsedNumBlocks": stats.primary_used_num_blocks,
@@ -54,6 +90,9 @@ def serialize_kv_cache_iteration_stats(stats) -> dict:
         "iterIntraDeviceCopyBlocks": stats.iter_intra_device_copy_blocks,
         "iterIntraDeviceCopyBytes": stats.iter_intra_device_copy_bytes,
     }
+    if keys is None:
+        return fields
+    return {key: fields[key] for key in keys}
 
 
 def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
@@ -78,7 +117,23 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
             "poolGroupId": stats.pool_group_id,
             "slotSize": list(stats.slot_size),
             "windowSizes": list(stats.window_sizes),
-            **serialize_kv_cache_iteration_stats(stats.stats),
+            **serialize_kv_cache_iteration_stats(
+                stats.stats, KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS
+            ),
         }
         for pool_group_id, stats in by_pool_group.items()
+    }
+
+    if not kv_iter_stats.by_life_cycle:
+        return
+
+    stats_dict["kvCacheIterationStatsByLifecycle"] = {
+        str(life_cycle_id): {
+            "lifeCycleId": stats.life_cycle_id,
+            "poolGroupId": stats.pool_group_id,
+            "windowSize": stats.window_size,
+            "kind": stats.kind,
+            **serialize_kv_cache_iteration_stats(stats.stats, KV_CACHE_ITERATION_STATS_REUSE_KEYS),
+        }
+        for life_cycle_id, stats in kv_iter_stats.by_life_cycle.items()
     }

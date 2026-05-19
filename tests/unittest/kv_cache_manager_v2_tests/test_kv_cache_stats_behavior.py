@@ -623,7 +623,15 @@ def test_pool_group_stats_are_reported(resource_guard) -> None:
     pool_group = stats_report.by_pool_group[0]
     assert pool_group.pool_group_id == 0
     assert set(pool_group.window_sizes) == {manager.max_seq_len, 8}
-    _assert_iteration_delta(pool_group.stats, alloc_total=4, alloc_new=4, missed=4)
+    _assert_iteration_delta(pool_group.stats, alloc_total=4, alloc_new=4)
+
+    life_cycle_stats = {
+        stats.window_size: stats.stats for stats in stats_report.by_life_cycle.values()
+    }
+    assert set(life_cycle_stats) == {manager.max_seq_len, 8}
+    _assert_iteration_delta(life_cycle_stats[manager.max_seq_len], missed=2)
+    _assert_iteration_delta(life_cycle_stats[8], missed=2)
+
     _assert_iteration_delta(
         stats_report.by_window_size[manager.max_seq_len],
         alloc_total=2,
