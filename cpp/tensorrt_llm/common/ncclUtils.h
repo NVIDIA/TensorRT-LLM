@@ -282,6 +282,12 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
+    // Comms whose symmetric memory path is known to fail collectively (e.g. H100 PCIe without
+    // NVLink fabric where ncclMemAlloc returns ncclUnhandledCudaError on at least one rank).
+    // Once recorded, subsequent requestBuffer() calls short-circuit to NCCLWindowBuffer{} so we
+    // don't repeatedly trigger the warning, the rank-sync allreduce, and the sticky-error drain
+    // for every autotuner trial.
+    std::unordered_set<ncclComm_t> mSymmetricUnavailable;
 };
 
 // RAII wrapper for NCCL window buffers

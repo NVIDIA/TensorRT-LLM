@@ -416,6 +416,17 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // This is cheap even if no buffers exist yet - cleanup will just return early
     registerBufferCleanup(comm);
 
+    // If a previous allocateAndRegisterBuffer call collectively concluded that this comm
+    // cannot use NCCL symmetric memory, short-circuit so callers transparently fall back to
+    // regular allreduce. This avoids re-running ncclMemAlloc + the rank-sync allreduce on
+    // every autotuner trial, which would otherwise spam warnings and stress the failing path.
+    // The decision is collective (driven by an ncclAllReduce(min) inside allocateAndRegisterBuffer),
+    // so all ranks reach the same conclusion and stay in sync without further communication.
+    if (mSymmetricUnavailable.find(comm) != mSymmetricUnavailable.end())
+    {
+        return NCCLWindowBuffer();
+    }
+
     // Check if we have an available buffer of at least the requested size for this communicator
     // Use best-fit: find the smallest buffer that's >= requested size
     auto& commBuffers = mBufferPool[comm];
@@ -466,6 +477,13 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     if (buffer.isValid())
     {
         commBuffers.push_back({buffer, true});
+    }
+    else
+    {
+        // The collective allreduce inside allocateAndRegisterBuffer agreed that at least one
+        // rank could not allocate symmetric memory. Mark this comm so future requests don't
+        // retry the failing path on every autotuner trial.
+        mSymmetricUnavailable.insert(comm);
     }
 
     return buffer;
@@ -700,6 +718,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     {
         // No buffers to clean up, but mark as cleaned
         mRegisteredComms.erase(comm);
+        mSymmetricUnavailable.erase(comm);
         return;
     }
 
@@ -775,6 +794,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
+    mSymmetricUnavailable.erase(comm);
 }
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
