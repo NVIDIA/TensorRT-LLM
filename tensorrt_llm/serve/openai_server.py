@@ -372,7 +372,22 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
 
+        # Resolution order:
+        #   1. Explicit --chat_template (file path or literal Jinja string).
+        #   2. Sidecar <model_dir>/chat_template.jinja, if present.
+        # Step 2 is required because transformers < 5.0 does not auto-load
+        # the sidecar into tokenizer.chat_template, and the model's
+        # tokenizer_class may not be recognised either. Without this fallback,
+        # any /v1/chat/completions request would raise
+        # "No chat template found for the given tokenizer and tools." from
+        # tensorrt_llm/inputs/utils.py.
         self.chat_template = load_chat_template(chat_template)
+        if self.chat_template is None and hf_tokenizer_path:
+            sidecar = Path(hf_tokenizer_path) / "chat_template.jinja"
+            if sidecar.is_file():
+                self.chat_template = load_chat_template(sidecar)
+                logger.info("Loaded chat template from sidecar file: %s",
+                            sidecar)
 
         # Enable response storage for Responses API
         self.enable_store = (len(
