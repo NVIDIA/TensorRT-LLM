@@ -661,12 +661,12 @@ def load_hf_tokenizer(model_dir: str,
                 "Retrying with local_files_only=True.")
             try:
                 return _load(local_files_only=True)
-            except Exception:
-                pass
-        # Propagate the original failure rather than silently returning None,
-        # so callers (e.g. trtllm-serve) fail fast at startup instead of
-        # crashing later inside a request handler.
-        raise
+            except Exception as e2:
+                logger.warning(
+                    f"Retry with local_files_only=True also failed: {e2}")
+        else:
+            logger.warning(f"Failed to load hf tokenizer from {model_dir}: {e}")
+        return None
 
 
 def load_custom_tokenizer(
