@@ -364,7 +364,13 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
     int handle = static_cast<int>(commBuffers.size());
     NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle);
-    commBuffers.push_back({buffer, true});
+    // Only cache valid buffers. allocateAndRegisterBuffer returns an empty buffer when any rank
+    // failed ncclMemAlloc (collective fallback to plain allreduce); caching it would leak a
+    // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
+    if (buffer.isValid())
+    {
+        commBuffers.push_back({buffer, true});
+    }
 
     return buffer;
 }
