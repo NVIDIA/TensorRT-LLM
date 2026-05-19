@@ -2895,20 +2895,17 @@ REUSED_TESTS_EOF
 // Build-scoped: ${UPLOAD_PATH} is per-build, so unswept progress tars are
 // garbage-collected with the rest of the build's artifacts anyway.
 def deleteProgressArtifact(stageName) {
-    def target = "${UPLOAD_PATH}/test-results-progress/results-${stageName}-progress.tar.gz"
+    def targetUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/results-${stageName}-progress.tar.gz"
     try {
-        rtServer(
-            id: 'Artifactory',
-            url: 'https://urm.nvidia.com/artifactory',
-            credentialsId: 'urm-artifactory-creds',
-            bypassProxy: true,
-            timeout: 300,
-        )
-        rtDelete(
-            serverId: 'Artifactory',
-            spec: """{ "files": [ { "pattern": "${target}" } ] }""",
-        )
-        echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${target}"
+        withCredentials([usernamePassword(
+                credentialsId: 'urm-artifactory-creds',
+                usernameVariable: 'ART_USER',
+                passwordVariable: 'ART_PASS')]) {
+            sh """
+                curl -fsSL --retry 2 -X DELETE -u "\$ART_USER:\$ART_PASS" '${targetUrl}'
+            """
+        }
+        echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${targetUrl}"
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
