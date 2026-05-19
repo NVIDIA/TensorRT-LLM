@@ -2957,6 +2957,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.lora_task_id,
                     input_tokens,
                     cache_salt_id=req.cache_salt_id)
+                # Saturated IndexMapper (e.g. disagg gen trans in progress) → None; retry next iter.
+                if kv_cache is None:
+                    release_resources(req)
+                    return None
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
@@ -2978,6 +2982,9 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.lora_task_id,
                         input_tokens,
                         cache_salt_id=req.cache_salt_id)
+                    if draft_kv_cache is None:
+                        release_resources(req)
+                        return None
                     success = draft_kv_cache.resume(
                         draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
