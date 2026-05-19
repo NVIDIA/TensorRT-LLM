@@ -37,6 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
     _remap_checkpoint_keys,
 )
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -872,6 +873,9 @@ class Flux2Transformer2DModel(nn.Module):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
+            elif isinstance(module, RMSNorm):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 # For non-Linear modules, load weights directly
                 module_weights = loader.filter_weights(name, weights)
