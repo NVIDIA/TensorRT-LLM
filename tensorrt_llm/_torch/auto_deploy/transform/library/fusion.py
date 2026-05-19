@@ -373,17 +373,20 @@ class FuseGemms(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # sort linear nodes by parent node
+        # sort linear nodes by (parent, has_bias). Bias and no-bias siblings
+        # can't co-fuse (would need zero-padding), so bucket them separately
+        # to preserve partial fusion when a subset is bias-uniform.
         linear_nodes = defaultdict(list)
         for node in gm.graph.nodes:
             if is_linear_op(node):
-                linear_nodes[node.args[0]].append(node)
+                has_bias = node.args[2] is not None
+                linear_nodes[(node.args[0], has_bias)].append(node)
 
         # fuse linear nodes
         idx = -1
         num_matches = 0
         with cuda_memory_tracker():
-            for parent_node, lin_children in linear_nodes.items():
+            for (parent_node, _has_bias), lin_children in linear_nodes.items():
                 if len(lin_children) < 2:
                     continue
                 if not check_same_children(parent_node, is_linear_op):
