@@ -263,13 +263,17 @@ def test_new_metrics_exposed(server: RemoteOpenAIServer):
         )
 
     # Trigger a RequestValidationError → 400 to populate the error counter.
-    # `max_tokens=-1` fails Pydantic validation in the OpenAI schema.
+    # `truncate_prompt_tokens=0` violates the Pydantic Field(ge=1) constraint
+    # on CompletionRequest, which is what the RequestValidationError handler
+    # in openai_server.py instruments. (`max_tokens` has no Field constraint,
+    # so a negative value is accepted by Pydantic and rejected later through
+    # a different code path that doesn't hit the validation handler.)
     req = Request(
         f'{server.url_root}/v1/completions',
         data=json.dumps({
             "model": "Server",
             "prompt": "Hello",
-            "max_tokens": -1,
+            "truncate_prompt_tokens": 0,
         }).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
