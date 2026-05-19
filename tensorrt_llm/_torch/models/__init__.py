@@ -87,7 +87,7 @@ __all__ = [
     "GptOssForCausalLM",
     "SeedOssForCausalLM",
     "Glm4MoeForCausalLM",
-    #"Qwen3VLModel",
+    "Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
 ]
 
