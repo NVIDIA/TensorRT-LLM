@@ -78,6 +78,11 @@ class WaitingQueue(ABC):
         pass
 
     @abstractmethod
+    def clear(self) -> None:
+        """Remove all requests from the queue."""
+        pass
+
+    @abstractmethod
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
         pass
@@ -144,6 +149,10 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         filtered_requests = [req for req in self if req.id not in request_ids]
         self.clear()
         self.extend(filtered_requests)
+
+    def clear(self) -> None:
+        """Remove all requests from the queue."""
+        super().clear()
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
@@ -247,6 +256,10 @@ class PriorityWaitingQueue(WaitingQueue):
         """Remove requests with the given IDs."""
         self._heap = [e for e in self._heap if e[2].id not in request_ids]
         heapq.heapify(self._heap)
+
+    def clear(self) -> None:
+        """Remove all requests from the queue."""
+        self._heap.clear()
 
     def __bool__(self) -> bool:
         return len(self._heap) > 0

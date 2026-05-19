@@ -204,13 +204,15 @@ class BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
-    virtual void respondAndSendAsync(LlmRequest* llmRequest) = 0;
+    // Transfers are asynchronous. Pass shared_ptr so the transceiver and its
+    // workers keep the request alive until the corresponding future resolves.
+    virtual void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
         = 0;
 
-    virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
-    virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
+    virtual void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) = 0;
+    virtual void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     /// Check all requests transferring context, and return the requests that have completed or encountered an error.
     virtual RequestStatuses checkContextTransferStatus(
@@ -221,7 +223,7 @@ public:
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -252,13 +254,13 @@ public:
 
     virtual ~CacheTransceiver();
 
-    void respondAndSendAsync(LlmRequest* llmRequest) override;
+    void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress) override;
 
-    void requestAndReceiveSync(LlmRequest* llmRequest) override;
-    void requestAndReceiveAsync(LlmRequest* llmRequest) override;
+    void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) override;
+    void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     RequestStatuses checkContextTransferStatus(
         std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override;
@@ -267,7 +269,7 @@ public:
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) override;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
 private:
     void initializeCommState();
@@ -276,8 +278,10 @@ private:
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
+    // Hold strong references while futures are outstanding so Python-side
+    // cleanup cannot leave C++ with dangling LlmRequest pointers.
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;

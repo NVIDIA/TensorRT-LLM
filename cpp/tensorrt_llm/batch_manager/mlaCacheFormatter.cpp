@@ -253,7 +253,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        auto cacheBufferHolder = BufferIndexHolder::acquireSend(*mCacheTransBufferManagers[transferIndexerKCache]);
+        auto cacheBufferId = cacheBufferHolder.get();
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -380,7 +381,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
@@ -487,13 +487,15 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             auto bufferKind = transferIndexerKCache ? static_cast<uint8_t>(BufferKind::kKV_INDEXER)
                                                     : static_cast<uint8_t>(BufferKind::kKV);
             auto preAssignedId = connections[pickUpConnections[0]]->getPreAssignedBufferId(bufferKind);
+            BufferIndexHolder cacheBufferHolder;
             if (preAssignedId.has_value())
             {
                 cacheBufferId = static_cast<int>(*preAssignedId);
             }
             else
             {
-                cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
+                cacheBufferHolder = BufferIndexHolder::acquireRecv(*mCacheTransBufferManagers[transferIndexerKCache]);
+                cacheBufferId = cacheBufferHolder.get();
             }
 
             auto targetNum = pickUpConnections.size();
@@ -642,10 +644,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             bufferManager.getStream().synchronize();
         }
 
-        if (cacheBufferId.has_value())
-        {
-            mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForRecv(cacheBufferId);
-        }
     }
     session.setTime(TransferSession::kTimePostprocess);
 

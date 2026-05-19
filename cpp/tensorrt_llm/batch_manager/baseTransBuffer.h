@@ -39,11 +39,53 @@ class FabricMemory;
 namespace tensorrt_llm::batch_manager
 {
 
+class BaseTransBufferManager;
+
 enum class BufferKind : uint8_t
 {
     kKV = 0,
     kKV_INDEXER = 1,
     kRNN = 2
+};
+
+class BufferIndexHolder
+{
+public:
+    enum class Direction : uint8_t
+    {
+        kSend = 0,
+        kRecv = 1
+    };
+
+    BufferIndexHolder() = default;
+    BufferIndexHolder(BaseTransBufferManager* manager, Direction direction, std::optional<int> bufferId);
+    ~BufferIndexHolder();
+
+    BufferIndexHolder(BufferIndexHolder const&) = delete;
+    BufferIndexHolder& operator=(BufferIndexHolder const&) = delete;
+    BufferIndexHolder(BufferIndexHolder&& other) noexcept;
+    BufferIndexHolder& operator=(BufferIndexHolder&& other) noexcept;
+
+    [[nodiscard]] static BufferIndexHolder acquireSend(BaseTransBufferManager& manager);
+    [[nodiscard]] static BufferIndexHolder acquireRecv(BaseTransBufferManager& manager);
+
+    [[nodiscard]] std::optional<int> get() const noexcept
+    {
+        return mBufferId;
+    }
+
+    [[nodiscard]] bool owns() const noexcept
+    {
+        return mOwns;
+    }
+
+    void reset() noexcept;
+
+private:
+    BaseTransBufferManager* mManager{nullptr};
+    Direction mDirection{Direction::kSend};
+    std::optional<int> mBufferId{std::nullopt};
+    bool mOwns{false};
 };
 
 /// @brief Base class for cache transfer buffer management.

@@ -20,8 +20,10 @@
 #include <future>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -102,6 +104,11 @@ public:
         }
     }
 
+    TransferSession(TransferSession const&) = delete;
+    TransferSession& operator=(TransferSession const&) = delete;
+    TransferSession(TransferSession&&) noexcept = default;
+    TransferSession& operator=(TransferSession&&) noexcept = default;
+
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
 
     // should be called only during the initialization of the TransferSession
@@ -151,6 +158,11 @@ public:
         mCounterPartRanks = std::move(ranks);
     }
 
+    void addBufferIndexHolder(BufferIndexHolder&& holder)
+    {
+        mBufferIndexHolders.emplace_back(std::move(holder));
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -162,6 +174,7 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    std::vector<BufferIndexHolder> mBufferIndexHolders;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
@@ -257,9 +270,10 @@ public:
 
     /// @brief Asynchronously respond to the request and send data.
     /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
-    /// should remain valid until future synchronization.
+    /// should remain valid until future synchronization. Passed as shared_ptr so
+    /// the async worker keeps the LlmRequest alive until the future resolves.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
@@ -314,9 +328,10 @@ public:
 
     /// @brief Asynchronously send a request to receive data.
     /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization.
+    /// data for this request should remain intact only after future synchronization. Passed as shared_ptr so
+    /// the async worker keeps the LlmRequest alive until the future resolves.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 

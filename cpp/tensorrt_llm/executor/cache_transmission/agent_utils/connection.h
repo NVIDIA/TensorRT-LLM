@@ -320,11 +320,11 @@ public:
     [[nodiscard]] std::string const& getAgentName() const;
 
     template <typename NotificationType>
-    void waitForNotification(
+    [[nodiscard]] bool waitForNotification(
         std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag);
-    void waitForSyncInfo(
+    [[nodiscard]] bool waitForSyncInfo(
         std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag);
-    void waitForReadySignal(
+    [[nodiscard]] bool waitForReadySignal(
         std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] bool isRunning() const override;
 
