@@ -400,17 +400,34 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
         return trtllm_inputs
 
     def get_scenarios(self) -> List[MultimodalScenario]:
-        """Minimal scenario sweep for the initial coverage.
+        """Modality-sanity sweep (image / multiple_image / video).
 
-        Starts with one image scenario, no CUDA graph / chunked
-        prefill / kv-cache reuse — those add additional surface area
-        (mRoPE handling under graph capture, multimodal cumsum under
-        chunking, etc.) that's worth adding incrementally once the
-        baseline parity passes.
+        These three catch differences in placeholder counts and the
+        multimodal-cumsum path between single-image, multi-image, and
+        video inputs.
+
+        CUDA-graph capture is intentionally not exercised here. The
+        standard `attn_metadata.create_cuda_graph_metadata` path only
+        addresses attention metadata; the Mamba SSM state buffer of the
+        hybrid (Mamba + attention) cache is not threaded through, so
+        replayed logits diverge from the HF reference. Adding that path
+        is dedicated harness work and tracked separately.
         """
         return [
             MultimodalScenario(
                 modality="image",
+                use_cuda_graph=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
+            MultimodalScenario(
+                modality="multiple_image",
+                use_cuda_graph=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
+            MultimodalScenario(
+                modality="video",
                 use_cuda_graph=False,
                 chunked_prefill=False,
                 kv_cache_reuse=False,

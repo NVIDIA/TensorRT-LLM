@@ -441,13 +441,24 @@ class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
 
-    def test_auto_dtype(self) -> None:
-        with LLM(
-            self.MODEL_PATH,
+    def _make_llm(self, model_path: str) -> LLM:
+        return LLM(
+            model_path,
             max_num_tokens=self.MAX_NUM_TOKENS,
             max_batch_size=self.MAX_BATCH_SIZE,
             kv_cache_config=self.kv_cache_config,
-        ) as llm:
+        )
+
+    def test_auto_dtype(self) -> None:
+        with self._make_llm(self.MODEL_PATH) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    @skip_pre_hopper
+    def test_fp8_prequantized(self) -> None:
+        model_path = f"{llm_models_root()}/Qwen3.5-35B-A3B-FP8"
+        with self._make_llm(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
