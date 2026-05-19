@@ -68,9 +68,9 @@ def _nest_prefill(si: SequenceInfo, input_ids, pages_per_seq, cache_loc, **kw):
         flat_ids,
         cu_seqlen,
         input_pos=0,
-        cache_loc=cache_loc,
-        cu_num_pages=cu_num_pages,
-        extra_page_per_seq=extra_page,
+        cache_loc_per_pool=[cache_loc],
+        cu_num_pages_per_pool=[cu_num_pages],
+        extra_page_per_seq_per_pool=[extra_page],
         **kw,
     )
     return si
@@ -137,9 +137,9 @@ class TestSwitchToGeneratePackedToDecode:
             [1, 2, 3, 4, 5],
             cu_seqlen=[0, 5],
             input_pos=[10],
-            cache_loc=[0, 1, 2, 3],
-            cu_num_pages=[0, 4],
-            extra_page_per_seq=[-1],
+            cache_loc_per_pool=[[0, 1, 2, 3]],
+            cu_num_pages_per_pool=[[0, 4]],
+            extra_page_per_seq_per_pool=[[-1]],
         )
 
         increment = torch.tensor([1], dtype=torch.int32, device=si.device)
@@ -174,9 +174,9 @@ class TestSwitchToGenerateDecodeToDecode:
             cu_seqlen=list(range(batch_size + 1)),
             input_pos=positions,
             batch_info=[0, 0, 0, 0, batch_size, batch_size],
-            cache_loc=cache_loc,
-            cu_num_pages=cu_num_pages,
-            extra_page_per_seq=[-1] * batch_size,
+            cache_loc_per_pool=[cache_loc],
+            cu_num_pages_per_pool=[cu_num_pages],
+            extra_page_per_seq_per_pool=[[-1] * batch_size],
         )
 
     def test_decode_increment_by_one(self):
@@ -261,9 +261,9 @@ class TestSwitchToGeneratePageBoundary:
             cu_seqlen=[0, 1],
             input_pos=[7],
             batch_info=[0, 0, 0, 0, 1, 1],
-            cache_loc=[10, 11],
-            cu_num_pages=[0, 2],
-            extra_page_per_seq=[99],
+            cache_loc_per_pool=[[10, 11]],
+            cu_num_pages_per_pool=[[0, 2]],
+            extra_page_per_seq_per_pool=[[99]],
         )
 
         increment = torch.tensor([1], dtype=torch.int32, device=si.device)
@@ -283,9 +283,9 @@ class TestSwitchToGeneratePageBoundary:
             cu_seqlen=[0, 1],
             input_pos=[7],
             batch_info=[0, 0, 0, 0, 1, 1],
-            cache_loc=[10, 11],
-            cu_num_pages=[0, 2],
-            extra_page_per_seq=[-1],
+            cache_loc_per_pool=[[10, 11]],
+            cu_num_pages_per_pool=[[0, 2]],
+            extra_page_per_seq_per_pool=[[-1]],
         )
 
 

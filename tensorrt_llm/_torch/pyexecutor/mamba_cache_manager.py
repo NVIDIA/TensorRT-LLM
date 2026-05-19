@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
+    PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import (
@@ -866,6 +867,10 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         model_type: str = "nemotron_hybrid",
         is_draft: bool = False,
         use_replay_state_update: bool = False,
+        # Per-pool configurations forwarded to the C++ KVCacheManager ctor.
+        # Lets a single manager host pools with mixed shapes (e.g. Gemma4
+        # hybrid attention). See KVCacheManager.__init__.
+        pool_configurations: Optional[List[PoolConfiguration]] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -915,6 +920,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             is_estimating_kv_cache=is_estimating_kv_cache,
             execution_stream=execution_stream,
             is_draft=is_draft,
+            pool_configurations=pool_configurations,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -1148,6 +1154,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
             linear_attention_metadata=self.linear_attention_metadata,
+            **kwargs,
         )
 
         assert self.local_num_mamba_layers > 0, "At least one mamba layer is required"

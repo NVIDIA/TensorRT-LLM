@@ -658,17 +658,34 @@ class ADEngine(ModelEngine):
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
-        # store cache information for all requests now
+        # Store cache information for all requests.
+        # All KV pools are hosted by a single C++ KVCacheManager; pool index is
+        # the position of the window in self.cache_seq_interface.kv_group_windows
+        # (the same source the kvcache transform used to register window groups
+        # on SequenceInfo).  Per-window queries on the manager route to the
+        # correct C++ pool via mLayerToWindowSize.
+        kv_group_windows = self.cache_seq_interface.kv_group_windows
+        # Cache hot lookups so the per-request loop avoids repeated C++
+        # dispatch / hasattr calls.
         _tokens_per_block = kv_cache_manager.tokens_per_block
         _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
-        cache_loc: List[int] = []
-        cu_num_pages: List[int] = [0]
-        extra_page_per_seq: List[int] = []
         state_slot_idx: List[int] = []
 
-        batch_cache_indices = kv_cache_manager.get_batch_cache_indices(
-            [r.py_request_id for r in ordered_requests]
-        )
+        # Uniform per-pool transport: a single-pool deployment is just the
+        # degenerate case of VSWA with one pool, so all pools (including 0)
+        # take the same code path below.
+        num_pools = len(kv_group_windows)
+        cache_loc_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        cu_num_pages_per_pool: List[List[int]] = [[0] for _ in range(num_pools)]
+        extra_page_per_seq_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+
+        # Batched per-pool lookup preserves the #13560 host-overhead
+        # optimization: one C++ call per pool instead of one per (request, pool).
+        request_ids = [r.py_request_id for r in ordered_requests]
+        batch_cache_indices_per_pool: List[List[List[int]]] = [
+            kv_cache_manager.get_batch_cache_indices(request_ids, window_size=group_window)
+            for group_window in kv_group_windows
+        ]
 
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
@@ -682,17 +699,25 @@ class ADEngine(ModelEngine):
             # get some info on the current request
             seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
             end_compute_i = input_pos[i] + seq_len_i
-            # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
-            num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
-            # construct cache information for the current request
-            cache_indices = batch_cache_indices[i]
-            cache_loc.extend(cache_indices[:num_active_blocks_i])
-            cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
-            if len(cache_indices) > num_active_blocks_i:
-                extra_page_per_seq.append(cache_indices[num_active_blocks_i])
-            else:
-                extra_page_per_seq.append(-1)
+            for pool_idx, group_window in enumerate(kv_group_windows):
+                all_indices = batch_cache_indices_per_pool[pool_idx][i]
+                # Active blocks = pages needed to fit end_compute_i tokens within
+                # this window.  The trailing slot in all_indices (when present)
+                # is the reserved spillover page.
+                active_token_count = min(end_compute_i, group_window)
+                pages_for_active = (active_token_count + _tokens_per_block - 1) // _tokens_per_block
+                num_active = min(len(all_indices), pages_for_active)
+                active_indices = all_indices[:num_active]
+
+                cache_loc_per_pool[pool_idx].extend(active_indices)
+                cu_num_pages_per_pool[pool_idx].append(
+                    cu_num_pages_per_pool[pool_idx][i] + num_active
+                )
+                if len(all_indices) > num_active:
+                    extra_page_per_seq_per_pool[pool_idx].append(all_indices[num_active])
+                else:
+                    extra_page_per_seq_per_pool[pool_idx].append(-1)
 
         # Store batch information based on prefill, decode, and extend requests.
         num_decode = len(generation_requests)
@@ -717,9 +742,9 @@ class ADEngine(ModelEngine):
             cu_seqlen=cu_seqlen,
             input_pos=input_pos,
             batch_info=batch_info,
-            cache_loc=cache_loc,
-            cu_num_pages=cu_num_pages,
-            extra_page_per_seq=extra_page_per_seq,
+            cache_loc_per_pool=cache_loc_per_pool if num_pools > 0 else None,
+            cu_num_pages_per_pool=cu_num_pages_per_pool if num_pools > 0 else None,
+            extra_page_per_seq_per_pool=extra_page_per_seq_per_pool if num_pools > 0 else None,
             slot_idx=state_slot_idx,
             prompt_lens=prompt_lens,
             gather_context_logits=gather_context_logits,
