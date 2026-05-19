@@ -22,7 +22,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -1077,7 +1077,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        if not _is_disagg():
+        if not _is_mm_disagg():
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Qwen2VisionModelBase(
                 mm_encoder_config, kwargs.get('vision_model_class', None))
@@ -1193,7 +1193,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         mm_multimodal_params = self._get_requests_with_mm_data(
             multimodal_params)
         if len(mm_multimodal_params) > 0:
-            if not _is_disagg():
+            if not _is_mm_disagg():
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params)
@@ -1272,7 +1272,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
-        if not _is_disagg():
+        if not _is_mm_disagg():
             self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights, weight_mapper)
@@ -1400,7 +1400,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
         if isinstance(weight_mapper, Qwen2VLHfWeightMapper):
             weights = weight_mapper.preprocess_weights(weights)
 
-        if not _is_disagg():
+        if not _is_mm_disagg():
             self.mm_encoder.load_weights(weights)
 
         self.llm.load_weights(weights)

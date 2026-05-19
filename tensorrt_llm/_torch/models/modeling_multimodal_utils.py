@@ -37,7 +37,8 @@ _DISAGG_CONTEXT_ROLES = {"context", "ctx"}
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
+# This is the multimodal encoder/prefill split, not generic disaggregated serving.
+def _is_mm_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 

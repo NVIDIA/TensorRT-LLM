@@ -43,7 +43,7 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
-    _is_disagg,
+    _is_mm_disagg,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_attached_multimodal_embeddings,
@@ -2611,7 +2611,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # to be the LLM-only config and no longer has vision_config /
         # sound_config / force_image_size / etc.
         mm_pretrained = self._mm_model_config.pretrained_config
-        is_multimodal_encoder_worker = not _is_disagg() or is_disagg_context_role()
+        is_multimodal_encoder_worker = not _is_mm_disagg() or is_disagg_context_role()
         if self.vision_encoder is None and is_multimodal_encoder_worker:
             self.vision_encoder = NanoV2VLVisionEncoder(self._mm_model_config).eval().to("cuda")
         sound_config = getattr(mm_pretrained, "sound_config", None)
@@ -3118,7 +3118,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
             # Raw image/video/audio tensors: run local encoder.
             if raw_ctx_params:
-                if _is_disagg() and not is_disagg_context_role():
+                if _is_mm_disagg() and not is_disagg_context_role():
                     raise ValueError(
                         "Raw multimodal inputs require a local multimodal encoder on the "
                         "disaggregated context worker. Set TRTLLM_DISAGG_ROLE=context for "
