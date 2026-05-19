@@ -5084,6 +5084,8 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
                 speculative_model=
                 f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
                 eagle3_one_model=True)
+        env_overrides = ({"TRTLLM_CAN_USE_DEEP_EP": "0"}
+                         if moe_backend == "CUTLASS" else None)
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
@@ -5092,7 +5094,8 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
                 **pytorch_config,
                 enable_attention_dp=attention_dp,
                 kv_cache_config=kv_cache_config,
-                speculative_config=spec_config) as llm:
+                speculative_config=spec_config,
+                env_overrides=env_overrides) as llm:
 
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
