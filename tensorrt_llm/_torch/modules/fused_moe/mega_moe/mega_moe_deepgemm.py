@@ -298,9 +298,7 @@ class MegaMoEDeepGemm(MoE):
         # max_num_tokens``, doubling the EP factor and exploding HBM (see
         # ``layout::Workspace`` / ``get_num_max_pool_tokens`` in DG).
         if self.use_dp and self.ep_size > 1:
-            self.max_num_tokens = max(
-                1, (self.max_num_tokens + self.ep_size - 1) // self.ep_size
-            )
+            self.max_num_tokens = max(1, (self.max_num_tokens + self.ep_size - 1) // self.ep_size)
 
         # Resolve the EP ProcessGroup at module construction — creating a
         # group at forward time would be collective on a non-synchronous
