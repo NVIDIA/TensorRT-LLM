@@ -8,9 +8,9 @@ Compares (mla_rope_inplace -> fp8_batched_quantize_1x128_permute102) against
 the new fused op `trtllm::fused_inv_rope_fp8_quant_vllm_port` on each of its
 backends:
 
-  - default — CuTe DSL kernel (preferred on SM100; matches Triton at large M
-    and is 12-19% faster at small M)
-  - `TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE=1` — explicit Triton fallback
+  - default — optimized Triton kernel
+  - `TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1` — opt-in CuTe DSL backend
+    (perf-tied with Triton; kept as scaffold for future TMA / warp-spec V2)
 
 Run inside a CUDA Blackwell (SM100f) container (the TRT-LLM build sqsh).
 """
@@ -147,19 +147,19 @@ def _run_neox_compare(num_tokens, backend_env):
 
 @pytest.mark.parametrize("num_tokens", [3, 64, 257, 512, 1024, 2048, 8192])
 def test_fused_inv_rope_fp8_quant_neox(num_tokens):
-    """Default backend (CuTe DSL on SM100)."""
+    """Default backend (optimized Triton)."""
     _run_neox_compare(num_tokens, backend_env={})
 
 
 @pytest.mark.parametrize("num_tokens", [3, 64, 257, 512, 1024, 2048, 8192])
-def test_fused_inv_rope_fp8_quant_neox_triton_fallback(num_tokens):
-    """Explicit Triton fallback (`TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE=1`)."""
-    _run_neox_compare(num_tokens, backend_env={"TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE": "1"})
+def test_fused_inv_rope_fp8_quant_neox_cute_dsl(num_tokens):
+    """Opt-in CuTe DSL backend (`TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1`)."""
+    _run_neox_compare(num_tokens, backend_env={"TLLM_USE_CUTE_DSL_FUSED_INV_ROPE": "1"})
 
 
 if __name__ == "__main__":
     test_fused_inv_rope_fp8_quant_neox(64)
     test_fused_inv_rope_fp8_quant_neox(257)
-    test_fused_inv_rope_fp8_quant_neox_triton_fallback(64)
-    test_fused_inv_rope_fp8_quant_neox_triton_fallback(257)
+    test_fused_inv_rope_fp8_quant_neox_cute_dsl(64)
+    test_fused_inv_rope_fp8_quant_neox_cute_dsl(257)
     print("OK")
