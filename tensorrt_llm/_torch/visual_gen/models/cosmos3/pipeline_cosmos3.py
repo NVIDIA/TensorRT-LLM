@@ -201,6 +201,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
                 use_guardrails=False,
                 image=None,
+                enable_sound=False,
             )
 
     def infer(self, req):
@@ -220,6 +221,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             use_resolution_template=req.params.extra_params.get("use_resolution_template", True),
             use_system_prompt=req.params.extra_params.get("use_system_prompt", False),
             use_guardrails=req.params.extra_params.get("use_guardrails", True),
+            enable_sound=req.params.extra_params.get("enable_sound", False),
         )
 
     def _format_prompt_with_template(
@@ -499,6 +501,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
         use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
+        enable_sound: bool = COSMOS3_EXTRA_SPECS["enable_sound"].default,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -615,7 +618,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # 3b. Sound noise init
         # T_sound = ceil(duration_s * sound_latent_fps / temporal_compression_factor_sound)
         # Duration derived from num_frames / frame_rate; matches cosmos3-internal.
-        do_sound = self.sound_gen and hasattr(self, "sound_tokenizer")
+        do_sound = enable_sound and self.sound_gen and hasattr(self, "sound_tokenizer")
         sound_latents = None
         if do_sound:
             duration_s = num_frames / frame_rate
