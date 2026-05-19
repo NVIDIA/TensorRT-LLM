@@ -546,7 +546,7 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     role: Required[str]
     """The role of the message's author."""
 
-    content: Union[str, List[ChatCompletionContentPartParam]]
+    content: Union[str, List[ChatCompletionContentPartParam], None]
     """The contents of the message."""
 
     name: str
