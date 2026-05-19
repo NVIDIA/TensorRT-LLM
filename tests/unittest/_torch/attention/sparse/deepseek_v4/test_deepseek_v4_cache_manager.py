@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -6,6 +9,9 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
+    DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV,
+)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
@@ -1388,7 +1394,26 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_swa_scratch_reuse_enabled_for_main_manager(self):
+    def test_swa_scratch_reuse_disabled_by_default_for_main_manager(self, monkeypatch):
+        monkeypatch.delenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, raising=False)
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        try:
+            assert not cache_manager.enable_swa_scratch_reuse
+            assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_swa_scratch_reuse_enabled_by_env_for_main_manager(self, monkeypatch):
+        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1405,7 +1430,8 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_draft_cache_manager_disables_swa_scratch_reuse(self):
+    def test_draft_cache_manager_disables_swa_scratch_reuse(self, monkeypatch):
+        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1423,7 +1449,8 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_context_request_enable_scratch_reuse_until_generation(self):
+    def test_context_request_enable_scratch_reuse_until_generation(self, monkeypatch):
+        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1457,7 +1484,8 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_disagg_generation_init_disables_swa_scratch_reuse(self):
+    def test_disagg_generation_init_disables_swa_scratch_reuse(self, monkeypatch):
+        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1487,7 +1515,8 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_dummy_generation_requests_with_swa_scratch_reuse(self):
+    def test_dummy_generation_requests_with_swa_scratch_reuse(self, monkeypatch):
+        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=2,
