@@ -466,20 +466,31 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
 {
-    // Step 1: Allocate symmetric memory (per-rank, non-collective — can fail asymmetrically).
-    void* ncclPtr = nullptr;
-    TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
-    int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
-    NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
-
-    // Step 2: ncclCommWindowRegister is collective — if any rank skips it, all other ranks hang.
-    // Synchronize the per-rank alloc status using a small cudaMalloc flag (not ncclMemAlloc, so
-    // OOM on symmetric memory does not prevent us from allocating the flag).
+    // Step 1: Pre-allocate the rank-sync flag *before* ncclMemAlloc.  ncclMemAlloc can fail
+    // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
+    // is unavailable; that failure may leave a sticky CUDA last-error on the device.  If we
+    // deferred this cudaMalloc until after the failure, the sticky error would propagate into
+    // cudaMalloc, TLLM_CUDA_CHECK would throw, and the failing rank would never reach the
+    // collective ncclAllReduce(min) below — hanging every other rank that *did* succeed.
     int* rankSyncFlag = nullptr;
     TLLM_CUDA_CHECK(cudaMalloc(&rankSyncFlag, sizeof(int)));
     CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
 
-    // Step 3: Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
+    // Step 2: Allocate symmetric memory (per-rank, non-collective — can fail asymmetrically).
+    // If ncclMemAlloc fails, drain any sticky CUDA last-error so the subsequent cudaMemcpy and
+    // ncclAllReduce(min) observe a clean device state and the failing rank reaches the collective
+    // below on the same control path as healthy ranks.
+    void* ncclPtr = nullptr;
+    TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
+    int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
+    NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
+    if (!localAllocOk)
+    {
+        (void) cudaGetLastError();
+    }
+
+    // Step 3: ncclCommWindowRegister is collective — if any rank skips it, all other ranks hang.
+    // Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
     // H2D failure is non-fatal: warn and continue — device flag may be stale but the allreduce
     // must still be reached by all ranks. allreduce and D2H failures are catastrophic (throw).
     auto stream = at::cuda::getCurrentCUDAStream().stream();
