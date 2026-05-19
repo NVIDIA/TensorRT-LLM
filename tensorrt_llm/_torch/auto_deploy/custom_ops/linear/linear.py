@@ -19,6 +19,21 @@ from typing import List, Optional
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
+
+# Cache sm version (call once).
+_SM_VERSION: Optional[int] = None
+
+
+def _sm_version() -> int:
+    global _SM_VERSION
+    if _SM_VERSION is None:
+        try:
+            _SM_VERSION = get_sm_version()
+        except Exception:
+            _SM_VERSION = 0
+    return _SM_VERSION
+
 
 @torch.library.custom_op("auto_deploy::torch_linear_simple", mutates_args=())
 def simple(
@@ -65,6 +80,23 @@ def simple(
     Returns:
         Output tensor of shape ``(..., out_features)``.
     """
+    # Blackwell (sm>=100): route bf16 linear to trtllm::cublas_mm. This matches
+    # PT's GPT-OSS path (modeling_gpt_oss.py: use_custom_cublas_mm = sm>=100) and
+    # selects single-pass cluster-mode cubins instead of cuBLAS-default
+    # split-K + reduce + zero-fill for small-M (decode) projection GEMMs.
+    if _sm_version() >= 100 and input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
+        # cublas_mm requires 2D mat_a/mat_b. Flatten leading dims and unflatten on exit.
+        in_shape = input.shape
+        input_2d = input.reshape(-1, in_shape[-1])
+        out_2d = torch.ops.trtllm.cublas_mm(
+            input_2d,
+            weight.t(),
+            bias,
+            None,  # out_dtype
+            0,  # output_buffer_kind = DEFAULT
+            None,  # group (no TP)
+        )
+        return out_2d.view(*in_shape[:-1], out_2d.shape[-1])
     return torch.ops.aten.linear(input, weight, bias)
 
 
