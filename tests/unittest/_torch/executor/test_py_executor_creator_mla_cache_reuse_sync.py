@@ -129,8 +129,7 @@ class _DummyModelEngine:
                 enable_flash_mla=False,
                 is_generation=True,
                 pretrained_config=SimpleNamespace(),
-                quant_config=SimpleNamespace(
-                    kv_cache_quant_algo=kv_cache_quant_algo),
+                quant_config=SimpleNamespace(kv_cache_quant_algo=kv_cache_quant_algo),
             ),
             vocab_size_padded=32000,
         )
@@ -209,40 +208,42 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
         is_last_pp_rank=lambda: True,
     )
 
-    monkeypatch.setattr(py_executor_creator, "_load_config_and_create_checkpoint_loader",
-                        lambda llm_args, checkpoint_dir: (llm_args, None))
+    monkeypatch.setattr(
+        py_executor_creator,
+        "_load_config_and_create_checkpoint_loader",
+        lambda llm_args, checkpoint_dir: (llm_args, None),
+    )
     monkeypatch.setattr(py_executor_creator, "_get_mapping", lambda _: fake_mapping)
-    monkeypatch.setattr(py_executor_creator.Distributed, "get",
-                        staticmethod(lambda mapping: SimpleNamespace()))
-    monkeypatch.setattr(py_executor_creator, "validate_feature_combination",
-                        lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "get_calibrator",
-                        lambda: _DummyCalibrator())
-    monkeypatch.setattr(py_executor_creator, "instantiate_sampler",
-                        lambda *args, **kwargs: SimpleNamespace())
-    monkeypatch.setattr(py_executor_creator, "get_spec_resource_manager",
-                        lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "get_spec_drafter",
-                        lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction",
-                        lambda: None)
-    monkeypatch.setattr(py_executor_creator, "log_memory_usage",
-                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        py_executor_creator.Distributed, "get", staticmethod(lambda mapping: SimpleNamespace())
+    )
+    monkeypatch.setattr(
+        py_executor_creator, "validate_feature_combination", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(py_executor_creator, "get_calibrator", lambda: _DummyCalibrator())
+    monkeypatch.setattr(
+        py_executor_creator, "instantiate_sampler", lambda *args, **kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        py_executor_creator, "get_spec_resource_manager", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(py_executor_creator, "get_spec_drafter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda: None)
+    monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: True)
     monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: False)
     monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(py_executor_creator, "KvCacheCreator", _DummyKvCacheCreator)
 
-    monkeypatch.setattr(py_executor_creator.torch.cuda, "mem_get_info",
-                        lambda: (2 << 30, 4 << 30))
-    monkeypatch.setattr(py_executor_creator.torch.cuda, "empty_cache",
-                        lambda: None)
-    monkeypatch.setattr(py_executor_creator.torch.cuda,
-                        "reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr(py_executor_creator.torch.cuda, "memory_stats",
-                        lambda: {"allocated_bytes.all.current": 0})
-    monkeypatch.setattr(py_executor_creator.torch.cuda, "Stream",
-                        lambda: SimpleNamespace(cuda_stream=123))
+    monkeypatch.setattr(py_executor_creator.torch.cuda, "mem_get_info", lambda: (2 << 30, 4 << 30))
+    monkeypatch.setattr(py_executor_creator.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(py_executor_creator.torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(
+        py_executor_creator.torch.cuda, "memory_stats", lambda: {"allocated_bytes.all.current": 0}
+    )
+    monkeypatch.setattr(
+        py_executor_creator.torch.cuda, "Stream", lambda: SimpleNamespace(cuda_stream=123)
+    )
 
     def _create_model_engine(**kwargs):
         return _DummyModelEngine(
@@ -250,8 +251,7 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
             kv_cache_quant_algo=kv_cache_quant_algo,
         )
 
-    monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine",
-                        _create_model_engine)
+    monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
 
     def _create_py_executor_instance(**kwargs):
         return _DummyPyExecutor(
@@ -261,17 +261,22 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
             execution_stream=kwargs["execution_stream"],
         )
 
-    monkeypatch.setattr(py_executor_creator, "create_py_executor_instance",
-                        _create_py_executor_instance)
+    monkeypatch.setattr(
+        py_executor_creator, "create_py_executor_instance", _create_py_executor_instance
+    )
 
     py_executor = py_executor_creator.create_py_executor(
         llm_args=llm_args,
         checkpoint_dir=None,
     )
     kv_cache_manager = py_executor.resource_manager.get_resource_manager(
-        ResourceManagerType.KV_CACHE_MANAGER)
+        ResourceManagerType.KV_CACHE_MANAGER
+    )
 
-    return kv_cache_manager.enable_block_reuse, py_executor.model_engine.attn_runtime_features.cache_reuse
+    return (
+        kv_cache_manager.enable_block_reuse,
+        py_executor.model_engine.attn_runtime_features.cache_reuse,
+    )
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):
