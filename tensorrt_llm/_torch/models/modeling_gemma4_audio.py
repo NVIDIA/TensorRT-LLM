@@ -45,7 +45,6 @@ Architecture references (HF transformers 5.5.3 ``modeling_gemma4.py``):
 """
 
 import math
-import os
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Dict, Optional, Tuple
@@ -59,25 +58,6 @@ from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as _HFGemma
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from .modeling_utils import _load_weights_impl
-
-# DEBUG_PROBE_BEGIN: gated by env var, fires only when DEBUG_AUDIO_TOWER=1.
-_DEBUG_AUDIO = os.environ.get("DEBUG_AUDIO_TOWER", "0") == "1"
-
-
-def _audio_stats(name: str, t: Optional[torch.Tensor]) -> None:
-    if not _DEBUG_AUDIO or t is None:
-        return
-    f = t.detach().float()
-    finite_frac = torch.isfinite(f).float().mean().item()
-    print(
-        f"  [audio] {name:32s} shape={tuple(t.shape)} dtype={t.dtype} "
-        f"mean={f.mean().item():+.4g} std={f.std().item():.4g} "
-        f"absmax={f.abs().max().item():.4g} finite={finite_frac:.4f}",
-        flush=True,
-    )
-
-
-# DEBUG_PROBE_END
 
 
 @dataclass
@@ -687,25 +667,8 @@ class Gemma4AudioModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> _AudioOutput:
-        # DEBUG_PROBE_BEGIN
-        if _DEBUG_AUDIO:
-            print("[audio] === Gemma4AudioModel.forward ===", flush=True)
-            _audio_stats("input_features (mel)", input_features)
-            _audio_stats(
-                "attention_mask", attention_mask.float() if attention_mask is not None else None
-            )
-        # DEBUG_PROBE_END
         hidden_states, output_mask = self.subsample_conv_projection(input_features, attention_mask)
-        # DEBUG_PROBE_BEGIN
-        _audio_stats("after subsample_conv_proj", hidden_states)
-        _audio_stats(
-            "output_mask (subsample)", output_mask.float() if output_mask is not None else None
-        )
-        # DEBUG_PROBE_END
         position_embeddings = self.rel_pos_enc(hidden_states)
-        # DEBUG_PROBE_BEGIN
-        _audio_stats("rel_pos_enc", position_embeddings)
-        # DEBUG_PROBE_END
 
         # output_mask: (B, T_audio) bool. Frames where mask is False are pad.
         if output_mask is None:
@@ -716,26 +679,15 @@ class Gemma4AudioModel(nn.Module):
             output_mask, seq_len=hidden_states.shape[1], device=hidden_states.device
         )
         attn_mask_5d = self._convert_4d_mask_to_blocked_5d(attn_mask_4d)
-        # DEBUG_PROBE_BEGIN
-        _audio_stats("attn_mask_5d", attn_mask_5d.float())
-        # DEBUG_PROBE_END
 
-        n_layers = len(self.layers)
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
                 attention_mask=attn_mask_5d,
                 position_embeddings=position_embeddings,
             )
-            # DEBUG_PROBE_BEGIN: log layers 0 / mid / last
-            if _DEBUG_AUDIO and (i == 0 or i == n_layers // 2 or i == n_layers - 1):
-                _audio_stats(f"after layer[{i}]", hidden_states)
-            # DEBUG_PROBE_END
 
         hidden_states = self.output_proj(hidden_states)
-        # DEBUG_PROBE_BEGIN
-        _audio_stats("after output_proj (final)", hidden_states)
-        # DEBUG_PROBE_END
         return _AudioOutput(last_hidden_state=hidden_states, attention_mask=output_mask)
 
     def load_weights(self, weights: Dict[str, torch.Tensor]):
@@ -759,38 +711,3 @@ class Gemma4AudioModel(nn.Module):
         for name, buf in self.named_buffers():
             if name in weights:
                 buf.data.copy_(weights[name].to(buf.dtype).to(buf.device))
-        # DEBUG_PROBE_BEGIN: verify checkpoint actually landed
-        if _DEBUG_AUDIO:
-            print("[audio] === load_weights summary ===", flush=True)
-            print(f"  checkpoint keys provided: {len(weights)}", flush=True)
-            loaded_param_keys = {n for n, _ in self.named_parameters()}
-            covered_params = sum(1 for k in weights if k in loaded_param_keys)
-            print(
-                f"  params covered by ckpt:   {covered_params}/{len(loaded_param_keys)}", flush=True
-            )
-            # Spot-check a few _Gemma4AudioRMSNorm weights — if they're all
-            # zeros, the (1+w) convention reduces to identity scaling and
-            # explains "BLEU=1.9, model ignores audio". Sample 3 RMSNorms.
-            picks = []
-            for name, mod in self.named_modules():
-                if isinstance(mod, _Gemma4AudioRMSNorm):
-                    picks.append((name, mod.weight))
-                    if len(picks) >= 3:
-                        break
-            for name, w in picks:
-                f = w.detach().float()
-                print(
-                    f"  rmsnorm[{name}].weight stats: "
-                    f"mean={f.mean().item():+.4g} std={f.std().item():.4g} "
-                    f"absmax={f.abs().max().item():.4g} zero_frac={(f == 0).float().mean().item():.4f}",
-                    flush=True,
-                )
-            # Also spot-check one clippable linear's input_min/output_max buffers.
-            for name, mod in self.named_modules():
-                if isinstance(mod, Gemma4AudioClippableLinear):
-                    for bname in ("input_min", "input_max", "output_min", "output_max"):
-                        b = getattr(mod, bname, None)
-                        if b is not None:
-                            print(f"  clip[{name}].{bname}: {b.item():+.4g}", flush=True)
-                    break
-        # DEBUG_PROBE_END
