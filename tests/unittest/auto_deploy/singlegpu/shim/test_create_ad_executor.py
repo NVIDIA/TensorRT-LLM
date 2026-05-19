@@ -61,6 +61,7 @@ class MockPyExecutor:
     max_beam_width: int
     guided_decoder: Any
     resource_governor_queue: Any = None
+    garbage_collection_gen0_threshold: Optional[int] = None
 
 
 @dataclass
