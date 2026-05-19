@@ -1281,6 +1281,10 @@ def _create_kv_cache_manager(
             logger.info(
                 "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
             use_replay = False
+        else:
+            logger.info(
+                f"Replay kernel is set as {use_replay} by TRTLLM_USE_MAMBA_REPLAY=1"
+            )
 
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
