@@ -466,40 +466,53 @@ class InsertMXFP4MLP(BaseTransform):
         factory,
         shared_config,
     ) -> Tuple[GraphModule, TransformInfo]:
-        """TRT-LLM-Gen backend: graph rewrite + CPU-side weight prep hook.
+        """TRT-LLM-Gen backend: graph rewrite + raw HF param registration.
 
         Per MoE node:
 
         1. Find ``torch_moe_dense_mlp`` + its upstream ``torch_moe_router``.
         2. Look up the experts module that owns the bf16 placeholder params.
-        3. Compute prepared-shape MXFP4 params via
-           :func:`prepare_mxfp4_weights_for_trtllm` on shape-only zero
-           tensors (so ``init_empty_weights`` / meta-device context is
-           preserved). Register them on the experts module:
-           ``fc1_w_trtllm`` / ``fc1_w_scale_trtllm`` / ``fc1_bias_trtllm`` /
-           ``fc2_*`` + SwiGLU constants. Tag the experts module with
-           ``_dtype_protected_params`` so ``model.to(dtype)`` doesn't
-           corrupt the uint8 / fp32 dtypes.
-        4. Delete the bf16 placeholders (``gate_up_proj`` / ``down_proj``).
-        5. Rewrite the ``torch_moe_dense_mlp`` node to
+        3. Delete the bf16 placeholders (``gate_up_proj`` / ``down_proj`` /
+           biases).
+        4. Register **raw HF MXFP4 params** at the EP-sliced shape
+           (``E_local = E_full / moe_ep_size``) on the experts module:
+           ``gate_up_proj_{blocks,scales,bias}`` and
+           ``down_proj_{blocks,scales,bias}``. Names match HF safetensors so
+           the standard ``load_state_dict`` path can populate them (after the
+           slim EP-slice hook below trims the leading expert axis when
+           ``moe_ep_size > 1``).
+        5. Also register the per-expert SwiGLU constants
+           (``swiglu_alpha_trtllm`` / beta / limit) — these are not in HF
+           safetensors so they are populated with their numeric defaults at
+           registration time.
+        6. Tag the experts module with ``_dtype_protected_params`` (raw
+           uint8 weights, uint8 scales, bf16 biases, fp32 SwiGLU constants
+           must all survive ``model.to(dtype)``).
+        7. Rewrite the ``torch_moe_dense_mlp`` node to
            ``trtllm_mxfp4_w4a{8,16}_moe_fused`` (selected by
-           ``config.trtllm_quant_act``).
-        6. If ``moe_tp_size > 1`` insert an ``auto_deploy.all_reduce`` node
-           after the downstream view (matches the modeling-side path).
+           ``config.trtllm_quant_act``) with args pointing at the **raw**
+           params for now. The downstream :class:`FuseMXFP4Moe`
+           POST_LOAD_FUSION transform will run
+           :func:`prepare_mxfp4_weights_for_trtllm` on the actually-loaded
+           GPU tensors, register prepared-shape params, and re-point the op
+           args. The op call is therefore not runnable between PATTERN_MATCHER
+           and POST_LOAD_FUSION, but no forward pass happens in that window.
+        8. If ``tp_size > 1`` insert an ``auto_deploy.all_reduce`` node
+           after the downstream view (covers both MoE-TP and MoE-EP).
 
         Then once for the whole module:
 
-        7. Register a top-level ``load_state_dict`` pre-hook
-           (:func:`make_mxfp4_trtllm_load_hook`) that converts raw HF
-           MXFP4 state-dict entries into prepared values on CPU before
-           they reach ``param.copy_()``.
+        9. Register a top-level ``load_state_dict`` pre-hook
+           (:func:`make_mxfp4_ep_slice_load_hook`) that slices raw HF MXFP4
+           tensors on the expert axis when ``moe_ep_size > 1``. The hook
+           does **not** run any kernel-layout prep — that runs on GPU in
+           :class:`FuseMXFP4Moe` after the weights are loaded.
         """
         import re
 
         from ...custom_ops.fused_moe.mxfp4_weight_prep import (
-            make_mxfp4_trtllm_load_hook,
+            make_mxfp4_sharding_load_hook,
             make_swiglu_param_tensors,
-            prepare_mxfp4_weights_for_trtllm,
         )
 
         # MoE topology: prefer the build-time ``DistConfig`` set on
@@ -611,49 +624,72 @@ class InsertMXFP4MLP(BaseTransform):
             # Locate the experts module via the gate_up param path.
             experts_mod, experts_path, _ = get_submodule_of_param(gm, gu_w_name)
 
-            # Compute prepared shapes by running the prep helper on shape-only
-            # zero tensors (CPU). We only keep ``prep.<>.shape``/``.dtype`` --
-            # actual data is filled by the load hook at load time.
+            # Per-rank dims after EP+TP slicing. The kernel-layout work
+            # (H-axis pad, TMA shuffle, dtype convert) is deferred to
+            # ``FuseMXFP4Moe`` at POST_LOAD_FUSION on GPU. EP+TP sharding is
+            # done on CPU inside the load hook (see
+            # :func:`make_mxfp4_sharding_load_hook`).
             h_blk = max(1, H // 32)
-            i_blk = max(1, i_size // 32)
-            zero_kw = {"device": "cpu"}
-            prep = prepare_mxfp4_weights_for_trtllm(
-                torch.zeros((e_local, 2 * i_size, h_blk, 16), dtype=torch.uint8, **zero_kw),
-                torch.zeros((e_local, 2 * i_size, h_blk), dtype=torch.uint8, **zero_kw),
-                torch.zeros((e_local, 2 * i_size), dtype=torch.bfloat16, **zero_kw),
-                torch.zeros((e_local, H, i_blk, 16), dtype=torch.uint8, **zero_kw),
-                torch.zeros((e_local, H, i_blk), dtype=torch.uint8, **zero_kw),
-                torch.zeros((e_local, H), dtype=torch.bfloat16, **zero_kw),
-                hidden_size=H,
-                intermediate_size=i_size,
-                tp_size=moe_tp_size,
-                tp_rank=moe_tp_rank,
-            )
 
-            num_local_experts = int(prep.fc1_weights_mxfp4.shape[0])
-            local_expert_offset = moe_ep_rank * e_local
-            valid_hidden_size = int(prep.valid_hidden_size)
-            valid_intermediate_size = int(prep.valid_intermediate_size)
-
-            # Register prepared-shape params (zero-init, meta-aware via
-            # ``torch.empty(shape, dtype=...)`` without ``device=``).
-            def _empty_like(t):
-                return torch.empty(t.shape, dtype=t.dtype)
-
-            prepared_specs = [
-                ("fc1_w_trtllm", prep.fc1_weights_mxfp4),
-                ("fc1_w_scale_trtllm", prep.fc1_weights_scale_ue8m0),
-                ("fc1_bias_trtllm", prep.fc1_bias_f32),
-                ("fc2_w_trtllm", prep.fc2_weights_mxfp4),
-                ("fc2_w_scale_trtllm", prep.fc2_weights_scale_ue8m0),
-                ("fc2_bias_trtllm", prep.fc2_bias_f32),
-            ]
-            for short, ref in prepared_specs:
-                experts_mod.register_parameter(
-                    short,
-                    nn.Parameter(_empty_like(ref), requires_grad=False),
+            # TP-aware pre-pad math (mirrors the hook). The hook pads the raw
+            # intermediate axis to ``i_padded_tp`` then slices ``per_rank_i``
+            # rows; ``per_rank_i`` is guaranteed to be a multiple of 128 by
+            # ``_get_weight_alignment``, so it's also the per-rank kernel
+            # weight-alignment size that the trtllm-gen runner expects.
+            if moe_tp_size > 1:
+                from tensorrt_llm._torch.modules.fused_moe.quantization import (
+                    _get_weight_alignment,
                 )
 
+                _MXFP4_SCALING_VECTOR_SIZE = 32
+                _WEIGHT_ALIGNMENT = 128
+                alignment_tp = _get_weight_alignment(
+                    _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, i_size
+                )
+                i_padded_tp = (
+                    (i_size + alignment_tp - 1) // alignment_tp
+                ) * alignment_tp
+                per_rank_i = i_padded_tp // moe_tp_size
+                slice_start = moe_tp_rank * per_rank_i
+                slice_stop = (moe_tp_rank + 1) * per_rank_i
+                # ``valid_intermediate_size`` reports the unpadded portion of
+                # this rank's slice — used by the kernel to mask OOB MMA in
+                # padded regions.
+                valid_intermediate_size = max(0, min(i_size, slice_stop) - slice_start)
+            else:
+                per_rank_i = i_size
+                valid_intermediate_size = i_size
+
+            # Local I block-count for down_proj after TP slicing.
+            i_blk_local = max(1, per_rank_i // 32)
+            two_i_local = 2 * per_rank_i  # gate_up's 2I axis is per-rank too
+
+            num_local_experts = e_local
+            local_expert_offset = moe_ep_rank * e_local
+            valid_hidden_size = H
+
+            # Register RAW HF MXFP4 params at the EP+TP-sliced shape — names
+            # match HF safetensors so the standard load path populates them
+            # after the sharding hook does the leading-axis (EP) + intermediate
+            # (TP) slice on the state-dict tensors.
+            raw_specs = [
+                ("gate_up_proj_blocks", (e_local, two_i_local, h_blk, 16), torch.uint8),
+                ("gate_up_proj_scales", (e_local, two_i_local, h_blk), torch.uint8),
+                ("gate_up_proj_bias", (e_local, two_i_local), torch.bfloat16),
+                ("down_proj_blocks", (e_local, H, i_blk_local, 16), torch.uint8),
+                ("down_proj_scales", (e_local, H, i_blk_local), torch.uint8),
+                ("down_proj_bias", (e_local, H), torch.bfloat16),
+            ]
+            for name, shape, dtype in raw_specs:
+                experts_mod.register_parameter(
+                    name,
+                    nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False),
+                )
+
+            # SwiGLU constants. These are NOT in HF safetensors, so we set
+            # them with their numeric defaults here (matches gpt-oss config:
+            # alpha=1.702, beta=1.0, limit=7.0). The kernel expects fp32
+            # tensors of length ``num_local_experts``.
             a, b, c = make_swiglu_param_tensors(num_local_experts)
             experts_mod.register_parameter(
                 "swiglu_alpha_trtllm", nn.Parameter(a, requires_grad=False)
@@ -665,11 +701,11 @@ class InsertMXFP4MLP(BaseTransform):
                 "swiglu_limit_trtllm", nn.Parameter(c, requires_grad=False)
             )
 
-            # Tell ``GptOssExperts._apply`` (and any analogous override) which
-            # params must keep their kernel-required dtype across ``.to(dtype)``
-            # walks. Generic mechanism: any module that inspects this attribute
-            # can opt into dtype protection without hard-coding names.
-            experts_mod._dtype_protected_params = tuple(name for name, _ in prepared_specs) + (
+            # Dtype protection: raw uint8 weights, uint8 scales, bf16 biases,
+            # and fp32 SwiGLU constants must all survive ``model.to(dtype)``.
+            # ``FuseMXFP4Moe`` will update this attribute to the prepared
+            # names after running prep at POST_LOAD_FUSION.
+            experts_mod._dtype_protected_params = tuple(name for name, _, _ in raw_specs) + (
                 "swiglu_alpha_trtllm",
                 "swiglu_beta_trtllm",
                 "swiglu_limit_trtllm",
@@ -680,20 +716,37 @@ class InsertMXFP4MLP(BaseTransform):
             if m:
                 layer_indices.append(int(m.group(1)))
 
-            # Build get_attr nodes for the new prepared params.
+            # Build get_attr nodes for the RAW params (will be replaced by
+            # ``FuseMXFP4Moe`` once GPU-side prep produces the kernel layout).
             prefix_path = (experts_path + ".") if experts_path else ""
             with gm.graph.inserting_before(n):
-                fc1_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_trtllm")
-                fc2_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_trtllm")
-                fc1_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_scale_trtllm")
-                fc2_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_scale_trtllm")
-                fc1_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_bias_trtllm")
-                fc2_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_bias_trtllm")
+                gu_blocks_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "gate_up_proj_blocks"
+                )
+                gu_scales_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "gate_up_proj_scales"
+                )
+                gu_bias_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "gate_up_proj_bias"
+                )
+                dn_blocks_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "down_proj_blocks"
+                )
+                dn_scales_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "down_proj_scales"
+                )
+                dn_bias_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "down_proj_bias"
+                )
                 sa_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_alpha_trtllm")
                 sb_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_beta_trtllm")
                 sl_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_limit_trtllm")
 
             # Rewrite the op call. Op target is chosen by ``trtllm_quant_act``.
+            # The op args point at RAW HF MXFP4 buffers for now — the op is
+            # NOT runnable until ``FuseMXFP4Moe`` (POST_LOAD_FUSION) swaps in
+            # the prepared layout. That is safe because no forward pass runs
+            # between PATTERN_MATCHER and POST_LOAD_FUSION.
             #   - "bf16"  -> trtllm_mxfp4_w4a16_moe_fused (bf16 input)
             #   - "mxfp8" -> trtllm_mxfp4_w4a8_moe_fused  (MXFP8 input)
             n.target = target_op
@@ -703,12 +756,12 @@ class InsertMXFP4MLP(BaseTransform):
                 router_weight_node,
                 router_bias_node,
                 int(top_k),
-                fc1_w_attr,
-                fc2_w_attr,
-                fc1_s_attr,
-                fc2_s_attr,
-                fc1_b_attr,
-                fc2_b_attr,
+                gu_blocks_attr,  # fc1_weights_mxfp4 (raw uint8; FuseMXFP4Moe replaces)
+                dn_blocks_attr,  # fc2_weights_mxfp4 (raw uint8)
+                gu_scales_attr,  # fc1_weights_scale_ue8m0 (raw uint8)
+                dn_scales_attr,  # fc2_weights_scale_ue8m0 (raw uint8)
+                gu_bias_attr,    # fc1_bias_f32 (raw bf16; FuseMXFP4Moe converts/pads/shuffles)
+                dn_bias_attr,    # fc2_bias_f32 (raw bf16)
                 sa_attr,
                 sb_attr,
                 sl_attr,
@@ -774,27 +827,37 @@ class InsertMXFP4MLP(BaseTransform):
 
             # Free bf16 placeholders from the experts module so they don't
             # linger as orphaned attributes (and don't get loaded from HF
-            # via the standard load_state_dict path).
-            for stale_name in (gu_w_name, gu_b_name, dn_w_name, dn_b_name):
+            # via the standard load_state_dict path). Skip the *bias* names
+            # because we re-registered them with the SAME names as new raw
+            # HF MXFP4 params (``gate_up_proj_bias`` / ``down_proj_bias``);
+            # those are the ones we want to keep, not delete. Only the
+            # ``gate_up_proj`` / ``down_proj`` weight tensors (which don't
+            # collide with any raw param name) need to be cleaned up here.
+            for stale_name in (gu_w_name, dn_w_name):
                 owner_mod, _path, attr_short = get_submodule_of_param(gm, stale_name)
                 _delete_module_attr(owner_mod, attr_short)
 
             num_matches += 1
 
-        # Register top-level load hook once for the whole module so the
-        # raw HF MXFP4 state_dict entries are converted to prepared layout
-        # BEFORE ``param.copy_()`` -- avoids the legacy POST_LOAD_FUSION
-        # raw/prepared double-allocation cycle.
-        if num_matches > 0:
-            assert hidden_size_global is not None  # for type checker
+        # Register top-level EP+TP sharding load hook whenever there is any
+        # actual sharding on the MoE axes. The hook only does *sharding*
+        # (EP leading-axis slice + TP-aware pre-pad / intermediate-axis
+        # slice) on the raw HF MXFP4 state-dict entries; the kernel-layout
+        # work (H-axis pad, TMA shuffle, dtype convert, bias / tp_size) is
+        # deferred to :class:`FuseMXFP4Moe` on GPU at POST_LOAD_FUSION.
+        if num_matches > 0 and (moe_ep_size > 1 or moe_tp_size > 1):
+            assert num_experts_global is not None  # for type checker
+            assert intermediate_size_global is not None
             num_layers = (max(layer_indices) + 1) if layer_indices else num_matches
             gm._register_load_state_dict_pre_hook(
-                make_mxfp4_trtllm_load_hook(
+                make_mxfp4_sharding_load_hook(
                     num_layers=num_layers,
-                    hidden_size=hidden_size_global,
-                    intermediate_size=intermediate_size_global,
                     num_experts=num_experts_global,
-                    dist_info_fn=_hook_dist_info_fn,
+                    intermediate_size=intermediate_size_global,
+                    moe_ep_size=moe_ep_size,
+                    moe_ep_rank=moe_ep_rank,
+                    moe_tp_size=moe_tp_size,
+                    moe_tp_rank=moe_tp_rank,
                 )
             )
             ad_logger.info(
@@ -820,3 +883,248 @@ def _delete_module_attr(module: nn.Module, name: str) -> None:
         del module._buffers[name]
     elif hasattr(module, name):
         delattr(module, name)
+
+
+# ============================================================================
+# POST_LOAD_FUSION: GPU-side MXFP4 kernel-layout prep
+# ============================================================================
+
+
+class FuseMXFP4MoeConfig(TransformConfig):
+    """Configuration for ``fuse_mxfp4_moe`` (POST_LOAD_FUSION)."""
+
+
+@TransformRegistry.register("fuse_mxfp4_moe")
+class FuseMXFP4Moe(BaseTransform):
+    """GPU-side MXFP4 MoE weight prep for the trtllm-gen backend.
+
+    Runs at POST_LOAD_FUSION, after raw HF MXFP4 buffers have been loaded
+    onto the experts modules by ``quantize_mxfp4_moe`` (backend=trtllm) +
+    the slim EP-slice load hook.
+
+    For each ``trtllm_mxfp4_w4a{8,16}_moe_fused`` node whose first weight
+    argument still references a raw ``gate_up_proj_blocks`` buffer:
+
+    1. Read the six raw GPU buffers (gate_up_proj_{blocks,scales,bias} and
+       down_proj_{blocks,scales,bias}) from the experts module.
+    2. Call :func:`prepare_mxfp4_weights_for_trtllm` on GPU to produce the
+       trtllm-gen kernel layout (pad + shuffle + interleave + bf16->fp32 bias).
+       Intermediate-axis TP slicing happens inside the prep helper.
+    3. Register the six prepared params on the experts module
+       (``fc1_w_trtllm``, ``fc1_w_scale_trtllm``, ``fc1_bias_trtllm``,
+       ``fc2_w_trtllm``, ``fc2_w_scale_trtllm``, ``fc2_bias_trtllm``).
+    4. Update the op call's weight args + insert new ``get_attr`` nodes
+       pointing at the prepared params; old raw ``get_attr`` nodes are
+       erased by graph cleanup if their use-count drops to zero.
+    5. Delete the raw module params and tighten ``_dtype_protected_params``
+       to the prepared-name list (so any later ``.to(dtype)`` walk
+       protects the kernel-required dtypes).
+
+    Skipping rules:
+      - Op target not ``trtllm_mxfp4_w4a{8,16}_moe_fused``: ignore.
+      - First weight arg's get_attr target name doesn't end in
+        ``gate_up_proj_blocks``: assume already prepped, ignore.
+    """
+
+    config: FuseMXFP4MoeConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseMXFP4MoeConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm,
+        factory,
+        shared_config,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        from ...custom_ops.fused_moe.mxfp4_weight_prep import (
+            prepare_mxfp4_weights_for_trtllm,
+        )
+
+        # Resolve runtime topology — used for TP slicing inside the prep
+        # helper. Mirrors the values read by ``_apply_trtllm`` at
+        # PATTERN_MATCHER time so per-rank shapes stay consistent.
+        dc = getattr(shared_config, "dist_config", None)
+        moe_tp_size = int(getattr(dc, "moe_tp_size", 1)) if dc is not None else 1
+        moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
+
+        # Identify candidate ops: both w4a8 and w4a16 share the same first-arg
+        # structure (raw ``gate_up_proj_blocks`` get_attr).
+        target_ops = (
+            torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused.default,
+            torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default,
+        )
+
+        num_matches = 0
+        for n in list(gm.graph.nodes):
+            if n.op != "call_function" or n.target not in target_ops:
+                continue
+            if len(n.args) < 13:
+                continue
+
+            # Arg layout from ``_apply_trtllm`` (see comment block there):
+            #   [0]  hidden_node
+            #   [1]  router_weight
+            #   [2]  router_bias
+            #   [3]  top_k
+            #   [4]  fc1_weights_mxfp4      <- raw gate_up_proj_blocks
+            #   [5]  fc2_weights_mxfp4      <- raw down_proj_blocks
+            #   [6]  fc1_weights_scale      <- raw gate_up_proj_scales
+            #   [7]  fc2_weights_scale      <- raw down_proj_scales
+            #   [8]  fc1_bias               <- raw gate_up_proj_bias (bf16)
+            #   [9]  fc2_bias               <- raw down_proj_bias (bf16)
+            #   [10] swiglu_alpha
+            #   [11] swiglu_beta
+            #   [12] swiglu_limit
+            #   [13] valid_hidden_size
+            #   [14] valid_intermediate_size
+            #   [15] local_expert_offset
+            #   [16] num_local_experts
+            #   [17] routing_method_type
+            gu_blocks_node = n.args[4]
+            dn_blocks_node = n.args[5]
+            gu_scales_node = n.args[6]
+            dn_scales_node = n.args[7]
+            gu_bias_node = n.args[8]
+            dn_bias_node = n.args[9]
+
+            # All six must be ``get_attr`` nodes pointing at raw HF buffers.
+            raw_get_attrs = (
+                gu_blocks_node,
+                dn_blocks_node,
+                gu_scales_node,
+                dn_scales_node,
+                gu_bias_node,
+                dn_bias_node,
+            )
+            if not all(
+                isinstance(a, Node) and a.op == "get_attr" for a in raw_get_attrs
+            ):
+                continue
+            if not str(gu_blocks_node.target).endswith("gate_up_proj_blocks"):
+                # Already prepped or unexpected layout — skip.
+                continue
+
+            # Locate the experts module via the raw param path.
+            gu_blocks_name = gu_blocks_node.target
+            experts_mod, experts_path, _ = get_submodule_of_param(gm, gu_blocks_name)
+
+            # Read raw GPU tensors and run kernel-layout prep on GPU.
+            # The load hook already did EP + TP slicing on CPU, so the
+            # tensors here are at the per-rank intermediate size. We pass
+            # ``tp_size=1`` to the prep helper to skip its TP-slice path
+            # (would slice again otherwise), and divide the bias by the
+            # *actual* ``moe_tp_size`` ourselves afterwards.
+            gu_blocks = gm.get_parameter(gu_blocks_name).data
+            gu_scales = gm.get_parameter(gu_scales_node.target).data
+            gu_bias = gm.get_parameter(gu_bias_node.target).data
+            dn_blocks = gm.get_parameter(dn_blocks_node.target).data
+            dn_scales = gm.get_parameter(dn_scales_node.target).data
+            dn_bias = gm.get_parameter(dn_bias_node.target).data
+
+            # Infer per-rank dims from the (already EP+TP-sliced) raw shapes.
+            e_local = int(gu_blocks.shape[0])
+            two_i_local = int(gu_blocks.shape[1])
+            per_rank_i = two_i_local // 2
+            H = int(dn_blocks.shape[1])
+
+            prep = prepare_mxfp4_weights_for_trtllm(
+                gu_blocks,
+                gu_scales,
+                gu_bias,
+                dn_blocks,
+                dn_scales,
+                dn_bias,
+                hidden_size=H,
+                # Pass the per-rank intermediate dim because the helper
+                # treats this as the local size (no further slicing).
+                intermediate_size=per_rank_i,
+                tp_size=1,
+                tp_rank=0,
+            )
+
+            # Bias-on-rank correction: kernel sums per-rank outputs across
+            # all moe_tp ranks via the post-MoE all_reduce, which would add
+            # the fc2 bias ``moe_tp_size`` times. Divide once here to make
+            # the post-AR sum reproduce the unsharded bias. Matches the prep
+            # helper's ``tp_size > 1`` branch (which we skip above).
+            fc2_bias = prep.fc2_bias_f32
+            if moe_tp_size > 1:
+                fc2_bias = fc2_bias / moe_tp_size
+
+            prepared_specs = [
+                ("fc1_w_trtllm", prep.fc1_weights_mxfp4),
+                ("fc1_w_scale_trtllm", prep.fc1_weights_scale_ue8m0),
+                ("fc1_bias_trtllm", prep.fc1_bias_f32),
+                ("fc2_w_trtllm", prep.fc2_weights_mxfp4),
+                ("fc2_w_scale_trtllm", prep.fc2_weights_scale_ue8m0),
+                ("fc2_bias_trtllm", fc2_bias),
+            ]
+            for short, tensor in prepared_specs:
+                experts_mod.register_parameter(
+                    short,
+                    nn.Parameter(tensor.contiguous(), requires_grad=False),
+                )
+
+            # Build prepared get_attr nodes inserted right before the op call.
+            prefix_path = (experts_path + ".") if experts_path else ""
+            with gm.graph.inserting_before(n):
+                fc1_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_trtllm")
+                fc2_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_trtllm")
+                fc1_s_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "fc1_w_scale_trtllm"
+                )
+                fc2_s_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "fc2_w_scale_trtllm"
+                )
+                fc1_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_bias_trtllm")
+                fc2_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_bias_trtllm")
+
+            new_args = list(n.args)
+            new_args[4] = fc1_w_attr
+            new_args[5] = fc2_w_attr
+            new_args[6] = fc1_s_attr
+            new_args[7] = fc2_s_attr
+            new_args[8] = fc1_b_attr
+            new_args[9] = fc2_b_attr
+            n.args = tuple(new_args)
+
+            # Erase raw get_attr nodes if no other consumer.
+            for stale_node in raw_get_attrs:
+                if len(stale_node.users) == 0:
+                    gm.graph.erase_node(stale_node)
+
+            # Delete raw module params now that prepared replaces them.
+            for raw_name in (
+                "gate_up_proj_blocks",
+                "gate_up_proj_scales",
+                "gate_up_proj_bias",
+                "down_proj_blocks",
+                "down_proj_scales",
+                "down_proj_bias",
+            ):
+                _delete_module_attr(experts_mod, raw_name)
+
+            # Update dtype protection to the prepared-name list.
+            experts_mod._dtype_protected_params = tuple(name for name, _ in prepared_specs) + (
+                "swiglu_alpha_trtllm",
+                "swiglu_beta_trtllm",
+                "swiglu_limit_trtllm",
+            )
+
+            num_matches += 1
+
+        if num_matches > 0:
+            ad_logger.info(
+                f"fuse_mxfp4_moe: GPU-prepped {num_matches} MoE node(s)"
+            )
+
+        info = TransformInfo(
+            skipped=(num_matches == 0),
+            num_matches=num_matches,
+            is_clean=(num_matches == 0),
+            has_valid_shapes=(num_matches == 0),
+        )
+        return gm, info

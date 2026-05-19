@@ -778,3 +778,190 @@ def make_mxfp4_trtllm_load_hook(
             )
 
     return hook
+
+
+# ============================================================================
+# Slim EP-slice-only load hook (post-load fusion design)
+# ============================================================================
+#
+# Companion to the new ``fuse_mxfp4_moe`` POST_LOAD_FUSION transform: the
+# dispatcher at PATTERN_MATCHER registers raw HF MXFP4 params at the
+# EP-sliced shape (E_local = num_experts // moe_ep_size). The standard load
+# path would then refuse to copy [E_full] state_dict tensors into [E_local]
+# module params. This hook fixes that by slicing the leading expert axis
+# in-place inside ``state_dict`` *without* touching key names or running any
+# kernel-layout prep. The prep is deferred to the GPU-side fuse transform.
+#
+# When ``moe_ep_size == 1`` no slicing is needed — caller should not register
+# this hook in that case (it would still be a no-op, but skipping it avoids
+# unnecessary state_dict iteration).
+
+
+def make_mxfp4_sharding_load_hook(
+    *,
+    num_layers: int,
+    num_experts: int,
+    intermediate_size: int,
+    moe_ep_size: int,
+    moe_ep_rank: int,
+    moe_tp_size: int,
+    moe_tp_rank: int,
+    layer_prefix: str = "model.layers",
+    experts_subpath: str = "mlp.experts",
+):
+    """Build a ``load_state_dict`` pre-hook that EP+TP-shards raw HF MXFP4 keys.
+
+    Companion to the GPU-side :class:`FuseMXFP4Moe` POST_LOAD_FUSION
+    transform. This hook handles the *sharding* axes (expert + intermediate)
+    on CPU before tensors are copied to GPU, so per-rank GPU memory only
+    holds this rank's slice. The kernel-layout work (H-axis padding,
+    per-expert TMA shuffle, bf16->fp32 bias conversion, bias / tp_size) is
+    deferred to ``FuseMXFP4Moe`` on GPU.
+
+    For each layer's six raw HF MXFP4 keys
+    (``gate_up_proj_{blocks,scales,bias}``,
+    ``down_proj_{blocks,scales,bias}``) the hook applies in order:
+
+    1. **EP slice (leading expert axis)** —
+       ``t[ep_start:ep_stop]`` where
+       ``experts_per_rank = num_experts / moe_ep_size``.
+       No-op when ``moe_ep_size == 1``.
+
+    2. **TP-aware pre-pad + slice (intermediate axis)** —
+       only when ``moe_tp_size > 1``. The intermediate dim ``I`` is padded
+       to ``i_padded_tp = ceil(I, alignment_tp)`` where
+       ``alignment_tp = _get_weight_alignment(128, 32, moe_tp_size, I)``,
+       guaranteeing ``per_rank_i = i_padded_tp / moe_tp_size`` is itself a
+       multiple of 128 (the kernel's TMA weight alignment). Then each
+       tensor is sliced on its intermediate-encoding axis:
+
+       * ``gate_up_proj_blocks``  ``[E, 2I, H/32, 16]``  — axis 1, range
+         ``[2*tp_start : 2*tp_stop]``. Works on the interleaved 2I layout
+         because gate/up indices alternate: index ``2k`` is gate(k), index
+         ``2k+1`` is up(k). The contiguous range ``[2k : 2k+2m]`` therefore
+         covers gate(k:k+m) ∪ up(k:k+m) — same semantics as a
+         de-interleaved per-half slice.
+       * ``gate_up_proj_scales`` ``[E, 2I, H/32]``      — axis 1, same range.
+       * ``gate_up_proj_bias``   ``[E, 2I]``            — axis 1, same range.
+       * ``down_proj_blocks``    ``[E, H, I/32, 16]``   — axis 2 (I_blk), range
+         ``[tp_start/32 : tp_stop/32]``. ``per_rank_i`` is a multiple of 32
+         (in fact 128), so block boundaries are integer.
+       * ``down_proj_scales``    ``[E, H, I/32]``       — axis 2, same range.
+       * ``down_proj_bias``      ``[E, H]``             — H axis isn't TP-split,
+         so the bias is left intact. ``FuseMXFP4Moe`` will divide it by
+         ``moe_tp_size`` after dtype conversion.
+
+    Args:
+        num_layers: number of decoder layers to scan.
+        num_experts: total expert count (``E_full``) on disk.
+        intermediate_size: per-expert intermediate dim ``I`` on disk
+            (i.e. before any padding/slicing).
+        moe_ep_size / moe_ep_rank: expert-parallel group size + this rank.
+        moe_tp_size / moe_tp_rank: MoE tensor-parallel group size + this rank
+            (intermediate-axis split).
+        layer_prefix: where layers live, default ``"model.layers"``.
+        experts_subpath: where the experts module sits within each layer,
+            default ``"mlp.experts"``.
+
+    Returns:
+        A hook with the standard ``(state_dict, prefix, ...)`` signature.
+    """
+    if num_experts % moe_ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
+        )
+    experts_per_rank = num_experts // moe_ep_size
+    ep_start = moe_ep_rank * experts_per_rank
+    ep_stop = ep_start + experts_per_rank
+
+    # TP-aware pre-pad/slice math (only used when moe_tp_size > 1).
+    if moe_tp_size > 1:
+        alignment_tp = _get_weight_alignment(
+            _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, intermediate_size
+        )
+        i_padded_tp = (
+            (intermediate_size + alignment_tp - 1) // alignment_tp
+        ) * alignment_tp
+        per_rank_i = i_padded_tp // moe_tp_size
+        tp_start = moe_tp_rank * per_rank_i
+        tp_stop = (moe_tp_rank + 1) * per_rank_i
+        if per_rank_i % _MXFP4_SCALING_VECTOR_SIZE != 0:
+            raise ValueError(
+                f"per_rank_i ({per_rank_i}) must be divisible by "
+                f"_MXFP4_SCALING_VECTOR_SIZE ({_MXFP4_SCALING_VECTOR_SIZE}); "
+                f"check _get_weight_alignment output."
+            )
+        # Block-axis bounds for down_proj's I_blk = I / 32 axis.
+        blk_pad = i_padded_tp // _MXFP4_SCALING_VECTOR_SIZE
+        blk_start = tp_start // _MXFP4_SCALING_VECTOR_SIZE
+        blk_stop = tp_stop // _MXFP4_SCALING_VECTOR_SIZE
+    else:
+        i_padded_tp = intermediate_size
+        per_rank_i = intermediate_size
+        tp_start = 0
+        tp_stop = intermediate_size
+        blk_pad = intermediate_size // _MXFP4_SCALING_VECTOR_SIZE
+        blk_start = 0
+        blk_stop = blk_pad
+
+    def _pad_axis(t: torch.Tensor, dim: int, target: int) -> torch.Tensor:
+        cur = t.shape[dim]
+        if cur >= target:
+            return t
+        pad_amount = target - cur
+        # F.pad spec is (pad_lastdim_left, pad_lastdim_right, ..., pad_dim_left, pad_dim_right)
+        pad = [0, 0] * (t.dim() - dim - 1) + [0, pad_amount] + [0, 0] * dim
+        return torch.nn.functional.pad(t, pad)
+
+    def hook(state_dict, prefix, *args, local_metadata=None, **kwargs):
+        do_ep = moe_ep_size > 1
+        do_tp = moe_tp_size > 1
+        if not (do_ep or do_tp):
+            # Nothing to slice — leave state_dict alone.
+            return
+        for layer_idx in range(num_layers):
+            base = f"{prefix}{layer_prefix}.{layer_idx}.{experts_subpath}."
+
+            # ---- EP slice (leading expert axis) ----
+            if do_ep:
+                for s in (
+                    "gate_up_proj_blocks",
+                    "gate_up_proj_scales",
+                    "gate_up_proj_bias",
+                    "down_proj_blocks",
+                    "down_proj_scales",
+                    "down_proj_bias",
+                ):
+                    k = base + s
+                    t = state_dict.get(k)
+                    if t is None:
+                        continue
+                    state_dict[k] = t[ep_start:ep_stop].contiguous()
+
+            # ---- TP-aware pre-pad + slice (intermediate axis) ----
+            if do_tp:
+                # gate_up_*: axis 1 (the 2I interleaved axis); pad to
+                # 2*i_padded_tp, then slice [2*tp_start : 2*tp_stop].
+                for s in ("gate_up_proj_blocks", "gate_up_proj_scales", "gate_up_proj_bias"):
+                    k = base + s
+                    t = state_dict.get(k)
+                    if t is None:
+                        continue
+                    t = _pad_axis(t, 1, 2 * i_padded_tp)
+                    state_dict[k] = t[:, 2 * tp_start : 2 * tp_stop].contiguous()
+
+                # down_proj_blocks / scales: axis 2 (I_blk = I / 32); pad to
+                # blk_pad, then slice [blk_start : blk_stop]. Inner 16 axis
+                # (blocks only) is untouched.
+                for s in ("down_proj_blocks", "down_proj_scales"):
+                    k = base + s
+                    t = state_dict.get(k)
+                    if t is None:
+                        continue
+                    t = _pad_axis(t, 2, blk_pad)
+                    state_dict[k] = t[:, :, blk_start:blk_stop].contiguous()
+                # down_proj_bias [E, H]: H axis is not TP-split. Leave as-is
+                # and let FuseMXFP4Moe divide by moe_tp_size after dtype
+                # conversion (matches the prep helper's tp-aware bias path).
+
+    return hook
