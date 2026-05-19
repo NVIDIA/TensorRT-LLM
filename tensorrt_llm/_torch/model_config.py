@@ -838,7 +838,6 @@ class ModelConfig(Generic[TConfig]):
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
                             compress_ratios=compress_ratios,
                             window_size=window_size,
-                            indexer_k_dtype=indexer_k_dtype,
                             **indexer_config)
             else:
                 raise ValueError(
