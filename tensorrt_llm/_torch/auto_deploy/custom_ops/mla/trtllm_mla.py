@@ -1285,8 +1285,7 @@ def _handle_prefill_thop_cached_kv(
             tokens_per_block,
             chunked_max_seq_len,
             max_context_length,
-            0,
-            1,
+            1,  # beam_width
             quant_mode,
         )
         chunk_kv = torch.nn.functional.linear(chunk_compressed_kv, w_grouped)
