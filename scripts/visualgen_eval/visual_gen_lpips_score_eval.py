@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import importlib.util
 import json
 import os
 import pathlib
@@ -64,6 +63,7 @@ import tempfile
 import time
 from typing import Any
 
+import cv2
 import lpips
 import numpy as np
 import torch
@@ -485,30 +485,60 @@ def _score_images(
         return float(lpips_model(generated_tensor, reference_tensor).reshape(-1).mean().item())
 
 
+def _decode_video_to_lpips_batch(
+    video_path: pathlib.Path,
+    device: str,
+) -> torch.Tensor:
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found for LPIPS comparison: {video_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video for LPIPS comparison: {video_path}")
+
+    frames = []
+    try:
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        cap.release()
+
+    if not frames:
+        raise ValueError(f"Decoded video contains no frames: {video_path}")
+
+    frames_array = np.stack(frames, axis=0)
+    batch = torch.from_numpy(frames_array.copy()).permute(0, 3, 1, 2).float() / 255.0
+    return batch.to(device=device, dtype=torch.float32) * 2.0 - 1.0
+
+
+def _validate_paired_video_shapes(generated: torch.Tensor, reference: torch.Tensor) -> None:
+    if generated.shape[1:] != reference.shape[1:]:
+        raise ValueError(
+            "Generated and reference video frames must have the same LPIPS tensor shape: "
+            f"{tuple(generated.shape[1:])} vs {tuple(reference.shape[1:])}."
+        )
+
+
 def _score_video_files(
     lpips_model: Any,
     generated_video_path: pathlib.Path,
     reference_video_path: pathlib.Path,
     device: str,
 ) -> float:
-    helper_path = pathlib.Path(__file__).resolve().with_name("lpips_video_utils.py")
-    if not helper_path.exists():
-        raise RuntimeError(f"Video LPIPS helper does not exist: {helper_path}")
+    generated = _decode_video_to_lpips_batch(generated_video_path, device)
+    reference = _decode_video_to_lpips_batch(reference_video_path, device)
+    _validate_paired_video_shapes(generated, reference)
 
-    spec = importlib.util.spec_from_file_location("lpips_video_utils", helper_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load video LPIPS helper: {helper_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    paired_frame_count = min(generated.shape[0], reference.shape[0])
+    generated = generated[:paired_frame_count]
+    reference = reference[:paired_frame_count]
 
-    return float(
-        module.average_video_file_lpips_score(
-            generated_video_path,
-            reference_video_path,
-            lpips_model,
-            device,
-        )
-    )
+    with torch.no_grad():
+        scores = lpips_model(generated, reference).flatten()
+    return float(scores.mean().item())
 
 
 def _resolve_output_path(
