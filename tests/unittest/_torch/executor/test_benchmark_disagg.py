@@ -503,6 +503,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex.enable_attention_dp = False
         ex.num_fetch_requests = 0
         ex.dist = Mock(rank=0, tp_size=1)
+        ex.dist.allreduce = Mock(side_effect=lambda v, op=None: v)
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
