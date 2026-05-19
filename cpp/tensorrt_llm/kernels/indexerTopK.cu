@@ -902,7 +902,12 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     int const kSeqSmall = bounds.kSeqSmall;
 
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    bool const canUseHeuristic = compressRatio == 1 && preIdx != nullptr && stride1 == 1 && isSupportedTopK
+    // compressRatio == 1: DSv3.2 indexer (no compressor).
+    // compressRatio == 4: DSv4 indexer (overlap compressor); logits/preIdx in
+    //   compressed-token-index space. Kernel handles N = actual_kv_len/cr and
+    //   forces preIdxOffset=0 internally for cr != 1.
+    bool const compressRatioOk = (compressRatio == 1 || compressRatio == 4);
+    bool const canUseHeuristic = compressRatioOk && preIdx != nullptr && stride1 == 1 && isSupportedTopK
         && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
         && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
 
@@ -930,7 +935,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     if (canUseHeuristic)
     {
         launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
-            preIdxStride, preIdxCount, numRows, stream);
+            preIdxStride, preIdxCount, numRows, compressRatio, stream);
         sync_check_cuda_error(stream);
         return;
     }
@@ -1035,14 +1040,16 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     int const kSeqSmall = bounds.kSeqSmall;
 
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    bool const canUseHeuristic = compressRatio == 1 && preIdx != nullptr && stride1 == 1 && isSupportedTopK
+    // See fp32 path: cr==1 (V3.2) and cr==4 (V4 indexer) are both supported.
+    bool const compressRatioOk = (compressRatio == 1 || compressRatio == 4);
+    bool const canUseHeuristic = compressRatioOk && preIdx != nullptr && stride1 == 1 && isSupportedTopK
         && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
         && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
 
     if (canUseHeuristic)
     {
         launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
-            preIdxStride, preIdxCount, numRows, stream);
+            preIdxStride, preIdxCount, numRows, compressRatio, stream);
     }
     else if (numColumns < kSortingAlgorithmThreshold)
     {

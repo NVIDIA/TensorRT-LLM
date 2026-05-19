@@ -717,12 +717,31 @@ class ModelConfig(Generic[TConfig]):
                 index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                 indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                 skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                # Pass-through DSA tuning flags so user-set values survive the
+                # V4 sparse_attention_config rebuild below. The V3.2 path
+                # already threads these explicitly (lines 723-727); without
+                # this block the V4 rebuild silently drops any user override
+                # back to subclass defaults (e.g., enable_heuristic_topk=False
+                # even when the user set it to True in --extra_llm_api_options).
+                use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
+                q_split_threshold = sparse_attention_config.q_split_threshold
+                indexer_rope_interleave = sparse_attention_config.indexer_rope_interleave
+                enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                indexer_k_dtype = sparse_attention_config.indexer_k_dtype
             else:
                 index_n_heads = pretrained_config.index_n_heads
                 index_head_dim = pretrained_config.index_head_dim
                 index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = None
                 skip_indexer_for_short_seqs = True
+                # Defaults match DeepSeekSparseAttentionConfig field defaults.
+                use_cute_dsl_topk = False
+                use_cute_dsl_paged_mqa_logits = False
+                q_split_threshold = 8192
+                indexer_rope_interleave = False
+                enable_heuristic_topk = False
+                indexer_k_dtype = "fp8"
             indexer_config = {}
             indexer_config['index_n_heads'] = index_n_heads
             indexer_config['index_head_dim'] = index_head_dim
@@ -730,6 +749,13 @@ class ModelConfig(Generic[TConfig]):
             indexer_config['indexer_max_chunk_size'] = indexer_max_chunk_size
             indexer_config[
                 'skip_indexer_for_short_seqs'] = skip_indexer_for_short_seqs
+            indexer_config['use_cute_dsl_topk'] = use_cute_dsl_topk
+            indexer_config[
+                'use_cute_dsl_paged_mqa_logits'] = use_cute_dsl_paged_mqa_logits
+            indexer_config['q_split_threshold'] = q_split_threshold
+            indexer_config['indexer_rope_interleave'] = indexer_rope_interleave
+            indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
+            indexer_config['indexer_k_dtype'] = indexer_k_dtype
             return indexer_config
 
         # Use file lock to prevent race conditions when multiple processes
