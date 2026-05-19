@@ -38,7 +38,8 @@ namespace torch_ext
 
 void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
     int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx,
-    std::optional<th::Tensor> const& heuristic_scratch, int64_t compress_ratio)
+    std::optional<th::Tensor> const& heuristic_scratch, int64_t compress_ratio,
+    std::optional<th::Tensor> const& radix_aux_indices, std::optional<th::Tensor> const& radix_aux_logits)
 {
     TORCH_CHECK(compress_ratio > 0, "compress_ratio must be greater than 0");
 
@@ -122,10 +123,35 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
         if (blocks_per_row > 1)
         {
-            aux_indices = th::empty({num_rows, blocks_per_row, index_topk},
-                th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-            aux_logits = th::empty({num_rows, blocks_per_row, index_topk},
-                th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+            // Prefer caller-owned scratch with stable address (CUDA Graph safe;
+            // matches the heuristic_scratch convention noted above). Falls
+            // back to per-call th::empty when the caller did not supply one
+            // (back-compat for bench scripts / older callers — exposes the
+            // CUDA-Graph stale-pointer hazard at high CONC, see SKILL G4).
+            int64_t const needed_elts = static_cast<int64_t>(num_rows) * blocks_per_row * index_topk;
+            if (radix_aux_indices.has_value() && radix_aux_logits.has_value())
+            {
+                auto const& ai = radix_aux_indices.value();
+                auto const& al = radix_aux_logits.value();
+                TORCH_CHECK(ai.is_cuda() && al.is_cuda(), "radix_aux_{indices,logits} must be CUDA tensors");
+                TORCH_CHECK(ai.device() == logits.device() && al.device() == logits.device(),
+                    "radix_aux_{indices,logits} must be on the same device as logits");
+                TORCH_CHECK(ai.is_contiguous() && al.is_contiguous(), "radix_aux_{indices,logits} must be contiguous");
+                TORCH_CHECK(ai.scalar_type() == th::kInt32, "radix_aux_indices must be int32");
+                TORCH_CHECK(al.scalar_type() == th::kFloat32, "radix_aux_logits must be float32");
+                TORCH_CHECK(ai.numel() >= needed_elts && al.numel() >= needed_elts,
+                    "radix_aux_{indices,logits} must hold at least num_rows*blocks_per_row*index_topk elements (got ",
+                    ai.numel(), " / ", al.numel(), ", need ", needed_elts, ")");
+                aux_indices = ai;
+                aux_logits = al;
+            }
+            else
+            {
+                aux_indices = th::empty({num_rows, blocks_per_row, index_topk},
+                    th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+                aux_logits = th::empty({num_rows, blocks_per_row, index_topk},
+                    th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+            }
         }
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
             aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
@@ -196,7 +222,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
-        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, int compress_ratio=1) -> ()");
+        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, int compress_ratio=1, "
+        "Tensor? radix_aux_indices=None, Tensor? radix_aux_logits=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

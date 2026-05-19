@@ -884,6 +884,34 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
 
+        # Persistent scratch for Radix-split-work indexer path (blocks_per_row > 1).
+        # Mirrors the fix the Heuristic path applied above: per-call th::empty
+        # inside indexer_topk_decode produces stale pointers under CUDA Graph
+        # replay when the caching allocator is perturbed by chunked prefill at
+        # high CONC. Sized to the worst case kMaxBlocksPerRowDecode=10 from
+        # cpp/tensorrt_llm/kernels/indexerTopK.cu. Allocated unconditionally:
+        # even with enable_heuristic_topk=True, the dispatcher can fall back
+        # to Radix when canUseHeuristic returns False (small numColumns, etc.).
+        _radix_max_blocks_per_row = 10
+        _radix_max_gen_tokens = self.max_num_sequences * (1 +
+                                                          self.max_draft_tokens)
+        self.radix_aux_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+             self.num_sparse_topk),
+            cache_name="radix_aux_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.radix_aux_logits = self.get_empty(
+            self.cuda_graph_buffers,
+            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+             self.num_sparse_topk),
+            cache_name="radix_aux_logits",
+            dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
+
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
@@ -2371,7 +2399,9 @@ class Indexer(nn.Module):
                         self.index_topk,
                         pre_idx=pre_idx,
                         heuristic_scratch=heuristic_scratch,
-                        compress_ratio=self.compress_ratio)
+                        compress_ratio=self.compress_ratio,
+                        radix_aux_indices=metadata.radix_aux_indices,
+                        radix_aux_logits=metadata.radix_aux_logits)
             else:
                 # padded
                 positions = torch.arange(
