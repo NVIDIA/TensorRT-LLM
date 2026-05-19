@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     RankIterStatsPayload,
     RankState,
 )
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 
 def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
@@ -203,13 +204,14 @@ class TestDefaultADPRouter:
         assert len(result[0]) == 1
         assert len(result[1]) == 0
 
-    def test_none_attention_dp_relax_is_relaxed(self):
+    def test_default_attention_dp_relax_is_relaxed(self):
         router = DefaultADPRouter(dist=_mock_dist())
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
         ]
-        req_relax = _make_request_item(1, target_dp_rank=0, attention_dp_relax=None)
+        req_relax = _make_request_item(1, target_dp_rank=0)
+        req_relax.request.py_scheduling_params = SchedulingParams(attention_dp_rank=0)
         req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
 
         result, _ = router.route_requests(
@@ -942,9 +944,10 @@ class TestKVCacheAwareADPRouterRouting:
         assert result[0] == []
         assert result[1] == [req]
 
-    def test_none_attention_dp_relax_is_relaxed(self):
+    def test_default_attention_dp_relax_is_relaxed(self):
         router = self._make_router(tp_size=2)
-        req_relax = _make_request_item(1, target_dp_rank=0, attention_dp_relax=None)
+        req_relax = _make_request_item(1, target_dp_rank=0)
+        req_relax.request.py_scheduling_params = SchedulingParams(attention_dp_rank=0)
         req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
 
         result, _ = router.route_requests(
