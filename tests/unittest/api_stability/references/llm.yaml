@@ -139,6 +139,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      enable_speculative_beam_history_d2h:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False

@@ -520,6 +520,10 @@ def main():
         with open(config_yaml, "r") as f:
             config = yaml.safe_load(f)
 
+    # Detect GPU type from config metadata
+    supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
+    is_b200 = "B200" in supported_gpus
+
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -684,6 +688,10 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
+        if is_b200:
+            ucx_tls_cmd = "export UCX_TLS=^ib &&"
+        else:
+            ucx_tls_cmd = "unset UCX_TLS &&"
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
@@ -691,20 +699,23 @@ def main():
                 f'export SERVER_ENV_VARS="{server_env_vars}"',
                 f'export BENCHMARK_ENV_VARS="{benchmark_env_var}"',
                 (
-                    'export pytestCommandCTXWorker="unset UCX_TLS &&'
+                    f'export pytestCommandCTXWorker="{ucx_tls_cmd}'
                     " $CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 (
-                    'export pytestCommandGENWorker="unset UCX_TLS &&'
+                    f'export pytestCommandGENWorker="{ucx_tls_cmd}'
                     " $GEN_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
-                'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
                 (
-                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f'export pytestCommandDisaggServer="{ucx_tls_cmd}'
+                    ' $SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"'
+                ),
+                (
+                    f'export pytestCommandBenchmark="{ucx_tls_cmd} $BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",

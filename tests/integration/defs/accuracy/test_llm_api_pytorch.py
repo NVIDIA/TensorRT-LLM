@@ -38,7 +38,8 @@ from tensorrt_llm.llmapi import (
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (get_device_count, get_device_memory, llm_models_root,
+from ..conftest import (check_device_contain, get_device_count,
+                        get_device_memory, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
@@ -6353,6 +6354,12 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128])
         moe_config = MoeConfig(backend=moe_backend)
 
+        # H20 path produces a small but fluctuating gap relative to H100/H200 BF16 MoE config.
+        # Construct extra spec to slightly dial down score threshold. See https://nvbugs/6069543.
+        is_h20_gpu = check_device_contain(
+            ["H20"]) and not check_device_contain(["H200"])
+        extra_acc_spec = "h20" if is_h20_gpu else None
+
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
@@ -6364,6 +6371,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  moe_config=moe_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
+                          extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @parametrize_with_ids("enable_block_reuse", [False, True])
