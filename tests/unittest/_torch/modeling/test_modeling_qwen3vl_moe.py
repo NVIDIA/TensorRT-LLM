@@ -253,14 +253,6 @@ class TestQwen3VLMoe(TestModelingMultimodal):
                 chunked_prefill=False,
                 kv_cache_reuse=False,
             ),
-            # ==== Disable fuse rope scenarios ====
-            TestQwen3VLMoeScenario(
-                modality="image",
-                use_cuda_graph=False,
-                disable_fuse_rope=True,
-                chunked_prefill=False,
-                kv_cache_reuse=False,
-            ),
         ]
         # Paged context FMHA (triggered by chunked_prefill / kv_cache_reuse)
         # is forced on for correctness on Hopper (SM90); the trtllm-gen
@@ -288,6 +280,22 @@ class TestQwen3VLMoe(TestModelingMultimodal):
                     ),
                 ]
             )
+        # ==== Disable fuse rope scenarios ====
+        # Run last: setup_scenario rebuilds trtllm_model with
+        # disable_fuse_rope=True for this scenario, and the rebuild is not
+        # undone afterwards. Keeping it at the tail prevents the rebuilt
+        # model from leaking into chunked-prefill / kv-cache-reuse
+        # scenarios (where it surfaces as a cos/sin vs. q/k seq-len
+        # mismatch in MRotaryEmbedding.forward).
+        scenarios.append(
+            TestQwen3VLMoeScenario(
+                modality="image",
+                use_cuda_graph=False,
+                disable_fuse_rope=True,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            )
+        )
         return scenarios
 
     def setup_scenario(self, scenario: TestQwen3VLMoeScenario):
