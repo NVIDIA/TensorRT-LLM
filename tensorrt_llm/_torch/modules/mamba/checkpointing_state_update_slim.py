@@ -303,6 +303,26 @@ def _replay_precompute_impl(
     dA_cumsum = tl.cumsum(A[:, None] * dt, axis=1)  # (H, T)
     decay_vec = tl.exp(dA_cumsum)  # (H, T)
 
+    # Cross-step continuity for old_dA_cumsum: when appending to active_buf at
+    # offset PNAT > 0, the previous step left a running cumsum at [0, PNAT)
+    # whose tail value lives at active_buf[head, PNAT-1].  Add that tail to
+    # this step's per-step-restarted cumsum before storing so the buffer
+    # holds one continuous cumsum across N back-to-back nowrites.  Write path
+    # (write_buf = 1 - buf_active, write_offset = 0) starts fresh, no prefix.
+    # Both branches are on scalar runtime values (write_checkpoint and PNAT),
+    # uniform across the block — use scalar if to short-circuit the load.
+    if write_checkpoint or prev_num_accepted_tokens == 0:
+        prev_total = tl.zeros((HEADS_PER_BLOCK,), dtype=tl.float32)
+    else:
+        last_cumsum_ptrs = (
+            old_dA_cumsum_ptr
+            + cache_batch_idx * stride_old_dA_cumsum_cache
+            + buf_active * stride_old_dA_cumsum_dbuf
+            + heads_block * stride_old_dA_cumsum_head
+            + (prev_num_accepted_tokens - 1) * stride_old_dA_cumsum_T
+        )
+        prev_total = tl.load(last_cumsum_ptrs).to(tl.float32)
+
     # Store dt, dA_cumsum to cache at [write_offset : write_offset+T) of write_buf.
     old_dt_addrs = (
         old_dt_ptr
@@ -320,7 +340,7 @@ def _replay_precompute_impl(
         + heads_block[:, None] * stride_old_dA_cumsum_head
         + (write_offset + offs_t)[None, :] * stride_old_dA_cumsum_T
     )
-    tl.store(old_dA_cumsum_addrs, dA_cumsum, mask=t_mask[None, :])
+    tl.store(old_dA_cumsum_addrs, dA_cumsum + prev_total[:, None], mask=t_mask[None, :])
 
     # decay_vec scratch — always at offs_t.
     decay_vec_addrs = (
@@ -530,6 +550,23 @@ def _rectangle_precompute_impl(
         A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
         dA_cumsum = tl.cumsum(A * dt, axis=0)
 
+        # Cross-step continuity for old_dA_cumsum: rectangle precompute runs
+        # only on the nowrite path (write_buf == buf_active, write_offset == PNAT).
+        # Add the running tail from buf_active[head_idx, PNAT-1] so the buffer
+        # holds one continuous cumsum across back-to-back nowrites.  PNAT is
+        # scalar/uniform, use scalar if to short-circuit the load at PNAT=0.
+        if prev_num_accepted_tokens == 0:
+            prev_total = 0.0
+        else:
+            last_cumsum_ptr = (
+                old_dA_cumsum_ptr
+                + cache_batch_idx * stride_old_dA_cumsum_cache
+                + buf_active * stride_old_dA_cumsum_dbuf
+                + head_idx * stride_old_dA_cumsum_head
+                + (prev_num_accepted_tokens - 1) * stride_old_dA_cumsum_T
+            )
+            prev_total = tl.load(last_cumsum_ptr).to(tl.float32)
+
         # Store dt and dA_cumsum to write_buf at [write_offset, write_offset+T)
         # for next step's replay/rectangle use.
         old_dt_base = (
@@ -552,7 +589,7 @@ def _rectangle_precompute_impl(
         )
         tl.store(
             old_dA_cumsum_base + (write_offset + offs_t) * stride_old_dA_cumsum_T,
-            dA_cumsum,
+            dA_cumsum + prev_total,
             mask=t_mask,
         )
 
@@ -585,9 +622,6 @@ def _rectangle_precompute_impl(
     # (H, T) and combo = factor_dt * exp_diff (H, T, K).  Store decay_vec_full;
     # combo_block stays in registers across gdc_wait — used directly post-wait
     # to compute rect_CB_scaled without a global memory roundtrip.
-    prev_k_idx = tl.minimum(
-        tl.maximum(prev_num_accepted_tokens - 1, 0), MAX_REPLAY_BUFFER_LENGTH - 1
-    )
     offs_h = tl.arange(0, HEADS_PER_BLOCK)
     heads_block = first_head + offs_h  # (H,)
 
@@ -627,11 +661,10 @@ def _rectangle_precompute_impl(
         old_dA_cumsum_read_h[:, None] + safe_old_k[None, :] * stride_old_dA_cumsum_T,
         mask=hk_mask, other=0.0,
     ).to(tl.float32)
-    # (H,) scalar-per-head: total_dA_cumsum at prev_k_idx.
-    total_dA_cumsum = tl.load(
-        old_dA_cumsum_read_h + prev_k_idx * stride_old_dA_cumsum_T
-    ).to(tl.float32)
     # (H, T) loads at [PNAT, PNAT+T) — this step's dA_cumsum_new from loop 1.
+    # With the cross-step continuity fix in loop 1, the values stored at
+    # [PNAT, PNAT+T) are the continuous cumsum (prefix + per-step new
+    # cumsum) — i.e., continuous_cumsum[PNAT..PNAT+T-1] in global indexing.
     ht_mask = t_mask[None, :]  # (1, T)
     dA_cumsum_new = tl.load(
         old_dA_cumsum_write_h[:, None]
@@ -651,11 +684,12 @@ def _rectangle_precompute_impl(
         mask=hkn_mask, other=0.0,
     ).to(tl.float32)
 
-    # decay_vec_full = total_decay * exp(cumAdt_new).  (H, T).
-    total_decay = tl.where(
-        prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0
-    )  # (H,)
-    decay_vec_full_block = total_decay[:, None] * tl.exp(dA_cumsum_new)  # (H, T)
+    # decay_vec_full[t] = exp(continuous_cumsum[PNAT+t]) — directly the
+    # continuous value now stored at buffer position write_offset+t.  Was
+    # decomposed as total_decay * exp(per_step_new[t]) when the buffer held
+    # per-step (non-continuous) cumsum; with the continuity fix the value
+    # IS continuous_cumsum[PNAT+t] so no decomposition is needed.
+    decay_vec_full_block = tl.exp(dA_cumsum_new)  # (H, T)
     decay_vec_addrs = (
         decay_vec_ptr
         + pid_b * stride_dv_batch
@@ -665,11 +699,25 @@ def _rectangle_precompute_impl(
     tl.store(decay_vec_addrs, decay_vec_full_block, mask=ht_mask)
 
     # combo_block = factor_dt * exp_diff — (H, T, K).  Stays in registers
-    # across gdc_wait.
+    # across gdc_wait.  With continuous cumsum in the buffer, s_k for any k
+    # (old or new) is simply -continuous_cumsum[k]; exp_diff[t, k] then
+    # equals exp(continuous_cumsum[PNAT+t] - continuous_cumsum[k]) — the
+    # decay weight for token k's contribution to the output at position
+    # PNAT+t.  No need to subtract any "total" — the dA_cumsum_new[t] term
+    # already carries the full prefix.
+    #
+    # Numerical note: pre-fix this kernel computed `total - old_dA[k]`
+    # (small-minus-small) then summed `+ dA_cumsum_new[t]` (also small,
+    # per-step).  Post-fix `s_k = -old_dA[k]` is large-magnitude positive
+    # and `dA_cumsum_new[t]` is large-magnitude negative; their sum
+    # cancels back to the same small value.  Cancellation error is bounded
+    # by ulp(max_magnitude) ≈ 2^-23 · |continuous_cumsum| — negligible
+    # for max_window ≤ ~1024.  Still one exp on the sum (not two muls of
+    # exps), so no overflow regression vs the original formulation.
     factor_dt = tl.where(is_old_k[None, :], old_dt_all, dt_at_kn)  # (H, K)
     s_k = tl.where(
         is_old_k[None, :],
-        total_dA_cumsum[:, None] - old_dA_cumsum_all,
+        -old_dA_cumsum_all,
         -dA_cumsum_at_kn,
     )  # (H, K)
     # exp_diff (H, T, K) = exp(s_k (H, 1, K) + dA_cumsum_new (H, T, 1)).
@@ -2098,6 +2146,161 @@ _QUANT_MAX_BY_DTYPE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Default tunings — looked up by (effective_batch, dtype, sr) when the caller
+# leaves mode/knobs as None.
+#
+# Effective batch = raw_batch × nheads_per_rank.  Our sweep was at TP=8 with
+# the standard Mamba2 nheads; at call time we compute it from the input
+# tensor shape so callers at other TP / nheads pick up the right cell.
+#
+# Schema: dict[(dtype_str, sr_str)] → list[(eff_batch_threshold, mode, knobs)]
+# sorted by threshold ascending.  Lookup finds the first threshold ≥ eff_b
+# (so missing intermediate batches fall up to the next tuned cell).  If
+# eff_b exceeds the largest threshold, use the largest entry.
+#
+# Each `knobs` dict only contains keys for the chosen mode; the wrapper
+# unpacks them with the same name as the matching kwargs.  Caller-provided
+# kwargs always win over table values.
+#
+# This table is intentionally NOT parameterized by T or max_window.  Our
+# sweep was T=6, max_window=16.  Callers outside that regime silently get
+# the same numbers — they may be suboptimal but they're correct.
+#
+# Source: audit_v2.py --emit-tuning.  Auto-generated from per-cell search
+# winners (best of pd / pm by bucket_expected_renorm).  Sweep was TP=8 with
+# NHEADS=128 → nheads_per_rank=16; thresholds are in effective_batch units.
+# Missing dtype/SR combos (fp16/RN, int8/RN, fp8/*) fall back via the
+# _resolve_tuning chain — RN→SR for same dtype, then fp8→int8/SR.
+_DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
+    ("fp32", "RN"): [
+        (   16, "persistent_main", {'_block_size_m_nowrite': 16, '_block_size_m_write': 8, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 1, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 1, '_num_stages_write': 2, '_num_warps_nowrite': 2, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1, score=6.22us
+        (   32, "persistent_main", {'_block_size_m_nowrite': 16, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 4, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=2, score=7.17us
+        (   64, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 3, '_num_stages_nowrite': 1, '_num_stages_write': 2, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=4, score=8.08us
+        (  128, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 6, '_cta_per_sm_write': 9, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': True, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=8, score=9.00us
+        (  256, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 1, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 4, '_num_warps_write': 2, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=16, score=10.92us
+        (  512, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 2, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=32, score=13.53us
+        ( 1024, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=64, score=19.50us
+        ( 2048, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 8, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 3, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=128, score=30.28us
+        ( 4096, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=256, score=50.32us
+        ( 8192, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=512, score=90.99us
+        (16384, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 1, '_num_stages_nowrite': 1, '_num_stages_write': 3, '_num_warps_nowrite': 2, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1024, score=171.69us
+    ],
+    ("fp16", "SR"): [
+        (   16, "persistent_main", {'_block_size_m_nowrite': 8, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 5, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 4, '_num_loop_stages_write': 3, '_num_stages_nowrite': 1, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1, score=6.16us
+        (   32, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 4, '_num_warps_nowrite': 4, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=2, score=7.01us
+        (   64, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 5, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 1, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=4, score=7.95us
+        (  128, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 8, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 1, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 4, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=8, score=8.87us
+        (  256, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 2, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 1, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 4, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=16, score=10.28us
+        (  512, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 6, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 2, '_num_warps_nowrite': 1, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=32, score=12.90us
+        ( 1024, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 2, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=64, score=16.71us
+        ( 2048, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=128, score=25.71us
+        ( 4096, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=256, score=39.80us
+        ( 8192, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 2, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=512, score=71.34us
+        (16384, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1024, score=133.51us
+    ],
+    ("int8", "SR"): [
+        (   16, "persistent_main", {'_block_size_m_nowrite': 8, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 5, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 4, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 3, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1, score=6.34us
+        (   32, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 4, '_num_stages_write': 2, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=2, score=7.36us
+        (   64, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 2, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 3, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=4, score=8.40us
+        (  128, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 10, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 16, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=8, score=9.37us
+        (  256, "persistent_dynamic", {'_block_size_m': 16, '_cta_per_sm': 8, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages': 1, '_num_stages': 4, '_num_warps': 1, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': True, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=16, score=10.02us
+        (  512, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 9, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 3, '_num_warps_nowrite': 2, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=32, score=13.15us
+        ( 1024, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 3, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=64, score=17.82us
+        ( 2048, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 3, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=128, score=27.01us
+        ( 4096, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 3, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 2, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=256, score=43.23us
+        ( 8192, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 8, '_cta_per_sm_write': 6, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=512, score=77.01us
+        (16384, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 6, '_cta_per_sm_write': 3, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 1, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1024, score=140.43us
+    ],
+}
+
+
+# Knob names that map between the modes' single-value (pd) and split-value
+# (pm) namespaces.  Used by `_bridge_tuning_knobs` when caller forces a mode
+# different from the table's recommendation.
+_PD_TO_PM_SPLIT_MAP = {  # pd unsplit knob → (pm_write_knob, pm_nowrite_knob)
+    "_block_size_m": ("_block_size_m_write", "_block_size_m_nowrite"),
+    "_num_warps":    ("_num_warps_write", "_num_warps_nowrite"),
+    "_num_stages":   ("_num_stages_write", "_num_stages_nowrite"),
+    # CPS / LS are persistent-loop knobs; pd uses _cta_per_sm + _num_loop_stages
+    # as unsplit, pm uses _cta_per_sm_write/_nowrite + _num_loop_stages_write/_nowrite.
+    "_cta_per_sm":      ("_cta_per_sm_write", "_cta_per_sm_nowrite"),
+    "_num_loop_stages": ("_num_loop_stages_write", "_num_loop_stages_nowrite"),
+}
+
+
+def _bridge_tuning_knobs(knobs: dict, from_mode: str, to_mode: str) -> dict:
+    """Convert a tuning dict between pd ↔ pm knob namespaces.
+
+    pd → pm: copy each unsplit value to both write/nowrite split knobs; drop
+    the unsplit form (pm doesn't read it).
+    pm → pd: take the nowrite split value as the unsplit knob; drop the
+    write/nowrite split forms (pd doesn't read them).
+    Shape knobs that exist in both modes (_heads_per_block, _flatten,
+    _warp_specialize, TMA flags, rectangle_for_nowrite) carry over unchanged.
+    """
+    out = dict(knobs)
+    if from_mode == "persistent_dynamic" and to_mode == "persistent_main":
+        for unsplit, (pm_w, pm_nw) in _PD_TO_PM_SPLIT_MAP.items():
+            if unsplit in out:
+                out.setdefault(pm_w, out[unsplit])
+                out.setdefault(pm_nw, out[unsplit])
+                del out[unsplit]
+    elif from_mode == "persistent_main" and to_mode == "persistent_dynamic":
+        for unsplit, (pm_w, pm_nw) in _PD_TO_PM_SPLIT_MAP.items():
+            if pm_nw in out:
+                out.setdefault(unsplit, out[pm_nw])
+                out.pop(pm_w, None)
+                out.pop(pm_nw, None)
+    return out
+
+
+def _resolve_tuning(
+    batch: int, nheads_per_rank: int, dt_str: str, sr_str: str,
+) -> tuple[str, dict] | None:
+    """Look up the default mode + knobs for this (eff_batch, dt, sr) cell.
+
+    Returns (mode, knobs_dict) or None if the table has no entry covering
+    this dtype/sr (including the fp8→int8/SR and dtype/RN→dtype/SR fallbacks).
+    Returning None lets the wrapper fall back to caller-provided kwargs or
+    kernel-side defaults.
+    """
+    eff_b = batch * max(1, nheads_per_rank)
+    # Lookup chain.  Order:
+    #   1. Exact (dt, sr).
+    #   2. (dt, SR) if RN missing for that dtype.
+    #   3. Cross-dtype fallback for dtypes we haven't tuned:
+    #        bf16 / int16 → fp16/SR
+    #        fp8          → int8/SR
+    # Unknown dtype → raise.
+    valid_dtypes = {"fp32", "fp16", "bf16", "int8", "int16", "fp8"}
+    if dt_str not in valid_dtypes:
+        raise ValueError(
+            f"checkpointing_state_update: unsupported state dtype {dt_str!r}; "
+            f"expected one of {sorted(valid_dtypes)}"
+        )
+    keys_to_try = [(dt_str, sr_str)]
+    if sr_str == "RN":
+        keys_to_try.append((dt_str, "SR"))
+    if dt_str in ("bf16", "int16"):
+        keys_to_try.append(("fp16", "SR"))
+    elif dt_str == "fp8":
+        keys_to_try.append(("int8", "SR"))
+    entries = None
+    for k in keys_to_try:
+        if k in _DEFAULT_TUNING:
+            entries = _DEFAULT_TUNING[k]
+            break
+    if entries is None:
+        return None
+    # Find first threshold ≥ eff_b; if none, use largest entry.
+    for thresh, mode, knobs in entries:
+        if eff_b <= thresh:
+            return mode, dict(knobs)
+    thresh, mode, knobs = entries[-1]
+    return mode, dict(knobs)
+
+
 def checkpointing_state_update(
     state: torch.Tensor,
     old_x: torch.Tensor,
@@ -2112,6 +2315,17 @@ def checkpointing_state_update(
     B: torch.Tensor,
     C: torch.Tensor,
     out: torch.Tensor,
+    # Required persistent-mode plumbing (REQUIRED for both pd and pm; pd
+    # ignores both internally but the wrapper still demands them):
+    #   n_writes  : (1,) int32 device tensor with the count of write-mode
+    #               slots in the batch.  pm uses it to size the two halves;
+    #               pd ignores it (per-slot runtime PNAT check).
+    #   slot_perm : (batch,) int32 device tensor remapping grid pid → slot.
+    #               pm uses it to cluster writes first (kernel grid step is
+    #               write_half then nowrite_half); pd ignores it.  Callers
+    #               that don't care about ordering should pass arange(batch).
+    n_writes: torch.Tensor,
+    slot_perm: torch.Tensor,
     D: torch.Tensor | None = None,
     z: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
@@ -2124,14 +2338,8 @@ def checkpointing_state_update(
     launch_with_pdl=False,
     use_internal_pdl=True,
     write_checkpoint: bool = True,
-    rectangle_for_nowrite: bool = False,
-    mode: str = "persistent_dynamic",
-    # Slot permutation: int32 (batch,) tensor mapping grid program_id ->
-    # original slot index.  When provided, the persistent kernels read pid_b
-    # through this perm so callers can pre-sort slots write-first (required
-    # for `persistent_main`, optional perf hint for `persistent_dynamic`).
-    # None => identity perm.
-    slot_perm: torch.Tensor | None = None,
+    rectangle_for_nowrite: bool | None = None,
+    mode: str | None = None,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
     _num_stages: int | None = None,
@@ -2160,38 +2368,19 @@ def checkpointing_state_update(
     # TMA state-tensor toggles — 4 independent paths (see CHECKPOINTING_DESIGN.md
     # item #17 for measured perf profiles).  Each is False=raw load/store, True=
     # use a host-built TMA tensor_descriptor for that path.
-    _use_tma_rect_load: bool = False,           # rect kernel's state load (nowrite-only)
-    _use_tma_replay_write_load: bool = False,   # replay-style state load when WC=True
-    _use_tma_replay_write_store: bool = False,  # replay-style state store when WC=True
-    _use_tma_replay_nowrite_load: bool = False, # replay-style state load when WC=False
-    # Persistent-mode bench kwargs (only consulted when mode == "persistent_main"):
-    # _n_writes : int — count of write-mode slots in the (pre-sorted) batch.
-    #   Required when mode == "persistent_main"; the persistent kernel uses
-    #   it as a runtime int32 to compute total_work for write/nowrite halves.
+    _use_tma_rect_load: bool | None = None,           # rect kernel's state load (nowrite-only)
+    _use_tma_replay_write_load: bool | None = None,   # replay-style state load when WC=True
+    _use_tma_replay_write_store: bool | None = None,  # replay-style state store when WC=True
+    _use_tma_replay_nowrite_load: bool | None = None, # replay-style state load when WC=False
+    # Persistent-mode tuning kwargs (consulted for both pd and pm; pd uses
+    # _cta_per_sm / _num_loop_stages, pm uses the _write/_nowrite splits):
     # _cta_per_sm : int — CTAs per SM in the 1D persistent grid.  Internally
-    #   expanded to `num_persistent = _cta_per_sm × NUM_SMS`.  Default = 1.
+    #   expanded to `num_persistent = _cta_per_sm × NUM_SMS`.
     # _num_loop_stages : int — `num_stages` arg on the inner `tl.range(...)`
     #   persistent loop.  Note: this is loop-level, NOT the kernel-arg
-    #   `num_stages` (which only pipelines dot-feeding loads).  Default 2.
-    # _flatten : bool — `flatten` arg on `tl.range(...)`.  Default True
-    #   (the canonical Triton 3.6 persistent idiom).
+    #   `num_stages` (which only pipelines dot-feeding loads).
+    # _flatten : bool — `flatten` arg on `tl.range(...)`.
     # _warp_specialize : bool — `warp_specialize` arg on `tl.range(...)`.
-    #   Default False.  Triton 3.6 only supports it on simple matmul loops;
-    #   our scan loop probably won't pattern-match — but exposed as a knob
-    #   for sweep experiments.  Requires num_warps >= 4 if True.
-    _n_writes: int | None = None,
-    # Optional pre-allocated (1,) int32 device tensor for the persistent
-    # kernel's n_writes input.  Bench passes this in mix scenarios so the
-    # captured CUDA graph can read varying n_writes per iter without
-    # re-capture.  When None and `_n_writes` is provided, we allocate a
-    # scratch tensor and fill from `_n_writes` (pure scenarios).
-    _n_writes_dev: torch.Tensor | None = None,
-    # When True, persistent_main host-skips empty-half launches (n_writes=0
-    # or =batch in pure scenarios).  Default True preserves today's behavior.
-    # Set False to always launch both halves — used by mix scenarios (where
-    # host can't cheaply read n_writes per iter) and for fair K-consistent
-    # comparisons.
-    _persistent_skip_empty_halves: bool = True,
     _cta_per_sm: int | None = None,
     _num_loop_stages: int | None = None,
     _flatten: bool | None = None,
@@ -2275,21 +2464,20 @@ def checkpointing_state_update(
         use_internal_pdl = False
 
     # Mode selection:
-    #   mode="persistent_dynamic" (default): single persistent-CTA kernel
-    #       covering the full batch.  Each work-item dispatches via runtime
-    #       PNAT check (is_write = (pnat + T) > MAX).  No write/nowrite split.
-    #       slot_perm is honored but optional.  write_checkpoint is ignored
-    #       (per-slot from PNAT).
+    #   mode=None (default): look up the table-tuned mode + knobs for this
+    #       (effective_batch, dtype, sr) cell.  See `_resolve_tuning` above.
+    #   mode="persistent_dynamic": single persistent-CTA kernel covering the
+    #       full batch.  Each work-item dispatches via runtime PNAT check
+    #       (is_write = (pnat + T) > MAX).  No write/nowrite split.
+    #       slot_perm is honored but optional.  write_checkpoint is ignored.
     #   mode="persistent_main": persistent-CTA kernel with two launches
-    #       (write half + nowrite half).  Caller must pre-sort slots
-    #       write-first via slot_perm and pass _n_writes / _n_writes_dev so
-    #       the kernel can split the persistent loop into the two halves
-    #       with the right WRITE_CHECKPOINT constexpr each time.  RECTANGLE
-    #       constexpr (= rectangle_for_nowrite) picks rect vs replay for the
-    #       nowrite half.  write_checkpoint is ignored (per-slot from PNAT).
-    assert mode in ("persistent_dynamic", "persistent_main"), (
-        f"unknown mode {mode!r}; expected 'persistent_dynamic' or 'persistent_main'"
-    )
+    #       (write half + nowrite half).  Caller MUST pre-sort slot_perm
+    #       write-first; the n_writes tensor partitions the persistent loop
+    #       into the two halves with the right WRITE_CHECKPOINT constexpr
+    #       each time.  RECTANGLE constexpr (= rectangle_for_nowrite) picks
+    #       rect vs replay for the nowrite half.  write_checkpoint is ignored.
+    # Note: mode-and-knob resolution from the default-tuning table happens
+    # below, after we have `batch` and `nheads`.
 
     # --- Hardware support gates ---
     # fp8 e4m3fn (any rounding mode) needs SM 89+ for the fp32↔e4m3 cvt PTX
@@ -2356,11 +2544,72 @@ def checkpointing_state_update(
     ngroups = B.shape[2]
     assert nheads % ngroups == 0
 
-    # --- Quantization plumbing ---
+    # --- Quantization plumbing (needed for SR/RN classification below) ---
     # QUANT_MAX > 0 ⇔ state is int8 / int16 / fp8_e4m3fn.  Kernel-entry
     # static_assert on the Triton side mirrors this invariant.
     quant_max = _QUANT_MAX_BY_DTYPE.get(state.dtype, 0.0)
     is_quantized = quant_max > 0.0
+
+    # --- Default-tuning lookup ---
+    # Resolve (mode, knobs) from the table when caller leaves them None.
+    # Caller-provided kwargs always win.  If the caller forces a mode that
+    # differs from the table's recommendation for this cell, we BRIDGE the
+    # table's knobs into the forced mode's knob namespace rather than fall
+    # back to (likely-terrible) kernel defaults:
+    #   table pd → forced pm: copy each unsplit pd knob (M, W, S, CPS, LS)
+    #                         to both write and nowrite split knobs.
+    #   table pm → forced pd: take the nowrite split values (Mnw, Wnw, Snw,
+    #                         CPSnw, LSnw) as the unsplit knobs.
+    # Empty table → no-op (caller passes whatever, mode falls back to pd).
+    _dt_str = {
+        torch.float32: "fp32",
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+        torch.int8: "int8",
+        torch.int16: "int16",
+        torch.float8_e4m3fn: "fp8",
+    }.get(state.dtype, str(state.dtype))
+    _sr_str = "SR" if (rand_seed is not None and is_quantized) else "RN"
+    _table_entry = _resolve_tuning(batch, nheads, _dt_str, _sr_str)
+    if _table_entry is not None:
+        _table_mode, _table_knobs = _table_entry
+        if mode is None:
+            mode = _table_mode
+        if mode != _table_mode:
+            # Bridge across modes — see header comment above.
+            _table_knobs = _bridge_tuning_knobs(_table_knobs, _table_mode, mode)
+        # Fill None-valued kwargs from table.  We can't reliably mutate
+        # locals() for re-read, so re-bind each kwarg explicitly.
+        if rectangle_for_nowrite is None and "rectangle_for_nowrite" in _table_knobs:
+            rectangle_for_nowrite = bool(_table_knobs["rectangle_for_nowrite"])
+        _block_size_m = _block_size_m if _block_size_m is not None else _table_knobs.get("_block_size_m")
+        _num_warps = _num_warps if _num_warps is not None else _table_knobs.get("_num_warps")
+        _num_stages = _num_stages if _num_stages is not None else _table_knobs.get("_num_stages")
+        _heads_per_block = _heads_per_block if _heads_per_block is not None else _table_knobs.get("_heads_per_block")
+        _precompute_num_warps = _precompute_num_warps if _precompute_num_warps is not None else _table_knobs.get("_precompute_num_warps")
+        _precompute_num_stages = _precompute_num_stages if _precompute_num_stages is not None else _table_knobs.get("_precompute_num_stages")
+        _block_size_m_write = _block_size_m_write if _block_size_m_write is not None else _table_knobs.get("_block_size_m_write")
+        _block_size_m_nowrite = _block_size_m_nowrite if _block_size_m_nowrite is not None else _table_knobs.get("_block_size_m_nowrite")
+        _num_warps_write = _num_warps_write if _num_warps_write is not None else _table_knobs.get("_num_warps_write")
+        _num_warps_nowrite = _num_warps_nowrite if _num_warps_nowrite is not None else _table_knobs.get("_num_warps_nowrite")
+        _num_stages_write = _num_stages_write if _num_stages_write is not None else _table_knobs.get("_num_stages_write")
+        _num_stages_nowrite = _num_stages_nowrite if _num_stages_nowrite is not None else _table_knobs.get("_num_stages_nowrite")
+        _cta_per_sm = _cta_per_sm if _cta_per_sm is not None else _table_knobs.get("_cta_per_sm")
+        _num_loop_stages = _num_loop_stages if _num_loop_stages is not None else _table_knobs.get("_num_loop_stages")
+        _flatten = _flatten if _flatten is not None else _table_knobs.get("_flatten")
+        _warp_specialize = _warp_specialize if _warp_specialize is not None else _table_knobs.get("_warp_specialize")
+        _use_tma_rect_load = _use_tma_rect_load or bool(_table_knobs.get("_use_tma_rect_load", False))
+        _use_tma_replay_write_load = _use_tma_replay_write_load or bool(_table_knobs.get("_use_tma_replay_write_load", False))
+        _use_tma_replay_write_store = _use_tma_replay_write_store or bool(_table_knobs.get("_use_tma_replay_write_store", False))
+        _use_tma_replay_nowrite_load = _use_tma_replay_nowrite_load or bool(_table_knobs.get("_use_tma_replay_nowrite_load", False))
+    # Final defaults if neither caller nor table set them (empty table case).
+    if mode is None:
+        mode = "persistent_dynamic"
+    if rectangle_for_nowrite is None:
+        rectangle_for_nowrite = False
+    assert mode in ("persistent_dynamic", "persistent_main"), (
+        f"unknown mode {mode!r}; expected 'persistent_dynamic' or 'persistent_main'"
+    )
     if is_quantized:
         assert state_scales is not None, (
             f"state.dtype={state.dtype} requires state_scales tensor "
@@ -2378,18 +2627,11 @@ def checkpointing_state_update(
     # Cache T-axis = MAX_WINDOW (the replay buffer capacity).  For the
     # placeholder degenerate case max_window = T (every step is a checkpoint
     # step).  For real replay-style checkpointing, max_window > T and
-    # `prev_num_accepted_tokens` can be 0..max_window.
+    # `prev_num_accepted_tokens` can be 0..max_window.  Window-axis kernel
+    # tiles (BLOCK_SIZE_WINDOW, BLOCK_SIZE_K) are derived independently from
+    # MAX_REPLAY_BUFFER_LENGTH so max_window can exceed BLOCK_SIZE_T freely.
     max_window = old_x.shape[1]
     assert T <= max_window, f"T={T} exceeds cache max_window={max_window}"
-    # Replay-style code path uses BLOCK_SIZE_T = max(np2(T), 16) for the
-    # combined T-axis (T_new tile size) and reuses it for window loads.  Until
-    # the heuristic is generalized to track max_window separately, require
-    # max_window to fit within that tile.
-    block_size_t = max(triton.next_power_of_2(T), 16)
-    assert max_window <= block_size_t, (
-        f"max_window={max_window} exceeds BLOCK_SIZE_T={block_size_t} "
-        f"derived from T={T}; extend the heuristic to include max_window."
-    )
 
     assert x.shape == (batch, T, nheads, dim)
     assert dt.shape == x.shape
@@ -2539,7 +2781,11 @@ def checkpointing_state_update(
     if _num_warps is not None:
         num_warps = _num_warps
     if _heads_per_block is not None:
-        heads_per_block = _heads_per_block
+        # Cap at heads_per_group: HEADS_PER_BLOCK divides the kernel's head
+        # axis, so a table value larger than the model's heads-per-group
+        # would overshoot.  Protects callers running smaller models than
+        # the one we tuned against.
+        heads_per_block = min(_heads_per_block, heads_per_group)
     if _precompute_num_warps is not None:
         precompute_num_warps = _precompute_num_warps
 
@@ -2615,23 +2861,37 @@ def checkpointing_state_update(
         state_tma_descriptor_write = state   # dummy; all consuming constexprs False
         state_tma_descriptor_nowrite = state  # dummy; all consuming constexprs False
 
-    # Slot permutation — pointer + USE_PERM gate.  When the caller provides
-    # a perm tensor the dl-family launches read pid_b through it; otherwise
-    # we pass any valid pointer (state_batch_indices) and USE_PERM=False so
-    # the kernel falls back to pid_grid.
-    if slot_perm is not None:
-        assert slot_perm.dtype in (torch.int32, torch.int64), (
-            f"slot_perm must be int32/int64, got {slot_perm.dtype}"
-        )
-        assert slot_perm.numel() >= batch, (
-            f"slot_perm has {slot_perm.numel()} entries; need >= batch ({batch})"
-        )
-        slot_perm_arg = slot_perm
-        use_perm = True
-    else:
-        # Any valid ptr — gated by USE_PERM=False at compile time.
-        slot_perm_arg = state_batch_indices if state_batch_indices is not None else state
-        use_perm = False
+    # Slot permutation — pointer + USE_PERM gate.  Always required: the
+    # persistent_main kernel reads pid_b through slot_perm to walk the
+    # write-first sorted batch.  persistent_dynamic forces USE_PERM=False
+    # at the call site (see launch_persistent_dynamic_main below) so the
+    # perm value doesn't matter for pd, but the tensor must still be valid.
+    assert isinstance(slot_perm, torch.Tensor), (
+        f"slot_perm must be a torch.Tensor, got {type(slot_perm).__name__}"
+    )
+    assert slot_perm.device == device, (
+        f"slot_perm must be on device {device}, got {slot_perm.device}"
+    )
+    assert slot_perm.dtype in (torch.int32, torch.int64), (
+        f"slot_perm must be int32/int64, got {slot_perm.dtype}"
+    )
+    assert slot_perm.shape == (batch,), (
+        f"slot_perm must have shape (batch={batch},), got {tuple(slot_perm.shape)}"
+    )
+    assert isinstance(n_writes, torch.Tensor), (
+        f"n_writes must be a torch.Tensor, got {type(n_writes).__name__}"
+    )
+    assert n_writes.device == device, (
+        f"n_writes must be on device {device}, got {n_writes.device}"
+    )
+    assert n_writes.dtype == torch.int32, (
+        f"n_writes must be int32, got {n_writes.dtype}"
+    )
+    assert n_writes.shape == (1,), (
+        f"n_writes must have shape (1,), got {tuple(n_writes.shape)}"
+    )
+    slot_perm_arg = slot_perm
+    use_perm = True
 
     precomp_grid = (batch, nheads // heads_per_block)
     d_strides = (D.stride(0), D.stride(1)) if D is not None else (0, 0)
@@ -2708,28 +2968,12 @@ def checkpointing_state_update(
     _num_pid_m = (dim + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
     def launch_persistent_main(write_checkpoint: bool,
-                               n_writes_dev: torch.Tensor,
                                *,
-                               host_n_writes: int | None = None,
-                               skip_empty_halves: bool = True,
                                launch_dependent_kernels: bool = False,
                                rectangle: bool = False):
-        # `n_writes_dev` is a (1,) int32 device tensor; the kernel reads
-        # the count from device memory.  `host_n_writes` is the same value
-        # known host-side (when available — pure scenarios) and lets us
-        # skip the launch entirely if its half is empty.  In mix scenarios
-        # the host doesn't know n_writes per iter without a sync, so
-        # `host_n_writes is None` and `skip_empty_halves` is forced False
-        # — both halves always launch and the kernel processes whatever
-        # range device-n_writes implies.
-        if skip_empty_halves and host_n_writes is not None:
-            n_slots_for_kernel = host_n_writes if write_checkpoint else (batch - host_n_writes)
-            if n_slots_for_kernel <= 0:
-                return
-        # Per-main knob selection.  The two persistent_main launches (write
-        # half vs nowrite half) get independent BLOCK_SIZE_M / num_warps /
-        # num_stages / cta_per_sm / num_loop_stages.  See the per-main args
-        # block in the wrapper signature.
+        # `n_writes` (wrapper-level) is the (1,) int32 device tensor with the
+        # write count.  Both halves always launch; the kernel's runtime PNAT
+        # check iterates only the slots that belong to its half.
         _bsm = BLOCK_SIZE_M_WRITE if write_checkpoint else BLOCK_SIZE_M_NOWRITE
         _nw = NUM_WARPS_WRITE if write_checkpoint else NUM_WARPS_NOWRITE
         _ns = NUM_STAGES_WRITE if write_checkpoint else NUM_STAGES_NOWRITE
@@ -2739,18 +2983,11 @@ def checkpointing_state_update(
         _nls = _nls if _nls else 2
         _num_persistent = _cps * _num_sms
         _num_pid_m_local = (dim + _bsm - 1) // _bsm
-        # Grid sizing: cap at min(full persistent grid, actual total_work).
-        # `n_slots` for this launch is `host_n_writes` (write half) / `batch -
-        # host_n_writes` (nowrite half) when host knows it (pure); else upper
-        # bound `batch` for mix scenarios where host can't read n_writes_dev
-        # without a sync.  Upper-bound is fine — the kernel's runtime check
-        # only iterates actual work; the only cost of overcounting is a few
-        # extra CTAs.
-        if host_n_writes is not None:
-            _n_slots_for_launch = host_n_writes if write_checkpoint else (batch - host_n_writes)
-        else:
-            _n_slots_for_launch = batch
-        _total_work_launch = max(1, _n_slots_for_launch * _num_pid_m_local * nheads)
+        # Grid sizing: cap at min(full persistent grid, upper-bound total work).
+        # We use `batch` as the upper bound on slots-per-half — overcounting
+        # by a few CTAs is fine since the kernel's runtime check only
+        # iterates the slots that actually belong to its half.
+        _total_work_launch = max(1, batch * _num_pid_m_local * nheads)
         grid = (min(_num_persistent, _total_work_launch),)
         # Per-path TMA descriptor — block_shape[0] must match _bsm.
         _desc = (state_tma_descriptor_write if write_checkpoint
@@ -2762,7 +2999,7 @@ def checkpointing_state_update(
             x, C, D, z, out,
             cb_scaled, decay_vec,
             state_batch_indices, slot_perm_arg, rand_seed, pad_slot_id,
-            n_writes_dev, batch, nheads,
+            n_writes, batch, nheads,
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
             state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
@@ -2839,7 +3076,7 @@ def checkpointing_state_update(
             x, C, D, z, out,
             cb_scaled, decay_vec,
             state_batch_indices, slot_perm_arg, rand_seed, pad_slot_id,
-            n_writes_dev, batch, nheads,
+            n_writes, batch, nheads,
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
             state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
@@ -2896,93 +3133,36 @@ def checkpointing_state_update(
     # ---- Mode dispatch ----------------------------------------------------
     with torch.cuda.device(device.index):
         if mode == "persistent_dynamic":
-            # Single-launch persistent kernel covering the full batch.
-            # Each work-item dispatches via runtime PNAT check (is_write =
-            # (pnat + T) > MAX).  No n_writes/half-split — kernel ignores
-            # n_writes_dev when IS_DYNAMIC=True (Triton DCEs the load).
-            # We still need a valid pointer to satisfy the kernel arg
-            # signature; allocate or reuse `_n_writes_dev`.
-            n_writes_dev_local = (
-                _n_writes_dev if _n_writes_dev is not None
-                else torch.zeros(1, dtype=torch.int32, device=device)
-            )
+            # Single-launch persistent kernel covering the full batch.  Each
+            # work-item dispatches via runtime PNAT check.  Kernel ignores
+            # n_writes (Triton DCEs the load) when IS_DYNAMIC=True; we still
+            # pass the wrapper-provided tensor as required by the signature.
             launch_dynamic_precompute(rectangle=rectangle_for_nowrite)
             launch_persistent_dynamic_main(
-                n_writes_dev_local,
+                n_writes,
                 launch_dependent_kernels=False,
                 rectangle=rectangle_for_nowrite,
             )
         elif mode == "persistent_main":
             # Persistent-CTA main kernel.  One shared dynamic_precompute
-            # (per-slot dispatch at runtime via PNAT) feeds two
-            # persistent_main launches (write half + nowrite half).
+            # (per-slot dispatch via PNAT) feeds two persistent_main
+            # launches (write half + nowrite half).  Both halves ALWAYS
+            # launch; the kernel's runtime check iterates only the slots
+            # belonging to its half (write: [0, n_writes), nowrite:
+            # [n_writes, batch)).
             #
-            # Hard-sort contract: caller has pre-sorted slots host-side so
-            # PNAT is monotone (writes first).  Pass the perm via
-            # slot_perm + USE_PERM.
-            #
-            # n_writes is read by the kernel from a (1,) int32 device
-            # tensor.  The caller can provide:
-            #   * _n_writes_dev only (mix): a pre-filled (1,) int32 tensor
-            #     it updates per iter via pre_iter_fn outside the captured
-            #     graph.  host can't cheaply read it without a sync, so both
-            #     halves always launch.
-            #   * _n_writes only (non-graph callers, e.g. unit tests): host
-            #     int.  We allocate the scratch tensor on the fly.  CANNOT
-            #     be used inside CUDA-graph capture — alloc inside capture
-            #     invalidates the stream.
-            #   * Both (pure under graph capture): caller pre-allocates the
-            #     tensor outside capture and tells us the host value too.
-            #     We skip the internal allocation and apply host-skip when
-            #     _persistent_skip_empty_halves=True.  This is the
-            #     production-equivalent path the bench's pure cells take.
-            if _n_writes_dev is not None:
-                n_writes_dev_local = _n_writes_dev  # no allocation
-                if _n_writes is not None:
-                    # Caller provided both: pure scenario with pre-allocated
-                    # tensor.  Use host_n_writes for the skip-empty fast path.
-                    assert 0 <= _n_writes <= batch, (
-                        f"_n_writes={_n_writes} must be in [0, batch={batch}]"
-                    )
-                    host_n_writes_local = _n_writes
-                    skip_empty_local = _persistent_skip_empty_halves
-                else:
-                    # Mix: host doesn't know n_writes without a sync.
-                    host_n_writes_local = None
-                    skip_empty_local = False
-            else:
-                # No pre-allocated tensor.  Fall back to on-the-fly alloc
-                # from _n_writes (host int).  NOT graph-capture-safe.
-                assert _n_writes is not None, (
-                    "mode='persistent_main' requires either _n_writes "
-                    "(host int, non-graph callers) or _n_writes_dev (device "
-                    "tensor, recommended for graph-capture callers)."
-                )
-                assert 0 <= _n_writes <= batch, (
-                    f"_n_writes={_n_writes} must be in [0, batch={batch}]"
-                )
-                n_writes_dev_local = torch.tensor(
-                    [_n_writes], dtype=torch.int32, device=device,
-                )
-                host_n_writes_local = _n_writes
-                skip_empty_local = _persistent_skip_empty_halves
-            # rectangle_for_nowrite=True: precompute populates cb_scaled
-            # for the rect path; nowrite half uses the rectangle impl;
-            # write half always replay-style (rect doesn't apply).
+            # Caller-provided contract: `n_writes` is a (1,) int32 device
+            # tensor (the kernel reads it at runtime, after the precompute);
+            # `slot_perm` is a (batch,) int32 device tensor pre-sorted
+            # write-first.
             launch_dynamic_precompute(rectangle=rectangle_for_nowrite)
             launch_persistent_main(
                 write_checkpoint=True,
-                n_writes_dev=n_writes_dev_local,
-                host_n_writes=host_n_writes_local,
-                skip_empty_halves=skip_empty_local,
                 launch_dependent_kernels=True,
                 rectangle=False,  # write always replay-style
             )
             launch_persistent_main(
                 write_checkpoint=False,
-                n_writes_dev=n_writes_dev_local,
-                host_n_writes=host_n_writes_local,
-                skip_empty_halves=skip_empty_local,
                 launch_dependent_kernels=False,
                 rectangle=rectangle_for_nowrite,
             )
