@@ -3099,12 +3099,12 @@ class PyExecutor:
 
         max_new_requests = total_max - total_num_active_requests
 
-        # Benchmark disagg fill-phase admission throttle: without it, the
-        # executor admits `total_max` requests in one iteration when the
-        # benchmark queue is preloaded, putting that many KV recvs in
-        # flight at once.  The transient transfer-staging peak can OOM-
-        # kill the GEN server before any transfer drains.  Cap at
-        # `tp_size` (one per rank per iteration) until the fill gate opens.
+        # Benchmark disagg fill-phase admission throttle: a preloaded queue
+        # (concurrency == total_max) would otherwise pop all requests into
+        # DISAGG_GENERATION_INIT in one iter, tripping PR #12206's fail-fast
+        # under ADP-router imbalance and growing the recv-buffer fallback
+        # faster than transfers drain.  Cap at `tp_size` (≈ pre-#12208
+        # blocking fill rate).  Verified on Kimi-K2 8k1k ctx8/gen1 con=8192.
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
                 and not self.is_warmup):
             max_new_requests = min(max_new_requests, self.dist.tp_size)
