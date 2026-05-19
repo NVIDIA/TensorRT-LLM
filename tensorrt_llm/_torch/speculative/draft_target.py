@@ -481,13 +481,9 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                 # Fall back to a synthetic request id; v2 needs one per row.
                 request_ids = list(range(int(batch_size)))
             # ``IbverbsDraftOffloadLayer.forward`` expects exactly one
-            # start-position per request (length == batch_size), but
-            # TRT-LLM passes the *full* per-token position_ids
-            # (length == total prompt+gen tokens in batch).  Build a
-            # per-request position vector — last position is what the
-            # draft side needs to know where to resume from.  Only
-            # batch_size=1 is exercised today (Phase 4 limitation); the
-            # multi-request path lands in Phase 9.
+            # position per request (length == batch_size), but TRT-LLM may
+            # pass the *full* per-token position_ids (length == total
+            # prompt+gen tokens in batch).  Build a per-request vector first.
             if position_ids is None or int(position_ids.numel()) == 0:
                 per_request_positions = torch.zeros(
                     (int(batch_size),), dtype=torch.int64, device=logits.device
@@ -498,6 +494,51 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                 last_pos = int(position_ids.reshape(-1)[-1].detach().cpu().item())
                 per_request_positions = torch.tensor(
                     [last_pos] * int(batch_size), dtype=torch.int64, device=logits.device
+                )
+
+            # The draft server's PEARL state machine interprets ``position``
+            # as the token position immediately BEFORE the target token carried
+            # in this packet.  For context rows the raw position already has
+            # that meaning: prompt last position precedes t_f.
+            #
+            # For generation rows, TRT-LLM's position_ids point at the end of
+            # the verify window.  If gamma=4 and target accepted only the
+            # correction token, raw position is P+4 but the packet token belongs
+            # after P.  If target accepted all draft tokens plus the bonus,
+            # raw position is already correct.  Shift by the number of accepted
+            # draft tokens so draft rollback/cache-hit logic lines up.
+            num_contexts = (
+                int(getattr(attn_metadata, "num_contexts", 0)) if attn_metadata is not None else 0
+            )
+            raw_per_request_positions = per_request_positions.clone()
+            if int(batch_size) > num_contexts:
+                raw_positions = [int(v) for v in raw_per_request_positions.detach().cpu().tolist()]
+                accepted_counts = [
+                    int(v) for v in num_accepted_tokens.reshape(-1).detach().cpu().tolist()
+                ]
+                adjusted_positions = []
+                for row, raw_pos in enumerate(raw_positions):
+                    if row < num_contexts:
+                        adjusted_positions.append(raw_pos)
+                        continue
+                    accepted_draft_tokens = max(
+                        0,
+                        min(int(self.max_draft_len), int(accepted_counts[row]) - 1),
+                    )
+                    adjusted_positions.append(
+                        max(0, raw_pos - int(self.max_draft_len) + accepted_draft_tokens)
+                    )
+                per_request_positions = torch.tensor(
+                    adjusted_positions, dtype=torch.int64, device=logits.device
+                )
+                _pearl_log(
+                    "target",
+                    "offload_position_resolved",
+                    raw_positions=raw_positions,
+                    positions=adjusted_positions,
+                    accepted_token_counts=accepted_counts[: int(batch_size)],
+                    num_contexts=int(num_contexts),
+                    max_draft_len=int(self.max_draft_len),
                 )
 
             # Auto prompt push on context phase: when ``num_contexts > 0``

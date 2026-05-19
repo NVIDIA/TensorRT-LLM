@@ -345,6 +345,9 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
             now = time.monotonic()
             remaining = deadline - now
             if remaining <= 0.0:
+                with self._prefetch_lock:
+                    stale = self._prefetch_cache.pop(rid, None)
+                self._cancel_prefetch(stale)
                 _pearl_log(
                     "draft",
                     "prefetch_wait_timeout",
@@ -354,8 +357,18 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                     actual_position=int(position),
                     waited=waited,
                     timeout_s=timeout_s,
+                    predicted_last_token=(
+                        int(stale["predicted_last_token"])
+                        if stale is not None and stale.get("predicted_last_token") is not None
+                        else None
+                    ),
+                    predicted_position=(
+                        int(stale["predicted_position"])
+                        if stale is not None and stale.get("predicted_position") is not None
+                        else None
+                    ),
                 )
-                return None, None
+                return None, stale
 
             waited = True
             event = draft_ready if predicted is not None else bonus_ready
