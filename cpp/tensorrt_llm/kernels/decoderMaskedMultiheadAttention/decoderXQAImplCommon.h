@@ -402,6 +402,8 @@ inline int computeMultiBlockCountForMLA(int batch_size, int max_seq_len, int mul
         return userSpecified.value();
     }
 
+    // 48 split-KV blocks gives one wave of 4-CGA MLA work on a 192-SM SM120 GPU.
+    constexpr int kMlaDefaultBlocksPerSequence = 48;
     int const safe_batch_size = std::max(batch_size, 1);
     int const max_by_sm = std::max(1, static_cast<int>(std::round(
                                       static_cast<float>(multiprocessor_count) / static_cast<float>(safe_batch_size))));
@@ -409,7 +411,7 @@ inline int computeMultiBlockCountForMLA(int batch_size, int max_seq_len, int mul
         1, (max_seq_len + kXqaMlaTokensPerTile * kXqaMlaMultiBlockMinTilesPerCta - 1)
             / (kXqaMlaTokensPerTile * kXqaMlaMultiBlockMinTilesPerCta));
     int const max_by_workspace = std::max(1, getXqaMaxNumSubSeq(/*isMLA=*/true) / safe_batch_size);
-    return std::max(1, std::min({max_by_sm, max_by_seq_len, max_by_workspace}));
+    return std::max(1, std::min({kMlaDefaultBlocksPerSequence, max_by_sm, max_by_seq_len, max_by_workspace}));
 }
 
 inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multiprocessor_count)
