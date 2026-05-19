@@ -3491,6 +3491,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 # to None to avoid coupling synthetic data to any salted branch.
                 kv_cache = self._create_kv_cache(req.py_request_id,
                                                  req.lora_task_id, input_tokens)
+                if kv_cache is None:
+                    release_resources(req)
+                    return None
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
@@ -3510,6 +3513,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
                         req.py_request_id, req.lora_task_id, input_tokens)
                     # Dummy path: see comment above, no salt.
+                    if draft_kv_cache is None:
+                        release_resources(req)
+                        return None
                     success = draft_kv_cache.resume(
                         draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
