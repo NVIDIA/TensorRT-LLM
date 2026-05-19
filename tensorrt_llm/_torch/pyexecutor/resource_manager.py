@@ -2116,6 +2116,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                              event_manager=self.event_manager)
             else:
                 raise
+        # Pass execution_stream to StorageManager so _batched_migrate
+        # can record a fresh event (V1-style syncWithBufferManager)
+        # to order copy streams after the latest forward-pass work.
+        self.impl._storage._execution_stream = self._stream.cuda_stream
 
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
