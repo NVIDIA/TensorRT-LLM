@@ -41,9 +41,23 @@ two-kernel pair in ``_deepseek_v4_o_proj``. The output is consumed verbatim by
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
+
+# Lazy import of the CuTe DSL backend (preferred default on SM100). If the
+# cutlass DSL stack is unavailable in the build, the import returns None and
+# this file falls back to the Triton kernel below. Users can also force the
+# Triton fallback explicitly via `TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE=1`
+# (set inside `_fused_inv_rope_fp8_quant_impl`).
+try:
+    from ..cute_dsl_kernels.blackwell import (  # noqa: F401
+        fused_inv_rope_fp8_quant as _cute_dsl_backend,
+    )
+except Exception:
+    _cute_dsl_backend = None  # type: ignore[assignment]
 
 
 @triton.jit
@@ -70,6 +84,12 @@ def _fused_inv_rope_fp8_quant_per_head(
     HALF_ROPE: tl.constexpr,
     IS_NEOX: tl.constexpr,
 ):
+    # Original 1-token-per-block kernel. Used by the Python dispatcher when
+    # M < threshold (small-M / GEN-phase shapes), where wrapping the body in
+    # an outer loop measurably hurts perf even with BLOCK_TOKENS_M=1 (the if/
+    # else around the bulk creates predicated execution that compiles less
+    # tightly than a straight return path). See `_fused_inv_rope_fp8_quant_
+    # per_head_mblock` for the multi-token path used at M >= 1024.
     # int64: stride multiply overflows int32 past num_tokens=32768 (IMA).
     pid_token = tl.program_id(0).to(tl.int64)
     pid_gh = tl.program_id(1).to(tl.int64)
@@ -158,8 +178,153 @@ def _fused_inv_rope_fp8_quant_per_head(
     tl.store(scale_addrs, scales)
 
 
+@triton.jit
+def _fused_inv_rope_fp8_quant_per_head_mblock(
+    o_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    fp8_ptr,
+    scale_ptr,
+    num_tokens,
+    heads_per_group: tl.constexpr,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    fp8_stride_group,
+    fp8_stride_token,
+    scale_stride_group,
+    scale_stride_k,
+    fp8_max: tl.constexpr,
+    eps: tl.constexpr,
+    QUANT_GROUP_SIZE: tl.constexpr,
+    CHUNKS_PER_HEAD: tl.constexpr,
+    ROPE_START: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    BLOCK_TOKENS_M: tl.constexpr,
+):
+    # Multi-token-per-block variant for M >= 1024. Grid X = ceil(M / BTM).
+    # Compared to the BTM=1 kernel: fewer total blocks → higher SM occupancy
+    # (each SM gets more useful work between launch-issue overheads), with
+    # the trade-off of inner-loop unrolling growing the compiled binary by
+    # BTM×. At BTM∈{8,16} the unroll cost is comfortably amortized.
+    # int64: stride multiply overflows int32 past num_tokens=32768 (IMA).
+    pid_x = tl.program_id(0).to(tl.int64)
+    pid_gh = tl.program_id(1).to(tl.int64)
+
+    g = pid_gh // heads_per_group
+    head_in_group = pid_gh % heads_per_group
+    global_head = pid_gh
+    qb_start = head_in_group * CHUNKS_PER_HEAD
+
+    HEAD_DIM: tl.constexpr = CHUNKS_PER_HEAD * QUANT_GROUP_SIZE
+    rope_abs_start: tl.constexpr = (CHUNKS_PER_HEAD - 1) * QUANT_GROUP_SIZE + ROPE_START
+    offsets = tl.arange(0, HEAD_DIM)
+    is_rope = offsets >= rope_abs_start
+    rope_local = offsets - rope_abs_start
+    block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
+    qb_indices = qb_start + block_offsets
+
+    # Inner loop over BLOCK_TOKENS_M tokens. tl.range (vs tl.static_range)
+    # generates a runtime loop instead of a fully-unrolled body. The
+    # num_stages arg here controls cross-iteration software pipelining
+    # (load_next overlap with compute_current_and_store) — distinct from
+    # the launch-site num_stages which only matters for warpgroup GEMM
+    # kernels. Depth=2 is enough to overlap one load with the previous
+    # iter's store.
+    for m_in_block in tl.range(0, BLOCK_TOKENS_M, num_stages=2):
+        pid_token = pid_x * BLOCK_TOKENS_M + m_in_block
+
+        if pid_token >= num_tokens:
+            scale_addrs = (
+                scale_ptr + g * scale_stride_group + pid_token + qb_indices * scale_stride_k
+            )
+            tl.store(scale_addrs, tl.zeros((CHUNKS_PER_HEAD,), dtype=tl.float32))
+        else:
+            input_base = o_ptr + pid_token * o_stride_token + global_head * o_stride_head
+            x = tl.load(input_base + offsets).to(tl.float32)
+
+            pos = tl.load(positions_ptr + pid_token)
+            cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
+
+            if IS_NEOX:
+                is_first_half = rope_local < HALF_ROPE
+                partner_local = tl.where(
+                    is_first_half, rope_local + HALF_ROPE, rope_local - HALF_ROPE
+                )
+                partner_abs = rope_abs_start + partner_local
+                x_partner = tl.load(input_base + partner_abs, mask=is_rope, other=0.0).to(
+                    tl.float32
+                )
+                cs_idx = tl.where(is_first_half, rope_local, rope_local - HALF_ROPE)
+                cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
+                sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+                sign = tl.where(is_first_half, 1.0, -1.0)
+                rotated = x * cos_v + sign * sin_v * x_partner
+            else:
+                x_partner = tl.load(input_base + (offsets ^ 1), mask=is_rope, other=0.0).to(
+                    tl.float32
+                )
+                cs_idx = tl.maximum(rope_local >> 1, 0)
+                cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
+                sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+                x_add = x * cos_v + x_partner * sin_v
+                x_sub = x * cos_v - x_partner * sin_v
+                is_even = (rope_local & 1) == 0
+                rotated = tl.where(is_even, x_add, x_sub)
+
+            x = tl.where(is_rope, rotated, x)
+
+            x_2d = tl.reshape(tl.abs(x), (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
+            block_absmax = tl.maximum(tl.max(x_2d, axis=1), eps)
+            scales = block_absmax * (1.0 / fp8_max)
+
+            scales_exp = tl.reshape(
+                tl.broadcast_to(
+                    tl.reshape(scales, (CHUNKS_PER_HEAD, 1)),
+                    (CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
+                ),
+                (HEAD_DIM,),
+            )
+            x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+
+            fp8_base = (
+                fp8_ptr
+                + g * fp8_stride_group
+                + pid_token * fp8_stride_token
+                + qb_start * QUANT_GROUP_SIZE
+            )
+            tl.store(fp8_base + offsets, x_quant)
+
+            scale_addrs = (
+                scale_ptr + g * scale_stride_group + pid_token + qb_indices * scale_stride_k
+            )
+            tl.store(scale_addrs, scales)
+
+
 def _tma_aligned_size(x: int, tma_align_size_in_elems: int = 4) -> int:
     return (x + tma_align_size_in_elems - 1) // tma_align_size_in_elems * tma_align_size_in_elems
+
+
+def _choose_block_tokens_m(num_tokens: int) -> int:
+    """Pick BLOCK_TOKENS_M based on M.
+
+    Microbench (DEP8 shape, n_groups=8, heads_per_group=16) on GB300:
+    - At M < 1024 the single-token-per-block path is the winner — BTM>1 adds
+      static-unroll overhead that's not amortized at small block count.
+    - At M >= 1024 multi-token blocks reduce grid size (fewer single-warp
+      launch costs) and improve SM occupancy. Measured wins:
+        M=1024  : BTM=8  → 63 µs vs 70 µs (BTM=1)  ≈ 10% faster
+        M=2048+ : BTM=16 → 113 µs vs 137 µs (BTM=1) ≈ 18% faster
+        M=8192  : BTM=16 → 448 µs vs 533 µs (BTM=1) ≈ 16% faster
+    """
+    if num_tokens >= 4096:
+        return 32
+    if num_tokens >= 2048:
+        return 16
+    if num_tokens >= 1024:
+        return 8
+    return 1
 
 
 def _fused_inv_rope_fp8_quant_impl(
@@ -173,6 +338,29 @@ def _fused_inv_rope_fp8_quant_impl(
     quant_group_size: int,
     is_neox: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # CuTe DSL is the default backend on SM100. It matches Triton at the
+    # CTX-side memory-bound regime (M >= 2048) and beats it at small M
+    # (12-19% faster on DSv4-Pro DEP8 shape) thanks to register-prefetched
+    # multi-token pipelining (BTM=1/8/16/32). Falls through to the Triton
+    # kernel below if (a) the cutlass DSL stack is unavailable in this
+    # build, or (b) the user explicitly opts out via
+    # `TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE=1`.
+    if (
+        _cute_dsl_backend is not None
+        and _cute_dsl_backend._fused_inv_rope_fp8_quant_impl_cute_dsl is not None
+        and os.environ.get("TLLM_DISABLE_CUTE_DSL_FUSED_INV_ROPE", "0") != "1"
+    ):
+        return _cute_dsl_backend._fused_inv_rope_fp8_quant_impl_cute_dsl(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups,
+            heads_per_group,
+            nope_dim,
+            rope_dim,
+            quant_group_size,
+            is_neox,
+        )
     num_tokens, num_heads, head_dim = o.shape
     assert num_heads == n_groups * heads_per_group, (
         f"num_heads={num_heads} != n_groups({n_groups}) * heads_per_group({heads_per_group})"
@@ -199,7 +387,12 @@ def _fused_inv_rope_fp8_quant_impl(
     fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 
-    tma_aligned_T = _tma_aligned_size(num_tokens, 4)
+    block_tokens_m = _choose_block_tokens_m(num_tokens)
+    # Pad scale-buffer M dim to max(BLOCK_TOKENS_M, 4): TMA consumer needs
+    # 4-alignment, and grid-X = ceil(M / BTM) blocks each writes BTM scale
+    # rows — so M must align to BTM too. lcm(BTM, 4) = max(BTM, 4) for
+    # BTM ∈ {1, 2, 4, 8, 16, ...} (powers of 2).
+    tma_aligned_T = _tma_aligned_size(num_tokens, max(block_tokens_m, 4))
 
     # FP8 output buffer: fully contiguous [n_groups, num_tokens, d] — must
     # match `fp8_batched_quantize_1x128_permute102`'s contiguous output exactly,
@@ -239,14 +432,7 @@ def _fused_inv_rope_fp8_quant_impl(
     if positions.dtype != torch.int32 and positions.dtype != torch.int64:
         positions = positions.to(torch.int64)
 
-    grid = (tma_aligned_T, n_groups * heads_per_group)
-    _fused_inv_rope_fp8_quant_per_head[grid](
-        o,
-        positions,
-        cos_sin_view,
-        fp8_buf,
-        scale_buf,
-        num_tokens,
+    common_kwargs = dict(
         heads_per_group=heads_per_group,
         o_stride_token=o.stride(0),
         o_stride_head=o.stride(1),
@@ -262,9 +448,51 @@ def _fused_inv_rope_fp8_quant_impl(
         ROPE_START=nope_dim % quant_group_size,
         HALF_ROPE=rope_dim // 2,
         IS_NEOX=is_neox,
-        num_warps=1,
-        num_stages=1,
     )
+
+    if block_tokens_m == 1:
+        # Small-M / GEN path: single-token-per-block kernel (no outer loop).
+        # Bit-for-bit equivalent to the original V1 kernel.
+        grid = (tma_aligned_T, n_groups * heads_per_group)
+        _fused_inv_rope_fp8_quant_per_head[grid](
+            o,
+            positions,
+            cos_sin_view,
+            fp8_buf,
+            scale_buf,
+            num_tokens,
+            **common_kwargs,
+            num_warps=1,
+            num_stages=1,
+        )
+    else:
+        # Large-M / CTX path: multi-token-per-block kernel. num_stages=2
+        # lets Triton interleave the next iter's TMA load with the current
+        # iter's compute+store across the unrolled BLOCK_TOKENS_M body.
+        # num_warps tuning: per-block work scales with BTM × HEAD_DIM.
+        # V2.3 microbench at M=8192 DEP8 shape:
+        #   BTM=16 nw=1 → 448 µs (3.6 TB/s, 45% peak)
+        #   BTM=16 nw=2 → 420 µs (3.8 TB/s, 48% peak)  ← best
+        #   BTM=16 nw=4 → 555 µs (2.9 TB/s, 36% peak)  ← reg-pressure regression
+        # So nw=2 for BTM>=8 (more threads help amortize the larger per-block
+        # load fan-out), nw=1 for BTM=1 (V1 ruled out nw>1 there).
+        nw = 2 if block_tokens_m >= 8 else 1
+        # num_stages: software-pipelining depth across the inner loop.
+        # BTM=32 has more iterations to pipeline so stages=3 has more value.
+        ns = 3 if block_tokens_m >= 32 else 2
+        grid = (tma_aligned_T // block_tokens_m, n_groups * heads_per_group)
+        _fused_inv_rope_fp8_quant_per_head_mblock[grid](
+            o,
+            positions,
+            cos_sin_view,
+            fp8_buf,
+            scale_buf,
+            num_tokens,
+            **common_kwargs,
+            BLOCK_TOKENS_M=block_tokens_m,
+            num_warps=nw,
+            num_stages=ns,
+        )
     return fp8_buf, scale_buf
 
 
@@ -282,7 +510,8 @@ def _fused_inv_rope_fp8_quant_fake(
     num_tokens, num_heads, head_dim = o.shape
     d = heads_per_group * head_dim
     num_scale_blocks = d // quant_group_size
-    tma_aligned_T = _tma_aligned_size(num_tokens, 4)
+    block_tokens_m = _choose_block_tokens_m(num_tokens)
+    tma_aligned_T = _tma_aligned_size(num_tokens, max(block_tokens_m, 4))
     fp8_buf = torch.empty(
         (n_groups, num_tokens, d),
         dtype=torch.float8_e4m3fn,
