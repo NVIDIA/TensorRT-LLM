@@ -477,12 +477,10 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 return_tensors="pt",
                 do_rescale=False,
             ).to(self.device)
-        # Transformers 5.x returns mm_token_type_ids which triggers a new
-        # position ID path (get_rope_index).  Keep it for image modalities
-        # (needed for correct position computation), but remove for video
-        # where the grid_thw iterator count can mismatch token counts.
-        if modality == "video" and "mm_token_type_ids" in processor_inputs:
-            del processor_inputs["mm_token_type_ids"]
+        # Transformers 5.5.x's `compute_3d_position_ids` raises a ValueError when
+        # multimodal grids are passed without `mm_token_type_ids`. The processor
+        # already returns this tensor for both image and video modalities, so
+        # keep it in the inputs to satisfy the new HF reference path.
         return processor_inputs
 
     def run_trtllm_forward(self, trtllm_inputs, use_cuda_graph: bool = False):

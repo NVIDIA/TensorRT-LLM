@@ -1,5 +1,5 @@
 ---
-name: serve-config-guide
+name: trtllm-serve-config-guide
 description: Generate a source-backed starting `trtllm-serve --config` YAML for
   basic aggregate single-node PyTorch serving, aligned with checked-in TensorRT-LLM
   configs and deployment docs. Preserves explicit latency / balanced / throughput

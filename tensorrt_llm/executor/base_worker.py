@@ -404,15 +404,28 @@ class BaseWorker(GenerationExecutor):
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
-            adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
-                request.lora_request.adapter_id)
-            self._load_lora_adapter(request.lora_request)
-            uid = str(request.lora_request.adapter_id)
-            lora_config = tllm.LoraConfig(
-                task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid]
-                if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid])
+            if self._is_pytorch_backend:
+                # PyTorch backend: don't embed weights in the request.
+                # Each rank loads independently from disk via py_lora_path
+                # in PeftCacheManager.add_request_peft().
+                # Pre-load on rank 0 to warm the LoRA manager cache so that
+                # add_request_peft finds the adapter already loaded.
+                self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
+                lora_config = tllm.LoraConfig(
+                    task_id=request.lora_request.adapter_id,
+                    weights=None,
+                    config=self._lora_manager.cpp_lora_config[uid])
+            else:
+                adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                    request.lora_request.adapter_id)
+                self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
+                lora_config = tllm.LoraConfig(
+                    task_id=request.lora_request.adapter_id,
+                    weights=self._lora_manager.cpp_lora_weights[uid]
+                    if not adapter_in_cache else None,
+                    config=self._lora_manager.cpp_lora_config[uid])
             py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None
@@ -682,15 +695,14 @@ class BaseWorker(GenerationExecutor):
 
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
+        attention_dp_rank = stats[3] if len(stats) > 3 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
-        # Tag with dp_rank=0 so Dynamo's adapter can always read
-        # stat["attentionDpRank"] without a missing-key branch. Attention-DP
-        # per-rank emission is a follow-up; today FPM only flows under
-        # non-attention-DP.
-        # TODO(https://jirasw.nvidia.com/browse/TRTLLM-12123): implement
-        # per-rank IterationStats delivery under attention-DP.
-        stats_dict.setdefault("attentionDpRank", 0)
+        # Always tag the row so Dynamo's adapter can read
+        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
+        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
+        stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
+                                         attention_dp_rank)
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []

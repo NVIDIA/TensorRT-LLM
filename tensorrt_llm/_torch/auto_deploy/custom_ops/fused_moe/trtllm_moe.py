@@ -937,11 +937,8 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("auto_deploy::trtllm_nvfp4_trtllm_gen_moe_fused", mutates_args=())
-def trtllm_nvfp4_trtllm_gen_moe_fused(
+def _trtllm_nvfp4_trtllm_gen_moe_impl(
     x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
     fc1_expert_weights_fp4: torch.Tensor,
     fc2_expert_weights_fp4: torch.Tensor,
     fc1_weight_blockscale_fp8: torch.Tensor,
@@ -950,6 +947,14 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     fc1_scale_c: torch.Tensor,
     fc1_alpha: torch.Tensor,
     fc2_alpha: torch.Tensor,
+    selected_experts: torch.Tensor | None = None,
+    routing_weights: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    routing_bias: torch.Tensor | None = None,
+    top_k: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
+    routed_scaling_factor: float = 1.0,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     mapping_config: str = "",
@@ -979,14 +984,43 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     else:
         raise ValueError(f"Unsupported activation '{ActivationType(act_fn).name}' for TRTLLM-Gen.")
 
-    top_k = int(routing_weights.shape[-1])
-    num_experts = int(fc1_expert_weights_fp4.shape[0])
+    has_internal_routing_inputs = router_logits is not None or routing_bias is not None
+    if has_internal_routing_inputs:
+        if router_logits is None:
+            raise ValueError(
+                "router_logits is required when TRTLLM-Gen internal routing is enabled."
+            )
+        if routing_bias is None:
+            raise ValueError(
+                "routing_bias is required when TRTLLM-Gen internal routing is enabled."
+            )
+        if top_k <= 0:
+            raise ValueError("top_k must be positive when TRTLLM-Gen internal routing is enabled.")
+        use_internal_routing = True
+    else:
+        if selected_experts is None or routing_weights is None:
+            raise ValueError(
+                "selected_experts and routing_weights are required without internal routing."
+            )
+        top_k = int(routing_weights.shape[-1])
+        use_internal_routing = False
+
+    local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     factor = 1 if act_type == 1 else 2
     intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
     routing_method_type = int(RoutingMethodType.DeepSeekV3)
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
+    if mapping is not None and use_internal_routing:
+        num_experts = local_num_experts * mapping.moe_ep_size
+        local_expert_offset = mapping.moe_ep_rank * local_num_experts
+    else:
+        num_experts = local_num_experts
+        local_expert_offset = 0
+
     if enable_alltoall:
+        if use_internal_routing:
+            raise ValueError("TRTLLM-Gen internal routing is not supported with MoE all-to-all.")
         final_hidden_states = _run_trtllm_gen_nvfp4_moe_with_alltoall(
             x=x2d,
             selected_experts=selected_experts.to(torch.int32),
@@ -1010,10 +1044,12 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
         x2d, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
     )
+    runner_router_logits = router_logits if use_internal_routing else None
+    runner_routing_bias = routing_bias if use_internal_routing else None
 
     outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        None,
-        None,
+        runner_router_logits,
+        runner_routing_bias,
         x_q_fp4,
         x_sf.view(torch.float8_e4m3fn),
         fc1_expert_weights_fp4,
@@ -1030,17 +1066,17 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         fc2_alpha,
         num_experts,
         top_k,
-        1,
-        1,
+        n_group if use_internal_routing else 1,
+        topk_group if use_internal_routing else 1,
         intermediate_size,
-        0,
-        num_experts,
-        1.0,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
         routing_method_type,
         do_finalize=True,
         act_type=act_type,
-        topk_weights=routing_weights.to(torch.bfloat16),
-        topk_ids=selected_experts.to(torch.int32),
+        topk_weights=None if use_internal_routing else routing_weights.to(torch.bfloat16),
+        topk_ids=None if use_internal_routing else selected_experts.to(torch.int32),
     )
     final_hidden_states = outputs[0]
     if final_hidden_states.shape[1] > x_shape[-1]:
@@ -1048,11 +1084,11 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     return final_hidden_states.view(x_shape)
 
 
-@trtllm_nvfp4_trtllm_gen_moe_fused.register_fake
-def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
+@torch.library.custom_op("auto_deploy::trtllm_nvfp4_trtllm_gen_moe_fused", mutates_args=())
+def trtllm_nvfp4_trtllm_gen_moe_fused(
     x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor | None,
+    routing_weights: torch.Tensor | None,
     fc1_expert_weights_fp4: torch.Tensor,
     fc2_expert_weights_fp4: torch.Tensor,
     fc1_weight_blockscale_fp8: torch.Tensor,
@@ -1061,6 +1097,63 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     fc1_scale_c: torch.Tensor,
     fc1_alpha: torch.Tensor,
     fc2_alpha: torch.Tensor,
+    router_logits: torch.Tensor | None = None,
+    routing_bias: torch.Tensor | None = None,
+    top_k: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
+    routed_scaling_factor: float = 1.0,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+) -> torch.Tensor:
+    return _trtllm_nvfp4_trtllm_gen_moe_impl(
+        x,
+        fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8,
+        fc1_act_global_scale,
+        fc1_scale_c,
+        fc1_alpha,
+        fc2_alpha,
+        selected_experts=selected_experts,
+        routing_weights=routing_weights,
+        router_logits=router_logits,
+        routing_bias=routing_bias,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        is_gated_mlp=is_gated_mlp,
+        act_fn=act_fn,
+        mapping_config=mapping_config,
+        max_num_tokens=max_num_tokens,
+        apply_routing_on_input=apply_routing_on_input,
+    )
+
+
+@trtllm_nvfp4_trtllm_gen_moe_fused.register_fake
+def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor | None,
+    routing_weights: torch.Tensor | None,
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc1_scale_c: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    router_logits: torch.Tensor | None = None,
+    routing_bias: torch.Tensor | None = None,
+    top_k: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
+    routed_scaling_factor: float = 1.0,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
     mapping_config: str = "",
