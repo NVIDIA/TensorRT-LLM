@@ -71,16 +71,12 @@ struct KernelConfig : public KernelConfigBase {
   int32_t mNumStagesEpilogue;
   // The number of stages of the persistent work id pipeline.
   int32_t mNumStagesWorkId;
-  // The number of stages of the KV shared memory buffer.
-  int32_t mNumStagesKv;
   // The number of stages of the K shared memory buffer.
   int32_t mNumStagesK;
   // The number of stages of the V shared memory buffer.
   int32_t mNumStagesV;
   // The number of stages of the pageOffsetsKv shared memory buffer.
   int32_t mNumStagesPageOffsetsKv;
-  // The number of stages of the Q shared memory buffer.
-  int32_t mNumStagesQ;
   // The number of stages of the transformed KV shared memory buffer.
   int32_t mNumStagesTransformedKv;
   // The number of stages of the transposed V shared memory buffer.
@@ -118,6 +114,8 @@ struct KernelConfig : public KernelConfigBase {
   KernelConfig(FmhaOptions_ const& options)
     : KernelConfigBase(options) // Copy all base class members from options.
     , mSupportsPagedKv{options.mQkvLayout == QkvLayout::PagedKv} {
+    TLLM_CHECK_ERROR(options.mNumStagesKv >= 0, "numStagesKv must be >= 0");
+    TLLM_CHECK_ERROR(options.mNumStagesQ >= 0, "numStagesQ must be >= 0");
 
     // Derive mDtypeKv: equals mDtypeK when K and V share the same dtype, else Void.
     mDtypeKv = (mDtypeK == mDtypeV) ? mDtypeK : tg::Dtype::Void;
@@ -181,11 +179,18 @@ struct KernelConfig : public KernelConfigBase {
         mNumStagesQ = int32_t{2 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
       }
     }
+    // A user-provided positive stage count overrides the heuristic; zero keeps the default.
+    if (options.mNumStagesQ > 0) {
+      mNumStagesQ = options.mNumStagesQ;
+    }
 
     // The number of stages of the KV shared memory buffer.
     if (tg::isArchHopper(options.mCudaArch)) {
       mNumStagesTransformedKv = 0;
       mNumStagesQ = mNumInstsQ;
+      if (options.mNumStagesQ > 0) {
+        mNumStagesQ = options.mNumStagesQ;
+      }
 
       // The minimal amount of stages for the kernel to run
       mNumStagesK = 1;
@@ -204,7 +209,7 @@ struct KernelConfig : public KernelConfigBase {
       // Take into account barriers in smem
       numFreeBytes -= 4 * 1024;
       // Take into account the minimal amount of stages
-      numFreeBytes -= mNumInstsQ * numBytesPerSmemStageQ;
+      numFreeBytes -= mNumStagesQ * numBytesPerSmemStageQ;
       numFreeBytes -= mNumStagesK * numBytesPerSmemStageK;
       numFreeBytes -= mNumStagesV * numBytesPerSmemStageV;
       numFreeBytes -= mNumStagesTransposedV * numBytesPerSmemStageV;
@@ -226,6 +231,12 @@ struct KernelConfig : public KernelConfigBase {
       }
 
       mNumStagesKv = mNumStagesK + mNumStagesV;
+      // Apply the KV override after computing the default K/V split.
+      if (options.mNumStagesKv > 0) {
+        mNumStagesKv = options.mNumStagesKv;
+        mNumStagesK = mNumStagesKv / 2;
+        mNumStagesV = mNumStagesKv - mNumStagesK;
+      }
     } else {
 
 
@@ -272,6 +283,10 @@ struct KernelConfig : public KernelConfigBase {
         }
         // Calculate the number of stages for smemKv.
         mNumStagesKv = calculateNumStagesKv(maxBufferSizeKBForSmemKv, options.mClusterDimX);
+      }
+      // Apply the KV override after all architecture-specific defaults are selected.
+      if (options.mNumStagesKv > 0) {
+        mNumStagesKv = options.mNumStagesKv;
       }
       mNumStagesTransformedKv = tg::dtypeGetNumBits(mDtypeKv) >= 8 ? 2 : 4;
       mNumStagesTransposedV = 0;
@@ -572,6 +587,8 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
   // dedicated columns (mSeparateTmemColsForSAndP false) to avoid data races. orderedSequence syncs
   // LDTM/STTM across instances.
   bool mInterleavesTmemSAndP;
+  // Whether 2-CTA causal spec decoding handles multiple Q tokens in one CTA cluster.
+  bool hasMultiTokensInTwoCta{false};
   // The reshape factor for K/V TMA box width to be a multiple of 128B.
   int32_t mReshapeFactorKv;
   // The reshape factor for K/V scaling factor TMA box width.
@@ -637,6 +654,10 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
   KernelTraits(FmhaOptions_ const& options)
     : KernelConfig(options)
     , MmaTraits(options) {
+
+    // Whether 2-CTA causal spec decoding handles multiple Q tokens in one CTA cluster.
+    hasMultiTokensInTwoCta =
+      mUseUtcmma2CtaMode && mTileSizeQ == 128 && mIsCausalSpecDecodingGen && mSingleTokenQPerCta;
 
     // The tile size for the correction step.
     mCorrTileSize = std::min(mValidTilePvN, 64);
@@ -881,9 +902,10 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     // Whether swizzle is needed for K/V.
     mSwizzleKv = mStoreTransformedKvInTmem ? true : !transformsKv;
 
-    // Whether we can reshape the TMA box width.
+    // Whether this kernel may reshape the TMA box width. The actual runtime factor can be lowered
+    // to 1 by descriptor setup when the K/V strides do not make adjacent tokens contiguous.
     bool canReshapeTmaKv = mSupportsPagedKv && mHeadDimQk == mHeadDimV && !mSwizzleKv;
-    // The reshape factor for K/V TMA box width:
+    // The maximum reshape factor for K/V TMA box width:
     //  - Aim for box width 128B.
     //  - But the box width must also be <= 128 elts for CU_TENSOR_MAP_SWIZZLE_128B.
     mReshapeFactorKv = canReshapeTmaKv
