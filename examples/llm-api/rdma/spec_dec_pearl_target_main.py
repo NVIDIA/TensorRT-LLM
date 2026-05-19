@@ -185,15 +185,25 @@ def main() -> int:
 
         tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
         if args.chat_template and getattr(tokenizer, "chat_template", None):
+            messages = [{"role": "user", "content": args.prompt}]
             generation_prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": args.prompt}],
+                messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
+            prompt_tokens = [
+                int(t)
+                for t in tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+            ]
             used_chat_template = True
-        prompt_tokens = [
-            int(t) for t in tokenizer.encode(generation_prompt, add_special_tokens=True)
-        ]
+        else:
+            prompt_tokens = [
+                int(t) for t in tokenizer.encode(generation_prompt, add_special_tokens=True)
+            ]
     except Exception as exc:
         pearl_trace_log(
             "target",
@@ -289,8 +299,9 @@ def main() -> int:
         temperature=0.0,
         top_p=1.0,
     )
+    generation_input = {"prompt_token_ids": prompt_tokens} if prompt_tokens else generation_prompt
     start_time = time.perf_counter()
-    outputs = llm.generate([generation_prompt], sampling_params=sampling)
+    outputs = llm.generate([generation_input], sampling_params=sampling)
     elapsed = max(time.perf_counter() - start_time, 1e-9)
     out = outputs[0].outputs[0]
     generated_tokens = len(out.token_ids)

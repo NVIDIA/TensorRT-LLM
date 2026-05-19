@@ -240,6 +240,60 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
 
         attn_metadata.update_for_spec_dec()
 
+    def _truncate_accepted_tokens_at_end_id(
+        self,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        spec_metadata: DraftTargetOneModelSpecMetadata,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Clip accepted windows at the first request end_id.
+
+        The normal sampler stops after appending an end token, but PEARL/RDMA
+        asks the draft server for the next segment before the sampler runs on
+        CPU.  If a multi-token verify window accepts an end_id in the middle,
+        the offload request must use that end_id as the last accepted token
+        instead of stepping past it.
+        """
+        end_ids = getattr(spec_metadata, "end_ids", None)
+        if not end_ids:
+            return num_accepted_tokens
+
+        new_counts = num_accepted_tokens.clone()
+        changes = []
+        rows = min(int(batch_size), int(accepted_tokens.shape[0]), len(end_ids))
+        width = int(accepted_tokens.shape[1])
+        for row in range(rows):
+            end_id = int(end_ids[row])
+            if end_id < 0:
+                continue
+            count = max(0, min(int(new_counts[row].item()), width))
+            if count == 0:
+                continue
+            matches = (accepted_tokens[row, :count] == end_id).nonzero(as_tuple=False)
+            if int(matches.numel()) == 0:
+                continue
+            truncated_count = int(matches[0].item()) + 1
+            if truncated_count < count:
+                new_counts[row] = truncated_count
+                changes.append(
+                    {
+                        "row": int(row),
+                        "end_id": int(end_id),
+                        "old_count": int(count),
+                        "new_count": int(truncated_count),
+                    }
+                )
+
+        if changes:
+            _pearl_log(
+                "target",
+                "accepted_terminal_truncated",
+                changes=changes,
+                request_ids=[int(r) for r in getattr(spec_metadata, "request_ids", [])],
+            )
+        return new_counts
+
     def forward(
         self,
         input_ids,
@@ -272,6 +326,13 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata
         )
+        if self._rdma_offload_enabled and not bool(is_warmup):
+            num_accepted_tokens = self._truncate_accepted_tokens_at_end_id(
+                accepted_tokens,
+                num_accepted_tokens,
+                spec_metadata,
+                batch_size,
+            )
         if self._rdma_offload_enabled and not bool(is_warmup):
             draft_tokens_for_log = None
             if spec_metadata.draft_tokens is not None and num_gens > 0:

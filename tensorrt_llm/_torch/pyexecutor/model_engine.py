@@ -3064,6 +3064,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
             spec_metadata.request_ids = request_ids
+            if spec_metadata.spec_dec_mode.is_pearl_one_model():
+                spec_metadata.end_ids = self._get_request_end_ids(
+                    scheduled_requests, request_ids)
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
@@ -3246,6 +3249,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
             spec_metadata.request_ids = request_ids
+            if spec_metadata.spec_dec_mode.is_pearl_one_model():
+                spec_metadata.end_ids = self._get_request_end_ids(
+                    scheduled_requests, request_ids)
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
@@ -3965,6 +3971,22 @@ class PyTorchModelEngine(ModelEngine):
             outputs['logits'] = logits[gather_ids]
 
         return outputs
+
+    @staticmethod
+    def _get_request_end_ids(scheduled_requests: ScheduledRequests,
+                             request_ids: List[int]) -> List[int]:
+
+        def _request_end_id(request) -> int:
+            end_id = getattr(request, "py_end_id", None)
+            return int(end_id) if end_id is not None else -1
+
+        request_by_id = {
+            int(request.py_request_id): _request_end_id(request)
+            for request in scheduled_requests.all_requests()
+        }
+        return [
+            request_by_id.get(int(request_id), -1) for request_id in request_ids
+        ]
 
     @nvtx_range("_forward_step_mm_encoder_only")
     def _forward_step_mm_encoder_only(

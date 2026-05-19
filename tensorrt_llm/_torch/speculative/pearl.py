@@ -86,6 +86,9 @@ class PEARLSpecMetadata(DraftTargetOneModelSpecMetadata):
     # The gamma actually used this iteration (may differ from max_draft_len
     # under adaptive scheduling).
     runtime_gamma: int = 0
+    # End token id for each request in the batch.  PEARL uses this before
+    # sending accepted state to the external draft server.
+    end_ids: Optional[List[int]] = None
 
     def __post_init__(self):
         super().__post_init__()
