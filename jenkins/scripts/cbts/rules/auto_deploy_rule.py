@@ -62,7 +62,10 @@ def _is_ad_claim(path: str) -> bool:
 
     `*.md` files are excluded so docs-only PRs (e.g.
     `examples/auto_deploy/README.md`) don't force AD stages —
-    `OutOfScopeRule` claims them as noop instead.
+    `OutOfScopeRule` claims them as noop instead. Other suffixes
+    (`.png` / `.jpg` / etc.) are NOT excluded here: a binary asset
+    under an AD path could be a test fixture, so the rule keeps
+    claiming them and forces AD stages to re-run (safe over-run).
     """
     if not path.startswith(_AD_SRC_PREFIXES):
         return False

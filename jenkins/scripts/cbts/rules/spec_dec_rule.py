@@ -112,7 +112,10 @@ def _is_spec_claim(path: str) -> bool:
 
     `*.md` files are excluded so docs-only PRs (e.g.
     `examples/eagle/README.md`) don't force spec-dec stages —
-    `OutOfScopeRule` claims them as noop instead.
+    `OutOfScopeRule` claims them as noop instead. Other suffixes
+    (`.png` / `.jpg` / etc.) are NOT excluded here: a binary asset
+    under a spec-dec path could be a test fixture, so the rule keeps
+    claiming them and forces spec-dec stages to re-run (safe over-run).
     """
     if not path.startswith(_SPEC_SRC_PREFIXES):
         return False

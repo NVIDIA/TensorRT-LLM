@@ -27,10 +27,10 @@ Seven rules, registered in `main.py::RULE_CLASSES`:
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`) |
-| `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; outward-facing files force fallback) |
-| `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. `.md`) |
-| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
+| `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
+| `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
+| `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
+| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
 
 See `rules/README.md` for per-rule logic.
 
@@ -38,9 +38,14 @@ See `rules/README.md` for per-rule logic.
 
 | Scope | Meaning |
 |---|---|
-| `waiveonly` / `testdefonly` / `testlistonly` | Single rule from the testsonly family fired with a narrow. |
-| `testsonly` | Multiple rules from the family fired; their narrows union. |
-| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry). Layer 2 still applies. |
+| `waiveonly` | `WaivesRule` fired solo: PR only edits `waives.txt`. |
+| `testdefonly` | `TestsDefRule` fired solo: PR only edits files under `tests/**/*`. |
+| `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
+| `autodeployonly` | `AutoDeployRule` fired solo: PR only touches AutoDeploy source paths (`examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**`; excl. `.md`). Narrows to AD-only blocks (`backend: autodeploy` plus blocks containing `test_llm_api_autodeploy.py` / `_autodeploy-` entries). |
+| `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**`; excl. `.md`; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files (eagerly imported by `trtllm-serve`) force `null` fallback. |
+| `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. `.md`). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
+| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `autodeployonly`, `visualgenonly`, `specdeconly`); their narrows union. |
+| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry, docs-only edits). Layer 2 still applies. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 
 `_combine_scopes` (main.py): rules with `scope="noop"` give way to any

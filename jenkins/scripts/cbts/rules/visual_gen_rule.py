@@ -84,7 +84,11 @@ def _is_vg_claim(path: str) -> bool:
 
     `*.md` files are excluded so docs-only PRs (e.g.
     `examples/visual_gen/README.md`) don't force VG stages —
-    `OutOfScopeRule` claims them as noop instead.
+    `OutOfScopeRule` claims them as noop instead. Image suffixes are
+    intentionally NOT excluded: VG ships reference images that are
+    loaded as test fixtures (e.g. `examples/visual_gen/cat_piano.png`
+    referenced by `tests/unittest/_torch/visual_gen/`), so edits to
+    them must still force VG stages.
     """
     if not path.startswith(_VG_SRC_PREFIXES):
         return False

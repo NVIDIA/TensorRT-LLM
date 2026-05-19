@@ -11,10 +11,10 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**` (non-`.md`), `tensorrt_llm/_torch/auto_deploy/**` (non-`.md`) |
-| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**` (non-`.md`), `tensorrt_llm/_torch/visual_gen/**` (non-`.md`), `tensorrt_llm/visual_gen/**` (non-`.md`) |
-| `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**` (non-`.md`), `tensorrt_llm/models/{eagle,medusa,redrafter}/**` (non-`.md`), `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**` (non-`.md`), `examples/llm-api/llm_speculative_decoding.py` |
-| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
+| `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (each excl. `.md`) |
+| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
+| `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
+| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
 
 ## WaivesRule
 
@@ -110,7 +110,10 @@ Outcomes:
 
 Path-only rule. Claims source files under `examples/auto_deploy/` and
 `tensorrt_llm/_torch/auto_deploy/` (excluding `.md`, which
-`OutOfScopeRule` claims as noop).
+`OutOfScopeRule` claims as noop). Other suffixes — including images —
+are NOT excluded: a binary asset under an AD path could be a test
+fixture, so the rule keeps claiming them and forces AD stages to
+re-run.
 
 Block selection — entry-based, two cases:
 - **Primary**: blocks where `condition.terms.backend == 'autodeploy'`.
@@ -149,7 +152,12 @@ discipline statically.
 
 Path-only rule. Claims source files under `examples/visual_gen/`,
 `tensorrt_llm/_torch/visual_gen/`, and `tensorrt_llm/visual_gen/`
-(excluding `.md`, which `OutOfScopeRule` claims as noop).
+(excluding `.md`, which `OutOfScopeRule` claims as noop). Image
+suffixes are intentionally NOT excluded: VG ships reference images
+used as test fixtures (e.g. `examples/visual_gen/cat_piano.png` and
+`examples/visual_gen/serve/media/woman_skyline_original_720p.jpeg` are
+loaded by `tests/unittest/_torch/visual_gen/`), so edits to them must
+still force VG stages.
 
 Block selection — entry-pattern based only:
 VisualGen has no `condition.terms.backend` of its own; VG entries
@@ -191,7 +199,10 @@ Path-only rule. Claims source files under `tensorrt_llm/_torch/speculative/`,
 `tensorrt_llm/models/{eagle,medusa,redrafter}/`,
 `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/`, and the
 single file `examples/llm-api/llm_speculative_decoding.py` (excluding
-`.md`, which `OutOfScopeRule` claims as noop).
+`.md`, which `OutOfScopeRule` claims as noop). Other suffixes —
+including images — are NOT excluded: a binary asset under a spec-dec
+path could be a test fixture, so the rule keeps claiming them and
+forces spec-dec stages to re-run.
 
 Block selection — entry-pattern based only:
 Spec-dec has no `condition.terms.backend` of its own; entries live in
@@ -245,8 +256,14 @@ in any subtree neither pre-merge nor post-merge L0 consumes:
 - `tests/integration/defs/.test_durations` — pytest-split timing cache.
 - `tests/microbenchmarks/` — benchmarking scripts, no L0 stage.
 - Any `*.md` file (docs anywhere in the repo cannot affect L0 tests).
-- Image extensions (`.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`)
-  anywhere in the repo.
+
+Image extensions (`.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`) are
+intentionally NOT claimed: image files anywhere in the repo can be test
+fixtures (e.g. `examples/visual_gen/cat_piano.png` is loaded by
+`tests/unittest/_torch/visual_gen/`), and location alone cannot
+distinguish a fixture from a doc diagram. Image edits therefore fall
+back to baseline unless a more specific rule (AD / VG / spec-dec)
+claims them inside its source subtree.
 
 Excludes `*.txt` (`requirements.txt` / `constraints.txt` are
 runtime-relevant). `OUT_OF_SCOPE_PREFIXES` and `OUT_OF_SCOPE_SUFFIXES`
