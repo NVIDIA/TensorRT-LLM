@@ -365,6 +365,7 @@ class FP4MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         remove_online_sf_transpose: bool = False,
+        use_batched_store: bool = True,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -411,6 +412,9 @@ class FP4MQALogitsKernel:
             )
             remove_online_sf_transpose = False
         self.remove_online_sf_transpose = remove_online_sf_transpose
+        # When True, defer per-t STG to register array and emit all STGs in
+        # one contiguous LSU phase after the for-t loop (epilogue micro-opt).
+        self.use_batched_store = use_batched_store
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -1837,6 +1841,13 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                # Batched STG: hold reduced result per t in register; the
+                # actual STG happens once after the for-t loop to land all
+                # STGs in one contiguous LSU phase.
+                if cutlass.const_expr(self.use_batched_store):
+                    result_arr = cute.make_fragment(next_n, self.output_dtype)
+                else:
+                    result_arr = None
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
@@ -2043,9 +2054,18 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
-                        mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+                        if cutlass.const_expr(self.use_batched_store):
+                            result_arr[t] = self.output_dtype(result_t)
+                        else:
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+
+                    if cutlass.const_expr(self.use_batched_store):
+                        # Batched STG: all result_arr[t] → mLogits in one pass.
+                        for t in cutlass.range_constexpr(next_n):
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -2084,6 +2104,13 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                # Batched STG: hold reduced result per t in register; the
+                # actual STG happens once after the for-t loop to land all
+                # STGs in one contiguous LSU phase.
+                if cutlass.const_expr(self.use_batched_store):
+                    result_arr = cute.make_fragment(next_n, self.output_dtype)
+                else:
+                    result_arr = None
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
@@ -2280,9 +2307,18 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
-                        mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+                        if cutlass.const_expr(self.use_batched_store):
+                            result_arr[t] = self.output_dtype(result_t)
+                        else:
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+
+                    if cutlass.const_expr(self.use_batched_store):
+                        # Batched STG: all result_arr[t] → mLogits in one pass.
+                        for t in cutlass.range_constexpr(next_n):
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
