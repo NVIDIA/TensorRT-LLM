@@ -8,11 +8,6 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 import os
 import threading
 import uuid
-
-# Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
-# (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
-# falls back to cuda_ipc / cuda_copy without affecting correctness).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
