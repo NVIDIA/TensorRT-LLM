@@ -80,6 +80,10 @@ def _build_argv(args: argparse.Namespace, worker_path: str, run_id: str) -> list
         str(args.iter_sleep_sec),
         "--run-id",
         run_id,
+        "--watchdog-timeout-sec",
+        str(args.watchdog_timeout_sec),
+        "--watchdog-poll-interval-sec",
+        str(args.watchdog_poll_interval_sec),
     ]
 
 
@@ -128,6 +132,18 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--iter-sleep-sec", type=float, default=0.05)
     parser.add_argument(
+        "--watchdog-timeout-sec",
+        type=float,
+        default=5.0,
+        help="Forwarded to the worker; varies the dominant component of recovery latency",
+    )
+    parser.add_argument(
+        "--watchdog-poll-interval-sec",
+        type=float,
+        default=0.1,
+        help="Forwarded to the worker",
+    )
+    parser.add_argument(
         "--budget-sec",
         type=float,
         default=10.0,
@@ -171,8 +187,15 @@ def main() -> int:
     pid_by_rank: dict[int, int] = {}
     loop_start_by_rank: dict[int, float] = {}
     victim_iter: int = 0
-    watchdog_fired_at: Optional[tuple[int, float]] = None  # (discoverer, monotonic_sec)
-    propagated_to: set[int] = set()
+    watchdog_fired_at: Optional[tuple[int, float]] = None  # (first_discoverer, monotonic_sec)
+    # Every rank that has surfaced the failure (either via its own watchdog
+    # firing or by receiving a broadcast). F3 finding: detection is parallel,
+    # not serial — multiple survivors typically discover independently within
+    # ~ms via their zero-collective completion-flag view, so the broadcast's
+    # recv-side mark_failed is often a redundant no-op. The "propagation"
+    # measurement therefore must include all watchdog-fire ranks, not just
+    # the first discoverer.
+    surfaced_by_rank: set[int] = set()
     reconfigure_done_at: dict[int, float] = {}
     first_post_reconfigure_iter_at: dict[int, float] = {}
     kill_at_monotonic: Optional[float] = None
@@ -218,10 +241,11 @@ def main() -> int:
                 elif victim_iter >= args.kill_after_iter * 20:
                     _maybe_kill_victim()
             elif etype == "watchdog_marked_failed":
+                surfaced_by_rank.add(rank)
                 if watchdog_fired_at is None:
                     watchdog_fired_at = (rank, float(wt))
             elif etype == "broadcast_received":
-                propagated_to.add(rank)
+                surfaced_by_rank.add(rank)
             elif etype == "reconfigure_done":
                 reconfigure_done_at.setdefault(rank, float(wt))
                 first_post_reconfigure_iter_at.setdefault(
@@ -247,8 +271,7 @@ def main() -> int:
     def _rel(t: Optional[float]) -> Optional[float]:
         return None if t is None else round(t - origin, 4)
 
-    full_propagated = propagated_to.union({watchdog_fired_at[0]} if watchdog_fired_at else set())
-    all_propagated = full_propagated.issuperset(set(survivors))
+    all_propagated = surfaced_by_rank.issuperset(set(survivors))
     propagated_at = (
         max(
             (

@@ -1,0 +1,884 @@
+{
+  "config": {
+    "np": 4,
+    "victim_rank": 2,
+    "kill_after_iter": 3,
+    "kill_at_iteration": 40,
+    "iterations": 400,
+    "iter_sleep_sec": 0.05,
+    "watchdog_timeout_sec": 2.0,
+    "watchdog_poll_interval_sec": 0.05,
+    "budget_sec": 10.0,
+    "output": "prototypes/wide_ep_ft_mvp/results/np4-timeout2s.json"
+  },
+  "run_id": "pid1740413-1779227435",
+  "events": {
+    "t_kill": 2.0557,
+    "t_watchdog_fires": 4.0626,
+    "t_mark_failed_propagated": 4.0627,
+    "t_iteration_boundary": 4.1103,
+    "t_reconfigure_done": 4.1117,
+    "t_first_new_request_completed": 4.1603
+  },
+  "raw_events": [
+    {
+      "rank": 1,
+      "event": "worker_start",
+      "wall_time_sec": 89457.002553521,
+      "pid": 1740419,
+      "ep_size": 4,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "worker_start",
+      "wall_time_sec": 89457.002600584,
+      "pid": 1740418,
+      "ep_size": 4,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "worker_start",
+      "wall_time_sec": 89457.002754674,
+      "pid": 1740421,
+      "ep_size": 4,
+      "_rank": 3
+    },
+    {
+      "rank": 2,
+      "event": "worker_start",
+      "wall_time_sec": 89457.005659186,
+      "pid": 1740420,
+      "ep_size": 4,
+      "_rank": 2
+    },
+    {
+      "rank": 1,
+      "event": "loop_start",
+      "wall_time_sec": 89457.007307119,
+      "_rank": 1
+    },
+    {
+      "rank": 2,
+      "event": "loop_start",
+      "wall_time_sec": 89457.007307481,
+      "_rank": 2
+    },
+    {
+      "rank": 3,
+      "event": "loop_start",
+      "wall_time_sec": 89457.007309219,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "loop_start",
+      "wall_time_sec": 89457.007318584,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89457.057477457,
+      "iteration": 0,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89457.057477796,
+      "iteration": 0,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89457.057474989,
+      "iteration": 0,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 1
+    },
+    {
+      "rank": 2,
+      "event": "heartbeat",
+      "wall_time_sec": 89457.057480047,
+      "iteration": 0,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 2
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89458.059759405,
+      "iteration": 20,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 3
+    },
+    {
+      "rank": 2,
+      "event": "heartbeat",
+      "wall_time_sec": 89458.059760962,
+      "iteration": 20,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 2
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89458.060253708,
+      "iteration": 20,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89458.060564624,
+      "iteration": 20,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89459.062474554,
+      "iteration": 40,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 3
+    },
+    {
+      "rank": 2,
+      "event": "heartbeat",
+      "wall_time_sec": 89459.062791444,
+      "iteration": 40,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 2
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89459.063020539,
+      "iteration": 40,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89459.063622293,
+      "iteration": 40,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89460.064900973,
+      "iteration": 60,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89460.065364177,
+      "iteration": 60,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89460.066271083,
+      "iteration": 60,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89461.067375003,
+      "iteration": 80,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89461.068319581,
+      "iteration": 80,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89461.068684569,
+      "iteration": 80,
+      "active_count": 4,
+      "failed_ranks": [],
+      "eplb_reconfigure_count": 0,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "watchdog_marked_failed",
+      "wall_time_sec": 89461.069913111,
+      "peer": 2,
+      "mark_time_sec": 89461.06987529,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "watchdog_marked_failed",
+      "wall_time_sec": 89461.069915068,
+      "peer": 2,
+      "mark_time_sec": 89461.069873633,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "watchdog_marked_failed",
+      "wall_time_sec": 89461.069978731,
+      "peer": 2,
+      "mark_time_sec": 89461.069938718,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "reconfigure_done",
+      "wall_time_sec": 89461.117589105,
+      "iteration": 82,
+      "cached_generation": 1,
+      "observed_generation": 1,
+      "duration_sec": 1.2725009582936764e-05,
+      "layers_touched": 2,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "reconfigure_done",
+      "wall_time_sec": 89461.118503191,
+      "iteration": 82,
+      "cached_generation": 1,
+      "observed_generation": 1,
+      "duration_sec": 1.314899418503046e-05,
+      "layers_touched": 2,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "reconfigure_done",
+      "wall_time_sec": 89461.118978447,
+      "iteration": 82,
+      "cached_generation": 1,
+      "observed_generation": 1,
+      "duration_sec": 1.2860007700510323e-05,
+      "layers_touched": 2,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89462.070318974,
+      "iteration": 100,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89462.070710633,
+      "iteration": 100,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89462.071546374,
+      "iteration": 100,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89463.07283098,
+      "iteration": 120,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89463.073344599,
+      "iteration": 120,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89463.073979356,
+      "iteration": 120,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89464.075369896,
+      "iteration": 140,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89464.075997108,
+      "iteration": 140,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89464.076750552,
+      "iteration": 140,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89465.077996704,
+      "iteration": 160,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89465.078593115,
+      "iteration": 160,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89465.079405759,
+      "iteration": 160,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89466.080550718,
+      "iteration": 180,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89466.081340452,
+      "iteration": 180,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89466.081907188,
+      "iteration": 180,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89467.083224864,
+      "iteration": 200,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89467.084027693,
+      "iteration": 200,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89467.08447212,
+      "iteration": 200,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89468.086199382,
+      "iteration": 220,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89468.08669253,
+      "iteration": 220,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89468.087058361,
+      "iteration": 220,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89469.088807487,
+      "iteration": 240,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89469.089545583,
+      "iteration": 240,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89469.08955238,
+      "iteration": 240,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89470.091600195,
+      "iteration": 260,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89470.092188292,
+      "iteration": 260,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89470.092191346,
+      "iteration": 260,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89471.0943443,
+      "iteration": 280,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89471.09493722,
+      "iteration": 280,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89471.094940654,
+      "iteration": 280,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89472.097043154,
+      "iteration": 300,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89472.097802525,
+      "iteration": 300,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89472.097873619,
+      "iteration": 300,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89473.099487844,
+      "iteration": 320,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89473.100225522,
+      "iteration": 320,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89473.100413535,
+      "iteration": 320,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89474.102075124,
+      "iteration": 340,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89474.102548645,
+      "iteration": 340,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89474.102961674,
+      "iteration": 340,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89475.104799351,
+      "iteration": 360,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89475.105582542,
+      "iteration": 360,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89475.105907947,
+      "iteration": 360,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 3,
+      "event": "heartbeat",
+      "wall_time_sec": 89476.107994373,
+      "iteration": 380,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 3
+    },
+    {
+      "rank": 1,
+      "event": "heartbeat",
+      "wall_time_sec": 89476.108208724,
+      "iteration": 380,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 1
+    },
+    {
+      "rank": 0,
+      "event": "heartbeat",
+      "wall_time_sec": 89476.10852999,
+      "iteration": 380,
+      "active_count": 3,
+      "failed_ranks": [
+        2
+      ],
+      "eplb_reconfigure_count": 1,
+      "_rank": 0
+    },
+    {
+      "rank": 1,
+      "event": "loop_end",
+      "wall_time_sec": 89477.060991572,
+      "final_active_count": 3,
+      "_rank": 1
+    },
+    {
+      "rank": 3,
+      "event": "loop_end",
+      "wall_time_sec": 89477.061560682,
+      "final_active_count": 3,
+      "_rank": 3
+    },
+    {
+      "rank": 0,
+      "event": "loop_end",
+      "wall_time_sec": 89477.061647655,
+      "final_active_count": 3,
+      "_rank": 0
+    }
+  ],
+  "exit_codes": {
+    "mpirun": 0
+  },
+  "victim_rank": 2,
+  "victim_iteration_at_kill": 40
+}

@@ -149,6 +149,18 @@ def main() -> int:
         required=True,
         help="Unique per-run identifier for the shared-memory completion-flag dir",
     )
+    parser.add_argument(
+        "--watchdog-timeout-sec",
+        type=float,
+        default=5.0,
+        help="Watchdog presumes a peer dead if its completion-flag has not advanced for this long",
+    )
+    parser.add_argument(
+        "--watchdog-poll-interval-sec",
+        type=float,
+        default=0.1,
+        help="How often the watchdog snapshots the completion-flag table",
+    )
     args = parser.parse_args()
 
     configure_nccl_async_error_handling()
@@ -208,7 +220,10 @@ def main() -> int:
         local_rank=local_rank,
         health=health,
         completion_flag_view=flags.snapshot,
-        config=WatchdogConfig(poll_interval_sec=0.1, timeout_sec=5.0),
+        config=WatchdogConfig(
+            poll_interval_sec=args.watchdog_poll_interval_sec,
+            timeout_sec=args.watchdog_timeout_sec,
+        ),
         on_peer_death=_on_peer_death,
     )
     broadcast = MpiFtSubcommStub(
