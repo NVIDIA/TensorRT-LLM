@@ -81,7 +81,7 @@ from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
-from ..speculative import SpecMetadata
+from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (
     AuxStreamType,
     EventType,
@@ -149,9 +149,22 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
 
 
 def _deepseek_v4_pos_embd_params(
-    config: PretrainedConfig, model_config: ModelConfig, layer_idx: Optional[int]
+    config: PretrainedConfig,
+    model_config: ModelConfig,
+    predicted_tokens_per_seq: int,
+    layer_idx: Optional[int],
 ) -> PositionalEmbeddingParams:
-    rope_params = RopeParams.from_config(config)
+    # Match the spec/overlap headroom that py_executor_creator applies
+    # to model_engine_max_seq_len before sizing the KV cache. The overlap
+    # branch is included unconditionally because disable_overlap_scheduler
+    # isn't reachable here; the overshoot when overlap is actually off is
+    # at most predicted_tokens_per_seq positions (= 1 + max_total_draft_tokens,
+    # which can exceed max_draft_len for tree-shaped drafts).
+    runtime_max_seq_len = model_config.max_seq_len
+    if runtime_max_seq_len is not None and model_config.spec_config is not None:
+        runtime_max_seq_len += 2 * max(0, predicted_tokens_per_seq - 1)
+        runtime_max_seq_len += get_num_extra_kv_tokens(model_config.spec_config)
+    rope_params = RopeParams.from_config(config, runtime_max_seq_len=runtime_max_seq_len)
 
     compress_ratios = None
     if model_config.sparse_attention_config is not None:
@@ -1292,7 +1305,9 @@ class DeepseekV4Attention(MLA):
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=_deepseek_v4_pos_embd_params(config, model_config, layer_idx),
+            pos_embd_params=_deepseek_v4_pos_embd_params(
+                config, model_config, predicted_tokens_per_seq, layer_idx
+            ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
