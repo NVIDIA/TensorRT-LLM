@@ -280,11 +280,12 @@ def test_gemma3n_decoder_layer_equivalence():
     hf_out = hf_layer(
         hidden_states,
         position_embeddings_global,
-        position_embeddings_local,
         per_layer_input,
         attention_mask=None,
         position_ids=position_ids,
-    )[0]
+    )
+    if isinstance(hf_out, tuple):
+        hf_out = hf_out[0]
     assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Decoder layer: ")
 
 
