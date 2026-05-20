@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import zipfile
 
 import pytest
 import torch
@@ -45,6 +46,9 @@ VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
 )
 VISUAL_GEN_LPIPS_GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden", "visual_gen_lpips")
+VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP = os.path.join(
+    VISUAL_GEN_LPIPS_GOLDEN_DIR, "visual_gen_lpips_golden_media.zip"
+)
 
 FLUX_LPIPS_PROMPT = "a tiny astronaut hatching from an egg on the moon"
 FLUX_LPIPS_HEIGHT = 256
@@ -322,6 +326,26 @@ def _skip_if_missing(path, label, is_dir=False):
         pytest.skip(f"{label} not found: {path}")
 
 
+def _extract_visual_gen_lpips_golden_media(tmp_path):
+    _skip_if_missing(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP, "VisualGen LPIPS golden media zip")
+    extract_dir = tmp_path / "visual_gen_lpips_golden_media"
+    if extract_dir.exists():
+        return extract_dir
+
+    with zipfile.ZipFile(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP) as archive:
+        for member in archive.namelist():
+            if os.path.isabs(member) or ".." in member.split("/"):
+                raise ValueError(f"Unsafe golden media zip member: {member}")
+        archive.extractall(extract_dir)
+    return extract_dir
+
+
+def _golden_media_path(tmp_path, media_name, label):
+    path = _extract_visual_gen_lpips_golden_media(tmp_path) / media_name
+    _skip_if_missing(path, label)
+    return path
+
+
 def _ltx2_lpips_text_encoder_path():
     scratch_space = conftest.llm_models_root()
     candidates = [
@@ -341,12 +365,52 @@ def _cleanup_cuda():
 
 
 def _save_lpips_video_mp4(video, output_path, frame_rate):
-    eval_dir = os.path.join(REPO_ROOT, "scripts", "visualgen_eval")
-    if eval_dir not in sys.path:
-        sys.path.insert(0, eval_dir)
-    from lpips_video_utils import save_video_mp4_for_lpips_comparison
+    from tensorrt_llm.media.encoding import save_video
 
-    save_video_mp4_for_lpips_comparison(video, output_path, frame_rate=frame_rate)
+    try:
+        save_video(video, output_path, frame_rate=frame_rate)
+        return
+    except RuntimeError as err:
+        if "MP4 format requires ffmpeg" not in str(err):
+            raise
+
+    import cv2
+
+    if video.dim() == 5:
+        video = video[0]
+    output_path = str(output_path)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    video_np = video.detach().cpu().numpy()
+    num_frames, height, width, channels = video_np.shape
+    assert channels == 3, f"Expected RGB video with 3 channels, got {channels}"
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(frame_rate),
+        (width, height),
+    )
+    assert writer.isOpened(), f"Failed to open MP4 writer for {output_path}"
+    try:
+        for frame in video_np:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
+
+
+def _disable_wan_fused_qk_norm_rope_if_unavailable(pipeline):
+    try:
+        getattr(torch.ops.trtllm, "fused_dit_cross_head_qk_norm_rope")
+        return
+    except AttributeError:
+        pass
+
+    for module in pipeline.modules():
+        if hasattr(module, "fuse_qk_norm_rope"):
+            module.fuse_qk_norm_rope = False
 
 
 def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, generated_path):
@@ -507,6 +571,7 @@ def _generate_wan_lpips_video(
         torch_compile=TorchCompileConfig(enable_torch_compile=False),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
+    _disable_wan_fused_qk_norm_rope_if_unavailable(pipeline)
     try:
         with torch.no_grad():
             result = pipeline.forward(
@@ -530,8 +595,9 @@ def _generate_wan_lpips_video(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_flux1_lpips_against_golden(tmp_path):
     generated_path = tmp_path / "flux1_generated.png"
-    golden_path = os.path.join(VISUAL_GEN_LPIPS_GOLDEN_DIR, "flux1_lpips_golden.png")
-    _skip_if_missing(golden_path, "FLUX.1 LPIPS golden image")
+    golden_path = _golden_media_path(
+        tmp_path, "flux1_lpips_golden.png", "FLUX.1 LPIPS golden image"
+    )
     _generate_flux_lpips_image(_lpips_model_path("FLUX.1-dev"), generated_path)
     score = _run_lpips_eval(
         tmp_path,
@@ -547,8 +613,9 @@ def test_flux1_lpips_against_golden(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_flux2_lpips_against_golden(tmp_path):
     generated_path = tmp_path / "flux2_generated.png"
-    golden_path = os.path.join(VISUAL_GEN_LPIPS_GOLDEN_DIR, "flux2_lpips_golden.png")
-    _skip_if_missing(golden_path, "FLUX.2 LPIPS golden image")
+    golden_path = _golden_media_path(
+        tmp_path, "flux2_lpips_golden.png", "FLUX.2 LPIPS golden image"
+    )
     _generate_flux_lpips_image(_lpips_model_path("FLUX.2-dev"), generated_path)
     score = _run_lpips_eval(
         tmp_path,
@@ -564,8 +631,9 @@ def test_flux2_lpips_against_golden(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_ltx2_lpips_against_golden(tmp_path):
     generated_path = tmp_path / "ltx2_generated.mp4"
-    golden_path = os.path.join(VISUAL_GEN_LPIPS_GOLDEN_DIR, "ltx2_lpips_golden_video.mp4")
-    _skip_if_missing(golden_path, "LTX-2 LPIPS golden video")
+    golden_path = _golden_media_path(
+        tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
+    )
     _generate_ltx2_lpips_video(generated_path)
     score = _run_lpips_eval(
         tmp_path,
@@ -581,8 +649,9 @@ def test_ltx2_lpips_against_golden(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_wan21_t2v_lpips_against_golden(tmp_path):
     generated_path = tmp_path / "wan21_t2v_generated.mp4"
-    golden_path = os.path.join(VISUAL_GEN_LPIPS_GOLDEN_DIR, "wan21_t2v_lpips_golden_video.mp4")
-    _skip_if_missing(golden_path, "Wan 2.1 LPIPS golden video")
+    golden_path = _golden_media_path(
+        tmp_path, "wan21_t2v_lpips_golden_video.mp4", "Wan 2.1 LPIPS golden video"
+    )
     _generate_wan_lpips_video(
         _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
         generated_path,
@@ -610,8 +679,9 @@ def test_wan21_t2v_lpips_against_golden(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_wan22_t2v_lpips_against_golden(tmp_path):
     generated_path = tmp_path / "wan22_t2v_generated.mp4"
-    golden_path = os.path.join(VISUAL_GEN_LPIPS_GOLDEN_DIR, "wan22_t2v_lpips_golden_video.mp4")
-    _skip_if_missing(golden_path, "Wan 2.2 LPIPS golden video")
+    golden_path = _golden_media_path(
+        tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
+    )
     _generate_wan_lpips_video(
         _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
         generated_path,
