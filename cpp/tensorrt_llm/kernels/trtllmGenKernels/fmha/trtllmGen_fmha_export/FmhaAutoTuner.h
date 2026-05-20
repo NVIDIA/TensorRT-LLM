@@ -54,6 +54,12 @@ public:
   // Select the GQA generation kernel.
   void selectGqaGenerationKernel();
 
+  // Select the kernel for tree-based custom speculative decoding (Eagle3 dynamic tree, MTP tree).
+  // Triggered by isCustomSpecDecodingGen with specDecodingTargetMaxGenLen > 0.
+  // Uses numTokensHeadsQ = numHeadsQPerKv * specDecodingTargetMaxGenLen as a config-time
+  // deterministic heuristic to choose tileSizeQ + kernelType.
+  void selectSpecDecTreeKernel();
+
   // Select the kernel and update the options.
   std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernel();
 
