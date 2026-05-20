@@ -14,12 +14,12 @@
 # limitations under the License.
 
 import hashlib
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, chunked, div_up, filled_list, unwrap_rawref
+from ._utils import TypedIndexList, chunked, div_up, filled_list, find_index, unwrap_rawref
 
 if TYPE_CHECKING:
     from ._page import CommittedPage
@@ -48,6 +48,13 @@ class ReuseScope(NamedTuple):
                     "Did you forget to update to_bytes() when adding new non-int fields to ReuseScope?"
                 )
         return ret
+
+
+class ReuseMatch(NamedTuple):
+    """Volatile result of a KV cache prefix match."""
+
+    blocks: list["Block"]
+    num_tokens: int
 
 
 # id_offset is usually vocab_size
@@ -424,9 +431,22 @@ class BlockRadixTree:
         assert not self.next
         return ret
 
+    def _num_matched_tokens(self, matched: list[tuple[Block, int]]) -> int:
+        if not matched:
+            return 0
+        return self._tokens_per_block * (len(matched) - 1) + matched[-1][1]
+
+    @staticmethod
+    def _has_pages(block: Block, lc_list: Iterable[LifeCycleId]) -> bool:
+        return all(block.storage[lc] is not None for lc in lc_list)
+
+    @staticmethod
+    def _has_page(block: Block, lc: LifeCycleId) -> bool:
+        return block.storage[lc] is not None
+
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to
     # tokens_per_block except the last one.
-    def match(
+    def _match_token_path(
         self,
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
@@ -452,6 +472,96 @@ class BlockRadixTree:
             if partial_block is not None:
                 block = partial_block
                 yield block, match_len
+
+    def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
+        tokens_per_block = self._tokens_per_block
+        assert all(b[1] == tokens_per_block for b in matched[:-1])
+
+        life_cycles = self._life_cycles
+
+        # check for full attention layers
+        attn_life_cycles = list(life_cycles.attention_life_cycles())
+        if any(lc.window_size is None for _, lc in attn_life_cycles):
+            lc_list = [lc_idx for lc_idx, lc in attn_life_cycles if lc.window_size is None]
+
+            def check_no_pages(b: tuple[Block, int]) -> bool:
+                return not BlockRadixTree._has_pages(b[0], lc_list)
+
+            n = find_index(matched, check_no_pages)
+            matched = matched[:n]
+
+        swa_life_cycles = tuple(
+            (lc_idx, lc) for lc_idx, lc in attn_life_cycles if lc.window_size is not None
+        )
+        # check for SWA sink
+        for lc_idx, lc in swa_life_cycles:
+
+            def check_no_page_lc(b: tuple[Block, int]) -> bool:
+                return not BlockRadixTree._has_page(b[0], lc_idx)
+
+            n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
+            if n < lc.num_sink_blocks:
+                matched = matched[:n]
+        # Check SWA window and SSM snapshot constraints together,
+        # since SSM truncation can invalidate SWA invariants.
+        # SSM is checked first (intervals are large, so it prunes more).
+        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        while matched:
+            # SSM truncation: truncate to the last block with an SSM snapshot
+            if ssm_lc_id is not None:
+                ssm_trunc = 0
+                for i in reversed(range(len(matched))):
+                    if matched[i][0].storage[ssm_lc_id] is not None:
+                        assert NDEBUG or matched[i][1] == self._tokens_per_block, (
+                            "SSM reuse snapshot must only be selected from a fully matched block"
+                        )
+                        ssm_trunc = i + 1
+                        break
+                matched = matched[:ssm_trunc]
+                if not matched:
+                    break
+            # SWA window check
+            num_tokens = self._num_matched_tokens(matched)
+            for lc_idx, lc in swa_life_cycles:
+                if lc.window_size is None:
+                    continue
+
+                def check_has_page_lc(b: tuple[Block, int]) -> bool:
+                    return BlockRadixTree._has_page(b[0], lc_idx)
+
+                n = find_index(reversed(matched), check_has_page_lc)
+                if n != 0:
+                    matched = matched[:-n]
+                    break
+                _, stale_end = lc.get_stale_range(num_tokens, tokens_per_block)
+
+                def has_no_page(b: tuple[Block, int]) -> bool:
+                    return not BlockRadixTree._has_page(b[0], lc_idx)
+
+                n = find_index(reversed(matched[stale_end:]), has_no_page)
+                if len(matched) - n > stale_end:
+                    matched = matched[: len(matched) - n - 1]
+                    break
+            else:
+                break
+        return matched
+
+    def match(
+        self,
+        reuse_scope: ReuseScope,
+        tokens: Sequence[TokenIdExt],
+        enable_partial_match: bool = False,
+    ) -> ReuseMatch:
+        """
+        Return the currently reusable prefix match without holding pages.
+
+        The result is volatile: callers that need to reuse the returned blocks must
+        acquire ownership of the pages before depending on them.
+        """
+        matched = self._prune_match(
+            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        )
+        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(
