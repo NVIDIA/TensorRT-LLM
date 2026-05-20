@@ -134,6 +134,10 @@ class BatchDesc:
     system_prompt_length: int = 0
 
 @dataclass(slots=True)
+class SwaScratchReuseConfig:
+    max_rewind_len: int = 0
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     vocab_size: int
@@ -144,8 +148,10 @@ class KVCacheManagerConfig:
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
     ssm_reuse_interval: int = 512
+    swa_scratch_reuse: SwaScratchReuseConfig | None = None
     helix_config: HelixConfig | None = None
-    enable_swa_scratch_reuse: bool = False
+    @property
+    def enable_swa_scratch_reuse(self) -> bool: ...
 
 # From _block_radix_tree.py
 def gen_multi_modal_tokens(
