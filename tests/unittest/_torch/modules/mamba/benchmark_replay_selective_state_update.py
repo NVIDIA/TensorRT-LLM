@@ -3240,6 +3240,7 @@ def _bench_config(
                     extra_kwargs["_flatten"] = bool(flatten)
                 if warp_specialize is not None:
                     extra_kwargs["_warp_specialize"] = bool(warp_specialize)
+                extra_kwargs["_use_replay_cache_slot"] = bool(args.use_cache_slot)
 
                 replay_selective_state_update(
                     state_work,
@@ -3340,6 +3341,8 @@ def _bench_config(
             parts.append(f"RECT={'auto' if rectangle_for_nowrite is None else (1 if rectangle_for_nowrite else 0)}")
             parts.append(f"MODE={_val(mode)}")
             parts.append(f"HSORT={1 if hardcode_sort else 0}")
+            if not args.use_cache_slot:
+                parts.append("CSLOT=0")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -3404,6 +3407,7 @@ def _bench_config(
                     bool(use_philox),
                     bool(rectangle_for_nowrite),
                     bool(hardcode_sort),
+                    bool(args.use_cache_slot),
                     scenario_pre_iter is not None,
                     expected_K,
                 )
@@ -4554,6 +4558,14 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="External PDL: conv1d launches dependents, precompute waits. "
         "Only relevant with --with-conv1d. --no-external-pdl disables.",
+    )
+    parser.add_argument(
+        "--use-cache-slot",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the cache-slot field from replay_work_items in persistent_main. "
+        "--no-use-cache-slot keeps the old identity-cache-slot shortcut for "
+        "diagnostic comparisons only.",
     )
     parser.add_argument(
         "--heads-per-block",
