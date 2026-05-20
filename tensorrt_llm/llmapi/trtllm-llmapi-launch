@@ -40,7 +40,18 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 export tllm_mpi_size=$(mpi_world_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
-export TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY=$(openssl rand -hex 32)
+unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD
+ipc_hmac_key=$(openssl rand -hex 32)
+
+function run_with_ipc_hmac_key {
+    local fd
+    exec {fd}<<<"$ipc_hmac_key"
+    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD="$fd" "$@"
+    local status=$?
+    exec {fd}<&-
+    return $status
+}
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
@@ -74,12 +85,13 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         set +e
 
         # Execute the task with cleaned environment
-        "${task_with_command[@]}"
+        run_with_ipc_hmac_key "${task_with_command[@]}"
         task_exit_code=$?
         log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
         # Stop the MPI Comm server
-        python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
+        run_with_ipc_hmac_key python3 -m tensorrt_llm.llmapi.mgmn_leader_node \
+            --action stop
         mpi_exit_code=$?
         log_stderr "Rank${mpi_rank} MPI Comm server exit code: $mpi_exit_code"
 
@@ -100,7 +112,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
     log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
     log_stderr "Rank0 host: $HOSTNAME"
-    python3 -m tensorrt_llm.llmapi.mgmn_leader_node
+    run_with_ipc_hmac_key python3 -m tensorrt_llm.llmapi.mgmn_leader_node
     mgmn_leader_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN leader node exit code: $mgmn_leader_node_exit_code"
 

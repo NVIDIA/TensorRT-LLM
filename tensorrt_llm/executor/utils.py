@@ -23,10 +23,47 @@ class LlmLauncherEnvs(StrEnum):
     # Spawn a process for the LLM-API Proxy
     TLLM_SPAWN_PROXY_PROCESS = "TLLM_SPAWN_PROXY_PROCESS"
     TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
-    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
+    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD = (
+        "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD")
 
     # Whether to use periodical responses handler in await_responses
     TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
+
+
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
+
+
+def _normalize_spawn_proxy_process_ipc_hmac_key(key: str | bytes) -> bytes:
+    if isinstance(key, bytes):
+        if len(key) == 32:
+            return key
+        key = key.decode("ascii")
+
+    key_bytes = bytes.fromhex(key)
+    if len(key_bytes) != 32:
+        raise ValueError("IPC HMAC key must be 32 bytes.")
+    return key_bytes
+
+
+def set_spawn_proxy_process_ipc_hmac_key(key: str | bytes) -> None:
+    global _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+    _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
+        _normalize_spawn_proxy_process_ipc_hmac_key(key))
+
+
+def _read_spawn_proxy_process_ipc_hmac_key_fd(fd_value: str) -> bytes:
+    fd = int(fd_value)
+    chunks: list[bytes] = []
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+    return _normalize_spawn_proxy_process_ipc_hmac_key(b"".join(chunks))
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
@@ -36,11 +73,21 @@ def get_spawn_proxy_process_ipc_addr_env() -> str | None:
 
 def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    key = os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY")
-    assert key is not None, (
-        f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
+    global _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+    if _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY is not None:
+        return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+
+    key_fd = os.environ.pop(
+        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD, None)
+    os.environ.pop("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY", None)
+    if key_fd is not None:
+        _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
+            _read_spawn_proxy_process_ipc_hmac_key_fd(key_fd))
+        return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+
+    raise AssertionError(
+        f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD} is not set. "
         "HMAC encryption is required for IPC communication.")
-    return bytes.fromhex(key)
 
 
 def get_spawn_proxy_process_env() -> bool:
