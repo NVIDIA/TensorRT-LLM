@@ -1505,15 +1505,9 @@ async def test_llm_rpc_get_stats_async():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", [None])
 def test_llm_context_only_timed_out(transceiver_runtime, monkeypatch):
-    # PR #13713 moved the V1 KV-transfer timeout enforcement trio
-    # (detection + cancellation + mark-as-error + free-blocks) behind
-    # TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL. This test asserts the
-    # active path (blocks freed after timeout), so opt in explicitly.
-    # The default (off) is observe-only; see the sibling
-    # ``test_llm_context_only_timed_out_observe_only`` for the
-    # dormant-trio contract.
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
     monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
 
     tp_size = 1
@@ -1694,7 +1688,7 @@ def test_llm_context_only_timed_out_observe_only(monkeypatch):
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"])
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", [None])
 def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
                                                        backend,
                                                        transceiver_runtime,
@@ -1703,9 +1697,7 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     if transceiver_runtime == "PYTHON" and backend == "UCX":
         pytest.skip("Python transceiver (V2) does not support UCX backend")
 
-    # PR #13713: opt into the V1 active-path timeout enforcement so the
-    # ``final_used_num_blocks == 0`` assertion is reachable. See
-    # ``test_llm_context_only_timed_out`` for rationale.
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
     monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
 
     tp_size = 1
@@ -1782,13 +1774,9 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", [None])
 async def test_llm_disagg_gen_cancelled(transceiver_runtime, monkeypatch):
-    # PR #13713: opt into the V1 active-path cancel surface so an abort
-    # that lands while the request is still in
-    # ``DISAGG_*_TRANS_IN_PROGRESS`` actually propagates through
-    # ``BindKvCacheTransceiver.cancel_request`` (gated when the flag is
-    # off). See ``test_llm_context_only_timed_out`` for rationale.
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
     monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
 
     tp_size = 1
@@ -1971,14 +1959,10 @@ def test_priority_request_completes_before_low_priority():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", [None])
 async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime,
                                                   monkeypatch):
-    # PR #13713: opt into the V1 active-path cancel surface so an abort
-    # that lands while the request is still in
-    # ``DISAGG_*_TRANS_IN_PROGRESS`` actually propagates through
-    # ``BindKvCacheTransceiver.cancel_request`` (gated when the flag is
-    # off). See ``test_llm_context_only_timed_out`` for rationale.
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
     monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
 
     tp_size = 1

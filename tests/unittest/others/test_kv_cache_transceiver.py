@@ -136,6 +136,24 @@ def _drive_template_handshake_to_completion(ctx_xcvr,
         f"a spurious lingering entry from the template handshake")
 
 
+@pytest.fixture(autouse=True)
+def _reset_disagg_inflight_cancel_flag_cache(monkeypatch):
+    """Reset the module-level ``is_disagg_inflight_cancel_enabled`` cache
+    before each test so per-test ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL``
+    settings are not poisoned by a prior test that initialized the cache.
+
+    ``BindKvCacheTransceiver.cancel_request`` reads the env var once and
+    caches it in ``_disagg_inflight_cancel_enabled_cache`` (see
+    ``tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py``). Without
+    this fixture an active-path test (flag=1) leaves the cache as ``True``
+    and a subsequent observe-only test (flag unset) reads stale ``True``;
+    or vice versa. ``monkeypatch.setattr`` auto-restores the cache at
+    test teardown so the reset is local to each test.
+    """
+    from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as _kct
+    monkeypatch.setattr(_kct, "_disagg_inflight_cancel_enabled_cache", None)
+
+
 @pytest.fixture
 def disagg_transceiver_pair(request):
     """Build a single-process disagg ctx/gen transceiver pair.
@@ -299,7 +317,10 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 @pytest.mark.parametrize("attention_type",
                          [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
                          ids=["mha", "mla"])
-def test_cancel_request_in_transmission(attention_type):
+def test_cancel_request_in_transmission(attention_type, monkeypatch):
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
+
     # Init kv_cache manager and cache transceiver
     mapping = Mapping(world_size=1, rank=0)
     dist = Distributed.get(mapping)
@@ -366,6 +387,76 @@ def test_cancel_request_in_transmission(attention_type):
     # Block the main thread due to the async operation
     time.sleep(2)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("attention_type",
+                         [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
+                         ids=["mha", "mla"])
+def test_cancel_request_in_transmission_observe_only(attention_type,
+                                                     monkeypatch):
+    """Pin down the flag-off contract for ``cancel_request``.
+
+    Mirrors ``test_cancel_request_in_transmission`` but with
+    ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL`` unset (the default after
+    the PR #13713 atomicity refactor). The
+    ``BindKvCacheTransceiver.cancel_request`` shim must short-circuit
+    to return ``False`` without invoking the C++ cancel surface, so
+    the in-flight transfer is not interrupted and the ctx request
+    does not transition to ``DISAGG_TRANS_ERROR``.
+
+    This regression-proofs the gate at the shim layer: any future
+    refactor that silently re-arms the cancel surface would surface
+    ``is_cancelled is True`` here and fail the assertion.
+    """
+    # Verify the observe-only path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL unset).
+    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
+
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    ctx_kv_cache_dtype = DataType.HALF
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, ctx_kv_cache_dtype)
+
+    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      max_tokens_in_buffer=512)
+
+    kv_cache_transceiver_ctx = create_kv_cache_transceiver(
+        mapping, dist, kv_cache_manager_ctx, attention_type,
+        cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    sampling_params = SamplingParams()
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+    kv_cache_manager_ctx.impl.refresh_blocks()
+    kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
+
+    # Mirror the active test's wait so the request is registered in
+    # ``mSenderFutures`` by the time we call cancel.
+    time.sleep(2)
+
+    # Observe-only contract:
+    is_cancelled = kv_cache_transceiver_ctx.cancel_request(ctx_request)
+    assert is_cancelled is False, (
+        "Flag-off cancel_request must return False without invoking "
+        "the C++ cancel surface. A True result here indicates the "
+        "BindKvCacheTransceiver.cancel_request gate has leaked and "
+        "the active cancel path is firing despite the opt-in being "
+        "unset.")
+    assert ctx_request.state != LlmRequestState.DISAGG_TRANS_ERROR, (
+        "Flag-off cancel_request must not transition the ctx request "
+        "to DISAGG_TRANS_ERROR; no cancellation actually occurred at "
+        "the C++ layer.")
 
 
 @pytest.mark.timeout(120)
@@ -447,7 +538,7 @@ def test_request_and_receive_async_state_ordering(disagg_transceiver_pair):
                          ids=["mha", "mla"],
                          indirect=True)
 def test_cancel_request_in_transmission_does_not_break_sender_future(
-        disagg_transceiver_pair, capfd):
+        disagg_transceiver_pair, capfd, monkeypatch):
     """Reproduce the sender-side broken-promise on cancel-after-ready.
 
     Pre-fix ``CacheSender::Impl::sendResponse`` erases the ready
@@ -455,6 +546,9 @@ def test_cancel_request_in_transmission_does_not_break_sender_future(
     promise, and the destructor surfaces ``future_error: Broken promise``
     on the sender future returned by ``respond_and_send_async()``.
     """
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
+
     (kv_cache_manager_ctx, kv_cache_manager_gen, kv_cache_transceiver_ctx,
      kv_cache_transceiver_gen) = disagg_transceiver_pair
 
@@ -691,7 +785,7 @@ def test_check_gen_transfer_status_at_least_one_does_not_block_on_unready_future
                          ids=["mha", "mla"],
                          indirect=True)
 def test_cancel_queued_gen_request_fulfills_receiver_future(
-        disagg_transceiver_pair, capfd):
+        disagg_transceiver_pair, capfd, monkeypatch):
     """Reproduce the receiver-side queued-cancel broken-promise.
 
     Mirrors the sender-side reproducer but on
@@ -707,6 +801,9 @@ def test_cancel_queued_gen_request_fulfills_receiver_future(
     queued request. Post-fix the queued promise is fulfilled with a
     structured cancellation exception before the queue entry is erased.
     """
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
+
     (kv_cache_manager_ctx, kv_cache_manager_gen, kv_cache_transceiver_ctx,
      kv_cache_transceiver_gen) = disagg_transceiver_pair
 
@@ -1055,6 +1152,8 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
 def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
     monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
 
     mapping = Mapping(world_size=1, rank=0)
     dtype = DataType.HALF
