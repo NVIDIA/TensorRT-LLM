@@ -390,7 +390,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                                    seqlens_q, cu_seqlens_q,
                                                    max_seqlen_q, attention_mask,
                                                    seqlens_kv, cu_seqlens_k,
-                                                   max_seqlen_k)
+                                                   max_seqlen_k, is_cross)
 
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -408,7 +408,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             max_seqlen_k,
             dropout_p=0.0,
             softmax_scale=softmax_scale,
-            causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            causal=attention_mask == PredefinedAttentionMask.CAUSAL
+            and not is_cross,
             alibi_slopes=None,
             deterministic=False,
             return_attn_probs=False,
@@ -416,21 +417,21 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return attn_output_unpad.reshape(attn_output_unpad.size(0), -1)
 
-    def _no_kv_cache_sdpa_fallback(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            num_heads: int,
-            num_kv_heads: int,
-            head_dim: int,
-            seqlens_q: torch.Tensor,
-            cu_seqlens_q: torch.Tensor,
-            max_seqlen_q: int,
-            attention_mask: AttentionMask,
-            seqlens_kv: Optional[torch.Tensor] = None,
-            cu_seqlens_k: Optional[torch.Tensor] = None,
-            max_seqlen_k: Optional[int] = None) -> torch.Tensor:
+    def _no_kv_cache_sdpa_fallback(self,
+                                   q: torch.Tensor,
+                                   k: torch.Tensor,
+                                   v: torch.Tensor,
+                                   num_heads: int,
+                                   num_kv_heads: int,
+                                   head_dim: int,
+                                   seqlens_q: torch.Tensor,
+                                   cu_seqlens_q: torch.Tensor,
+                                   max_seqlen_q: int,
+                                   attention_mask: AttentionMask,
+                                   seqlens_kv: Optional[torch.Tensor] = None,
+                                   cu_seqlens_k: Optional[torch.Tensor] = None,
+                                   max_seqlen_k: Optional[int] = None,
+                                   is_cross: bool = False) -> torch.Tensor:
         """PyTorch SDPA fallback for dtypes not supported by flash-attn.
 
         When ``seqlens_kv`` / ``cu_seqlens_k`` are provided, K/V are sliced
@@ -461,11 +462,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             if self.q_scaling is not None:
                 qk_scale = 1 / (math.sqrt(head_dim) * self.q_scaling)
 
-            # SDPA's is_causal flag implies square attention. For
-            # cross-attention (different Q/K lengths) we never apply a causal
-            # mask: the decoder Q attends to all encoder K/V tokens.
-            sdpa_is_causal = is_causal and (end_q - start_q) == (end_k -
-                                                                 start_k)
+            # SDPA's is_causal flag implies square attention. Cross-attention
+            # is never causal: the decoder Q attends to all encoder K/V tokens.
+            sdpa_is_causal = (is_causal and not is_cross
+                              and (end_q - start_q) == (end_k - start_k))
             out = F.scaled_dot_product_attention(q_s,
                                                  k_s,
                                                  v_s,

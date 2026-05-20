@@ -115,23 +115,16 @@ bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const&
     return false;
 }
 
-void checkEncoderInitCrossKvCacheManager(RequestList const& activeRequests, LlmRequestState noScheduleUntilState,
-    LlmRequestState noScheduleAfterState, OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager)
+void checkRequiredCrossKvCacheManager(
+    LlmRequestState noScheduleUntilState, OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager)
 {
-    if (crossKvCacheManager)
+    if (noScheduleUntilState != LlmRequestState::kENCODER_INIT)
     {
         return;
     }
 
-    auto const encoderInitRequestIt = std::find_if(activeRequests.begin(), activeRequests.end(),
-        [noScheduleUntilState, noScheduleAfterState](std::shared_ptr<LlmRequest> const& req)
-        {
-            return req->isEncoderInitState() && req->hasReachedState(noScheduleUntilState)
-                && !req->hasReachedState(noScheduleAfterState);
-        });
-
-    TLLM_CHECK_WITH_INFO(encoderInitRequestIt == activeRequests.end(),
-        "Encoder-init request %lu requires a cross_kv_cache_manager.", (*encoderInitRequestIt)->mRequestId);
+    TLLM_CHECK_WITH_INFO(
+        static_cast<bool>(crossKvCacheManager), "Encoder-decoder scheduling requires a cross_kv_cache_manager.");
 }
 
 } // namespace
@@ -212,8 +205,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 {
     RequestVector scheduledRequests;
 
-    checkEncoderInitCrossKvCacheManager(
-        activeRequests, getNoScheduleUntilState(), getNoScheduleAfterState(), crossKvCacheManager);
+    checkRequiredCrossKvCacheManager(getNoScheduleUntilState(), crossKvCacheManager);
 
     // Now check if we can add pending requests
     auto const maxPeftCachePages
@@ -425,8 +417,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
-    checkEncoderInitCrossKvCacheManager(
-        activeRequests, getNoScheduleUntilState(), getNoScheduleAfterState(), crossKvCacheManager);
+    checkRequiredCrossKvCacheManager(getNoScheduleUntilState(), crossKvCacheManager);
 
     kvCacheManager.startScheduling();
     if (crossKvCacheManager)

@@ -336,6 +336,8 @@ class PyResult:
             self.diff.context_logits_list[i] = context_logits.to("cpu")
         for i, generation_logits in enumerate(self.diff.generation_logits_list):
             self.diff.generation_logits_list[i] = generation_logits.to("cpu")
+        if self.diff.encoder_output is not None:
+            self.diff.encoder_output = self.diff.encoder_output.detach().cpu()
         return self.diff
 
     def apply_diff(self, diff: Diff):
