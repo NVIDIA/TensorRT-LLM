@@ -192,6 +192,23 @@ class CLIPVisionModel(nn.Module, MultimodalEncoderMixin):
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
 
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # LLaVA-Next-style consumers split each image into multiple sub-image
+        # patches via ``image_grid_pinpoints`` (up to ~5 sequences per image),
+        # so the per-encoder request count exceeds the LLM-side batch size.
+        # The pre-encoder_args code hardcoded ``max_num_requests=8192``;
+        # preserve that as a floor so callers that leave
+        # ``encoder_max_batch_size`` unset (and inherit the smaller LLM-side
+        # ``max_batch_size``) still get a buffer large enough for the
+        # worst-case patch split.
+        max_num_requests = max(max_num_requests, 8192)
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=None,
+        )
+
     def prepare_attn_metadata(self, batch_size):
         """
         To simplify the usage of the model, this function aims to fill the metadata for Attention
