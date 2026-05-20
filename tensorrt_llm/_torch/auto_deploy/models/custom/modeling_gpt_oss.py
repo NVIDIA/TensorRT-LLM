@@ -265,13 +265,6 @@ class GptOssExperts(nn.Module):
     Quantization (MXFP4 → Triton / TRT-LLM-Gen) is handled by the
     ``quantize_mxfp4_moe`` transform, which rewrites the FX graph and swaps
     parameters at PATTERN_MATCHER time (see :mod:`...transform.library.fused_moe_mxfp4`).
-
-    Dtype protection (generic mechanism): a transform registering MXFP4-specific
-    params (uint8 weights / ue8m0 scales / fp32 biases / fp32 SwiGLU constants)
-    should also set ``self._dtype_protected_params`` to a tuple of those names.
-    The overridden :meth:`_apply` then preserves their dtype across
-    ``model.to(dtype)`` walks (which would otherwise corrupt the kernel-required
-    dtypes). Modules without that attribute behave like a plain ``nn.Module``.
     """
 
     def __init__(self, config):
@@ -292,44 +285,6 @@ class GptOssExperts(nn.Module):
             torch.empty(self.num_experts, self.expert_dim, self.hidden_size)
         )
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
-
-    def _apply(self, fn, recurse=True):
-        """Preserve dtype on params listed in ``self._dtype_protected_params``.
-
-        The ``quantize_mxfp4_moe`` transform sets ``_dtype_protected_params``
-        to a tuple of names whose kernel-required dtype (uint8 for MXFP4
-        weights and ue8m0 scales, float32 for biases and SwiGLU constants)
-        must survive ``model.to(dtype)``. Without this protection
-        ``model.to(bf16)`` would downcast those params and produce garbage
-        MoE output.
-
-        If the attribute is absent or empty, this override is a no-op and
-        behaves identically to ``nn.Module._apply``.
-        """
-        protected_names = tuple(getattr(self, "_dtype_protected_params", ()) or ())
-        if not protected_names:
-            return super()._apply(fn, recurse=recurse)
-
-        protected = {}
-        for name in protected_names:
-            p = self._parameters.get(name)
-            if p is not None:
-                protected[name] = (p, p.dtype)
-                # Drop temporarily so super()._apply doesn't include it in its walk.
-                del self._parameters[name]
-
-        super()._apply(fn, recurse=recurse)
-
-        # Re-attach with dtype preserved. Apply ``fn`` to pick up the device /
-        # layout part of the transform, then cast back to the original dtype.
-        for name, (orig_param, orig_dtype) in protected.items():
-            new_data = fn(orig_param.data)
-            if new_data.dtype != orig_dtype:
-                new_data = new_data.to(orig_dtype)
-            orig_param.data = new_data
-            self._parameters[name] = orig_param
-
-        return self
 
     def forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
         return torch.ops.auto_deploy.torch_moe_dense_mlp(

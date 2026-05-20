@@ -662,9 +662,7 @@ class QuantizeMXFP4MOE(BaseTransform):
         5. Also register the per-expert SwiGLU constants (``swiglu_alpha_trtllm`` / beta / limit) —
            these are not in HF safetensors so they are populated with their numeric defaults at
            registration time.
-        6. Tag the experts module with ``_dtype_protected_params`` (raw uint8 weights, uint8
-           scales, bf16 biases, fp32 SwiGLU constants must all survive ``model.to(dtype)``).
-        7. Rewrite the ``torch_moe_dense_mlp`` node to
+        6. Rewrite the ``torch_moe_dense_mlp`` node to
            ``trtllm_quant_mxfp4_trtllm_gen_moe_fused`` (with ``act_dtype`` set from
            ``config.trtllm_quant_act``) with args pointing at the **raw** params for
            now. The downstream :class:`FuseMXFP4Moe` POST_LOAD_FUSION transform will run
@@ -672,12 +670,12 @@ class QuantizeMXFP4MOE(BaseTransform):
            register prepared-shape params, and re-point the op args. The op call is therefore not
            runnable between PATTERN_MATCHER and POST_LOAD_FUSION, but no forward pass happens in
            that window.
-        8. If ``tp_size > 1`` insert an ``auto_deploy.all_reduce`` node after the downstream view
+        7. If ``tp_size > 1`` insert an ``auto_deploy.all_reduce`` node after the downstream view
            (covers both MoE-TP and MoE-EP).
 
         Then once for the whole module:
 
-        9. Register a top-level ``load_state_dict`` pre-hook
+        8. Register a top-level ``load_state_dict`` pre-hook
            (:func:`make_mxfp4_sharding_load_hook`) that slices raw HF MXFP4 tensors on the expert
            axis when ``moe_ep_size > 1``. The hook does **not** run any kernel-layout prep —
            that runs on GPU in :class:`FuseMXFP4Moe` after the weights are loaded.
@@ -850,16 +848,6 @@ class QuantizeMXFP4MOE(BaseTransform):
             )
             experts_mod.register_parameter(
                 "swiglu_limit_trtllm", nn.Parameter(c, requires_grad=False)
-            )
-
-            # Dtype protection: raw uint8 weights, uint8 scales, bf16 biases,
-            # and fp32 SwiGLU constants must all survive ``model.to(dtype)``.
-            # ``FuseMXFP4Moe`` will update this attribute to the prepared
-            # names after running prep at POST_LOAD_FUSION.
-            experts_mod._dtype_protected_params = tuple(name for name, _, _ in raw_specs) + (
-                "swiglu_alpha_trtllm",
-                "swiglu_beta_trtllm",
-                "swiglu_limit_trtllm",
             )
 
             # Track layer index so the load hook iterates the right range.
@@ -1272,13 +1260,6 @@ class FuseMXFP4Moe(BaseTransform):
                 "down_proj_bias",
             ):
                 _delete_module_attr(experts_mod, raw_name)
-
-            # Update dtype protection to the prepared-name list.
-            experts_mod._dtype_protected_params = tuple(name for name, _, _ in prepared_kinds) + (
-                "swiglu_alpha_trtllm",
-                "swiglu_beta_trtllm",
-                "swiglu_limit_trtllm",
-            )
 
         # Scratch goes out of scope here → CUDA caching allocator reclaims
         # the scratch region. The persistent prepared blocks remain
