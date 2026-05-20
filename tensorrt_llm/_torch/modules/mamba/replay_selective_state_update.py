@@ -35,8 +35,7 @@ from .mamba2_metadata import (
 )
 from .softplus import softplus
 
-_REPLAY_WORK_POSITION_IN_DECODE_BATCH = tl.constexpr(
-    REPLAY_WORK_POSITION_IN_DECODE_BATCH)
+_REPLAY_WORK_POSITION_IN_DECODE_BATCH = tl.constexpr(REPLAY_WORK_POSITION_IN_DECODE_BATCH)
 _REPLAY_WORK_CACHE_SLOT = tl.constexpr(REPLAY_WORK_CACHE_SLOT)
 _REPLAY_WORK_PNAT = tl.constexpr(REPLAY_WORK_PNAT)
 _REPLAY_WORK_CACHE_BUF_IDX = tl.constexpr(REPLAY_WORK_CACHE_BUF_IDX)
@@ -125,9 +124,7 @@ def _bitrev32(x: tl.tensor) -> tl.tensor:
 
 
 @triton.jit
-def _stochastic_round_int8_packed(
-    x: tl.tensor, rand: tl.tensor, offs_n: tl.tensor
-) -> tl.tensor:
+def _stochastic_round_int8_packed(x: tl.tensor, rand: tl.tensor, offs_n: tl.tensor) -> tl.tensor:
     """Stochastic rounding for int8 using one random uint32 per 4 values."""
     low = rand & 0x0000FFFF
     high = (rand >> 16) & 0x0000FFFF
@@ -144,9 +141,7 @@ def _stochastic_round_int8_packed(
 
 
 @triton.jit
-def _stochastic_round_int16_packed(
-    x: tl.tensor, rand: tl.tensor, offs_n: tl.tensor
-) -> tl.tensor:
+def _stochastic_round_int16_packed(x: tl.tensor, rand: tl.tensor, offs_n: tl.tensor) -> tl.tensor:
     """Stochastic rounding for int16 using one random uint32 per 2 values."""
     rand_bits = tl.where((offs_n & 1) == 0, rand, _bitrev32(rand))
     rand01 = (rand_bits & 0x00FFFFFF).to(tl.float32) * (1.0 / float(1 << 24))
@@ -256,7 +251,6 @@ def _replay_precompute_impl(
     else:
         cache_batch_idx = pid_b.to(tl.int64)
 
-
     # --- Cache write semantics ---
     # cache_buf_idx names this step's "active" buffer — the one with the
     # historical inputs at [0, PNAT).  The other buffer is "staging".
@@ -298,7 +292,8 @@ def _replay_precompute_impl(
 
     # Load dt (H, T)
     dt_addrs = (
-        dt_ptr + pid_b * stride_dt_batch
+        dt_ptr
+        + pid_b * stride_dt_batch
         + heads_block[:, None] * stride_dt_head
         + offs_t[None, :] * stride_dt_T
     )
@@ -354,7 +349,8 @@ def _replay_precompute_impl(
 
     # decay_vec scratch — always at offs_t.
     decay_vec_addrs = (
-        decay_vec_ptr + pid_b * stride_dv_batch
+        decay_vec_ptr
+        + pid_b * stride_dv_batch
         + heads_block[:, None] * stride_dv_head
         + offs_t[None, :] * stride_dv_t
     )
@@ -414,15 +410,13 @@ def _replay_precompute_impl(
         0.0,
     )  # (H, T, T)
     cb_scaled_addrs = (
-        cb_scaled_ptr + pid_b * stride_cb_batch
+        cb_scaled_ptr
+        + pid_b * stride_cb_batch
         + heads_block[:, None, None] * stride_cb_head
         + offs_t[None, :, None] * stride_cb_t
         + offs_t[None, None, :] * stride_cb_j
     )  # (H, T, T)
-    cb_store_mask = (
-        (offs_t[None, :, None] < BLOCK_SIZE_T)
-        & (offs_t[None, None, :] < BLOCK_SIZE_T)
-    )
+    cb_store_mask = (offs_t[None, :, None] < BLOCK_SIZE_T) & (offs_t[None, None, :] < BLOCK_SIZE_T)
     tl.store(cb_scaled_addrs, CB_scaled_block, mask=cb_store_mask)
 
 
@@ -438,8 +432,8 @@ def _rectangle_precompute_impl(
     B_ptr,
     C_ptr,
     # Output pointers
-    cb_scaled_ptr,            # (batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_K) — rectangle
-    decay_vec_ptr,            # (batch, nheads, BLOCK_SIZE_T) — total_decay * exp(cumAdt_new[t])
+    cb_scaled_ptr,  # (batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_K) — rectangle
+    decay_vec_ptr,  # (batch, nheads, BLOCK_SIZE_T) — total_decay * exp(cumAdt_new[t])
     # Cache pointers (both buffers reachable via stride_*_dbuf).  Nowrite
     # path: read from buf_active at [0, PNAT), write new tokens at
     # [PNAT, PNAT+T) of buf_active (same buffer).
@@ -635,11 +629,13 @@ def _rectangle_precompute_impl(
     hk_mask = is_old_k[None, :]  # (1, K)
     old_dt_all = tl.load(
         old_dt_read_h[:, None] + safe_old_k[None, :] * stride_old_dt_T,
-        mask=hk_mask, other=0.0,
+        mask=hk_mask,
+        other=0.0,
     ).to(tl.float32)
     old_dA_cumsum_all = tl.load(
         old_dA_cumsum_read_h[:, None] + safe_old_k[None, :] * stride_old_dA_cumsum_T,
-        mask=hk_mask, other=0.0,
+        mask=hk_mask,
+        other=0.0,
     ).to(tl.float32)
     # Use loop-1 registers for this step's newly appended tokens.  These are
     # exactly the values stored above at [PNAT, PNAT+T); reloading them here
@@ -654,9 +650,7 @@ def _rectangle_precompute_impl(
     # wrapper passes this as an explicit constexpr so fast-path compilations do
     # not carry the fallback branch.
     if USE_GATHER_FOR_NEW_TOKENS:
-        new_token_gather_idx = tl.broadcast_to(
-            safe_k_new[None, :], (HEADS_PER_BLOCK, BLOCK_SIZE_K)
-        )
+        new_token_gather_idx = tl.broadcast_to(safe_k_new[None, :], (HEADS_PER_BLOCK, BLOCK_SIZE_K))
         dt_at_kn = tl.where(
             is_new_k[None, :],
             tl.gather(dt_new, new_token_gather_idx, axis=1),
@@ -669,9 +663,8 @@ def _rectangle_precompute_impl(
         )  # (H, K)
     else:
         new_token_selector = (
-            (offs_t[:, None] == (offs_k[None, :] - prev_num_accepted_tokens))
-            & is_new_k[None, :]
-        )
+            offs_t[:, None] == (offs_k[None, :] - prev_num_accepted_tokens)
+        ) & is_new_k[None, :]
         dt_at_kn = tl.sum(
             tl.where(new_token_selector[None, :, :], dt_new[:, :, None], 0.0),
             axis=1,
@@ -772,9 +765,8 @@ def _rectangle_precompute_impl(
         + offs_t[None, :, None] * stride_cb_t
         + offs_k[None, None, :] * stride_cb_j
     )  # (H, T, K)
-    cb_store_mask_3d = (
-        (offs_t[None, :, None] < BLOCK_SIZE_T)
-        & (offs_k[None, None, :] < BLOCK_SIZE_K)
+    cb_store_mask_3d = (offs_t[None, :, None] < BLOCK_SIZE_T) & (
+        offs_k[None, None, :] < BLOCK_SIZE_K
     )  # (1, T, K) → broadcasts to (H, T, K)
     tl.store(cb_scaled_addrs, rect_CB_scaled_block, mask=cb_store_mask_3d)
 
@@ -786,8 +778,7 @@ def _rectangle_precompute_impl(
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.heuristics(
-    {"BLOCK_SIZE_K": lambda args: max(
-        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+    {"BLOCK_SIZE_K": lambda args: max(triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
 )
 @triton.jit()
 def _dynamic_precompute_kernel(
@@ -1256,7 +1247,8 @@ def _persistent_main_impl(
     )
     old_dA_cumsum_all = tl.load(
         old_dA_cumsum_base + offs_window * stride_old_dA_cumsum_T,
-        mask=old_window_mask, other=0.0,
+        mask=old_window_mask,
+        other=0.0,
     ).to(tl.float32)
 
     prev_k_idx = tl.minimum(
@@ -1283,7 +1275,9 @@ def _persistent_main_impl(
         + pid_h * stride_old_x_head
     )
     old_x_all = tl.load(
-        old_x_read_base + offs_window[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
+        old_x_read_base
+        + offs_window[:, None] * stride_old_x_T
+        + offs_m[None, :] * stride_old_x_dim,
         mask=old_window_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
@@ -1347,9 +1341,7 @@ def _persistent_main_impl(
             r01 = tl.join(r0, r1)
             r23 = tl.join(r2, r3)
             r0123 = tl.join(r01, r23)
-            rand_compact = tl.reshape(
-                r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE // RAND_DIVISOR)
-            )
+            rand_compact = tl.reshape(r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE // RAND_DIVISOR))
             # Broadcast each unique rand to RAND_DIVISOR adjacent positions.
             # Pack-group (pack=2 fp16 / pack=4 fp8) consumes adjacent positions;
             # the unique rand lands at the asm's read slot; duplicates feed
@@ -1391,13 +1383,9 @@ def _persistent_main_impl(
                         "fp8 SR is handled by the prior branch.",
                     )
                     if state_ptrs.dtype.element_ty == tl.int8:
-                        state_q = _stochastic_round_int8_packed(
-                            state_q, rand, offs_n[None, :]
-                        )
+                        state_q = _stochastic_round_int8_packed(state_q, rand, offs_n[None, :])
                     else:
-                        state_q = _stochastic_round_int16_packed(
-                            state_q, rand, offs_n[None, :]
-                        )
+                        state_q = _stochastic_round_int16_packed(state_q, rand, offs_n[None, :])
                 elif state_ptrs.dtype.element_ty != tl.float8e4nv:
                     tl.static_assert(
                         (state_ptrs.dtype.element_ty == tl.int8)
@@ -1485,7 +1473,8 @@ def _persistent_main_impl(
     if HAS_Z:
         z_all = tl.load(
             z_ptr + offs_t[:, None] * stride_z_T + offs_m[None, :] * stride_z_dim,
-            mask=t_mask[:, None] & m_mask[None, :], other=0.0,
+            mask=t_mask[:, None] & m_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
         out_all_z = out_all * z_all * tl.sigmoid(z_all)
         out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
@@ -1515,7 +1504,7 @@ def _persistent_rectangle_impl(
     # state_tma_descriptor: TMA tensor_descriptor (same flat 2D view as
     # replay path).  Used when USE_TMA_LOAD; ignored otherwise.
     state_tma_descriptor,
-    state_scales_ptr,        # only consulted when QUANT_MAX > 0
+    state_scales_ptr,  # only consulted when QUANT_MAX > 0
     old_x_ptr,
     x_ptr,
     C_ptr,
@@ -1617,9 +1606,13 @@ def _persistent_rectangle_impl(
         )
         state = state_tma_descriptor.load([offs_y, 0])
     else:
-        state_ptr_local = state_ptr + cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+        state_ptr_local = (
+            state_ptr + cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+        )
         state_ptrs = (
-            state_ptr_local + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+            state_ptr_local
+            + offs_m[:, None] * stride_state_dim
+            + offs_n[None, :] * stride_state_dstate
         )
         state_mask = m_mask[:, None] & n_mask[None, :]
         state = tl.load(state_ptrs, mask=state_mask, other=0.0)
@@ -1631,7 +1624,8 @@ def _persistent_rectangle_impl(
         )
         decode_scale = tl.load(
             state_scales_base + offs_m * stride_state_scales_dim,
-            mask=m_mask, other=1.0,
+            mask=m_mask,
+            other=1.0,
         ).to(tl.float32)
     else:
         state = state.to(tl.float32)
@@ -1662,9 +1656,7 @@ def _persistent_rectangle_impl(
 
     # Hoist: old_x doesn't depend on conv1d/precompute; load before gdc_wait.
     old_x_load = tl.load(
-        old_x_read_base
-        + safe_old_k[:, None] * stride_old_x_T
-        + offs_m[None, :] * stride_old_x_dim,
+        old_x_read_base + safe_old_k[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
         mask=is_old_k[:, None] & m_mask[None, :],
         other=0.0,
     ).to(tl.float32)
@@ -1683,9 +1675,7 @@ def _persistent_rectangle_impl(
         other=0.0,
     )
     tl.store(
-        old_x_write_base
-        + offs_k[:, None] * stride_old_x_T
-        + offs_m[None, :] * stride_old_x_dim,
+        old_x_write_base + offs_k[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
         x_K,
         mask=is_new_k[:, None] & m_mask[None, :],
     )
@@ -1694,7 +1684,7 @@ def _persistent_rectangle_impl(
     x_combined = old_x_load + x_K_f32
 
     if HAS_D or HAS_Z:
-        sel_tk = (offs_t[:, None] == (offs_k[None, :] - prev_num_accepted_tokens))
+        sel_tk = offs_t[:, None] == (offs_k[None, :] - prev_num_accepted_tokens)
         x_all = tl.dot(sel_tk.to(tl.bfloat16), x_K.to(tl.bfloat16))
     else:
         x_all = x_K_f32  # placeholder; unused
@@ -1707,13 +1697,12 @@ def _persistent_rectangle_impl(
     ).to(tl.float32)
 
     decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
-    decay_vec_full = tl.load(
-        decay_vec_base + offs_t * stride_dv_t, mask=t_mask, other=0.0
-    ).to(tl.float32)
+    decay_vec_full = tl.load(decay_vec_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(
+        tl.float32
+    )
 
     state_out = (
-        tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16))
-        * decay_vec_full[:, None]
+        tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec_full[:, None]
     )
     if QUANT_MAX > 0.0:
         state_out = state_out * decode_scale[None, :]
@@ -1728,7 +1717,8 @@ def _persistent_rectangle_impl(
     if HAS_Z:
         z_all = tl.load(
             z_ptr + offs_t[:, None] * stride_z_T + offs_m[None, :] * stride_z_dim,
-            mask=t_mask[:, None] & m_mask[None, :], other=0.0,
+            mask=t_mask[:, None] & m_mask[None, :],
+            other=0.0,
         ).to(tl.float32)
         out_all_z = out_all * z_all * tl.sigmoid(z_all)
         out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
@@ -1749,12 +1739,14 @@ def _persistent_rectangle_impl(
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.heuristics(
-    {"BLOCK_SIZE_WINDOW": lambda args: max(
-        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+    {
+        "BLOCK_SIZE_WINDOW": lambda args: max(
+            triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16
+        )
+    }
 )
 @triton.heuristics(
-    {"BLOCK_SIZE_K": lambda args: max(
-        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+    {"BLOCK_SIZE_K": lambda args: max(triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
 )
 @triton.heuristics(
     {"NUM_PID_M_BLOCKS": lambda args: triton.cdiv(args["dim"], args["BLOCK_SIZE_M"])}
@@ -1798,9 +1790,9 @@ def _persistent_main_kernel(
     # device memory keeps the pointer stable across CUDA graph replay while
     # allowing the value to change between iterations.
     # When IS_DYNAMIC=True the value is unused (Triton DCEs the load).
-    n_writes_ptr,   # int32 *: device-side count of write-mode slots
-    batch_total,    # int32: total slot count
-    nheads,         # int32: total head count (== _replay_main_impl's program_id axis 2 count)
+    n_writes_ptr,  # int32 *: device-side count of write-mode slots
+    batch_total,  # int32: total slot count
+    nheads,  # int32: total head count (== _replay_main_impl's program_id axis 2 count)
     # Dimensions
     T: tl.constexpr,
     MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
@@ -1942,8 +1934,12 @@ def _persistent_main_kernel(
     # slot, then head — mirrors the existing 3D grid's axis ordering
     # (axis=0 fastest = pid_m).
     for tile_id in tl.range(
-        pid, total_work, NUM_PERSISTENT,
-        flatten=FLATTEN, num_stages=NUM_LOOP_STAGES, warp_specialize=WARP_SPECIALIZE,
+        pid,
+        total_work,
+        NUM_PERSISTENT,
+        flatten=FLATTEN,
+        num_stages=NUM_LOOP_STAGES,
+        warp_specialize=WARP_SPECIALIZE,
     ):
         pid_m = tile_id % NUM_PID_M_BLOCKS
         pid_b_local = (tile_id // NUM_PID_M_BLOCKS) % n_slots_local
@@ -1961,25 +1957,15 @@ def _persistent_main_kernel(
         else:
             work_item_base = replay_work_items_ptr + work_item_idx * _REPLAY_WORK_ITEM_WIDTH
             if USE_REPLAY_CACHE_SLOT:
-                pid_b = tl.load(
-                    work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH
-                )
-                cache_batch_idx = tl.load(
-                    work_item_base + _REPLAY_WORK_CACHE_SLOT
-                ).to(tl.int64)
+                pid_b = tl.load(work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH)
+                cache_batch_idx = tl.load(work_item_base + _REPLAY_WORK_CACHE_SLOT).to(tl.int64)
                 pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
-                active_buf = tl.load(
-                    work_item_base + _REPLAY_WORK_CACHE_BUF_IDX
-                ).to(tl.int32)
+                active_buf = tl.load(work_item_base + _REPLAY_WORK_CACHE_BUF_IDX).to(tl.int32)
             else:
-                pid_b = tl.load(
-                    work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH
-                )
+                pid_b = tl.load(work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH)
                 cache_batch_idx = work_item_idx.to(tl.int64)
                 pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
-                active_buf = tl.load(
-                    work_item_base + _REPLAY_WORK_CACHE_BUF_IDX
-                ).to(tl.int32)
+                active_buf = tl.load(work_item_base + _REPLAY_WORK_CACHE_BUF_IDX).to(tl.int32)
         # Dispatch: when RECTANGLE is set, send nowrite slots to the rectangle
         # impl.  `replay_work_items` carries the cache slot, PNAT and active
         # buffer for persistent_main; persistent_dynamic resolves those once
@@ -2003,91 +1989,267 @@ def _persistent_main_kernel(
                 # constexpr-folds; passing literal True here is consistent
                 # and constexpr-equivalent.
                 _persistent_main_impl(
-                    pid_m, pid_b, pid_h,
-                    cache_batch_idx, active_buf, pnat,
-                    state_ptr, state_tma_descriptor, state_scales_ptr,
-                    old_x_ptr, old_B_ptr, old_dt_ptr, old_dA_cumsum_ptr,
-                    x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
-                    cb_scaled_ptr, decay_vec_ptr,
+                    pid_m,
+                    pid_b,
+                    pid_h,
+                    cache_batch_idx,
+                    active_buf,
+                    pnat,
+                    state_ptr,
+                    state_tma_descriptor,
+                    state_scales_ptr,
+                    old_x_ptr,
+                    old_B_ptr,
+                    old_dt_ptr,
+                    old_dA_cumsum_ptr,
+                    x_ptr,
+                    C_ptr,
+                    D_ptr,
+                    z_ptr,
+                    out_ptr,
+                    cb_scaled_ptr,
+                    decay_vec_ptr,
                     rand_seed_ptr,
-                    T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
-                    stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
-                    stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                    stride_old_x_cache, stride_old_x_dbuf, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
-                    stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T,
-                    stride_old_B_group, stride_old_B_dstate,
-                    stride_old_dt_cache, stride_old_dt_dbuf, stride_old_dt_head, stride_old_dt_T,
-                    stride_old_dA_cumsum_cache, stride_old_dA_cumsum_dbuf,
-                    stride_old_dA_cumsum_head, stride_old_dA_cumsum_T,
-                    stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
-                    stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
-                    stride_D_head, stride_D_dim,
-                    stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
-                    stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
-                    stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
-                    stride_dv_batch, stride_dv_head, stride_dv_t,
-                    BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
-                    BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_WINDOW,
-                    LAUNCH_WITH_PDL, USE_RS_ROUNDING, PHILOX_ROUNDS, QUANT_MAX,
-                    True, IS_DYNAMIC,  # WRITE_CHECKPOINT=True (write arm)
+                    T,
+                    MAX_REPLAY_BUFFER_LENGTH,
+                    dim,
+                    dstate,
+                    nheads_ngroups_ratio,
+                    stride_state_batch,
+                    stride_state_head,
+                    stride_state_dim,
+                    stride_state_dstate,
+                    stride_state_scales_cache,
+                    stride_state_scales_head,
+                    stride_state_scales_dim,
+                    stride_old_x_cache,
+                    stride_old_x_dbuf,
+                    stride_old_x_T,
+                    stride_old_x_head,
+                    stride_old_x_dim,
+                    stride_old_B_cache,
+                    stride_old_B_dbuf,
+                    stride_old_B_T,
+                    stride_old_B_group,
+                    stride_old_B_dstate,
+                    stride_old_dt_cache,
+                    stride_old_dt_dbuf,
+                    stride_old_dt_head,
+                    stride_old_dt_T,
+                    stride_old_dA_cumsum_cache,
+                    stride_old_dA_cumsum_dbuf,
+                    stride_old_dA_cumsum_head,
+                    stride_old_dA_cumsum_T,
+                    stride_x_batch,
+                    stride_x_T,
+                    stride_x_head,
+                    stride_x_dim,
+                    stride_C_batch,
+                    stride_C_T,
+                    stride_C_group,
+                    stride_C_dstate,
+                    stride_D_head,
+                    stride_D_dim,
+                    stride_z_batch,
+                    stride_z_T,
+                    stride_z_head,
+                    stride_z_dim,
+                    stride_out_batch,
+                    stride_out_T,
+                    stride_out_head,
+                    stride_out_dim,
+                    stride_cb_batch,
+                    stride_cb_head,
+                    stride_cb_t,
+                    stride_cb_j,
+                    stride_dv_batch,
+                    stride_dv_head,
+                    stride_dv_t,
+                    BLOCK_SIZE_M,
+                    HAS_D,
+                    HAS_Z,
+                    HAS_CACHE_BATCH_INDICES,
+                    BLOCK_SIZE_DSTATE,
+                    BLOCK_SIZE_T,
+                    BLOCK_SIZE_WINDOW,
+                    LAUNCH_WITH_PDL,
+                    USE_RS_ROUNDING,
+                    PHILOX_ROUNDS,
+                    QUANT_MAX,
+                    True,
+                    IS_DYNAMIC,  # WRITE_CHECKPOINT=True (write arm)
                     True,  # WRITE_CHECKPOINT_IS_CONSTEXPR
-                    USE_TMA_LOAD_WRITE, USE_TMA_LOAD_NOWRITE, USE_TMA_STORE,
+                    USE_TMA_LOAD_WRITE,
+                    USE_TMA_LOAD_NOWRITE,
+                    USE_TMA_STORE,
                 )
             else:
                 _persistent_rectangle_impl(
-                    pid_m, pid_b, pid_h,
-                    cache_batch_idx, active_buf, pnat,
-                    state_ptr, state_tma_descriptor, state_scales_ptr,
+                    pid_m,
+                    pid_b,
+                    pid_h,
+                    cache_batch_idx,
+                    active_buf,
+                    pnat,
+                    state_ptr,
+                    state_tma_descriptor,
+                    state_scales_ptr,
                     old_x_ptr,
-                    x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
-                    cb_scaled_ptr, decay_vec_ptr,
-                    T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
-                    stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
-                    stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                    stride_old_x_cache, stride_old_x_dbuf, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
-                    stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
-                    stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
-                    stride_D_head, stride_D_dim,
-                    stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
-                    stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
-                    stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
-                    stride_dv_batch, stride_dv_head, stride_dv_t,
-                    BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
-                    BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_K,
-                    LAUNCH_WITH_PDL, QUANT_MAX,
+                    x_ptr,
+                    C_ptr,
+                    D_ptr,
+                    z_ptr,
+                    out_ptr,
+                    cb_scaled_ptr,
+                    decay_vec_ptr,
+                    T,
+                    MAX_REPLAY_BUFFER_LENGTH,
+                    dim,
+                    dstate,
+                    nheads_ngroups_ratio,
+                    stride_state_batch,
+                    stride_state_head,
+                    stride_state_dim,
+                    stride_state_dstate,
+                    stride_state_scales_cache,
+                    stride_state_scales_head,
+                    stride_state_scales_dim,
+                    stride_old_x_cache,
+                    stride_old_x_dbuf,
+                    stride_old_x_T,
+                    stride_old_x_head,
+                    stride_old_x_dim,
+                    stride_x_batch,
+                    stride_x_T,
+                    stride_x_head,
+                    stride_x_dim,
+                    stride_C_batch,
+                    stride_C_T,
+                    stride_C_group,
+                    stride_C_dstate,
+                    stride_D_head,
+                    stride_D_dim,
+                    stride_z_batch,
+                    stride_z_T,
+                    stride_z_head,
+                    stride_z_dim,
+                    stride_out_batch,
+                    stride_out_T,
+                    stride_out_head,
+                    stride_out_dim,
+                    stride_cb_batch,
+                    stride_cb_head,
+                    stride_cb_t,
+                    stride_cb_j,
+                    stride_dv_batch,
+                    stride_dv_head,
+                    stride_dv_t,
+                    BLOCK_SIZE_M,
+                    HAS_D,
+                    HAS_Z,
+                    HAS_CACHE_BATCH_INDICES,
+                    BLOCK_SIZE_DSTATE,
+                    BLOCK_SIZE_T,
+                    BLOCK_SIZE_K,
+                    LAUNCH_WITH_PDL,
+                    QUANT_MAX,
                     USE_TMA_LOAD_NOWRITE,  # rect-load TMA toggle
                 )
         else:
             _persistent_main_impl(
-                pid_m, pid_b, pid_h,
-                cache_batch_idx, active_buf, pnat,
-                state_ptr, state_tma_descriptor, state_scales_ptr,
-                old_x_ptr, old_B_ptr, old_dt_ptr, old_dA_cumsum_ptr,
-                x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
-                cb_scaled_ptr, decay_vec_ptr,
+                pid_m,
+                pid_b,
+                pid_h,
+                cache_batch_idx,
+                active_buf,
+                pnat,
+                state_ptr,
+                state_tma_descriptor,
+                state_scales_ptr,
+                old_x_ptr,
+                old_B_ptr,
+                old_dt_ptr,
+                old_dA_cumsum_ptr,
+                x_ptr,
+                C_ptr,
+                D_ptr,
+                z_ptr,
+                out_ptr,
+                cb_scaled_ptr,
+                decay_vec_ptr,
                 rand_seed_ptr,
-                T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
-                stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
-                stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                stride_old_x_cache, stride_old_x_dbuf, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
-                stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T,
-                stride_old_B_group, stride_old_B_dstate,
-                stride_old_dt_cache, stride_old_dt_dbuf, stride_old_dt_head, stride_old_dt_T,
-                stride_old_dA_cumsum_cache, stride_old_dA_cumsum_dbuf,
-                stride_old_dA_cumsum_head, stride_old_dA_cumsum_T,
-                stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
-                stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
-                stride_D_head, stride_D_dim,
-                stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
-                stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
-                stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
-                stride_dv_batch, stride_dv_head, stride_dv_t,
-                BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
-                BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_WINDOW,
-                LAUNCH_WITH_PDL, USE_RS_ROUNDING, PHILOX_ROUNDS, QUANT_MAX,
-                WRITE_CHECKPOINT, IS_DYNAMIC,
+                T,
+                MAX_REPLAY_BUFFER_LENGTH,
+                dim,
+                dstate,
+                nheads_ngroups_ratio,
+                stride_state_batch,
+                stride_state_head,
+                stride_state_dim,
+                stride_state_dstate,
+                stride_state_scales_cache,
+                stride_state_scales_head,
+                stride_state_scales_dim,
+                stride_old_x_cache,
+                stride_old_x_dbuf,
+                stride_old_x_T,
+                stride_old_x_head,
+                stride_old_x_dim,
+                stride_old_B_cache,
+                stride_old_B_dbuf,
+                stride_old_B_T,
+                stride_old_B_group,
+                stride_old_B_dstate,
+                stride_old_dt_cache,
+                stride_old_dt_dbuf,
+                stride_old_dt_head,
+                stride_old_dt_T,
+                stride_old_dA_cumsum_cache,
+                stride_old_dA_cumsum_dbuf,
+                stride_old_dA_cumsum_head,
+                stride_old_dA_cumsum_T,
+                stride_x_batch,
+                stride_x_T,
+                stride_x_head,
+                stride_x_dim,
+                stride_C_batch,
+                stride_C_T,
+                stride_C_group,
+                stride_C_dstate,
+                stride_D_head,
+                stride_D_dim,
+                stride_z_batch,
+                stride_z_T,
+                stride_z_head,
+                stride_z_dim,
+                stride_out_batch,
+                stride_out_T,
+                stride_out_head,
+                stride_out_dim,
+                stride_cb_batch,
+                stride_cb_head,
+                stride_cb_t,
+                stride_cb_j,
+                stride_dv_batch,
+                stride_dv_head,
+                stride_dv_t,
+                BLOCK_SIZE_M,
+                HAS_D,
+                HAS_Z,
+                HAS_CACHE_BATCH_INDICES,
+                BLOCK_SIZE_DSTATE,
+                BLOCK_SIZE_T,
+                BLOCK_SIZE_WINDOW,
+                LAUNCH_WITH_PDL,
+                USE_RS_ROUNDING,
+                PHILOX_ROUNDS,
+                QUANT_MAX,
+                WRITE_CHECKPOINT,
+                IS_DYNAMIC,
                 False,  # WRITE_CHECKPOINT_IS_CONSTEXPR
-                USE_TMA_LOAD_WRITE, USE_TMA_LOAD_NOWRITE, USE_TMA_STORE,
+                USE_TMA_LOAD_WRITE,
+                USE_TMA_LOAD_NOWRITE,
+                USE_TMA_STORE,
             )
 
 
@@ -2131,43 +2293,830 @@ _QUANT_MAX_BY_DTYPE = {
 # _resolve_tuning chain — RN→SR for same dtype, then fp8→int8/SR.
 _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
     ("fp32", "RN"): [
-        (   16, "persistent_main", {'_block_size_m_nowrite': 16, '_block_size_m_write': 8, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 1, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 1, '_num_stages_write': 2, '_num_warps_nowrite': 2, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1, score=6.22us
-        (   32, "persistent_main", {'_block_size_m_nowrite': 16, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 4, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=2, score=7.17us
-        (   64, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 3, '_num_stages_nowrite': 1, '_num_stages_write': 2, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=4, score=8.08us
-        (  128, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 6, '_cta_per_sm_write': 9, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': True, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=8, score=9.00us
-        (  256, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 1, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 4, '_num_warps_write': 2, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=16, score=10.92us
-        (  512, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 2, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=32, score=13.53us
-        ( 1024, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=64, score=19.50us
-        ( 2048, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 8, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 3, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=128, score=30.28us
-        ( 4096, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=256, score=50.32us
-        ( 8192, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=512, score=90.99us
-        (16384, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 1, '_num_stages_nowrite': 1, '_num_stages_write': 3, '_num_warps_nowrite': 2, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1024, score=171.69us
+        (
+            16,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 16,
+                "_block_size_m_write": 8,
+                "_cta_per_sm_nowrite": 4,
+                "_cta_per_sm_write": 1,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=1, score=6.22us
+        (
+            32,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 16,
+                "_block_size_m_write": 16,
+                "_cta_per_sm_nowrite": 9,
+                "_cta_per_sm_write": 7,
+                "_flatten": False,
+                "_heads_per_block": 1,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=2, score=7.17us
+        (
+            64,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 9,
+                "_cta_per_sm_write": 4,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 3,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 4,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=4, score=8.08us
+        (
+            128,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 64,
+                "_cta_per_sm_nowrite": 6,
+                "_cta_per_sm_write": 9,
+                "_flatten": False,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 1,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": True,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": False,
+            },
+        ),  # raw_batch=8, score=9.00us
+        (
+            256,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 64,
+                "_cta_per_sm_nowrite": 9,
+                "_cta_per_sm_write": 1,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 4,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 16,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=16, score=10.92us
+        (
+            512,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 10,
+                "_cta_per_sm_write": 4,
+                "_flatten": False,
+                "_heads_per_block": 16,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 1,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 16,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": False,
+            },
+        ),  # raw_batch=32, score=13.53us
+        (
+            1024,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 4,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 16,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=64, score=19.50us
+        (
+            2048,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 2,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=128, score=30.28us
+        (
+            4096,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 4,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 2,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=256, score=50.32us
+        (
+            8192,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 10,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 2,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=512, score=90.99us
+        (
+            16384,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 9,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 2,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=1024, score=171.69us
     ],
     ("fp16", "SR"): [
-        (   16, "persistent_main", {'_block_size_m_nowrite': 8, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 5, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 4, '_num_loop_stages_write': 3, '_num_stages_nowrite': 1, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1, score=6.16us
-        (   32, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 9, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 4, '_num_warps_nowrite': 4, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=2, score=7.01us
-        (   64, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 5, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 1, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=4, score=7.95us
-        (  128, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 8, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 1, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 4, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=8, score=8.87us
-        (  256, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 2, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 1, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 4, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=16, score=10.28us
-        (  512, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 6, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 2, '_num_warps_nowrite': 1, '_num_warps_write': 2, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=32, score=12.90us
-        ( 1024, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 2, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=64, score=16.71us
-        ( 2048, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 2, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=128, score=25.71us
-        ( 4096, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=256, score=39.80us
-        ( 8192, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 2, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=512, score=71.34us
-        (16384, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1024, score=133.51us
+        (
+            16,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 8,
+                "_block_size_m_write": 16,
+                "_cta_per_sm_nowrite": 5,
+                "_cta_per_sm_write": 7,
+                "_flatten": False,
+                "_heads_per_block": 1,
+                "_num_loop_stages_nowrite": 4,
+                "_num_loop_stages_write": 3,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=1, score=6.16us
+        (
+            32,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 16,
+                "_cta_per_sm_nowrite": 9,
+                "_cta_per_sm_write": 4,
+                "_flatten": False,
+                "_heads_per_block": 1,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 4,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=2, score=7.01us
+        (
+            64,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 16,
+                "_cta_per_sm_nowrite": 5,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=4, score=7.95us
+        (
+            128,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_write": 4,
+                "_flatten": False,
+                "_heads_per_block": 1,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 1,
+                "_num_warps_nowrite": 4,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 4,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=8, score=8.87us
+        (
+            256,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 10,
+                "_cta_per_sm_write": 2,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 1,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 16,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": False,
+            },
+        ),  # raw_batch=16, score=10.28us
+        (
+            512,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 7,
+                "_cta_per_sm_write": 6,
+                "_flatten": False,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 2,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": False,
+            },
+        ),  # raw_batch=32, score=12.90us
+        (
+            1024,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 7,
+                "_cta_per_sm_write": 7,
+                "_flatten": False,
+                "_heads_per_block": 16,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=64, score=16.71us
+        (
+            2048,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 7,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 1,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 2,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=128, score=25.71us
+        (
+            4096,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 7,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=256, score=39.80us
+        (
+            8192,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 7,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=512, score=71.34us
+        (
+            16384,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 7,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 16,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 1,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=1024, score=133.51us
     ],
     ("int8", "SR"): [
-        (   16, "persistent_main", {'_block_size_m_nowrite': 8, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 5, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 1, '_num_loop_stages_nowrite': 4, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 3, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1, score=6.34us
-        (   32, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 8, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 4, '_num_stages_write': 2, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=2, score=7.36us
-        (   64, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 2, '_cta_per_sm_write': 4, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 2, '_num_stages_write': 3, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 8, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=4, score=8.40us
-        (  128, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 10, '_flatten': False, '_heads_per_block': 2, '_num_loop_stages_nowrite': 2, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 4, '_num_warps_write': 4, '_precompute_num_warps': 16, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=8, score=9.37us
-        (  256, "persistent_dynamic", {'_block_size_m': 16, '_cta_per_sm': 8, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages': 1, '_num_stages': 4, '_num_warps': 1, '_precompute_num_warps': 16, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': True, '_use_tma_replay_write_load': False, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': False}),  # raw_batch=16, score=10.02us
-        (  512, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 16, '_cta_per_sm_nowrite': 7, '_cta_per_sm_write': 9, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 2, '_num_stages_write': 3, '_num_warps_nowrite': 2, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=32, score=13.15us
-        ( 1024, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 32, '_cta_per_sm_nowrite': 10, '_cta_per_sm_write': 7, '_flatten': False, '_heads_per_block': 16, '_num_loop_stages_nowrite': 1, '_num_loop_stages_write': 1, '_num_stages_nowrite': 4, '_num_stages_write': 3, '_num_warps_nowrite': 1, '_num_warps_write': 1, '_precompute_num_warps': 8, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': False, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=64, score=17.82us
-        ( 2048, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 3, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=128, score=27.01us
-        ( 4096, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 4, '_cta_per_sm_write': 3, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 2, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': False, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=256, score=43.23us
-        ( 8192, "persistent_main", {'_block_size_m_nowrite': 32, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 8, '_cta_per_sm_write': 6, '_flatten': False, '_heads_per_block': 4, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 3, '_num_stages_write': 1, '_num_warps_nowrite': 1, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=512, score=77.01us
-        (16384, "persistent_main", {'_block_size_m_nowrite': 64, '_block_size_m_write': 64, '_cta_per_sm_nowrite': 6, '_cta_per_sm_write': 3, '_flatten': False, '_heads_per_block': 8, '_num_loop_stages_nowrite': 3, '_num_loop_stages_write': 2, '_num_stages_nowrite': 1, '_num_stages_write': 4, '_num_warps_nowrite': 2, '_num_warps_write': 4, '_precompute_num_warps': 1, '_use_tma_rect_load': True, '_use_tma_replay_nowrite_load': False, '_use_tma_replay_write_load': True, '_use_tma_replay_write_store': True, '_warp_specialize': False, 'rectangle_for_nowrite': True}),  # raw_batch=1024, score=140.43us
+        (
+            16,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 8,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 5,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 1,
+                "_num_loop_stages_nowrite": 4,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=1, score=6.34us
+        (
+            32,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 10,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 4,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=2, score=7.36us
+        (
+            64,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 2,
+                "_cta_per_sm_write": 4,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 4,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=4, score=8.40us
+        (
+            128,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 10,
+                "_cta_per_sm_write": 10,
+                "_flatten": False,
+                "_heads_per_block": 2,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 4,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 16,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=8, score=9.37us
+        (
+            256,
+            "persistent_dynamic",
+            {
+                "_block_size_m": 16,
+                "_cta_per_sm": 8,
+                "_flatten": False,
+                "_heads_per_block": 16,
+                "_num_loop_stages": 1,
+                "_num_stages": 4,
+                "_num_warps": 1,
+                "_precompute_num_warps": 16,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": True,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": False,
+            },
+        ),  # raw_batch=16, score=10.02us
+        (
+            512,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 16,
+                "_cta_per_sm_nowrite": 7,
+                "_cta_per_sm_write": 9,
+                "_flatten": False,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=32, score=13.15us
+        (
+            1024,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 10,
+                "_cta_per_sm_write": 7,
+                "_flatten": False,
+                "_heads_per_block": 16,
+                "_num_loop_stages_nowrite": 1,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 4,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": False,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=64, score=17.82us
+        (
+            2048,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 64,
+                "_cta_per_sm_nowrite": 4,
+                "_cta_per_sm_write": 3,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=128, score=27.01us
+        (
+            4096,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 64,
+                "_cta_per_sm_nowrite": 4,
+                "_cta_per_sm_write": 3,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 2,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=256, score=43.23us
+        (
+            8192,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 64,
+                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_write": 6,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 3,
+                "_num_stages_write": 1,
+                "_num_warps_nowrite": 1,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=512, score=77.01us
+        (
+            16384,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 64,
+                "_block_size_m_write": 64,
+                "_cta_per_sm_nowrite": 6,
+                "_cta_per_sm_write": 3,
+                "_flatten": False,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 3,
+                "_num_loop_stages_write": 2,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 4,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # raw_batch=1024, score=140.43us
     ],
 }
 
@@ -2177,11 +3126,11 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
 # different from the table's recommendation.
 _PD_TO_PM_SPLIT_MAP = {  # pd unsplit knob → (pm_write_knob, pm_nowrite_knob)
     "_block_size_m": ("_block_size_m_write", "_block_size_m_nowrite"),
-    "_num_warps":    ("_num_warps_write", "_num_warps_nowrite"),
-    "_num_stages":   ("_num_stages_write", "_num_stages_nowrite"),
+    "_num_warps": ("_num_warps_write", "_num_warps_nowrite"),
+    "_num_stages": ("_num_stages_write", "_num_stages_nowrite"),
     # CPS / LS are persistent-loop knobs; pd uses _cta_per_sm + _num_loop_stages
     # as unsplit, pm uses _cta_per_sm_write/_nowrite + _num_loop_stages_write/_nowrite.
-    "_cta_per_sm":      ("_cta_per_sm_write", "_cta_per_sm_nowrite"),
+    "_cta_per_sm": ("_cta_per_sm_write", "_cta_per_sm_nowrite"),
     "_num_loop_stages": ("_num_loop_stages_write", "_num_loop_stages_nowrite"),
 }
 
@@ -2213,7 +3162,10 @@ def _bridge_tuning_knobs(knobs: dict, from_mode: str, to_mode: str) -> dict:
 
 
 def _resolve_tuning(
-    batch: int, nheads_per_rank: int, dt_str: str, sr_str: str,
+    batch: int,
+    nheads_per_rank: int,
+    dt_str: str,
+    sr_str: str,
 ) -> tuple[str, dict] | None:
     """Look up the default mode + knobs for this (eff_batch, dt, sr) cell.
 
@@ -2321,10 +3273,10 @@ def replay_selective_state_update(
     # TMA state-tensor toggles — 4 independent paths (see replay design notes
     # item #17 for measured perf profiles).  Each is False=raw load/store, True=
     # use a host-built TMA tensor_descriptor for that path.
-    _use_tma_rect_load: bool | None = None,           # rect kernel's state load (nowrite-only)
-    _use_tma_replay_write_load: bool | None = None,   # SSM state load when WRITE_CHECKPOINT=True
+    _use_tma_rect_load: bool | None = None,  # rect kernel's state load (nowrite-only)
+    _use_tma_replay_write_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=True
     _use_tma_replay_write_store: bool | None = None,  # SSM state store when WRITE_CHECKPOINT=True
-    _use_tma_replay_nowrite_load: bool | None = None, # SSM state load when WRITE_CHECKPOINT=False
+    _use_tma_replay_nowrite_load: bool | None = None,  # SSM state load when WRITE_CHECKPOINT=False
     _use_replay_cache_slot: bool = True,
     # Persistent-mode tuning kwargs (consulted for both pd and pm; pd uses
     # _cta_per_sm / _num_loop_stages, pm uses the _write/_nowrite splits):
@@ -2543,41 +3495,62 @@ def replay_selective_state_update(
         # locals() for re-read, so re-bind each kwarg explicitly.
         if rectangle_for_nowrite is None and "rectangle_for_nowrite" in _table_knobs:
             rectangle_for_nowrite = bool(_table_knobs["rectangle_for_nowrite"])
-        _block_size_m = _block_size_m if _block_size_m is not None else _table_knobs.get("_block_size_m")
+        _block_size_m = (
+            _block_size_m if _block_size_m is not None else _table_knobs.get("_block_size_m")
+        )
         _num_warps = _num_warps if _num_warps is not None else _table_knobs.get("_num_warps")
         _num_stages = _num_stages if _num_stages is not None else _table_knobs.get("_num_stages")
-        _heads_per_block = _heads_per_block if _heads_per_block is not None else _table_knobs.get("_heads_per_block")
+        _heads_per_block = (
+            _heads_per_block
+            if _heads_per_block is not None
+            else _table_knobs.get("_heads_per_block")
+        )
         _precompute_num_warps = (
             _precompute_num_warps
             if _precompute_num_warps is not None
-            else _table_knobs.get("_precompute_num_warps"))
+            else _table_knobs.get("_precompute_num_warps")
+        )
         _precompute_num_stages = (
             _precompute_num_stages
             if _precompute_num_stages is not None
-            else _table_knobs.get("_precompute_num_stages"))
+            else _table_knobs.get("_precompute_num_stages")
+        )
         _block_size_m_write = (
             _block_size_m_write
             if _block_size_m_write is not None
-            else _table_knobs.get("_block_size_m_write"))
+            else _table_knobs.get("_block_size_m_write")
+        )
         _block_size_m_nowrite = (
             _block_size_m_nowrite
             if _block_size_m_nowrite is not None
-            else _table_knobs.get("_block_size_m_nowrite"))
-        _num_warps_write = _num_warps_write if _num_warps_write is not None else _table_knobs.get("_num_warps_write")
+            else _table_knobs.get("_block_size_m_nowrite")
+        )
+        _num_warps_write = (
+            _num_warps_write
+            if _num_warps_write is not None
+            else _table_knobs.get("_num_warps_write")
+        )
         _num_warps_nowrite = (
             _num_warps_nowrite
             if _num_warps_nowrite is not None
-            else _table_knobs.get("_num_warps_nowrite"))
+            else _table_knobs.get("_num_warps_nowrite")
+        )
         _num_stages_write = (
             _num_stages_write
             if _num_stages_write is not None
-            else _table_knobs.get("_num_stages_write"))
+            else _table_knobs.get("_num_stages_write")
+        )
         _num_stages_nowrite = (
             _num_stages_nowrite
             if _num_stages_nowrite is not None
-            else _table_knobs.get("_num_stages_nowrite"))
+            else _table_knobs.get("_num_stages_nowrite")
+        )
         _cta_per_sm = _cta_per_sm if _cta_per_sm is not None else _table_knobs.get("_cta_per_sm")
-        _num_loop_stages = _num_loop_stages if _num_loop_stages is not None else _table_knobs.get("_num_loop_stages")
+        _num_loop_stages = (
+            _num_loop_stages
+            if _num_loop_stages is not None
+            else _table_knobs.get("_num_loop_stages")
+        )
         # persistent_main uses split write/nowrite tuning knobs.
         _num_loop_stages_write = (
             _num_loop_stages_write
@@ -2600,15 +3573,23 @@ def replay_selective_state_update(
             else _table_knobs.get("_cta_per_sm_nowrite")
         )
         _flatten = _flatten if _flatten is not None else _table_knobs.get("_flatten")
-        _warp_specialize = _warp_specialize if _warp_specialize is not None else _table_knobs.get("_warp_specialize")
+        _warp_specialize = (
+            _warp_specialize
+            if _warp_specialize is not None
+            else _table_knobs.get("_warp_specialize")
+        )
         if _use_tma_rect_load is None:
             _use_tma_rect_load = bool(_table_knobs.get("_use_tma_rect_load", False))
         if _use_tma_replay_write_load is None:
             _use_tma_replay_write_load = bool(_table_knobs.get("_use_tma_replay_write_load", False))
         if _use_tma_replay_write_store is None:
-            _use_tma_replay_write_store = bool(_table_knobs.get("_use_tma_replay_write_store", False))
+            _use_tma_replay_write_store = bool(
+                _table_knobs.get("_use_tma_replay_write_store", False)
+            )
         if _use_tma_replay_nowrite_load is None:
-            _use_tma_replay_nowrite_load = bool(_table_knobs.get("_use_tma_replay_nowrite_load", False))
+            _use_tma_replay_nowrite_load = bool(
+                _table_knobs.get("_use_tma_replay_nowrite_load", False)
+            )
     # Final defaults if neither caller nor table set them (empty table case).
     if mode is None:
         mode = "persistent_dynamic"
@@ -2802,8 +3783,7 @@ def replay_selective_state_update(
         heads_per_block = int(_heads_per_block)
     assert heads_per_block > 0, "heads_per_block must be positive"
     heads_per_block = min(heads_per_block, heads_per_group)
-    while (heads_per_group % heads_per_block != 0
-           or heads_per_block & (heads_per_block - 1) != 0):
+    while heads_per_group % heads_per_block != 0 or heads_per_block & (heads_per_block - 1) != 0:
         heads_per_block -= 1
     if _precompute_num_warps is not None:
         precompute_num_warps = _precompute_num_warps
@@ -2812,7 +3792,9 @@ def replay_selective_state_update(
     # overrides the corresponding shared value for ONE main launch only.
     # Default (None) = tied to shared value (current behavior).
     BLOCK_SIZE_M_WRITE = _block_size_m_write if _block_size_m_write is not None else BLOCK_SIZE_M
-    BLOCK_SIZE_M_NOWRITE = _block_size_m_nowrite if _block_size_m_nowrite is not None else BLOCK_SIZE_M
+    BLOCK_SIZE_M_NOWRITE = (
+        _block_size_m_nowrite if _block_size_m_nowrite is not None else BLOCK_SIZE_M
+    )
     NUM_WARPS_WRITE = _num_warps_write if _num_warps_write is not None else num_warps
     NUM_WARPS_NOWRITE = _num_warps_nowrite if _num_warps_nowrite is not None else num_warps
     NUM_STAGES_WRITE = _num_stages_write if _num_stages_write is not None else _num_stages
@@ -2820,8 +3802,12 @@ def replay_selective_state_update(
     # Persistent-only per-main:
     CTA_PER_SM_WRITE = _cta_per_sm_write if _cta_per_sm_write is not None else _cta_per_sm
     CTA_PER_SM_NOWRITE = _cta_per_sm_nowrite if _cta_per_sm_nowrite is not None else _cta_per_sm
-    NUM_LOOP_STAGES_WRITE = _num_loop_stages_write if _num_loop_stages_write is not None else _num_loop_stages
-    NUM_LOOP_STAGES_NOWRITE = _num_loop_stages_nowrite if _num_loop_stages_nowrite is not None else _num_loop_stages
+    NUM_LOOP_STAGES_WRITE = (
+        _num_loop_stages_write if _num_loop_stages_write is not None else _num_loop_stages
+    )
+    NUM_LOOP_STAGES_NOWRITE = (
+        _num_loop_stages_nowrite if _num_loop_stages_nowrite is not None else _num_loop_stages
+    )
 
     HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
 
@@ -2862,36 +3848,41 @@ def replay_selective_state_update(
     # dummy; kernels never reference it because their constexprs are all
     # False (Triton DCEs the dead branches).
     # `triton.set_allocator()` must run before any descriptor-using launch.
-    if (_use_tma_rect_load or _use_tma_replay_write_load
-            or _use_tma_replay_write_store or _use_tma_replay_nowrite_load):
+    if (
+        _use_tma_rect_load
+        or _use_tma_replay_write_load
+        or _use_tma_replay_write_store
+        or _use_tma_replay_nowrite_load
+    ):
         from triton.tools.tensor_descriptor import TensorDescriptor
+
         _ensure_tma_allocator()
         assert state.is_contiguous(), "TMA state requires contiguous state"
         assert state.stride(-1) == 1, "TMA state requires inner stride 1"
         _state_flat = state.view(-1, state.shape[-1])
         _dstate_pow2 = triton.next_power_of_2(dstate)
         state_tma_descriptor_write = TensorDescriptor.from_tensor(
-            _state_flat, block_shape=[BLOCK_SIZE_M_WRITE, _dstate_pow2],
+            _state_flat,
+            block_shape=[BLOCK_SIZE_M_WRITE, _dstate_pow2],
         )
         if BLOCK_SIZE_M_NOWRITE == BLOCK_SIZE_M_WRITE:
             state_tma_descriptor_nowrite = state_tma_descriptor_write
         else:
             state_tma_descriptor_nowrite = TensorDescriptor.from_tensor(
-                _state_flat, block_shape=[BLOCK_SIZE_M_NOWRITE, _dstate_pow2],
+                _state_flat,
+                block_shape=[BLOCK_SIZE_M_NOWRITE, _dstate_pow2],
             )
     else:
-        state_tma_descriptor_write = state   # dummy; all consuming constexprs False
+        state_tma_descriptor_write = state  # dummy; all consuming constexprs False
         state_tma_descriptor_nowrite = state  # dummy; all consuming constexprs False
 
     # Work items are sorted write-first for persistent_main. Each row carries
     # decode-batch position, cache slot, PNAT, and active cache buffer index.
     assert isinstance(replay_work_items, torch.Tensor), (
-        "replay_work_items must be a torch.Tensor, got "
-        f"{type(replay_work_items).__name__}"
+        f"replay_work_items must be a torch.Tensor, got {type(replay_work_items).__name__}"
     )
     assert replay_work_items.device == device, (
-        f"replay_work_items must be on device {device}, got "
-        f"{replay_work_items.device}"
+        f"replay_work_items must be on device {device}, got {replay_work_items.device}"
     )
     assert replay_work_items.dtype == torch.int32, (
         f"replay_work_items must be int32, got {replay_work_items.dtype}"
@@ -2905,15 +3896,9 @@ def replay_selective_state_update(
     assert isinstance(n_writes, torch.Tensor), (
         f"n_writes must be a torch.Tensor, got {type(n_writes).__name__}"
     )
-    assert n_writes.device == device, (
-        f"n_writes must be on device {device}, got {n_writes.device}"
-    )
-    assert n_writes.dtype == torch.int32, (
-        f"n_writes must be int32, got {n_writes.dtype}"
-    )
-    assert n_writes.shape == (1,), (
-        f"n_writes must have shape (1,), got {tuple(n_writes.shape)}"
-    )
+    assert n_writes.device == device, f"n_writes must be on device {device}, got {n_writes.device}"
+    assert n_writes.dtype == torch.int32, f"n_writes must be int32, got {n_writes.dtype}"
+    assert n_writes.shape == (1,), f"n_writes must have shape (1,), got {tuple(n_writes.shape)}"
     replay_work_items_arg = replay_work_items
 
     precomp_grid = (batch, nheads // heads_per_block)
@@ -2926,26 +3911,56 @@ def replay_selective_state_update(
 
     def launch_dynamic_precompute(rectangle: bool):
         _dynamic_precompute_kernel[precomp_grid](
-            dt, dt_bias, A, B, C,
-            cb_scaled, decay_vec,
-            old_B, old_dt, old_dA_cumsum,
-            cache_buf_idx, prev_num_accepted_tokens,
+            dt,
+            dt_bias,
+            A,
+            B,
+            C,
+            cb_scaled,
+            decay_vec,
+            old_B,
+            old_dt,
+            old_dA_cumsum,
+            cache_buf_idx,
+            prev_num_accepted_tokens,
             state_batch_indices,
-            T, max_window, dstate, nheads // ngroups,
-            dt.stride(0), dt.stride(1), dt.stride(2),
+            T,
+            max_window,
+            dstate,
+            nheads // ngroups,
+            dt.stride(0),
+            dt.stride(1),
+            dt.stride(2),
             dt_bias.stride(0) if dt_bias is not None else 0,
             A.stride(0),
-            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
-            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
-            cb_scaled.stride(0), cb_scaled.stride(1),
-            cb_scaled.stride(2), cb_scaled.stride(3),
-            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
-            old_B.stride(0), old_B.stride(1), old_B.stride(2),
-            old_B.stride(3), old_B.stride(4),
-            old_dt.stride(0), old_dt.stride(1),
-            old_dt.stride(2), old_dt.stride(3),
-            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
-            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
+            B.stride(0),
+            B.stride(1),
+            B.stride(2),
+            B.stride(3),
+            C.stride(0),
+            C.stride(1),
+            C.stride(2),
+            C.stride(3),
+            cb_scaled.stride(0),
+            cb_scaled.stride(1),
+            cb_scaled.stride(2),
+            cb_scaled.stride(3),
+            decay_vec.stride(0),
+            decay_vec.stride(1),
+            decay_vec.stride(2),
+            old_B.stride(0),
+            old_B.stride(1),
+            old_B.stride(2),
+            old_B.stride(3),
+            old_B.stride(4),
+            old_dt.stride(0),
+            old_dt.stride(1),
+            old_dt.stride(2),
+            old_dt.stride(3),
+            old_dA_cumsum.stride(0),
+            old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2),
+            old_dA_cumsum.stride(3),
             dt_softplus,
             HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
             LAUNCH_WITH_PDL=launch_with_pdl,
@@ -2985,10 +4000,9 @@ def replay_selective_state_update(
     # constexpr.)
     _num_pid_m = (dim + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
-    def launch_persistent_main(write_checkpoint: bool,
-                               *,
-                               launch_dependent_kernels: bool = False,
-                               rectangle: bool = False):
+    def launch_persistent_main(
+        write_checkpoint: bool, *, launch_dependent_kernels: bool = False, rectangle: bool = False
+    ):
         # `n_writes` is the (1,) int32 device tensor with the write count.
         # Both halves always launch; an empty half has a zero-length slot
         # range and the persistent loop does no work.
@@ -3009,34 +4023,86 @@ def replay_selective_state_update(
         grid = (min(num_persistent, total_work_launch),)
         # Per-path TMA descriptor — block_shape[0] must match block_size_m.
         selected_state_tma_descriptor = (
-            state_tma_descriptor_write if write_checkpoint
-            else state_tma_descriptor_nowrite)
+            state_tma_descriptor_write if write_checkpoint else state_tma_descriptor_nowrite
+        )
         _persistent_main_kernel[grid](
-            state, selected_state_tma_descriptor, state_scales_arg, old_x,
-            old_B, old_dt, old_dA_cumsum,
-            prev_num_accepted_tokens, cache_buf_idx,
-            x, C, D, z, out,
-            cb_scaled, decay_vec,
-            state_batch_indices, replay_work_items_arg, rand_seed,
-            n_writes, batch, nheads,
-            T, max_window, dim, dstate, nheads // ngroups,
-            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
-            state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
-            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3), old_x.stride(4),
-            old_B.stride(0), old_B.stride(1), old_B.stride(2),
-            old_B.stride(3), old_B.stride(4),
-            old_dt.stride(0), old_dt.stride(1),
-            old_dt.stride(2), old_dt.stride(3),
-            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
-            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
-            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
-            d_strides[0], d_strides[1],
-            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            cb_scaled.stride(0), cb_scaled.stride(1),
-            cb_scaled.stride(2), cb_scaled.stride(3),
-            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            state,
+            selected_state_tma_descriptor,
+            state_scales_arg,
+            old_x,
+            old_B,
+            old_dt,
+            old_dA_cumsum,
+            prev_num_accepted_tokens,
+            cache_buf_idx,
+            x,
+            C,
+            D,
+            z,
+            out,
+            cb_scaled,
+            decay_vec,
+            state_batch_indices,
+            replay_work_items_arg,
+            rand_seed,
+            n_writes,
+            batch,
+            nheads,
+            T,
+            max_window,
+            dim,
+            dstate,
+            nheads // ngroups,
+            state.stride(0),
+            state.stride(1),
+            state.stride(2),
+            state.stride(3),
+            state_scales_strides[0],
+            state_scales_strides[1],
+            state_scales_strides[2],
+            old_x.stride(0),
+            old_x.stride(1),
+            old_x.stride(2),
+            old_x.stride(3),
+            old_x.stride(4),
+            old_B.stride(0),
+            old_B.stride(1),
+            old_B.stride(2),
+            old_B.stride(3),
+            old_B.stride(4),
+            old_dt.stride(0),
+            old_dt.stride(1),
+            old_dt.stride(2),
+            old_dt.stride(3),
+            old_dA_cumsum.stride(0),
+            old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2),
+            old_dA_cumsum.stride(3),
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            C.stride(0),
+            C.stride(1),
+            C.stride(2),
+            C.stride(3),
+            d_strides[0],
+            d_strides[1],
+            z_strides[0],
+            z_strides[1],
+            z_strides[2],
+            z_strides[3],
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            cb_scaled.stride(0),
+            cb_scaled.stride(1),
+            cb_scaled.stride(2),
+            cb_scaled.stride(3),
+            decay_vec.stride(0),
+            decay_vec.stride(1),
+            decay_vec.stride(2),
             block_size_m,
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
@@ -3068,9 +4134,11 @@ def replay_selective_state_update(
             launch_pdl=use_internal_pdl,
         )
 
-    def launch_persistent_dynamic_main(n_writes_tensor: torch.Tensor,
-                                       launch_dependent_kernels: bool = False,
-                                       rectangle: bool = False):
+    def launch_persistent_dynamic_main(
+        n_writes_tensor: torch.Tensor,
+        launch_dependent_kernels: bool = False,
+        rectangle: bool = False,
+    ):
         # Single-launch persistent kernel covering the whole batch with
         # runtime per-slot WRITE_CHECKPOINT branch.  No half-split, no
         # n_writes needed (the kernel ignores n_writes_tensor when
@@ -3088,31 +4156,83 @@ def replay_selective_state_update(
         # the write-side descriptor matches.  Both write and nowrite slots
         # in this kernel share that BSM.
         _persistent_main_kernel[grid](
-            state, state_tma_descriptor_write, state_scales_arg, old_x,
-            old_B, old_dt, old_dA_cumsum,
-            prev_num_accepted_tokens, cache_buf_idx,
-            x, C, D, z, out,
-            cb_scaled, decay_vec,
-            state_batch_indices, replay_work_items_arg, rand_seed,
-            n_writes_tensor, batch, nheads,
-            T, max_window, dim, dstate, nheads // ngroups,
-            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
-            state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
-            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3), old_x.stride(4),
-            old_B.stride(0), old_B.stride(1), old_B.stride(2),
-            old_B.stride(3), old_B.stride(4),
-            old_dt.stride(0), old_dt.stride(1),
-            old_dt.stride(2), old_dt.stride(3),
-            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
-            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
-            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
-            d_strides[0], d_strides[1],
-            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            cb_scaled.stride(0), cb_scaled.stride(1),
-            cb_scaled.stride(2), cb_scaled.stride(3),
-            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            state,
+            state_tma_descriptor_write,
+            state_scales_arg,
+            old_x,
+            old_B,
+            old_dt,
+            old_dA_cumsum,
+            prev_num_accepted_tokens,
+            cache_buf_idx,
+            x,
+            C,
+            D,
+            z,
+            out,
+            cb_scaled,
+            decay_vec,
+            state_batch_indices,
+            replay_work_items_arg,
+            rand_seed,
+            n_writes_tensor,
+            batch,
+            nheads,
+            T,
+            max_window,
+            dim,
+            dstate,
+            nheads // ngroups,
+            state.stride(0),
+            state.stride(1),
+            state.stride(2),
+            state.stride(3),
+            state_scales_strides[0],
+            state_scales_strides[1],
+            state_scales_strides[2],
+            old_x.stride(0),
+            old_x.stride(1),
+            old_x.stride(2),
+            old_x.stride(3),
+            old_x.stride(4),
+            old_B.stride(0),
+            old_B.stride(1),
+            old_B.stride(2),
+            old_B.stride(3),
+            old_B.stride(4),
+            old_dt.stride(0),
+            old_dt.stride(1),
+            old_dt.stride(2),
+            old_dt.stride(3),
+            old_dA_cumsum.stride(0),
+            old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2),
+            old_dA_cumsum.stride(3),
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            C.stride(0),
+            C.stride(1),
+            C.stride(2),
+            C.stride(3),
+            d_strides[0],
+            d_strides[1],
+            z_strides[0],
+            z_strides[1],
+            z_strides[2],
+            z_strides[3],
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            cb_scaled.stride(0),
+            cb_scaled.stride(1),
+            cb_scaled.stride(2),
+            cb_scaled.stride(3),
+            decay_vec.stride(0),
+            decay_vec.stride(1),
+            decay_vec.stride(2),
             BLOCK_SIZE_M,
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,

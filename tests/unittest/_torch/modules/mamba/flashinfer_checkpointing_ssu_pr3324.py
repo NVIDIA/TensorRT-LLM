@@ -28,7 +28,6 @@ from typing import Optional
 
 import jinja2
 import torch
-
 from flashinfer.compilation_context import CompilationContext
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.core import JitSpec, gen_jit_spec
@@ -138,9 +137,7 @@ def _gen_module(
     with open(_CSRC_DIR / "checkpointing_ssu_customize_config.jinja") as file:
         config_template = jinja2.Template(file.read())
 
-    state_scale_type = (
-        _DTYPE_MAP[state_scale_dtype] if state_scale_dtype is not None else "void"
-    )
+    state_scale_type = _DTYPE_MAP[state_scale_dtype] if state_scale_dtype is not None else "void"
     config = config_template.render(
         state_dtype=_DTYPE_MAP[state_dtype],
         input_dtype=_DTYPE_MAP[input_dtype],
@@ -247,9 +244,7 @@ def checkpointing_ssu(
         if state_scale is None:
             raise ValueError(f"state dtype {state.dtype} requires state_scale")
     elif state_scale is not None:
-        raise ValueError(
-            f"state_scale must be None for non-quantized state dtype {state.dtype}"
-        )
+        raise ValueError(f"state_scale must be None for non-quantized state dtype {state.dtype}")
     if cu_seqlens is not None:
         npredicted = max_seqlen if max_seqlen is not None else old_x.size(1)
     else:

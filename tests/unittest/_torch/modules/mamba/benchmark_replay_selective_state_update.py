@@ -227,9 +227,7 @@ def _import_mamba_kernels_fast():
     # from mamba2_metadata at import time.  Stub those constants instead of
     # importing the full metadata module and its scheduler/attention deps.
     metadata_stub = types.ModuleType(f"{mamba_pkg}.mamba2_metadata")
-    metadata_stub.REPLAY_WORK_POSITION_IN_DECODE_BATCH = (
-        REPLAY_WORK_POSITION_IN_DECODE_BATCH
-    )
+    metadata_stub.REPLAY_WORK_POSITION_IN_DECODE_BATCH = REPLAY_WORK_POSITION_IN_DECODE_BATCH
     metadata_stub.REPLAY_WORK_CACHE_SLOT = REPLAY_WORK_CACHE_SLOT
     metadata_stub.REPLAY_WORK_PNAT = REPLAY_WORK_PNAT
     metadata_stub.REPLAY_WORK_CACHE_BUF_IDX = REPLAY_WORK_CACHE_BUF_IDX
@@ -328,9 +326,7 @@ def _resolve_prev_ks(args, mtp_len: int) -> list[int]:
     upper = getattr(args, "max_window", 0) or mtp_len
     if getattr(args, "prev_tokens_int", None):
         return sorted(set(max(0, min(upper, int(v))) for v in args.prev_tokens_int))
-    return sorted(
-        set(min(mtp_len, max(0, round(f * mtp_len))) for f in args.prev_tokens_fracs)
-    )
+    return sorted(set(min(mtp_len, max(0, round(f * mtp_len))) for f in args.prev_tokens_fracs))
 
 
 def _al_counts_to_distribution(
@@ -343,8 +339,7 @@ def _al_counts_to_distribution(
         raise SystemExit(f"no numeric AL rows found in {label}")
     if max(al_to_count) > T:
         raise SystemExit(
-            f"AL histogram {label} contains accepted length {max(al_to_count)} "
-            f"> T={T}"
+            f"AL histogram {label} contains accepted length {max(al_to_count)} > T={T}"
         )
     if min(al_to_count) < 0:
         raise SystemExit(f"AL histogram {label} contains negative accepted lengths")
@@ -379,9 +374,7 @@ def _load_al_distribution(path: Path, T: int, column: int = 1) -> np.ndarray:
             count = float(row[column])
         except (IndexError, ValueError):
             continue
-        al_to_count[accepted_length] = (
-            al_to_count.get(accepted_length, 0.0) + count
-        )
+        al_to_count[accepted_length] = al_to_count.get(accepted_length, 0.0) + count
 
     return _al_counts_to_distribution(al_to_count, T, str(path))
 
@@ -420,8 +413,7 @@ def _markov_stationary(al_dist: np.ndarray, T: int, window: int) -> np.ndarray:
     idx = int(np.argmin(np.abs(eigvals - 1.0)))
     if abs(eigvals[idx] - 1.0) > 1e-6:
         raise SystemExit(
-            "stationary distribution eigensolve failed: closest eigenvalue "
-            f"to 1 is {eigvals[idx]}"
+            f"stationary distribution eigensolve failed: closest eigenvalue to 1 is {eigvals[idx]}"
         )
 
     pi = np.real(eigvecs[:, idx])
@@ -471,27 +463,21 @@ def _build_replay_work_items_cpu(
     n_samples, batch = samples.shape
     write_mask = samples + T > window
     order = np.argsort(-write_mask.astype(np.int8), kind="stable", axis=1)
-    positions = np.broadcast_to(
-        np.arange(batch, dtype=np.int32), (n_samples, batch)
-    )
+    positions = np.broadcast_to(np.arange(batch, dtype=np.int32), (n_samples, batch))
 
     if cache_buf_idx_samples is None:
         cache_buf_idx_samples = np.zeros_like(samples, dtype=np.int32)
     else:
         cache_buf_idx_samples = np.asarray(cache_buf_idx_samples, dtype=np.int32)
         if cache_buf_idx_samples.ndim == 1:
-            cache_buf_idx_samples = np.broadcast_to(
-                cache_buf_idx_samples[None, :], samples.shape
-            )
+            cache_buf_idx_samples = np.broadcast_to(cache_buf_idx_samples[None, :], samples.shape)
         if cache_buf_idx_samples.shape != samples.shape:
             raise ValueError(
                 "cache_buf_idx_samples shape must match pnat_samples, got "
                 f"{cache_buf_idx_samples.shape} and {samples.shape}"
             )
 
-    work_items = np.empty(
-        (n_samples, batch, REPLAY_WORK_ITEM_WIDTH), dtype=np.int32
-    )
+    work_items = np.empty((n_samples, batch, REPLAY_WORK_ITEM_WIDTH), dtype=np.int32)
     work_items[:, :, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = np.take_along_axis(
         positions, order, axis=1
     )
@@ -558,8 +544,7 @@ def _build_tensors(
     device = "cuda"
 
     # Cache lookup — grow batch in place if needed; else return views.
-    cache_key = (state_dtype, act_dtype, max_window, mtp_len,
-                 nheads, head_dim, d_state, ngroups)
+    cache_key = (state_dtype, act_dtype, max_window, mtp_len, nheads, head_dim, d_state, ngroups)
     cached = _TENSOR_CACHE.get(cache_key)
     if cached is not None and cached["max_batch"] >= batch:
         # Hit — return slices for current batch.
@@ -637,9 +622,7 @@ def _build_tensors(
         else:
             state0 = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
     else:
-        state0 = torch.randn(
-            batch, nheads, head_dim, d_state, device=device, dtype=state_dtype
-        )
+        state0 = torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=state_dtype)
         state_scales0 = None
 
     # --- Cache tensors for replay kernel ---
@@ -669,12 +652,8 @@ def _build_tensors(
     # prev_tokens placeholder — overwritten per-run
     prev_tokens = torch.zeros(batch, device=device, dtype=torch.int32)
     state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
-    replay_work_items = torch.empty(
-        batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32
-    )
-    replay_work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = (
-        state_batch_indices
-    )
+    replay_work_items = torch.empty(batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32)
+    replay_work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = state_batch_indices
     replay_work_items[:, REPLAY_WORK_CACHE_SLOT] = state_batch_indices
     replay_work_items[:, REPLAY_WORK_PNAT] = 0
     replay_work_items[:, REPLAY_WORK_CACHE_BUF_IDX] = 0
@@ -800,8 +779,7 @@ _SR_SUPPORTED_DTYPES = (
 )
 
 
-def _sr_modes_for_dtype(state_dtype: torch.dtype,
-                        requested_modes: list[str]) -> list[str]:
+def _sr_modes_for_dtype(state_dtype: torch.dtype, requested_modes: list[str]) -> list[str]:
     """Return the rounding modes that should run for one state dtype."""
     if state_dtype == torch.float32:
         return ["RN"]
@@ -830,9 +808,7 @@ def _kernels_per_iter_incremental(
     elif mode == "persistent_main":
         k = 3  # 1 dynamic_precomp + write-main + nowrite-main
     else:
-        raise ValueError(
-            f"mode must be resolved before CUPTI kernel counting, got {mode!r}"
-        )
+        raise ValueError(f"mode must be resolved before CUPTI kernel counting, got {mode!r}")
     if with_conv1d:
         k += 1
     return k
@@ -1003,23 +979,27 @@ def _parse_cupti_buffer_ptr(libcupti, buffer_ptr: int, valid_size: int, *, inclu
                     zero_ts_names[name] = zero_ts_names.get(name, 0) + 1
                 continue
             if include_names:
-                records.append((
-                    name,
-                    int(kernel.start),
-                    int(kernel.end),
-                    int(kernel.correlation_id),
-                    0,
-                    int(kernel.graph_node_id),
-                    int(kernel.stream_id),
-                ))
+                records.append(
+                    (
+                        name,
+                        int(kernel.start),
+                        int(kernel.end),
+                        int(kernel.correlation_id),
+                        0,
+                        int(kernel.graph_node_id),
+                        int(kernel.stream_id),
+                    )
+                )
             else:
-                records.append((
-                    int(kernel.start),
-                    int(kernel.end),
-                    int(kernel.correlation_id),
-                    int(kernel.graph_node_id),
-                    int(kernel.stream_id),
-                ))
+                records.append(
+                    (
+                        int(kernel.start),
+                        int(kernel.end),
+                        int(kernel.correlation_id),
+                        int(kernel.graph_node_id),
+                        int(kernel.stream_id),
+                    )
+                )
         elif result == _CUPTI_ERROR_MAX_LIMIT_REACHED:
             break
         elif result == _CUPTI_ERROR_INVALID_KIND:
@@ -1082,13 +1062,17 @@ def _cupti_parser_worker(input_queue, output_queue, ready_event) -> None:
                     include_names=False,
                 )
                 records_by_generation.setdefault(generation, []).extend(records)
-                zero_ts_by_generation[generation] = zero_ts_by_generation.get(generation, 0) + zero_ts_count
+                zero_ts_by_generation[generation] = (
+                    zero_ts_by_generation.get(generation, 0) + zero_ts_count
+                )
                 ctypes.memset(parser_ptr, 0, len(shm.buf))
             except Exception as exc:  # pragma: no cover - diagnostic worker path
                 output_queue.put({"kind": "error", "generation": generation, "error": repr(exc)})
             finally:
                 del shared_char
-            output_queue.put({"kind": "buffer_done", "generation": generation, "buffer_id": buffer_id})
+            output_queue.put(
+                {"kind": "buffer_done", "generation": generation, "buffer_id": buffer_id}
+            )
         elif kind == "finish":
             if len(item) == 4:
                 _, generation, filter_plan, stats_request = item
@@ -1116,21 +1100,25 @@ def _cupti_parser_worker(input_queue, output_queue, ready_event) -> None:
                     )
                     parser_stats_ms = 1000.0 * (time.perf_counter() - stats_start_s)
                     filtered_records = []
-                output_queue.put({
-                    "kind": "finish_done",
-                    "generation": generation,
-                    "records": filtered_records,
-                    "zero_ts_count": zero_ts_count,
-                    "zero_ts_names": {},
-                    "raw_record_count": len(raw_records),
-                    "stats": stats,
-                    "stats_ready": stats_ready,
-                    "parser_stats_ms": parser_stats_ms,
-                })
+                output_queue.put(
+                    {
+                        "kind": "finish_done",
+                        "generation": generation,
+                        "records": filtered_records,
+                        "zero_ts_count": zero_ts_count,
+                        "zero_ts_names": {},
+                        "raw_record_count": len(raw_records),
+                        "stats": stats,
+                        "stats_ready": stats_ready,
+                        "parser_stats_ms": parser_stats_ms,
+                    }
+                )
             except Exception as exc:  # pragma: no cover - diagnostic worker path
                 output_queue.put({"kind": "error", "generation": generation, "error": repr(exc)})
         else:
-            output_queue.put({"kind": "error", "generation": -1, "error": f"unknown parser message {kind!r}"})
+            output_queue.put(
+                {"kind": "error", "generation": -1, "error": f"unknown parser message {kind!r}"}
+            )
     for shm in shared_blocks.values():
         shm.close()
 
@@ -1219,9 +1207,11 @@ class CuptiKernelTimer:
             if spawn_ok:
                 last_err = None
                 break
-            last_err = (f"attempt {_spawn_attempt + 1}: "
-                        f"alive={self._parse_process.is_alive()}, "
-                        f"exitcode={self._parse_process.exitcode}")
+            last_err = (
+                f"attempt {_spawn_attempt + 1}: "
+                f"alive={self._parse_process.is_alive()}, "
+                f"exitcode={self._parse_process.exitcode}"
+            )
             try:
                 if self._parse_process.is_alive():
                     self._parse_process.terminate()
@@ -1240,10 +1230,12 @@ class CuptiKernelTimer:
 
         self._request_callback = self._request_callback_type(self._request_buffer)
         self._complete_callback = self._complete_callback_type(self._complete_buffer)
-        self._check(self._libcupti.cuptiActivityRegisterCallbacks(
-            self._request_callback,
-            self._complete_callback,
-        ))
+        self._check(
+            self._libcupti.cuptiActivityRegisterCallbacks(
+                self._request_callback,
+                self._complete_callback,
+            )
+        )
         self._check(self._libcupti.cuptiActivityEnable(_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL))
         atexit.register(self.close)
 
@@ -1397,9 +1389,7 @@ class CuptiKernelTimer:
             phase_start_s = time.perf_counter() if collect_timing else 0.0
             self._set_flush_period_ms(flush_period_ms)
             if collect_timing:
-                start_timing["period_enable_ms"] = 1000.0 * (
-                    time.perf_counter() - phase_start_s
-                )
+                start_timing["period_enable_ms"] = 1000.0 * (time.perf_counter() - phase_start_s)
         self._last_start_timing = start_timing
         return generation
 
@@ -1452,9 +1442,7 @@ class CuptiKernelTimer:
         phase_start_s = time.perf_counter() if collect_timing else 0.0
         self._set_flush_period_ms(0)
         if collect_timing:
-            stop_timing["period_disable_ms"] = 1000.0 * (
-                time.perf_counter() - phase_start_s
-            )
+            stop_timing["period_disable_ms"] = 1000.0 * (time.perf_counter() - phase_start_s)
         phase_start_s = time.perf_counter() if collect_timing else 0.0
         self._flush(0)
         if collect_timing:
@@ -1480,9 +1468,7 @@ class CuptiKernelTimer:
             result = self._finish_results.pop(generation, None)
             if result is not None:
                 if collect_timing:
-                    stop_timing["parser_wait_ms"] = 1000.0 * (
-                        time.perf_counter() - phase_start_s
-                    )
+                    stop_timing["parser_wait_ms"] = 1000.0 * (time.perf_counter() - phase_start_s)
                     stop_timing["total_ms"] = (
                         stop_timing.get("period_disable_ms", 0.0)
                         + stop_timing.get("flush_ms", 0.0)
@@ -1557,10 +1543,7 @@ def _stats_from_spans(spans_us: list[float]) -> dict:
 
 
 def _binomial_pmf(n: int, p: float) -> tuple[float, ...]:
-    return tuple(
-        math.comb(n, k) * (p**k) * ((1.0 - p)**(n - k))
-        for k in range(n + 1)
-    )
+    return tuple(math.comb(n, k) * (p**k) * ((1.0 - p) ** (n - k)) for k in range(n + 1))
 
 
 def _kmix_bucket_score(
@@ -1595,10 +1578,16 @@ def _kmix_bucket_score(
     return numerator / denominator if denominator > 0.0 else None
 
 
-def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
-                              zero_ts_count: int = 0,
-                              zero_ts_names: dict | None = None,
-                              include_details: bool = True):
+def _stats_from_cupti_records(
+    records,
+    warmup,
+    iters,
+    tag,
+    expected_K,
+    zero_ts_count: int = 0,
+    zero_ts_names: dict | None = None,
+    include_details: bool = True,
+):
     """Bin a flat CUPTI kernel record stream into per-iter spans + per-kernel
     relative timestamps.  Used by both graph and eager CUPTI paths.
 
@@ -1611,7 +1600,8 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
     them out).
     """
     records = [
-        r for r in records
+        r
+        for r in records
         if r[0] is not None and any(s in r[0] for s in _CUPTI_KEEP_KERNEL_SUBSTRINGS)
     ]
     records.sort(key=lambda r: r[1])  # by start_ns
@@ -1621,6 +1611,7 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
     expected_total = expected_K * expected_iters
     if total != expected_total:
         from collections import Counter
+
         name_counts = dict(Counter(r[0] for r in records))
         # Non-fatal: skip this cell instead of killing the whole sweep.
         # Mismatch may be a CUPTI dropped-records issue (rare configs),
@@ -1659,16 +1650,17 @@ def _stats_from_cupti_records(records, warmup, iters, tag, expected_K,
                     flush=True,
                 )
             if len(records) > 30:
-                print(f"  ... ({len(records) - 30} more records elided)",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"  ... ({len(records) - 30} more records elided)", file=sys.stderr, flush=True
+                )
         return None
     K = expected_K
-    timed = records[warmup * K:]
+    timed = records[warmup * K :]
 
     spans_us: list[float] = []
     per_kernel: dict[str, dict[str, list[float]]] = {}
     for i in range(iters):
-        chunk = timed[i * K:(i + 1) * K]
+        chunk = timed[i * K : (i + 1) * K]
         iter_start_ns = min(r[1] for r in chunk)
         iter_end_ns = max(r[2] for r in chunk)
         spans_us.append((iter_end_ns - iter_start_ns) / 1000.0)
@@ -1719,7 +1711,6 @@ class _HostTiming:
 
 
 class _PendingCuptiStats:
-
     def __init__(
         self,
         timer: CuptiKernelTimer,
@@ -1830,8 +1821,9 @@ def _graph_group_iters(args, total_iters: int, pre_iter_fn, pre_iter_group_facto
     return max(1, int(requested))
 
 
-def _get_cupti_filter_plan(timer: CuptiKernelTimer, graph, cache_key: tuple | None,
-                           group_iters: int) -> tuple[int, tuple[str | None, ...]]:
+def _get_cupti_filter_plan(
+    timer: CuptiKernelTimer, graph, cache_key: tuple | None, group_iters: int
+) -> tuple[int, tuple[str | None, ...]]:
     full_cache_key = None if cache_key is None else (cache_key, group_iters)
     if full_cache_key is not None:
         cached = _CUPTI_FILTER_PLAN_CACHE.get(full_cache_key)
@@ -1945,9 +1937,10 @@ def _time_kernel_cuda_graph(
         host_timing.stop("graph_preload_ms")
 
     plan_cache_key = None if cupti_plan_key is None else (cupti_plan_key, group_iters)
-    host_timing.add("cupti_plan_cached", (
-        plan_cache_key is not None and plan_cache_key in _CUPTI_FILTER_PLAN_CACHE
-    ))
+    host_timing.add(
+        "cupti_plan_cached",
+        (plan_cache_key is not None and plan_cache_key in _CUPTI_FILTER_PLAN_CACHE),
+    )
     host_timing.start()
     records_per_replay, ordinal_names = _get_cupti_filter_plan(
         timer,
@@ -2140,8 +2133,11 @@ def _run_kernel_untimed(args, run_fn, reset_fn, tag: str) -> dict:
 
     if args.cuda_graph:
         # Eager warmup before capture (Triton autotune)
-        reset_fn(); run_fn(); torch.cuda.synchronize()
-        reset_fn(); torch.cuda.synchronize()
+        reset_fn()
+        run_fn()
+        torch.cuda.synchronize()
+        reset_fn()
+        torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             for _ in range(warmup + iters):
@@ -2172,7 +2168,10 @@ def _run_kernel_untimed(args, run_fn, reset_fn, tag: str) -> dict:
 
 
 def _time_kernel(
-    args, run_fn, reset_fn, tag: str,
+    args,
+    run_fn,
+    reset_fn,
+    tag: str,
     *,
     expected_K: int,
     pre_iter_fn=None,
@@ -2200,7 +2199,10 @@ def _time_kernel(
         return _run_kernel_untimed(args, run_fn, reset_fn, tag)
     if args.cuda_graph:
         return _time_kernel_cuda_graph(
-            args, run_fn, reset_fn, tag,
+            args,
+            run_fn,
+            reset_fn,
+            tag,
             expected_K=expected_K,
             pre_iter_fn=pre_iter_fn,
             pre_iter_group_factory=pre_iter_group_factory,
@@ -2208,7 +2210,10 @@ def _time_kernel(
             cupti_plan_key=cupti_plan_key,
         )
     return _time_kernel_eager(
-        args, run_fn, reset_fn, tag,
+        args,
+        run_fn,
+        reset_fn,
+        tag,
         expected_K=expected_K,
         pre_iter_fn=pre_iter_fn,
         iters_override=iters_override,
@@ -2242,12 +2247,16 @@ def _warm_one_config(args, cfg, baseline_fn) -> None:
     function references across processes.
     """
     outer_cfg, inner_overrides_or_list = cfg
-    overrides_list = (inner_overrides_or_list
-                      if isinstance(inner_overrides_or_list, list)
-                      else [inner_overrides_or_list])
-    (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode,
-     rect, mode, hardcode_sort) = outer_cfg
+    overrides_list = (
+        inner_overrides_or_list
+        if isinstance(inner_overrides_or_list, list)
+        else [inner_overrides_or_list]
+    )
+    (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode, rect, mode, hardcode_sort) = (
+        outer_cfg
+    )
     import argparse as _ap
+
     for inner_overrides in overrides_list:
         # Fresh clone per entry: prevents knob-value leakage between
         # consecutive cells in a CPS-grouped task (entries may set
@@ -2256,19 +2265,30 @@ def _warm_one_config(args, cfg, baseline_fn) -> None:
         for k, v in inner_overrides.items():
             setattr(args_copy, k, v)
         _bench_config(
-            args_copy, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
-            sr_mode=sr_mode, rectangle_for_nowrite=rect, mode=mode,
+            args_copy,
+            batch,
+            mtp_len,
+            prev_ks,
+            state_dtype,
+            act_dtype,
+            baseline_fn,
+            sr_mode=sr_mode,
+            rectangle_for_nowrite=rect,
+            mode=mode,
             hardcode_sort=hardcode_sort,
             warmup_only=True,
         )
 
 
-def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
-                          baseline_fn, max_workers: int) -> None:
+def _compile_warmup_phase(
+    args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes, baseline_fn, max_workers: int
+) -> None:
     _cw_t0 = time.perf_counter()
+
     def _cw(label: str) -> None:
         dt = time.perf_counter() - _cw_t0
         print(f"[compile-warmup] t={dt:7.2f}s  {label}", file=sys.stderr, flush=True)
+
     _cw("entered _compile_warmup_phase")
     """Parallel compile-warmup using a ProcessPoolExecutor with `spawn`
     start method.
@@ -2292,8 +2312,8 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
     avoid pickling complications; the parent compiles the baseline
     kernel itself before launching the pool when applicable.
     """
-    from concurrent.futures import ProcessPoolExecutor
     import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
 
     sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
 
@@ -2321,19 +2341,22 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                     for sr_mode in _sr_modes_for_dtype(state_dtype, sr_modes_list):
                         for mode in modes_list:
                             for rect in rect_list:
-                                can_sort = (
-                                    args.mix_csv is not None
-                                    or getattr(args, "pmix", False)
-                                )
-                                effective_hsort_list = (
-                                    hsort_list if can_sort else [False]
-                                )
+                                can_sort = args.mix_csv is not None or getattr(args, "pmix", False)
+                                effective_hsort_list = hsort_list if can_sort else [False]
                                 for hardcode_sort in effective_hsort_list:
-                                    configs.append((
-                                        batch, mtp_len, prev_ks,
-                                        state_dtype, act_dtype, sr_mode,
-                                        rect, mode, hardcode_sort,
-                                    ))
+                                    configs.append(
+                                        (
+                                            batch,
+                                            mtp_len,
+                                            prev_ks,
+                                            state_dtype,
+                                            act_dtype,
+                                            sr_mode,
+                                            rect,
+                                            mode,
+                                            hardcode_sort,
+                                        )
+                                    )
 
     # Enumerate inner-knob signatures.  Two paths:
     #   (1) --cell-list mode (preferred when set): pull exactly the cells
@@ -2402,14 +2425,15 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
         # tasks then failed the cell-list filter inside the worker and
         # wasted dispatch overhead.  This path is O(|unique cell groups|).
         from collections import defaultdict as _dd
+
         cell_groups: dict = _dd(list)
         for tup in cell_set:
             d = dict(zip(cell_keys, tup))
             cell_outer = (
-                "SR" if d.get("SR", 0) else "RN",       # sr_mode
-                bool(d.get("RECT", 0)),                  # rect
-                d.get("MODE", "persistent_dynamic"),     # mode
-                bool(d.get("HSORT", 0)),                 # hardcode_sort
+                "SR" if d.get("SR", 0) else "RN",  # sr_mode
+                bool(d.get("RECT", 0)),  # rect
+                d.get("MODE", "persistent_dynamic"),  # mode
+                bool(d.get("HSORT", 0)),  # hardcode_sort
             )
             inner = {}
             for k, v in d.items():
@@ -2440,31 +2464,48 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
         # ============== SWEEP-ARGS PATH ==============
         # Build inner_dicts via cartesian over knob axes, then cross with
         # the `configs` outer cartesian.  Existing behavior.
-        m_pairs   = _split_or_pair("block_size_m",     "block_size_m_write",     "block_size_m_nowrite")
-        w_pairs   = _split_or_pair("num_warps",        "num_warps_write",        "num_warps_nowrite")
-        ns_pairs  = _split_or_pair("num_stages",       "num_stages_write",       "num_stages_nowrite")
-        cps_pairs = _split_or_pair("cta_per_sm",       "cta_per_sm_write",       "cta_per_sm_nowrite")
-        ls_pairs  = _split_or_pair("num_loop_stages",  "num_loop_stages_write",  "num_loop_stages_nowrite")
-        pw_vals   = _ps(args.precompute_num_warps)
-        ps_vals   = _ps(args.precompute_num_stages)
-        h_vals    = _ps(args.heads_per_block)
-        mr_vals   = _ps(args.maxnreg)
-        ct_vals   = _ps(args.num_ctas)
-        fl_vals   = _ps(args.flatten)
-        wsp_vals  = _ps(args.warp_specialize)
-        trl_vals  = _ps(args.use_tma_rect_load)
-        twl_vals  = _ps(args.use_tma_replay_write_load)
-        tnl_vals  = _ps(args.use_tma_replay_nowrite_load)
-        tws_vals  = _ps(args.use_tma_replay_write_store)
+        m_pairs = _split_or_pair("block_size_m", "block_size_m_write", "block_size_m_nowrite")
+        w_pairs = _split_or_pair("num_warps", "num_warps_write", "num_warps_nowrite")
+        ns_pairs = _split_or_pair("num_stages", "num_stages_write", "num_stages_nowrite")
+        cps_pairs = _split_or_pair("cta_per_sm", "cta_per_sm_write", "cta_per_sm_nowrite")
+        ls_pairs = _split_or_pair(
+            "num_loop_stages", "num_loop_stages_write", "num_loop_stages_nowrite"
+        )
+        pw_vals = _ps(args.precompute_num_warps)
+        ps_vals = _ps(args.precompute_num_stages)
+        h_vals = _ps(args.heads_per_block)
+        mr_vals = _ps(args.maxnreg)
+        ct_vals = _ps(args.num_ctas)
+        fl_vals = _ps(args.flatten)
+        wsp_vals = _ps(args.warp_specialize)
+        trl_vals = _ps(args.use_tma_rect_load)
+        twl_vals = _ps(args.use_tma_replay_write_load)
+        tnl_vals = _ps(args.use_tma_replay_nowrite_load)
+        tws_vals = _ps(args.use_tma_replay_write_store)
         import itertools as _it
+
         inner_dicts = []
-        for ((mw, mnw), (ww, wnw), (sw, snw), (cw, cnw), (lw, lnw),
-             pw, ps_, h, mr, ct, fl, wsp,
-             trl, twl, tnl, tws) in _it.product(
-                m_pairs, w_pairs, ns_pairs, cps_pairs, ls_pairs,
-                pw_vals, ps_vals, h_vals, mr_vals, ct_vals,
-                fl_vals, wsp_vals,
-                trl_vals, twl_vals, tnl_vals, tws_vals):
+        for (mw, mnw), (ww, wnw), (sw, snw), (cw, cnw), (
+            lw,
+            lnw,
+        ), pw, ps_, h, mr, ct, fl, wsp, trl, twl, tnl, tws in _it.product(
+            m_pairs,
+            w_pairs,
+            ns_pairs,
+            cps_pairs,
+            ls_pairs,
+            pw_vals,
+            ps_vals,
+            h_vals,
+            mr_vals,
+            ct_vals,
+            fl_vals,
+            wsp_vals,
+            trl_vals,
+            twl_vals,
+            tnl_vals,
+            tws_vals,
+        ):
             d = {}
             for k, v in (
                 ("block_size_m_write", mw),
@@ -2508,14 +2549,17 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
     # Shuffle ACROSS tasks (preserve within-group CPS sequence for in-process
     # cache adjacency — within-group order is intentional, not shuffled).
     import random as _r
+
     _r.shuffle(tasks)
 
     _cw(f"built {len(tasks)} tasks covering {n_total_cells} cells in {n_groups} groups")
-    print(f"[compile-warmup] {len(tasks)} compile tasks "
-          f"({n_outer_used} outer × {n_groups} cell-groups "
-          f"covering {n_total_cells} cells, CPS-grouped"
-          + (", per-cell outer" if cell_set else "")
-          + f") across {max_workers} processes (ProcessPoolExecutor, {_MP_START_METHOD} start)")
+    print(
+        f"[compile-warmup] {len(tasks)} compile tasks "
+        f"({n_outer_used} outer × {n_groups} cell-groups "
+        f"covering {n_total_cells} cells, CPS-grouped"
+        + (", per-cell outer" if cell_set else "")
+        + f") across {max_workers} processes (ProcessPoolExecutor, {_MP_START_METHOD} start)"
+    )
     t0 = time.perf_counter()
 
     ctx = multiprocessing.get_context(_MP_START_METHOD)
@@ -2526,10 +2570,7 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
         # baseline_fn=None: workers compile only the replay kernel.
         # Baseline kernels (if any) get compiled lazily in the parent during
         # the timing phase — usually just one extra compile, negligible.
-        futures = {
-            ex.submit(_warm_one_config, args, task, None): task
-            for task in tasks
-        }
+        futures = {ex.submit(_warm_one_config, args, task, None): task for task in tasks}
         _cw(f"submitted {len(futures)} tasks, waiting for results")
         _n_done = 0
         for fut in futures:
@@ -2539,17 +2580,18 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                 errors.append((futures[fut], e))
             _n_done += 1
             # Progress beacons at 10/25/50/75/100% to gauge effective parallelism.
-            if _n_done in (max(1, len(futures)//10),
-                           max(1, len(futures)//4),
-                           max(1, len(futures)//2),
-                           max(1, (3*len(futures))//4),
-                           len(futures)):
+            if _n_done in (
+                max(1, len(futures) // 10),
+                max(1, len(futures) // 4),
+                max(1, len(futures) // 2),
+                max(1, (3 * len(futures)) // 4),
+                len(futures),
+            ):
                 _cw(f"{_n_done}/{len(futures)} tasks complete")
 
     if errors:
         for cfg, e in errors:
-            print(f"[compile-warmup] FAILED config {cfg}: {type(e).__name__}: {e}",
-                  file=sys.stderr)
+            print(f"[compile-warmup] FAILED config {cfg}: {type(e).__name__}: {e}", file=sys.stderr)
         raise errors[0][1]
 
     print(f"[compile-warmup] done in {time.perf_counter() - t0:.1f}s")
@@ -2632,7 +2674,7 @@ def _bench_config(
     head_dim = args.head_dim
     d_state = args.d_state
     with_conv1d = getattr(args, "with_conv1d", False)
-    use_philox = (sr_mode == "SR")
+    use_philox = sr_mode == "SR"
 
     # SR rounding: allow fp16 and the quantized dtypes (int8/int16/fp8).
     # bf16/fp32 SR is not supported (no PTX path for bf16; fp32 doesn't need
@@ -2643,9 +2685,7 @@ def _bench_config(
         if state_dtype not in _SR_SUPPORTED_DTYPES:
             return
         rand_seed = torch.randint(0, 2**62, (1,), device="cuda", dtype=torch.int64)
-    mode = _resolve_effective_replay_mode(
-        args, batch, state_dtype, use_philox, mode
-    )
+    mode = _resolve_effective_replay_mode(args, batch, state_dtype, use_philox, mode)
     if mode != "persistent_main" and nowrite_first:
         return
 
@@ -2703,7 +2743,10 @@ def _bench_config(
             return False
         assert is_pr3324_baseline, args.baseline
         if state_dtype not in (
-            torch.float32, torch.float16, torch.int8, torch.float8_e4m3fn,
+            torch.float32,
+            torch.float16,
+            torch.int8,
+            torch.float8_e4m3fn,
         ):
             return False
         return not (use_philox and state_dtype == torch.float32)
@@ -2764,11 +2807,13 @@ def _bench_config(
     num_loop_stages_values = _parse_sweep(args.num_loop_stages)
     flatten_values = _parse_sweep(args.flatten)
     warp_specialize_values = _parse_sweep(args.warp_specialize)
+
     # Per-main split-knob sweeps.  Default = same as the shared sweep (so each
     # combo is tied).  When set independently, the inner loop sweeps the
     # cross-product (write × nowrite); --skip-diagonal drops the tied subset.
     def _split_or_share(split_csv, shared_values):
         return _parse_sweep(split_csv) if split_csv else shared_values
+
     block_size_m_write_values = _split_or_share(args.block_size_m_write, block_size_m_values)
     block_size_m_nowrite_values = _split_or_share(args.block_size_m_nowrite, block_size_m_values)
     num_warps_write_values = _split_or_share(args.num_warps_write, num_warps_values)
@@ -2777,19 +2822,31 @@ def _bench_config(
     num_stages_nowrite_values = _split_or_share(args.num_stages_nowrite, num_stages_values)
     cta_per_sm_write_values = _split_or_share(args.cta_per_sm_write, cta_per_sm_values)
     cta_per_sm_nowrite_values = _split_or_share(args.cta_per_sm_nowrite, cta_per_sm_values)
-    num_loop_stages_write_values = _split_or_share(args.num_loop_stages_write, num_loop_stages_values)
-    num_loop_stages_nowrite_values = _split_or_share(args.num_loop_stages_nowrite, num_loop_stages_values)
+    num_loop_stages_write_values = _split_or_share(
+        args.num_loop_stages_write, num_loop_stages_values
+    )
+    num_loop_stages_nowrite_values = _split_or_share(
+        args.num_loop_stages_nowrite, num_loop_stages_values
+    )
     # Whether any *_write / *_nowrite knob was independently set — used by
     # --skip-diagonal to know if the cross-product is non-trivial.  Without
     # any split, the per-main values == shared values and skip-diagonal is
     # a no-op (which is correct).
-    _any_split = any(getattr(args, name) for name in (
-        "block_size_m_write", "block_size_m_nowrite",
-        "num_warps_write", "num_warps_nowrite",
-        "num_stages_write", "num_stages_nowrite",
-        "cta_per_sm_write", "cta_per_sm_nowrite",
-        "num_loop_stages_write", "num_loop_stages_nowrite",
-    ))
+    _any_split = any(
+        getattr(args, name)
+        for name in (
+            "block_size_m_write",
+            "block_size_m_nowrite",
+            "num_warps_write",
+            "num_warps_nowrite",
+            "num_stages_write",
+            "num_stages_nowrite",
+            "cta_per_sm_write",
+            "cta_per_sm_nowrite",
+            "num_loop_stages_write",
+            "num_loop_stages_nowrite",
+        )
+    )
     # TMA toggles — independent 0/1 sweep per path.  The skip-dupe at the
     # top of the inner loop body collapses cells where a flag's path is
     # unreachable for the current rectangle_for_nowrite setting.
@@ -2812,13 +2869,15 @@ def _bench_config(
         for prev_k in prev_ks:
             # Persistent modes dispatch per-slot from PNAT, so any prev_k
             # <= max_window is valid.
-            scenarios.append({
-                "label": f"k{prev_k}",
-                "print_label": prev_k,
-                "fill": prev_k,
-                "pre_iter": None,
-                "iters": None,  # use args.iters
-            })
+            scenarios.append(
+                {
+                    "label": f"k{prev_k}",
+                    "print_label": prev_k,
+                    "fill": prev_k,
+                    "pre_iter": None,
+                    "iters": None,  # use args.iters
+                }
+            )
     # Mix scenario: bench pre-bakes per-iter PNAT samples, n_writes, and
     # replay_work_items. Grouped graph capture copies window rows into the
     # persistent kernel-input tensors before each in-graph L2 flush, so timed
@@ -2835,15 +2894,15 @@ def _bench_config(
         )
         samples_gpu = torch.from_numpy(src).to(device=device, dtype=torch.int32)
 
-        n_writes_per_iter_all, replay_work_items_samples_cpu = (
-            _build_replay_work_items_cpu(src, mtp_len, max_window)
+        n_writes_per_iter_all, replay_work_items_samples_cpu = _build_replay_work_items_cpu(
+            src, mtp_len, max_window
         )
         n_writes_samples_gpu = torch.from_numpy(n_writes_per_iter_all).to(
             device=device, dtype=torch.int32
         )
-        replay_work_items_samples_gpu = torch.from_numpy(
-            replay_work_items_samples_cpu
-        ).to(device=device, dtype=torch.int32)
+        replay_work_items_samples_gpu = torch.from_numpy(replay_work_items_samples_cpu).to(
+            device=device, dtype=torch.int32
+        )
         n_writes_mix = torch.zeros(1, dtype=torch.int32, device=device)
 
         def _mix_pre_iter(
@@ -2856,7 +2915,7 @@ def _bench_config(
             _rwi=replay_work_items_buf,
         ):
             _pt.copy_(_s[i])
-            _nw.copy_(_ns[i:i + 1])
+            _nw.copy_(_ns[i : i + 1])
             _rwi.copy_(_wi[i])
 
         def _mix_pre_iter_group_factory(
@@ -2869,11 +2928,11 @@ def _bench_config(
             _rwi=replay_work_items_buf,
         ):
             sample_window = torch.empty(
-                (group_iters, _s.shape[1]), device=_s.device, dtype=_s.dtype,
+                (group_iters, _s.shape[1]),
+                device=_s.device,
+                dtype=_s.dtype,
             )
-            n_writes_window = torch.empty(
-                (group_iters,), device=_ns.device, dtype=_ns.dtype
-            )
+            n_writes_window = torch.empty((group_iters,), device=_ns.device, dtype=_ns.dtype)
             work_items_window = torch.empty(
                 (group_iters, _wi.shape[1], _wi.shape[2]),
                 device=_wi.device,
@@ -2889,26 +2948,28 @@ def _bench_config(
 
             def _graph_pre_iter(j):
                 _pt.copy_(sample_window[j])
-                _nw.copy_(n_writes_window[j:j + 1])
+                _nw.copy_(n_writes_window[j : j + 1])
                 _rwi.copy_(work_items_window[j])
 
             return _pre_replay, _graph_pre_iter
 
         # Mix iters override: if --mix-iters set, use it; else use args.iters.
         mix_iters = getattr(args, "mix_iters", None)
-        scenarios.append({
-            "label": f"mix{mix_label}",
-            "print_label": "mix",
-            "fill": None,
-            "pre_iter": _mix_pre_iter,
-            "pre_iter_group_factory": _mix_pre_iter_group_factory,
-            "iters": mix_iters,  # None => use args.iters
-            "n_writes": n_writes_mix,
-            # Full per-iter n_writes array (size = warmup + iters).  Used by
-            # the JSON-detailed output to pair each iter's span with its
-            # mix composition for post-hoc bucketing analysis.
-            "n_writes_per_iter": n_writes_per_iter_all,
-        })
+        scenarios.append(
+            {
+                "label": f"mix{mix_label}",
+                "print_label": "mix",
+                "fill": None,
+                "pre_iter": _mix_pre_iter,
+                "pre_iter_group_factory": _mix_pre_iter_group_factory,
+                "iters": mix_iters,  # None => use args.iters
+                "n_writes": n_writes_mix,
+                # Full per-iter n_writes array (size = warmup + iters).  Used by
+                # the JSON-detailed output to pair each iter's span with its
+                # mix composition for post-hoc bucketing analysis.
+                "n_writes_per_iter": n_writes_per_iter_all,
+            }
+        )
 
     # Pure scenarios use one constant n_writes/work-items row. Mix scenarios
     # update both tensors per iter. persistent_main always launches both
@@ -2926,9 +2987,7 @@ def _bench_config(
                 device=state_work.device, dtype=torch.int32
             )
             replay_work_items_buf.copy_(
-                torch.from_numpy(work_items_cpu).to(
-                    device=state_work.device, dtype=torch.int32
-                )
+                torch.from_numpy(work_items_cpu).to(device=state_work.device, dtype=torch.int32)
             )
         prev_k_for_print = scn["print_label"]
         scenario_pre_iter = scn["pre_iter"]
@@ -2946,18 +3005,13 @@ def _bench_config(
             else:
                 nw_full = scn.get("n_writes_per_iter")
                 if nw_full is not None:
-                    scenario_per_iter_nw = (
-                        nw_full[args.warmup:args.warmup + eff_iters].tolist()
-                    )
+                    scenario_per_iter_nw = nw_full[args.warmup : args.warmup + eff_iters].tolist()
 
         if baseline_fn is not None and is_pr3324_baseline:
             baseline_suffix_parts = [f"SR={int(use_philox)}"]
             hsort_list_for_tags = getattr(args, "hardcode_sort_list", [False])
             hsort_in_cell_list = "HSORT" in getattr(args, "_cell_list_keys", ())
-            emit_hsort_tag = (
-                hardcode_sort or len(hsort_list_for_tags) > 1
-                or hsort_in_cell_list
-            )
+            emit_hsort_tag = hardcode_sort or len(hsort_list_for_tags) > 1 or hsort_in_cell_list
             if scn["fill"] is None and emit_hsort_tag:
                 baseline_suffix_parts.append(f"HSORT={1 if hardcode_sort else 0}")
             baseline_sweep_suffix = ",".join(baseline_suffix_parts)
@@ -3017,9 +3071,7 @@ def _bench_config(
                     D=D,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=(
-                        state_batch_indices if args.use_cache_slot else None
-                    ),
+                    state_batch_indices=(state_batch_indices if args.use_cache_slot else None),
                     state_scale=state_scales_work,
                     rand_seed=rand_seed,
                     philox_rounds=args.philox_rounds,
@@ -3070,8 +3122,7 @@ def _bench_config(
                     act_dtype_name=act_dtype_name,
                     sweep_suffix=baseline_sweep_suffix,
                     per_iter_nw=scenario_per_iter_nw,
-                    kmix_bucket_write_frac=mix_write_frac
-                    if scn["fill"] is None else None,
+                    kmix_bucket_write_frac=mix_write_frac if scn["fill"] is None else None,
                     skipped_tag=base_tag,
                 )
 
@@ -3084,16 +3135,23 @@ def _bench_config(
         # pair this with --skip-diagonal to drop the tied subset).
         if _any_split:
             _iter_axes = (
-                block_size_m_write_values, block_size_m_nowrite_values,
-                num_warps_write_values, num_warps_nowrite_values,
-                num_stages_write_values, num_stages_nowrite_values,
+                block_size_m_write_values,
+                block_size_m_nowrite_values,
+                num_warps_write_values,
+                num_warps_nowrite_values,
+                num_stages_write_values,
+                num_stages_nowrite_values,
                 precompute_num_warps_values,
                 precompute_num_stages_values,
                 heads_per_block_values,
-                maxnreg_values, num_ctas_values,
-                cta_per_sm_write_values, cta_per_sm_nowrite_values,
-                num_loop_stages_write_values, num_loop_stages_nowrite_values,
-                flatten_values, warp_specialize_values,
+                maxnreg_values,
+                num_ctas_values,
+                cta_per_sm_write_values,
+                cta_per_sm_nowrite_values,
+                num_loop_stages_write_values,
+                num_loop_stages_nowrite_values,
+                flatten_values,
+                warp_specialize_values,
                 use_tma_rect_load_values,
                 use_tma_replay_write_load_values,
                 use_tma_replay_nowrite_load_values,
@@ -3103,16 +3161,23 @@ def _bench_config(
             # Tied: one value per shared knob.  Wrap in single-element list for
             # uniform iteration; the body sets w/nw both to the shared value.
             _iter_axes = (
-                block_size_m_values, [None],
-                num_warps_values, [None],
-                num_stages_values, [None],
+                block_size_m_values,
+                [None],
+                num_warps_values,
+                [None],
+                num_stages_values,
+                [None],
                 precompute_num_warps_values,
                 precompute_num_stages_values,
                 heads_per_block_values,
-                maxnreg_values, num_ctas_values,
-                cta_per_sm_values, [None],
-                num_loop_stages_values, [None],
-                flatten_values, warp_specialize_values,
+                maxnreg_values,
+                num_ctas_values,
+                cta_per_sm_values,
+                [None],
+                num_loop_stages_values,
+                [None],
+                flatten_values,
+                warp_specialize_values,
                 use_tma_rect_load_values,
                 use_tma_replay_write_load_values,
                 use_tma_replay_nowrite_load_values,
@@ -3136,23 +3201,35 @@ def _bench_config(
         # its assigned one — turning compile-warmup into 28-way duplication.
         # (Observed: 256 tasks in 233s under that bug vs ~18s correct.)
         if getattr(args, "_cell_list_set", None) and not warmup_only:
+
             def _gen_from_cell_list():
                 keys = args._cell_list_keys
                 for tup in args._cell_list_set:
                     d = dict(zip(keys, tup))
                     yield (
-                        d.get("Mw"), d.get("Mnw"),
-                        d.get("Ww"), d.get("Wnw"),
-                        d.get("Sw"), d.get("Snw"),
-                        d.get("pW"), d.get("pS"),
+                        d.get("Mw"),
+                        d.get("Mnw"),
+                        d.get("Ww"),
+                        d.get("Wnw"),
+                        d.get("Sw"),
+                        d.get("Snw"),
+                        d.get("pW"),
+                        d.get("pS"),
                         d.get("H"),
-                        d.get("R"), d.get("CT"),
-                        d.get("CPSw"), d.get("CPSnw"),
-                        d.get("LSw"), d.get("LSnw"),
-                        d.get("FL"), d.get("WS"),
-                        d.get("TMARL"), d.get("TMAWL"),
-                        d.get("TMANL"), d.get("TMAWS"),
+                        d.get("R"),
+                        d.get("CT"),
+                        d.get("CPSw"),
+                        d.get("CPSnw"),
+                        d.get("LSw"),
+                        d.get("LSnw"),
+                        d.get("FL"),
+                        d.get("WS"),
+                        d.get("TMARL"),
+                        d.get("TMAWL"),
+                        d.get("TMANL"),
+                        d.get("TMAWS"),
                     )
+
             _iter_source = _gen_from_cell_list()
         else:
             _iter_source = itertools.product(*_iter_axes)
@@ -3190,12 +3267,16 @@ def _bench_config(
                 num_loop_stages_nw = num_loop_stages_w
             # Skip-diagonal: when split is on, drop the tied subset (same as a
             # prior shared-knob sweep would cover).
-            if _any_split and args.skip_diagonal and (
-                block_size_m_w == block_size_m_nw and
-                num_warps_w == num_warps_nw and
-                num_stages_w == num_stages_nw and
-                cta_per_sm_w == cta_per_sm_nw and
-                num_loop_stages_w == num_loop_stages_nw
+            if (
+                _any_split
+                and args.skip_diagonal
+                and (
+                    block_size_m_w == block_size_m_nw
+                    and num_warps_w == num_warps_nw
+                    and num_stages_w == num_stages_nw
+                    and cta_per_sm_w == cta_per_sm_nw
+                    and num_loop_stages_w == num_loop_stages_nw
+                )
             ):
                 continue
             # Backward-compat aliases used by the existing body below.  When
@@ -3217,12 +3298,20 @@ def _bench_config(
             _write_path = True  # both halves exist for persistent modes
             _rect_path = rectangle_for_nowrite
             _replay_nowrite_path = not rectangle_for_nowrite
+
             def _set(v):  # flag set to a non-zero sweep value
                 return v is not None and v != 0
-            if (_set(use_tma_rect_load) and not _rect_path
-                    or _set(use_tma_replay_write_load) and not _write_path
-                    or _set(use_tma_replay_nowrite_load) and not _replay_nowrite_path
-                    or _set(use_tma_replay_write_store) and not _write_path):
+
+            if (
+                _set(use_tma_rect_load)
+                and not _rect_path
+                or _set(use_tma_replay_write_load)
+                and not _write_path
+                or _set(use_tma_replay_nowrite_load)
+                and not _replay_nowrite_path
+                or _set(use_tma_replay_write_store)
+                and not _write_path
+            ):
                 continue
 
             assert scenario_n_writes is not None
@@ -3323,6 +3412,7 @@ def _bench_config(
                 )
 
             parts = []
+
             # Tuned wrapper knobs emit "auto" when unset, meaning the wrapper
             # resolves them from _DEFAULT_TUNING per cell.  pS/R/CT are not
             # tuning-table knobs today, so leave them out unless explicitly
@@ -3343,6 +3433,7 @@ def _bench_config(
                 else:
                     parts.append(f"{name_w}={_val(val_w)}")
                     parts.append(f"{name_nw}={_val(val_nw)}")
+
             _emit_split("Mw", "Mnw", block_size_m_w, block_size_m_nw)
             _emit_split("Ww", "Wnw", num_warps_w, num_warps_nw)
             _emit_split("Sw", "Snw", num_stages_w, num_stages_nw)
@@ -3374,7 +3465,9 @@ def _bench_config(
             parts.append(f"TMANL={_val(use_tma_replay_nowrite_load)}")
             parts.append(f"TMAWS={_val(use_tma_replay_write_store)}")
             parts.append(f"SR={1 if use_philox else 0}")
-            parts.append(f"RECT={'auto' if rectangle_for_nowrite is None else (1 if rectangle_for_nowrite else 0)}")
+            parts.append(
+                f"RECT={'auto' if rectangle_for_nowrite is None else (1 if rectangle_for_nowrite else 0)}"
+            )
             nowrite_first_list_for_tags = getattr(args, "nowrite_first_list", [False])
             nowrite_first_in_cell_list = "NWF" in getattr(args, "_cell_list_keys", ())
             if nowrite_first or len(nowrite_first_list_for_tags) > 1 or nowrite_first_in_cell_list:
@@ -3408,8 +3501,13 @@ def _bench_config(
                 # re-evaluating the inner scenario loop; conservatively skip
                 # only when the prev_k_for_print's specific key is done.
                 _resume_key = _build_json_key(
-                    "replay", batch, mtp_len, prev_k_for_print,
-                    state_dtype_name, sweep_suffix, args.tp_size,
+                    "replay",
+                    batch,
+                    mtp_len,
+                    prev_k_for_print,
+                    state_dtype_name,
+                    sweep_suffix,
+                    args.tp_size,
                 )
                 if _resume_key in done_keys:
                     continue
@@ -3433,7 +3531,8 @@ def _bench_config(
                 retry_budget = 0 if defer_results else max(0, getattr(args, "cupti_retry", 1))
                 stats = None
                 expected_K = _kernels_per_iter_incremental(
-                    mode, with_conv1d=with_conv1d,
+                    mode,
+                    with_conv1d=with_conv1d,
                 )
                 plan_key = (
                     "incremental",
@@ -3457,7 +3556,10 @@ def _bench_config(
                 )
                 for attempt in range(retry_budget + 1):
                     stats = _time_kernel(
-                        args, _run_incr, reset_fn, sweep_tag,
+                        args,
+                        _run_incr,
+                        reset_fn,
+                        sweep_tag,
                         expected_K=expected_K,
                         pre_iter_fn=scenario_pre_iter,
                         pre_iter_group_factory=scenario_pre_iter_group_factory,
@@ -3491,22 +3593,23 @@ def _bench_config(
                         act_dtype_name=act_dtype_name,
                         sweep_suffix=sweep_suffix,
                         per_iter_nw=per_iter_nw,
-                        kmix_bucket_write_frac=mix_write_frac
-                        if scn["fill"] is None else None,
+                        kmix_bucket_write_frac=mix_write_frac if scn["fill"] is None else None,
                         skipped_tag=sweep_tag,
                     )
 
 
 # Map full torch dtype name → short tag used in JSON keys (matches collect.py).
 _DTYPE_SHORT = {
-    "float32": "fp32", "bfloat16": "bf16", "float16": "fp16",
-    "int8": "int8", "int16": "int16", "float8_e4m3fn": "fp8",
+    "float32": "fp32",
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "int8": "int8",
+    "int16": "int16",
+    "float8_e4m3fn": "fp8",
 }
 
 
-def _build_json_key(
-    kernel_name, batch, mtp_len, prev_k, state_dtype_name, sweep_suffix, tp_size
-):
+def _build_json_key(kernel_name, batch, mtp_len, prev_k, state_dtype_name, sweep_suffix, tp_size):
     """Build a key matching collect.py's kernel_data.json convention:
 
       incremental/{batch}/{mtp}/{sd}/k{k}/{sweep_parts}/tp{tp}
@@ -3528,9 +3631,7 @@ def _build_json_key(
         # sweep_suffix format: " M=4,W=1,S=1,SR=0,RECT=0"
         # collect.py format:    "M4_W1_S1_SR0_RECT0"
         # Strip leading/trailing whitespace, drop '=', commas → underscores.
-        parts.append(
-            sweep_suffix.strip().replace("=", "").replace(",", "_")
-        )
+        parts.append(sweep_suffix.strip().replace("=", "").replace(",", "_"))
     parts.append(f"tp{tp_size}")
     return "/".join(parts)
 
@@ -3578,8 +3679,13 @@ def _print_row(
     )
     if jsonl_path is not None:
         key = _build_json_key(
-            kernel_name, batch, mtp_len, prev_k, state_dtype_name,
-            sweep_suffix, tp_size,
+            kernel_name,
+            batch,
+            mtp_len,
+            prev_k,
+            state_dtype_name,
+            sweep_suffix,
+            tp_size,
         )
         if json_detailed:
             row_stats = stats
@@ -3587,8 +3693,13 @@ def _print_row(
             row_stats = {
                 k: stats[k]
                 for k in (
-                    "median", "p95", "p99", "n", "iters_us",
-                    "n_writes_per_iter", "kmix_bucket_score",
+                    "median",
+                    "p95",
+                    "p99",
+                    "n",
+                    "iters_us",
+                    "n_writes_per_iter",
+                    "kmix_bucket_score",
                 )
                 if k in stats
             }
@@ -3607,6 +3718,7 @@ def _print_row(
             # segments (cells/sec, downtime between bench invocations) without
             # needing to instrument the bench's outer loops separately.
             import time as _time
+
             rec = {"key": key, "stats": row_stats, "t": _time.time()}
             if jsonl_host is not None:
                 rec["host"] = jsonl_host
@@ -3722,29 +3834,29 @@ def _submit_result_job(
 # For split (write/nowrite) knobs, we use Xw / Xnw keys.  Tied forms (M, W,
 # S, CPS, LS) accepted on load and expanded to their w/nw variants.
 _CELL_LIST_KEY_TO_ARG = {
-    "Mw":    "block_size_m_write",
-    "Mnw":   "block_size_m_nowrite",
-    "Ww":    "num_warps_write",
-    "Wnw":   "num_warps_nowrite",
-    "Sw":    "num_stages_write",
-    "Snw":   "num_stages_nowrite",
-    "CPSw":  "cta_per_sm_write",
+    "Mw": "block_size_m_write",
+    "Mnw": "block_size_m_nowrite",
+    "Ww": "num_warps_write",
+    "Wnw": "num_warps_nowrite",
+    "Sw": "num_stages_write",
+    "Snw": "num_stages_nowrite",
+    "CPSw": "cta_per_sm_write",
     "CPSnw": "cta_per_sm_nowrite",
-    "LSw":   "num_loop_stages_write",
-    "LSnw":  "num_loop_stages_nowrite",
-    "pW":    "precompute_num_warps",
-    "pS":    "precompute_num_stages",
-    "H":     "heads_per_block",
-    "R":     "maxnreg",
-    "CT":    "num_ctas",
-    "FL":    "flatten",
-    "WS":    "warp_specialize",
+    "LSw": "num_loop_stages_write",
+    "LSnw": "num_loop_stages_nowrite",
+    "pW": "precompute_num_warps",
+    "pS": "precompute_num_stages",
+    "H": "heads_per_block",
+    "R": "maxnreg",
+    "CT": "num_ctas",
+    "FL": "flatten",
+    "WS": "warp_specialize",
     "TMARL": "use_tma_rect_load",
     "TMAWL": "use_tma_replay_write_load",
     "TMANL": "use_tma_replay_nowrite_load",
     "TMAWS": "use_tma_replay_write_store",
-    "RECT":  "rectangle_for_nowrite",
-    "NWF":   "nowrite_first",
+    "RECT": "rectangle_for_nowrite",
+    "NWF": "nowrite_first",
     "HSORT": "hardcode_sort",
     # MODE and SR get special handling (string values):
     # MODE → args.modes (single mode name)
@@ -3753,12 +3865,13 @@ _CELL_LIST_KEY_TO_ARG = {
 
 # Split-knob tied form: "M" expands to both "Mw" and "Mnw".
 _CELL_LIST_TIED_EXPANSIONS = {
-    "M":   ("Mw", "Mnw"),
-    "W":   ("Ww", "Wnw"),
-    "S":   ("Sw", "Snw"),
+    "M": ("Mw", "Mnw"),
+    "W": ("Ww", "Wnw"),
+    "S": ("Sw", "Snw"),
     "CPS": ("CPSw", "CPSnw"),
-    "LS":  ("LSw", "LSnw"),
+    "LS": ("LSw", "LSnw"),
 }
+
 
 def _normalize_cell(cell: dict) -> dict:
     """Expand tied-form keys (M, W, S, CPS, LS) to their w/nw variants.
@@ -3787,10 +3900,7 @@ def _load_cell_list_into_args(args) -> None:
         print("[cell-list] empty list — nothing to time", file=sys.stderr)
         return
     allowed_keys = set(_CELL_LIST_KEY_TO_ARG) | {"MODE", "SR"}
-    unknown_keys = sorted({
-        key for cell in cells for key in cell
-        if key not in allowed_keys
-    })
+    unknown_keys = sorted({key for cell in cells for key in cell if key not in allowed_keys})
     if unknown_keys:
         sys.exit(f"--cell-list: unknown keys {unknown_keys}")
     # All cells must share the same key set (uniform schema)
@@ -3818,19 +3928,22 @@ def _load_cell_list_into_args(args) -> None:
         elif key == "SR":
             args.sr_modes = ",".join(sorted({"SR" if v else "RN" for v in vals}))
         else:
-            print(f"[cell-list] WARNING: unknown key {key!r} in cells; "
-                  f"will not override any args.* attribute (the value will "
-                  f"still be matched in the filter if a matching local var "
-                  f"is in scope)", file=sys.stderr)
+            print(
+                f"[cell-list] WARNING: unknown key {key!r} in cells; "
+                f"will not override any args.* attribute (the value will "
+                f"still be matched in the filter if a matching local var "
+                f"is in scope)",
+                file=sys.stderr,
+            )
 
     # Canonical key order (sorted) for tuple matching in the inner loop
     args._cell_list_keys = tuple(sorted(keys0))
-    args._cell_list_set = {
-        tuple(c[k] for k in args._cell_list_keys) for c in cells
-    }
-    print(f"[cell-list] loaded {len(cells)} cells with keys "
-          f"{list(args._cell_list_keys)}; overrode args.* to auto-cover",
-          file=sys.stderr)
+    args._cell_list_set = {tuple(c[k] for k in args._cell_list_keys) for c in cells}
+    print(
+        f"[cell-list] loaded {len(cells)} cells with keys "
+        f"{list(args._cell_list_keys)}; overrode args.* to auto-cover",
+        file=sys.stderr,
+    )
 
 
 # Maps cell-list key → name of the local variable in _bench_config's inner
@@ -3838,32 +3951,32 @@ def _load_cell_list_into_args(args) -> None:
 # Keep in sync with the loop-variable names; the filter is lenient about
 # missing names (it picks them up from the inner scope at runtime).
 _CELL_LIST_KEY_TO_LOCAL = {
-    "Mw":    "block_size_m_w",
-    "Mnw":   "block_size_m_nw",
-    "Ww":    "num_warps_w",
-    "Wnw":   "num_warps_nw",
-    "Sw":    "num_stages_w",
-    "Snw":   "num_stages_nw",
-    "CPSw":  "cta_per_sm_w",
+    "Mw": "block_size_m_w",
+    "Mnw": "block_size_m_nw",
+    "Ww": "num_warps_w",
+    "Wnw": "num_warps_nw",
+    "Sw": "num_stages_w",
+    "Snw": "num_stages_nw",
+    "CPSw": "cta_per_sm_w",
     "CPSnw": "cta_per_sm_nw",
-    "LSw":   "num_loop_stages_w",
-    "LSnw":  "num_loop_stages_nw",
-    "pW":    "precompute_num_warps",
-    "pS":    "precompute_num_stages",
-    "H":     "heads_per_block",
-    "R":     "maxnreg",
-    "CT":    "num_ctas",
-    "FL":    "flatten",
-    "WS":    "warp_specialize",
+    "LSw": "num_loop_stages_w",
+    "LSnw": "num_loop_stages_nw",
+    "pW": "precompute_num_warps",
+    "pS": "precompute_num_stages",
+    "H": "heads_per_block",
+    "R": "maxnreg",
+    "CT": "num_ctas",
+    "FL": "flatten",
+    "WS": "warp_specialize",
     "TMARL": "use_tma_rect_load",
     "TMAWL": "use_tma_replay_write_load",
     "TMANL": "use_tma_replay_nowrite_load",
     "TMAWS": "use_tma_replay_write_store",
-    "RECT":  "rectangle_for_nowrite",
-    "NWF":   "nowrite_first",
-    "MODE":  "mode",
+    "RECT": "rectangle_for_nowrite",
+    "NWF": "nowrite_first",
+    "MODE": "mode",
     "HSORT": "hardcode_sort",
-    "SR":    "use_philox",
+    "SR": "use_philox",
 }
 
 
@@ -3896,9 +4009,11 @@ def _run_benchmark(args) -> None:
     # run can later attribute wall time to setup vs compile-warmup vs prewarm
     # vs timing.  Single-line format makes log-grepping trivial.
     _phase_t0 = time.perf_counter()
+
     def _phase(label: str) -> None:
         dt = time.perf_counter() - _phase_t0
         print(f"[phase] t={dt:7.2f}s  {label}", file=sys.stderr, flush=True)
+
     _phase("enter _run_benchmark")
 
     # Pending-results FIFO for srxl's deferred CUPTI parsing pipeline.  Each
@@ -3928,9 +4043,10 @@ def _run_benchmark(args) -> None:
     args._done_keys: set[str] = set()
     args._baseline_seen_keys: set[str] = set()
     args._jsonl_host = None  # hostname stamp for the current run
-    args._jsonl_gpu = None   # GPU device id stamp (current process visibility)
+    args._jsonl_gpu = None  # GPU device id stamp (current process visibility)
     if getattr(args, "json_output", None):
         import socket
+
         args._jsonl_host = socket.gethostname()
         # Capture GPU id once at startup.  Used by the oracle-cache layer in
         # search_driver to attribute timings to a specific (host, gpu) pair
@@ -3964,9 +4080,11 @@ def _run_benchmark(args) -> None:
                     if rec_host:
                         host_counts[rec_host] = host_counts.get(rec_host, 0) + 1
             if n_loaded:
-                host_summary = ", ".join(
-                    f"{h}={n}" for h, n in sorted(host_counts.items())
-                ) if host_counts else "(no host stamps)"
+                host_summary = (
+                    ", ".join(f"{h}={n}" for h, n in sorted(host_counts.items()))
+                    if host_counts
+                    else "(no host stamps)"
+                )
                 print(
                     f"[resume] {args._jsonl_path}: loaded {n_loaded} prior "
                     f"cell results across hosts [{host_summary}]; sweep will "
@@ -4093,8 +4211,13 @@ def _run_benchmark(args) -> None:
     _phase("about to enter compile-warmup")
     if args.compile_threads > 0:
         _compile_warmup_phase(
-            args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
-            baseline_fn, max_workers=args.compile_threads,
+            args,
+            batch_sizes,
+            mtp_lengths,
+            state_dtypes,
+            act_dtypes,
+            baseline_fn,
+            max_workers=args.compile_threads,
         )
     _phase("returned from compile-warmup")
 
@@ -4109,8 +4232,14 @@ def _run_benchmark(args) -> None:
         for act_dtype in act_dtypes:
             for mtp_len in mtp_lengths:
                 _build_tensors(
-                    _max_batch, mtp_len, state_dtype, act_dtype,
-                    args.tp_nheads, args.head_dim, args.d_state, args.tp_ngroups,
+                    _max_batch,
+                    mtp_len,
+                    state_dtype,
+                    act_dtype,
+                    args.tp_nheads,
+                    args.head_dim,
+                    args.d_state,
+                    args.tp_ngroups,
                     max_window=getattr(args, "max_window", None) or None,
                 )
     _phase("done tensor prewarm — entering timing")
@@ -4164,9 +4293,7 @@ def _run_benchmark(args) -> None:
         mix_label = mix_csv.stem
         # T (= mtp_len) varies per cell; load once with the LARGEST mtp so
         # we have enough columns; the loader normalizes the dist anyway.
-        mix_al = _load_al_distribution(
-            mix_csv, T=max(mtp_lengths), column=args.mix_csv_column
-        )
+        mix_al = _load_al_distribution(mix_csv, T=max(mtp_lengths), column=args.mix_csv_column)
 
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
@@ -4184,23 +4311,23 @@ def _run_benchmark(args) -> None:
             if mix_al is not None:
                 _max_window = getattr(args, "max_window", 0) or mtp_len
                 mix_pi = _markov_stationary(mix_al, mtp_len, _max_window)
-                mix_write_frac = float(
-                    mix_pi[_max_window - mtp_len + 1:].sum()
-                )
+                mix_write_frac = float(mix_pi[_max_window - mtp_len + 1 :].sum())
                 _max_iters = max(args.iters, getattr(args, "mix_iters", None) or args.iters)
                 mix_samples_cpu = _sample_steady_state_pnat(
-                    mix_al, T=mtp_len, window=_max_window, batch=batch,
-                    K=args.warmup + _max_iters, seed=args.mix_seed,
+                    mix_al,
+                    T=mtp_len,
+                    window=_max_window,
+                    batch=batch,
+                    K=args.warmup + _max_iters,
+                    seed=args.mix_seed,
                 )
                 if any(hsort_list):
                     # write-first stable argsort: kind='stable' preserves
                     # original-slot order within each mode group.
-                    write_mask = (
-                        mix_samples_cpu + mtp_len > _max_window
-                    ).astype(np.int8)  # 1 = write, 0 = nowrite
-                    perm_idx = np.argsort(
-                        -write_mask, kind="stable", axis=-1
-                    ).astype(np.int32)
+                    write_mask = (mix_samples_cpu + mtp_len > _max_window).astype(
+                        np.int8
+                    )  # 1 = write, 0 = nowrite
+                    perm_idx = np.argsort(-write_mask, kind="stable", axis=-1).astype(np.int32)
                     # Apply the perm to the prev_tokens samples themselves.
                     # Result row i = mix_samples_cpu[i] reordered such
                     # that write-mode entries come first.
@@ -4215,17 +4342,19 @@ def _run_benchmark(args) -> None:
                             for rect in rect_list:
                                 for nowrite_first in nowrite_first_list:
                                     can_sort = mix_samples_cpu is not None
-                                    cell_list_active = bool(
-                                        getattr(args, "_cell_list_keys", ())
-                                    )
+                                    cell_list_active = bool(getattr(args, "_cell_list_keys", ()))
                                     effective_hsort_list = (
-                                        hsort_list if (can_sort or cell_list_active)
-                                        else [False]
+                                        hsort_list if (can_sort or cell_list_active) else [False]
                                     )
                                     for hardcode_sort in effective_hsort_list:
                                         _bench_config(
-                                            args, batch, mtp_len, prev_ks,
-                                            state_dtype, act_dtype, baseline_fn,
+                                            args,
+                                            batch,
+                                            mtp_len,
+                                            prev_ks,
+                                            state_dtype,
+                                            act_dtype,
+                                            baseline_fn,
                                             sr_mode=sr_mode,
                                             rectangle_for_nowrite=rect,
                                             mode=mode,
@@ -4246,8 +4375,7 @@ def _run_benchmark(args) -> None:
     # host stamps).  No clean-exit `.json` write — use `jsonl_to_json.py` to
     # materialize a snapshot when an analyzer wants one.
     if args.json_output and args._jsonl_path is not None:
-        print(f"\nJSONL results: {args._jsonl_path} "
-              f"(meta sidecar: {args.json_output}.meta.json)")
+        print(f"\nJSONL results: {args._jsonl_path} (meta sidecar: {args.json_output}.meta.json)")
 
     # Write the skipped-cells sidecar.  Caller can convert this list to a
     # --cell-list JSON (one dict per skipped cell) to drive a retry pass in
@@ -4269,12 +4397,18 @@ def _run_benchmark(args) -> None:
         with open(tmp, "w") as f:
             json.dump(payload, f, indent=2)
         os.replace(tmp, skipped_path)
-        print(f"Skipped {len(args._skipped_cells)} cells (CUPTI mismatch); "
-              f"tags written to: {skipped_path}", file=sys.stderr)
+        print(
+            f"Skipped {len(args._skipped_cells)} cells (CUPTI mismatch); "
+            f"tags written to: {skipped_path}",
+            file=sys.stderr,
+        )
     elif args._skipped_cells:
         # No output path but there are skipped cells — emit a stderr summary.
-        print(f"Skipped {len(args._skipped_cells)} cells (CUPTI mismatch); "
-              f"first 5: {args._skipped_cells[:5]}", file=sys.stderr)
+        print(
+            f"Skipped {len(args._skipped_cells)} cells (CUPTI mismatch); "
+            f"first 5: {args._skipped_cells[:5]}",
+            file=sys.stderr,
+        )
 
 
 # CLI
@@ -4328,12 +4462,16 @@ def _parse_args() -> argparse.Namespace:
         default="bf16",
         help="Comma-separated activation dtypes for x/B/C/dt: fp32,bf16",
     )
-    parser.add_argument("--warmup", type=int, default=4,
-                        help="Number of warmup iterations.  Default aligns with "
-                        "the graph group-iters (default 4 for mix scenarios) so "
-                        "warmup + iters / mix-iters lands on a clean multiple "
-                        "without per-args rounding overhead.  Earlier default of "
-                        "20 was overkill for steady-state warming.")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=4,
+        help="Number of warmup iterations.  Default aligns with "
+        "the graph group-iters (default 4 for mix scenarios) so "
+        "warmup + iters / mix-iters lands on a clean multiple "
+        "without per-args rounding overhead.  Earlier default of "
+        "20 was overkill for steady-state warming.",
+    )
     parser.add_argument("--iters", type=int, default=100, help="Number of timed iterations")
     parser.add_argument(
         "--compile-threads",
@@ -4521,48 +4659,70 @@ def _parse_args() -> argparse.Namespace:
         help="Override num_stages for the main kernel (comma-separated sweep).",
     )
     parser.add_argument(
-        "--block-size-m-write", type=str, default=None,
+        "--block-size-m-write",
+        type=str,
+        default=None,
         help="Sweep BLOCK_SIZE_M for the WRITE main only (overrides --block-size-m "
         "for the write half).  Tied to --block-size-m if unset.",
     )
     parser.add_argument(
-        "--block-size-m-nowrite", type=str, default=None,
+        "--block-size-m-nowrite",
+        type=str,
+        default=None,
         help="Sweep BLOCK_SIZE_M for the NOWRITE main only.  Tied to --block-size-m if unset.",
     )
     parser.add_argument(
-        "--num-warps-write", type=str, default=None,
+        "--num-warps-write",
+        type=str,
+        default=None,
         help="Sweep num_warps for the WRITE main only.  Tied to --num-warps if unset.",
     )
     parser.add_argument(
-        "--num-warps-nowrite", type=str, default=None,
+        "--num-warps-nowrite",
+        type=str,
+        default=None,
         help="Sweep num_warps for the NOWRITE main only.  Tied to --num-warps if unset.",
     )
     parser.add_argument(
-        "--num-stages-write", type=str, default=None,
+        "--num-stages-write",
+        type=str,
+        default=None,
         help="Sweep num_stages for the WRITE main only.  Tied to --num-stages if unset.",
     )
     parser.add_argument(
-        "--num-stages-nowrite", type=str, default=None,
+        "--num-stages-nowrite",
+        type=str,
+        default=None,
         help="Sweep num_stages for the NOWRITE main only.  Tied to --num-stages if unset.",
     )
     parser.add_argument(
-        "--cta-per-sm-write", type=str, default=None,
+        "--cta-per-sm-write",
+        type=str,
+        default=None,
         help="Sweep cta_per_sm for the WRITE persistent_main only.  Tied to --cta-per-sm if unset.",
     )
     parser.add_argument(
-        "--cta-per-sm-nowrite", type=str, default=None,
+        "--cta-per-sm-nowrite",
+        type=str,
+        default=None,
         help="Sweep cta_per_sm for the NOWRITE persistent_main only.  Tied to --cta-per-sm if unset.",
     )
     parser.add_argument(
-        "--num-loop-stages-write", type=str, default=None,
+        "--num-loop-stages-write",
+        type=str,
+        default=None,
         help="Sweep num_loop_stages for the WRITE persistent_main only.  Tied to --num-loop-stages if unset.",
     )
     parser.add_argument(
-        "--num-loop-stages-nowrite", type=str, default=None,
+        "--num-loop-stages-nowrite",
+        type=str,
+        default=None,
         help="Sweep num_loop_stages for the NOWRITE persistent_main only.  Tied to --num-loop-stages if unset.",
     )
     parser.add_argument(
-        "--skip-diagonal", action=argparse.BooleanOptionalAction, default=False,
+        "--skip-diagonal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="When sweeping any per-main *_write / *_nowrite knobs, skip cells "
         "where ALL splittable knobs satisfy write_value == nowrite_value (i.e. "
         "the 'diagonal' that's already covered by a prior shared-knob sweep). "
@@ -4846,9 +5006,7 @@ def _parse_args() -> argparse.Namespace:
             f"built-in T{DEFAULT_PMIX_T} distribution or --mix-csv for a custom histogram."
         )
     if args.pmix:
-        mtp_lengths_for_pmix = [
-            int(x) for x in args.mtp_lengths.split(",") if x.strip()
-        ]
+        mtp_lengths_for_pmix = [int(x) for x in args.mtp_lengths.split(",") if x.strip()]
         if any(t != DEFAULT_PMIX_T for t in mtp_lengths_for_pmix):
             parser.error(
                 f"--pmix uses the built-in T{DEFAULT_PMIX_T} histogram; "
@@ -4870,16 +5028,20 @@ def _parse_args() -> argparse.Namespace:
         _DEFAULT_CUDA_GRAPH_GROUP_ITERS_PURE,
         getattr(args, "cuda_graph_group_iters", None) or 0,
     )
+
     def _round_iters_to_group(name, val):
         total = args.warmup + val
         if total % _group_for_rounding == 0:
             return val
         new_total = ((total + _group_for_rounding - 1) // _group_for_rounding) * _group_for_rounding
         new_val = new_total - args.warmup
-        print(f"[bench] rounding --{name} {val} → {new_val} so warmup+{name} "
-              f"({new_total}) is a multiple of graph group_iters={_group_for_rounding}",
-              file=sys.stderr)
+        print(
+            f"[bench] rounding --{name} {val} → {new_val} so warmup+{name} "
+            f"({new_total}) is a multiple of graph group_iters={_group_for_rounding}",
+            file=sys.stderr,
+        )
         return new_val
+
     args.iters = _round_iters_to_group("iters", args.iters)
     if getattr(args, "mix_iters", None):
         args.mix_iters = _round_iters_to_group("mix-iters", args.mix_iters)
@@ -4895,7 +5057,7 @@ def _parse_args() -> argparse.Namespace:
 
     # Backward-compat: --philox-rounding implies --sr-modes SR if --sr-modes
     # was left at the default.  If both are set explicitly, error.
-    sr_modes_default = (args.sr_modes == "RN")
+    sr_modes_default = args.sr_modes == "RN"
     if args.philox_rounding:
         if not sr_modes_default and args.sr_modes != "SR":
             parser.error(
@@ -4943,9 +5105,7 @@ def _parse_args() -> argparse.Namespace:
 
     hsort_modes = [
         v.strip()
-        for v in (
-            args.hardcode_sort if args.hardcode_sort is not None else "0"
-        ).split(",")
+        for v in (args.hardcode_sort if args.hardcode_sort is not None else "0").split(",")
         if v.strip()
     ]
     hsort_list = []
@@ -4956,10 +5116,7 @@ def _parse_args() -> argparse.Namespace:
     if not hsort_list:
         hsort_list = [False]
     if not args.use_cache_slot and not all(hsort_list):
-        parser.error(
-            "--no-use-cache-slot is a diagnostic shortcut and requires "
-            "--hardcode-sort 1"
-        )
+        parser.error("--no-use-cache-slot is a diagnostic shortcut and requires --hardcode-sort 1")
     args.hardcode_sort_list = hsort_list
 
     # mode=None means "let the wrapper resolve from _DEFAULT_TUNING".  Same
@@ -4969,13 +5126,12 @@ def _parse_args() -> argparse.Namespace:
     else:
         modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
         valid_modes = {
-            "persistent_main", "persistent_dynamic",
+            "persistent_main",
+            "persistent_dynamic",
         }
         for m in modes_raw:
             if m not in valid_modes:
-                parser.error(
-                    f"--modes value must be one of {sorted(valid_modes)}, got {m!r}"
-                )
+                parser.error(f"--modes value must be one of {sorted(valid_modes)}, got {m!r}")
         args.modes_list = modes_raw if modes_raw else [None]
     return args
 
@@ -5014,13 +5170,17 @@ if __name__ == "__main__":
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         mp.set_start_method("forkserver", force=True)
         try:
-            mp.set_forkserver_preload([
-                "benchmark_replay_selective_state_update",
-            ])
+            mp.set_forkserver_preload(
+                [
+                    "benchmark_replay_selective_state_update",
+                ]
+            )
         except Exception as _e:
-            print(f"[warn] set_forkserver_preload failed: {_e!r}; "
-                  f"forks will still work but pay full import cost",
-                  file=sys.stderr)
+            print(
+                f"[warn] set_forkserver_preload failed: {_e!r}; "
+                f"forks will still work but pay full import cost",
+                file=sys.stderr,
+            )
     _MP_START_METHOD = _args.mp_start_method
 
     _out_path = None

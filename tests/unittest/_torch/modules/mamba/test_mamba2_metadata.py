@@ -101,13 +101,12 @@ class TestMamba2Metadata:
             def __init__(self):
                 self.state_indices = [0, 3, 1, 4, 2]
                 self.prev_num_accepted_tokens = torch.tensor(
-                    [0, 4, 10, 11, 20], dtype=torch.int32, device="cuda")
-                self.cache_buf_idx = torch.tensor([0, 1, 0, 1, 0],
-                                                  dtype=torch.int32,
-                                                  device="cuda")
+                    [0, 4, 10, 11, 20], dtype=torch.int32, device="cuda"
+                )
+                self.cache_buf_idx = torch.tensor([0, 1, 0, 1, 0], dtype=torch.int32, device="cuda")
 
             def get_state_indices(self, request_ids, is_padding):
-                return self.state_indices[:len(request_ids)]
+                return self.state_indices[: len(request_ids)]
 
             def get_replay_state_update_metadata(self):
                 return ReplayStateUpdateMetadata(
@@ -127,8 +126,7 @@ class TestMamba2Metadata:
             kv_cache_manager=ReplayCacheManager(),
             request_ids=[10, 11, 12, 13, 14],
             kv_cache_params=SimpleNamespace(
-                num_cached_tokens_per_seq=torch.tensor([0],
-                                                       dtype=torch.int),
+                num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int),
             ),
         )
 
@@ -146,8 +144,9 @@ class TestMamba2Metadata:
         )
         actual = metadata.replay_work_items[:4]
         torch.testing.assert_close(actual, expected)
-        torch.testing.assert_close(metadata.replay_n_writes.cpu(),
-                                   torch.tensor([2], dtype=torch.int32))
+        torch.testing.assert_close(
+            metadata.replay_n_writes.cpu(), torch.tensor([2], dtype=torch.int32)
+        )
         assert actual[0, REPLAY_WORK_POSITION_IN_DECODE_BATCH] == 0
         assert actual[0, REPLAY_WORK_CACHE_SLOT] == 3
         assert actual[0, REPLAY_WORK_PNAT] == 11
