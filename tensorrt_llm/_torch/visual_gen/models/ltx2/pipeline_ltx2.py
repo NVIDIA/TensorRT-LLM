@@ -1747,6 +1747,17 @@ class LTX2Pipeline(BasePipeline):
 
             return dn_v, dn_a
 
+        def _sync_cuda_graph_seq_parallel():
+            if (
+                self.model_config.cuda_graph.enable_cuda_graph
+                and dist.is_available()
+                and dist.is_initialized()
+                and getattr(self.transformer, "use_seq_parallel", False)
+                and getattr(self.transformer, "seq_parallel_size", 1) > 1
+            ):
+                torch.cuda.synchronize()
+                dist.barrier(group=getattr(self.transformer, "seq_parallel_pg", None))
+
         step_counter = [0]
 
         def forward_fn(
@@ -1759,6 +1770,7 @@ class LTX2Pipeline(BasePipeline):
             audio_latents_in = extra_stream_latents.get("audio")
             cur_step = step_counter[0]
             step_counter[0] += 1
+            _sync_cuda_graph_seq_parallel()
 
             if not use_multi_modal_guidance or video_guider.should_skip_step(cur_step):
                 dn_v, dn_a = _run_transformer(
@@ -1891,6 +1903,10 @@ class LTX2Pipeline(BasePipeline):
         # forward_fn, so tell BasePipeline not to apply its own CFG.
         effective_guidance = 1.0 if use_multi_modal_guidance else guidance_scale
 
+        def _sync_cuda_graph_seq_parallel_step(step_latents):
+            _sync_cuda_graph_seq_parallel()
+            return step_latents
+
         timer.mark_denoise_start()
         result = self.denoise(
             latents=latents,
@@ -1912,6 +1928,7 @@ class LTX2Pipeline(BasePipeline):
             extra_streams={
                 "audio": (audio_latents, audio_scheduler),
             },
+            post_step_fn=_sync_cuda_graph_seq_parallel_step,
         )
 
         latents, extra_stream_latents = result

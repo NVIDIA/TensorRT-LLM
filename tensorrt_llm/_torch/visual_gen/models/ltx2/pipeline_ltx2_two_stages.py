@@ -594,6 +594,30 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     def common_warmup_shapes(self) -> list:
         return [(512, 768, 121)]
 
+    def _clear_transformer_cuda_graphs_for_lora_swap(self, reason: str) -> None:
+        if not self.model_config.cuda_graph.enable_cuda_graph:
+            return
+
+        # Stage 2 temporarily swaps quantized transformer weights to BF16 LoRA
+        # weights. Captured graphs hold parameter storage addresses, so any
+        # graph captured before the swap is stale after the storage changes.
+        torch.cuda.synchronize()
+        for name, runner in self._cuda_graph_runners.items():
+            logger.info(f"Clearing CUDA graphs for {name} {reason}")
+            runner.clear()
+
+    def _sync_after_rank0_stage2(self) -> None:
+        dist = torch.distributed
+        if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+
+        # The stage-1 denoise path can leave CUDA-graph NCCL work queued on
+        # non-primary ranks. Drain it before issuing the default-PG barrier so
+        # the barrier is ordered after prior sequence-parallel collectives.
+        torch.cuda.synchronize()
+        logger.info("Syncing workers after rank-0-only stage 2")
+        dist.barrier()
+
     # ------------------------------------------------------------------
     # Component loading
     # ------------------------------------------------------------------
@@ -782,8 +806,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         timer.mark_post_start()
 
         # Non-primary workers (rank != 0) receive None from
-        # decode_latents and exit here.  Rank 0 continues with Stage 2.
+        # decode_latents and wait here while rank 0 completes Stage 2.  Without
+        # this sync, they can enter the worker request loop early and block in
+        # the next request broadcast while rank 0 is still generating.
         if video_latents is None:
+            self._clear_transformer_cuda_graphs_for_lora_swap("before rank-0-only stage 2 wait")
+            self._sync_after_rank0_stage2()
             timer.mark_end()
             return timer.fill(PipelineOutput(video=None, audio=None, frame_rate=float(frame_rate)))
 
@@ -804,6 +832,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # For FP4 models (static-packed or dynamic), stage 2 always runs in
         # BF16: the quant_method is swapped to UnquantizedLinearMethod inside
         # _apply_lora_deltas and restored afterwards.  BF16 models are unaffected.
+        self._clear_transformer_cuda_graphs_for_lora_swap("before stage 2 LoRA weight swap")
         n, saved_lora_state, snapshot_required = _apply_lora_deltas(
             self.transformer,
             self._distilled_lora_deltas,
@@ -859,6 +888,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
                 )
             logger.info("Un-merged distilled LoRA after stage 2")
+            self._clear_transformer_cuda_graphs_for_lora_swap("after stage 2 LoRA restore")
 
         # ================================================================
         # Decode
@@ -866,6 +896,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         if output_type == "latent":
             if self.rank == 0:
                 logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+            self._sync_after_rank0_stage2()
             timer.mark_end()
             return timer.fill(
                 PipelineOutput(
@@ -901,6 +932,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         if self.rank == 0:
             logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+        self._sync_after_rank0_stage2()
         timer.mark_end()
         return timer.fill(
             PipelineOutput(
