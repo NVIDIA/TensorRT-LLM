@@ -313,7 +313,7 @@ packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
-    name='aep4p_tensorrt_llm',
+    name='tensorrt_llm',
     version=get_version(),
     description=
     ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
