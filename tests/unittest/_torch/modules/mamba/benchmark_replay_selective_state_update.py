@@ -2979,9 +2979,11 @@ def _bench_config(
                     )
                 else:
                     x_call, B_call, C_call = x, B, C
+                # PR3324 predates double-buffered old_x. The benchmark keeps
+                # cache_buf_idx at zero, so buffer 0 is the active baseline view.
                 baseline_fn(
                     state_work,
-                    old_x_work,
+                    old_x_work[:, 0],
                     old_B_work,
                     old_dt_work,
                     old_dA_cumsum_work,
