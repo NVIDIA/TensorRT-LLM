@@ -2611,7 +2611,7 @@ def _bench_config(
     mix_samples_cpu=None,
     mix_label: str = "",
     hardcode_sort: bool = False,
-    nowrite_first: bool = False,
+    nowrite_first: bool | None = None,
     mix_samples_sorted_cpu=None,
     mix_write_frac: float | None = None,
     warmup_only: bool = False,
@@ -3468,7 +3468,7 @@ def _bench_config(
             parts.append(
                 f"RECT={'auto' if rectangle_for_nowrite is None else (1 if rectangle_for_nowrite else 0)}"
             )
-            nowrite_first_list_for_tags = getattr(args, "nowrite_first_list", [False])
+            nowrite_first_list_for_tags = getattr(args, "nowrite_first_list", [None])
             nowrite_first_in_cell_list = "NWF" in getattr(args, "_cell_list_keys", ())
             if nowrite_first or len(nowrite_first_list_for_tags) > 1 or nowrite_first_in_cell_list:
                 parts.append(f"NWF={1 if nowrite_first else 0}")
@@ -4280,7 +4280,7 @@ def _run_benchmark(args) -> None:
     rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
     modes_list = getattr(args, "modes_list", ["persistent_dynamic"])
     hsort_list = getattr(args, "hardcode_sort_list", [False])
-    nowrite_first_list = getattr(args, "nowrite_first_list", [False])
+    nowrite_first_list = getattr(args, "nowrite_first_list", [None])
 
     # Pre-load AL distribution for mix mode.
     mix_al = None
@@ -4862,9 +4862,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nowrite-first",
         type=str,
-        default="0",
+        default=None,
         help="Comma-separated 0/1 values for mode=persistent_main launch order. "
         "0 launches write before nowrite; 1 launches nowrite before write. "
+        "When unset (default), the wrapper resolves from _DEFAULT_TUNING. "
         "Ignored for persistent_dynamic.",
     )
     parser.add_argument(
@@ -5089,18 +5090,17 @@ def _parse_args() -> argparse.Namespace:
             rect_list = [None]
     args.rectangle_for_nowrite_list = rect_list
 
-    nowrite_first_modes = [
-        v.strip()
-        for v in (args.nowrite_first if args.nowrite_first is not None else "0").split(",")
-        if v.strip()
-    ]
-    nowrite_first_list = []
-    for v in nowrite_first_modes:
-        if v not in ("0", "1"):
-            parser.error(f"--nowrite-first value must be 0 or 1, got {v!r}")
-        nowrite_first_list.append(v == "1")
-    if not nowrite_first_list:
-        nowrite_first_list = [False]
+    if args.nowrite_first is None:
+        nowrite_first_list = [None]
+    else:
+        nowrite_first_modes = [v.strip() for v in args.nowrite_first.split(",") if v.strip()]
+        nowrite_first_list = []
+        for v in nowrite_first_modes:
+            if v not in ("0", "1"):
+                parser.error(f"--nowrite-first value must be 0 or 1, got {v!r}")
+            nowrite_first_list.append(v == "1")
+        if not nowrite_first_list:
+            nowrite_first_list = [None]
     args.nowrite_first_list = nowrite_first_list
 
     hsort_modes = [
