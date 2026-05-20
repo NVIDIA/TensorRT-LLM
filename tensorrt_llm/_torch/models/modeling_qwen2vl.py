@@ -173,10 +173,15 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         ``transformers<5`` exposes the cap directly on the image processor
         as ``max_pixels``; ``transformers>=5`` migrated to a
-        ``size={"shortest_edge": ..., "longest_edge": ...}`` dict where
-        ``longest_edge`` carries the same upper bound. Falls back to
-        ``None`` when neither is available so callers degrade to the
-        single-sequence default.
+        ``size={"shortest_edge": ..., "longest_edge": ...}`` container where
+        ``longest_edge`` carries the same upper bound. In 5.x the container
+        is ``transformers.image_utils.SizeDict`` — NOT a ``dict`` subclass,
+        though it supports ``__getitem__`` — so an ``isinstance(..., dict)``
+        check silently drops the lookup and falls through to ``None``,
+        which then makes ``get_max_requests_per_mm_item`` underestimate the
+        encoder prealloc to the single-sequence default. Use subscript
+        access directly (matches vLLM's Qwen2-VL handling) and only fall
+        back to ``None`` when ``size`` is missing the key entirely.
         """
         image_proc = getattr(self.processor, "image_processor", None)
         if image_proc is None:
@@ -184,9 +189,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if hasattr(image_proc, "max_pixels"):
             return image_proc.max_pixels
         size = getattr(image_proc, "size", None)
-        if isinstance(size, dict):
-            return size.get("longest_edge")
-        return None
+        if size is None:
+            return None
+        try:
+            return size["longest_edge"]
+        except (KeyError, TypeError):
+            return None
 
     def get_num_mm_tokens(
         self,
