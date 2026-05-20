@@ -16,6 +16,7 @@
 
 Ensures /v1/responses perf metrics parity with chat/completions.
 """
+
 import asyncio
 import inspect
 import json
@@ -70,9 +71,12 @@ def server(temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
     """Start a RemoteOpenAIServer with perf-metrics enabled and yield it to tests."""
     model_path = get_model_path(_MODEL)
     args = [
-        "--reasoning_parser", "qwen3",
-        "--tool_parser", "qwen3",
-        "--extra_llm_api_options", temp_extra_llm_api_options_file,
+        "--reasoning_parser",
+        "qwen3",
+        "--tool_parser",
+        "qwen3",
+        "--extra_llm_api_options",
+        temp_extra_llm_api_options_file,
     ]
     logger.info(f"Starting responses perf-metrics server: model={_MODEL}")
     with RemoteOpenAIServer(model_path, args) as remote_server:
@@ -83,6 +87,7 @@ def server(temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _fetch_perf_metrics(server: RemoteOpenAIServer) -> list:
     """Return the current /perf_metrics list (may be empty)."""
@@ -99,20 +104,21 @@ def _assert_perf_metrics_entry_valid(entry: dict, context: str = ""):
     data = entry["perf_metrics"]
     assert "first_iter" in data, f"{context}: missing 'first_iter'"
     assert "last_iter" in data, f"{context}: missing 'last_iter'"
-    assert data["first_iter"] <= data["last_iter"], \
-        f"{context}: first_iter > last_iter"
+    assert data["first_iter"] <= data["last_iter"], f"{context}: first_iter > last_iter"
 
     timing = data["timing_metrics"]
-    for key in ("arrival_time", "first_scheduled_time", "first_token_time",
-                "last_token_time"):
+    for key in ("arrival_time", "first_scheduled_time", "first_token_time", "last_token_time"):
         assert key in timing, f"{context}: missing timing key '{key}'"
 
-    assert timing["arrival_time"] < timing["first_scheduled_time"], \
+    assert timing["arrival_time"] < timing["first_scheduled_time"], (
         f"{context}: arrival_time not before first_scheduled_time"
-    assert timing["first_scheduled_time"] < timing["first_token_time"], \
+    )
+    assert timing["first_scheduled_time"] < timing["first_token_time"], (
         f"{context}: first_scheduled_time not before first_token_time"
-    assert timing["first_token_time"] <= timing["last_token_time"], \
+    )
+    assert timing["first_token_time"] <= timing["last_token_time"], (
         f"{context}: first_token_time after last_token_time"
+    )
 
 
 def _parse_prometheus_counter(data: str, metric_name: str) -> float | None:
@@ -129,8 +135,8 @@ def _parse_prometheus_counter(data: str, metric_name: str) -> float | None:
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_non_streaming_responses_populates_perf_metrics(
-        server: RemoteOpenAIServer):
+
+def test_non_streaming_responses_populates_perf_metrics(server: RemoteOpenAIServer):
     """Non-streaming /v1/responses must append one entry to /perf_metrics."""
     # Establish baseline count (other tests may have run first in the module).
     before = _fetch_perf_metrics(server)
@@ -156,8 +162,7 @@ def test_non_streaming_responses_populates_perf_metrics(
     assert "ctx_request_id" not in new_entry
 
 
-def test_streaming_responses_populates_perf_metrics(
-        server: RemoteOpenAIServer):
+def test_streaming_responses_populates_perf_metrics(server: RemoteOpenAIServer):
     """Streaming /v1/responses must append one entry to /perf_metrics after stream completes."""
     before = _fetch_perf_metrics(server)
     count_before = len(before)
@@ -187,7 +192,8 @@ def test_streaming_responses_populates_perf_metrics(
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
-        server: RemoteOpenAIServer):
+    server: RemoteOpenAIServer,
+):
     """Partially consumed /v1/responses streams must not append completed perf_metrics entries."""
     before = _fetch_perf_metrics(server)
     count_before = len(before)
@@ -208,17 +214,17 @@ async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
     try:
         async for _ in stream:
             got_partial_event = True
-            assert not isinstance(
-                _, ResponseCompletedEvent), (
-                    "Expected a non-terminal delta event before cancellation, "
-                    "but received the completed response event instead")
-            assert isinstance(_, (ResponseTextDeltaEvent,
-                                  ResponseReasoningTextDeltaEvent)), (
-                                      "Expected a streamed delta event before "
-                                      "cancellation")
+            assert not isinstance(_, ResponseCompletedEvent), (
+                "Expected a non-terminal delta event before cancellation, "
+                "but received the completed response event instead"
+            )
+            assert isinstance(_, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)), (
+                "Expected a streamed delta event before cancellation"
+            )
             assert len(_fetch_perf_metrics(server)) == count_before, (
                 "/perf_metrics changed before the stream was cancelled, "
-                "which indicates the request may have already completed")
+                "which indicates the request may have already completed"
+            )
             break
     finally:
         # Explicitly close the stream early to simulate client cancellation.
@@ -313,8 +319,7 @@ def test_prometheus_counter_advances_for_responses(server: RemoteOpenAIServer):
 
     after = _get_counter()
     assert after > before, (
-        f"Prometheus {METRIC} did not advance after /v1/responses "
-        f"(before={before}, after={after})"
+        f"Prometheus {METRIC} did not advance after /v1/responses (before={before}, after={after})"
     )
 
 
@@ -331,8 +336,9 @@ def test_parity_with_chat_completions(server: RemoteOpenAIServer):
         stream=False,
     )
     after_chat = _fetch_perf_metrics(server)
-    assert len(after_chat) == len(before_chat) + 1, \
+    assert len(after_chat) == len(before_chat) + 1, (
         "chat/completions did not produce exactly one /perf_metrics entry"
+    )
     chat_entry = after_chat[-1]
 
     # Responses API entry.
@@ -344,8 +350,9 @@ def test_parity_with_chat_completions(server: RemoteOpenAIServer):
         stream=False,
     )
     after_resp = _fetch_perf_metrics(server)
-    assert len(after_resp) == len(before_resp) + 1, \
+    assert len(after_resp) == len(before_resp) + 1, (
         "/v1/responses did not produce exactly one /perf_metrics entry"
+    )
     resp_entry = after_resp[-1]
 
     # Both entries must have the same top-level keys.

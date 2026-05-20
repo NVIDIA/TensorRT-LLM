@@ -29,6 +29,7 @@ The fix in openai_server.py adds:
        if res is not None:                                  # new guard check
            await self._extract_metrics(res, raw_request)   # new
 """
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -36,11 +37,12 @@ import pytest
 # TensorRT-LLM imports.  We copy only the structure; no real classes needed.
 # ---------------------------------------------------------------------------
 
+
 async def _responses_create_response(promise, extract_metrics_fn, raw_request):
     """Mirror the fixed create_response() inner function from openai_server.py."""
-    await promise.aresult()          # wait for the LLM to finish
-    response = object()              # stand-in for ResponsesResponse
-    await extract_metrics_fn(promise, raw_request)   # <-- THE FIX (line 1622)
+    await promise.aresult()  # wait for the LLM to finish
+    response = object()  # stand-in for ResponsesResponse
+    await extract_metrics_fn(promise, raw_request)  # <-- THE FIX (line 1622)
     return response
 
 
@@ -50,8 +52,7 @@ async def _aiter(items):
         yield item
 
 
-async def _responses_create_streaming_generator(
-        promise_items, extract_metrics_fn, raw_request):
+async def _responses_create_streaming_generator(promise_items, extract_metrics_fn, raw_request):
     """Mirror the fixed create_streaming_generator() inner function from openai_server.py.
 
     promise_items: list of 'output chunk' objects the async-for loop sees.
@@ -61,22 +62,24 @@ async def _responses_create_streaming_generator(
     for r in initial:
         yield r
 
-    res = None                           # <-- THE FIX: guard initialiser (line 1634)
+    res = None  # <-- THE FIX: guard initialiser (line 1634)
     async for res in _aiter(promise_items):
-        yield res                        # yield each chunk to caller
-    if res is not None:                  # <-- THE FIX: guard check (line 1639)
-        await extract_metrics_fn(res, raw_request)   # <-- THE FIX (line 1641)
+        yield res  # yield each chunk to caller
+    if res is not None:  # <-- THE FIX: guard check (line 1639)
+        await extract_metrics_fn(res, raw_request)  # <-- THE FIX (line 1641)
 
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
 # ---------------------------------------------------------------------------
 
+
 class _FakePromise:
     """Minimal stand-in for RequestOutput / Future used in the non-stream path."""
+
     async def aresult(self):
         """Return immediately to simulate a resolved future."""
-        return None   # just returns immediately
+        return None  # just returns immediately
 
 
 RAW_REQUEST = object()  # opaque stand-in for FastAPI Request
@@ -85,6 +88,7 @@ RAW_REQUEST = object()  # opaque stand-in for FastAPI Request
 # ---------------------------------------------------------------------------
 # Test 1: non-streaming path calls _extract_metrics exactly once
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_non_streaming_calls_extract_metrics_once():
@@ -111,6 +115,7 @@ async def test_non_streaming_calls_extract_metrics_once():
 #          and passes the LAST item (not the first, not a count)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_streaming_with_items_calls_extract_metrics_once():
     """Verify _extract_metrics is called once with the last chunk in the streaming path."""
@@ -122,8 +127,7 @@ async def test_streaming_with_items_calls_extract_metrics_once():
         calls.append((res, req))
 
     received = []
-    async for chunk in _responses_create_streaming_generator(
-            chunks, fake_extract, RAW_REQUEST):
+    async for chunk in _responses_create_streaming_generator(chunks, fake_extract, RAW_REQUEST):
         received.append(chunk)
 
     assert received == chunks, "All yielded chunks must be forwarded to the caller"
@@ -143,6 +147,7 @@ async def test_streaming_with_items_calls_extract_metrics_once():
 # Test 3: streaming path with ONE item still calls _extract_metrics once
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_streaming_single_item_calls_extract_metrics_once():
     """Verify _extract_metrics is called once even when only a single chunk is yielded."""
@@ -152,8 +157,7 @@ async def test_streaming_single_item_calls_extract_metrics_once():
     async def fake_extract(res, req):
         calls.append(res)
 
-    async for _ in _responses_create_streaming_generator(
-            [ONLY_CHUNK], fake_extract, RAW_REQUEST):
+    async for _ in _responses_create_streaming_generator([ONLY_CHUNK], fake_extract, RAW_REQUEST):
         pass
 
     assert len(calls) == 1
@@ -167,6 +171,7 @@ async def test_streaming_single_item_calls_extract_metrics_once():
 #          With the guard but wrong condition: spurious metric entry.
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_streaming_empty_iterator_does_not_call_extract_metrics():
     """Verify _extract_metrics is NOT called when the streaming iterator yields no items."""
@@ -175,8 +180,7 @@ async def test_streaming_empty_iterator_does_not_call_extract_metrics():
     async def fake_extract(res, req):
         calls.append(res)
 
-    async for _ in _responses_create_streaming_generator(
-            [], fake_extract, RAW_REQUEST):
+    async for _ in _responses_create_streaming_generator([], fake_extract, RAW_REQUEST):
         pass
 
     assert len(calls) == 0, (
@@ -190,6 +194,7 @@ async def test_streaming_empty_iterator_does_not_call_extract_metrics():
 #          only after the last item is consumed
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_streaming_extract_metrics_called_only_after_last_item():
     """Extract happens AFTER all items are yielded, not before or during."""
@@ -200,14 +205,15 @@ async def test_streaming_extract_metrics_called_only_after_last_item():
         call_order.append(("extract", res))
 
     chunks = [1, 2, 3]
-    async for chunk in _responses_create_streaming_generator(
-            chunks, fake_extract, RAW_REQUEST):
+    async for chunk in _responses_create_streaming_generator(chunks, fake_extract, RAW_REQUEST):
         yielded.append(chunk)
         call_order.append(("yield", chunk))
 
     # All yields must precede the extract call
     assert call_order == [
-        ("yield", 1), ("yield", 2), ("yield", 3),
+        ("yield", 1),
+        ("yield", 2),
+        ("yield", 3),
         ("extract", 3),
     ], (
         "_extract_metrics must be called only AFTER all stream chunks are yielded. "
@@ -219,6 +225,7 @@ async def test_streaming_extract_metrics_called_only_after_last_item():
 # Test 6: non-streaming path — _extract_metrics is called AFTER aresult()
 #          (i.e., only when the full result is ready, not before)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_non_streaming_extract_called_after_aresult():
@@ -238,14 +245,13 @@ async def test_non_streaming_extract_called_after_aresult():
 
     await _responses_create_response(TrackedPromise(), fake_extract, RAW_REQUEST)
 
-    assert order == ["aresult_done", "extract"], (
-        f"Unexpected execution order: {order}"
-    )
+    assert order == ["aresult_done", "extract"], f"Unexpected execution order: {order}"
 
 
 # ---------------------------------------------------------------------------
 # Test 7: both paths are independent — calling one does not affect the other
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_non_streaming_and_streaming_are_independent():
