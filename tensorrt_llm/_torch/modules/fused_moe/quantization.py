@@ -624,12 +624,16 @@ class FusedMoEMethodBase(ABC):
 
     def pre_reload_weights(self, module: torch.nn.Module):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            # Extract meta tensor from metadata dict
-            meta_tensor = metadata['meta']
-            param = torch.nn.Parameter(torch.empty_like(meta_tensor,
-                                                        device="cuda"),
-                                       requires_grad=False)
-            module.register_parameter(param_name, param)
+            # Reuse the cached staging buffer to avoid allocating a fresh
+            # original-shape FP8 tensor on every reload (memory regression fix).
+            # On the first call 'reload_buf' is absent so we allocate once and
+            # cache it; subsequent calls reuse the existing buffer.
+            if 'reload_buf' not in metadata:
+                meta_tensor = metadata['meta']
+                metadata['reload_buf'] = torch.nn.Parameter(
+                    torch.empty_like(meta_tensor, device="cuda"),
+                    requires_grad=False)
+            module.register_parameter(param_name, metadata['reload_buf'])
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
