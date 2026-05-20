@@ -257,7 +257,7 @@ class KVCacheManager:
             self._life_cycles,
             storage_config,
             config.tokens_per_block,
-            config.enable_swa_scratch_reuse,
+            config.swa_scratch_reuse,
             typical_batch=config.typical_step,
             constraints=config.constraints,
             event_manager=event_manager,
@@ -819,3 +819,7 @@ class KVCacheManager:
             else:
                 ub = mid
         return min(lb * tokens_per_block, token_num_upper_bound)
+
+    @property
+    def init_config(self) -> KVCacheManagerConfig:
+        return self._init_config

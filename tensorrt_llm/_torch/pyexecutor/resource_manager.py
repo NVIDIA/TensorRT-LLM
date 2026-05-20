@@ -48,7 +48,8 @@ from tensorrt_llm.runtime.kv_cache_hash import (
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode, ReuseScope)
+    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode,
+    ReuseScope, SwaScratchReuseConfig)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheIterationStatsDelta
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
@@ -1928,6 +1929,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
@@ -2453,7 +2455,9 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
-            enable_swa_scratch_reuse=self.enable_swa_scratch_reuse,
+            swa_scratch_reuse=(SwaScratchReuseConfig(
+                max_rewind_len=self.max_draft_len)
+                               if self.enable_swa_scratch_reuse else None),
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,

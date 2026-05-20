@@ -45,6 +45,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     PageIndexMode,
     ScratchDesc,
+    SwaScratchReuseConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
@@ -804,7 +805,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
-            enable_swa_scratch_reuse=self.enable_swa_scratch_reuse,
+            swa_scratch_reuse=(
+                SwaScratchReuseConfig(max_rewind_len=self._max_draft_len)
+                if self.enable_swa_scratch_reuse
+                else None
+            ),
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
