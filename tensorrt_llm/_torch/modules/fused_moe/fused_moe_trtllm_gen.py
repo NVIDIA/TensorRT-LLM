@@ -362,7 +362,7 @@ class TRTLLMGenFusedMoE(MoE):
                     self.routing_method):
                 return False
             return True
-
+        return True
         use_flashinfer = os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER",
                                         "0")
         if use_flashinfer != "1":

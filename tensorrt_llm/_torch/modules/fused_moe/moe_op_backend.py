@@ -633,8 +633,11 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
-            # Run with pre-computed routing (packed format)
+            # FlashInfer nightly exposes unpacked precomputed routing for the FP4
+            # routed API only. The FP8 routed API still takes packed top-k input.
+            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
+                torch.bfloat16
+            ).view(torch.int16).to(torch.int32)
             return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
                 topk_ids=packed_topk_ids,
                 routing_bias=routing_bias,
@@ -757,11 +760,12 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
-                torch.int16
+            routing_input = (
+                topk_ids.to(torch.int32),
+                topk_weights.to(torch.bfloat16),
             )
             outputs = self._fused_moe.trtllm_fp4_block_scale_routed_moe(
-                packed_tensor,
+                routing_input,
                 routing_bias,
                 hidden_states,
                 hidden_states_scale.view(torch.float8_e4m3fn)
