@@ -180,6 +180,7 @@ def _fused_inv_rope_fp8_quant_per_head_mblock(
     fp8_stride_token,
     scale_stride_group,
     scale_stride_k,
+    scale_buf_m: tl.constexpr,
     fp8_max: tl.constexpr,
     eps: tl.constexpr,
     QUANT_GROUP_SIZE: tl.constexpr,
@@ -189,12 +190,12 @@ def _fused_inv_rope_fp8_quant_per_head_mblock(
     IS_NEOX: tl.constexpr,
     BLOCK_TOKENS_M: tl.constexpr,
 ):
-    # Multi-token-per-block variant for M >= 1024. Grid X = ceil(M / BTM).
-    # Compared to the BTM=1 kernel: fewer total blocks → higher SM occupancy
-    # (each SM gets more useful work between launch-issue overheads), with
-    # the trade-off of inner-loop unrolling growing the compiled binary by
-    # BTM×. At BTM∈{8,16} the unroll cost is comfortably amortized.
-    # int64: stride multiply overflows int32 past num_tokens=32768 (IMA).
+    # Multi-token-per-block variant for M >= 1024. Grid X = ceil(scale_buf_m / BTM).
+    # scale_buf_m = pad_up(num_tokens, 4) — the BMM consumer's expected
+    # scale-tensor M dim (see `cute_dsl_fp8_bmm_blackwell` `sf_m = pad_up(m, 4)`).
+    # The grid may overshoot past scale_buf_m when scale_buf_m isn't a multiple
+    # of BTM, so the inner loop guards with `pid_token < scale_buf_m` to avoid
+    # OOB scale writes.
     pid_x = tl.program_id(0).to(tl.int64)
     pid_gh = tl.program_id(1).to(tl.int64)
 
@@ -221,7 +222,13 @@ def _fused_inv_rope_fp8_quant_per_head_mblock(
     for m_in_block in tl.range(0, BLOCK_TOKENS_M, num_stages=2):
         pid_token = pid_x * BLOCK_TOKENS_M + m_in_block
 
-        if pid_token >= num_tokens:
+        if pid_token >= scale_buf_m:
+            # Beyond the (4-aligned) scale buffer: skip entirely. Happens
+            # only on the very last grid block when scale_buf_m % BTM != 0.
+            pass
+        elif pid_token >= num_tokens:
+            # Padding row in [num_tokens, pad_up(num_tokens, 4)): zero scale
+            # so the BMM dequant sees 0 instead of stale memory.
             scale_addrs = (
                 scale_ptr + g * scale_stride_group + pid_token + qb_indices * scale_stride_k
             )
@@ -351,11 +358,16 @@ def _fused_inv_rope_fp8_quant_impl(
     fp8_max = torch.finfo(fp8_dtype).max
 
     block_tokens_m = _choose_block_tokens_m(num_tokens)
-    # Pad scale-buffer M dim to max(BLOCK_TOKENS_M, 4): TMA consumer needs
-    # 4-alignment, and grid-X = ceil(M / BTM) blocks each writes BTM scale
-    # rows — so M must align to BTM too. lcm(BTM, 4) = max(BTM, 4) for
-    # BTM ∈ {1, 2, 4, 8, 16, ...} (powers of 2).
-    tma_aligned_T = _tma_aligned_size(num_tokens, max(block_tokens_m, 4))
+    # The scale buffer is consumed by `cute_dsl_fp8_bmm_blackwell` which
+    # *hard-codes* its m-dim stride as `sf_m = pad_up(m, 4)` (see
+    # `tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py:3635`). Padding
+    # to a different alignment makes the BMM read scales from wrong physical
+    # offsets — silently producing wrong dequant values for ~7-13 gsm8k
+    # points under DEP8 when BTM > 4. We MUST keep the producer's pad equal
+    # to pad_up(num_tokens, 4) regardless of BTM. The mblock kernel's grid
+    # may overshoot scale_buf_m when scale_buf_m % BTM != 0; the inner-loop
+    # guard handles that (see `_fused_inv_rope_fp8_quant_per_head_mblock`).
+    tma_aligned_T = _tma_aligned_size(num_tokens, 4)
 
     # FP8 output buffer: fully contiguous [n_groups, num_tokens, d] — must
     # match `fp8_batched_quantize_1x128_permute102`'s contiguous output exactly,
@@ -443,7 +455,12 @@ def _fused_inv_rope_fp8_quant_impl(
         # num_stages: software-pipelining depth across the inner loop.
         # BTM=32 has more iterations to pipeline so stages=3 has more value.
         ns = 3 if block_tokens_m >= 32 else 2
-        grid = (tma_aligned_T // block_tokens_m, n_groups * heads_per_group)
+        # ceil_div: tma_aligned_T may not be a multiple of BTM (e.g.
+        # M=1500, tma_aligned_T=1500, BTM=16 → grid_x=94, max pid_token=1519).
+        # The kernel's inner-loop `pid_token < scale_buf_m` guard handles
+        # the overshoot — no OOB scale writes.
+        grid_x = (tma_aligned_T + block_tokens_m - 1) // block_tokens_m
+        grid = (grid_x, n_groups * heads_per_group)
         _fused_inv_rope_fp8_quant_per_head_mblock[grid](
             o,
             positions,
@@ -451,6 +468,7 @@ def _fused_inv_rope_fp8_quant_impl(
             fp8_buf,
             scale_buf,
             num_tokens,
+            scale_buf_m=tma_aligned_T,
             **common_kwargs,
             BLOCK_TOKENS_M=block_tokens_m,
             num_warps=nw,
