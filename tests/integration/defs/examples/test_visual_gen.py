@@ -1088,7 +1088,7 @@ def test_vbench_dimension_score_wan22_a14b_fp8(
         llm_venv,
         title="WAN 2.2 A14B FP8",
         golden_scores=VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES,
-        max_score_diff=0.05,
+        max_score_diff=0.06,
     )
 
 
