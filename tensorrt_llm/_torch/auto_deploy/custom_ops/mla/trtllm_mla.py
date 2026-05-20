@@ -1372,7 +1372,8 @@ def _handle_prefill_thop_cached_kv(
             None,  # sparse_attn_indices
             None,  # sparse_attn_offsets
             1,  # sparse_attn_indices_block_size
-            0,  # sparse_mla_topk
+            0,  # num_sparse_topk
+            None,  # sparse_mla_topk_lens
             None,  # skip_softmax_threshold_scale_factor_prefill
             None,  # skip_softmax_threshold_scale_factor_decode
             None,  # skip_softmax_stat
