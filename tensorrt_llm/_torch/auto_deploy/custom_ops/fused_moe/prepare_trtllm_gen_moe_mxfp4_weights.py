@@ -6,43 +6,18 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""MXFP4 weight prep for TRT-LLM-Gen `bf16_mxe2m1_block_scale_moe_runner`.
+"""MXFP4 weight prep for TRT-LLM-Gen ``bf16_mxe2m1_block_scale_moe_runner``.
 
-This produces the kernel-ready stacked tensors that
-``auto_deploy::trtllm_mxfp4_w4a16_moe_fused`` expects, starting from the
-HuggingFace on-disk MXFP4 layout that the existing AutoDeploy
-``quantize_mxfp4_moe`` transform registers.
+Transforms HF on-disk MXFP4 expert tensors (``gate_up_proj_*``, ``down_proj_*`` registered by
+``quantize_mxfp4_moe``) into the kernel-ready stacked layout that
+``auto_deploy::trtllm_mxfp4_w4a16_moe_fused`` expects: ``[E_local, 2I_pad, H_pad/2]`` weights,
+``[E_local, 2I_pad]`` fp32 biases, etc., all run through ``torch.ops.trtllm.shuffle_matrix`` for
+the TMA layout.
 
-Layout notes:
-
-* HF on-disk:
-    gate_up_proj_blocks  : ``[E, 2I, H/32, 16]`` ``uint8`` (= ``[E, 2I, H/2]`` flattened)
-    gate_up_proj_scales  : ``[E, 2I, H/32]``     ``uint8`` (UE8M0)
-    gate_up_proj_bias    : ``[E, 2I]``           ``bfloat16``
-    down_proj_blocks     : ``[E, H, I/32, 16]``  ``uint8``
-    down_proj_scales     : ``[E, H, I/32]``      ``uint8``
-    down_proj_bias       : ``[E, H]``            ``bfloat16``
-
-* What the trtllm-gen kernel expects:
-    gemm1_weights        : ``[E_local, 2I_pad, H_pad/2]``    ``uint8`` (col-parallel for w1/w3)
-    gemm1_weights_scale  : ``[E_local, 2I_pad, H_pad/32]``   ``uint8``
-    gemm1_bias           : ``[E_local, 2I_pad]``             ``float32``
-    gemm2_weights        : ``[E_local, H_pad, I_pad/2]``     ``uint8`` (row-parallel for w2)
-    gemm2_weights_scale  : ``[E_local, H_pad, I_pad/32]``    ``uint8``
-    gemm2_bias           : ``[E_local, H_pad]``              ``float32`` (divided by tp_size)
-
-  All weights / scales additionally go through
-  ``torch.ops.trtllm.shuffle_matrix`` so the kernel can hit its TMA layout.
-
-This module mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod``
-(`tensorrt_llm/_torch/modules/fused_moe/quantization.py:4135`).
-The PT helpers are reused via direct import to keep the algorithm
-byte-identical:
-
-* ``maybe_pad_for_mxfp4``                           — alignment padding
-* ``trtllmgen_maybe_get_cached_w3_w1_permute_indices`` — gated GEMM shuffle
-* ``trtllmgen_maybe_get_cached_w2_permute_indices`` — non-gated GEMM shuffle
-* ``_get_weight_alignment``                         — alignment derivation
+Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod``
+(``tensorrt_llm/_torch/modules/fused_moe/quantization.py:4135``) — PT helpers
+(``maybe_pad_for_mxfp4``, ``trtllmgen_maybe_get_cached_*``, ``_get_weight_alignment``) are imported
+directly so the algorithm is byte-identical.
 """
 
 from dataclasses import dataclass
@@ -73,12 +48,8 @@ _EPILOGUE_TILE_M: int = 128
 def _compute_padded_dims(per_rank_i: int, hidden_size: int) -> Tuple[int, int, int]:
     """Returns ``(i_pad, h_w1_pad, h_w2_pad)`` for the trtllm-gen layout.
 
-    ``i_pad`` aligns the per-rank intermediate dim to ``_WEIGHT_ALIGNMENT``
-    (128, TMA weight alignment). ``h_w1_pad`` aligns hidden to
-    ``_INPUT_HIDDEN_ALIGNMENT`` (512, TMA input constraint) for w1's K-axis.
-    ``h_w2_pad`` aligns hidden to ``_WEIGHT_ALIGNMENT`` (128) for w2's
-    weight N-axis. Used by :class:`MXFP4PrepScratch.allocate` and the
-    main prep helper so all sites share one ceiling formula.
+    ``i_pad`` / ``h_w2_pad`` align to 128 (TMA weight alignment);
+    ``h_w1_pad`` aligns to 512 (TMA input-hidden constraint on w1's K-axis).
     """
     i_pad = ((per_rank_i + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT) * _WEIGHT_ALIGNMENT
     h_w1_pad = (
@@ -108,29 +79,16 @@ class TRTLLMGenMXFP4MoEWeights:
 class MXFP4PrepScratch:
     """Reusable GPU scratch buffers for ``prepare_trtllm_gen_moe_mxfp4_weights``.
 
-    Use :meth:`allocate` to pre-allocate once for the per-rank kernel-layout
-    shape; pass to :func:`prepare_trtllm_gen_moe_mxfp4_weights` via the
-    ``scratch=`` kwarg on every MoE layer in a build/fuse pass. The helper
-    writes its pad + shuffle outputs into these buffers in-place, so no
-    transient pad/shuffle tensors accumulate or are freed per layer.
+    Allocated once per build pass via :meth:`allocate` (sized for ONE MoE layer's per-rank shape —
+    gpt-oss guarantees H/I/E are constant across layers) and reused on every layer to avoid
+    per-layer pad/shuffle transients. ``trtllm.shuffle_matrix`` is not in-place, so we keep
+    separate ``_pad_buf`` (post-pad, pre-shuffle) and no-suffix (post-shuffle, kernel-ready)
+    buffers per tensor kind.
 
-    Caller MUST ``.clone()`` (or ``.data.copy_()`` into a fresh nn.Parameter)
-    the relevant buffer fields *before the next layer's prep call*; otherwise
-    the next call's writes overwrite the previous layer's data. The intended
-    usage in :class:`FuseMXFP4Moe` is to pre-allocate the destination
-    ``nn.Parameter`` storage for every MoE layer *first* (so all prepared
-    blocks are placed contiguously in allocator order, with no transients
-    interleaved), then per layer run prep with scratch and ``copy_`` from
-    scratch into the pre-allocated parameter storage.
-
-    All buffers are sized for ONE MoE layer's per-rank shape. gpt-oss has
-    a cross-layer consistency guarantee (all MoE layers share H/I/E) so
-    one scratch is sufficient for every layer in the model.
-
-    Fields ending in ``_pad_buf`` hold pad outputs (post pad, pre shuffle);
-    fields without that suffix hold shuffle outputs (kernel-ready layout).
-    Two separate buffers per kind because ``trtllm.shuffle_matrix`` reads
-    from one tensor and writes a new one — it cannot operate in-place.
+    Caller MUST ``copy_`` the prep result into final storage before the next call — the dataclass
+    holds VIEWS of these buffers and the next call overwrites them. The intended use is
+    :class:`FuseMXFP4Moe`: pre-allocate all layers' destination ``nn.Parameter`` storage first,
+    then per-layer prep + ``copy_`` from scratch.
     """
 
     # Shuffle outputs (= kernel-ready layout; what the prepared nn.Parameter
@@ -168,11 +126,10 @@ class MXFP4PrepScratch:
         hidden_size: int,
         device: torch.device | str,
     ) -> "MXFP4PrepScratch":
-        """Allocate the scratch buffers for one MoE layer's per-rank shape.
+        """Allocate scratch for one MoE layer at the given per-rank shape.
 
-        ``e_local`` is the per-rank expert count, ``per_rank_i`` is the
-        intermediate dim already TP-sliced (or full ``I`` if no TP), and
-        ``hidden_size`` is the model's hidden dim ``H``.
+        ``per_rank_i`` is the already-TP-sliced intermediate dim (= full ``I``
+        when ``tp_size == 1``).
         """
         i_pad, h_w1_pad, h_w2_pad = _compute_padded_dims(per_rank_i, hidden_size)
         u8 = dict(dtype=torch.uint8, device=device)
@@ -241,11 +198,11 @@ def _shuffle_one_expert(
     num_elts_per_sf: int | None,
     is_scale: bool,
 ) -> torch.Tensor:
-    """Single-expert TMA-layout shuffle. Looping over experts is required
-    because PT's permute-index helpers derive indices from a 2-D shape.
+    """Single-expert TMA-layout shuffle (looped per-expert because PT's permute-index helpers
+    derive indices from a 2-D shape).
 
-    ``permute_fn`` selects the gated (w3/w1) or non-gated (w2) permutation;
-    ``is_scale=True`` chains ``block_scale_interleave`` (kernel scale layout).
+    ``permute_fn``: gated (w3/w1) vs non-gated (w2). ``is_scale=True`` chains
+    ``block_scale_interleave`` for the kernel's scale layout.
     """
     slc = slc.contiguous()
     perm = permute_fn(slc, _PERMUTE_CACHE, _EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf)
@@ -263,17 +220,12 @@ def _shuffle_per_expert(
     is_scale: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-expert TMA-layout shuffle, used for weights, scales, and biases.
+    """Per-expert TMA-layout shuffle (weights, scales, biases all share this).
 
-    PT mirror points (`tensorrt_llm/_torch/modules/fused_moe/quantization.py`):
-      * weights: ``load_expert_w3_w1_weight`` / ``load_expert_w2_weight``
-      * scales:  ``..._weight_scale_mxfp4`` (adds ``block_scale_interleave``)
-      * biases:  same row permute as weights so ``bias[i]`` aligns with
-        ``weight_row[i]`` post-shuffle (gemm1_bias indexes into the wrong
-        rows otherwise → MoE output garbage).
-
-    ``out=None`` builds a fresh stacked tensor; otherwise per-expert results
-    are ``copy_``-ed into ``out[i]`` so caller-provided storage is filled.
+    Biases use the SAME row permute as their weights so ``bias[i]`` aligns with ``weight_row[i]``
+    post-shuffle — mismatch → kernel epilogue adds the wrong bias and MoE output is garbage.
+    ``out=None`` returns a fresh stacked tensor; otherwise per-expert results are ``copy_``-ed
+    into caller-provided storage.
     """
     e = stacked.size(0)
     per_expert = (
@@ -292,14 +244,10 @@ def _deinterleave_gate_up(
     gate_up_scales: torch.Tensor,  # [E, 2I, H/32]
     gate_up_bias: torch.Tensor,  # [E, 2I]
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split the interleaved 2I axis into separate gate/up halves.
+    """Split the HF interleaved 2I axis (gate at even rows, up at odd rows) into separate halves.
 
-    HF's MXFP4 gate_up layout interleaves gate at even rows and up at odd rows.
-    PT's gpt-oss loader (``modeling_gpt_oss.py:695-706`` +
-    ``quantization.py:4252-4258``) ends up with ``dst_w3 = up`` in the first
-    half and ``dst_w1 = gate`` in the second half. We keep up/gate separate
-    here so downstream row-padding puts the zero-pad rows INSIDE each half,
-    not at the very end of the concatenated 2I axis.
+    Kept separate so downstream row-padding puts the zero-pad rows INSIDE each half before re-concat
+    as ``[up | gate]`` — matches PT's ``dst_w3 = up`` / ``dst_w1 = gate`` chunk layout.
     """
     return (
         gu_3d[:, 0::2, :].contiguous(),  # gate_rows_w
@@ -337,20 +285,32 @@ def _tp_slice_intermediate_axis(
     tp_size: int,
     tp_rank: int,
 ):
-    """Pre-pad + slice the intermediate axis to this rank's range.
+    """Pre-pad ``I`` to ``i_padded_tp`` then slice this rank's range (mirrors PT
+    ``quantization.py:4211-4234``).
 
-    Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod`` shard math
-    (``quantization.py:4211-4234``): pad I to ``i_padded_tp`` (a multiple of
-    ``alignment_tp`` so ``i_padded_tp / tp_size`` is itself 128-aligned),
-    then slice each tensor on its intermediate-encoding axis. PRE-padding
-    before sharding guarantees scaling-factor blocks (32 elements each) do
-    not straddle rank boundaries.
+    The alignment guarantees ``i_padded_tp / tp_size`` stays 128-aligned and that scaling-factor
+    blocks (32 elements) don't straddle rank boundaries. Example: gpt-oss I=2880 @ tp=8 →
+    ``alignment_tp=3072`` → ``per_rank_i=384``.
 
-    For gpt-oss-120b with I=2880 @ tp=8: ``alignment_tp=3072`` →
-    ``per_rank_i=384``.
+    No-op when ``tp_size == 1``: returns inputs unchanged with
+    ``per_rank_i = valid_intermediate = intermediate_size``.
 
-    Returns the sliced tensors plus ``(per_rank_i, valid_intermediate)``.
+    Returns the (possibly sliced) tensors plus ``(per_rank_i, valid_intermediate)``.
     """
+    if tp_size == 1:
+        return (
+            gate_rows_w,
+            up_rows_w,
+            gate_rows_s,
+            up_rows_s,
+            gate_b,
+            up_b,
+            dn_3d,
+            down_scales,
+            intermediate_size,
+            intermediate_size,
+        )
+
     alignment_tp = _get_weight_alignment(
         _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, tp_size, intermediate_size
     )
@@ -381,7 +341,7 @@ def _tp_slice_intermediate_axis(
     )
 
 
-def _pad_concat_gate_up(
+def _pad_concat_fc1(
     up_rows: torch.Tensor,
     gate_rows: torch.Tensor,
     col_alignment: int,
@@ -558,45 +518,22 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
     tp_rank: int = 0,
     scratch: MXFP4PrepScratch | None = None,
 ) -> TRTLLMGenMXFP4MoEWeights:
-    """Convert HF on-disk MXFP4 expert weights into trtllm-gen-ready stacked tensors.
+    """Convert HF on-disk MXFP4 expert weights to the trtllm-gen kernel layout.
 
-    Mirrors the algorithm in
-    ``MXFP4WeightTRTLLMGenFusedMoEMethod.{post_load_weights,
-    load_expert_w3_w1_weight, load_expert_w2_weight,
-    load_expert_w3_w1_weight_scale_mxfp4, load_expert_w2_weight_scale_mxfp4}``.
+    Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod`` (``post_load_weights`` +
+    ``load_expert_w{3_w1,2}_weight{,_scale_mxfp4}``).
 
-    For ``tp_size > 1`` (TP-MoE):
-    intermediate dim is sharded across ``tp_size`` ranks before the kernel-
-    layout pad+shuffle.  PT does this in
-    ``load_expert_w3_w1_weight`` / ``load_expert_w2_weight`` via
-    ``load_weight_shard(..., COLUMN/ROW)`` after a TP-aware pre-pad
-    (``alignment = _get_weight_alignment(weight_alignment, scaling_vector_size,
-    tp_size, I)``).  We replicate that here in three steps:
-      1. derive ``alignment_tp`` so ``alignment_tp / tp_size`` is
-         128-aligned — guarantees per-rank ``I/tp`` is itself 128-aligned
-         after the pre-pad, which is what TMA + cubin coverage need.
-      2. pre-pad each half (gate / up / scales / biases / down) on the
-         intermediate axis to ``alignment_tp``.
-      3. slice the intermediate axis to this rank's range
-         ``[tp_rank * (alignment_tp / tp_size) : (tp_rank+1) * ...]``.
-    The downstream pad+shuffle then operates on per-rank tensors with
-    intermediate dim ``alignment_tp / tp_size`` (= 384 for gpt-oss at
-    tp=8).  ``valid_intermediate`` is clamped to ``min(intermediate_size,
-    slice_stop) - slice_start`` so the kernel hint reflects the unpadded
-    portion of this rank's slice (matches PT's
-    ``intermediate_size_per_partition_lean``).
+    Notes on optional args:
+      * ``tp_size > 1``: shard the intermediate dim before the kernel-layout pad+shuffle — see
+        :func:`_tp_slice_intermediate_axis` for the TP-aware pre-pad + slice math (mirrors PT
+        ``load_weight_shard``).
+      * ``scratch != None``: pad/shuffle outputs are written into the pre-allocated GPU buffers and
+        the returned dataclass holds VIEWS into that scratch, so caller must ``copy_`` results out
+        before the next call. Only supported at ``tp_size == 1`` (load hook does TP slicing first
+        — see :class:`MXFP4PrepScratch`).
 
-    EP (expert dim slicing) is NOT done here — the transform handles EP by
-    selecting the expert subset before calling this helper.
-
-    Scratch path (``scratch != None``): all kernel-layout outputs (pad +
-    shuffle results and the fp32 biases) are written into the pre-allocated
-    GPU buffers in :class:`MXFP4PrepScratch`. The returned
-    :class:`TRTLLMGenMXFP4MoEWeights` fields are VIEWS of those buffers, so
-    the caller MUST consume / copy them out before the next call to this
-    function overwrites the scratch. Scratch path only supports
-    ``tp_size == 1`` (the intended use case is ``FuseMXFP4Moe`` calling
-    this helper after the load hook has already done TP slicing).
+    EP (expert-axis slicing) is NOT done here — the caller selects the expert subset before
+    invoking.
     """
     if tp_size > 1 and intermediate_size % tp_size != 0:
         raise ValueError(
@@ -624,34 +561,30 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
     )
 
     # 2. TP slicing on the intermediate axis (no-op for tp_size == 1).
-    if tp_size > 1:
-        (
-            gate_rows_w,
-            up_rows_w,
-            gate_rows_s,
-            up_rows_s,
-            gate_b,
-            up_b,
-            dn_3d,
-            down_scales,
-            intermediate_size_for_local,
-            valid_intermediate,
-        ) = _tp_slice_intermediate_axis(
-            gate_rows_w,
-            up_rows_w,
-            gate_rows_s,
-            up_rows_s,
-            gate_b,
-            up_b,
-            dn_3d,
-            down_scales,
-            intermediate_size,
-            tp_size,
-            tp_rank,
-        )
-    else:
-        intermediate_size_for_local = intermediate_size
-        valid_intermediate = intermediate_size
+    (
+        gate_rows_w,
+        up_rows_w,
+        gate_rows_s,
+        up_rows_s,
+        gate_b,
+        up_b,
+        dn_3d,
+        down_scales,
+        intermediate_size_for_local,
+        valid_intermediate,
+    ) = _tp_slice_intermediate_axis(
+        gate_rows_w,
+        up_rows_w,
+        gate_rows_s,
+        up_rows_s,
+        gate_b,
+        up_b,
+        dn_3d,
+        down_scales,
+        intermediate_size,
+        tp_size,
+        tp_rank,
+    )
 
     # 3. Per-rank padded layout dims (mirrors PT
     #    ``MXFP4WeightTRTLLMGenFusedMoEMethod``: per-expert I + H padded
@@ -662,7 +595,7 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
 
     # 4. Pad weights + scales (concat [up | gate] for fc1; single half for fc2).
     sv = _MXFP4_SCALING_VECTOR_SIZE
-    gu_padded = _pad_concat_gate_up(
+    gu_padded = _pad_concat_fc1(
         up_rows_w,
         gate_rows_w,
         hidden_w1_pad // 2,
@@ -675,7 +608,7 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
         hidden_w2_pad,
         scratch_buf=scratch.fc2_w_pad_buf if scratch is not None else None,
     )
-    gu_scale_padded = _pad_concat_gate_up(
+    gu_scale_padded = _pad_concat_fc1(
         up_rows_s,
         gate_rows_s,
         hidden_w1_pad // sv,
@@ -724,23 +657,3 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
         intermediate_size_padded=intermediate_size_padded,
         hidden_size_padded=hidden_size_padded,
     )
-
-
-def make_swiglu_param_tensors(
-    num_local_experts: int,
-    *,
-    alpha: float = 1.702,
-    beta: float = 1.0,
-    limit: float = 7.0,
-    device: torch.device | str | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the per-expert SwiGLU-bias parameter triple expected by the kernel.
-
-    For gpt-oss-120b: alpha=1.702, beta=1.0, limit=7.0 (constants embedded in the
-    HF model config).
-    """
-    dev = torch.device(device) if device is not None else None
-    a = torch.full((num_local_experts,), alpha, dtype=torch.float32, device=dev)
-    b = torch.full((num_local_experts,), beta, dtype=torch.float32, device=dev)
-    c = torch.full((num_local_experts,), limit, dtype=torch.float32, device=dev)
-    return a, b, c

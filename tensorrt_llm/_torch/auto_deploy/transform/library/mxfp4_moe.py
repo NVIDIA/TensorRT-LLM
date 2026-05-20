@@ -428,6 +428,27 @@ def make_mxfp4_sharding_load_hook(
     return hook
 
 
+def make_swiglu_param_tensors(
+    num_local_experts: int,
+    *,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+    limit: float = 7.0,
+    device: torch.device | str | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the per-expert SwiGLU-bias parameter triple expected by the kernel.
+
+    These constants are NOT in HF safetensors (only in the model config), so
+    the transform constructs them here and registers them as ``nn.Parameter``
+    on the experts module. For gpt-oss-120b: alpha=1.702, beta=1.0, limit=7.0.
+    """
+    dev = torch.device(device) if device is not None else None
+    a = torch.full((num_local_experts,), alpha, dtype=torch.float32, device=dev)
+    b = torch.full((num_local_experts,), beta, dtype=torch.float32, device=dev)
+    c = torch.full((num_local_experts,), limit, dtype=torch.float32, device=dev)
+    return a, b, c
+
+
 class InsertMXFP4MLPConfig(TransformConfig):
     """Configuration for ``quantize_mxfp4_moe``."""
 
@@ -701,10 +722,6 @@ class InsertMXFP4MLP(BaseTransform):
            :class:`FuseMXFP4Moe` after the weights are loaded.
         """
         import re
-
-        from ...custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
-            make_swiglu_param_tensors,
-        )
 
         # MoE topology comes from the build-time ``DistConfig`` on
         # ``shared_config``; passed directly into the sharding load hook
