@@ -1304,6 +1304,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ),
     ]
 
+    @skip_pre_blackwell
     @pytest.mark.parametrize(
         "model_id,model_name,world_size_override,moe_topology", MODEL_PARAMS)
     def test_mxfp4_gsm8k(self, model_id, model_name, world_size_override,
@@ -1313,16 +1314,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           {"scores_filter": "exact_match,flexible-extract"})
 
         yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
+        # world_size: yaml-driven; ``world_size_override`` is only used for
+        # MoE-TP / MoE-EP cases that exercise sharding on top of the same yaml.
         world_size = (world_size_override if world_size_override is not None
                       else registry_world_size)
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
-        # On TP > 1 the default `dist_mapping` resolves to EP=world_size
-        # (Triton EP path). We override `dist_mapping` here according to
-        # `moe_topology` and include "moe" in `shard_layers` so
-        # `AllReduceShardableNode` resolves the post-MoE all_reduce
-        # placeholder emitted by `GptOssMLP.forward`.
+        # Override the default MoE topology via `apply_sharding_hints`:
+        # `dist_mapping` selects MoE-TP vs MoE-EP, and ``"moe"`` in
+        # `shard_layers` lets the sharding pass wire up the MoE all_reduce
+        # (inserted by ``QuantizeMXFP4MOE._apply_trtllm`` when tp_size > 1).
         extra_kwargs = {}
         if moe_topology is not None and world_size > 1:
             if moe_topology == "tp":
