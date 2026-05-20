@@ -109,6 +109,9 @@ def _init_gb10_nccl_symmetric_workaround() -> bool:
     return True
 
 
+deep_gemm.set_pdl(get_env_enable_pdl())
+
+
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
