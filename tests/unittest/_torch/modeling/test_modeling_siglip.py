@@ -126,6 +126,15 @@ class TestSiglipVisionModel(unittest.TestCase):
                                   output_attentions=False,
                                   output_hidden_states=True)
 
+        # Mirror PyTorchModelEngine: allocate the encoder's AttentionMetadata
+        # with engine-style runtime sizes before forward. Without this the
+        # MultimodalEncoderMixin's `attn_metadata` stays at its class-level
+        # default of None and `prepare_attn_metadata` blows up on attribute
+        # access.
+        seq_len = (hf_config.image_size // hf_config.patch_size)**2
+        tllm_model.setup_attn_metadata(max_num_requests=batch_size,
+                                       max_num_tokens=seq_len * batch_size)
+
         # Fill the metadata for tllm attn
         attn_metadata = tllm_model.prepare_attn_metadata(batch_size)
 

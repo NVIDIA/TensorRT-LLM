@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import bypass_processor_output_validation
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
@@ -192,7 +193,32 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 ):
                     module.post_load_weights()
 
+        # Mirror PyTorchModelEngine._set_up_attn_metadata: walk submodules and
+        # build each encoder's AttentionMetadata with engine-style upper-bound
+        # sizes. Without this, MultimodalEncoderMixin.attn_metadata stays None
+        # and the encoder's `prepare_attn_metadata` trips an AttributeError.
+        for module in model.modules():
+            if isinstance(module, MultimodalEncoderMixin):
+                module.setup_attn_metadata(
+                    max_num_requests=self.get_encoder_max_num_requests(),
+                    max_num_tokens=self.get_encoder_max_num_tokens(),
+                )
+
         return model, model_config
+
+    def get_encoder_max_num_requests(self) -> int:
+        """Upper bound on per-encoder request count across all test scenarios.
+
+        Mirrors the engine's `encoder_batch_size * max_requests_per_item`
+        product but with generous fixed defaults that cover every scenario in
+        this test harness (multi-image, multi-frame video, etc.). Subclasses
+        may override if their encoder needs more.
+        """
+        return 64
+
+    def get_encoder_max_num_tokens(self) -> int:
+        """Upper bound on per-encoder token count across all test scenarios."""
+        return 65536
 
     def create_hf_model(self, pretrained_config: PretrainedConfig) -> PreTrainedModel:
         """Create a HuggingFace model instance."""
