@@ -506,6 +506,7 @@ def _rectangle_precompute_impl(
     BLOCK_SIZE_K: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
+    USE_GATHER_FOR_NEW_TOKENS: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_hg = tl.program_id(axis=1)
@@ -653,8 +654,10 @@ def _rectangle_precompute_impl(
 
     # Production uses matching padded T/K sizes, where tl.gather is the cheap
     # path.  Some tests use a larger padded K than T; Triton rejects that gather
-    # axis mismatch, so use a slower one-hot sum fallback for those cases.
-    if BLOCK_SIZE_T == BLOCK_SIZE_K:
+    # axis mismatch, so use a slower one-hot sum fallback for those cases.  The
+    # wrapper passes this as an explicit constexpr so fast-path compilations do
+    # not carry the fallback branch.
+    if USE_GATHER_FOR_NEW_TOKENS:
         new_token_gather_idx = tl.broadcast_to(
             safe_k_new[None, :], (HEADS_PER_BLOCK, BLOCK_SIZE_K)
         )
@@ -867,6 +870,7 @@ def _dynamic_precompute_kernel(
     HEADS_PER_BLOCK: tl.constexpr,
     # Compile-time pick: rectangle (with replay-write fallback) vs replay-only.
     RECTANGLE: tl.constexpr,
+    RECTANGLE_USE_GATHER: tl.constexpr,
 ):
     # Hoisted PDL signal: fire as the first thing every program does.
     if LAUNCH_DEPENDENT_KERNELS:
@@ -1008,6 +1012,7 @@ def _dynamic_precompute_kernel(
             BLOCK_SIZE_K,
             LAUNCH_WITH_PDL,
             HEADS_PER_BLOCK,
+            RECTANGLE_USE_GATHER,
         )
 
 
@@ -2634,6 +2639,7 @@ def replay_selective_state_update(
     # one-hot fallback because tl.gather requires matching padded axis sizes.
     # Production uses matching padded T/K; mismatches are for tests/debugging.
     BLOCK_SIZE_K = max(triton.next_power_of_2(max_window), 16)
+    rectangle_use_gather = BLOCK_SIZE_T == BLOCK_SIZE_K
 
     # Allocate precomputed intermediates (per-call, not cached).  Always
     # allocate (T, K) — the largest layout that any path uses.  Replay-style
@@ -2906,6 +2912,7 @@ def replay_selective_state_update(
             LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
             HEADS_PER_BLOCK=heads_per_block,
             RECTANGLE=rectangle,
+            RECTANGLE_USE_GATHER=rectangle_use_gather,
             num_warps=precompute_num_warps,
             **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
             launch_pdl=launch_with_pdl,
