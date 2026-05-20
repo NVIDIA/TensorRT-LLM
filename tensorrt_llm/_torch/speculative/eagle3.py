@@ -513,11 +513,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
             )
-            self._saved_position_offsets_query_len = getattr(
-                attn_metadata, 'position_offsets_query_len', 0)
+            self._saved_position_offsets_cpp = (
+                attn_metadata.spec_decoding_position_offsets_cpp)
         else:
             self._saved_position_offsets = None
-            self._saved_position_offsets_query_len = None
+            self._saved_position_offsets_cpp = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
             )
@@ -540,11 +540,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(
                 self._saved_position_offsets)
+            attn_metadata.spec_decoding_position_offsets_cpp = (
+                self._saved_position_offsets_cpp)
             self._saved_position_offsets = None
-        if getattr(self, '_saved_position_offsets_query_len', None) is not None:
-            attn_metadata.position_offsets_query_len = (
-                self._saved_position_offsets_query_len)
-            self._saved_position_offsets_query_len = None
+            self._saved_position_offsets_cpp = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(

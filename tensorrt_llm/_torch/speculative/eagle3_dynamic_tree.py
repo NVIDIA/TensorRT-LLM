@@ -330,7 +330,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
         """XQA indexes mask flat via cuQSeqLens with per-request stride
         n_tok * ceil(n_tok/32) (C++ sets mPackedMaskMaxSeqLenQ from
-        position_offsets_query_len = query_len after commit 973731a9c).
+        spec_decoding_position_offsets_cpp.sizes()[1]).
         The padded buffer is [n_req, buf_dim, ceil(buf_dim/32)] with a
         larger row stride, so when n_tok < buf_dim and n_req > 1 packed
         reads see misaligned rows. Copy the meaningful
@@ -347,10 +347,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         flat[:total_elems] = scratch.view(-1)
 
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
-        """Set spec-dec gen lengths and the C++ row-stride hint
-        (mPackedMaskMaxSeqLenQ = position_offsets_query_len) in one place."""
+        """Set spec-dec gen lengths and refresh the C++ position-offset view."""
         attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
-        attn_metadata.position_offsets_query_len = query_len
+        attn_metadata.update_position_offsets_for_cpp(query_len)
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
