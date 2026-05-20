@@ -1,3 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import tempfile
 import unittest
 from copy import deepcopy
 from unittest.mock import Mock, patch
@@ -5,6 +22,7 @@ from unittest.mock import Mock, patch
 import torch
 
 import tensorrt_llm
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -21,6 +39,8 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig as LlmKvCacheConfig
+from tensorrt_llm.llmapi import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -326,6 +346,54 @@ class TestAfmoeSanity(unittest.TestCase):
                 self.assertIsInstance(layer.mlp, AfmoeMoE)
 
 
+class TestAfmoeEndToEnd(unittest.TestCase):
+    """Exercise AFMoE through the PyTorch LLM API with dummy weights."""
+
+    def test_llm_dummy_load_generates_from_token_ids(self):
+        if not torch.cuda.is_available():
+            self.skipTest("AFMoE LLM API test requires CUDA")
+
+        with tempfile.TemporaryDirectory() as tmp_model_dir:
+            with open(f"{tmp_model_dir}/config.json", "w", encoding="utf-8") as f:
+                json.dump(AFMOE_CONFIG, f, indent=2)
+
+            prompts = [
+                {"prompt_token_ids": [100, 200, 300]},
+                {"prompt_token_ids": [101, 202]},
+            ]
+            sampling_params = SamplingParams(
+                max_tokens=2,
+                end_id=AFMOE_CONFIG["vocab_size"] - 1,
+                pad_id=AFMOE_CONFIG["vocab_size"] - 1,
+                detokenize=False,
+                ignore_eos=True,
+            )
+
+            with LLM(
+                model=tmp_model_dir,
+                load_format="dummy",
+                tensor_parallel_size=1,
+                enable_chunked_prefill=False,
+                disable_overlap_scheduler=True,
+                attn_backend="TRTLLM",
+                max_batch_size=len(prompts),
+                max_num_tokens=16,
+                max_seq_len=64,
+                moe_config=MoeConfig(max_num_tokens=64),
+                moe_expert_parallel_size=-1,
+                moe_tensor_parallel_size=-1,
+                enable_attention_dp=False,
+                kv_cache_config=LlmKvCacheConfig(enable_block_reuse=False),
+            ) as llm:
+                outputs = llm.generate(prompts, sampling_params=sampling_params)
+
+        self.assertEqual(len(outputs), len(prompts))
+        for prompt, output in zip(prompts, outputs):
+            self.assertEqual(output.prompt_token_ids, prompt["prompt_token_ids"])
+            self.assertEqual(len(output.outputs), 1)
+            self.assertEqual(len(output.outputs[0].token_ids), sampling_params.max_tokens)
+
+
 class TestAfmoeTPAttributes(unittest.TestCase):
     """Verify TP-related module attributes are wired correctly."""
 
@@ -333,6 +401,18 @@ class TestAfmoeTPAttributes(unittest.TestCase):
         config_dict = deepcopy(AFMOE_CONFIG)
         afmoe_config = AfmoeConfig.from_dict(config_dict)
         mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=0)
+        model_config = ModelConfig(pretrained_config=afmoe_config, mapping=mapping)
+        return AfmoeForCausalLM(model_config)
+
+    def _build_attention_dp_model(self, tp_size):
+        config_dict = deepcopy(AFMOE_CONFIG)
+        afmoe_config = AfmoeConfig.from_dict(config_dict)
+        mapping = Mapping(
+            world_size=tp_size,
+            tp_size=tp_size,
+            rank=0,
+            enable_attention_dp=True,
+        )
         model_config = ModelConfig(pretrained_config=afmoe_config, mapping=mapping)
         return AfmoeForCausalLM(model_config)
 
@@ -380,6 +460,27 @@ class TestAfmoeTPAttributes(unittest.TestCase):
                 f"num_heads_per_tp * head_dim = {expected_local_out}, "
                 f"got {actual_out}",
             )
+
+    def test_attention_dp_uses_unsharded_gate_and_mlp_modules(self):
+        model = self._build_attention_dp_model(tp_size=2)
+        config = model.config
+        expected_gate_out = config.num_attention_heads * (
+            config.hidden_size // config.num_attention_heads
+        )
+
+        for layer in model.model.layers:
+            gate_proj = layer.self_attn.gate_proj
+            self.assertEqual(gate_proj.tp_size, 1)
+            self.assertEqual(gate_proj.weight.shape[0], expected_gate_out)
+
+            if layer.moe_enabled:
+                self.assertIsNone(layer.mlp.allreduce)
+                if layer.mlp.shared_experts is not None:
+                    self.assertEqual(layer.mlp.shared_experts.gate_up_proj.tp_size, 1)
+                    self.assertEqual(layer.mlp.shared_experts.down_proj.tp_size, 1)
+            else:
+                self.assertEqual(layer.mlp.gate_up_proj.tp_size, 1)
+                self.assertEqual(layer.mlp.down_proj.tp_size, 1)
 
     def test_attention_layer_types(self):
         model = self._build_model(tp_size=1)

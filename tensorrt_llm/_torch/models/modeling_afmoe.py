@@ -1,4 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Inference-only AFMoE (Arcee Foundation MoE) for TensorRT-LLM.
 
 Follows the HF implementation of AfmoeForCausalLM.
@@ -13,13 +27,14 @@ Key architectural features:
   - Optional muP embedding scaling
 """
 
-from typing import Dict, List, Optional
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
@@ -72,6 +87,23 @@ def _validate_routing_config(config: PretrainedConfig) -> None:
         )
 
 
+def _get_attention_dp_mapping(mapping: Mapping) -> Mapping:
+    """Return the effective TP=1 mapping used by attention-DP modules."""
+    if not mapping.enable_attention_dp:
+        return mapping
+
+    return Mapping(
+        world_size=mapping.world_size,
+        rank=mapping.rank,
+        gpus_per_node=mapping.gpus_per_node,
+        tp_size=1,
+        pp_size=mapping.pp_size * mapping.tp_size,
+        cp_size=mapping.cp_size,
+        cp_config=mapping.cp_config,
+        enable_attention_dp=mapping.enable_attention_dp,
+    )
+
+
 class AfmoeGate(nn.Module):
     """Router gate for AFMoE, following the DeepSeekV3 grouped top-k pattern."""
 
@@ -111,7 +143,7 @@ class AfmoeGate(nn.Module):
         )
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self, weights: list[dict]):
         assert len(weights) == 1
         self.weight.copy_(weights[0]["weight"][:])
         self.e_score_correction_bias.copy_(
@@ -184,6 +216,7 @@ class AfmoeMoE(nn.Module):
                 bias=False,
                 dtype=config.torch_dtype,
                 config=model_config,
+                overridden_tp_size=1 if self.enable_attention_dp else None,
                 reduce_output=False,
                 layer_idx=layer_idx,
             )
@@ -285,7 +318,7 @@ class AfmoeAttention(Attention):
             config.num_attention_heads * self.head_dim,
             bias=False,
             dtype=config.torch_dtype,
-            mapping=model_config.mapping,
+            mapping=_get_attention_dp_mapping(model_config.mapping),
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=False,
             quant_config=model_config.get_quant_config(),
@@ -371,6 +404,7 @@ class AfmoeDecoderLayer(DecoderLayer):
                 bias=False,
                 dtype=config.torch_dtype,
                 config=model_config,
+                overridden_tp_size=1 if model_config.mapping.enable_attention_dp else None,
                 layer_idx=layer_idx,
             )
 
@@ -505,6 +539,6 @@ class AfmoeForCausalLM(DecoderModelForCausalLM[AfmoeModel, PretrainedConfig]):
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
-    def load_weights(self, weights: Dict, weight_mapper, **kwargs):
+    def load_weights(self, weights: dict, weight_mapper, **kwargs):
         weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=weights, weight_mapper=weight_mapper, **kwargs)
