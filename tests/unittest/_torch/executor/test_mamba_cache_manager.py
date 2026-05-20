@@ -116,7 +116,7 @@ def test_padding_slot_is_permanent():
 
 @skip_no_cuda
 def test_replay_update_mamba_states_uses_history_window():
-    """Replay path appends PNAT until the layer kernels checkpointed."""
+    """Replay path accumulates PNAT until layer kernels write a checkpoint."""
     mgr = _make_mgr(max_batch_size=4, max_draft_len=5, use_replay_state_update=True)
     assert mgr.replay_step_width == 6
     assert mgr.replay_history_size == 16

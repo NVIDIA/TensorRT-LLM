@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,10 +26,13 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
-from .mamba2_metadata import (REPLAY_WORK_CACHE_BUF_IDX,
-                              REPLAY_WORK_CACHE_SLOT,
-                              REPLAY_WORK_ITEM_WIDTH, REPLAY_WORK_PNAT,
-                              REPLAY_WORK_POSITION_IN_DECODE_BATCH)
+from .mamba2_metadata import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+)
 from .softplus import softplus
 
 _REPLAY_WORK_POSITION_IN_DECODE_BATCH = tl.constexpr(
@@ -263,10 +267,9 @@ def _replay_precompute_impl(
     #       afterward; PNAT_next = PNAT + accepted.  [0, PNAT) preserved.
     #   WRITE_CHECKPOINT=True (would overflow): write to STAGING buffer at
     #       [0, T).  Caller flips cache_buf_idx afterward; next step's
-    #       active = the one we just wrote.  PNAT_next = accepted.  Old
-    #       data in the previous active buffer is folded into state via
-    #       the replay update and discarded.  This matches today's replay
-    #       kernel behavior exactly.
+    #       active = the one we just wrote.  PNAT_next = accepted.  The
+    #       previous active-buffer history is folded into state by replay
+    #       before the caller flips to the staging buffer.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
     if write_checkpoint:
@@ -876,10 +879,8 @@ def _dynamic_precompute_kernel(
 
     pnat_local = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
     needs_write_runtime = pnat_local + T > MAX_REPLAY_BUFFER_LENGTH
-    # write_checkpoint is now runtime in replay precompute, so a single
-    # call site handles both write and nowrite for the replay branch.
-    # Take rectangle only when RECTANGLE is True AND this slot doesn't
-    # need write; everything else funnels into replay.
+    # Replay precompute uses a per-slot write predicate; use rectangle only
+    # for no-write slots when enabled.
     if needs_write_runtime or not RECTANGLE:
         _replay_precompute_impl(
             dt_ptr,
@@ -1267,11 +1268,8 @@ def _persistent_main_impl(
 
     coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
 
-    # Double-buffered old_x: load from active_buf (the "previous step" buffer);
-    # store at the end writes to write_buf (= 1 - active_buf when is_write,
-    # else active_buf — same as old_dt / old_dA_cumsum / old_B).  Splitting
-    # the read and write into separate dbuf slots when is_write eliminates
-    # the same-thread store-vs-load race we previously saw on old_x.
+    # Double buffering keeps old_x replay reads and checkpoint writes in
+    # disjoint buffers on write steps.
     old_x_read_base = (
         old_x_ptr
         + cache_batch_idx * stride_old_x_cache
@@ -1591,8 +1589,7 @@ def _persistent_rectangle_impl(
     QUANT_MAX: tl.constexpr,
     USE_TMA_LOAD: tl.constexpr = False,
 ):
-    # Nowrite-only: write_offset = PNAT (new tokens append at [PNAT, PNAT+T)).
-    write_offset = prev_num_accepted_tokens
+    # Nowrite-only: new tokens append at [PNAT, PNAT+T).
 
     # Rectangle K-axis layout: old at [0, PNAT), new at [PNAT, PNAT+T).
 
@@ -1887,15 +1884,9 @@ def _persistent_main_kernel(
     QUANT_MAX: tl.constexpr,
     WRITE_CHECKPOINT: tl.constexpr,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
-    # NUM_PERSISTENT: runtime int (not constexpr).  Used ONLY as the loop
-    # stride in `tl.range(pid, total_work, NUM_PERSISTENT, ...)`.  Making it
-    # runtime collapses the cta_per_sm tuning dim from the kernel's compile
-    # signature: 8 CPS values used to mean 8x recompiles; now they share one
-    # compiled kernel.  Work decomposition (pid_m, pid_b_local, pid_h) does
-    # NOT depend on NUM_PERSISTENT — it uses constexpr NUM_PID_M_BLOCKS and
-    # runtime n_slots_local — so loop unrolling and flatten=/num_stages=/
-    # warp_specialize= optimizations on `tl.range` operate independently of
-    # the stride value.
+    # NUM_PERSISTENT is a runtime loop stride, so CTA-per-SM tuning can vary
+    # without changing the compiled kernel signature. Work decomposition uses
+    # constexpr NUM_PID_M_BLOCKS and runtime n_slots_local.
     NUM_PERSISTENT,
     NUM_LOOP_STAGES: tl.constexpr,
     NUM_PID_M_BLOCKS: tl.constexpr,
@@ -2425,8 +2416,10 @@ def replay_selective_state_update(
         _maxnreg, _num_ctas) are benchmark-only overrides; production callers
         should leave them None to use the heuristic-tuned defaults.
     """
+    sm_version = get_sm_version()
+
     # PDL needs sm >= 90.
-    if get_sm_version() < 90:
+    if sm_version < 90:
         launch_with_pdl = False
         use_internal_pdl = False
 
@@ -2451,9 +2444,9 @@ def replay_selective_state_update(
     # fp8 e4m3fn (any rounding mode) needs SM 89+ for the fp32↔e4m3 cvt PTX
     # instructions (Ada Lovelace introduced them; Hopper/Blackwell carry them).
     if state.dtype == torch.float8_e4m3fn:
-        assert get_sm_version() >= 89, (
+        assert sm_version >= 89, (
             "fp8_e4m3fn state requires SM 89+ (Ada Lovelace / Hopper / Blackwell) "
-            f"for fp32↔fp8 cvt PTX instructions; current SM is {get_sm_version()}."
+            f"for fp32↔fp8 cvt PTX instructions; current SM is {sm_version}."
         )
 
     # PTX cvt.rs.* (stochastic rounding) family lands on Blackwell only.
@@ -2462,14 +2455,14 @@ def replay_selective_state_update(
     # PTX SR instruction needed, runs anywhere.
     if rand_seed is not None:
         if state.dtype == torch.float16:
-            assert get_sm_version() >= 100, (
+            assert sm_version >= 100, (
                 "fp16 stochastic rounding (PTX cvt.rs.f16x2.f32) requires "
-                f"sm_100a (Blackwell B200+); current SM is {get_sm_version()}."
+                f"sm_100a (Blackwell B200+); current SM is {sm_version}."
             )
         elif state.dtype == torch.float8_e4m3fn:
-            assert get_sm_version() >= 100, (
+            assert sm_version >= 100, (
                 "fp8 stochastic rounding (PTX cvt.rs.satfinite.e4m3x4.f32) "
-                f"requires sm_100a (Blackwell B200+); current SM is {get_sm_version()}."
+                f"requires sm_100a (Blackwell B200+); current SM is {sm_version}."
             )
         else:
             assert state.dtype in (torch.int8, torch.int16), (
@@ -2525,15 +2518,10 @@ def replay_selective_state_update(
 
     # --- Default-tuning lookup ---
     # Resolve (mode, knobs) from the table when caller leaves them None.
-    # Caller-provided kwargs always win.  If the caller forces a mode that
-    # differs from the table's recommendation for this cell, we BRIDGE the
-    # table's knobs into the forced mode's knob namespace rather than fall
-    # back to (likely-terrible) kernel defaults:
-    #   table pd → forced pm: copy each unsplit pd knob (M, W, S, CPS, LS)
-    #                         to both write and nowrite split knobs.
-    #   table pm → forced pd: take the nowrite split values (Mnw, Wnw, Snw,
-    #                         CPSnw, LSnw) as the unsplit knobs.
-    # Empty table → no-op (caller passes whatever, mode falls back to pd).
+    # Caller-provided kwargs always win.  If the caller forces a different
+    # mode, translate table knobs into that mode's namespace: persistent_dynamic
+    # knobs fan out to both persistent_main halves, while persistent_main
+    # nowrite knobs seed persistent_dynamic.
     _dt_str = {
         torch.float32: "fp32",
         torch.float16: "fp16",
@@ -2559,14 +2547,35 @@ def replay_selective_state_update(
         _num_warps = _num_warps if _num_warps is not None else _table_knobs.get("_num_warps")
         _num_stages = _num_stages if _num_stages is not None else _table_knobs.get("_num_stages")
         _heads_per_block = _heads_per_block if _heads_per_block is not None else _table_knobs.get("_heads_per_block")
-        _precompute_num_warps = _precompute_num_warps if _precompute_num_warps is not None else _table_knobs.get("_precompute_num_warps")
-        _precompute_num_stages = _precompute_num_stages if _precompute_num_stages is not None else _table_knobs.get("_precompute_num_stages")
-        _block_size_m_write = _block_size_m_write if _block_size_m_write is not None else _table_knobs.get("_block_size_m_write")
-        _block_size_m_nowrite = _block_size_m_nowrite if _block_size_m_nowrite is not None else _table_knobs.get("_block_size_m_nowrite")
+        _precompute_num_warps = (
+            _precompute_num_warps
+            if _precompute_num_warps is not None
+            else _table_knobs.get("_precompute_num_warps"))
+        _precompute_num_stages = (
+            _precompute_num_stages
+            if _precompute_num_stages is not None
+            else _table_knobs.get("_precompute_num_stages"))
+        _block_size_m_write = (
+            _block_size_m_write
+            if _block_size_m_write is not None
+            else _table_knobs.get("_block_size_m_write"))
+        _block_size_m_nowrite = (
+            _block_size_m_nowrite
+            if _block_size_m_nowrite is not None
+            else _table_knobs.get("_block_size_m_nowrite"))
         _num_warps_write = _num_warps_write if _num_warps_write is not None else _table_knobs.get("_num_warps_write")
-        _num_warps_nowrite = _num_warps_nowrite if _num_warps_nowrite is not None else _table_knobs.get("_num_warps_nowrite")
-        _num_stages_write = _num_stages_write if _num_stages_write is not None else _table_knobs.get("_num_stages_write")
-        _num_stages_nowrite = _num_stages_nowrite if _num_stages_nowrite is not None else _table_knobs.get("_num_stages_nowrite")
+        _num_warps_nowrite = (
+            _num_warps_nowrite
+            if _num_warps_nowrite is not None
+            else _table_knobs.get("_num_warps_nowrite"))
+        _num_stages_write = (
+            _num_stages_write
+            if _num_stages_write is not None
+            else _table_knobs.get("_num_stages_write"))
+        _num_stages_nowrite = (
+            _num_stages_nowrite
+            if _num_stages_nowrite is not None
+            else _table_knobs.get("_num_stages_nowrite"))
         _cta_per_sm = _cta_per_sm if _cta_per_sm is not None else _table_knobs.get("_cta_per_sm")
         _num_loop_stages = _num_loop_stages if _num_loop_stages is not None else _table_knobs.get("_num_loop_stages")
         # persistent_main uses split write/nowrite tuning knobs.
@@ -2609,6 +2618,11 @@ def replay_selective_state_update(
     _use_tma_replay_write_load = bool(_use_tma_replay_write_load)
     _use_tma_replay_write_store = bool(_use_tma_replay_write_store)
     _use_tma_replay_nowrite_load = bool(_use_tma_replay_nowrite_load)
+    if sm_version < 90:
+        _use_tma_rect_load = False
+        _use_tma_replay_write_load = False
+        _use_tma_replay_write_store = False
+        _use_tma_replay_nowrite_load = False
     assert mode in ("persistent_dynamic", "persistent_main"), (
         f"unknown mode {mode!r}; expected 'persistent_dynamic' or 'persistent_main'"
     )
@@ -2626,11 +2640,9 @@ def replay_selective_state_update(
         )
         assert state_scales.device == state.device
 
-    # Cache T-axis = MAX_WINDOW (the replay buffer capacity).  For the
-    # placeholder degenerate case max_window = T (every step writes replay
-    # state).  For real replay-style history, max_window > T and
-    # `prev_num_accepted_tokens` can be 0..max_window.  Window-axis kernel
-    # tiles (BLOCK_SIZE_WINDOW, BLOCK_SIZE_K) are derived independently from
+    # Cache window capacity comes from old_x.shape[2]; it may equal T or be
+    # larger when retaining replay history. Window-axis kernel tiles
+    # (BLOCK_SIZE_WINDOW, BLOCK_SIZE_K) are derived independently from
     # MAX_REPLAY_BUFFER_LENGTH so max_window can exceed BLOCK_SIZE_T freely.
     max_window = old_x.shape[2]
     assert T <= max_window, f"T={T} exceeds cache max_window={max_window}"
@@ -2787,11 +2799,12 @@ def replay_selective_state_update(
     if _num_warps is not None:
         num_warps = _num_warps
     if _heads_per_block is not None:
-        # Cap at heads_per_group: HEADS_PER_BLOCK divides the kernel's head
-        # axis, so a table value larger than the model's heads-per-group
-        # would overshoot.  Protects callers running smaller models than
-        # the one we tuned against.
-        heads_per_block = min(_heads_per_block, heads_per_group)
+        heads_per_block = int(_heads_per_block)
+    assert heads_per_block > 0, "heads_per_block must be positive"
+    heads_per_block = min(heads_per_block, heads_per_group)
+    while (heads_per_group % heads_per_block != 0
+           or heads_per_block & (heads_per_block - 1) != 0):
+        heads_per_block -= 1
     if _precompute_num_warps is not None:
         precompute_num_warps = _precompute_num_warps
 
@@ -2817,6 +2830,9 @@ def replay_selective_state_update(
     )
     assert heads_per_block <= heads_per_group, (
         f"heads_per_block ({heads_per_block}) must not cross group boundary ({heads_per_group})"
+    )
+    assert heads_per_group % heads_per_block == 0, (
+        f"heads_per_block ({heads_per_block}) must divide heads_per_group ({heads_per_group})"
     )
 
     # state_scales pointer + strides: real tensor when quantized, otherwise
@@ -2943,18 +2959,12 @@ def replay_selective_state_update(
         )
 
     # ---- launch_persistent_main ------------------------------------------
-    # Persistent-CTA main kernel.  Single launch covers `n_slots` slots
-    # starting at `slot_offset`.  Caller invokes twice: once for the write
-    # half (slot_offset=0, n_slots=n_writes, write_checkpoint=True) and
-    # once for the nowrite half (slot_offset=n_writes,
-    # n_slots=batch-n_writes, write_checkpoint=False).  Hard-sort
-    # contract: caller has pre-sorted slots so [0, n_writes) are writes
-    # and [n_writes, batch) are nowrites.
+    # Persistent main launches the write and nowrite halves separately.
+    # Replay work items are write-first, and the device n_writes tensor
+    # partitions [0, n_writes) from [n_writes, batch).
 
-    # Resolve persistent-mode bench knobs.  Defaults: cta_per_sm = 1
-    # (one CTA per SM, matches upstream `_p_matmul_ogs.py`); num_loop_stages
-    # = 2 (matches in-tree `swiglu` precedent for non-dot persistent loops);
-    # flatten = True (canonical Triton 3.6 idiom); warp_specialize = False.
+    # Resolve persistent-mode tuning knobs. None values fall back to stable
+    # defaults so direct callers do not need to mirror benchmark search args.
     _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     cta_per_sm_arg = _cta_per_sm if _cta_per_sm else 1
     num_persistent_arg = cta_per_sm_arg * _num_sms
@@ -2982,26 +2992,27 @@ def replay_selective_state_update(
         # `n_writes` is the (1,) int32 device tensor with the write count.
         # Both halves always launch; an empty half has a zero-length slot
         # range and the persistent loop does no work.
-        _bsm = BLOCK_SIZE_M_WRITE if write_checkpoint else BLOCK_SIZE_M_NOWRITE
-        _nw = NUM_WARPS_WRITE if write_checkpoint else NUM_WARPS_NOWRITE
-        _ns = NUM_STAGES_WRITE if write_checkpoint else NUM_STAGES_NOWRITE
-        _cps = CTA_PER_SM_WRITE if write_checkpoint else CTA_PER_SM_NOWRITE
-        _cps = _cps if _cps else 1
-        _nls = NUM_LOOP_STAGES_WRITE if write_checkpoint else NUM_LOOP_STAGES_NOWRITE
-        _nls = _nls if _nls else 2
-        _num_persistent = _cps * _num_sms
-        _num_pid_m_local = (dim + _bsm - 1) // _bsm
+        block_size_m = BLOCK_SIZE_M_WRITE if write_checkpoint else BLOCK_SIZE_M_NOWRITE
+        launch_num_warps = NUM_WARPS_WRITE if write_checkpoint else NUM_WARPS_NOWRITE
+        launch_num_stages = NUM_STAGES_WRITE if write_checkpoint else NUM_STAGES_NOWRITE
+        ctas_per_sm = CTA_PER_SM_WRITE if write_checkpoint else CTA_PER_SM_NOWRITE
+        ctas_per_sm = ctas_per_sm if ctas_per_sm else 1
+        num_loop_stages = NUM_LOOP_STAGES_WRITE if write_checkpoint else NUM_LOOP_STAGES_NOWRITE
+        num_loop_stages = num_loop_stages if num_loop_stages else 2
+        num_persistent = ctas_per_sm * _num_sms
+        num_pid_m_local = (dim + block_size_m - 1) // block_size_m
         # Grid sizing: cap at min(full persistent grid, upper-bound total work).
         # We use `batch` as the upper bound on slots-per-half — overcounting
         # by a few CTAs is fine since the kernel derives the exact slot range
         # from n_writes at runtime.
-        _total_work_launch = max(1, batch * _num_pid_m_local * nheads)
-        grid = (min(_num_persistent, _total_work_launch),)
-        # Per-path TMA descriptor — block_shape[0] must match _bsm.
-        _desc = (state_tma_descriptor_write if write_checkpoint
-                 else state_tma_descriptor_nowrite)
+        total_work_launch = max(1, batch * num_pid_m_local * nheads)
+        grid = (min(num_persistent, total_work_launch),)
+        # Per-path TMA descriptor — block_shape[0] must match block_size_m.
+        selected_state_tma_descriptor = (
+            state_tma_descriptor_write if write_checkpoint
+            else state_tma_descriptor_nowrite)
         _persistent_main_kernel[grid](
-            state, _desc, state_scales_arg, old_x,
+            state, selected_state_tma_descriptor, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
@@ -3026,14 +3037,14 @@ def replay_selective_state_update(
             cb_scaled.stride(0), cb_scaled.stride(1),
             cb_scaled.stride(2), cb_scaled.stride(3),
             decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
-            _bsm,
+            block_size_m,
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             QUANT_MAX=quant_max,
             WRITE_CHECKPOINT=write_checkpoint,
             LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
-            NUM_PERSISTENT=_num_persistent,
-            NUM_LOOP_STAGES=_nls,
+            NUM_PERSISTENT=num_persistent,
+            NUM_LOOP_STAGES=num_loop_stages,
             FLATTEN=flatten_arg,
             WARP_SPECIALIZE=warp_specialize_arg,
             IS_DYNAMIC=False,
@@ -3050,8 +3061,8 @@ def replay_selective_state_update(
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint),
             USE_REPLAY_CACHE_SLOT=bool(_use_replay_cache_slot),
-            num_warps=_nw,
-            **({"num_stages": _ns} if _ns else {}),
+            num_warps=launch_num_warps,
+            **({"num_stages": launch_num_stages} if launch_num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
             **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
@@ -3070,8 +3081,8 @@ def replay_selective_state_update(
         # Grid sizing: cap at total_work (= batch * num_pid_m * nheads) for
         # the dynamic case (full-batch coverage); see launch_persistent_main
         # comment for correctness rationale.
-        _total_work_launch = max(1, batch * _num_pid_m * nheads)
-        grid = (min(num_persistent_arg, _total_work_launch),)
+        total_work_launch = max(1, batch * _num_pid_m * nheads)
+        grid = (min(num_persistent_arg, total_work_launch),)
         # Persistent-dynamic kernel uses a single BLOCK_SIZE_M (same as the
         # wrapper's BLOCK_SIZE_M == BLOCK_SIZE_M_WRITE tied convention), so
         # the write-side descriptor matches.  Both write and nowrite slots

@@ -17,7 +17,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Union
 
 import torch
 
@@ -63,6 +63,14 @@ def use_cpp_mamba_cache_manager() -> bool:
     return os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
 
 
+class ReplayStateUpdateMetadata(NamedTuple):
+    """Shared tensors and fixed sizes for replay state updates."""
+    prev_num_accepted_tokens: torch.Tensor
+    cache_buf_idx: torch.Tensor
+    replay_step_width: int
+    replay_history_size: int
+
+
 class BaseMambaCacheManager(ABC):
     """Abstract interface for accessing mamba/recurrent state caches."""
 
@@ -76,7 +84,7 @@ class BaseMambaCacheManager(ABC):
 
     def get_replay_state_update_metadata(
         self
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+    ) -> Optional[ReplayStateUpdateMetadata]:
         """Return replay metadata tensors and fixed replay sizes."""
         return None
 
@@ -609,7 +617,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     def get_replay_state_update_metadata(
         self
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+    ) -> Optional[ReplayStateUpdateMetadata]:
         if (not self._use_replay_state_update
                 or not isinstance(self.mamba_cache, self.SpeculativeState)
                 or self.mamba_cache.prev_num_accepted_tokens is None
@@ -617,9 +625,12 @@ class PythonMambaCacheManager(BaseResourceManager):
                 or self.replay_step_width is None
                 or self.replay_history_size is None):
             return None
-        return (self.mamba_cache.prev_num_accepted_tokens,
-                self.mamba_cache.cache_buf_idx, self.replay_step_width,
-                self.replay_history_size)
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=(
+                self.mamba_cache.prev_num_accepted_tokens),
+            cache_buf_idx=self.mamba_cache.cache_buf_idx,
+            replay_step_width=self.replay_step_width,
+            replay_history_size=self.replay_history_size)
 
     def shutdown(self):
         """Release tensor memory."""
@@ -814,7 +825,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     def get_replay_state_update_metadata(
         self
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+    ) -> Optional[ReplayStateUpdateMetadata]:
         get_metadata = getattr(self._impl, 'get_replay_state_update_metadata',
                                None)
         if get_metadata is None:
@@ -1358,13 +1369,14 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # block (prefix-cache hit or block recycled across requests) may carry
         # stale prev_num_accepted_tokens / cache_buf_idx values from a prior
         # owner; the replay kernel reads these on the first decode step.
-        if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
+        if (self._use_replay_state_update
+                and self.prev_num_accepted_tokens is not None
+                and self.cache_buf_idx is not None):
             num_contexts = len(scheduled_batch.context_requests)
             if num_contexts > 0:
                 ctx_slots = self.cuda_state_indices[:num_contexts].long()
                 self.prev_num_accepted_tokens[ctx_slots] = 0
-                # don't care which half of doulbe-buffer is using
-                # self.cache_buf_idx[ctx_slots] = 0
+                self.cache_buf_idx[ctx_slots] = 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -1698,15 +1710,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     def get_replay_state_update_metadata(
         self
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, int, int]]:
+    ) -> Optional[ReplayStateUpdateMetadata]:
         if (not self._use_replay_state_update
                 or self.prev_num_accepted_tokens is None
                 or self.cache_buf_idx is None
                 or self.replay_step_width is None
                 or self.replay_history_size is None):
             return None
-        return (self.prev_num_accepted_tokens, self.cache_buf_idx,
-                self.replay_step_width, self.replay_history_size)
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=self.prev_num_accepted_tokens,
+            cache_buf_idx=self.cache_buf_idx,
+            replay_step_width=self.replay_step_width,
+            replay_history_size=self.replay_history_size)
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype

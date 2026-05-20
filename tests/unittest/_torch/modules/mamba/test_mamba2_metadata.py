@@ -20,14 +20,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
-    Mamba2Metadata,
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
     REPLAY_WORK_PNAT,
     REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+    Mamba2Metadata,
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
 )
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import ReplayStateUpdateMetadata
 
 skip_no_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -109,8 +110,12 @@ class TestMamba2Metadata:
                 return self.state_indices[:len(request_ids)]
 
             def get_replay_state_update_metadata(self):
-                return (self.prev_num_accepted_tokens, self.cache_buf_idx, 6,
-                        16)
+                return ReplayStateUpdateMetadata(
+                    prev_num_accepted_tokens=self.prev_num_accepted_tokens,
+                    cache_buf_idx=self.cache_buf_idx,
+                    replay_step_width=6,
+                    replay_history_size=16,
+                )
 
         metadata = Mamba2Metadata(max_batch_size=5, chunk_size=8)
         seq_lens = torch.tensor([2, 7, 7, 7, 7], dtype=torch.int)

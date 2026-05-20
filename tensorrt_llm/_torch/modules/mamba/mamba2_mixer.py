@@ -514,9 +514,9 @@ class Mamba2Mixer(nn.Module):
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
-                    # replay_work_items is sorted write-first and carries
-                    # decode-batch position, cache slot, PNAT, and active
-                    # cache buffer index for persistent-main replay.
+                    # replay_work_items is write-first for persistent_main and
+                    # carries decode-batch position, cache slot, PNAT, and
+                    # active cache buffer index for replay kernels.
                     replay_selective_state_update(
                         ssm_states,
                         layer_cache.old_x,

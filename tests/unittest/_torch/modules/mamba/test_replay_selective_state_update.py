@@ -86,6 +86,9 @@ _CONFIGS = [
     (16, 64, 128, 1),  # TP=8 production config
     (32, 64, 128, 2),  # TP=4, ngroups>1 (more heads than B/C groups)
 ]
+_HEADS_PER_BLOCK_CONFIGS = _CONFIGS + [
+    (6, 64, 128, 2),  # heads_per_group=3 exercises HPB divisor fallback
+]
 
 # Quantized state dtypes and their representable-magnitude limits (== QUANT_MAX
 # in the kernel).  fp8_e4m3fn cells require SM 89+ for the fp32↔fp8 cvt PTX
@@ -622,13 +625,8 @@ def test_replay_selective_state_update(
         ("all_write", [12, 13, 14, 15], None, False),
         # All-nowrite: every slot fits in the window.
         ("all_nowrite", [3, 4, 5, 6], None, False),
-        # Mixed PNATs with HAND-CODED work-item order.  The auto-computed order
-        # for these PNATs would be [2, 3, 0, 1] — same as the explicit
-        # value — so this scenario is functionally redundant with the
-        # auto variant ONLY if `_make_replay_work_items` (the test
-        # helper) is itself correct.  Keeping a hand-coded copy guards
-        # against a buggy helper: the kernel still gets a known-good order
-        # and the scenario would still pass even if the helper regressed.
+        # Mixed PNATs with hand-coded work-item order, independent of the
+        # _make_replay_work_items test helper.
         ("mixed_explicit", [3, 10, 12, 16], [2, 3, 0, 1], False),
         ("mixed_explicit_rect", [3, 10, 12, 16], [2, 3, 0, 1], True),
         # Mixed PNATs with AUTO-COMPUTED work-item order via `_make_replay_work_items`
@@ -655,11 +653,7 @@ def test_replay_selective_state_update_scenarios(
       - all_write / all_nowrite: every slot on one branch — verifies the
         empty-half early-return on pm and the all-uniform per-slot dispatch
         on pd.
-      - mixed_explicit: hand-coded work-item order, bypassing the test's
-        `_make_replay_work_items` helper.  Guards against a buggy helper:
-        if the auto-computation regressed, the auto scenarios would still
-        pass with the broken value, but this one runs against a known-good
-        order and would still detect the kernel-side issue.
+      - mixed_explicit: hand-coded work-item order independent of the helper.
       - mixed_auto: unsorted PNATs, work-item order auto-computed via the
         helper — the production-shaped flow.
 
@@ -1290,10 +1284,8 @@ def test_philox_rounding_unbiased(state_dtype):
     #   * int16: residual std ~1e-4 → SE ~9e-8 (very tight bound)
     #   * int8:  residual std ~3e-2 → SE ~2e-5
     #   * fp8:   residual std ~1e-1 → SE ~9e-5 (loosest, magnitude-driven)
-    # The previous fixed-1e-5 threshold was below SE for int8/fp8 and would
-    # always fail by chance.  Note the |sr|<|det| fallback was also dropped:
-    # on Gaussian (symmetric) inputs RN's bias is ~0 by symmetry, so SR vs RN
-    # is just two unbiased estimators racing — unreliable as a unbias test.
+    # A fixed absolute threshold is below SE for int8/fp8. Gaussian inputs
+    # also make RN nearly unbiased, so |sr| < |det| is not reliable here.
     se_sr = stochastic_std / (num_nonzero ** 0.5)
     K = 4
     assert abs(stochastic_mean) < K * se_sr, (
@@ -1305,22 +1297,9 @@ def test_philox_rounding_unbiased(state_dtype):
     )
 
 
-# HEADS_PER_BLOCK > 1 test.  The default heuristic only picks HPB > 1 at large
-# total_heads (>= 256-512), which the main test with batch=2 never reaches.
-# This test overrides _heads_per_block to exercise multi-head precompute tiles.
-#
-# Beyond OUTPUT and STATE checks, this also asserts the kernel's WRITE
-# CONTRACT on every cache buffer (old_x, old_B, old_dt, old_dA_cumsum)
-# across a sweep of PNATs covering nowrite (PNAT=0,1,T,max_window-T-1,
-# max_window-T) and write (PNAT=max_window-T+1, max_window-1) paths.  The
-# old_dA_cumsum check is the one that originally hid the
-# continuous-across-nowrite bug — direct verification prevents regression.
-# Both `rectangle_for_nowrite` arms are exercised explicitly (don't rely on
-# tuning).
-#
-# Configs: (nheads=16, ngroups=1) and (nheads=32, ngroups=2) both have
-# heads_per_group=16.  The heuristic caps HPB at min(2|4, hpg), so HPB=2, 4.
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+# HEADS_PER_BLOCK coverage for multi-head precompute tiles and non-power
+# heads_per_group, where the wrapper must keep each tile within one B/C group.
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _HEADS_PER_BLOCK_CONFIGS)
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
 @pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
@@ -1354,13 +1333,6 @@ def test_replay_heads_per_block(
     batch = 8
     device = "cuda"
     dtype = torch.bfloat16
-
-    if nheads % heads_per_block != 0:
-        pytest.skip(f"nheads ({nheads}) not divisible by heads_per_block ({heads_per_block})")
-    if heads_per_block > nheads // ngroups:
-        pytest.skip(
-            f"heads_per_block ({heads_per_block}) exceeds heads_per_group ({nheads // ngroups})"
-        )
 
     torch.manual_seed(42)
 
@@ -1486,7 +1458,7 @@ def test_replay_heads_per_block(
     dt2_proc = F.softplus(dt2_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum2_step = torch.cumsum(A_base.float()[None, None, :] * dt2_proc, dim=1)
 
-    # Reference state walk identical to the original test.
+    # Build reference by replaying old history, then this step's tokens.
     ref_state_f32 = state0.float().clone()
     for slot in range(batch):
         if pnat_list[slot] > 0:
@@ -1545,7 +1517,7 @@ def test_replay_heads_per_block(
         _heads_per_block=heads_per_block,
     )
 
-    # ---------------- Output + state checks (existing coverage) -------------
+    # ---------------- Output + state checks ---------------------------------
     torch.testing.assert_close(
         test_out,
         ref_out,
@@ -1651,7 +1623,7 @@ def test_replay_heads_per_block(
         # WRITE: per-step cumsum starting from 0 (fresh staging buf).
         # NOWRITE: continuous — cumsum offset by the prefix value at
         # old_dA_cumsum_pre[slot, active_buf, head, PNAT-1] (or 0 if PNAT=0).
-        # This is the direct regression assertion for the bug just fixed.
+        # Verifies dA_cumsum continuity across no-write appends.
         expected_old_dAcs_slot = old_dA_cumsum_pre[slot].clone()
         step_cumsum = dA_cumsum2_step[slot].T  # (nheads, T)
         if is_write:
@@ -1688,7 +1660,7 @@ def test_replay_heads_per_block(
 # `rectangle_nowrite` forces the rectangle vs non-rectangle nowrite path
 # (via `mode="persistent_main"` + `rectangle_for_nowrite=…` kwargs)
 # rather than relying on the tuning table's mode pick.
-@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _HEADS_PER_BLOCK_CONFIGS)
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
 @pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
@@ -1710,11 +1682,6 @@ def test_replay_heads_per_block_multistep(
     device = "cuda"
     dtype = torch.bfloat16
     n_steps = 8
-
-    if nheads % heads_per_block != 0:
-        pytest.skip(f"nheads ({nheads}) not divisible by HPB ({heads_per_block})")
-    if heads_per_block > nheads // ngroups:
-        pytest.skip(f"HPB ({heads_per_block}) exceeds heads_per_group ({nheads // ngroups})")
 
     torch.manual_seed(42)
 

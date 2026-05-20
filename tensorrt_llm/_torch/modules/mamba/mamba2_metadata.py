@@ -252,8 +252,10 @@ class Mamba2Metadata:
             return
         self.replay_n_writes.zero_()
 
-        prev_num_accepted_tokens, cache_buf_idx, replay_step_width, \
-            replay_history_size = replay_metadata
+        prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
+        cache_buf_idx = replay_metadata.cache_buf_idx
+        replay_step_width = replay_metadata.replay_step_width
+        replay_history_size = replay_metadata.replay_history_size
         num_decodes = batch_size - num_contexts
         self.replay_num_decodes = num_decodes
         if num_decodes == 0:
