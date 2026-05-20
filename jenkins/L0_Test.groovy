@@ -1703,7 +1703,7 @@ def durationLookupKeys(String rawLine)
         return []
     }
     def keys = [testName]
-    def wrapperMatch = (testName =~ /^[^/]*test\w+\.py::(?:\w+::)*\w+\[(.+)\]$/)
+    def wrapperMatch = (testName =~ '^(?:.*/)?test\\w+\\.py::(?:\\w+::)*\\w+\\[(.+)\\]$')
     if (wrapperMatch.matches()) {
         keys << wrapperMatch[0][1]
     }
