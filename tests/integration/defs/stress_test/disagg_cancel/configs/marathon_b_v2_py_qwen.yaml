@@ -1,0 +1,129 @@
+# Marathon B: V2 KV cache + Python transceiver + NIXL, Qwen-class non-MLA.
+#
+# Exercises the pure-Python disagg path (KvCacheTransceiverV2 +
+# KVCacheManagerV2 + NIXL backend) on a non-MLA, GQA-style model so
+# the marathon coverage is symmetric across the two supported
+# (KV-cache manager × transceiver runtime) backends. Schema
+# documentation lives in ../README.md.
+#
+# This YAML is intentionally not parametrized in
+# `_MARATHON_CONFIGS` yet; it ships as a ready-to-wire template that
+# becomes active once canary references for Qwen2.5-7B-Instruct are
+# recorded.
+
+hostname: localhost
+model: Qwen2.5-7B-Instruct
+backend: pytorch
+
+context_servers:
+  num_instances: 3                  # 3P3D cluster (3 context + 3 generation workers)
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  disable_overlap_scheduler: false  # overlap ON
+  max_num_tokens: 16384
+  max_seq_len: 16384
+  enable_chunked_prefill: true
+  kv_cache_config:
+    enable_block_reuse: true        # block reuse ON
+    enable_partial_reuse: true
+    free_gpu_memory_fraction: 0.3
+    use_kv_cache_manager_v2: true   # V2 KV cache
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON     # Python transceiver
+    max_tokens_in_buffer: 16384
+    kv_transfer_timeout_ms: 60000
+
+generation_servers:
+  num_instances: 3
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  disable_overlap_scheduler: false
+  max_num_tokens: 16384
+  max_seq_len: 16384
+  enable_chunked_prefill: true
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    free_gpu_memory_fraction: 0.3
+    use_kv_cache_manager_v2: true
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON
+    max_tokens_in_buffer: 16384
+    kv_transfer_timeout_ms: 60000
+
+stress_config:
+  duration_min: 120
+
+  kv_cache_manager: v2
+  transceiver: python
+
+  base_concurrency: 64
+  client_cancel_rate: 0.10
+  input_length:
+    distribution: uniform
+    min_tokens: 4096
+    max_tokens: 12288
+  output_length: 512
+
+  bursts:
+    interval_min: 8
+    concurrency: 256
+    duration_s: 60
+    input_length:
+      distribution: uniform
+      min_tokens: 12288
+      max_tokens: 16384
+
+  injections:
+    - at_min: 15
+      type: sigstop
+      target: gen_worker_random
+      duration_s: 20
+    - at_min: 30
+      type: sigstop
+      target: gen_worker_random
+      duration_s: 30
+    - at_min: 45
+      type: sigstop
+      target: ctx_worker_random
+      duration_s: 20
+    - at_min: 60
+      type: sigkill
+      target: gen_worker_0
+      respawn_within_s: 60
+    - at_min: 75
+      type: sigstop
+      target: gen_worker_random
+      duration_s: 20
+    - at_min: 90
+      type: sigstop
+      target: ctx_worker_random
+      duration_s: 30
+    - at_min: 105
+      type: sigstop
+      target: gen_worker_random
+      duration_s: 20
+
+  canary:
+    prompts_file: stress_canary_prompts.json
+    rate_per_min: 5
+    greedy_decoding: true
+    seed: 42
+    max_tokens: 128
+    check_token_equivalent: true
+    error_rate_overall_max: 0.01
+    error_rate_injection_window_max: 0.10
+    recovery_time_max_s: 30
+
+  log_scan:
+    hard_zero_patterns:
+      - "Broken promise"
+      - "NO RECOVERY"
+      - "Segfault"
+      - "SIGSEGV"
+      - "0xffffffffffffffff"
+      - "Poisoned .* cache transfer buffer"
+
+  kv_cache_growth_max: 0.10
