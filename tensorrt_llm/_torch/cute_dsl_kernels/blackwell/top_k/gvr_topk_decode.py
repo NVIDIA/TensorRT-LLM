@@ -1,0 +1,1431 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""GVR (Guess-Verify-Refine) heuristic Top-K kernel — cuTe DSL port for
+Blackwell sm_100.
+
+Drop-in alternative to ``torch.ops.trtllm.indexer_topk_decode`` (CUDA
+``heuristicTopKMultiRowKernel``). Single CTA per row, block size 512,
+preIdxOffset = (row_idx % next_n) + 1 (V3.2 decode semantics).
+
+Supported (dtype, K): fp32/bf16/fp16 × 512/1024/2048.
+"""
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
+from cutlass.utils.distributed import atomicAdd
+from cutlass.utils.smem_allocator import SmemAllocator
+
+from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+
+
+def float_as_uint32(float_val):
+    """Interpret FP32 value as uint32 bit pattern (cuTe DSL bit-cast)."""
+    return llvm.bitcast(cutlass.Uint32.mlir_type, float_val.ir_value())
+
+
+def _fmin_f32_inline(a, b):
+    """Emit single PTX `min.f32` -> single SASS FMNMX instruction.
+
+    cuTe DSL has cute.arch.fmax but NOT cute.arch.fmin; the canonical
+    workaround `-fmax(-a, -b)` lowers to a 3-instruction sequence
+    (FADD R, RZ, -a; FADD R, RZ, -b; FMNMX R, ...; FADD R, RZ, -R).
+    Per phase-resolved hotspot analysis 2026-05-11
+    (.perfbot/learnings/20260511T150703-agent.yaml F004), this pattern
+    is concentrated in block_fused_snap_iter's inner loop and accounts
+    for ~8-10 us of the cuTe vs prod GVR gap at fp32 K=2048 BS=1.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [a.ir_value(), b.ir_value()],
+            "min.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# =============================================================================
+# Constants (mirror heuristic_topk.cuh:157-167)
+# =============================================================================
+
+BLOCK_SIZE = 512
+WARP_SIZE = 32
+NUM_WARPS = BLOCK_SIZE // WARP_SIZE  # 16
+
+MAX_CANDIDATES = 6144  # K=2048 + SAFETY_MARGIN×2
+MAX_REFINE_ITERS = 15
+NUM_BINS_DEFAULT = 2048
+
+FLT_MAX = 3.4028235e38
+NEG_FLT_MAX = -FLT_MAX
+
+
+# =============================================================================
+# GvrParams<T, K> — mirror heuristic_topk.cuh:209-285
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class GvrParams:
+    kFTarget: int
+    kC: int  # candidate buffer cap
+    kNumBins: int  # histogram bin count
+
+    @staticmethod
+    def get(dtype_name: str, top_k: int) -> "GvrParams":
+        """Returns the per-(dtype, K) specialization parameters.
+
+        Mirrors CUDA template specialization GvrParams<T, K>.
+        """
+        TABLE = {
+            ("float32", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=1024),
+            ("float32", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
+            ("float32", 2048): GvrParams(kFTarget=3072, kC=6144, kNumBins=NUM_BINS_DEFAULT),
+            ("bfloat16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),
+            ("bfloat16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=512),
+            ("bfloat16", 2048): GvrParams(kFTarget=4096, kC=5120, kNumBins=NUM_BINS_DEFAULT),
+            ("float16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),
+            ("float16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
+            ("float16", 2048): GvrParams(kFTarget=4096, kC=5120, kNumBins=NUM_BINS_DEFAULT),
+        }
+        if (dtype_name, top_k) not in TABLE:
+            raise ValueError(f"Unsupported GvrParams<{dtype_name}, {top_k}>")
+        return TABLE[(dtype_name, top_k)]
+
+
+# =============================================================================
+# GvrTopKKernel — class-based cuTe DSL kernel matching TRTLLM idiom
+# =============================================================================
+
+
+class GvrTopKKernel:
+    """GVR (Guess-Verify-Refine) heuristic top-K kernel, cuTe DSL port.
+
+    One CTA per row (matches CUDA heuristicTopKMultiRowKernel BS=1 semantics).
+    Block size = 512, smem region sized to GvrParams<dtype, top_k>.
+
+    Algorithm phases (mirror heuristic_topk.cuh:627-1192):
+      P1: preIdx Min/Max/Mean → initial threshold
+      P2: Secant threshold search loop (count-only)
+      P3: Ballot-free candidate collect into smem keys[]/vals[]
+      P4: Histogram snap (cand → exact top-K) + writeback
+
+    Production-path semantics: preIdxOffset = (row_idx % next_n) + 1
+    (V3.2 decode +1 temporal shift; see heuristicTopKDecode.cu:89-93).
+    """
+
+    def __init__(
+        self,
+        dtype: cutlass.Numeric,
+        top_k: int,
+        next_n: int = 1,
+        num_threads: int = BLOCK_SIZE,
+    ):
+        # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
+        self.dtype = dtype
+        self.top_k = top_k
+        self.next_n = next_n
+        self.num_threads = num_threads
+        self.num_warps = num_threads // WARP_SIZE
+
+        # Map cutlass dtype → GvrParams lookup name
+        if dtype == cutlass.Float32:
+            self._dtype_name = "float32"
+        elif dtype == cutlass.BFloat16:
+            self._dtype_name = "bfloat16"
+        elif dtype == cutlass.Float16:
+            self._dtype_name = "float16"
+        else:
+            raise ValueError(f"Unsupported dtype for GvrTopKKernel: {dtype}")
+
+        params = GvrParams.get(self._dtype_name, top_k)
+        self.kC = params.kC
+        self.kNumBins = params.kNumBins
+        self.kFTarget = params.kFTarget
+
+    # ------------------------------------------------------------------
+    # Input load helper — casts to fp32 regardless of input dtype.
+    # Mirrors CUDA's Trait::to_fp32 pattern (heuristic_topk.cuh:74-153).
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _load_fp32(self, ptr_view, idx):
+        v = ptr_view[idx]
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            return v
+        else:
+            return cutlass.Float32(v)
+
+    # ------------------------------------------------------------------
+    # Warp-level reductions (mirror heuristic_topk.cuh:336-398)
+    #
+    # Use cute.arch.warp_redux_sync — direct map to PTX redux.sync (sm_80+
+    # for int32, sm_100 hardware for fp32). NCU on 2026-05-11 showed the
+    # generic cute.arch.warp_reduction_{sum,max} lower to SHFL.BFLY 5-step
+    # tree, not REDUX — accounting for ~29% (~7.7 us) of the cuTe vs CUDA
+    # gap at K=2048 fp32 BS=1. warp_redux_sync emits redux.sync directly
+    # (see cutlass/cute/arch/nvvm_wrappers.py:1611).
+    # ------------------------------------------------------------------
+    @cute.jit
+    def warp_reduce_sum_i32(self, val):
+        # REDUX.SYNC.ADD.S32 (sm_80+)
+        return cute.arch.warp_redux_sync(val, "add")
+
+    @cute.jit
+    def warp_reduce_sum_f32(self, val):
+        # PTX redux.sync has no fadd — keep shfl-tree fallback.
+        return cute.arch.warp_reduction_sum(val)
+
+    @cute.jit
+    def warp_reduce_min_f32(self, val):
+        # PTX redux.sync.fmin.f32 (sm_100). Single instruction; supersedes
+        # the prior negation trick (-warp_reduction_max(-val)) which lowered
+        # to 5x SHFL.BFLY + 2x FNEG.
+        return cute.arch.warp_redux_sync(val, "fmin")
+
+    @cute.jit
+    def warp_reduce_max_f32(self, val):
+        # PTX redux.sync.fmax.f32 (sm_100). Supersedes warp_reduction_max
+        # (shfl tree) lowering.
+        return cute.arch.warp_redux_sync(val, "fmax")
+
+    # ------------------------------------------------------------------
+    # Phase 1: preIdx Min/Max/Mean → initial threshold
+    # CUDA source: heuristic_topk.cuh:645-714
+    # ------------------------------------------------------------------
+    @cute.jit
+    def phase1_preidx_stats(
+        self,
+        input_row,  # cute.Tensor [N] fp32 (post-cast for half-prec)
+        N,
+        pre_idx_row,  # cute.Tensor [M] int32
+        pre_idx_count,
+        pre_idx_offset,
+        smem_wmin_f32,  # cute.Tensor [NUM_WARPS] float32
+        smem_wmax_f32,  # cute.Tensor [NUM_WARPS] float32
+        smem_wsum_f32,  # cute.Tensor [NUM_WARPS] float32
+        smem_wcnt_i32,  # cute.Tensor [NUM_WARPS] int32
+        s_thr,  # cute.Tensor [3] float32: [threshold, val_lo, val_hi, pmax_saved]
+        s_thr_extra,  # cute.Tensor [1] float32: [pmax_saved]
+        s_iscalars,  # cute.Tensor [5] int32: [cand_count, done, cnt_lo, cnt_hi, out_count]
+        tidx,
+        warp_id,
+        lane,
+    ):
+        """preIdx scan + warp reduce + block aggregate + initial threshold.
+
+        Smem layout split: floats kept in fp32 buffers, ints kept in int32
+        buffers (no bit-cast tricks needed — avoids ArithValue/ir_value
+        coupling and keeps types clean for the MLIR codegen).
+        """
+        local_min = cutlass.Float32(FLT_MAX)
+        local_max = cutlass.Float32(NEG_FLT_MAX)
+        local_sum = cutlass.Float32(0.0)
+        local_cnt = cutlass.Int32(0)
+
+        # Stride loop over preIdx with pre_idx_offset shift.
+        i = tidx
+        while i < pre_idx_count:
+            raw = pre_idx_row[i]
+            idx = raw + pre_idx_offset
+            if idx >= 0 and idx < N:
+                v = self._load_fp32(input_row, idx)
+                # cute.arch.fmax / negate-trick keep result as cutlass.Float32.
+                local_max = cute.arch.fmax(local_max, v)
+                local_min = _fmin_f32_inline(local_min, v)
+                local_sum = local_sum + v
+                local_cnt = local_cnt + 1
+            i = i + self.num_threads
+
+        # Warp-level reductions.
+        wmin = self.warp_reduce_min_f32(local_min)
+        wmax = self.warp_reduce_max_f32(local_max)
+        wsum = self.warp_reduce_sum_f32(local_sum)
+        wcnt = self.warp_reduce_sum_i32(local_cnt)
+
+        # Lane 0 of each warp writes warp result to typed smem buffers.
+        if lane == 0:
+            smem_wmin_f32[warp_id] = wmin
+            smem_wmax_f32[warp_id] = wmax
+            smem_wsum_f32[warp_id] = wsum
+            smem_wcnt_i32[warp_id] = wcnt
+        cute.arch.barrier()
+
+        # tid==0 aggregates NUM_WARPS warp results → pmin, pmax, psum, pcnt → pmean.
+        # Output scalars (float):
+        #   s_thr[0] = threshold (initial = pmean)
+        #   s_thr[1] = val_lo (= pmin)
+        #   s_thr[2] = val_hi (= pmax)
+        #   s_thr_extra[0] = pmax_saved (= pmax)
+        # Output scalars (int):
+        #   s_iscalars[0] = cand_count = 0
+        #   s_iscalars[1] = done = 0
+        #   s_iscalars[2] = cnt_lo seed = pre_idx_count + pre_idx_count // 4
+        #   s_iscalars[3] = cnt_hi seed = 1
+        #   s_iscalars[4] = out_count = 0
+        if tidx == 0:
+            pmin = cutlass.Float32(FLT_MAX)
+            pmax = cutlass.Float32(NEG_FLT_MAX)
+            psum = cutlass.Float32(0.0)
+            pcnt = cutlass.Int32(0)
+            for w in cutlass.range_constexpr(self.num_warps):
+                v_min = smem_wmin_f32[w]
+                v_max = smem_wmax_f32[w]
+                v_sum = smem_wsum_f32[w]
+                v_cnt = smem_wcnt_i32[w]
+                pmax = cute.arch.fmax(pmax, v_max)
+                pmin = _fmin_f32_inline(pmin, v_min)
+                psum = psum + v_sum
+                pcnt = pcnt + v_cnt
+
+            pmean = cutlass.Float32(0.0)
+            if pcnt > 0:
+                pmean = psum / cutlass.Float32(pcnt)
+            else:
+                pmean = (pmin + pmax) * cutlass.Float32(0.5)
+
+            # cnt_lo seed: pre_idx_count + pre_idx_count // 4 (CUDA :702-703)
+            cnt_lo_seed = pre_idx_count + (pre_idx_count >> 2)
+
+            s_thr[0] = pmean
+            s_thr[1] = pmin
+            s_thr[2] = pmax
+            s_thr_extra[0] = pmax
+            s_iscalars[0] = cutlass.Int32(0)  # cand_count
+            s_iscalars[1] = cutlass.Int32(0)  # done
+            s_iscalars[2] = cutlass.Int32(cnt_lo_seed)  # cnt_lo
+            s_iscalars[3] = cutlass.Int32(1)  # cnt_hi
+            s_iscalars[4] = cutlass.Int32(0)  # out_count
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
+    # block_count_ge — Phase 2 / Phase 3 GE-count over global input
+    # CUDA source: heuristic_topk.cuh:400-429 (blockCountGE)
+    #
+    # Per-thread accumulate (4-element strided), cache to smem_ptcnt[tid]
+    # for P3 reuse, warp-reduce, block-reduce → s_iscalars[0] = cand_count.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def block_count_ge(
+        self,
+        input_row,  # cute.Tensor [N] fp32
+        N,
+        threshold,  # cutlass.Float32 scalar
+        smem_ptcnt,  # cute.Tensor [BLOCK_SIZE] int32 (P3 cache)
+        smem_wcnt,  # cute.Tensor [NUM_WARPS] int32 (block reduce scratch)
+        s_iscalars,  # cute.Tensor [5] int32 (writes [0] = cand_count)
+        tidx,
+        warp_id,
+        lane,
+    ):
+        """Count input[i] >= threshold across N elements.
+
+        Vectorized: each thread loads 128-bit per iter (4 fp32 / 8 bf16 / 8 fp16)
+        via cute.copy + CopyUniversalOp. Mirrors CUDA GVR's float4 / int4 LDG.128
+        pattern (heuristic_topk.cuh:407 / :524). Falls back to scalar tail for
+        the N-mod-vec_w remainder.
+        """
+        num_threads = cutlass.const_expr(self.num_threads)
+        # 128-bit / dtype_bits = vec width
+        vec_w = cutlass.const_expr(128 // self.dtype.width)
+        elem_bytes = cutlass.const_expr(self.dtype.width // 8)
+        c = cutlass.Int32(0)
+
+        # Vectorized main loop using cute.copy.
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=cutlass.const_expr(128),
+        )
+        frag = cute.make_fragment((vec_w,), self.dtype)
+
+        row_addr = input_row.iterator.toint()
+        n_aligned = (N // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+        i = tidx * cutlass.Int32(vec_w)
+        step = cutlass.Int32(num_threads * vec_w)
+        while i + cutlass.Int32(vec_w - 1) < N:
+            src_ptr = cute.make_ptr(
+                self.dtype,
+                row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                assumed_align=16,
+            )
+            src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
+            cute.copy(copy_atom, src, frag)
+            for j in cutlass.range_constexpr(vec_w):
+                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                    vj = frag[j]
+                else:
+                    vj = cutlass.Float32(frag[j])
+                if vj >= threshold:
+                    c = c + cutlass.Int32(1)
+            i = i + step
+
+        # Tail scalar loop
+        it = n_aligned + tidx
+        while it < N:
+            v = self._load_fp32(input_row, it)
+            if v >= threshold:
+                c = c + cutlass.Int32(1)
+            it = it + cutlass.Int32(num_threads)
+
+        # Cache per-thread count for P3 retry-shrink reuse.
+        smem_ptcnt[tidx] = c
+
+        # Warp reduce + lane-0 write
+        wc = self.warp_reduce_sum_i32(c)
+        if lane == 0:
+            smem_wcnt[warp_id] = wc
+        cute.arch.barrier()
+
+        # Block aggregate by tid==0
+        if tidx == 0:
+            total = cutlass.Int32(0)
+            for w in cutlass.range_constexpr(self.num_warps):
+                total = total + smem_wcnt[w]
+            s_iscalars[0] = total
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
+    # Phase 2: Secant-interpolation threshold search
+    # CUDA source: heuristic_topk.cuh:716-810
+    #
+    # Refines threshold to bring cand_count into [kK, kCC] using secant
+    # interpolation on (val_lo, cnt_lo) / (val_hi, cnt_hi). At most
+    # MAX_REFINE_ITERS iterations.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def phase2_secant_search(
+        self,
+        input_row,
+        N,
+        smem_ptcnt,
+        smem_wcnt,
+        s_thr,  # [threshold, val_lo, val_hi]
+        s_iscalars,  # [cand_count, done, cnt_lo, cnt_hi, out_count]
+        tidx,
+        warp_id,
+        lane,
+    ):
+        """Refine smem threshold to land cand_count in [kK, kCC] window.
+
+        Calls block_count_ge to evaluate each candidate threshold and
+        updates the bracket (val_lo, val_hi, cnt_lo, cnt_hi). Marks
+        s_iscalars[1] (done) = 1 on convergence, 2 on bracket exhaustion.
+        """
+        kK = cutlass.const_expr(self.top_k)
+        kCC = cutlass.const_expr(self.kC)
+        kFTarget = cutlass.const_expr(self.kFTarget)
+
+        # ---- Initial count with the Phase-1 mean as threshold ----
+        # TODO: smem_ptcnt is not always needed? only for the last block_count_ge.
+        # Do we have methods to reduce its write.
+        thr_init = s_thr[0]
+        self.block_count_ge(
+            input_row,
+            N,
+            thr_init,
+            smem_ptcnt,
+            smem_wcnt,
+            s_iscalars,
+            tidx,
+            warp_id,
+            lane,
+        )
+
+        # tid==0 classifies the initial count.
+        if tidx == 0:
+            c0 = s_iscalars[0]
+            t0 = s_thr[0]
+            if c0 >= cutlass.Int32(kK) and c0 <= cutlass.Int32(kCC):
+                s_iscalars[1] = cutlass.Int32(1)  # done = 1 (converged)
+            elif c0 > cutlass.Int32(kCC):
+                # too many → threshold is the new lower bound (search HIGHER)
+                s_thr[1] = t0
+                s_iscalars[2] = c0
+            else:
+                # too few → threshold is the new upper bound (search LOWER)
+                s_thr[2] = t0
+                s_iscalars[3] = c0
+        cute.arch.barrier()
+
+        # ---- Secant refinement loop (unrolled by jit; per-iter early-exit
+        # via reading s_iscalars[1] == 0). ----
+        for it in range(MAX_REFINE_ITERS):
+            # Check done flag (read once per iter — gates the iter body).
+            if s_iscalars[1] == cutlass.Int32(0):
+                # tid==0 computes new threshold via secant interpolation.
+                if tidx == 0:
+                    vlo = s_thr[1]
+                    vhi = s_thr[2]
+                    clo = s_iscalars[2]
+                    chi = s_iscalars[3]
+                    rng = vhi - vlo
+                    nv = cutlass.Float32(0.0)
+                    if clo > chi and rng > cutlass.Float32(1e-10):
+                        f = cutlass.Float32(clo - cutlass.Int32(kFTarget)) / cutlass.Float32(
+                            clo - chi
+                        )
+                        # clamp f to [0.05, 0.95]
+                        f = cute.arch.fmax(cutlass.Float32(0.05), f)
+                        f = _fmin_f32_inline(f, cutlass.Float32(0.95))
+                        if it == 0:
+                            # iter 0: f = min(f, 0.5)
+                            f = _fmin_f32_inline(f, cutlass.Float32(0.5))
+                        nv = vlo + rng * f
+                    else:
+                        nv = (vlo + vhi) * cutlass.Float32(0.5)
+
+                    # clamp nv into (vlo, vhi) range
+                    if nv <= vlo:
+                        nv = vlo + rng * cutlass.Float32(0.05)
+                    if nv >= vhi:
+                        nv = vhi - rng * cutlass.Float32(0.05)
+
+                    if nv == vlo or nv == vhi:
+                        # Bracket exhausted — try midpoint, else give up.
+                        nv = (vlo + vhi) * cutlass.Float32(0.5)
+                        if nv == vlo or nv == vhi:
+                            s_thr[0] = vlo
+                            s_iscalars[1] = cutlass.Int32(2)  # done = 2 (give up)
+                        else:
+                            s_thr[0] = nv
+                    else:
+                        s_thr[0] = nv
+                cute.arch.barrier()
+
+                # Re-check done (tid==0 may have set it to 2)
+                if s_iscalars[1] == cutlass.Int32(0):
+                    new_thr = s_thr[0]
+                    self.block_count_ge(
+                        input_row,
+                        N,
+                        new_thr,
+                        smem_ptcnt,
+                        smem_wcnt,
+                        s_iscalars,
+                        tidx,
+                        warp_id,
+                        lane,
+                    )
+                    # tid==0 classifies the new count.
+                    if tidx == 0:
+                        c_new = s_iscalars[0]
+                        t_new = s_thr[0]
+                        if c_new >= cutlass.Int32(kK) and c_new <= cutlass.Int32(kCC):
+                            s_iscalars[1] = cutlass.Int32(1)
+                        elif c_new > cutlass.Int32(kCC):
+                            s_thr[1] = t_new
+                            s_iscalars[2] = c_new
+                        else:
+                            s_thr[2] = t_new
+                            s_iscalars[3] = c_new
+                    cute.arch.barrier()
+
+        # ---- Post-loop fallback: if still not done, force threshold ----
+        if tidx == 0:
+            if s_iscalars[1] == cutlass.Int32(0):
+                if s_iscalars[2] <= cutlass.Int32(kCC * 2):
+                    s_thr[0] = s_thr[1]  # threshold = val_lo
+                else:
+                    s_thr[0] = s_thr[2]  # threshold = val_hi
+                s_iscalars[1] = cutlass.Int32(2)
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
+    # Phase 3: Ballot-free candidate collect
+    # CUDA source: heuristic_topk.cuh:813-912
+    #
+    # If P2 ended with done=2 (bracket exhausted), first run a retry-shrink
+    # loop (≤10 iters) to bring cand_count <= kCC.
+    # Then reuse cached smem_ptcnt → warp prefix sum → block prefix sum
+    # → stream-write keys[]/vals[] for v >= threshold.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def phase3_collect_candidates(
+        self,
+        input_row,
+        N,
+        smem_keys,
+        smem_vals,
+        smem_ptcnt,
+        smem_wcnt,
+        s_thr,
+        s_iscalars,
+        tidx,
+        warp_id,
+        lane,
+    ):
+        """Retry-shrink (if done!=1) + warp/block prefix sum + stream-write.
+
+        After this fn, smem_keys[0:cand_count] contains all v >= threshold
+        in some order (determined by tid's per-thread index within stream-write
+        loop), and smem_vals[0:cand_count] holds matching original indices.
+        smem_ptcnt is reused per-thread cached counts from the LAST
+        block_count_ge inside P2 (or inside the retry-shrink below).
+        """
+        kK = cutlass.const_expr(self.top_k)
+        kCC = cutlass.const_expr(self.kC)
+        num_threads = cutlass.const_expr(self.num_threads)
+
+        # ---- Retry-shrink loop (only if P2 didn't converge cleanly) ----
+        if s_iscalars[1] != cutlass.Int32(1):
+            # Re-count with current threshold (may already have stale cand_count)
+            cur_thr = s_thr[0]
+            self.block_count_ge(
+                input_row,
+                N,
+                cur_thr,
+                smem_ptcnt,
+                smem_wcnt,
+                s_iscalars,
+                tidx,
+                warp_id,
+                lane,
+            )
+            if tidx == 0:
+                if s_iscalars[0] > cutlass.Int32(kCC):
+                    s_thr[1] = s_thr[0]  # val_lo = threshold
+            cute.arch.barrier()
+
+            # 10-iter shrink (Python-unrolled with runtime break-via-guard)
+            for rs in range(10):
+                if s_iscalars[0] > cutlass.Int32(kCC):
+                    if tidx == 0:
+                        lo = s_thr[1]
+                        hi = s_thr[2]
+                        mid = (lo + hi) * cutlass.Float32(0.5)
+                        if mid == lo:
+                            mid = hi
+                        s_thr[0] = mid
+                    cute.arch.barrier()
+                    new_thr = s_thr[0]
+                    self.block_count_ge(
+                        input_row,
+                        N,
+                        new_thr,
+                        smem_ptcnt,
+                        smem_wcnt,
+                        s_iscalars,
+                        tidx,
+                        warp_id,
+                        lane,
+                    )
+                    if tidx == 0:
+                        c_rs = s_iscalars[0]
+                        if c_rs > cutlass.Int32(kCC):
+                            s_thr[1] = s_thr[0]
+                        elif c_rs < cutlass.Int32(kK):
+                            s_thr[2] = s_thr[0]
+                    cute.arch.barrier()
+
+        # ---- Warp prefix sum over smem_ptcnt ----
+        # my_total_qual = per-thread count cached by last block_count_ge.
+        my_total_qual = smem_ptcnt[tidx]
+        tp = my_total_qual
+
+        # TODO: optimize this. using mindy's block prefix sum.
+        # 5-level shfl_up_sync inclusive scan within warp.
+        for off_i in cutlass.range_constexpr(5):
+            off_v = cutlass.const_expr(1 << off_i)
+            # NOTE: mask_and_clamp=0 matches CUDA __shfl_up_sync semantics
+            # (cuTe DSL default is 31 which makes shfl.up always return own
+            # value, breaking the prefix sum). See SESSION_LOG session 4.
+            other = cute.arch.shuffle_sync_up(tp, off_v, mask_and_clamp=0)
+            if lane >= cutlass.Int32(off_v):
+                tp = tp + other
+
+        my_excl_offset = tp - my_total_qual
+        # Warp total = lane 31's tp; broadcast via shfl_sync_bfly (or
+        # cross-lane read: shuffle_sync_op with lane=31).
+        warp_total = cute.arch.shuffle_sync(tp, cutlass.Int32(WARP_SIZE - 1))
+
+        if lane == 0:
+            smem_wcnt[warp_id] = warp_total
+        cute.arch.barrier()
+
+        # ---- Block prefix sum (tid==0 over NUM_WARPS warp totals) ----
+        if tidx == 0:
+            total = cutlass.Int32(0)
+            for w in cutlass.range_constexpr(self.num_warps):
+                cnt = smem_wcnt[w]
+                smem_wcnt[w] = total
+                total = total + cnt
+            s_iscalars[0] = total  # cand_count
+        cute.arch.barrier()
+
+        # Each thread's write base = warp-prefix + intra-warp exclusive offset.
+        my_base = smem_wcnt[warp_id]
+        # TODO: 这块的逻辑没有看懂？warp的start offset + ?
+        my_write_pos = my_base + my_excl_offset
+
+        # ---- Stream-write loop ----
+        # 4-element unrolled main loop + scalar tail.
+        thr_final = s_thr[0]
+        # Vectorized main loop using cute.copy (128-bit per thread per iter).
+        vec_w_p3 = cutlass.const_expr(128 // self.dtype.width)
+        elem_bytes_p3 = cutlass.const_expr(self.dtype.width // 8)
+        copy_atom_p3 = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=cutlass.const_expr(128),
+        )
+        frag_p3 = cute.make_fragment((vec_w_p3,), self.dtype)
+        row_addr_p3 = input_row.iterator.toint()
+
+        n_aligned = (N // cutlass.Int32(vec_w_p3)) * cutlass.Int32(vec_w_p3)
+        wc = my_write_pos
+        ic2 = tidx * cutlass.Int32(vec_w_p3)
+        step = cutlass.Int32(num_threads * vec_w_p3)
+        while ic2 + cutlass.Int32(vec_w_p3 - 1) < N:
+            src_ptr_p3 = cute.make_ptr(
+                self.dtype,
+                row_addr_p3 + cutlass.Int64(ic2) * cutlass.Int64(elem_bytes_p3),
+                assumed_align=16,
+            )
+            src_p3 = cute.make_tensor(src_ptr_p3, cute.make_layout((vec_w_p3,)))
+            cute.copy(copy_atom_p3, src_p3, frag_p3)
+            for j in cutlass.range_constexpr(vec_w_p3):
+                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                    vj_p3 = frag_p3[j]
+                else:
+                    # TODO: why cast to float32?
+                    vj_p3 = cutlass.Float32(frag_p3[j])
+                if vj_p3 >= thr_final and wc < cutlass.Int32(kCC):
+                    smem_keys[wc] = vj_p3
+                    smem_vals[wc] = ic2 + cutlass.Int32(j)
+                    wc = wc + cutlass.Int32(1)
+            ic2 = ic2 + step
+
+        # Tail scalar loop
+        it2 = n_aligned + tidx
+        while it2 < N:
+            v = self._load_fp32(input_row, it2)
+            if v >= thr_final and wc < cutlass.Int32(kCC):
+                smem_keys[wc] = v
+                smem_vals[wc] = it2
+                wc = wc + cutlass.Int32(1)
+            it2 = it2 + cutlass.Int32(num_threads)
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
+    # block_fused_snap_iter — P4 snap convergence inner step
+    # CUDA source: heuristic_topk.cuh:436-510
+    # ------------------------------------------------------------------
+    @cute.jit
+    def block_fused_snap_iter(
+        self,
+        smem_keys,
+        smem_wcnt,
+        smem_hist,  # reused as scratch for s_up/s_down warp aggregates
+        s_thr,
+        s_iscalars,
+        count,
+        tidx,
+        warp_id,
+        lane,
+    ):
+        """One iteration of histogram snap. Updates s_iscalars[2]=cnt_lo (cge),
+        s_iscalars[3]=cnt_hi (cgt), and s_thr[0]=threshold (moves toward
+        the cnt-in-(kK_GT, kK_GE) bracket).
+        """
+        kK = cutlass.const_expr(self.top_k)
+        num_threads = cutlass.const_expr(self.num_threads)
+        thr = s_thr[0]
+
+        lge = cutlass.Int32(0)
+        lgt = cutlass.Int32(0)
+        s_up = cutlass.Float32(FLT_MAX)
+        s_down = cutlass.Float32(NEG_FLT_MAX)
+
+        isi = tidx
+        while isi < count:
+            v = smem_keys[isi]
+            if v >= thr:
+                lge = lge + cutlass.Int32(1)
+            if v > thr:
+                lgt = lgt + cutlass.Int32(1)
+                # s_up = min(s_up, v) — hot path in block_fused_snap_iter (~10us)
+                s_up = _fmin_f32_inline(s_up, v)
+            if v < thr:
+                s_down = cute.arch.fmax(s_down, v)
+            isi = isi + cutlass.Int32(num_threads)
+
+        packed = (lge << cutlass.Int32(16)) | lgt
+        packed = self.warp_reduce_sum_i32(packed)
+        s_up = self.warp_reduce_min_f32(s_up)
+        s_down = self.warp_reduce_max_f32(s_down)
+
+        # Lane 0 stages results into warp slots (smem_hist[0..NW-1] = s_up,
+        # smem_hist[NW..2*NW-1] = s_down stored as int32 bit-cast).
+        if lane == 0:
+            smem_wcnt[warp_id] = packed
+            smem_hist[warp_id] = float_as_uint32(s_up)
+            smem_hist[self.num_warps + warp_id] = float_as_uint32(s_down)
+        cute.arch.barrier()
+
+        if tidx == 0:
+            tp = cutlass.Int32(0)
+            total_up = cutlass.Float32(FLT_MAX)
+            total_down = cutlass.Float32(NEG_FLT_MAX)
+            for w in cutlass.range_constexpr(self.num_warps):
+                tp = tp + smem_wcnt[w]
+                vu = llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value())
+                vd = llvm.bitcast(
+                    cutlass.Float32.mlir_type, smem_hist[self.num_warps + w].ir_value()
+                )
+                vu_w = cutlass.Float32(vu)
+                vd_w = cutlass.Float32(vd)
+                total_up = _fmin_f32_inline(total_up, vu_w)
+                total_down = cute.arch.fmax(total_down, vd_w)
+
+            cge = tp >> cutlass.Int32(16)
+            cgt = tp & cutlass.Int32(0xFFFF)
+            s_iscalars[2] = cge
+            s_iscalars[3] = cgt
+
+            if cgt >= cutlass.Int32(kK):
+                if total_up < cutlass.Float32(FLT_MAX):
+                    s_thr[0] = total_up
+            elif cge < cutlass.Int32(kK):
+                if total_down > cutlass.Float32(NEG_FLT_MAX):
+                    s_thr[0] = total_down
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
+    # Phase 4: Histogram-based k-th selection + two-pass writeback
+    # CUDA source: heuristic_topk.cuh:914-1128
+    # ------------------------------------------------------------------
+    @cute.jit
+    def phase4_histogram_snap(
+        self,
+        smem_keys,
+        smem_vals,
+        smem_hist,
+        smem_wcnt,
+        s_thr,
+        s_iscalars,
+        output_values_row,
+        output_indices_row,
+        cand_count,
+        tidx,
+        warp_id,
+        lane,
+    ):
+        """Three branches by cand_count:
+        == kK : direct emit (fast path)
+        >  kK : histogram k-th bin search + snap + 2-pass writeback
+        <  kK : emit cand_count + pad with -FLT_MAX
+        """
+        kK = cutlass.const_expr(self.top_k)
+        kBins = cutlass.const_expr(self.kNumBins)
+        num_threads = cutlass.const_expr(self.num_threads)
+        num_warps = cutlass.const_expr(self.num_warps)
+        bins_per_warp = cutlass.const_expr(kBins // self.num_warps)
+
+        # ----- Branch A: cand_count == kK (fast path) -----
+        if cand_count == cutlass.Int32(kK):
+            i4 = tidx
+            while i4 < cutlass.Int32(kK):
+                output_values_row[i4] = self.dtype(smem_keys[i4])
+                output_indices_row[i4] = smem_vals[i4]
+                i4 = i4 + cutlass.Int32(num_threads)
+        elif cand_count > cutlass.Int32(kK):
+            # ----- Branch B: cand_count > kK → histogram snap -----
+
+            # Block min/max over keys[0:cand_count]
+            local_cmin = cutlass.Float32(FLT_MAX)
+            local_cmax = cutlass.Float32(NEG_FLT_MAX)
+            i5 = tidx
+            while i5 < cand_count:
+                v = smem_keys[i5]
+                local_cmin = _fmin_f32_inline(local_cmin, v)
+                local_cmax = cute.arch.fmax(local_cmax, v)
+                i5 = i5 + cutlass.Int32(num_threads)
+            cmin = self.warp_reduce_min_f32(local_cmin)
+            cmax = self.warp_reduce_max_f32(local_cmax)
+            # Stage warp results into smem_wcnt[w] (cmin) and smem_hist[w] (cmax)
+            # as bit-cast int32. cmax stored at smem_hist[0..NW-1].
+            if lane == 0:
+                smem_wcnt[warp_id] = float_as_uint32(cmin)
+                smem_hist[warp_id] = float_as_uint32(cmax)
+            cute.arch.barrier()
+
+            # tid==0 block reduce → broadcast block_min/block_max via smem.
+            # We reuse s_thr[1]=val_lo as block_min, s_thr[2]=val_hi as block_max
+            # (those slots are no longer needed in P4).
+            if tidx == 0:
+                bmin = cutlass.Float32(FLT_MAX)
+                bmax = cutlass.Float32(NEG_FLT_MAX)
+                for w in cutlass.range_constexpr(self.num_warps):
+                    vmin_bits = smem_wcnt[w]
+                    vmax_bits = smem_hist[w]
+                    vmin = cutlass.Float32(
+                        llvm.bitcast(cutlass.Float32.mlir_type, vmin_bits.ir_value())
+                    )
+                    vmax = cutlass.Float32(
+                        llvm.bitcast(cutlass.Float32.mlir_type, vmax_bits.ir_value())
+                    )
+                    bmin = _fmin_f32_inline(bmin, vmin)
+                    bmax = cute.arch.fmax(bmax, vmax)
+                if bmax <= bmin:
+                    bmax = bmin + cutlass.Float32(1e-6)
+                s_thr[1] = bmin
+                s_thr[2] = bmax
+            cute.arch.barrier()
+
+            # Zero histogram (must zero ALL slots since smem_hist[0..NW-1] was
+            # used as cmax scratch above).
+            i6 = tidx
+            while i6 < cutlass.Int32(kBins):
+                smem_hist[i6] = cutlass.Int32(0)
+                i6 = i6 + cutlass.Int32(num_threads)
+            cute.arch.barrier()
+
+            bmin_r = s_thr[1]
+            bmax_r = s_thr[2]
+            range1 = bmax_r - bmin_r
+            # inv1 = (kBins - 1 + 0.99) / range1  (range1 > 0 guaranteed by 1e-6 patch)
+            inv1 = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range1
+
+            # Build histogram by atomicAdd.
+            i7 = tidx
+            while i7 < cand_count:
+                vk = smem_keys[i7]
+                bin_f = (vk - bmin_r) * inv1
+                bin_i = cutlass.Int32(bin_f)
+                if bin_i < cutlass.Int32(0):
+                    bin_i = cutlass.Int32(0)
+                if bin_i > cutlass.Int32(kBins - 1):
+                    bin_i = cutlass.Int32(kBins - 1)
+                atomicAdd(smem_hist.iterator + bin_i, cutlass.Int32(1))
+                i7 = i7 + cutlass.Int32(num_threads)
+            cute.arch.barrier()
+
+            # ---- Parallel k-th bin search (3-step) ----
+            # Step 1: each warp sums BINS_PER_WARP bins (high→low slice)
+            warp_bin_sum = cutlass.Int32(0)
+            for jb in cutlass.range_constexpr(bins_per_warp):
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - cutlass.Int32(jb)
+                )
+                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+            if lane == 0:
+                smem_wcnt[warp_id] = warp_bin_sum
+            cute.arch.barrier()
+
+            # Step 2: tid==0 finds target warp; stores prefix-count + warp index
+            # into s_iscalars[2] (=cnt_lo: prefix before target warp)
+            # and s_iscalars[3] (=cnt_hi: target warp index)
+            if tidx == 0:
+                cum = cutlass.Int32(0)
+                tw = cutlass.Int32(num_warps - 1)
+                found = cutlass.Int32(0)
+                for w2 in cutlass.range_constexpr(self.num_warps):
+                    cum = cum + smem_wcnt[w2]
+                    if cum >= cutlass.Int32(kK) and found == cutlass.Int32(0):
+                        tw = cutlass.Int32(w2)
+                        found = cutlass.Int32(1)
+                # Recompute prefix BEFORE target warp
+                cum2 = cutlass.Int32(0)
+                for w3 in cutlass.range_constexpr(self.num_warps):
+                    if cutlass.Int32(w3) < tw:
+                        cum2 = cum2 + smem_wcnt[w3]
+                s_iscalars[2] = cum2  # prefix
+                s_iscalars[3] = tw  # target warp index
+            cute.arch.barrier()
+
+            # Step 3: target warp's lane 0 scans BINS_PER_WARP bins → threshold
+            target_warp = s_iscalars[3]
+            if warp_id == target_warp and lane == cutlass.Int32(0):
+                base_cum = s_iscalars[2]
+                thr_local = bmin_r
+                bmin_local = bmin_r
+                set_done = cutlass.Int32(0)
+                for jb2 in cutlass.range_constexpr(bins_per_warp):
+                    bidx2 = (
+                        cutlass.Int32(kBins - 1)
+                        - target_warp * cutlass.Int32(bins_per_warp)
+                        - cutlass.Int32(jb2)
+                    )
+                    base_cum = base_cum + smem_hist[bidx2]
+                    if base_cum >= cutlass.Int32(kK) and set_done == cutlass.Int32(0):
+                        thr_local = bmin_local + cutlass.Float32(bidx2) * range1 / cutlass.Float32(
+                            kBins
+                        )
+                        set_done = cutlass.Int32(1)
+                s_thr[0] = thr_local
+            cute.arch.barrier()
+
+            # ---- Snap convergence loop ----
+            # snap_limit = cand_count > 128 ? cand_count / 4 : 32
+            snap_limit = cutlass.Int32(32)
+            if cand_count > cutlass.Int32(128):
+                snap_limit = cand_count >> cutlass.Int32(2)
+
+            # Loop with runtime break-via-guard. We unroll up to a safe ceiling
+            # then loop the rest with a while.
+            # For simplicity: while loop with explicit break-flag.
+            si = cutlass.Int32(0)
+            done_snap = cutlass.Int32(0)
+            while si < snap_limit and done_snap == cutlass.Int32(0):
+                self.block_fused_snap_iter(
+                    smem_keys,
+                    smem_wcnt,
+                    smem_hist,
+                    s_thr,
+                    s_iscalars,
+                    cand_count,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+                # After block_fused_snap_iter, s_iscalars[2]=cge, s_iscalars[3]=cgt.
+                if s_iscalars[3] < cutlass.Int32(kK) and s_iscalars[2] >= cutlass.Int32(kK):
+                    done_snap = cutlass.Int32(1)
+                si = si + cutlass.Int32(1)
+
+            # ---- Two-pass output writeback (ballot+popc, CUDA-style) ----
+            # Per-iter: ballot collects emit flags into a 32-bit mask, popc gives
+            # within-warp count, lane 0 atomicAdds to out_count, shuffle broadcasts
+            # the base offset. No per-iter barriers — only 1 barrier between passes.
+            sel_thr = s_thr[0]
+            if tidx == 0:
+                s_iscalars[4] = cutlass.Int32(0)  # out_count
+            cute.arch.barrier()
+
+            # Pass 1: v > sel_thr — strided over (warp_id*WARP_SIZE, ...) like CUDA
+            base_w = warp_id * cutlass.Int32(WARP_SIZE)
+            while base_w < cand_count:
+                ix1 = base_w + lane
+                emit_gt = cutlass.Int32(0)
+                v_p1 = cutlass.Float32(NEG_FLT_MAX)
+                if ix1 < cand_count:
+                    v_p1 = smem_keys[ix1]
+                    if v_p1 > sel_thr:
+                        emit_gt = cutlass.Int32(1)
+                mask_gt = cute.arch.vote_ballot_sync(emit_gt != cutlass.Int32(0))
+                cnt_gt = cutlass.Int32(cute.arch.popc(mask_gt))
+                lane_mask_gt = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+                moff_gt = cutlass.Int32(cute.arch.popc(mask_gt & lane_mask_gt))
+                bp_gt = cutlass.Int32(0)
+                if lane == cutlass.Int32(0):
+                    bp_gt = atomicAdd(
+                        s_iscalars.iterator + cutlass.Int32(4),
+                        cnt_gt,
+                    )
+                bp_gt = cute.arch.shuffle_sync(bp_gt, cutlass.Int32(0))
+                wpos_p1 = bp_gt + moff_gt
+                if emit_gt != cutlass.Int32(0) and wpos_p1 < cutlass.Int32(kK):
+                    output_values_row[wpos_p1] = self.dtype(v_p1)
+                    output_indices_row[wpos_p1] = smem_vals[ix1]
+                base_w = base_w + cutlass.Int32(num_threads)
+            cute.arch.barrier()
+
+            # Pass 2: v == sel_thr (ballot+popc, same pattern as Pass 1)
+            base_w2 = warp_id * cutlass.Int32(WARP_SIZE)
+            while base_w2 < cand_count:
+                ix2 = base_w2 + lane
+                emit_eq = cutlass.Int32(0)
+                v_p2 = cutlass.Float32(NEG_FLT_MAX)
+                if ix2 < cand_count:
+                    v_p2 = smem_keys[ix2]
+                    if v_p2 == sel_thr:
+                        emit_eq = cutlass.Int32(1)
+                mask_eq = cute.arch.vote_ballot_sync(emit_eq != cutlass.Int32(0))
+                cnt_eq = cutlass.Int32(cute.arch.popc(mask_eq))
+                lane_mask_eq = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+                moff_eq = cutlass.Int32(cute.arch.popc(mask_eq & lane_mask_eq))
+                bp_eq = cutlass.Int32(0)
+                if lane == cutlass.Int32(0):
+                    bp_eq = atomicAdd(
+                        s_iscalars.iterator + cutlass.Int32(4),
+                        cnt_eq,
+                    )
+                bp_eq = cute.arch.shuffle_sync(bp_eq, cutlass.Int32(0))
+                wpos_p2 = bp_eq + moff_eq
+                if emit_eq != cutlass.Int32(0) and wpos_p2 < cutlass.Int32(kK):
+                    output_values_row[wpos_p2] = self.dtype(v_p2)
+                    output_indices_row[wpos_p2] = smem_vals[ix2]
+                base_w2 = base_w2 + cutlass.Int32(num_threads)
+            cute.arch.barrier()
+
+            # Pad remainder with -FLT_MAX / -1
+            filled_par = s_iscalars[4]
+            if filled_par > cutlass.Int32(kK):
+                filled_par = cutlass.Int32(kK)
+            ipad = filled_par + tidx
+            while ipad < cutlass.Int32(kK):
+                output_values_row[ipad] = self.dtype(NEG_FLT_MAX)
+                output_indices_row[ipad] = cutlass.Int32(-1)
+                ipad = ipad + cutlass.Int32(num_threads)
+        else:
+            # ----- Branch C: cand_count < kK -----
+            # Emit cand_count + pad
+            i10 = tidx
+            while i10 < cand_count:
+                output_values_row[i10] = self.dtype(smem_keys[i10])
+                output_indices_row[i10] = smem_vals[i10]
+                i10 = i10 + cutlass.Int32(num_threads)
+            i11 = cand_count + tidx
+            while i11 < cutlass.Int32(kK):
+                output_values_row[i11] = self.dtype(NEG_FLT_MAX)
+                output_indices_row[i11] = cutlass.Int32(-1)
+                i11 = i11 + cutlass.Int32(num_threads)
+
+    # ------------------------------------------------------------------
+    # Main kernel — one CTA per row
+    # CUDA source: heuristicTopKDecode.cu:49-93 (heuristicTopKMultiRowKernel)
+    # ------------------------------------------------------------------
+    @cute.kernel
+    def gvr_topk_kernel(
+        self,
+        input_data: cute.Tensor,  # [numRows, stride0] dtype
+        pre_idx: cute.Tensor,  # [numRows / next_n, pre_idx_stride] int32
+        seq_lens: cute.Tensor,  # [numRows / next_n] int32
+        output_values: cute.Tensor,  # [numRows, top_k] dtype
+        output_indices: cute.Tensor,  # [numRows, top_k] int32
+    ):
+        """One CTA per row. Grid = (num_rows, 1, 1)."""
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        next_n = cutlass.const_expr(self.next_n)
+        top_k = cutlass.const_expr(self.top_k)
+        num_threads = cutlass.const_expr(self.num_threads)
+        num_warps = cutlass.const_expr(self.num_warps)
+        kC = cutlass.const_expr(self.kC)
+        kNumBins = cutlass.const_expr(self.kNumBins)
+
+        warp_id = tidx // WARP_SIZE
+        lane = tidx & (WARP_SIZE - 1)
+
+        row_idx = bidx
+        pre_idx_row_idx = row_idx // next_n
+        pre_idx_offset = cutlass.Int32(row_idx % next_n) + cutlass.Int32(1)
+
+        # Per-row length
+        seq_len = seq_lens[pre_idx_row_idx]
+        N = seq_len - cutlass.Int32(next_n) + cutlass.Int32(row_idx % next_n) + cutlass.Int32(1)
+
+        # Slice per-row views.
+        input_row = input_data[row_idx, None]
+        pre_idx_row = pre_idx[pre_idx_row_idx, None]
+        output_values_row = output_values[row_idx, None]
+        output_indices_row = output_indices[row_idx, None]
+        pre_idx_count = pre_idx.shape[1]
+
+        griddepcontrol_wait()
+
+        # ---- Shared memory allocation ----
+        # Typed regions (no union/bit-cast hacks). Total ≈ same as CUDA
+        # KernelSmemTplK (within SmemAllocator 128B alignment padding).
+        smem = SmemAllocator()
+        # keys[kC] fp32 (P3 candidate values; smem keys always fp32 even for half-prec)
+        # TODO: why use fp32 even for half-prec?
+        smem_keys = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_ordered_layout((kC,), order=(0,)),
+            byte_alignment=128,
+        )
+        # vals[kC] int32 (P3 candidate indices)
+        smem_vals = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((kC,), order=(0,)),
+            byte_alignment=128,
+        )
+        # histogram[kNumBins] int32 (P4 only)
+        smem_hist = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((kNumBins,), order=(0,)),
+            byte_alignment=128,
+        )
+        # per_thread_counts[BLOCK_SIZE] int32 (P2/P3 cached counts)
+        smem_ptcnt = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((num_threads,), order=(0,)),
+            byte_alignment=128,
+        )
+        # warp_counts[NUM_WARPS] int32 (P3 prefix-sum scratch)
+        smem_wcnt = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((num_warps,), order=(0,)),
+            byte_alignment=128,
+        )
+        # Phase-1 warp aggregates (fp32 + int32; ~256 bytes total)
+        smem_wmin = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_ordered_layout((num_warps,), order=(0,)),
+            byte_alignment=64,
+        )
+        smem_wmax = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_ordered_layout((num_warps,), order=(0,)),
+            byte_alignment=64,
+        )
+        smem_wsum = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_ordered_layout((num_warps,), order=(0,)),
+            byte_alignment=64,
+        )
+        smem_wcnt_p1 = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((num_warps,), order=(0,)),
+            byte_alignment=64,
+        )
+        # Float scalars: threshold, val_lo, val_hi
+        s_thr = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_ordered_layout((3,), order=(0,)),
+            byte_alignment=16,
+        )
+        # Extra float scalar: pmax_saved (kept separate so s_thr stays exactly 3-wide)
+        s_thr_extra = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=cute.make_ordered_layout((1,), order=(0,)),
+            byte_alignment=16,
+        )
+        # Int scalars: cand_count, done, cnt_lo, cnt_hi, out_count
+        s_iscalars = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((5,), order=(0,)),
+            byte_alignment=16,
+        )
+
+        # ---- Degenerate path: N <= top_k → copy input as-is ----
+        # cuTe DSL doesn't allow `return` from @cute.kernel under dynamic
+        # predicates — restructure as if/else covering both branches.
+        if N <= cutlass.Int32(top_k):
+            jd = tidx
+            while jd < N:
+                output_values_row[jd] = input_row[jd]
+                output_indices_row[jd] = cutlass.Int32(jd)
+                jd = jd + cutlass.Int32(num_threads)
+            jp = N + cutlass.Int32(tidx)
+            while jp < cutlass.Int32(top_k):
+                output_values_row[jp] = self.dtype(NEG_FLT_MAX)
+                output_indices_row[jp] = cutlass.Int32(-1)
+                jp = jp + cutlass.Int32(num_threads)
+        else:
+            # =================================================================
+            # Phase 1 — preIdx Min/Max/Mean
+            # =================================================================
+            self.phase1_preidx_stats(
+                input_row,
+                N,
+                pre_idx_row,
+                pre_idx_count,
+                pre_idx_offset,
+                smem_wmin,
+                smem_wmax,
+                smem_wsum,
+                smem_wcnt_p1,
+                s_thr,
+                s_thr_extra,
+                s_iscalars,
+                tidx,
+                warp_id,
+                lane,
+            )
+
+            # Degenerate threshold init: val_hi <= -FLT_MAX or val_lo >= val_hi
+            v_lo = s_thr[1]
+            v_hi = s_thr[2]
+            if v_hi <= cutlass.Float32(NEG_FLT_MAX) or v_lo >= v_hi:
+                if tidx == 0:
+                    # Emit identity output (first min(top_k, N) indices)
+                    emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
+                    je = cutlass.Int32(0)
+                    while je < emit_count:
+                        output_indices_row[je] = je
+                        output_values_row[je] = input_row[je]
+                        je = je + cutlass.Int32(1)
+            else:
+                # =============================================================
+                # Phase 2 — Secant threshold search
+                # CUDA source: heuristic_topk.cuh:716-810
+                # =============================================================
+                self.phase2_secant_search(
+                    input_row,
+                    N,
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_thr,
+                    s_iscalars,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+
+                # =============================================================
+                # Phase 3 — Ballot-free candidate collect
+                # CUDA source: heuristic_topk.cuh:813-912
+                # =============================================================
+                self.phase3_collect_candidates(
+                    input_row,
+                    N,
+                    smem_keys,
+                    smem_vals,
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_thr,
+                    s_iscalars,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+
+                # =============================================================
+                # Phase 4 — Histogram snap + writeback (top-K from candidates)
+                # CUDA source: heuristic_topk.cuh:914-1128
+                # =============================================================
+                # cand_count = min(s_iscalars[0], kCC)
+                cand_count_p4 = s_iscalars[0]
+                if cand_count_p4 > cutlass.Int32(self.kC):
+                    cand_count_p4 = cutlass.Int32(self.kC)
+
+                self.phase4_histogram_snap(
+                    smem_keys,
+                    smem_vals,
+                    smem_hist,
+                    smem_wcnt,
+                    s_thr,
+                    s_iscalars,
+                    output_values_row,
+                    output_indices_row,
+                    cand_count_p4,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+
+        griddepcontrol_launch_dependents()
+
+    # ------------------------------------------------------------------
+    # Host-side launcher
+    # ------------------------------------------------------------------
+    @cute.jit
+    def __call__(
+        self,
+        input_data: cute.Tensor,
+        pre_idx: cute.Tensor,
+        seq_lens: cute.Tensor,
+        output_values: cute.Tensor,
+        output_indices: cute.Tensor,
+        stream,
+    ):
+        num_rows = input_data.shape[0]
+        self.gvr_topk_kernel(
+            input_data,
+            pre_idx,
+            seq_lens,
+            output_values,
+            output_indices,
+        ).launch(
+            grid=(num_rows, 1, 1),
+            block=(self.num_threads, 1, 1),
+            stream=stream,
+            use_pdl=TRTLLM_ENABLE_PDL,
+        )
+
+
+# =============================================================================
+# Public Python entrypoint
+# =============================================================================
+
+import torch  # noqa: E402
+from cuda.bindings import driver as cuda  # noqa: E402
+from cutlass.cute.runtime import from_dlpack  # noqa: E402
+
+_DTYPE_TORCH_TO_CUTE = {
+    torch.float32: cutlass.Float32,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+}
+
+# Compile cache keyed by (cute_dtype, top_k, next_n). Each entry is a JIT-compiled
+# kernel callable; same (dtype, K, next_n) reuse avoids re-JIT.
+_gvr_topk_compile_cache: dict = {}
+
+
+# TODO: use fake_tensor (dynamic for some dim), not from_dlpack.
+def gvr_topk_decode(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int = 1,
+    out_values: Optional[torch.Tensor] = None,
+    out_indices: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
+
+    Args:
+        logits:    ``[num_rows, max_S]`` float32 / bfloat16 / float16.
+        pre_idx:   ``[num_rows // next_n, pre_idx_count]`` int32.
+                   ``pre_idx[..., 0]`` must be the argmax index — indexer invariant.
+        seq_lens:  ``[num_rows // next_n]`` int32. Effective sequence length per group.
+        top_k:     K ∈ {512, 1024, 2048} — compile-time specialized.
+        next_n:    Temporal stride for V3.2 ``preIdxOffset = (row % next_n) + 1``.
+        out_values, out_indices: Optional preallocated outputs.
+
+    Returns:
+        Tuple ``(out_values, out_indices)`` where ``out_values`` is shaped
+        ``[num_rows, top_k]`` with the same dtype as ``logits`` and
+        ``out_indices`` is ``[num_rows, top_k]`` int32.
+
+    Indices are unordered within each row (top-K set, not sorted).
+    """
+    assert logits.is_cuda, "logits must be on CUDA"
+    assert logits.dim() == 2, f"logits must be 2D, got {logits.shape}"
+    assert pre_idx.dim() == 2 and pre_idx.dtype == torch.int32
+    assert seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+
+    if logits.dtype not in _DTYPE_TORCH_TO_CUTE:
+        raise ValueError(f"Unsupported logits dtype: {logits.dtype}")
+    cute_dtype = _DTYPE_TORCH_TO_CUTE[logits.dtype]
+
+    num_rows = logits.shape[0]
+    if out_values is None:
+        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
+    if out_indices is None:
+        out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
+
+    in_t = from_dlpack(logits, assumed_align=16)
+    pre_t = from_dlpack(pre_idx, assumed_align=16)
+    seq_t = from_dlpack(seq_lens, assumed_align=16)
+    out_v_t = from_dlpack(out_values, assumed_align=16)
+    out_i_t = from_dlpack(out_indices, assumed_align=16)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    key = (cute_dtype, top_k, next_n)
+    if key not in _gvr_topk_compile_cache:
+        kernel = GvrTopKKernel(dtype=cute_dtype, top_k=top_k, next_n=next_n)
+        _gvr_topk_compile_cache[key] = cute.compile(
+            kernel, in_t, pre_t, seq_t, out_v_t, out_i_t, stream
+        )
+
+    _gvr_topk_compile_cache[key](in_t, pre_t, seq_t, out_v_t, out_i_t, stream)
+    return out_values, out_indices
+
+
+__all__ = ["GvrTopKKernel", "GvrParams", "gvr_topk_decode"]

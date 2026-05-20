@@ -16,10 +16,14 @@
 
 from .filtered_top_k_decode_varlen import FilteredTopKKernelVarlenDecode
 from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
+from .gvr_topk_decode import GvrParams, GvrTopKKernel, gvr_topk_decode
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel
 
 __all__ = [
     "SinglePassMultiCTARadixTopKKernel",
     "FilteredTopKKernelVarlen",
     "FilteredTopKKernelVarlenDecode",
+    "GvrParams",
+    "GvrTopKKernel",
+    "gvr_topk_decode",
 ]
