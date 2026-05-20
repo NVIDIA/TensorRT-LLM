@@ -220,14 +220,11 @@ class Mamba2Metadata:
                                          dtype=torch.int32,
                                          device="cuda")
 
-        self.replay_work_items = torch.zeros(
-            max_batch_size,
-            REPLAY_WORK_ITEM_WIDTH,
-            dtype=torch.int32,
-            device="cuda")
-        self.replay_n_writes = torch.zeros(1,
-                                           dtype=torch.int32,
-                                           device="cuda")
+        self.replay_work_items = torch.zeros(max_batch_size,
+                                             REPLAY_WORK_ITEM_WIDTH,
+                                             dtype=torch.int32,
+                                             device="cuda")
+        self.replay_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.replay_num_decodes = 0
 
         # Pre-allocated buffers.
@@ -261,9 +258,8 @@ class Mamba2Metadata:
         if num_decodes == 0:
             return
 
-        position_in_decode_batch = torch.arange(num_decodes,
-                                                dtype=torch.int32,
-                                                device=self.state_indices.device)
+        position_in_decode_batch = torch.arange(
+            num_decodes, dtype=torch.int32, device=self.state_indices.device)
         cache_slot = self.state_indices[num_contexts:batch_size]
         cache_slot_idx = cache_slot.to(torch.long)
         pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
@@ -272,8 +268,7 @@ class Mamba2Metadata:
         writes = (pnat + replay_step_width > replay_history_size)
         writes_i32 = writes.to(torch.int32)
         write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
-        n_writes = torch.sum(writes_i32, dim=0,
-                             keepdim=True).to(torch.int32)
+        n_writes = torch.sum(writes_i32, dim=0, keepdim=True).to(torch.int32)
         no_write_offsets = position_in_decode_batch - write_offsets
         output_offsets = torch.where(writes, write_offsets,
                                      n_writes + no_write_offsets)
@@ -285,8 +280,9 @@ class Mamba2Metadata:
         work_items[:, REPLAY_WORK_CACHE_SLOT].scatter_(0, output_offsets,
                                                        cache_slot)
         work_items[:, REPLAY_WORK_PNAT].scatter_(0, output_offsets, pnat)
-        work_items[:, REPLAY_WORK_CACHE_BUF_IDX].scatter_(
-            0, output_offsets, active_cache_buf_idx)
+        work_items[:,
+                   REPLAY_WORK_CACHE_BUF_IDX].scatter_(0, output_offsets,
+                                                       active_cache_buf_idx)
         self.replay_n_writes.copy_(n_writes)
 
     def prepare(self, attn_metadata: AttentionMetadata):

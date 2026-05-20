@@ -83,8 +83,7 @@ class BaseMambaCacheManager(ABC):
         ...
 
     def get_replay_state_update_metadata(
-        self
-    ) -> Optional[ReplayStateUpdateMetadata]:
+            self) -> Optional[ReplayStateUpdateMetadata]:
         """Return replay metadata tensors and fixed replay sizes."""
         return None
 
@@ -616,8 +615,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         return self._use_replay_state_update
 
     def get_replay_state_update_metadata(
-        self
-    ) -> Optional[ReplayStateUpdateMetadata]:
+            self) -> Optional[ReplayStateUpdateMetadata]:
         if (not self._use_replay_state_update
                 or not isinstance(self.mamba_cache, self.SpeculativeState)
                 or self.mamba_cache.prev_num_accepted_tokens is None
@@ -824,8 +822,7 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         return getattr(self._impl, 'use_replay_state_update', False)
 
     def get_replay_state_update_metadata(
-        self
-    ) -> Optional[ReplayStateUpdateMetadata]:
+            self) -> Optional[ReplayStateUpdateMetadata]:
         get_metadata = getattr(self._impl, 'get_replay_state_update_metadata',
                                None)
         if get_metadata is None:
@@ -1709,12 +1706,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         return self._use_replay_state_update
 
     def get_replay_state_update_metadata(
-        self
-    ) -> Optional[ReplayStateUpdateMetadata]:
+            self) -> Optional[ReplayStateUpdateMetadata]:
         if (not self._use_replay_state_update
                 or self.prev_num_accepted_tokens is None
-                or self.cache_buf_idx is None
-                or self.replay_step_width is None
+                or self.cache_buf_idx is None or self.replay_step_width is None
                 or self.replay_history_size is None):
             return None
         return ReplayStateUpdateMetadata(
