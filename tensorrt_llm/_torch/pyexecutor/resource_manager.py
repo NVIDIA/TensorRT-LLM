@@ -1,11 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import copy
 import enum
 import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -38,7 +41,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
                                                       _KVCache)
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    gen_multi_modal_tokens
+    gen_multimodal_cache_key_tokens
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -87,6 +90,217 @@ class Role:
     KEY_BLOCK_SCALE = DataRole("key_block_scale")
     VALUE_BLOCK_SCALE = DataRole("value_block_scale")
     ALL = DataRole("all")
+
+
+class _MmRunMetadata(NamedTuple):
+    """CPU tensors for exact multimodal run lookup.
+
+    `num_runs` is the total number of flat multimodal runs across all
+    multimodal items, i.e. `item_run_cu_offsets[-1]`. All members are 1-D CPU
+    int64 tensors with shape `[num_runs]`.
+    """
+
+    # Shape [num_runs]; full-prompt start index for each flat run.
+    run_positions: torch.Tensor
+    # Shape [num_runs]; one-past-last full-prompt index for each flat run.
+    run_ends: torch.Tensor
+    # Shape [num_runs]; logical multimodal item index for each flat run.
+    run_item_indices: torch.Tensor
+    # Shape [num_runs]; item-local token offset where each flat run begins.
+    run_item_offsets: torch.Tensor
+
+
+def _hash_to_digest(hash_ints: Sequence[int]) -> bytes:
+    # Convert 8 x int32 hash chunks to the 32-byte digest used by C++ block
+    # keys. The byte order matches getNthByte(), which extracts MSB first.
+    try:
+        hash_len = len(hash_ints)
+    except TypeError as exc:
+        raise ValueError(
+            "Expected 8 int32 hash values, got non-sized input") from exc
+    if hash_len != 8:
+        raise ValueError(f"Expected 8 int32 hash values, got {hash_len}")
+    if not all(isinstance(value, int) for value in hash_ints):
+        raise ValueError("Expected multimodal hash values to be integers")
+    return b''.join(v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+
+
+def _ensure_int64_cpu_tensor(
+        values: Sequence[int] | torch.Tensor) -> torch.Tensor:
+    # Block-reuse augmentation is Python-side index math. The metadata is
+    # produced by host mm preprocessing and carried in
+    # MultimodalInput metadata. A non-CPU tensor here means the upstream
+    # contract drifted and would introduce an unexpected sync in the
+    # block-reuse path, so fail loudly.
+    if isinstance(values, torch.Tensor):
+        if values.device.type != "cpu":
+            raise ValueError(
+                "multimodal block-reuse metadata must be CPU-resident, "
+                f"got {values.device}")
+        return values.to(dtype=torch.int64)
+    return torch.as_tensor(values, dtype=torch.int64)
+
+
+def _resolve_multimodal_run_metadata(
+        req: LlmRequest) -> Optional[_MmRunMetadata]:
+    # Worked example for one logical multimodal item split by text:
+    #
+    #   prompt index: 0    1      2      3    4      5
+    #   prompt token: T0   MM0:0  MM0:1  T1   MM0:2  MM0:3
+    #   flat run:          run0   run0        run1   run1
+    #
+    # Inputs encode the prompt layout as:
+    #
+    #   item_run_cu_offsets = [0, 2]  # item 0 owns flat runs [0, 2)
+    #   run_positions       = [1, 4]  # run0 starts at prompt 1, run1 at 4
+    #   run_lengths         = [2, 2]  # token counts for run0 and run1
+    #
+    # The derived arrays below let the augmentation loop map any overlapping
+    # flat run back to the item digest and to the item-local token offset:
+    #
+    #   item_run_counts        = [2]     # item 0 has two runs
+    #   cumulative_run_lengths = [0,2,4] # tokens before run0, run1, and end
+    #   item_starts            = [0]     # item 0 starts at flat run 0
+    #   run_item_indices       = [0,0]   # run0 and run1 both belong to item 0
+    #   run_item_offsets       = [0,2]   # run1 begins at MM0 token offset 2
+    #
+    # So a chunk slice covering prompt [4, 6) uses MM0's digest with token
+    # offset 2; a slice covering prompt [5, 6) uses token offset 3.
+
+    # Shape [num_items + 1]; item i owns flat runs [offsets[i], offsets[i + 1]).
+    item_run_cu_offsets = req.multimodal_item_run_cu_offsets
+    # Shape [num_runs]; full-prompt start index for each flat run.
+    run_positions = req.multimodal_run_positions
+    # Shape [num_runs]; token count for each flat run.
+    run_lengths = req.multimodal_run_lengths
+
+    if all(field is None
+           for field in (item_run_cu_offsets, run_positions, run_lengths)):
+        return None
+
+    if (item_run_cu_offsets is None or run_positions is None
+            or run_lengths is None):
+        raise ValueError(
+            "multimodal run metadata must be validated before block reuse and provided together"
+        )
+
+    item_run_cu_offsets = _ensure_int64_cpu_tensor(item_run_cu_offsets)
+    run_positions = _ensure_int64_cpu_tensor(run_positions)
+    run_lengths = _ensure_int64_cpu_tensor(run_lengths)
+
+    # Shape [num_items]; number of flat runs owned by each logical item.
+    item_run_counts = item_run_cu_offsets[1:] - item_run_cu_offsets[:-1]
+
+    # Shape [num_runs + 1]; item-token count before each flat run, plus end.
+    cumulative_run_lengths = torch.cat(
+        (torch.zeros(1, dtype=torch.int64), torch.cumsum(run_lengths, dim=0)))
+
+    # Shape [num_items]; first flat-run index for each logical item.
+    item_starts = item_run_cu_offsets[:-1]
+
+    # Shape [num_runs]; logical multimodal item index for each flat run.
+    run_item_indices = torch.repeat_interleave(
+        torch.arange(item_run_counts.numel(), dtype=torch.int64),
+        item_run_counts)
+
+    # Shape [num_runs]; item-local token offset where each flat run begins.
+    run_item_offsets = (cumulative_run_lengths[:-1] -
+                        cumulative_run_lengths[item_starts][run_item_indices])
+    # Shape [num_runs]; one-past-last full-prompt index for each flat run.
+    run_ends = run_positions + run_lengths
+
+    return _MmRunMetadata(
+        run_positions=run_positions,
+        run_ends=run_ends,
+        run_item_indices=run_item_indices,
+        run_item_offsets=run_item_offsets,
+    )
+
+
+def _augment_tokens_with_mm_run_metadata(
+        vocab_size: int, result: list[TokenIdExt],
+        multimodal_hashes: Sequence[Sequence[int]], metadata: _MmRunMetadata,
+        chunk_start: int, chunk_end: int) -> list[TokenIdExt]:
+    # Only rewrite multimodal runs that overlap the materialized prompt slice.
+    overlap_mask = ((metadata.run_ends > chunk_start)
+                    & (metadata.run_positions < chunk_end))
+    # Shape [num_overlapping_runs]; flat-run indices that touch this chunk.
+    overlap_run_indices = torch.nonzero(overlap_mask).flatten()
+    if overlap_run_indices.numel() == 0:
+        return result
+
+    # `result` is indexed relative to this chunk, but multimodal cache-key
+    # tokens are indexed relative to the logical multimodal item. The rewrite
+    # below therefore computes, for each selected run segment:
+    # - chunk_result_offset = prompt position - chunk_start
+    # - item_token_offset = item-local run start + intra-run prompt offset
+    # Shape [num_overlapping_runs]; item index for each selected flat run.
+    overlap_run_item_indices = metadata.run_item_indices[overlap_run_indices]
+    # Materialize the selected run metadata once before the Python loop. These
+    # are CPU tensors by construction, and the loop below is request hot-path
+    # bookkeeping.
+    overlap_run_positions = metadata.run_positions[overlap_run_indices]
+    prompt_overlap_starts = torch.clamp(overlap_run_positions, min=chunk_start)
+    prompt_overlap_ends = torch.clamp(metadata.run_ends[overlap_run_indices],
+                                      max=chunk_end)
+    item_token_offsets = (metadata.run_item_offsets[overlap_run_indices] +
+                          prompt_overlap_starts - overlap_run_positions)
+    chunk_result_offsets = prompt_overlap_starts - chunk_start
+    lengths = prompt_overlap_ends - prompt_overlap_starts
+
+    current_item_idx: Optional[int] = None
+    digest = b""
+    for item_idx, chunk_result_offset, item_token_offset, length in zip(
+            overlap_run_item_indices.tolist(),
+            chunk_result_offsets.tolist(),
+            item_token_offsets.tolist(),
+            lengths.tolist(),
+            strict=True):
+        if item_idx != current_item_idx:
+            current_item_idx = item_idx
+            digest = _hash_to_digest(multimodal_hashes[item_idx])
+        # Feed the coarse item property (content digest) and granular run
+        # properties (item-local offset and span length) into the key
+        # generator, so cache keys reflect the actual multimodal tokens being
+        # rewritten.
+        result[chunk_result_offset:chunk_result_offset +
+               length] = gen_multimodal_cache_key_tokens(
+                   vocab_size, digest, length, token_offset=item_token_offset)
+
+    return result
+
+
+def _augment_tokens_with_contiguous_mm_metadata(
+        vocab_size: int, result: list[TokenIdExt],
+        multimodal_hashes: Sequence[Sequence[int]],
+        multimodal_positions: Sequence[int] | torch.Tensor,
+        multimodal_lengths: Sequence[int] | torch.Tensor, chunk_start: int,
+        chunk_end: int) -> list[TokenIdExt]:
+    # Legacy metadata assumes every item is one contiguous prompt span. Exact
+    # run metadata is preferred for video layouts that interleave text tokens.
+    positions = _ensure_int64_cpu_tensor(multimodal_positions)
+    lengths = _ensure_int64_cpu_tensor(multimodal_lengths)
+
+    item_ends = positions + lengths
+    overlap_mask = (item_ends > chunk_start) & (positions < chunk_end)
+    overlap_item_indices = torch.nonzero(overlap_mask).flatten()
+    for item_idx_tensor in overlap_item_indices:
+        item_idx = int(item_idx_tensor)
+        pos = positions[item_idx].item()
+        length = lengths[item_idx].item()
+        overlap_start = max(pos, chunk_start)
+        overlap_end = min(pos + length, chunk_end)
+        source_offset = overlap_start - pos
+        result_offset = overlap_start - chunk_start
+        overlap_length = overlap_end - overlap_start
+        result[result_offset:result_offset +
+               overlap_length] = gen_multimodal_cache_key_tokens(
+                   vocab_size,
+                   _hash_to_digest(multimodal_hashes[item_idx]),
+                   overlap_length,
+                   token_offset=source_offset)
+
+    return result
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -2602,50 +2816,38 @@ class KVCacheManagerV2(BaseResourceManager):
         Multimodal placeholder tokens (e.g. image_token_id) share the same ID
         regardless of the underlying content. This method replaces each
         multimodal token region with TokenIdExt values produced by
-        gen_multi_modal_tokens(), embedding the content digest (Blake3 hash)
-        into the token sequence so that the radix tree can distinguish blocks
-        belonging to different images/videos.
+        gen_multimodal_cache_key_tokens(), embedding the content digest
+        (Blake3 hash) into the token sequence so that the radix tree can
+        distinguish blocks belonging to different images/videos.
 
-        When *start*/*end* are given, only the slice ``tokens[start:end]`` is
-        materialized and returned. This avoids re-augmenting the full prompt
-        on every chunk during chunked prefill.
+        When *start*/*end* are given, they define the chunk bounds; only
+        `tokens[start:end]` is materialized and returned. This avoids
+        re-augmenting the full prompt on every chunk during chunked prefill.
 
         For text-only requests this is a no-op.
         """
         if end is None:
             end = len(tokens)
-        is_sliced = start != 0 or end != len(tokens)
+        chunk_start = start
+        chunk_end = end
+        is_sliced = chunk_start != 0 or chunk_end != len(tokens)
 
         if (req.multimodal_hashes is None or req.multimodal_positions is None
                 or req.multimodal_lengths is None):
-            return tokens[start:end] if is_sliced else tokens
+            return tokens[chunk_start:chunk_end] if is_sliced else tokens
 
-        result: list[TokenIdExt] = list(tokens[start:end])
-        for hash_ints, pos, length in zip(req.multimodal_hashes,
-                                          req.multimodal_positions,
-                                          req.multimodal_lengths,
-                                          strict=True):
-            mm_end = pos + length
-            # Skip multimodal items outside [start, end).
-            if mm_end <= start or pos >= end:
-                continue
-            # Convert 8 x int32 hash to 32-byte digest (big-endian,
-            # matching v1 C++ getNthByte which extracts MSB first).
-            assert len(
-                hash_ints
-            ) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
-            digest = b''.join(
-                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
-            mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
-            # Overlap between [pos, mm_end) and [start, end).
-            overlap_start = max(pos, start)
-            overlap_end = min(mm_end, end)
-            mm_offset = overlap_start - pos
-            result_offset = overlap_start - start
-            n = overlap_end - overlap_start
-            result[result_offset:result_offset +
-                   n] = mm_tokens[mm_offset:mm_offset + n]
-        return result
+        result: list[TokenIdExt] = list(tokens[chunk_start:chunk_end])
+        run_metadata = _resolve_multimodal_run_metadata(req)
+        if run_metadata is not None:
+            return _augment_tokens_with_mm_run_metadata(self.vocab_size, result,
+                                                        req.multimodal_hashes,
+                                                        run_metadata,
+                                                        chunk_start, chunk_end)
+
+        return _augment_tokens_with_contiguous_mm_metadata(
+            self.vocab_size, result, req.multimodal_hashes,
+            req.multimodal_positions, req.multimodal_lengths, chunk_start,
+            chunk_end)
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
