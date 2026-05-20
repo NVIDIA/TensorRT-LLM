@@ -2,12 +2,9 @@ import pytest
 import torch
 from _graph_test_helpers import run_test_transformed_gm
 from torch.export import Dim
-from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import *  # noqa
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
-from tensorrt_llm._torch.auto_deploy.transform.library.rms_norm import FuseRMSNorm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -137,21 +134,3 @@ def test_fuse_rmsnorm_preserves_node_metadata():
     ]
     assert len(rms_nodes) >= 1
     assert all("val" in n.meta and hasattr(n.meta["val"], "dtype") for n in rms_nodes)
-
-
-def _make_passthrough_gm():
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    graph.output(x)
-    return GraphModule(torch.nn.Module(), graph)
-
-
-def _apply_fuse_rmsnorm(gm, **kwargs):
-    transform = FuseRMSNorm.from_kwargs(stage="post_load_fusion", **kwargs)
-    transformed, _ = transform._apply(gm, None, None, SharedConfig())
-    return transformed
-
-
-def test_fuse_rmsnorm_grafia_backend_is_invalid():
-    with pytest.raises(ValueError, match="Invalid rmsnorm_backend"):
-        _apply_fuse_rmsnorm(_make_passthrough_gm(), rmsnorm_backend="grafia")

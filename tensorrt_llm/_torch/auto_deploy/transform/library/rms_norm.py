@@ -212,9 +212,7 @@ class FuseRMSNormConfig(TransformConfig):
 
     rmsnorm_backend: str = Field(
         default="flashinfer",
-        description=(
-            "Backend to use for RMSNorm computation ('flashinfer', 'triton', or 'torch')."
-        ),
+        description="Backend to use for RMSNorm computation ('flashinfer', 'triton', or 'torch').",
     )
     gated_rmsnorm_backend: str = Field(
         default="triton",
@@ -269,6 +267,7 @@ class FuseRMSNorm(BaseTransform):
         # Use the .default overload so downstream pattern matchers (which trace
         # the pattern via Python dispatch and end up with OpOverload targets)
         # see matching node targets, not an OpOverloadPacket.
+        target_op = _BACKEND_OPS[backend].default
         cnt = 0
 
         # First, fuse the norm-before-gate decomposition:
@@ -339,7 +338,6 @@ class FuseRMSNorm(BaseTransform):
                     torch.ops.auto_deploy.triton_rmsnorm_gated.default,
                     args=(x, weight, gate, eps, group_size, True),
                 )
-                fused_node.meta.update(output_node.meta)
 
             output_node.replace_all_uses_with(fused_node)
             graph.erase_node(output_node)
@@ -363,7 +361,6 @@ class FuseRMSNorm(BaseTransform):
         # Replace torch_rmsnorm ops with the selected backend
         for node in list(graph.nodes):
             if is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
-                target_op = _BACKEND_OPS[backend].default
                 # Replace with the selected backend op
                 with graph.inserting_after(node):
                     new_node: Node = graph.call_function(

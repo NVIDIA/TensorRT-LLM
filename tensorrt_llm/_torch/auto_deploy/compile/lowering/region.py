@@ -1,11 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 import torch
 
 from .arguments import OpArgumentResolver
 from .context import BackendAdapter, LoweringContext
 from .datamodel import BoundaryValue, ProgramData, RegionSpec
-from .registry import LOWERINGS, LoweringFn, _get_mapping_lowering
+from .registry import LOWERINGS, LoweringRule, _get_mapping_lowering
 
 
 def resolve_get_attr_value(program: ProgramData, target: str):
@@ -35,7 +40,7 @@ def lower_region(
     adapter: BackendAdapter,
     args: OpArgumentResolver | None = None,
     *,
-    lowerings: dict[object, LoweringFn] | None = None,
+    lowerings: Mapping[object, LoweringRule] | None = None,
 ):
     args = args or OpArgumentResolver()
     ctx = LoweringContext(program=program, region=region, adapter=adapter, args=args, env={})

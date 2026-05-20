@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,17 +21,17 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.grafia import (
     GrafiaRegionModule,
 )
 from tensorrt_llm._torch.auto_deploy.compile.backends.grafia import plugin as grafia_plugin_module
+from tensorrt_llm._torch.auto_deploy.compile.backends.grafia.ops import (
+    get_grafia_op_lowerings_by_target,
+)
 from tensorrt_llm._torch.auto_deploy.compile.backends.grafia.ops import rmsnorm as grafia_rmsnorm
 from tensorrt_llm._torch.auto_deploy.compile.lowering import (
-    LOWERINGS,
     ModeContext,
     OpArgumentResolver,
     PlanDispatcher,
     ProgramData,
     SupportDecision,
-    ValueType,
     analyze_region_boundaries,
-    lower_rms_norm,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import *  # noqa: F403
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -114,33 +117,6 @@ class _FakeSpecModule:
     CTMTensorSpec = _FakeCTMTensorSpec
     CTMOpSpec = _FakeCTMOpSpec
     CTMGraphSpec = _FakeCTMGraphSpec
-
-
-class _RecordingRMSNormAdapter:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def emit_rms_norm(self, x, weight, *, eps, result_meta, loc=None):
-        self.calls.append(("emit_rms_norm", x, weight, eps, result_meta, loc))
-        return "%rms"
-
-
-class _RecordingLoweringContext:
-    def __init__(self, adapter: _RecordingRMSNormAdapter) -> None:
-        self.args = OpArgumentResolver()
-        self.b = adapter
-        self.adapter = adapter
-
-    def resolve(self, value):
-        if isinstance(value, torch.fx.Node):
-            return f"%{value.name}"
-        return value
-
-    def result_type(self, node):
-        return ValueType.from_node(node)
-
-    def loc(self, node):
-        return node.name
 
 
 def _patch_fake_ctm_compile(monkeypatch) -> None:
@@ -292,8 +268,9 @@ def test_grafia_backend_registered_and_config_accepts_backend():
 def test_grafia_rmsnorm_support_and_shared_lowering_dispatch():
     gm = _make_torch_rmsnorm_gm()
     rms = next(n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_rmsnorm))
+    lowering = grafia_rmsnorm.RMSNORM_LOWERING
 
-    decision = grafia_rmsnorm.classify_node(
+    decision = lowering.classify_node(
         rms,
         ModeContext(name="rmsnorm", phase="rmsnorm"),
         ProgramData(gm),
@@ -303,18 +280,11 @@ def test_grafia_rmsnorm_support_and_shared_lowering_dispatch():
     assert isinstance(decision, SupportDecision)
     assert decision.is_supported
 
-    adapter = _RecordingRMSNormAdapter()
-    result = lower_rms_norm(_RecordingLoweringContext(adapter), rms)
-
-    assert result == "%rms"
-    assert len(adapter.calls) == 1
-    call = adapter.calls[0]
-    assert call[:4] == ("emit_rms_norm", "%x", "%weight", 1e-5)
-    assert call[4] == ValueType.from_node(rms)
-    assert call[5] == rms.name
+    lowerings_by_target = get_grafia_op_lowerings_by_target()
+    assert lowerings_by_target[rms.target] is lowering
 
 
-def test_grafia_backend_plugin_uses_global_lowering_mapping(monkeypatch):
+def test_grafia_backend_plugin_uses_op_lowering_mapping(monkeypatch):
     _patch_fake_ctm_compile(monkeypatch)
     gm = _make_torch_rmsnorm_gm()
     program = ProgramData(gm)
@@ -356,7 +326,8 @@ def test_grafia_backend_plugin_uses_global_lowering_mapping(monkeypatch):
     assert captured["program"] is program
     assert captured["region"] is region
     assert captured["args"] is args
-    assert captured["lowerings"] is LOWERINGS
+    assert captured["lowerings"] is plugin.op_lowerings_by_target
+    assert captured["lowerings"][rms.target] is grafia_rmsnorm.RMSNORM_LOWERING
 
 
 def test_grafia_backend_routes_unsupported_op_eager_with_zero_regions():

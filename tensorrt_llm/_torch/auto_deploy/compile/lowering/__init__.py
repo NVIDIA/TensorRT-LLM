@@ -30,7 +30,7 @@ from .executor import (
 from .hybrid import HybridGraphBuilder, HybridPlanModule
 from .planning import BackendPlugin, MultiModePlanner, default_contiguous_supported_groups
 from .region import lower_region, resolve_get_attr_value
-from .registry import LOWERINGS, LoweringFn, lower_rms_norm, register_builtin_lowerings
+from .registry import LOWERINGS, LoweringRule
 
 __all__ = [
     "BackendAdapter",
@@ -46,7 +46,7 @@ __all__ = [
     "HybridGraphBuilder",
     "HybridPlanModule",
     "LoweringContext",
-    "LoweringFn",
+    "LoweringRule",
     "LOWERINGS",
     "ModeContext",
     "MultiModePlanner",
@@ -64,8 +64,6 @@ __all__ = [
     "default_contiguous_supported_groups",
     "executable_nodes",
     "graph_order",
-    "register_builtin_lowerings",
-    "lower_rms_norm",
     "lower_region",
     "resolve_get_attr_value",
     "PlanDispatcher",

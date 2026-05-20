@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,7 +23,6 @@ from tensorrt_llm._torch.auto_deploy.compile.lowering import (
     ValueType,
     analyze_region_boundaries,
     lower_region,
-    lower_rms_norm,
 )
 
 
@@ -252,10 +254,6 @@ class _FakeAdapter:
         self.calls.append(("emit", op_name, tuple(operands), dict(attrs), tuple(result_types), loc))
         return f"%{op_name}"
 
-    def emit_rms_norm(self, x, weight, *, eps, result_meta, loc=None):
-        self.calls.append(("emit_rms_norm", x, weight, eps, result_meta, loc))
-        return "%rms"
-
     def finalize(self):
         self.calls.append(("finalize",))
         return {"calls": self.calls}
@@ -273,7 +271,19 @@ def _make_rmsnorm_graph(target) -> tuple[GraphModule, Node]:
     return GraphModule(root, graph), rms
 
 
-def test_lower_rms_norm_extracts_args_and_calls_backend_adapter_emit_rms_norm():
+class _FakeRmsNormLowering:
+    def __call__(self, ctx, node):
+        x, weight, eps = ctx.args.get(node, "input", "weight", "eps")
+        return ctx.adapter.emit(
+            "fake.rms_norm",
+            (ctx.resolve(x), ctx.resolve(weight)),
+            {"eps": float(eps)},
+            (ctx.result_type(node),),
+            loc=ctx.loc(node),
+        )
+
+
+def test_lower_region_invokes_callable_op_lowering():
     target = _rmsnorm_target()
     gm, rms = _make_rmsnorm_graph(target)
     region = analyze_region_boundaries(gm, [rms], mode=_mode(), region_id="r0")
@@ -284,7 +294,7 @@ def test_lower_rms_norm_extracts_args_and_calls_backend_adapter_emit_rms_norm():
         region,
         adapter,
         OpArgumentResolver(),
-        lowerings={target: lower_rms_norm},
+        lowerings={target: _FakeRmsNormLowering()},
     )
 
     assert artifact is not None
@@ -296,14 +306,14 @@ def test_lower_rms_norm_extracts_args_and_calls_backend_adapter_emit_rms_norm():
     assert not isinstance(constant_call[2], nn.Parameter)
     assert constant_call[3] == "const:weight"
     assert adapter.calls[3] == (
-        "emit_rms_norm",
-        "%x",
-        "const:weight",
-        1e-5,
-        ValueType(name="rms"),
+        "emit",
+        "fake.rms_norm",
+        ("%x", "const:weight"),
+        {"eps": 1e-5},
+        (ValueType(name="rms"),),
         "rms",
     )
-    assert adapter.calls[4] == ("output", ("%rms",), ("rms",))
+    assert adapter.calls[4] == ("output", ("%fake.rms_norm",), ("rms",))
     assert adapter.calls[5] == ("finalize",)
 
 

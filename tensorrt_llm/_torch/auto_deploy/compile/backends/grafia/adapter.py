@@ -197,19 +197,6 @@ class GrafiaCTMBackendAdapter:
             "use a typed semantic adapter method"
         )
 
-    def emit_rms_norm(
-        self,
-        x: Any,
-        weight: Any,
-        *,
-        eps: float,
-        result_meta: ValueType,
-        loc: Any | None = None,
-    ) -> Any:
-        from .ops.rmsnorm import emit
-
-        return emit(self, x, weight, eps=eps, result_meta=result_meta, loc=loc)
-
     def register_compile_resource(
         self,
         resource_id: Any,

@@ -12,104 +12,126 @@ from typing import Any
 import torch
 from torch.fx import Node
 
-from .....utils.node_utils import is_op
-from ....lowering import OpArgumentResolver, ProgramData, SupportDecision, ValueType
+from ....lowering import (
+    LoweringContext,
+    ModeContext,
+    OpArgumentResolver,
+    ProgramData,
+    SupportDecision,
+    ValueType,
+)
 from ..constants import RMSNORM_OP_KIND, SUPPORTED_RMSNORM_HIDDEN, SUPPORTED_RMSNORM_ROWS
 from ..errors import GrafiaCompileError, GrafiaUnsupportedError
 from ..metadata import _ctm_dtype_to_torch, _dtype_from_meta, _is_contiguous_meta, _shape_from_meta
+from .base import GrafiaOpLowering
 
 _COMPILE_RESOURCE_ID = "grafia.rmsnorm.cubin"
 
 
-def is_source_node(node: Node) -> bool:
-    return is_op(node, torch.ops.auto_deploy.torch_rmsnorm)
+class RmsNormLowering(GrafiaOpLowering):
+    """Grafia lowering for canonical AutoDeploy RMSNorm."""
 
+    @property
+    def source_ops(self) -> tuple[Any, ...]:
+        return (torch.ops.auto_deploy.torch_rmsnorm.default,)
 
-def classify_node(
-    node: Node,
-    mode,
-    _program: ProgramData,
-    args: OpArgumentResolver,
-) -> SupportDecision:
-    if not is_source_node(node):
-        return SupportDecision.eager_only(
-            f"unsupported Grafia op remains eager: op={node.op}, target={node.target}"
-        )
-    if not node.users:
-        return SupportDecision.eager_only(
-            "canonical torch_rmsnorm has no external users and remains eager"
-        )
-    try:
-        validate_node_contract(node, args)
-    except GrafiaUnsupportedError as exc:
-        return SupportDecision.eager_only(str(exc))
-    return SupportDecision.supported(f"canonical torch_rmsnorm is supported in Grafia {mode.name}")
-
-
-def validate_node_contract(node: Node, args: OpArgumentResolver) -> None:
-    x_node, weight_node, eps = args.get(node, "input", "weight", "eps")
-    if not isinstance(x_node, Node) or not isinstance(weight_node, Node):
-        raise GrafiaUnsupportedError(
-            f"torch_rmsnorm node {node.name!r} requires tensor node inputs"
-        )
-    if isinstance(eps, bool) or not isinstance(eps, (float, int)):
-        raise GrafiaUnsupportedError(
-            f"torch_rmsnorm node {node.name!r} requires numeric eps, got {eps!r}"
+    def classify_node(
+        self,
+        node: Node,
+        mode: ModeContext,
+        _program: ProgramData,
+        args: OpArgumentResolver,
+    ) -> SupportDecision:
+        if not node.users:
+            return SupportDecision.eager_only(
+                "canonical torch_rmsnorm has no external users and remains eager"
+            )
+        try:
+            self.validate_node_contract(node, args)
+        except GrafiaUnsupportedError as exc:
+            return SupportDecision.eager_only(str(exc))
+        return SupportDecision.supported(
+            f"canonical torch_rmsnorm is supported in Grafia {mode.name}"
         )
 
-    _validate_tensor_contract(x_node, weight_node, node)
+    def lower(self, ctx: LoweringContext, node: Node) -> Any:
+        x, weight, eps = ctx.args.get(node, "input", "weight", "eps")
+        return self.emit(
+            ctx.adapter,
+            ctx.resolve(x),
+            ctx.resolve(weight),
+            eps=float(eps),
+            result_meta=ctx.result_type(node),
+            loc=ctx.loc(node),
+        )
+
+    def validate_node_contract(self, node: Node, args: OpArgumentResolver) -> None:
+        x_node, weight_node, eps = args.get(node, "input", "weight", "eps")
+        if not isinstance(x_node, Node) or not isinstance(weight_node, Node):
+            raise GrafiaUnsupportedError(
+                f"torch_rmsnorm node {node.name!r} requires tensor node inputs"
+            )
+        if isinstance(eps, bool) or not isinstance(eps, (float, int)):
+            raise GrafiaUnsupportedError(
+                f"torch_rmsnorm node {node.name!r} requires numeric eps, got {eps!r}"
+            )
+
+        _validate_tensor_contract(x_node, weight_node, node)
+
+    def emit(
+        self,
+        adapter: Any,
+        x: Any,
+        weight: Any,
+        *,
+        eps: float,
+        result_meta: ValueType,
+        loc: Any | None = None,
+    ) -> Any:
+        adapter.register_compile_resource(
+            _COMPILE_RESOURCE_ID,
+            cache_key=_default_rmsnorm_cubin_path,
+            configure_backend=_configure_rmsnorm_cubin_path,
+        )
+        shape, dtype = adapter._shape_dtype_from_result_type(result_meta, loc)
+        _validate_ctm_specs(adapter, x, weight, shape, dtype, loc)
+        if len(shape) < 1:
+            raise GrafiaUnsupportedError(
+                f"{adapter._region_id}: RMSNorm result {loc!r} must have rank >= 1"
+            )
+        hidden_size = shape[-1]
+        op_id = len(adapter.ops)
+        output = adapter._tensor_spec(
+            name=str(loc or f"rms_norm_{op_id}"),
+            shape=shape,
+            dtype=dtype,
+            producer_id=op_id,
+        )
+        attrs = {"hidden_size": hidden_size, "eps": float(eps)}
+        adapter.ops.append(
+            adapter.spec_mod.CTMOpSpec(
+                op_kind=RMSNORM_OP_KIND,
+                id=op_id,
+                inputs=[x, weight],
+                outputs=[output],
+                attrs=attrs,
+            )
+        )
+        adapter.op_kinds.append(RMSNORM_OP_KIND)
+        adapter._op_cache_records.append(
+            (
+                RMSNORM_OP_KIND,
+                tuple(getattr(tensor, "name", "") for tensor in (x, weight)),
+                output.name,
+                tuple(shape),
+                adapter._dtype_name(dtype),
+                tuple(sorted(attrs.items())),
+            )
+        )
+        return output
 
 
-def emit(
-    adapter: Any,
-    x: Any,
-    weight: Any,
-    *,
-    eps: float,
-    result_meta: ValueType,
-    loc: Any | None = None,
-) -> Any:
-    adapter.register_compile_resource(
-        _COMPILE_RESOURCE_ID,
-        cache_key=_default_rmsnorm_cubin_path,
-        configure_backend=_configure_rmsnorm_cubin_path,
-    )
-    shape, dtype = adapter._shape_dtype_from_result_type(result_meta, loc)
-    _validate_ctm_specs(adapter, x, weight, shape, dtype, loc)
-    if len(shape) < 1:
-        raise GrafiaUnsupportedError(
-            f"{adapter._region_id}: RMSNorm result {loc!r} must have rank >= 1"
-        )
-    hidden_size = shape[-1]
-    op_id = len(adapter.ops)
-    output = adapter._tensor_spec(
-        name=str(loc or f"rms_norm_{op_id}"),
-        shape=shape,
-        dtype=dtype,
-        producer_id=op_id,
-    )
-    attrs = {"hidden_size": hidden_size, "eps": float(eps)}
-    adapter.ops.append(
-        adapter.spec_mod.CTMOpSpec(
-            op_kind=RMSNORM_OP_KIND,
-            id=op_id,
-            inputs=[x, weight],
-            outputs=[output],
-            attrs=attrs,
-        )
-    )
-    adapter.op_kinds.append(RMSNORM_OP_KIND)
-    adapter._op_cache_records.append(
-        (
-            RMSNORM_OP_KIND,
-            tuple(getattr(tensor, "name", "") for tensor in (x, weight)),
-            output.name,
-            tuple(shape),
-            adapter._dtype_name(dtype),
-            tuple(sorted(attrs.items())),
-        )
-    )
-    return output
+RMSNORM_LOWERING = RmsNormLowering()
 
 
 @cache

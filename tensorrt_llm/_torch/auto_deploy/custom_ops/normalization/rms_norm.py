@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom operators for FlashInfer, Triton, and reference RMSNorm implementations."""
+"""Custom operator for FlashInfer and Triton RMSNorm implementation."""
 
 import flashinfer
 import torch

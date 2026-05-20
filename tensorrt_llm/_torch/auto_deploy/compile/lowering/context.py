@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -30,16 +33,6 @@ class BackendAdapter(Protocol):
         attrs: Mapping[str, object],
         result_types: Sequence[ValueType],
         *,
-        loc: Any | None = None,
-    ) -> Any: ...
-
-    def emit_rms_norm(
-        self,
-        x: Any,
-        weight: Any,
-        *,
-        eps: float,
-        result_meta: ValueType,
         loc: Any | None = None,
     ) -> Any: ...
 

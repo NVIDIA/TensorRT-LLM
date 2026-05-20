@@ -10,19 +10,17 @@ from typing import Any
 from torch.fx import Node
 
 from ...lowering import (
-    LOWERINGS,
     ModeContext,
     OpArgumentResolver,
     ProgramData,
     RegionSpec,
     SupportDecision,
     lower_region,
-    register_builtin_lowerings,
 )
 from .adapter import GrafiaBackendContext, GrafiaCTMBackendAdapter
 from .constants import BACKEND_NAME, GRAFIA_MODES
 from .errors import GrafiaUnsupportedError
-from .ops import rmsnorm
+from .ops import get_grafia_op_lowerings_by_target
 from .runtime import GrafiaLoweredArtifact, GrafiaRegionModule
 
 
@@ -38,7 +36,7 @@ class GrafiaBackendPlugin:
         backend_context: GrafiaBackendContext | None = None,
         compile_artifacts: bool = True,
     ) -> None:
-        register_builtin_lowerings()
+        self.op_lowerings_by_target = get_grafia_op_lowerings_by_target()
         self.compiler_kwargs = dict(compiler_kwargs or {})
         self.backend_context = backend_context
         self.compile_artifacts = compile_artifacts
@@ -61,8 +59,9 @@ class GrafiaBackendPlugin:
         program: ProgramData,
         args: OpArgumentResolver,
     ) -> SupportDecision:
-        if rmsnorm.is_source_node(node):
-            return rmsnorm.classify_node(node, mode, program, args)
+        op_lowering = self.op_lowerings_by_target.get(node.target)
+        if op_lowering is not None:
+            return op_lowering.classify_node(node, mode, program, args)
         return SupportDecision.eager_only(
             f"unsupported Grafia op remains eager: op={node.op}, target={node.target}"
         )
@@ -94,7 +93,7 @@ class GrafiaBackendPlugin:
             region,
             adapter,
             args,
-            lowerings=LOWERINGS,
+            lowerings=self.op_lowerings_by_target,
         )
 
     def make_region_module(
