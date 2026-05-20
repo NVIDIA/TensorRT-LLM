@@ -129,6 +129,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                               default=None)
     _mla_decode_plan_params: Optional[MLAPlanParams] = field(init=False,
                                                              default=None)
+    num_ctx_cached_tokens: int = field(init=False, default=0)
     _mla_ragged_planned: bool = field(init=False, default=False)
     _mla_context_planned: bool = field(init=False, default=False)
     _mla_decode_planned: bool = field(init=False, default=False)
@@ -689,6 +690,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.kv_cache_params = KVCacheParams(use_cache=False)
             n = self.num_seqs
             self._cached_token_lens[:n].zero_()
+            self.num_ctx_cached_tokens = 0
             self.kv_lens_cuda_runtime = self.seq_lens_cuda[:n]
             for plan_params in list(self._plan_params_to_wrappers.keys()):
                 if plan_params.attention_mask_data is None:
@@ -709,6 +711,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.kv_cache_params.num_cached_tokens_per_seq, dtype=torch.int)
         self._cached_token_lens[:cached_token_lens.size(0)].copy_(
             cached_token_lens, non_blocking=True)
+        if self.num_contexts > 0:
+            self.num_ctx_cached_tokens = sum(
+                self.kv_cache_params.num_cached_tokens_per_seq[:self.
+                                                               num_contexts])
+        else:
+            self.num_ctx_cached_tokens = 0
 
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
@@ -1362,14 +1370,14 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     out=output[:num_tokens].view(-1, self.num_heads,
                                                  self.kv_lora_rank))
 
-    def _mla_forward_cached_context(
+    def _mla_forward_paged_context(
         self,
         q: torch.Tensor,
         metadata: FlashInferAttentionMetadata,
         output: torch.Tensor,
         latent_cache: torch.Tensor,
     ) -> None:
-        """MLA context phase with cached KV: append latent and run paged MLA."""
+        """MLA context phase with paged KV: append latent and run paged MLA."""
         num_ctx_tokens = metadata.num_ctx_tokens
         kv_dtype = q.dtype
         if self.has_fp8_kv_cache:
@@ -1453,11 +1461,25 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                                           latent_cache)
                 return
             elif k is None and v is None:
-                if attention_input_type == AttentionInputType.context_only:
+                has_cached_context = (
+                    attention_input_type == AttentionInputType.context_only
+                    and metadata.enable_context_mla_with_cached_kv
+                    and metadata.num_ctx_cached_tokens > 0)
+                has_first_chunk_context = (
+                    attention_input_type == AttentionInputType.context_only
+                    and metadata.enable_context_mla_with_cached_kv
+                    and metadata.num_ctx_cached_tokens == 0)
+                if has_cached_context or has_first_chunk_context:
+                    # Context MLA with cached KV uses paged MLA. The first
+                    # chunk has no cached tokens yet, but still uses this path.
                     assert latent_cache is not None, (
-                        "FlashInfer MLA cached context requires latent_cache.")
-                    self._mla_forward_cached_context(q, metadata, output,
-                                                     latent_cache)
+                        "FlashInfer MLA paged context requires latent_cache.")
+                    self._mla_forward_paged_context(q, metadata, output,
+                                                    latent_cache)
+                elif attention_input_type == AttentionInputType.context_only:
+                    raise ValueError(
+                        "FlashInfer MLA context without cached KV "
+                        "requires key/value tensors.")
                 else:
                     # MLA generation phase: paged decode + slice
                     self._mla_forward_generation(q, metadata, output,

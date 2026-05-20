@@ -2408,7 +2408,10 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
-            if attn_metadata.runtime_features.chunked_prefill:
+            if attn_metadata.enable_context_mla_with_cached_kv:
+                # The zero-cached first chunk still needs FlashInfer's paged
+                # MLA context path; the backend checks num_ctx_cached_tokens
+                # when distinguishing cached vs first-chunk context.
                 return self.forward_absorption_context(
                     q,
                     compressed_kv,
