@@ -352,7 +352,6 @@
     "disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]": 98.97588296607137,
     "disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]": 67.9668476767838,
     "disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]": 82.28277984517626,
-    "disaggregated/test_disaggregated.py::test_disaggregated_trtllm_sampler[TinyLlama-1.1B-Chat-v1.0]": 62.51559329708107,
     "disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]": 238.76137515995651,
     "disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]": 78.98068026197143,
     "disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-DeepSeek-V3-Lite-fp8/fp8]": 77.51831256924197,
