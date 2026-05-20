@@ -28,6 +28,7 @@ Design Principles:
 4. Unified EPLB integration for backends that support it
 """
 
+import copy
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
@@ -281,11 +282,24 @@ class ConfigurableMoE(MoE):
           / etc., which only become known after the sync. Defer weight
           creation to the explicit ``backend.create_weights()`` call below.
         """
-        from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+        from tensorrt_llm._torch.modules.fused_moe.create_moe import (
+            create_moe_backend,
+            resolve_moe_cls,
+        )
 
-        moe_cls = get_moe_cls(model_config, override_quant_config=override_quant_config)
+        moe_cls = resolve_moe_cls(
+            model_config,
+            routing_method,
+            self.dtype,
+            override_quant_config=override_quant_config,
+        )
 
-        with self._temporarily_skip_weight_creation(model_config):
+        backend_model_config = model_config
+        if override_quant_config is not None:
+            backend_model_config = copy.deepcopy(model_config)
+            backend_model_config.quant_config = override_quant_config
+
+        with self._temporarily_skip_weight_creation(backend_model_config):
             backend = create_moe_backend(
                 moe_cls=moe_cls,
                 routing_method=routing_method,
@@ -294,7 +308,7 @@ class ConfigurableMoE(MoE):
                 intermediate_size=self.intermediate_size,
                 dtype=self.dtype,
                 reduce_results=self.reduce_results,
-                model_config=model_config,
+                model_config=backend_model_config,
                 aux_stream_dict=self.aux_stream_dict,
                 weight_loading_mode=self.weight_loading_mode,
                 bias=kwargs.get("bias", False),
@@ -321,7 +335,7 @@ class ConfigurableMoE(MoE):
 
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
-        if not model_config.skip_create_weights_in_init:
+        if not backend_model_config.skip_create_weights_in_init:
             self.backend.create_weights()
 
     def _supports_load_balancer(self) -> bool:

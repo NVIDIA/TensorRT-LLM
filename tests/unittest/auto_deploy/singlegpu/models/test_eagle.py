@@ -16,6 +16,7 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
+from typing import Any, ClassVar, Dict
 
 import pytest
 import torch
@@ -79,7 +80,7 @@ class MockEagleConfig(EagleConfig):
     For standalone testing, we need to load these from the checkpoint.
     """
 
-    _drafter_defaults = {
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": False,
             "load_lm_head_from_target": False,
@@ -137,7 +138,9 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
         from accelerate import init_empty_weights
 
         model_config, unused_kwargs = self._get_model_config()
-        model_config = MockEagleConfig(model_config, model_config.model_type)
+        # transformers>=5.5 applies @dataclass(kw_only=True) to PretrainedConfig
+        # subclasses, overriding EagleConfig.__init__. Use the factory classmethod.
+        model_config = MockEagleConfig.from_base_config(model_config, model_config.model_type)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = MockEagle3ModelForCausalLM._from_config(model_config, **unused_kwargs)
@@ -236,7 +239,7 @@ def test_eagle_model_torch_export():
     eagle_path = Path(eagle_model_path)
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     dtype = torch.float16
 
     # Create model via EagleDrafterFactory (creates EagleDrafterForCausalLM)

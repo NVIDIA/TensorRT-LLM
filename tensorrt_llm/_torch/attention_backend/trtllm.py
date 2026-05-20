@@ -1328,12 +1328,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_scale_quant_orig = (self.kv_scale_quant_orig
                                if forward_args.kv_scales_sf is None else
                                forward_args.kv_scales_sf)
-        mrope_rotary_cos_sin = forward_args.mrope_config.get(
-            'mrope_rotary_cos_sin'
-        ) if forward_args.mrope_config is not None else None
-        mrope_position_deltas = forward_args.mrope_config.get(
-            'mrope_position_deltas'
-        ) if forward_args.mrope_config is not None else None
+        mrope_rotary_cos_sin = forward_args.mrope_rotary_cos_sin
+        mrope_position_deltas = forward_args.mrope_position_deltas
         workspace = metadata.workspace if not metadata.is_cuda_graph else metadata.cuda_graph_workspace
         flash_mla_tile_scheduler_metadata = (
             metadata.flash_mla_tile_scheduler_metadata
@@ -1345,7 +1341,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                  metadata.max_num_tokens)
 
         helix_active = metadata.helix_position_offsets is not None
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
+        use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
+                         or forward_args.sage_attn_num_elts_per_blk_k > 0
+                         or forward_args.sage_attn_num_elts_per_blk_v > 0)
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,

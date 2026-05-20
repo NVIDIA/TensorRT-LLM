@@ -776,6 +776,7 @@ def test_create_beam_history():
                 beam_history_builder=sampler._prepare_beam_history(
                     request,
                     finish_reasons=torch.ones((beam_width, ), dtype=torch.int),
+                    d2h_copier=sampler._copy_to_host,
                 ), )
 
         yield _uut

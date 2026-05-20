@@ -23,7 +23,7 @@ from itertools import chain
 from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
-from .._block_radix_tree import Block, RootBlock, UselessBlockError
+from .._block_radix_tree import Block, ReuseScope, RootBlock, UselessBlockError
 from .._common import (
     BAD_BLOCK_ORDINAL,
     BAD_PAGE_INDEX,
@@ -171,7 +171,7 @@ class _KVCache:
     __slots__ = (
         "id",
         "_manager",
-        "_lora_task_id",
+        "_reuse_scope",
         "_get_priority",
         "_cuda_stream",
         "_status",
@@ -199,7 +199,7 @@ class _KVCache:
 
     id: int | None
     _manager: "KVCacheManager"
-    _lora_task_id: int | None
+    _reuse_scope: ReuseScope
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
     _status: _Status
@@ -240,14 +240,14 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
+        reuse_scope: ReuseScope,
         input_tokens: Sequence[TokenIdExt] | None,
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
     ):
         self.id = id
         self._manager = manager
-        self._lora_task_id = lora_task_id
+        self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
         self._status = self.Status.SUSPENDED
@@ -279,7 +279,6 @@ class _KVCache:
         self._avg_history_length = Average()
         self._avg_capacity = Average()
         self._avg_history_length.update(self.history_length)
-        self._avg_capacity.update(self.capacity)
         manager._living_kv_caches.add(rawref.ref(self))
         manager._avg_reused_length.update(self.history_length)
         manager._num_created_kv_caches += 1
@@ -342,14 +341,16 @@ class _KVCache:
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
         manager = self.manager
-        manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
-        manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
-        manager._try_update_target_ratios()
+        if self.capacity > 0:
+            self._avg_capacity.update(self.capacity)
+            manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
+            manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
+            manager._num_sampled_kv_caches += 1
+            manager._try_update_target_ratios()
         with self._record_event():
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
-        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
@@ -677,8 +678,6 @@ class _KVCache:
     @history_length.setter
     def history_length(self, history_length: int) -> None:
         "History length cannot be decreased. Increase may trigger out-of-window block eviction/dropping for SWA layers."
-        if self._shortcut_set_history_length(history_length):
-            return
         success = self.resize(None, history_length)
         assert success
 
@@ -1041,7 +1040,7 @@ class _KVCache:
             raise LogicError("Cannot commit block that is not full except last block")
         prev: RootBlock | Block
         if ordinal == 0:
-            prev = self.manager._radix_tree.add_or_get_existing(self._lora_task_id)
+            prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
         try:
@@ -1395,10 +1394,9 @@ class _KVCache:
 
     def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]) -> None:
         manager = self.manager
-        lora_task_id = self._lora_task_id
         matched = list(
             manager._radix_tree.match(
-                lora_task_id, input_tokens or [], manager.enable_partial_match
+                self._reuse_scope, input_tokens or [], manager.enable_partial_match
             )
         )
         tokens_per_block = manager.tokens_per_block

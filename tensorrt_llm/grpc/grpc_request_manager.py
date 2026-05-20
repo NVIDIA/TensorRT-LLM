@@ -26,7 +26,7 @@ detokenization and return token IDs only.
 import asyncio
 import traceback
 from collections.abc import AsyncGenerator
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor.request import LoRARequest, PromptAdapterRequest
@@ -255,7 +255,8 @@ def create_sampling_params_from_proto(
     bad: Optional[List[str]] = None,
     bad_token_ids: Optional[List[int]] = None,
     guided_decoding: Optional[pb2.GuidedDecodingParams] = None,
-    embedding_bias: Optional[List[float]] = None,
+    embedding_bias: Optional[Sequence[float]] = None,
+    vocab_size: Optional[int] = None,
     include_stop_token_in_output: bool = False,
 ) -> SamplingParams:
     """Convert protobuf configuration to TensorRT-LLM SamplingParams.
@@ -271,6 +272,7 @@ def create_sampling_params_from_proto(
         bad_token_ids: Bad word token IDs
         guided_decoding: Guided decoding parameters
         embedding_bias: Embedding bias tensor
+        vocab_size: Vocabulary size used to validate embedding bias length
 
     Returns:
         TensorRT-LLM SamplingParams with detokenize=False
@@ -366,6 +368,10 @@ def create_sampling_params_from_proto(
 
     # Embedding bias
     if embedding_bias:
+        if vocab_size and len(embedding_bias) != vocab_size:
+            raise ValueError(
+                f"embedding_bias length ({len(embedding_bias)}) must match vocab_size ({vocab_size})"
+            )
         kwargs["embedding_bias"] = list(embedding_bias)
 
     # Guided decoding

@@ -15,9 +15,6 @@
 #   # Run the benchmark
 #   ./benchmark_visual_gen.sh
 #
-# Requirements:
-#   pip install "diffusers>=0.37.0"
-#
 # Optional (for MP4/H.264 video output):
 #   apt-get install ffmpeg   # or: conda install ffmpeg
 #   Without ffmpeg, videos are saved as AVI/MJPEG using a pure-Python encoder.

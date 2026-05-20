@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from torch import nn
-from transformers import NemotronHConfig, PretrainedConfig
+from transformers import AutoConfig, NemotronHConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -52,11 +52,35 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
 
+class NemotronHPuzzleConfig(PretrainedConfig):
+    model_type = "nemotron_h_puzzle"
+
+
+NemotronHModelConfig = ModelConfig[NemotronHConfig | NemotronHPuzzleConfig]
+
+
+def _bc_getattr(bc, key, default=None):
+    """Get attribute from a block_config entry (dict or dataclass)."""
+    if isinstance(bc, dict):
+        return bc.get(key, default)
+    return getattr(bc, key, default)
+
+
+def _get_layer_moe_param(config, layer_idx: int, param_name: str):
+    """Get per-layer MoE parameter, falling back to global config."""
+    block_configs = getattr(config, 'block_configs', None)
+    if block_configs and layer_idx < len(block_configs):
+        val = _bc_getattr(block_configs[layer_idx], param_name)
+        if val is not None:
+            return val
+    return getattr(config, param_name, None)
+
+
 class MLPLayer(MLP):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
@@ -96,7 +120,7 @@ class TransformerLayer(Attention):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         reduce_output: bool = False,
         use_custom_cublas_mm: bool = False,
@@ -154,22 +178,26 @@ class NemotronHMOE(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.layer_idx = layer_idx
-        self.moe_intermediate_size = (config.moe_intermediate_size[0]
-                                      if isinstance(
-                                          config.moe_intermediate_size, list)
-                                      else config.moe_intermediate_size)
-        self.use_latent_moe: bool = getattr(config, "moe_latent_size",
-                                            None) is not None
-        self.moe_hidden_size: int = (config.moe_latent_size
-                                     if self.use_latent_moe else
+
+        # Per-layer MoE params (models with block_configs have varying params).
+        def _moe(name):
+            return _get_layer_moe_param(config, layer_idx, name)
+
+        moe_intermediate = _moe('moe_intermediate_size')
+        self.moe_intermediate_size = (moe_intermediate[0] if isinstance(
+            moe_intermediate, list) else moe_intermediate)
+
+        moe_latent = _moe('moe_latent_size')
+        self.use_latent_moe: bool = moe_latent is not None
+        self.moe_hidden_size: int = (moe_latent if self.use_latent_moe else
                                      config.hidden_size)
         self.mlp_bias = config.mlp_bias if hasattr(config,
                                                    "mlp_bias") else False
         self.moe_n_group = config.n_group
-        self.num_experts = config.n_routed_experts
+        self.num_experts = _moe('n_routed_experts')
         self.hidden_size = config.hidden_size
         self.num_shared_experts = config.n_shared_experts
-        self.top_k = config.num_experts_per_tok
+        self.top_k = _moe('num_experts_per_tok')
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.routed_scaling_factor = config.routed_scaling_factor
         self.mapping = model_config.mapping
@@ -179,7 +207,7 @@ class NemotronHMOE(nn.Module):
             self.shared_experts = None
         else:
             shared_expert_intermediate_size = (
-                config.moe_shared_expert_intermediate_size *
+                _moe('moe_shared_expert_intermediate_size') *
                 config.n_shared_experts)
 
             self.shared_experts = MLP(
@@ -384,7 +412,7 @@ class NemotronHLayer(DecoderLayer):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         # M -> MambaLayer
         # - -> MLPLayer
@@ -609,7 +637,7 @@ class NemotronHLayer(DecoderLayer):
 
 class NemotronHModel(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[NemotronHConfig]):
+    def __init__(self, model_config: NemotronHModelConfig):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
 
@@ -726,13 +754,16 @@ class NemotronHModel(DecoderModel):
         return hidden_states
 
 
+@register_auto_model("NemotronHPuzzleForCausalLM")
 @register_auto_model("NemotronHForCausalLM")
 class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
-                                                       NemotronHConfig]):
+                                                       NemotronHConfig
+                                                       | NemotronHPuzzleConfig]
+                           ):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
     ):
         # rms_norm_eps might be named differently in the config.
         if hasattr(model_config.pretrained_config, "rms_norm_eps"):
@@ -742,6 +773,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         else:
             raise ValueError("layer_norm_epsilon or rms_norm_eps is not set")
         model_config.pretrained_config.rms_norm_eps = rms_epsilon
+
+        self._normalize_puzzle_config(model_config.pretrained_config)
 
         if (not model_config.mapping.enable_attention_dp
                 and model_config.mapping.tp_size not in [1, 2, 4, 8]):
@@ -799,6 +832,31 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
 
+    @staticmethod
+    def _normalize_puzzle_config(config):
+        """Set global MoE defaults from block_configs for models with per-layer MoE params."""
+        block_configs = getattr(config, 'block_configs', None)
+        if not block_configs:
+            return
+
+        def _is_moe(bc):
+            return _bc_getattr(bc, 'block_type') == 'moe'
+
+        first_moe = next((bc for bc in block_configs if _is_moe(bc)), None)
+        if first_moe is None:
+            return
+
+        # Prefer MTP MoE block as fallback (used for MTP layers beyond
+        # block_configs range), otherwise use first main-model MoE block.
+        mtp_configs = getattr(config, 'mtp_block_configs', None) or []
+        fallback = next((bc for bc in mtp_configs if _is_moe(bc)), first_moe)
+
+        for attr in ('n_routed_experts', 'moe_intermediate_size',
+                     'num_experts_per_tok', 'moe_latent_size',
+                     'moe_shared_expert_intermediate_size'):
+            if not hasattr(config, attr) or getattr(config, attr) is None:
+                setattr(config, attr, _bc_getattr(fallback, attr))
+
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
@@ -852,7 +910,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         has_start_projections: bool,
@@ -1003,7 +1061,7 @@ class NemotronHMTP(nn.Module):
 
     def __init__(
         self,
-        model_config: ModelConfig[NemotronHConfig],
+        model_config: NemotronHModelConfig,
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         is_separate_draft_engine: bool = False,
@@ -1055,8 +1113,8 @@ class NemotronHMTP(nn.Module):
         # Add shared_head for MTP, following DeepseekV3MTP pattern
         self.shared_head = DeepseekV3MTPHead(model_config)
 
-    def _get_mtp_sublayer_quant_config(
-            self, model_config: ModelConfig[NemotronHConfig], layer_idx: int):
+    def _get_mtp_sublayer_quant_config(self, model_config: NemotronHModelConfig,
+                                       layer_idx: int):
         """
         Get quantization config for MTP sublayer.
         The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
@@ -1100,3 +1158,6 @@ class NemotronHMTP(nn.Module):
                 lora_params=lora_params,
             )
         return hidden_states
+
+
+AutoConfig.register(NemotronHPuzzleConfig.model_type, NemotronHPuzzleConfig)

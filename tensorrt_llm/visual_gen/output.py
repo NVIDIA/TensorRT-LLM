@@ -11,7 +11,7 @@ on every successful output and is ``None`` on error outputs.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
 import torch
 
@@ -62,7 +62,9 @@ class VisualGenOutput:
     :class:`VisualGenMetrics` instance. Error outputs leave all media tensors
     and ``metrics`` as ``None`` and set ``error`` to the failure message.
 
-    Use :meth:`save` to persist the output to disk; rates carried on the
+    Use :meth:`save` to persist the output to disk. Pass a single path for
+    the ``n == 1`` case (returns :class:`pathlib.Path`) or a list of paths
+    for the ``n > 1`` case (returns ``List[Path]``); rates carried on the
     output are used as defaults and can be overridden via keyword args.
     """
 
@@ -77,18 +79,23 @@ class VisualGenOutput:
 
     def save(
         self,
-        path,
+        path: Union[str, Path, List[Union[str, Path]]],
         *,
         format: Optional[str] = None,
         frame_rate: Optional[float] = None,
         audio_sample_rate: Optional[int] = None,
         quality: int = 95,
-    ) -> Path:
+    ) -> Union[Path, List[Path]]:
         """Encode this output to disk via :mod:`tensorrt_llm.media.encoding`.
 
         Args:
-            path: Output file path. Format is inferred from the extension
-                unless ``format`` is given.
+            path: Where to write. A single :class:`str`/:class:`pathlib.Path`
+                writes one file (batched tensors collapse to the first
+                slice); a list of paths writes one file per batch item via
+                :func:`~tensorrt_llm.media.encoding.save_images` /
+                :func:`~tensorrt_llm.media.encoding.save_videos`. In both
+                cases format is inferred from the extension unless
+                ``format`` is given.
             format: Explicit format override (``'png'``/``'jpg'``/``'webp'``
                 for images, ``'mp4'``/``'avi'`` for video).
             frame_rate: Override the frame rate for video output. Defaults to
@@ -98,22 +105,31 @@ class VisualGenOutput:
             quality: Quality for lossy image formats (1-100).
 
         Returns:
-            :class:`pathlib.Path` of the saved file.
+            :class:`pathlib.Path` when ``path`` is a single path, or a list
+            of :class:`pathlib.Path` (in batch order) when ``path`` is a list.
 
         Raises:
             RuntimeError: When the output carries an upstream error.
-            ValueError: When video output lacks a frame rate, or when the
-                output carries no media tensor at all.
+            ValueError: When video output lacks a frame rate, when the
+                output carries no media tensor at all, or when the list
+                length does not match the batch size.
             NotImplementedError: When the output is audio-only.
         """
-        from tensorrt_llm.media.encoding import save_image, save_video
+        from tensorrt_llm.media.encoding import save_image, save_images, save_video, save_videos
 
         if self.error is not None:
             raise RuntimeError(
                 f"Cannot save output: request {self.request_id} failed with error: {self.error}"
             )
 
+        is_batch = isinstance(path, list)
+
         if self.image is not None:
+            if is_batch:
+                saved_list = save_images(
+                    self.image, [str(p) for p in path], format=format, quality=quality
+                )
+                return [Path(p) for p in saved_list]
             saved = save_image(self.image, path, format=format, quality=quality)
             return Path(saved)
 
@@ -125,13 +141,24 @@ class VisualGenOutput:
                     "provided as a keyword argument."
                 )
             asr = audio_sample_rate if audio_sample_rate is not None else self.audio_sample_rate
+            asr_value = asr if asr is not None else 24000
+            if is_batch:
+                saved_list = save_videos(
+                    self.video,
+                    [str(p) for p in path],
+                    audios=self.audio,
+                    frame_rate=fr,
+                    format=format,
+                    audio_sample_rate=asr_value,
+                )
+                return [Path(p) for p in saved_list]
             saved = save_video(
                 self.video,
                 path,
                 audio=self.audio,
                 frame_rate=fr,
                 format=format,
-                audio_sample_rate=asr if asr is not None else 24000,
+                audio_sample_rate=asr_value,
             )
             return Path(saved)
 

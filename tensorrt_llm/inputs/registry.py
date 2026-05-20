@@ -3,8 +3,8 @@ import random
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
-                    TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, List, Optional, Protocol,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from PIL import Image
@@ -20,6 +20,7 @@ from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+                         _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
@@ -135,6 +136,14 @@ class BaseMultimodalInputProcessor(ABC):
     If these are not implemented, the pipeline detokenizes the text prompt first and then
     processes the multimodal inputs.
     """
+
+    # Whether multimodal soft-token runs need bidirectional attention spanning
+    # the full block. When True, the chunked-prefill scheduler must keep each
+    # MM block intact within a single iteration (snap-up or snap-down at chunk
+    # boundaries) so the second half does not attend to a frozen first half.
+    # Default False: most VLMs (Llava, Qwen-VL) use causal attention over MM
+    # tokens and tolerate splitting. Gemma4 sets True.
+    mm_bidirectional_blocks: ClassVar[bool] = False
 
     def __init__(self,
                  model_path,
@@ -817,6 +826,21 @@ def maybe_compute_mm_embed_cumsum(
     mm_data = extra_processed_inputs.get("multimodal_data")
     if mm_data is None:
         return
+
+    # Always backfill the bidirectional-MM gate first (cheap; instance attr
+    # falls through to class attr in Python). Must happen BEFORE the cumsum
+    # idempotency guard below, otherwise the path where
+    # `multimodal_hashing_process` already setdefault()ed the cumsum (without
+    # this flag) leaves scheduler_v2 reading mm_bidirectional_blocks=None and
+    # silently skipping align — which then trips
+    # get_flashinfer_attention_mask's `cached_token_lens == 0` assert on
+    # 26B/31B once an image block is split across chunks. Gemma4 sets this
+    # per-instance from text_config.use_bidirectional_attention.
+    mm_data.setdefault(
+        "mm_bidirectional_blocks",
+        bool(getattr(input_processor, "mm_bidirectional_blocks", False)),
+    )
+
     if "multimodal_embed_mask_cumsum" in mm_data:
         return
 
@@ -993,6 +1017,7 @@ def create_input_processor_with_hash(
         input_ids_tensor = _as_cpu_tensor(prompt_token_ids)
         if input_ids_tensor.numel() == 0:
             start_positions, start_special_token_positions = [], []
+            item_run_cu_offsets, run_positions, run_lengths = [0], [], []
         else:
             mm_mask, embed_mask, special_mask = _compute_mm_masks(
                 input_ids_tensor,
@@ -1006,6 +1031,8 @@ def create_input_processor_with_hash(
             start_positions, start_special_token_positions = (
                 _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
                                                     num_mm_tokens))
+            item_run_cu_offsets, run_positions, run_lengths = (
+                _find_mm_token_runs_from_mask(mm_mask, num_mm_tokens))
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
@@ -1020,7 +1047,8 @@ def create_input_processor_with_hash(
 
         extra_processed_inputs[
             "multimodal_input"] = MultimodalInput.from_components(
-                mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list)
+                mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list,
+                item_run_cu_offsets, run_positions, run_lengths)
         return prompt_token_ids, extra_processed_inputs
 
     def process_tokenized_prompt_maybe_hash(

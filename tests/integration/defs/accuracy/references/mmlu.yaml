@@ -156,6 +156,10 @@ google/gemma-3-27b-it:
     accuracy: 76.80
 google/gemma-4-26B-A4B-it:
   - accuracy: 71.296
+google/gemma-3n-E2B-it:
+  - accuracy: 59.527
+google/gemma-4-E2B-it:
+  - accuracy: 56.823
 Qwen/Qwen2-0.5B-Instruct:
   - accuracy: 45.30
   - quant_algo: FP8
@@ -433,6 +437,10 @@ nvidia/Nemotron-Super-V3:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 85.13
+nvidia/Nemotron-Ultra-V3:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.70
 nvidia/Nemotron-3-Nano:
   - accuracy: 73.85
   - quant_algo: FP8

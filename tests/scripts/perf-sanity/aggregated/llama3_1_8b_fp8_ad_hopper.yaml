@@ -1,0 +1,21 @@
+metadata:
+  model_name: llama_v3.1_8b_instruct_fp8
+  supported_gpus:
+  - H100
+  - H200
+hardware:
+  gpus_per_node: 1
+server_configs:
+  # 1k1k config - AutoDeploy backend, 1 GPU (Llama-3.1-8B FP8 on Hopper)
+  - name: "llama3_1_8b_ad_ws1_1k1k"
+    model_name: "llama_v3.1_8b_instruct_fp8"
+    backend: "_autodeploy"
+    extra_llm_api_config_path: "examples/auto_deploy/model_registry/configs/llama3_1_8b.yaml"
+    world_size: 1
+    client_configs:
+      - name: "con64_iter10_1k1k"
+        concurrency: 64
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"

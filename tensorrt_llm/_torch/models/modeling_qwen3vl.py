@@ -968,6 +968,15 @@ class Qwen3VLModelBase(PreTrainedModel):
         disable_fuse_rope = kwargs.get("disable_fuse_rope", False)
         model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         model_config.pretrained_config.text_config.disable_fuse_rope = disable_fuse_rope
+        # transformers>=5.5 flipped the ``Qwen3VL[Moe]TextConfig`` class-level
+        # default for ``tie_word_embeddings`` from inherited ``False`` to
+        # ``True``. Real checkpoints set it only on the top-level config, so
+        # the nested ``text_config`` silently picks up the new default and
+        # ties lm_head to embed_tokens, producing systematic logits drift.
+        # Mirror the top-level value onto ``text_config`` to stay aligned.
+        model_config.pretrained_config.text_config.tie_word_embeddings = (
+            model_config.pretrained_config.tie_word_embeddings
+        )
         # In transformers 5.x, rope_scaling may delegate to rope_parameters which
         # can be None.  Ensure the dict exists before setting the type key.
         if model_config.pretrained_config.text_config.rope_scaling is None:
