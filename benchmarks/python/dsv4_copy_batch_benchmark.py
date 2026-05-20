@@ -20,15 +20,20 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import statistics
 import time
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
+    DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV,
+)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
@@ -76,6 +81,7 @@ class BenchmarkConfig:
     iterations: int
     phases: list[str]
     methods: list[str]
+    scratch_reuse_modes: list[str]
     sync_cuda: bool
     include_device_copy: bool
 
@@ -92,6 +98,7 @@ class BenchmarkTarget:
 class BenchmarkResult:
     name: str
     phase: str
+    scratch_reuse: str
     iterations: int
     min_ms: float
     mean_ms: float
@@ -100,6 +107,24 @@ class BenchmarkResult:
     p99_ms: float
     max_ms: float
     mean_ms_per_seq: float
+
+
+@contextmanager
+def _scratch_reuse_env(mode: str):
+    original = os.environ.get(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV)
+    if mode == "enabled":
+        os.environ[DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV] = "1"
+    elif mode == "disabled":
+        os.environ.pop(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, None)
+    else:
+        raise ValueError(f"unsupported scratch reuse mode: {mode}")
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, None)
+        else:
+            os.environ[DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV] = original
 
 
 def _normalize_compress_ratios(values: list[int]) -> list[int]:
@@ -417,6 +442,7 @@ def _benchmark_target(
     warmup: int,
     sync_cuda: bool,
     batch_size: int,
+    scratch_reuse: str,
 ) -> BenchmarkResult:
     should_sync = sync_cuda and target.uses_cuda
     for _ in range(warmup):
@@ -439,6 +465,7 @@ def _benchmark_target(
     return BenchmarkResult(
         name=target.name,
         phase=target.phase,
+        scratch_reuse=scratch_reuse,
         iterations=iterations,
         min_ms=sorted_ms[0],
         mean_ms=mean_ms,
@@ -457,7 +484,8 @@ def _print_results(results: list[BenchmarkResult], config: BenchmarkConfig) -> N
         f"batch={config.batch_size}, seq_len={config.seq_len}, max_seq_len={config.max_seq_len}, "
         f"tokens_per_block={config.tokens_per_block}, layers={len(config.compress_ratios)}, "
         f"max_gpu_total_bytes={config.max_gpu_total_bytes}, sync_cuda={config.sync_cuda}, "
-        f"include_device_copy={config.include_device_copy}"
+        f"include_device_copy={config.include_device_copy}, "
+        f"scratch_reuse_modes={config.scratch_reuse_modes}"
     )
     print(
         "Model fields: "
@@ -469,6 +497,7 @@ def _print_results(results: list[BenchmarkResult], config: BenchmarkConfig) -> N
     print()
     header = (
         "phase",
+        "scratch_reuse",
         "target",
         "iters",
         "min_ms",
@@ -483,6 +512,7 @@ def _print_results(results: list[BenchmarkResult], config: BenchmarkConfig) -> N
     for result in results:
         print(
             f"{result.phase:>18} "
+            f"{result.scratch_reuse:>18} "
             f"{result.name:>18} "
             f"{result.iterations:>18d} "
             f"{result.min_ms:>18.3f} "
@@ -504,10 +534,16 @@ def _write_csv(results: list[BenchmarkResult], path: Path) -> None:
             writer.writerow(result.__dict__)
 
 
-def _run_phase(config: BenchmarkConfig, phase: str) -> list[BenchmarkResult]:
-    cache_manager = _create_cache_manager(config)
+def _run_phase(config: BenchmarkConfig, phase: str, scratch_reuse: str) -> list[BenchmarkResult]:
+    with _scratch_reuse_env(scratch_reuse):
+        cache_manager = _create_cache_manager(config)
     requests: list[LlmRequest] = []
     try:
+        if cache_manager.enable_swa_scratch_reuse != (scratch_reuse == "enabled"):
+            raise RuntimeError(
+                f"expected scratch reuse {scratch_reuse}, got "
+                f"{cache_manager.enable_swa_scratch_reuse}"
+            )
         requests = _prepare_context_requests(cache_manager, config.batch_size, config.seq_len)
         if phase == "generation":
             _promote_to_generation(cache_manager, requests, config.seq_len)
@@ -525,6 +561,7 @@ def _run_phase(config: BenchmarkConfig, phase: str) -> list[BenchmarkResult]:
                 warmup=config.warmup,
                 sync_cuda=config.sync_cuda,
                 batch_size=config.batch_size,
+                scratch_reuse=scratch_reuse,
             )
             for target in targets
         ]
@@ -591,6 +628,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Comma-separated method list: block_offsets,sliding,compress,indexer,all.",
     )
     parser.add_argument(
+        "--scratch-reuse",
+        type=lambda value: _parse_choices(value, ("all", "disabled", "enabled")),
+        default=["disabled", "enabled"],
+        help="Comma-separated scratch reuse modes: disabled,enabled,all.",
+    )
+    parser.add_argument(
         "--no-sync",
         action="store_true",
         help="Do not synchronize CUDA after device-copy helpers; measures host enqueue overhead only.",
@@ -643,13 +686,15 @@ def main() -> None:
         iterations=args.iterations,
         phases=args.phase,
         methods=args.methods,
+        scratch_reuse_modes=args.scratch_reuse,
         sync_cuda=not args.no_sync,
         include_device_copy=args.include_device_copy,
     )
 
     all_results: list[BenchmarkResult] = []
-    for phase in config.phases:
-        all_results.extend(_run_phase(config, phase))
+    for scratch_reuse in config.scratch_reuse_modes:
+        for phase in config.phases:
+            all_results.extend(_run_phase(config, phase, scratch_reuse))
 
     _print_results(all_results, config)
     if args.csv is not None:
