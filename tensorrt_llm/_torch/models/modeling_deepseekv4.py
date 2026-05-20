@@ -151,8 +151,8 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
 def _deepseek_v4_pos_embd_params(
     config: PretrainedConfig,
     model_config: ModelConfig,
-    predicted_tokens_per_seq: int,
     layer_idx: Optional[int],
+    predicted_tokens_per_seq: int = 1,
 ) -> PositionalEmbeddingParams:
     # Match the spec/overlap headroom that py_executor_creator applies
     # to model_engine_max_seq_len before sizing the KV cache. The overlap
@@ -1306,7 +1306,7 @@ class DeepseekV4Attention(MLA):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=_deepseek_v4_pos_embd_params(
-                config, model_config, predicted_tokens_per_seq, layer_idx
+                config, model_config, layer_idx, predicted_tokens_per_seq
             ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
