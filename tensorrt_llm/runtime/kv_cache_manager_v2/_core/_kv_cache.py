@@ -779,7 +779,7 @@ class _KVCache:
                     else:
                         if len(indices) < new_num_blocks:
                             raise ValueError("User-provided base page indices is too short")
-                            
+
             stream_wait_events(
                 self.cuda_stream, (s.ready_event for s in chain.from_iterable(slots))
             )
@@ -794,7 +794,7 @@ class _KVCache:
                 new_num_blocks,
                 beam_width,
                 excluded_ranges,
-                record_generation_alloc_stats
+                record_generation_alloc_stats,
             )
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
                 block = make_typed(
