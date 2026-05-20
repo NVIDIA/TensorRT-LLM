@@ -761,36 +761,44 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         pixel_values: torch.Tensor,
         image_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Single batched vision-tower call across all images in this LLM step.
+        # ``Gemma4VisionModel.forward`` flattens valid patches across the
+        # batch and runs FULL attention with per-image ``cu_seqlens`` via
+        # varlen ``attn_metadata`` (same pattern as Qwen2VL / LlavaNext).
+        # ``pixel_values`` arrives shape ``(B, max_patches, 3*patch_size**2)``
+        # already cross-request ``torch.cat``-ed in ``forward``, so all
+        # images share ``max_patches`` (image processor pads with -1
+        # sentinels in ``image_position_ids`` for variable image sizes).
         pooling_k2 = self._top_config.vision_config.pooling_kernel_size**2
         target_dtype = self.embed_vision.embedding_projection.weight.dtype
 
-        per_image_features = []
-        for i in range(pixel_values.shape[0]):
-            pv = pixel_values[i].unsqueeze(0)
-            pp = image_position_ids[i].unsqueeze(0) if image_position_ids is not None else None
+        batch_size, max_patches = pixel_values.shape[0], pixel_values.shape[1]
 
-            max_patches = pv.shape[1]
+        if image_position_ids is None:
+            # Square images with implicit row-major grid coordinates.
+            side = int(math.sqrt(max_patches))
+            grid = torch.stack(
+                torch.meshgrid(
+                    torch.arange(side, device=pixel_values.device),
+                    torch.arange(side, device=pixel_values.device),
+                    indexing="ij",
+                ),
+                dim=-1,
+            ).reshape(-1, 2)
+            image_position_ids = grid.unsqueeze(0).expand(batch_size, -1, -1)
 
-            if pp is None:
-                side = int(math.sqrt(max_patches))
-                pp = torch.stack(
-                    torch.meshgrid(
-                        torch.arange(side, device=pv.device),
-                        torch.arange(side, device=pv.device),
-                        indexing="ij",
-                    ),
-                    dim=-1,
-                ).reshape(1, -1, 2)
+        output_length = max_patches // pooling_k2
 
-            output_length = max_patches // pooling_k2
+        with torch.autocast(device_type="cuda", dtype=self.model_dtype):
+            output = self.vision_tower(
+                pixel_values, image_position_ids, output_length=output_length
+            )
+            # ``last_hidden_state`` is flat ``(N_valid_pool_tokens_total, hidden_size)``
+            # after pooler+strip; ``embed_vision`` is token-wise (RMSNorm +
+            # Linear), so shape doesn't matter for projection.
+            projected = self.embed_vision(output.last_hidden_state.to(target_dtype))
 
-            with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-                output = self.vision_tower(pv, pp, output_length=output_length)
-                hidden = output.last_hidden_state
-                projected = self.embed_vision(hidden.unsqueeze(0).to(target_dtype)).squeeze(0)
-            per_image_features.append(projected)
-
-        return torch.cat(per_image_features, dim=0).contiguous()
+        return projected.contiguous()
 
     @nvtx_range("[Audio] process")
     def _get_audio_features(

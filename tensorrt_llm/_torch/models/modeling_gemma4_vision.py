@@ -63,7 +63,7 @@ from .modeling_utils import _load_weights_impl
 # rejects non-fp32 / non-contiguous strides and 1152-wide bf16 inputs from
 # SigLip. HF's class is pure PyTorch and handles ``with_scale=False`` (the
 # weightless ``v_norm`` case) via a flag.
-class _Gemma4VisionRMSNorm(_HFGemma4RMSNorm):
+class Gemma4VisionRMSNorm(_HFGemma4RMSNorm):
     """Kwarg + dtype adapter around HF ``Gemma4RMSNorm``."""
 
     def __init__(
@@ -81,7 +81,7 @@ class _Gemma4VisionRMSNorm(_HFGemma4RMSNorm):
 
 
 @dataclass
-class _VisionOutput:
+class VisionOutput:
     """Stand-in for ``transformers.BaseModelOutputWithPast`` (only field used)."""
 
     last_hidden_state: torch.Tensor
@@ -279,15 +279,33 @@ class Gemma4VisionAttention(Attention):
     so we pass ``q_scaling = 1 / sqrt(head_dim)`` to neutralize the sqrt.
     """
 
+    # trtllm-gen FMHA on sm100a ships cubins for these head_dim sizes only.
+    # Variants whose HF ``head_dim`` is not in this set are padded up to the
+    # next supported size; the kernel sees zero-padded q/k/v while RMSNorm,
+    # RoPE, and o_proj math run on the unpadded HF channels (see ``forward``
+    # for the slice / re-pad dance and ``Gemma4VisionModel.load_weights`` for
+    # weight zero-padding). Gemma4 26B/31B vision: ``head_dim=72`` → 80.
+    _FMHA_SUPPORTED_HEAD_DIMS = (64, 80, 128, 256, 512)
+
     def __init__(
         self, model_config: ModelConfig, vision_config, layer_idx: int, dtype: torch.dtype
     ):
-        head_dim = getattr(
+        hf_head_dim = getattr(
             vision_config,
             "head_dim",
             vision_config.hidden_size // vision_config.num_attention_heads,
         )
-        q_scaling = 1.0 / math.sqrt(head_dim)
+        if hf_head_dim in self._FMHA_SUPPORTED_HEAD_DIMS:
+            padded_head_dim = hf_head_dim
+        else:
+            padded_head_dim = next(d for d in self._FMHA_SUPPORTED_HEAD_DIMS if d >= hf_head_dim)
+        # TRT-LLM ``Attention`` applies ``qk_scale = 1 / (sqrt(self.head_dim) *
+        # q_scaling)``; HF ``Gemma4VisionAttention`` sets ``scaling = 1.0`` (no
+        # ``1/sqrt(d)`` rescale). Use the padded ``head_dim`` here so the scale
+        # exactly cancels — the padded q/k channels are zero, so the dot product
+        # is numerically the same regardless of ``sqrt(padded)`` vs
+        # ``sqrt(hf_head_dim)``.
+        q_scaling = 1.0 / math.sqrt(padded_head_dim)
         max_pe = getattr(vision_config, "max_position_embeddings", None) or (
             getattr(vision_config, "position_embedding_size", 0) ** 2 or 4096
         )
@@ -304,20 +322,27 @@ class Gemma4VisionAttention(Attention):
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
-            head_dim=head_dim,
+            head_dim=padded_head_dim,
         )
         self.vision_config = vision_config
+        # ``self.head_dim`` is now ``padded_head_dim`` (the kernel-facing value).
+        # ``self.hf_head_dim`` is the original HF head_dim; norm + RoPE see
+        # this dim only. ``self.head_dim_pad`` is the zero-padding width.
+        self.hf_head_dim = hf_head_dim
+        self.head_dim_pad = padded_head_dim - hf_head_dim
 
         # HF Gemma4RMSNorm is the plain variant (``x_normed * weight``, no
         # ``(1+w)``). v_norm has ``with_scale=False`` (no learnable weight).
-        self.q_norm = _Gemma4VisionRMSNorm(
-            hidden_size=self.head_dim, eps=vision_config.rms_norm_eps, dtype=dtype
+        # Norms operate on ``hf_head_dim``; padded channels are sliced off
+        # before norm and re-padded with zeros after RoPE (see ``forward``).
+        self.q_norm = Gemma4VisionRMSNorm(
+            hidden_size=self.hf_head_dim, eps=vision_config.rms_norm_eps, dtype=dtype
         )
-        self.k_norm = _Gemma4VisionRMSNorm(
-            hidden_size=self.head_dim, eps=vision_config.rms_norm_eps, dtype=dtype
+        self.k_norm = Gemma4VisionRMSNorm(
+            hidden_size=self.hf_head_dim, eps=vision_config.rms_norm_eps, dtype=dtype
         )
-        self.v_norm = _Gemma4VisionRMSNorm(
-            hidden_size=self.head_dim,
+        self.v_norm = Gemma4VisionRMSNorm(
+            hidden_size=self.hf_head_dim,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
             has_weights=False,
@@ -346,7 +371,7 @@ class Gemma4VisionAttention(Attention):
             ):
                 self.register_buffer(name, pos_inf.clone())
 
-    def _head_norm(self, x: torch.Tensor, norm: _Gemma4VisionRMSNorm) -> torch.Tensor:
+    def _head_norm(self, x: torch.Tensor, norm: Gemma4VisionRMSNorm) -> torch.Tensor:
         # HF ``Gemma4RMSNorm`` is pure PyTorch and normalises over the last
         # dim, so we can pass the (..., head_dim) tensor through directly.
         return norm(x)
@@ -377,17 +402,54 @@ class Gemma4VisionAttention(Attention):
         k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
 
-        q = self._head_norm(q, self.q_norm)
-        k = self._head_norm(k, self.k_norm)
-        v = self._head_norm(v, self.v_norm)
+        # When ``head_dim`` was padded to satisfy the FMHA cubin set, the
+        # qkv_proj last ``head_dim_pad`` channels are produced by zero-padded
+        # weight rows (see ``Gemma4VisionModel.load_weights``) — slice them
+        # off before RMSNorm so the mean-of-squares averages over
+        # ``hf_head_dim`` (HF semantics), not the padded width.
+        if self.head_dim_pad > 0:
+            q_real = q[..., : self.hf_head_dim]
+            k_real = k[..., : self.hf_head_dim]
+            v_real = v[..., : self.hf_head_dim]
+        else:
+            q_real, k_real, v_real = q, k, v
+
+        q_real = self._head_norm(q_real, self.q_norm)
+        k_real = self._head_norm(k_real, self.k_norm)
+        v_real = self._head_norm(v_real, self.v_norm)
 
         cos, sin = position_embeddings
-        q = _apply_multidimensional_rope(q, cos, sin, position_ids, unsqueeze_dim=1)
-        k = _apply_multidimensional_rope(k, cos, sin, position_ids, unsqueeze_dim=1)
+        q_real = _apply_multidimensional_rope(q_real, cos, sin, position_ids, unsqueeze_dim=1)
+        k_real = _apply_multidimensional_rope(k_real, cos, sin, position_ids, unsqueeze_dim=1)
+
+        # Re-pad with zeros for the FMHA kernel. Zeros in q_pad/k_pad don't
+        # contribute to QK^T; zeros in v_pad produce zero output channels — so
+        # ``attn_output[..., hf_head_dim:]`` is identically 0 and o_proj's
+        # last padded columns (also zero) don't see real signal either way.
+        if self.head_dim_pad > 0:
+            pad_shape = q_real.shape[:-1] + (self.head_dim_pad,)
+            q = torch.cat([q_real, q_real.new_zeros(pad_shape)], dim=-1)
+            k = torch.cat([k_real, k_real.new_zeros(pad_shape)], dim=-1)
+            v = torch.cat([v_real, v_real.new_zeros(pad_shape)], dim=-1)
+        else:
+            q, k, v = q_real, k_real, v_real
 
         q = q.reshape(num_tokens, self.num_heads * self.head_dim)
         k = k.reshape(num_tokens, self.num_key_value_heads * self.head_dim)
         v = v.reshape(num_tokens, self.num_key_value_heads * self.head_dim)
+
+        # Defensive dtype cast: HF ``Gemma4RMSNorm.forward`` casts internals to
+        # fp32; RoPE / clamp paths can also promote. The FMHA dispatcher
+        # rejects non-bf16/half input ("Fall back to unfused MHA because of
+        # unsupported data type") and falls into the O(B × T²) unfused path.
+        # Casting q/k/v back to the projection weight dtype (matches model
+        # dtype, typically bf16; fp32 in unit tests) keeps the kernel
+        # dispatch on the FMHA path in production and is a no-op when the
+        # tower was constructed in fp32 anyway.
+        target_dtype = self.qkv_proj.weight.dtype
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
 
         q, k, v = self.convert_qkv(q, k, v)
         attn_output = self.forward_impl(
@@ -429,22 +491,22 @@ class Gemma4VisionEncoderLayer(nn.Module):
             dtype=dtype,
         )
         self.mlp = Gemma4VisionMLP(vision_config, dtype, mapping)
-        self.input_layernorm = _Gemma4VisionRMSNorm(
+        self.input_layernorm = Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
         )
-        self.post_attention_layernorm = _Gemma4VisionRMSNorm(
+        self.post_attention_layernorm = Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
         )
-        self.pre_feedforward_layernorm = _Gemma4VisionRMSNorm(
+        self.pre_feedforward_layernorm = Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
         )
-        self.post_feedforward_layernorm = _Gemma4VisionRMSNorm(
+        self.post_feedforward_layernorm = Gemma4VisionRMSNorm(
             hidden_size=vision_config.hidden_size,
             eps=vision_config.rms_norm_eps,
             dtype=dtype,
@@ -507,7 +569,7 @@ class Gemma4VisionEncoder(nn.Module):
         attn_metadata: AttentionMetadata,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         position_ids: torch.Tensor,
-    ) -> _VisionOutput:
+    ) -> VisionOutput:
         hidden_states = inputs_embeds
         for layer in self.layers:
             hidden_states = layer(
@@ -516,7 +578,7 @@ class Gemma4VisionEncoder(nn.Module):
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
             )
-        return _VisionOutput(last_hidden_state=hidden_states)
+        return VisionOutput(last_hidden_state=hidden_states)
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +688,7 @@ class Gemma4VisionModel(nn.Module):
         pixel_position_ids: (B, num_patches, 2) -- (x, y) per patch; -1 = padding
         output_length: post-pool token count (== num_patches // pooling_k**2)
 
-    Returns ``_VisionOutput`` with ``last_hidden_state`` of shape
+    Returns ``VisionOutput`` with ``last_hidden_state`` of shape
     ``(N_valid_tokens, hidden_size)`` (flat across the batch after pooler_mask strip).
     """
 
@@ -652,13 +714,22 @@ class Gemma4VisionModel(nn.Module):
 
         # SigLip-style context-only metadata: kv_cache_manager=None, no decode
         # phase. Re-prepared each forward with the actual per-image seq lens.
-        # Vision tower runs one image per call (mm forward loops per-image),
-        # so bounds are vision-scale, not LLM-scale. Using LLM max_num_tokens
-        # here makes the C++ attn workspace resize to TB-range and OOM
-        # (sized as max_num_requests * heads * max_num_tokens^2 * bytes).
+        # Vision tower is called once per LLM step across all images in the
+        # batch (``modeling_gemma4mm._get_image_features``), so the batch
+        # axis here is the cross-request image count.
+        #
+        # Sizing rationale: vision attention dispatches to the trtllm-gen
+        # FMHA kernel (see ``Gemma4VisionAttention``: dtype cast on q/k/v
+        # before ``forward_impl``; head_dim padded to an FMHA-supported
+        # cubin size in ``__init__`` + ``load_weights``). FMHA workspace is
+        # O(max_num_tokens × hidden_size) — linear, no batch² term — so we
+        # can safely pull the LLM-side ``max_num_requests`` (typically
+        # 8192) without OOM. ``max_num_tokens`` stays at a vision-scale
+        # 8192 (covers worst-case patch counts) — pulling the LLM-side
+        # value of 16384 would still bloat workspace 4× on no reason.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         self.attn_metadata = self.metadata_cls(
-            max_num_requests=1,
+            max_num_requests=getattr(model_config, "max_num_requests", 8192) or 8192,
             max_num_tokens=8192,
             kv_cache_manager=None,
         )
@@ -680,7 +751,7 @@ class Gemma4VisionModel(nn.Module):
         pixel_values: torch.Tensor,
         pixel_position_ids: torch.Tensor,
         output_length: Optional[int] = None,
-    ) -> _VisionOutput:
+    ) -> VisionOutput:
         if output_length is None:
             k = self.config.pooling_kernel_size
             output_length = pixel_values.shape[-2] // (k * k)
@@ -727,7 +798,7 @@ class Gemma4VisionModel(nn.Module):
         hidden_states = hidden_states[pooler_mask]
         if self.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale
-        return _VisionOutput(last_hidden_state=hidden_states)
+        return VisionOutput(last_hidden_state=hidden_states)
 
     def load_weights(self, weights: Dict[str, torch.Tensor]):
         # HF Gemma4ClippableLinear has nested ``.linear`` weights. We collapse
@@ -742,7 +813,13 @@ class Gemma4VisionModel(nn.Module):
         #   - Attention output clamps: q/k/v stay separate; o_proj input/output
         #     clamps move from ``self_attn.o_proj.{input,output}_{min,max}``
         #     into the attention module as ``o_{input,output}_{min,max}``.
+        #   - If the model's HF ``head_dim`` is not an FMHA-supported cubin
+        #     size (e.g. 72 for 26B/31B), zero-pad q/k/v/o_proj head dim to
+        #     the next supported size (e.g. 80) so the trtllm-gen FMHA
+        #     kernel can dispatch. Norm/RoPE math sees only the unpadded
+        #     channels (see ``Gemma4VisionAttention.forward``).
         remapped = self._remap_clamp_buffers(dict(weights))
+        remapped = self._pad_attention_head_dim(remapped)
         # Strip the HF ``.linear`` indirection inside our ClippableLinear
         # wrappers (MLP and patch_embedder.input_proj are also wrapped/standalone).
         # The attention's qkv_proj absorbs HF q_proj/k_proj/v_proj via
@@ -817,3 +894,78 @@ class Gemma4VisionModel(nn.Module):
                         remapped[f"{prefix}.o_{io}_{kind}"] = weights[src].clone()
                         remapped.pop(src, None)
         return remapped
+
+    def _pad_attention_head_dim(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Zero-pad q/k/v_proj and o_proj head dim from HF to FMHA-supported.
+
+        No-op when ``head_dim`` was already in the FMHA cubin set (E2B/E4B
+        vision: head_dim=64). For 26B/31B vision (head_dim=72), pads to 80
+        so the trtllm-gen FMHA dispatcher finds a matching kernel and
+        keeps workspace linear in seq_len.
+
+        Math invariant: zeros in the appended channels mean (a) qkv_proj
+        outputs zero on those channels (zero-rowed weight × any input = 0),
+        (b) softmax(QK^T) is the same since pad·pad=0 doesn't contribute,
+        (c) ``attn_output[..., hf:padded]`` is identically zero (V's pad
+        channels are zero), and (d) o_proj's zero-padded last columns × the
+        zero attn_output channels = 0. Net: byte-equivalent to the unpadded
+        HF math, plus 11% extra compute on the kernel side (80/72).
+        """
+        import re
+
+        first_attn = self.encoder.layers[0].self_attn
+        if getattr(first_attn, "head_dim_pad", 0) == 0:
+            return weights
+
+        hf_hd = first_attn.hf_head_dim
+        padded_hd = first_attn.head_dim
+        nh = first_attn.num_heads
+        nkv = first_attn.num_key_value_heads
+        pad_w = padded_hd - hf_hd
+
+        # HF keys at this point have already had ``.linear.`` stripped if the
+        # rename pattern landed first, but the rename happens INSIDE
+        # ``_load_weights_impl``. So we see the raw HF keys here:
+        #   self_attn.{q,k,v}_proj.linear.{weight,bias}
+        #   self_attn.o_proj.linear.{weight,bias}
+        qkv_re = re.compile(r"(.*self_attn\.)([qkv])_proj\.linear\.(weight|bias)$")
+        o_re = re.compile(r"(.*self_attn\.)o_proj\.linear\.(weight|bias)$")
+        out = dict(weights)
+        for k, v in list(weights.items()):
+            m = qkv_re.match(k)
+            if m is not None and m.group(3) == "weight":
+                # HF (sec=q): (nh × hf_hd, hidden_size)
+                # HF (sec=k,v): (nkv × hf_hd, hidden_size)
+                heads = nh if m.group(2) == "q" else nkv
+                w = v
+                assert w.shape[0] == heads * hf_hd, (
+                    f"Unexpected qkv shape {tuple(w.shape)} for {k} "
+                    f"(expected first dim = {heads}*{hf_hd})"
+                )
+                w = w.view(heads, hf_hd, -1)
+                zeros = w.new_zeros(heads, pad_w, w.shape[-1])
+                out[k] = torch.cat([w, zeros], dim=1).reshape(heads * padded_hd, -1)
+                continue
+            if m is not None and m.group(3) == "bias":
+                heads = nh if m.group(2) == "q" else nkv
+                b = v
+                assert b.shape[0] == heads * hf_hd
+                b = b.view(heads, hf_hd)
+                zeros = b.new_zeros(heads, pad_w)
+                out[k] = torch.cat([b, zeros], dim=1).reshape(heads * padded_hd)
+                continue
+            m_o = o_re.match(k)
+            if m_o is not None and m_o.group(2) == "weight":
+                # HF o_proj.weight: (hidden_size, nh × hf_hd) — pad the input dim.
+                w = v
+                assert w.shape[1] == nh * hf_hd, (
+                    f"Unexpected o_proj shape {tuple(w.shape)} for {k} "
+                    f"(expected second dim = {nh}*{hf_hd})"
+                )
+                w = w.view(-1, nh, hf_hd)
+                zeros = w.new_zeros(w.shape[0], nh, pad_w)
+                out[k] = torch.cat([w, zeros], dim=2).reshape(-1, nh * padded_hd)
+                continue
+            # o_proj.bias is shape (hidden_size,) — output dim, not head dim.
+            # No padding needed.
+        return out

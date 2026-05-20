@@ -219,6 +219,10 @@ class TestGemma4VisionTower(unittest.TestCase):
         Validates the ``_load_weights_impl`` ``params_map`` regex
         (``self_attn.q_proj.linear.weight`` → ``self_attn.q_proj.weight``) plus
         the built-in qkv fusion (``qkv_proj`` ← stack(q,k,v)).
+
+        When ``head_dim`` is padded to an FMHA-supported size (e.g. 32 → 64,
+        72 → 80), the fused ``qkv_proj.weight`` has zero-padded tail channels
+        per head; comparison must apply the same zero-pad to the HF reference.
         """
         torch.manual_seed(0)
         vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
@@ -227,17 +231,27 @@ class TestGemma4VisionTower(unittest.TestCase):
 
         trt_tower.load_weights(dict(hf_tower.state_dict()))
 
-        # Spot-check: fused qkv_proj.weight == vstack(q,k,v) from HF.
+        # Spot-check: fused qkv_proj.weight == vstack(zero-pad(q,k,v)) from HF.
         hf_sd = hf_tower.state_dict()
         for i in range(vision_cfg.num_hidden_layers):
-            expected = torch.cat(
-                [
-                    hf_sd[f"encoder.layers.{i}.self_attn.q_proj.linear.weight"],
-                    hf_sd[f"encoder.layers.{i}.self_attn.k_proj.linear.weight"],
-                    hf_sd[f"encoder.layers.{i}.self_attn.v_proj.linear.weight"],
-                ],
-                dim=0,
-            )
+            attn = trt_tower.encoder.layers[i].self_attn
+            nh = attn.num_heads
+            nkv = attn.num_key_value_heads
+            hf_hd = attn.hf_head_dim
+            padded_hd = attn.head_dim
+
+            def _pad_head_dim(t: torch.Tensor, heads: int) -> torch.Tensor:
+                # t: (heads * hf_hd, hidden) → (heads * padded_hd, hidden)
+                if padded_hd == hf_hd:
+                    return t
+                t = t.view(heads, hf_hd, -1)
+                zeros = t.new_zeros(heads, padded_hd - hf_hd, t.shape[-1])
+                return torch.cat([t, zeros], dim=1).reshape(heads * padded_hd, -1)
+
+            q = _pad_head_dim(hf_sd[f"encoder.layers.{i}.self_attn.q_proj.linear.weight"], nh)
+            k = _pad_head_dim(hf_sd[f"encoder.layers.{i}.self_attn.k_proj.linear.weight"], nkv)
+            v = _pad_head_dim(hf_sd[f"encoder.layers.{i}.self_attn.v_proj.linear.weight"], nkv)
+            expected = torch.cat([q, k, v], dim=0)
             got = trt_tower.encoder.layers[i].self_attn.qkv_proj.weight.data
             torch.testing.assert_close(got.float(), expected.float(), atol=0, rtol=0)
 
@@ -270,6 +284,61 @@ class TestGemma4VisionTower(unittest.TestCase):
         self.assertTrue(
             torch.allclose(hf_flat, trt_out, atol=atol, rtol=rtol),
             f"max diff={diff.max().item():.4f} mean diff={diff.mean().item():.4f}",
+        )
+
+    @torch.no_grad()
+    def test_forward_batched_matches_per_image_loop(self):
+        """B>1 single-call equivalence to per-image looped calls.
+
+        The caller ``_get_image_features`` was rewritten to feed all images
+        in one batched ``vision_tower`` call (varlen ``cu_seqlens`` attention).
+        This regression test guards that the batched path is numerically
+        equivalent to looping ``B=1`` calls and concatenating. If a future
+        change introduces cross-image leakage (e.g. shared attn_metadata
+        state not properly reset, or pooler bleeding across images), the
+        loop-vs-batched diff catches it.
+        """
+        torch.manual_seed(0)
+        cfg_dict = deepcopy(SMALL_VISION_CONFIG)
+        cfg_dict["use_clipped_linears"] = False
+        vision_cfg = Gemma4VisionConfig(**cfg_dict)
+
+        hf_tower = HFGemma4VisionModel(vision_cfg).to("cuda").to(torch.float32).eval()
+        trt_tower = _build_trt_vision_tower(vision_cfg)
+        trt_tower.load_weights(dict(hf_tower.state_dict()))
+
+        B = 3
+        pv_batched, pos_batched, output_length = _make_dummy_pixel_input(vision_cfg, B=B)
+
+        # Path 1 (legacy): per-image loop, B=1 each, then concat.
+        per_image = []
+        with torch.inference_mode():
+            for i in range(B):
+                out_i = trt_tower(
+                    pv_batched[i : i + 1],
+                    pos_batched[i : i + 1],
+                    output_length=output_length,
+                ).last_hidden_state
+                per_image.append(out_i)
+        looped = torch.cat(per_image, dim=0)
+
+        # Path 2 (new): single batched call.
+        with torch.inference_mode():
+            batched = trt_tower(
+                pv_batched, pos_batched, output_length=output_length
+            ).last_hidden_state
+
+        # Shape must match (both flat, N_valid_total = B * output_length when
+        # all images have full validity, as in this dummy input).
+        self.assertEqual(looped.shape, batched.shape)
+        # Values should be byte-equivalent (deterministic FULL attention on
+        # both paths, no cross-image bleed). Allow a small atol for tiny
+        # kernel-order tile reshuffles, but no rtol slack.
+        diff = (looped - batched).abs()
+        self.assertTrue(
+            torch.allclose(looped, batched, atol=1e-4, rtol=0),
+            f"Cross-image batched call diverges from per-image loop: "
+            f"max diff={diff.max().item():.6f} mean diff={diff.mean().item():.6f}",
         )
 
 
@@ -1126,6 +1195,131 @@ class TestGemma4MultimodalE2E(unittest.TestCase):
             runner.test_all()
         finally:
             runner.tearDown()
+
+
+class TestGemma4VisionHeadDimPadding(unittest.TestCase):
+    """Head_dim 72 (26B/31B vision) gets zero-padded to 80 so the trtllm-gen
+    FMHA dispatcher finds a matching cubin (sm100a ships H64/H80/H128/H256/H512;
+    no H72). qkv_proj/o_proj weights pad along the head dim; norm + RoPE run
+    on the unpadded HF channels; the padded last channels stay zero through
+    the kernel and don't contribute to the output (zero × anything = 0 in
+    both QK^T and softmax(QK^T)V).
+
+    Without this padding, vision attention falls into the unfused MHA path
+    (``Fall back to unfused MHA``) with O(B × T²) workspace, OOMing 26B/31B
+    MMMU at LLM-scale ``max_num_requests``.
+    """
+
+    HEAD_DIM_72_CONFIG = {
+        # nh=2, head_dim=72 → hidden_size=144. Small enough to run on CPU/GPU
+        # quickly while exercising the 72→80 padding path.
+        "hidden_size": 144,
+        "intermediate_size": 288,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 72,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "rms_norm_eps": 1e-6,
+        "patch_size": 16,
+        "pooling_kernel_size": 3,
+        "position_embedding_size": 1024,
+        "use_clipped_linears": False,
+        "standardize": True,
+        "model_type": "gemma4_vision",
+    }
+
+    def test_attention_overrides_head_dim_to_80(self):
+        """``Gemma4VisionAttention`` should pad HF head_dim=72 to kernel
+        head_dim=80 at init; qkv_proj weight dim should reflect padded size."""
+        vision_cfg = Gemma4VisionConfig(**self.HEAD_DIM_72_CONFIG)
+        trt_tower = _build_trt_vision_tower(vision_cfg)
+        attn = trt_tower.encoder.layers[0].self_attn
+
+        self.assertEqual(attn.hf_head_dim, 72)
+        self.assertEqual(attn.head_dim, 80)
+        self.assertEqual(attn.head_dim_pad, 8)
+        # qkv_proj fused: q_size + 2*kv_size = nh*80 + 2*nkv*80 = (2 + 2*2)*80 = 480.
+        expected_qkv_out = (
+            vision_cfg.num_attention_heads + 2 * vision_cfg.num_key_value_heads
+        ) * attn.head_dim
+        self.assertEqual(attn.qkv_proj.weight.shape[0], expected_qkv_out)
+        # q_norm operates on unpadded HF head_dim (72).
+        self.assertEqual(attn.q_norm.weight.shape[0], 72)
+
+    def test_attention_no_pad_when_head_dim_supported(self):
+        """Head_dim already in FMHA cubin set (64) → padding is a no-op."""
+        cfg_dict = deepcopy(SMALL_VISION_CONFIG)
+        cfg_dict["head_dim"] = 64
+        cfg_dict["hidden_size"] = 64 * cfg_dict["num_attention_heads"]
+        vision_cfg = Gemma4VisionConfig(**cfg_dict)
+        trt_tower = _build_trt_vision_tower(vision_cfg)
+        attn = trt_tower.encoder.layers[0].self_attn
+
+        self.assertEqual(attn.hf_head_dim, 64)
+        self.assertEqual(attn.head_dim, 64)
+        self.assertEqual(attn.head_dim_pad, 0)
+
+    @torch.no_grad()
+    def test_load_weights_zero_pads_qkv_and_o_proj(self):
+        """Weight load should pad q/k/v_proj (rows) and o_proj (cols) head dim
+        72→80 with zeros; the appended slices must be exactly zero."""
+        vision_cfg = Gemma4VisionConfig(**self.HEAD_DIM_72_CONFIG)
+        hf_tower = HFGemma4VisionModel(vision_cfg).to("cuda").to(torch.float32).eval()
+        trt_tower = _build_trt_vision_tower(vision_cfg)
+        trt_tower.load_weights(dict(hf_tower.state_dict()))
+
+        nh = vision_cfg.num_attention_heads
+        for layer in trt_tower.encoder.layers:
+            qkv_w = layer.self_attn.qkv_proj.weight.data
+            # qkv_proj.weight shape: ((nh + 2*nkv) * 80, hidden_size).
+            # Reshape to (heads_total, 80, hidden); last 8 channels of each
+            # head must be exactly zero (zero-pad from load_weights).
+            heads_total = nh + 2 * vision_cfg.num_key_value_heads
+            qkv_w_3d = qkv_w.view(heads_total, 80, -1)
+            self.assertTrue(
+                torch.all(qkv_w_3d[:, 72:, :] == 0),
+                "qkv_proj.weight last 8 channels per head must be zero (padding)",
+            )
+
+            o_w = layer.self_attn.o_proj.weight.data
+            # o_proj.weight shape: (hidden_size, nh * 80) — pad last 8 cols per head.
+            o_w_3d = o_w.view(-1, nh, 80)
+            self.assertTrue(
+                torch.all(o_w_3d[:, :, 72:] == 0),
+                "o_proj.weight last 8 cols per head must be zero (padding)",
+            )
+
+    @torch.no_grad()
+    def test_forward_parity_head_dim_72(self):
+        """HF ↔ TRT forward parity at head_dim=72 with padding-to-80 dance.
+
+        The zero-pad math is mathematically equivalent to unpadded HF
+        computation: zeros in q/k don't contribute to QK^T, zeros in v
+        produce zero output channels, zeros in o_proj's last columns ignore
+        those zero channels. Same fp32 tolerance as the head_dim=32 parity
+        test (``test_forward_parity_no_clamp``).
+        """
+        vision_cfg = Gemma4VisionConfig(**self.HEAD_DIM_72_CONFIG)
+
+        hf_tower = HFGemma4VisionModel(vision_cfg).to("cuda").to(torch.float32).eval()
+        trt_tower = _build_trt_vision_tower(vision_cfg)
+        trt_tower.load_weights(dict(hf_tower.state_dict()))
+
+        pv, pos, output_length = _make_dummy_pixel_input(vision_cfg)
+        with torch.inference_mode():
+            hf_out = hf_tower(pv, pos, output_length=output_length).last_hidden_state
+            trt_out = trt_tower(pv, pos, output_length=output_length).last_hidden_state
+
+        hf_flat = hf_out.reshape(-1, vision_cfg.hidden_size)
+        self.assertEqual(hf_flat.shape, trt_out.shape)
+        diff = (hf_flat - trt_out).abs()
+        atol, rtol = 5e-2, 5e-2
+        self.assertTrue(
+            torch.allclose(hf_flat, trt_out, atol=atol, rtol=rtol),
+            f"head_dim=72 padded-to-80 diverges from HF: "
+            f"max diff={diff.max().item():.4f} mean diff={diff.mean().item():.4f}",
+        )
 
 
 if __name__ == "__main__":

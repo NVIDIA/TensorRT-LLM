@@ -61,7 +61,7 @@ from .modeling_utils import _load_weights_impl
 
 
 @dataclass
-class _AudioOutput:
+class AudioOutput:
     """Stand-in for ``transformers.Gemma4AudioModelOutput`` (fields used by caller)."""
 
     last_hidden_state: torch.Tensor
@@ -74,7 +74,7 @@ class _AudioOutput:
 # ---------------------------------------------------------------------------
 
 
-class _Gemma4AudioRMSNorm(_HFGemma4RMSNorm):
+class Gemma4AudioRMSNorm(_HFGemma4RMSNorm):
     """Kwarg + dtype adapter around HF ``Gemma4RMSNorm`` (``w * x / rms(x)``)."""
 
     def __init__(self, *, hidden_size: int, eps: float, dtype: Optional[torch.dtype] = None):
@@ -425,10 +425,10 @@ class Gemma4AudioFeedForward(nn.Module):
         self.ffw_layer_2 = Gemma4AudioClippableLinear(
             config, config.hidden_size * 4, config.hidden_size, dtype, mapping=mapping
         )
-        self.pre_layer_norm = _Gemma4AudioRMSNorm(
+        self.pre_layer_norm = Gemma4AudioRMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.post_layer_norm = _Gemma4AudioRMSNorm(
+        self.post_layer_norm = Gemma4AudioRMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.act_fn = ACT2FN[config.hidden_act]
@@ -486,10 +486,10 @@ class Gemma4AudioLightConv1d(nn.Module):
             bias=False,
             dtype=dtype,
         )
-        self.pre_layer_norm = _Gemma4AudioRMSNorm(
+        self.pre_layer_norm = Gemma4AudioRMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.conv_norm = _Gemma4AudioRMSNorm(
+        self.conv_norm = Gemma4AudioRMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.act_fn = ACT2FN[config.hidden_act]
@@ -530,13 +530,13 @@ class Gemma4AudioLayer(nn.Module):
             config, layer_idx=layer_idx, dtype=dtype, mapping=mapping
         )
         self.lconv1d = Gemma4AudioLightConv1d(config, dtype=dtype, mapping=mapping)
-        self.norm_pre_attn = _Gemma4AudioRMSNorm(
+        self.norm_pre_attn = Gemma4AudioRMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.norm_post_attn = _Gemma4AudioRMSNorm(
+        self.norm_post_attn = Gemma4AudioRMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.norm_out = _Gemma4AudioRMSNorm(
+        self.norm_out = Gemma4AudioRMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.gradient_clipping = config.gradient_clipping
@@ -580,7 +580,7 @@ class Gemma4AudioModel(nn.Module):
         input_features:  (B, mel_T, mel_bins) — mel-spectrogram frames
         attention_mask:  (B, mel_T) bool — True for valid frames
 
-    Returns ``_AudioOutput`` with:
+    Returns ``AudioOutput`` with:
         last_hidden_state: (B, T_audio, output_proj_dims)
         attention_mask:    (B, T_audio) bool — post-subsample frame validity
     """
@@ -666,7 +666,7 @@ class Gemma4AudioModel(nn.Module):
         input_features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> _AudioOutput:
+    ) -> AudioOutput:
         hidden_states, output_mask = self.subsample_conv_projection(input_features, attention_mask)
         position_embeddings = self.rel_pos_enc(hidden_states)
 
@@ -688,7 +688,7 @@ class Gemma4AudioModel(nn.Module):
             )
 
         hidden_states = self.output_proj(hidden_states)
-        return _AudioOutput(last_hidden_state=hidden_states, attention_mask=output_mask)
+        return AudioOutput(last_hidden_state=hidden_states, attention_mask=output_mask)
 
     def load_weights(self, weights: Dict[str, torch.Tensor]):
         """Load HF ``Gemma4AudioModel`` weights.

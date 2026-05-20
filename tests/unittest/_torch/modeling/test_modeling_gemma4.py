@@ -3045,25 +3045,25 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
     def test_audio_rmsnorm_inherits_from_hf_class(self):
         from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
 
-        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import Gemma4AudioRMSNorm
 
-        self.assertTrue(issubclass(_Gemma4AudioRMSNorm, HFRMSNorm))
+        self.assertTrue(issubclass(Gemma4AudioRMSNorm, HFRMSNorm))
 
     def test_vision_rmsnorm_inherits_from_hf_class(self):
         from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
 
-        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionRMSNorm
 
-        self.assertTrue(issubclass(_Gemma4VisionRMSNorm, HFRMSNorm))
+        self.assertTrue(issubclass(Gemma4VisionRMSNorm, HFRMSNorm))
 
     def test_audio_rmsnorm_uses_plain_w_not_one_plus_w(self):
         """With ``weight=ones``, output must equal ``x/rms`` (plain ``w``),
         NOT ``2*x/rms`` (Gemma3 ``(1+w)`` convention). This is the exact
         failure mode that produced E4B BLEU=1.90."""
-        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import Gemma4AudioRMSNorm
 
         hidden_size, eps = 16, 1e-6
-        norm = _Gemma4AudioRMSNorm(hidden_size=hidden_size, eps=eps)
+        norm = Gemma4AudioRMSNorm(hidden_size=hidden_size, eps=eps)
         with torch.no_grad():
             norm.weight.fill_(1.0)
         torch.manual_seed(0)
@@ -3082,10 +3082,10 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
         self.assertGreater(diff_one_plus_w, 1e-2)
 
     def test_vision_rmsnorm_uses_plain_w_not_one_plus_w(self):
-        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionRMSNorm
 
         hidden_size, eps = 16, 1e-6
-        norm = _Gemma4VisionRMSNorm(hidden_size=hidden_size, eps=eps)
+        norm = Gemma4VisionRMSNorm(hidden_size=hidden_size, eps=eps)
         with torch.no_grad():
             norm.weight.fill_(1.0)
         torch.manual_seed(1)
@@ -3099,10 +3099,10 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
         """``has_weights=False`` maps to HF ``with_scale=False`` — the
         ``v_norm`` slot in ``Gemma4VisionAttention``. Output is pure
         ``x/rms`` regardless of any (non-existent) weight buffer."""
-        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionRMSNorm
 
         hidden_size, eps = 16, 1e-6
-        norm = _Gemma4VisionRMSNorm(hidden_size=hidden_size, eps=eps, has_weights=False)
+        norm = Gemma4VisionRMSNorm(hidden_size=hidden_size, eps=eps, has_weights=False)
         torch.manual_seed(2)
         x = torch.randn(4, hidden_size)
         expected = self._rms_normalize(x, eps)
@@ -3114,10 +3114,10 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
         ``Gemma4RMSNorm``: same weights → byte-identical output."""
         from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
 
-        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import Gemma4AudioRMSNorm
 
         hidden_size, eps = 16, 1e-6
-        adapter = _Gemma4AudioRMSNorm(hidden_size=hidden_size, eps=eps)
+        adapter = Gemma4AudioRMSNorm(hidden_size=hidden_size, eps=eps)
         hf = HFRMSNorm(hidden_size, eps=eps)
         with torch.no_grad():
             hf.weight.copy_(adapter.weight)
@@ -3126,15 +3126,15 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
         self.assertTrue(torch.equal(adapter(x), hf(x)))
 
     def test_audio_rmsnorm_dtype_kwarg_casts_weight(self):
-        from tensorrt_llm._torch.models.modeling_gemma4_audio import _Gemma4AudioRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import Gemma4AudioRMSNorm
 
-        norm = _Gemma4AudioRMSNorm(hidden_size=8, eps=1e-6, dtype=torch.bfloat16)
+        norm = Gemma4AudioRMSNorm(hidden_size=8, eps=1e-6, dtype=torch.bfloat16)
         self.assertEqual(norm.weight.dtype, torch.bfloat16)
 
     def test_vision_rmsnorm_dtype_kwarg_casts_weight(self):
-        from tensorrt_llm._torch.models.modeling_gemma4_vision import _Gemma4VisionRMSNorm
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionRMSNorm
 
-        norm = _Gemma4VisionRMSNorm(hidden_size=8, eps=1e-6, dtype=torch.bfloat16)
+        norm = Gemma4VisionRMSNorm(hidden_size=8, eps=1e-6, dtype=torch.bfloat16)
         self.assertEqual(norm.weight.dtype, torch.bfloat16)
 
     def test_vision_attention_uses_native_rmsnorm_adapter(self):
@@ -3152,10 +3152,8 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
         # All q_norm/k_norm/v_norm/*_layernorm constructors should be the adapter.
         # Use regex to tolerate the line-wrap that black/yapf inserts after the
         # opening paren on long multi-arg calls.
-        forbidden_pattern = re.compile(
-            r"(?<!_Gemma4Vision)RMSNorm\s*\(\s*hidden_size=vision_config"
-        )
-        adapter_pattern = re.compile(r"_Gemma4VisionRMSNorm\s*\(\s*hidden_size=")
+        forbidden_pattern = re.compile(r"(?<!Gemma4Vision)RMSNorm\s*\(\s*hidden_size=vision_config")
+        adapter_pattern = re.compile(r"Gemma4VisionRMSNorm\s*\(\s*hidden_size=")
         self.assertFalse(
             forbidden_pattern.search(src),
             "Vision tower must not construct TRT-LLM RMSNorm directly "
@@ -3165,7 +3163,7 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
         self.assertTrue(
             adapter_pattern.search(src),
             "Vision tower must construct the HF-derived "
-            "``_Gemma4VisionRMSNorm`` adapter for q/k/v norms and "
+            "``Gemma4VisionRMSNorm`` adapter for q/k/v norms and "
             "encoder layer norms.",
         )
 
@@ -3182,12 +3180,12 @@ class TestGemma4AudioTowerStructure(unittest.TestCase):
 
     def test_audio_module_exports_expected_classes(self):
         """The native audio tower replaces ``AutoModel.from_config`` — the
-        ``Gemma4AudioModel`` + ``_Gemma4AudioRMSNorm`` symbols are part of
+        ``Gemma4AudioModel`` + ``Gemma4AudioRMSNorm`` symbols are part of
         the contract with ``modeling_gemma4mm.py``."""
         from tensorrt_llm._torch.models import modeling_gemma4_audio as ma
 
         self.assertTrue(hasattr(ma, "Gemma4AudioModel"))
-        self.assertTrue(hasattr(ma, "_Gemma4AudioRMSNorm"))
+        self.assertTrue(hasattr(ma, "Gemma4AudioRMSNorm"))
         # Audio layer is also referenced by load_weights / probe paths.
         self.assertTrue(hasattr(ma, "Gemma4AudioLayer"))
 
@@ -3211,6 +3209,86 @@ class TestGemma4AudioTowerStructure(unittest.TestCase):
         self.assertIn("Gemma4AudioModel(audio_model_config)", src)
         # The previous HF fallback line must be gone.
         self.assertNotIn("AutoModel.from_config(config.audio_config)", src)
+
+
+class TestGemma4VisionCrossImageBatching(unittest.TestCase):
+    """Guards for the cross-image batched vision-tower call path.
+
+    The vision tower's inner ``forward`` already supports ``B>1`` via
+    varlen ``cu_seqlens``. The caller ``_get_image_features`` must feed
+    all images in one call (single ``vision_tower(pixel_values, ...)``
+    invocation), not loop one image at a time. Looping defeats the
+    varlen kernel and forces ``max_num_requests=1`` on the metadata,
+    serialising what should be a batched call.
+    """
+
+    def test_get_image_features_is_single_batched_call(self):
+        """``_get_image_features`` must call ``self.vision_tower`` exactly
+        once per invocation and must not contain a Python-level
+        ``for i in range(pixel_values.shape[0])`` loop.
+
+        Pattern matches LlavaNext / Qwen2VL / Qwen3VL / Nemotron-Nano
+        dynamic-resolution — all of which batch images in a single tower
+        call. Gemma4 was the outlier before this guard."""
+        import re
+
+        from tensorrt_llm._torch.models import modeling_gemma4mm as mm
+
+        src = open(mm.__file__).read()
+        # Locate the function body so we don't match unrelated for-loops elsewhere.
+        match = re.search(
+            r"def _get_image_features\(.*?\)(.*?)(?=\n    def |\nclass )",
+            src,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match, "Could not locate `_get_image_features` method in modeling_gemma4mm.py"
+        )
+        body = match.group(1)
+        self.assertNotRegex(
+            body,
+            r"for\s+\w+\s+in\s+range\(\s*pixel_values\.shape\[0\]\s*\)",
+            "Vision feature extraction must not loop one image at a time; "
+            "feed all images to ``self.vision_tower`` in a single batched call "
+            "to participate in varlen cu_seqlens attention.",
+        )
+        # Exactly one vision_tower call expected.
+        self.assertEqual(
+            body.count("self.vision_tower("),
+            1,
+            "`_get_image_features` should invoke ``self.vision_tower`` exactly once; "
+            "additional calls indicate the per-image loop has been re-introduced.",
+        )
+
+    def test_vision_attn_metadata_max_num_requests_is_not_one(self):
+        """The vision tower's ``attn_metadata`` was hardcoded to
+        ``max_num_requests=1`` while the caller loop fed one image per
+        forward. After lifting the loop, the bound must accept ``B>1``
+        cross-image batches (capped vision-scale, not LLM-scale, to keep
+        unfused-MHA workspace under control)."""
+        import re
+
+        from tensorrt_llm._torch.models import modeling_gemma4_vision as mv
+
+        src = open(mv.__file__).read()
+        # Find the Gemma4VisionModel.attn_metadata = self.metadata_cls(...) block.
+        m = re.search(
+            r"self\.attn_metadata\s*=\s*self\.metadata_cls\((.*?)\)",
+            src,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            m, "Could not locate ``self.attn_metadata = self.metadata_cls(...)`` in vision tower."
+        )
+        block = m.group(1)
+        # Reject the legacy ``max_num_requests=1,`` literal.
+        self.assertNotRegex(
+            block,
+            r"max_num_requests\s*=\s*1\s*,",
+            "Vision tower ``max_num_requests`` must not be hardcoded to 1 — "
+            "the caller no longer loops per-image, so the metadata must allow "
+            "cross-image batching.",
+        )
 
 
 if __name__ == "__main__":
