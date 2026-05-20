@@ -494,14 +494,7 @@ class TestDeepseekV4CacheManager:
             )
             return host_block_table[0]
 
-        sliding_block_tables = torch.empty(
-            cache_manager.num_local_layers,
-            len(DEEPSEEK_V4_SLIDING_ATTENTION),
-            1,
-            cache_manager.max_blocks_per_seq,
-            dtype=torch.int32,
-            device="cpu",
-        )
+        sliding_block_tables = torch.empty_like(cache_manager._host_per_layer_block_tables_staging)
         cache_manager.copy_batch_sliding_block_tables(
             sliding_block_tables,
             [req.py_request_id],
@@ -1112,13 +1105,8 @@ class TestDeepseekV4CacheManager:
                 DeepseekV4AttentionType.INDEXER_COMPRESS,
                 DeepseekV4AttentionType.COMPRESSOR_KV,
             }
-            sliding_block_tables = torch.empty(
-                cache_manager.num_local_layers,
-                len(DEEPSEEK_V4_SLIDING_ATTENTION),
-                1,
-                cache_manager.max_blocks_per_seq,
-                dtype=torch.int32,
-                device="cpu",
+            sliding_block_tables = torch.empty_like(
+                cache_manager._host_per_layer_block_tables_staging
             )
             compress_block_table = torch.empty(
                 1,
@@ -1219,14 +1207,7 @@ class TestDeepseekV4CacheManager:
         try:
             requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
             request_ids = [req.py_request_id for req in requests]
-            actual = torch.empty(
-                cache_manager.num_attention_op_pools,
-                len(request_ids),
-                2,
-                cache_manager.max_blocks_per_seq,
-                dtype=torch.int32,
-                device="cpu",
-            )
+            actual = torch.empty_like(cache_manager._host_attention_op_block_offsets_staging)
 
             cache_manager.copy_batch_block_offsets(
                 actual,
@@ -1246,7 +1227,7 @@ class TestDeepseekV4CacheManager:
                     DeepseekV4AttentionType.SWA,
                     PageIndexMode.PER_LAYER,
                 )
-                expected[local_layer_idx] = ref
+                expected[local_layer_idx, : len(request_ids)] = ref
 
             # DSV4 AttentionOp only consumes the key table. The value table is
             # intentionally left untouched to avoid extra CPU work.
@@ -1274,14 +1255,7 @@ class TestDeepseekV4CacheManager:
         try:
             requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
             request_ids = [req.py_request_id for req in requests]
-            actual = torch.empty(
-                cache_manager.num_local_layers,
-                len(DEEPSEEK_V4_SLIDING_ATTENTION),
-                len(request_ids),
-                cache_manager.max_blocks_per_seq,
-                dtype=torch.int32,
-                device="cpu",
-            )
+            actual = torch.empty_like(cache_manager._host_per_layer_block_tables_staging)
 
             cache_manager.copy_batch_sliding_block_tables(
                 actual,
@@ -1297,7 +1271,7 @@ class TestDeepseekV4CacheManager:
                 for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
                     if not compress_ratio_has_attention(compress_ratio, attn_type):
                         continue
-                    expected[local_layer_idx, attn_type.value] = (
+                    expected[local_layer_idx, attn_type.value, : len(request_ids)] = (
                         self._reference_copy_batch_page_indices(
                             cache_manager,
                             request_ids,
