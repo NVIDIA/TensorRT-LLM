@@ -244,7 +244,7 @@ class GptOssExperts(nn.Module):
     ``torch_moe_dense_mlp`` in :meth:`forward`. Quantization (MXFP4 →
     Triton / TRT-LLM-Gen) is handled by the ``quantize_mxfp4_moe`` transform,
     which rewrites the FX graph + swaps parameters at PATTERN_MATCHER time
-    (see :mod:`tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe`).
+    (see :mod:`tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4`).
 
     Dtype protection (kept here as a generic mechanism): when a transform
     registers MXFP4-specific params (uint8 weights / ue8m0 scales / fp32
