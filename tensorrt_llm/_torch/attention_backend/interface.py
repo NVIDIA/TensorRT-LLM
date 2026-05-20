@@ -26,6 +26,7 @@ from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
 
 try:
@@ -638,7 +639,6 @@ class RopeParams:
                 weakref.ref(rope_cos_sin),
             )
         # One-shot log on cache miss (typically 2-4 times per model load).
-        from ..pyexecutor.trace_log_utils import log_tensor_size
         log_tensor_size("rope/new_table",
                         rope_cos_sin,
                         max_pos=self.max_positions,
