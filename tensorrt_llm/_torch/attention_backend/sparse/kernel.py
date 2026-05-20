@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import triton
@@ -2114,6 +2115,7 @@ def _deepseek_v4_local_to_global_kernel(
     compressed_indices_stride1,
     out_stride0,
     out_stride1,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     """
     Triton kernel for converting local indices to global KV cache pool indices.
@@ -2127,6 +2129,9 @@ def _deepseek_v4_local_to_global_kernel(
     This enables the FMHA kernel to determine which TMA descriptor to use based
     solely on tile index (tile 0 = SWA via tmaKSecondary_, rest = compress via tmaK_).
     """
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
+
     token_id = tl.program_id(0)
 
     # Load request ID for this token
@@ -2187,6 +2192,9 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_write_pos = num_swa_indices + compressed_ids
         compressed_out_ptr = out_ptr + token_id * out_stride0 + compressed_write_pos * out_stride1
         tl.store(compressed_out_ptr, compressed_global_index)
+
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def deepseek_v4_local_to_global_indices(
@@ -2310,6 +2318,7 @@ def deepseek_v4_local_to_global_indices(
     compressed_indices_stride0, compressed_indices_stride1 = compressed_local_indices_c.stride(
     )
     out_stride0, out_stride1 = out.stride()
+    launch_with_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
     # Launch kernel
     _deepseek_v4_local_to_global_kernel[grid](
@@ -2339,6 +2348,8 @@ def deepseek_v4_local_to_global_indices(
         compressed_indices_stride1,
         out_stride0,
         out_stride1,
+        LAUNCH_WITH_PDL=launch_with_pdl,
+        launch_pdl=launch_with_pdl,
     )
 
     return out

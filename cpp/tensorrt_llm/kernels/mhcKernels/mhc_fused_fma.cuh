@@ -78,6 +78,10 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
     int const lane = tid % WARP_SIZE;
     bool const do_sqr = (n_start == 0);
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
     int const hidden_per_split = hidden_size / NUM_K_SPLITS;
     int const h_start = k_split * hidden_per_split;
     int const h_end = h_start + hidden_per_split;
@@ -363,6 +367,9 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
         }
         __syncthreads();
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 // ===================================================================
@@ -419,8 +426,17 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
     int const lane = tid % WARP_SIZE;
     bool const is_n0 = (n_start == 0);
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
     if (base_tok >= M)
+    {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
         return;
+    }
 
     int const hidden_per_split = hidden_size / KS;
     int const h_lo = k_split * hidden_per_split;
@@ -773,7 +789,12 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
         __syncthreads();
     }
     if (!s_is_last)
+    {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
         return;
+    }
 
     // Phase 4: inline bigFuse for the TM tokens in this batch.
     // Layout: FULL_N = HC_MULT*(2+HC_MULT) = 24
@@ -963,6 +984,9 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
         }
         __syncthreads();
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 } // namespace fused_fma_kernels

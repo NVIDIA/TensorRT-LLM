@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1208,8 +1208,16 @@ __global__ void mlaRoPEInplaceKernel(T* __restrict__ data, int32_t const* __rest
     int const vecs_per_rope
         = IS_NEOX ? (half_rope * BYTES_PER_ELT / BYTES_PER_LOAD) : (rope_dim * BYTES_PER_ELT / BYTES_PER_LOAD);
     int const head_idx = blockIdx.y * HEADS_PER_BLOCK + threadIdx.y;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
     if (head_idx >= num_heads || tid >= vecs_per_rope)
+    {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
         return;
+    }
 
     int const head_size = nope_dim + rope_dim;
     T* head_ptr = data + (static_cast<int64_t>(blockIdx.x) * num_heads + head_idx) * head_size;
@@ -1273,6 +1281,9 @@ __global__ void mlaRoPEInplaceKernel(T* __restrict__ data, int32_t const* __rest
 
         *reinterpret_cast<VecT*>(&head_ptr[nope_dim + elem_offset]) = v;
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T>
@@ -1299,18 +1310,21 @@ void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos
 
         if (hpb <= 4)
         {
-            mlaRoPEInplaceKernel<T, INV, NEOX, 4><<<grid, dim3(vecs_per_rope, 4), 0, stream>>>(
-                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+            tensorrt_llm::common::launchWithPdlWhenEnabled("mlaRoPEInplaceKernel",
+                mlaRoPEInplaceKernel<T, INV, NEOX, 4>, grid, dim3(vecs_per_rope, 4), 0, stream, data, position_ids,
+                cos_sin_cache, num_heads, nope_dim, rope_dim);
         }
         else if (hpb <= 8)
         {
-            mlaRoPEInplaceKernel<T, INV, NEOX, 8><<<grid, dim3(vecs_per_rope, 8), 0, stream>>>(
-                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+            tensorrt_llm::common::launchWithPdlWhenEnabled("mlaRoPEInplaceKernel",
+                mlaRoPEInplaceKernel<T, INV, NEOX, 8>, grid, dim3(vecs_per_rope, 8), 0, stream, data, position_ids,
+                cos_sin_cache, num_heads, nope_dim, rope_dim);
         }
         else
         {
-            mlaRoPEInplaceKernel<T, INV, NEOX, 16><<<grid, dim3(vecs_per_rope, 16), 0, stream>>>(
-                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+            tensorrt_llm::common::launchWithPdlWhenEnabled("mlaRoPEInplaceKernel",
+                mlaRoPEInplaceKernel<T, INV, NEOX, 16>, grid, dim3(vecs_per_rope, 16), 0, stream, data, position_ids,
+                cos_sin_cache, num_heads, nope_dim, rope_dim);
         }
     };
 
