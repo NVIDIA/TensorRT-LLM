@@ -494,14 +494,19 @@ class TestDeepseekV4CacheManager:
             )
             return host_block_table[0]
 
-        sliding_block_tables = torch.empty_like(cache_manager._host_per_layer_block_tables_staging)
-        cache_manager.copy_batch_sliding_block_tables(
-            sliding_block_tables,
-            [req.py_request_id],
-            num_contexts=num_contexts,
-            num_seqs=1,
+        sliding_block_tables = torch.empty_like(
+            cache_manager._host_per_layer_block_tables_staging,
+            device="cuda",
         )
-        return sliding_block_tables[
+        with torch.cuda.stream(cache_manager._stream):
+            cache_manager.copy_batch_sliding_block_tables(
+                sliding_block_tables,
+                [req.py_request_id],
+                num_contexts=num_contexts,
+                num_seqs=1,
+            )
+        cache_manager._stream.synchronize()
+        return sliding_block_tables.cpu()[
             cache_manager.layer_offsets[layer_idx],
             attn_type.value,
             0,
@@ -1105,8 +1110,9 @@ class TestDeepseekV4CacheManager:
                 DeepseekV4AttentionType.INDEXER_COMPRESS,
                 DeepseekV4AttentionType.COMPRESSOR_KV,
             }
-            sliding_block_tables = torch.empty_like(
-                cache_manager._host_per_layer_block_tables_staging
+            sliding_block_tables_cuda = torch.empty_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                device="cuda",
             )
             compress_block_table = torch.empty(
                 1,
@@ -1120,12 +1126,13 @@ class TestDeepseekV4CacheManager:
                 dtype=torch.int32,
                 device="cpu",
             )
-            cache_manager.copy_batch_sliding_block_tables(
-                sliding_block_tables,
-                [req.py_request_id],
-                num_contexts=1,
-                num_seqs=1,
-            )
+            with torch.cuda.stream(cache_manager._stream):
+                cache_manager.copy_batch_sliding_block_tables(
+                    sliding_block_tables_cuda,
+                    [req.py_request_id],
+                    num_contexts=1,
+                    num_seqs=1,
+                )
             cache_manager.copy_batch_compress_block_tables(
                 compress_block_table,
                 [req.py_request_id],
@@ -1141,6 +1148,8 @@ class TestDeepseekV4CacheManager:
                 num_contexts=1,
                 num_seqs=1,
             )
+            cache_manager._stream.synchronize()
+            sliding_block_tables = sliding_block_tables_cuda.cpu()
             for attn_type in attention_types:
                 layer0_buffer = _view_fp8_as_uint8(cache_manager.get_buffers(0, attn_type))
                 layer1_buffer = _view_fp8_as_uint8(cache_manager.get_buffers(1, attn_type))
@@ -1207,17 +1216,24 @@ class TestDeepseekV4CacheManager:
         try:
             requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
             request_ids = [req.py_request_id for req in requests]
-            actual = torch.empty_like(cache_manager._host_attention_op_block_offsets_staging)
-
-            cache_manager.copy_batch_block_offsets(
-                actual,
-                request_ids,
-                beam_width=1,
-                num_contexts=num_contexts,
-                num_seqs=len(request_ids),
+            actual = torch.empty_like(
+                cache_manager._host_attention_op_block_offsets_staging,
+                device="cuda",
             )
 
-            expected = torch.full_like(actual[:, :, 0], BAD_PAGE_INDEX)
+            with torch.cuda.stream(cache_manager._stream):
+                cache_manager.copy_batch_block_offsets(
+                    actual,
+                    request_ids,
+                    beam_width=1,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+
+            expected = torch.full_like(
+                cache_manager._host_attention_op_block_offsets_staging[:, :, 0],
+                BAD_PAGE_INDEX,
+            )
             for local_layer_idx, pp_layer in enumerate(cache_manager.pp_layers):
                 ref = self._reference_copy_batch_page_indices(
                     cache_manager,
@@ -1229,9 +1245,9 @@ class TestDeepseekV4CacheManager:
                 )
                 expected[local_layer_idx, : len(request_ids)] = ref
 
-            # DSV4 AttentionOp only consumes the key table. The value table is
-            # intentionally left untouched to avoid extra CPU work.
-            torch.testing.assert_close(actual[:, :, 0], expected)
+            # DSV4 AttentionOp only consumes the key table.
+            cache_manager._stream.synchronize()
+            torch.testing.assert_close(actual.cpu()[:, :, 0], expected)
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
@@ -1255,16 +1271,23 @@ class TestDeepseekV4CacheManager:
         try:
             requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
             request_ids = [req.py_request_id for req in requests]
-            actual = torch.empty_like(cache_manager._host_per_layer_block_tables_staging)
-
-            cache_manager.copy_batch_sliding_block_tables(
-                actual,
-                request_ids,
-                num_contexts=num_contexts,
-                num_seqs=len(request_ids),
+            actual = torch.empty_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                device="cuda",
             )
 
-            expected = torch.full_like(actual, BAD_PAGE_INDEX)
+            with torch.cuda.stream(cache_manager._stream):
+                cache_manager.copy_batch_sliding_block_tables(
+                    actual,
+                    request_ids,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+
+            expected = torch.full_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                BAD_PAGE_INDEX,
+            )
             for pp_layer in cache_manager.pp_layers:
                 compress_ratio = cache_manager._compress_ratios[pp_layer]
                 local_layer_idx = cache_manager.layer_offsets[pp_layer]
@@ -1282,7 +1305,8 @@ class TestDeepseekV4CacheManager:
                         )
                     )
 
-            torch.testing.assert_close(actual, expected)
+            cache_manager._stream.synchronize()
+            torch.testing.assert_close(actual.cpu(), expected)
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
