@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5341,
-    "total_files": 493
+    "total_violations": 5333,
+    "total_files": 492
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -487,11 +487,8 @@
     "D212": 1,
     "E402": 27
   },
-  "tensorrt_llm/_torch/attention_backend/interface.py": {
-    "F821": 2
-  },
   "tensorrt_llm/_torch/attention_backend/sparse/dsa.py": {
-    "F821": 3
+    "F821": 2
   },
   "tensorrt_llm/_torch/attention_backend/sparse/kernel.py": {
     "E731": 3
@@ -787,6 +784,7 @@
     "D212": 5,
     "D300": 3,
     "F402": 1,
+    "F811": 1,
     "F821": 1
   },
   "tensorrt_llm/executor/rpc/rpc_client.py": {
@@ -928,7 +926,7 @@
     "D411": 2
   },
   "tensorrt_llm/llmapi/llm_args.py": {
-    "D200": 24,
+    "D200": 23,
     "D202": 1,
     "D205": 11,
     "D208": 2,
@@ -1587,8 +1585,7 @@
     "D205": 1,
     "D212": 1,
     "D300": 1,
-    "D411": 1,
-    "D415": 8
+    "D415": 7
   },
   "tensorrt_llm/serve/scripts/benchmark_dataset.py": {
     "D200": 4,
@@ -2149,8 +2146,8 @@
     "F811": 1
   },
   "tests/unittest/llmapi/test_executor.py": {
-    "D205": 5,
-    "D209": 3
+    "D205": 3,
+    "D209": 2
   },
   "tests/unittest/llmapi/test_llm.py": {
     "D200": 1,
