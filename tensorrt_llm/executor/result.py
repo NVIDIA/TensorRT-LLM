@@ -378,6 +378,8 @@ class GenerationResultBase:
 
         if sequence_is_finished:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
+                # Keep the trailing EOS in token_ids; the detokenizer hides
+                # it from text. stop_reason stays None to mark "natural EOS".
                 output.finish_reason = 'stop'
             elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
                 output.finish_reason = 'stop'
@@ -748,22 +750,36 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
             'spaces_between_special_tokens':
             self.sampling_params.spaces_between_special_tokens
         }
+        end_id = self.sampling_params.end_id
+        include_stop = self.sampling_params.include_stop_str_in_output
+
         if self.sampling_params.detokenize and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
+                # Hide trailing EOS from decoded text without mutating
+                # token_ids (matches vLLM). stop_reason is None gates on
+                # END_ID; STOP_WORDS sets it and was stripped upstream.
+                trim_eos = (beam_output.finish_reason == 'stop'
+                            and beam_output.stop_reason is None
+                            and not include_stop and end_id is not None)
                 if hasattr(
                         self.tokenizer, 'decode_incrementally'
                 ) and self._streaming and not self.sampling_params.use_beam_search:
+                    diff = beam_output.token_ids_diff
+                    if trim_eos and diff and diff[-1] == end_id:
+                        diff = diff[:-1]
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
-                        beam_output.token_ids_diff,
+                        diff,
                         prev_text=beam_output.text,
                         states=beam_output._incremental_states,
                         flush=self._done,
                         stream_interval=self.sampling_params._stream_interval,
                         **kwargs)
                 else:
-                    beam_output.text = self.tokenizer.decode(
-                        beam_output.token_ids, **kwargs)
+                    tids = beam_output.token_ids
+                    if trim_eos and tids and tids[-1] == end_id:
+                        tids = tids[:-1]
+                    beam_output.text = self.tokenizer.decode(tids, **kwargs)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
