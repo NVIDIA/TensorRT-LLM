@@ -219,201 +219,329 @@ def _pad_per_expert_2d(
 ) -> torch.Tensor:
     """Pad each expert's 2-D matrix to the given row/col alignment.
 
-    When ``out`` is provided, write each expert's padded matrix into
-    ``out[i]`` in-place (no per-expert allocation accumulated, no final
-    ``torch.stack`` allocation). Backward-compatible with the
-    ``out=None`` path that builds + stacks a fresh tensor.
+    ``out=None``: build a fresh stacked tensor (one alloc).
+    ``out=...``:  write each expert's padded matrix into ``out[i]`` in-place
+    so caller-provided storage (e.g. a scratch slice) is filled directly.
     """
     e = weight_3d.size(0)
+    padded_per_expert = (
+        maybe_pad_for_mxfp4(weight_3d[i], col_alignment, row_alignment) for i in range(e)
+    )
     if out is None:
-        out_list = []
-        for i in range(e):
-            out_list.append(maybe_pad_for_mxfp4(weight_3d[i], col_alignment, row_alignment))
-        return torch.stack(out_list, dim=0).contiguous()
-
+        return torch.stack(list(padded_per_expert), dim=0).contiguous()
     assert out.shape[0] == e, f"out leading dim {out.shape[0]} != e {e}"
-    for i in range(e):
-        padded = maybe_pad_for_mxfp4(weight_3d[i], col_alignment, row_alignment)
+    for i, padded in enumerate(padded_per_expert):
         out[i].copy_(padded)
     return out
 
 
-def _shuffle_per_expert_w3_w1(
-    stacked: torch.Tensor,  # [E, 2I_pad, X]   uint8  (X = H_pad/2 or H_pad/32)
-    num_elts_per_sf: int | None = None,
-    is_scale: bool = False,
-    *,
-    out: torch.Tensor | None = None,
+def _shuffle_one_expert(
+    slc: torch.Tensor,
+    permute_fn,
+    num_elts_per_sf: int | None,
+    is_scale: bool,
 ) -> torch.Tensor:
-    """Apply the gated-GEMM shuffle (used for both w3/w1 weight and its scale).
+    """Single-expert TMA-layout shuffle. Looping over experts is required
+    because PT's permute-index helpers derive indices from a 2-D shape.
 
-    For scales (``is_scale=True``), additionally apply
-    ``torch.ops.trtllm.block_scale_interleave`` after shuffling — PT's
-    ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w3_w1_weight_scale_mxfp4``
-    (quantization.py:4382) does both steps; the kernel reads scales in this
-    interleaved layout. Without it the dequantization scaling is wrong and
-    output logits are garbage.
-
-    Looping over experts because the PT permute-index helpers compute indices
-    from a 2-D shape; applying them slice-by-slice avoids ambiguity at the
-    leading expert dim.
-
-    When ``out`` is provided, per-expert shuffle results are copied into
-    ``out[i]`` in-place — the per-iter shuffle alloc still happens (the
-    ``trtllm.shuffle_matrix`` CUDA op returns its own tensor) but it is
-    freed immediately after the copy, so no per-expert tensors accumulate
-    in a list and no final ``torch.stack`` allocation is required.
+    ``permute_fn`` selects the gated (w3/w1) or non-gated (w2) permutation;
+    ``is_scale=True`` chains ``block_scale_interleave`` (kernel scale layout).
     """
-    e = stacked.size(0)
-    if out is None:
-        out_list = []
-        for i in range(e):
-            slc = stacked[i].contiguous()
-            perm = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
-                slc,
-                _PERMUTE_CACHE,
-                _EPILOGUE_TILE_M,
-                num_elts_per_sf=num_elts_per_sf,
-            )
-            shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-            if is_scale:
-                shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
-            out_list.append(shuffled.view(slc.dtype))
-        return torch.stack(out_list, dim=0).contiguous()
-
-    assert out.shape[0] == e
-    for i in range(e):
-        slc = stacked[i].contiguous()
-        perm = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
-            slc,
-            _PERMUTE_CACHE,
-            _EPILOGUE_TILE_M,
-            num_elts_per_sf=num_elts_per_sf,
-        )
-        shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-        if is_scale:
-            shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
-        out[i].copy_(shuffled.view(slc.dtype))
-    return out
+    slc = slc.contiguous()
+    perm = permute_fn(slc, _PERMUTE_CACHE, _EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf)
+    shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
+    if is_scale:
+        shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
+    return shuffled.view(slc.dtype)
 
 
-def _shuffle_per_expert_w2(
-    stacked: torch.Tensor,  # [E, H_pad, X]   uint8  (X = I_pad/2 or I_pad/32)
-    num_elts_per_sf: int | None = None,
-    is_scale: bool = False,
-    *,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    e = stacked.size(0)
-    if out is None:
-        out_list = []
-        for i in range(e):
-            slc = stacked[i].contiguous()
-            perm = trtllmgen_maybe_get_cached_w2_permute_indices(
-                slc,
-                _PERMUTE_CACHE,
-                _EPILOGUE_TILE_M,
-                num_elts_per_sf=num_elts_per_sf,
-            )
-            shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-            if is_scale:
-                shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
-            out_list.append(shuffled.view(slc.dtype))
-        return torch.stack(out_list, dim=0).contiguous()
-
-    assert out.shape[0] == e
-    for i in range(e):
-        slc = stacked[i].contiguous()
-        perm = trtllmgen_maybe_get_cached_w2_permute_indices(
-            slc,
-            _PERMUTE_CACHE,
-            _EPILOGUE_TILE_M,
-            num_elts_per_sf=num_elts_per_sf,
-        )
-        shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-        if is_scale:
-            shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
-        out[i].copy_(shuffled.view(slc.dtype))
-    return out
-
-
-def _shuffle_per_expert_bias_w3_w1(
+def _shuffle_per_expert(
     stacked: torch.Tensor,
+    permute_fn,
     *,
+    num_elts_per_sf: int | None = None,
+    is_scale: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply gated-GEMM row shuffle to a 1D-per-expert bias tensor.
+    """Per-expert TMA-layout shuffle, used for weights, scales, and biases.
 
-    Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w3_w1_weight``
-    bias path (quantization.py:4237-4271): the same permute (interleave w3/w1
-    halves + epilogue-tile block reorder) is applied to bias rows as to weight
-    rows, so ``bias[i]`` aligns with ``weight_row[i]`` after the shuffle.
-    Skipping this step makes ``gemm1_bias`` index into the wrong post-shuffle
-    output rows and produces garbage MoE output.
+    PT mirror points (`tensorrt_llm/_torch/modules/fused_moe/quantization.py`):
+      * weights: ``load_expert_w3_w1_weight`` / ``load_expert_w2_weight``
+      * scales:  ``..._weight_scale_mxfp4`` (adds ``block_scale_interleave``)
+      * biases:  same row permute as weights so ``bias[i]`` aligns with
+        ``weight_row[i]`` post-shuffle (gemm1_bias indexes into the wrong
+        rows otherwise → MoE output garbage).
+
+    ``out=None`` builds a fresh stacked tensor; otherwise per-expert results
+    are ``copy_``-ed into ``out[i]`` so caller-provided storage is filled.
     """
     e = stacked.size(0)
+    per_expert = (
+        _shuffle_one_expert(stacked[i], permute_fn, num_elts_per_sf, is_scale) for i in range(e)
+    )
     if out is None:
-        out_list = []
-        for i in range(e):
-            slc = stacked[i].contiguous()  # [2*I_pad] 1D
-            perm = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
-                slc,
-                _PERMUTE_CACHE,
-                _EPILOGUE_TILE_M,
-            )
-            shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-            out_list.append(shuffled)
-        return torch.stack(out_list, dim=0).contiguous()
-
+        return torch.stack(list(per_expert), dim=0).contiguous()
     assert out.shape[0] == e
-    for i in range(e):
-        slc = stacked[i].contiguous()
-        perm = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
-            slc,
-            _PERMUTE_CACHE,
-            _EPILOGUE_TILE_M,
-        )
-        shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
+    for i, shuffled in enumerate(per_expert):
         out[i].copy_(shuffled)
     return out
 
 
-def _shuffle_per_expert_bias_w2(
-    stacked: torch.Tensor,
-    *,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Apply non-gated TMA row shuffle to a 1D-per-expert bias tensor.
+def _deinterleave_gate_up(
+    gu_3d: torch.Tensor,  # [E, 2I, H/2]
+    gate_up_scales: torch.Tensor,  # [E, 2I, H/32]
+    gate_up_bias: torch.Tensor,  # [E, 2I]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the interleaved 2I axis into separate gate/up halves.
 
-    Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w2_weight``
-    bias path (quantization.py:4304-4319): only the epilogue-tile block reorder
-    is applied (no gated_act_gemm interleave for the non-gated GEMM2).
+    HF's MXFP4 gate_up layout interleaves gate at even rows and up at odd rows.
+    PT's gpt-oss loader (``modeling_gpt_oss.py:695-706`` +
+    ``quantization.py:4252-4258``) ends up with ``dst_w3 = up`` in the first
+    half and ``dst_w1 = gate`` in the second half. We keep up/gate separate
+    here so downstream row-padding puts the zero-pad rows INSIDE each half,
+    not at the very end of the concatenated 2I axis.
     """
-    e = stacked.size(0)
-    if out is None:
-        out_list = []
-        for i in range(e):
-            slc = stacked[i].contiguous()  # [H_pad] 1D
-            perm = trtllmgen_maybe_get_cached_w2_permute_indices(
-                slc,
-                _PERMUTE_CACHE,
-                _EPILOGUE_TILE_M,
-            )
-            shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-            out_list.append(shuffled)
-        return torch.stack(out_list, dim=0).contiguous()
+    return (
+        gu_3d[:, 0::2, :].contiguous(),  # gate_rows_w
+        gu_3d[:, 1::2, :].contiguous(),  # up_rows_w
+        gate_up_scales[:, 0::2, :].contiguous(),  # gate_rows_s
+        gate_up_scales[:, 1::2, :].contiguous(),  # up_rows_s
+        gate_up_bias[:, 0::2].contiguous(),  # gate_b
+        gate_up_bias[:, 1::2].contiguous(),  # up_b
+    )
 
-    assert out.shape[0] == e
-    for i in range(e):
-        slc = stacked[i].contiguous()
-        perm = trtllmgen_maybe_get_cached_w2_permute_indices(
-            slc,
-            _PERMUTE_CACHE,
-            _EPILOGUE_TILE_M,
+
+def _pad_and_slice_axis(t: torch.Tensor, dim: int, target: int, lo: int, hi: int) -> torch.Tensor:
+    """Pad ``t`` on ``dim`` to ``target`` then slice ``[lo:hi]`` on that dim."""
+    cur = t.shape[dim]
+    if cur < target:
+        pad_amount = target - cur
+        # F.pad spec is reversed-axis order; build dynamically.
+        pad_spec = [0, 0] * (t.dim() - dim - 1) + [0, pad_amount] + [0, 0] * dim
+        t = torch.nn.functional.pad(t, pad_spec)
+    idx = [slice(None)] * t.dim()
+    idx[dim] = slice(lo, hi)
+    return t[tuple(idx)].contiguous()
+
+
+def _tp_slice_intermediate_axis(
+    gate_rows_w: torch.Tensor,
+    up_rows_w: torch.Tensor,
+    gate_rows_s: torch.Tensor,
+    up_rows_s: torch.Tensor,
+    gate_b: torch.Tensor,
+    up_b: torch.Tensor,
+    dn_3d: torch.Tensor,
+    down_scales: torch.Tensor,
+    intermediate_size: int,
+    tp_size: int,
+    tp_rank: int,
+):
+    """Pre-pad + slice the intermediate axis to this rank's range.
+
+    Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod`` shard math
+    (``quantization.py:4211-4234``): pad I to ``i_padded_tp`` (a multiple of
+    ``alignment_tp`` so ``i_padded_tp / tp_size`` is itself 128-aligned),
+    then slice each tensor on its intermediate-encoding axis. PRE-padding
+    before sharding guarantees scaling-factor blocks (32 elements each) do
+    not straddle rank boundaries.
+
+    For gpt-oss-120b with I=2880 @ tp=8: ``alignment_tp=3072`` →
+    ``per_rank_i=384``.
+
+    Returns the sliced tensors plus ``(per_rank_i, valid_intermediate)``.
+    """
+    alignment_tp = _get_weight_alignment(
+        _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, tp_size, intermediate_size
+    )
+    i_padded_tp = ((intermediate_size + alignment_tp - 1) // alignment_tp) * alignment_tp
+    per_rank_i = i_padded_tp // tp_size
+    slice_start = tp_rank * per_rank_i
+    slice_stop = (tp_rank + 1) * per_rank_i
+    valid_intermediate = max(0, min(intermediate_size, slice_stop) - slice_start)
+
+    # Pad I axis (rows) of gate / up to i_padded_tp, then slice this rank's chunk.
+    def shard(t: torch.Tensor, dim: int, target: int, lo: int, hi: int) -> torch.Tensor:
+        return _pad_and_slice_axis(t, dim, target, lo, hi)
+
+    sf_padded = i_padded_tp // _MXFP4_SCALING_VECTOR_SIZE
+    sf_start = slice_start // _MXFP4_SCALING_VECTOR_SIZE
+    sf_stop = slice_stop // _MXFP4_SCALING_VECTOR_SIZE
+    return (
+        shard(gate_rows_w, 1, i_padded_tp, slice_start, slice_stop),
+        shard(up_rows_w, 1, i_padded_tp, slice_start, slice_stop),
+        shard(gate_rows_s, 1, i_padded_tp, slice_start, slice_stop),
+        shard(up_rows_s, 1, i_padded_tp, slice_start, slice_stop),
+        shard(gate_b, 1, i_padded_tp, slice_start, slice_stop),
+        shard(up_b, 1, i_padded_tp, slice_start, slice_stop),
+        shard(dn_3d, 2, i_padded_tp // 2, slice_start // 2, slice_stop // 2),
+        shard(down_scales, 2, sf_padded, sf_start, sf_stop),
+        per_rank_i,
+        valid_intermediate,
+    )
+
+
+def _pad_concat_gate_up(
+    up_rows: torch.Tensor,
+    gate_rows: torch.Tensor,
+    col_alignment: int,
+    intermediate_size_pad: int,
+    *,
+    scratch_buf: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pad each half [E, I, X] then concat as ``[up | gate]`` on the 2I axis.
+
+    Used for both weights (col_alignment = ``hidden_w1_pad // 2``) and scales
+    (col_alignment = ``hidden_w1_pad // _MXFP4_SCALING_VECTOR_SIZE``). When
+    ``scratch_buf`` is provided, the two halves are written directly into
+    ``scratch_buf[:, :i_pad]`` and ``scratch_buf[:, i_pad:]`` — no per-half
+    tensors or final concat alloc.
+    """
+    if scratch_buf is None:
+        up_p = _pad_per_expert_2d(up_rows, col_alignment, intermediate_size_pad)
+        gate_p = _pad_per_expert_2d(gate_rows, col_alignment, intermediate_size_pad)
+        return torch.cat([up_p, gate_p], dim=1).contiguous()
+    i_pad = intermediate_size_pad
+    _pad_per_expert_2d(up_rows, col_alignment, intermediate_size_pad, out=scratch_buf[:, :i_pad, :])
+    _pad_per_expert_2d(
+        gate_rows, col_alignment, intermediate_size_pad, out=scratch_buf[:, i_pad:, :]
+    )
+    return scratch_buf
+
+
+def _pad_fc2(
+    t: torch.Tensor,
+    col_alignment: int,
+    row_alignment: int,
+    *,
+    scratch_buf: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-expert pad on the [E, H, X] down tensor. No concat (single half)."""
+    if scratch_buf is None:
+        return _pad_per_expert_2d(t, col_alignment, row_alignment)
+    _pad_per_expert_2d(t, col_alignment, row_alignment, out=scratch_buf)
+    return scratch_buf
+
+
+def _shuffle_weights_and_scales(
+    gu_padded: torch.Tensor,
+    dn_padded: torch.Tensor,
+    gu_scale_padded: torch.Tensor,
+    dn_scale_padded: torch.Tensor,
+    *,
+    scratch: "MXFP4PrepScratch | None" = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply per-expert TMA-layout shuffle to weights + scales for both GEMMs."""
+    w3w1 = trtllmgen_maybe_get_cached_w3_w1_permute_indices
+    w2 = trtllmgen_maybe_get_cached_w2_permute_indices
+    fc1_w_out = scratch.fc1_w_buf if scratch is not None else None
+    fc1_s_out = scratch.fc1_s_buf if scratch is not None else None
+    fc2_w_out = scratch.fc2_w_buf if scratch is not None else None
+    fc2_s_out = scratch.fc2_s_buf if scratch is not None else None
+    fc1_w = _shuffle_per_expert(gu_padded, w3w1, out=fc1_w_out)
+    fc1_s = _shuffle_per_expert(
+        gu_scale_padded,
+        w3w1,
+        num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE,
+        is_scale=True,
+        out=fc1_s_out,
+    )
+    fc2_w = _shuffle_per_expert(dn_padded, w2, out=fc2_w_out)
+    fc2_s = _shuffle_per_expert(
+        dn_scale_padded,
+        w2,
+        num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE,
+        is_scale=True,
+        out=fc2_s_out,
+    )
+    return fc1_w, fc1_s, fc2_w, fc2_s
+
+
+def _prepare_fc1_bias(
+    up_b: torch.Tensor,
+    gate_b: torch.Tensor,
+    intermediate_size_pad: int,
+    *,
+    scratch_pad_buf: torch.Tensor | None = None,
+    scratch_out_buf: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pad each half [E, I] → [E, I_pad] (fp32), concat ``[up | gate]``, shuffle.
+
+    The TMA-layout row shuffle on the bias is critical: PT applies the SAME
+    permute to bias rows as to weight rows so ``bias[i]`` aligns with
+    ``weight_row[i]`` after the shuffle. Skipping it → kernel's epilogue adds
+    the wrong bias to each output row → MoE output garbage (~2% GSM8K).
+    """
+    if scratch_pad_buf is None:
+        up_p = (
+            _pad_per_expert_2d(up_b.unsqueeze(-1), 1, intermediate_size_pad)
+            .squeeze(-1)
+            .float()
+            .contiguous()
         )
-        shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-        out[i].copy_(shuffled)
-    return out
+        gate_p = (
+            _pad_per_expert_2d(gate_b.unsqueeze(-1), 1, intermediate_size_pad)
+            .squeeze(-1)
+            .float()
+            .contiguous()
+        )
+        fc1_bias_padded = torch.cat([up_p, gate_p], dim=1).contiguous()
+    else:
+        # ``_pad_per_expert_2d`` writes through ``copy_``; the scratch fp32
+        # buffer absorbs bf16-padded values via copy_'s implicit cast.
+        i_pad = intermediate_size_pad
+        _pad_per_expert_2d(
+            up_b.unsqueeze(-1),
+            1,
+            intermediate_size_pad,
+            out=scratch_pad_buf[:, :i_pad].unsqueeze(-1),
+        )
+        _pad_per_expert_2d(
+            gate_b.unsqueeze(-1),
+            1,
+            intermediate_size_pad,
+            out=scratch_pad_buf[:, i_pad:].unsqueeze(-1),
+        )
+        fc1_bias_padded = scratch_pad_buf
+    return _shuffle_per_expert(
+        fc1_bias_padded, trtllmgen_maybe_get_cached_w3_w1_permute_indices, out=scratch_out_buf
+    )
+
+
+def _prepare_fc2_bias(
+    down_bias: torch.Tensor,
+    hidden_w2_pad: int,
+    tp_size: int,
+    *,
+    scratch_pad_buf: torch.Tensor | None = None,
+    scratch_out_buf: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pad ``[E, H] → [E, H_pad]`` (fp32), divide by ``tp_size``, shuffle.
+
+    Scratch path enforces ``tp_size == 1`` upstream (TP slicing happens in
+    the load hook before this helper is reached), so no division is applied
+    when using scratch.
+    """
+    if scratch_pad_buf is None:
+        fc2_b = (
+            _pad_per_expert_2d(down_bias.unsqueeze(-1), 1, hidden_w2_pad)
+            .squeeze(-1)
+            .float()
+            .contiguous()
+        )
+        if tp_size > 1:
+            fc2_b = fc2_b / tp_size
+    else:
+        _pad_per_expert_2d(
+            down_bias.unsqueeze(-1),
+            1,
+            hidden_w2_pad,
+            out=scratch_pad_buf.unsqueeze(-1),
+        )
+        fc2_b = scratch_pad_buf
+    return _shuffle_per_expert(
+        fc2_b, trtllmgen_maybe_get_cached_w2_permute_indices, out=scratch_out_buf
+    )
 
 
 def prepare_trtllm_gen_moe_mxfp4_weights(
@@ -476,10 +604,8 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
             f"tp_size ({tp_size}) for TP-MoE."
         )
     if scratch is not None and tp_size != 1:
-        # The scratch path assumes its input is already TP-sliced (caller
-        # does that in the load hook). Combining scratch with tp_size > 1
-        # would double-slice on the intermediate axis. Loud error rather
-        # than silent corruption.
+        # Scratch path assumes inputs are already TP-sliced (load hook does
+        # that). Combining scratch with tp_size > 1 would double-slice.
         raise ValueError(
             "prepare_trtllm_gen_moe_mxfp4_weights: scratch is only supported with "
             f"tp_size=1 (got tp_size={tp_size}). The caller is expected to do "
@@ -488,330 +614,104 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
     if tp_rank < 0 or tp_rank >= tp_size:
         raise ValueError(f"tp_rank {tp_rank} out of range for tp_size {tp_size}")
 
-    e = gate_up_blocks.size(0)
-    assert down_blocks.size(0) == e
+    assert down_blocks.size(0) == gate_up_blocks.size(0)
 
-    # 1. Reshape blocks to 3-D (collapse the inner [..., 16] dim).
+    # 1. Flatten blocks ([..., 16] → flattened) and de-interleave gate/up halves.
     gu_3d = _flatten_block_dim(gate_up_blocks)  # [E, 2I, H/2]
-    dn_3d = _flatten_block_dim(down_blocks)  # [E, H,  I/2]
+    dn_3d = _flatten_block_dim(down_blocks)  # [E, H, I/2]
+    gate_rows_w, up_rows_w, gate_rows_s, up_rows_s, gate_b, up_b = _deinterleave_gate_up(
+        gu_3d, gate_up_scales, gate_up_bias
+    )
 
-    # 1a. De-interleave w1 (gate) and w3 (up) into SEPARATE per-half tensors.
-    #
-    # Rationale: HF's gpt-oss-120b dense ``gate_up_proj`` is ``[E, H, 2I]``
-    # with gate at even indices and up at odd indices on the last dim
-    # (``torch_moe_dense_mlp`` line ~765 splits via
-    # ``gate, up = gate_up[..., ::2], gate_up[..., 1::2]``).
-    # The MXFP4 quantization moves that 2I axis to dim 1, preserving the
-    # *interleaving* across rows: row 0 = gate0, row 1 = up0, row 2 = gate1,
-    # row 3 = up1, ...
-    #
-    # PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w3_w1_weight``
-    # writes a separated layout (see line 4256 in quantization.py):
-    #     dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
-    #     dst_w3_weight.copy_(w3_weight); dst_w1_weight.copy_(w1_weight)
-    # So the trtllm-gen kernel expects rows 0..I_pad-1 = w3 (up),
-    # I_pad..2*I_pad-1 = w1 (gate). We keep up and gate separate through the
-    # row-padding so the zero-pad rows go INSIDE each half (not at the very
-    # end), then stack as [up | gate] before col-padding and shuffling.
-    gate_rows_w = gu_3d[:, 0::2, :].contiguous()  # [E, I, H/2]
-    up_rows_w = gu_3d[:, 1::2, :].contiguous()  # [E, I, H/2]
-    gate_rows_s = gate_up_scales[:, 0::2, :].contiguous()  # [E, I, H/32]
-    up_rows_s = gate_up_scales[:, 1::2, :].contiguous()  # [E, I, H/32]
-    gate_b = gate_up_bias[:, 0::2].contiguous()  # [E, I]
-    up_b = gate_up_bias[:, 1::2].contiguous()  # [E, I]
-
-    # 1b. TP slicing on the intermediate axis (when tp_size > 1).
-    #
-    # PT (quantization.py:4221-4234) computes a TP-aware alignment first so
-    # that ``per_shard = padded_I / tp_size`` is itself a multiple of
-    # ``weight_alignment`` (kernel TMA constraint).  For gpt-oss-120b
-    # I=2880 at tp=8: ``_get_weight_alignment(128, 32, 8, 2880) = 3072``
-    # so each rank holds ``3072/8 = 384`` intermediate elements (= 128*3).
-    # The PRE-pad happens before sharding so scaling-factor blocks (32
-    # elements each) don't straddle rank boundaries.
+    # 2. TP slicing on the intermediate axis (no-op for tp_size == 1).
     if tp_size > 1:
-        alignment_tp = _get_weight_alignment(
-            _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, tp_size, intermediate_size
+        (
+            gate_rows_w,
+            up_rows_w,
+            gate_rows_s,
+            up_rows_s,
+            gate_b,
+            up_b,
+            dn_3d,
+            down_scales,
+            intermediate_size_for_local,
+            valid_intermediate,
+        ) = _tp_slice_intermediate_axis(
+            gate_rows_w,
+            up_rows_w,
+            gate_rows_s,
+            up_rows_s,
+            gate_b,
+            up_b,
+            dn_3d,
+            down_scales,
+            intermediate_size,
+            tp_size,
+            tp_rank,
         )
-        # Pad intermediate axis to ``alignment_tp`` BEFORE sharding (PT pads-
-        # before-shard semantics; quantization.py:4211-4220 explains why).
-        i_padded_tp = ((intermediate_size + alignment_tp - 1) // alignment_tp) * alignment_tp
-        per_rank_i = i_padded_tp // tp_size  # = 384 for gpt-oss tp=8
-        slice_start = tp_rank * per_rank_i
-        slice_stop = (tp_rank + 1) * per_rank_i
-        # ``valid_intermediate`` per rank: clamp to original ``intermediate_size``.
-        valid_intermediate = max(0, min(intermediate_size, slice_stop) - slice_start)
-
-        def _pad_int_axis(t: torch.Tensor, dim: int, target: int) -> torch.Tensor:
-            cur = t.shape[dim]
-            if cur >= target:
-                return t
-            pad_amount = target - cur
-            # F.pad pad spec is reversed-axis order; build dynamically.
-            pad = [0, 0] * (t.dim() - dim - 1) + [0, pad_amount] + [0, 0] * dim
-            return torch.nn.functional.pad(t, pad)
-
-        # Pad I axis (rows) of gate / up to i_padded_tp, then slice this
-        # rank's chunk.  Same for the scale tensors (rows) and biases.
-        gate_rows_w = _pad_int_axis(gate_rows_w, 1, i_padded_tp)[
-            :, slice_start:slice_stop, :
-        ].contiguous()
-        up_rows_w = _pad_int_axis(up_rows_w, 1, i_padded_tp)[
-            :, slice_start:slice_stop, :
-        ].contiguous()
-        gate_rows_s = _pad_int_axis(gate_rows_s, 1, i_padded_tp)[
-            :, slice_start:slice_stop, :
-        ].contiguous()
-        up_rows_s = _pad_int_axis(up_rows_s, 1, i_padded_tp)[
-            :, slice_start:slice_stop, :
-        ].contiguous()
-        gate_b = _pad_int_axis(gate_b, 1, i_padded_tp)[:, slice_start:slice_stop].contiguous()
-        up_b = _pad_int_axis(up_b, 1, i_padded_tp)[:, slice_start:slice_stop].contiguous()
-
-        # down (dn_3d): cols = I/2.  Pad to i_padded_tp/2 then slice.
-        dn_3d = _pad_int_axis(dn_3d, 2, i_padded_tp // 2)[
-            :, :, slice_start // 2 : slice_stop // 2
-        ].contiguous()
-        # down scales: cols = I/scaling_vector_size.
-        sf_per_rank_start = slice_start // _MXFP4_SCALING_VECTOR_SIZE
-        sf_per_rank_stop = slice_stop // _MXFP4_SCALING_VECTOR_SIZE
-        sf_padded = i_padded_tp // _MXFP4_SCALING_VECTOR_SIZE
-        down_scales = _pad_int_axis(down_scales, 2, sf_padded)[
-            :, :, sf_per_rank_start:sf_per_rank_stop
-        ].contiguous()
-
-        # The downstream pad+shuffle now treats ``per_rank_i`` as the local
-        # intermediate dim.  Reuse the existing variable name so the rest
-        # of the function is unchanged.
-        intermediate_size_for_local = per_rank_i
     else:
         intermediate_size_for_local = intermediate_size
         valid_intermediate = intermediate_size
 
-    # 2. Determine per-rank dims.
-    valid_hidden = hidden_size
-
-    # 3. Pad weights.
-    #
-    # PT pads on the per-expert *I* (intermediate, line 3712-3713 in
-    # quantization.py) and *H* (hidden, line 3715/3717) before constructing
-    # the buffer shape — the ``2I`` row dim of w1 is then ``I_pad * 2``,
-    # NOT ``round_up(2I, weight_alignment)``.
-    #
-    # That distinction matters for gpt-oss-120b: I=2880 is not 128-aligned
-    # (2880 % 128 = 64), so PT's I_pad = 2944. w1's 2I row dim therefore
-    # becomes 5888 (= 2*2944), and w2's I/2 col dim becomes 1472 (= 2944/2).
-    # Both reflect the same I_pad — kernel sees a consistent intermediate
-    # dim. If we instead pad ``2I = 5760`` directly, weight_alignment=128
-    # leaves 5760 unchanged (already 128-aligned), so w1's I_pad stays at
-    # 2880 while w2's I_pad jumps to 2944 from the col padding. The kernel
-    # then mixes 2880 (w1) and 2944 (w2) for the *same* intermediate dim and
-    # the autotune cubin lookup finds no config.
-    #
-    # Same idea for the hidden axis: PT pads w1.K to 512 (input_hidden_align)
-    # and w2.N to 128 (weight_align). H=2880 → w1.K=3072, w2.N=2944.
-    # We replicate that exactly so the kernel's args.hidden_size /
-    # output_hidden_size match what PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod``
-    # exercises.
+    # 3. Per-rank padded layout dims (mirrors PT
+    #    ``MXFP4WeightTRTLLMGenFusedMoEMethod``: per-expert I + H padded
+    #    BEFORE 2I row dim, so w1.2I = 2*I_pad — see ``_compute_padded_dims``).
     intermediate_size_pad, hidden_w1_pad, hidden_w2_pad = _compute_padded_dims(
         intermediate_size_for_local, hidden_size
     )
 
-    # gate_up weights — pad each half [E, I, H/2] to [E, I_pad, H_w1_pad/2]
-    # SEPARATELY so the zero-pad rows live inside each half, then stack as
-    # [up | gate]. PT's gpt-oss loader (modeling_gpt_oss.py:695-706 +
-    # quantization.py:4252-4258) ends up with ``dst_w3 = up`` in the first
-    # half and ``dst_w1 = gate`` in the second half via this exact
-    # de-interleave + chunk dance.
-    #
-    # When scratch is provided, we write the two halves directly into the
-    # first/second halves of ``scratch.fc1_w_pad_buf`` (no per-half
-    # tensor + no concat alloc).
-    if scratch is None:
-        up_padded_w = _pad_per_expert_2d(up_rows_w, hidden_w1_pad // 2, intermediate_size_pad)
-        gate_padded_w = _pad_per_expert_2d(gate_rows_w, hidden_w1_pad // 2, intermediate_size_pad)
-        gu_padded = torch.cat(
-            [up_padded_w, gate_padded_w], dim=1
-        ).contiguous()  # [E, 2I_pad, H_w1_pad/2]
-    else:
-        i_pad = intermediate_size_pad
-        gu_padded = scratch.fc1_w_pad_buf
-        _pad_per_expert_2d(
-            up_rows_w,
-            hidden_w1_pad // 2,
-            intermediate_size_pad,
-            out=gu_padded[:, :i_pad, :],
-        )
-        _pad_per_expert_2d(
-            gate_rows_w,
-            hidden_w1_pad // 2,
-            intermediate_size_pad,
-            out=gu_padded[:, i_pad:, :],
-        )
+    # 4. Pad weights + scales (concat [up | gate] for fc1; single half for fc2).
+    sv = _MXFP4_SCALING_VECTOR_SIZE
+    gu_padded = _pad_concat_gate_up(
+        up_rows_w,
+        gate_rows_w,
+        hidden_w1_pad // 2,
+        intermediate_size_pad,
+        scratch_buf=scratch.fc1_w_pad_buf if scratch is not None else None,
+    )
+    dn_padded = _pad_fc2(
+        dn_3d,
+        intermediate_size_pad // 2,
+        hidden_w2_pad,
+        scratch_buf=scratch.fc2_w_pad_buf if scratch is not None else None,
+    )
+    gu_scale_padded = _pad_concat_gate_up(
+        up_rows_s,
+        gate_rows_s,
+        hidden_w1_pad // sv,
+        intermediate_size_pad,
+        scratch_buf=scratch.fc1_s_pad_buf if scratch is not None else None,
+    )
+    dn_scale_padded = _pad_fc2(
+        down_scales,
+        intermediate_size_pad // sv,
+        hidden_w2_pad,
+        scratch_buf=scratch.fc2_s_pad_buf if scratch is not None else None,
+    )
 
-    # down: rows = H, cols = I/2. Target shape [E, H_w2_pad, I_pad/2 = 1472].
-    # PT pads w2's I/2 axis to ``alignment // 2`` where alignment=128,
-    # giving 64-multiple (quantization.py:4287). For I/2=1440 → 1472.
-    # The kernel then asserts ``gemm2_weights.shape[2] == intermediate_size / 2``,
-    # so I_pad_w2 must match I_pad_w1 (both 2944).
-    if scratch is None:
-        dn_padded = _pad_per_expert_2d(dn_3d, intermediate_size_pad // 2, hidden_w2_pad)
-    else:
-        dn_padded = scratch.fc2_w_pad_buf
-        _pad_per_expert_2d(dn_3d, intermediate_size_pad // 2, hidden_w2_pad, out=dn_padded)
+    # 5. Per-expert TMA-layout shuffle (weights + scales).
+    fc1_weights, fc1_weights_scale, fc2_weights, fc2_weights_scale = _shuffle_weights_and_scales(
+        gu_padded, dn_padded, gu_scale_padded, dn_scale_padded, scratch=scratch
+    )
 
-    # 4. Pad scales — same per-half logic for w1; col_alignment uses
-    #    scaling-vector size.
-    if scratch is None:
-        up_padded_s = _pad_per_expert_2d(
-            up_rows_s, hidden_w1_pad // _MXFP4_SCALING_VECTOR_SIZE, intermediate_size_pad
-        )
-        gate_padded_s = _pad_per_expert_2d(
-            gate_rows_s, hidden_w1_pad // _MXFP4_SCALING_VECTOR_SIZE, intermediate_size_pad
-        )
-        gu_scale_padded = torch.cat([up_padded_s, gate_padded_s], dim=1).contiguous()
-        dn_scale_padded = _pad_per_expert_2d(
-            down_scales,
-            intermediate_size_pad // _MXFP4_SCALING_VECTOR_SIZE,
-            hidden_w2_pad,
-        )
-    else:
-        i_pad = intermediate_size_pad
-        gu_scale_padded = scratch.fc1_s_pad_buf
-        _pad_per_expert_2d(
-            up_rows_s,
-            hidden_w1_pad // _MXFP4_SCALING_VECTOR_SIZE,
-            intermediate_size_pad,
-            out=gu_scale_padded[:, :i_pad, :],
-        )
-        _pad_per_expert_2d(
-            gate_rows_s,
-            hidden_w1_pad // _MXFP4_SCALING_VECTOR_SIZE,
-            intermediate_size_pad,
-            out=gu_scale_padded[:, i_pad:, :],
-        )
-        dn_scale_padded = scratch.fc2_s_pad_buf
-        _pad_per_expert_2d(
-            down_scales,
-            intermediate_size_pad // _MXFP4_SCALING_VECTOR_SIZE,
-            hidden_w2_pad,
-            out=dn_scale_padded,
-        )
-
-    # 5. Shuffle weights + scales for the kernel's TMA layout.
-    if scratch is None:
-        fc1_weights = _shuffle_per_expert_w3_w1(gu_padded)
-        fc1_weights_scale = _shuffle_per_expert_w3_w1(
-            gu_scale_padded, num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE, is_scale=True
-        )
-        fc2_weights = _shuffle_per_expert_w2(dn_padded)
-        fc2_weights_scale = _shuffle_per_expert_w2(
-            dn_scale_padded, num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE, is_scale=True
-        )
-    else:
-        fc1_weights = _shuffle_per_expert_w3_w1(gu_padded, out=scratch.fc1_w_buf)
-        fc1_weights_scale = _shuffle_per_expert_w3_w1(
-            gu_scale_padded,
-            num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE,
-            is_scale=True,
-            out=scratch.fc1_s_buf,
-        )
-        fc2_weights = _shuffle_per_expert_w2(dn_padded, out=scratch.fc2_w_buf)
-        fc2_weights_scale = _shuffle_per_expert_w2(
-            dn_scale_padded,
-            num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE,
-            is_scale=True,
-            out=scratch.fc2_s_buf,
-        )
-
-    # 6. Bias: convert to float32. For w2, divide by tp_size (no-op at tp=1).
-    #    Pad each half separately so the [up | gate] split matches the
-    #    weights' row layout.
-    if scratch is None:
-        up_bias_padded = (
-            _pad_per_expert_2d(
-                up_b.unsqueeze(-1),  # [E, I, 1]
-                col_alignment=1,
-                row_alignment=intermediate_size_pad,
-            )
-            .squeeze(-1)
-            .float()
-            .contiguous()
-        )  # [E, I_pad] float32
-        gate_bias_padded = (
-            _pad_per_expert_2d(
-                gate_b.unsqueeze(-1),
-                col_alignment=1,
-                row_alignment=intermediate_size_pad,
-            )
-            .squeeze(-1)
-            .float()
-            .contiguous()
-        )
-        fc1_bias_padded = torch.cat(
-            [up_bias_padded, gate_bias_padded], dim=1
-        ).contiguous()  # [E, 2I_pad]
-    else:
-        i_pad = intermediate_size_pad
-        # _pad_per_expert_2d writes through ``copy_`` so dtype must match.
-        # The scratch fp32 buffer can absorb the bf16-padded values via
-        # PyTorch's implicit cast in ``copy_``. We use a tiny per-half view
-        # so the layout matches [up | gate] without an explicit concat.
-        _pad_per_expert_2d(
-            up_b.unsqueeze(-1),
-            col_alignment=1,
-            row_alignment=intermediate_size_pad,
-            out=scratch.fc1_b_pad_buf[:, :i_pad].unsqueeze(-1),
-        )
-        _pad_per_expert_2d(
-            gate_b.unsqueeze(-1),
-            col_alignment=1,
-            row_alignment=intermediate_size_pad,
-            out=scratch.fc1_b_pad_buf[:, i_pad:].unsqueeze(-1),
-        )
-        fc1_bias_padded = scratch.fc1_b_pad_buf  # [E, 2I_pad] fp32
-
-    # Match PT: bias rows go through the SAME row-permutation as the weight
-    # rows so ``bias[i]`` lines up with ``weight_row[i]`` after the kernel's
-    # TMA-layout shuffle. Without this the kernel's epilogue adds the wrong
-    # bias to each output row and the MoE output is garbage (eval ~2% on
-    # gpt-oss-120b GSM8K instead of ~90%).
-    if scratch is None:
-        fc1_bias_padded = _shuffle_per_expert_bias_w3_w1(fc1_bias_padded)
-    else:
-        fc1_bias_padded = _shuffle_per_expert_bias_w3_w1(fc1_bias_padded, out=scratch.fc1_b_buf)
-
-    if scratch is None:
-        fc2_bias_padded = (
-            _pad_per_expert_2d(
-                down_bias.unsqueeze(-1),
-                col_alignment=1,
-                row_alignment=hidden_w2_pad,
-            )
-            .squeeze(-1)
-            .float()
-            .contiguous()
-        )  # [E, H_pad] float32
-        if tp_size > 1:
-            fc2_bias_padded = fc2_bias_padded / tp_size
-        # Same TMA-layout shuffle as ``fc2_weights`` (no gated_act interleave for
-        # the non-gated GEMM2). PT's ``load_expert_w2_weight`` (quantization.py:
-        # 4304-4319) runs this shuffle on the bias too.
-        fc2_bias_padded = _shuffle_per_expert_bias_w2(fc2_bias_padded)
-    else:
-        # Pad bf16 → fp32 into scratch pad buffer.
-        _pad_per_expert_2d(
-            down_bias.unsqueeze(-1),
-            col_alignment=1,
-            row_alignment=hidden_w2_pad,
-            out=scratch.fc2_b_pad_buf.unsqueeze(-1),
-        )
-        # tp_size > 1 is rejected for scratch above, so no /tp_size needed.
-        fc2_bias_padded = _shuffle_per_expert_bias_w2(scratch.fc2_b_pad_buf, out=scratch.fc2_b_buf)
+    # 6. Pad + shuffle biases (fp32, w2 bias divided by tp_size at tp>1).
+    fc1_bias_padded = _prepare_fc1_bias(
+        up_b,
+        gate_b,
+        intermediate_size_pad,
+        scratch_pad_buf=scratch.fc1_b_pad_buf if scratch is not None else None,
+        scratch_out_buf=scratch.fc1_b_buf if scratch is not None else None,
+    )
+    fc2_bias_padded = _prepare_fc2_bias(
+        down_bias,
+        hidden_w2_pad,
+        tp_size,
+        scratch_pad_buf=scratch.fc2_b_pad_buf if scratch is not None else None,
+        scratch_out_buf=scratch.fc2_b_buf if scratch is not None else None,
+    )
 
     intermediate_size_padded = fc1_weights.shape[1] // 2  # 2I_pad / 2 = I_pad
     hidden_size_padded = fc1_weights.shape[-1] * 2  # (H_pad/2) * 2 = H_pad
-
     return TRTLLMGenMXFP4MoEWeights(
         fc1_weights_mxfp4=fc1_weights,
         fc1_weights_scale_ue8m0=fc1_weights_scale,
@@ -819,7 +719,7 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
         fc2_weights_mxfp4=fc2_weights,
         fc2_weights_scale_ue8m0=fc2_weights_scale,
         fc2_bias_f32=fc2_bias_padded,
-        valid_hidden_size=valid_hidden,
+        valid_hidden_size=hidden_size,
         valid_intermediate_size=valid_intermediate,
         intermediate_size_padded=intermediate_size_padded,
         hidden_size_padded=hidden_size_padded,
