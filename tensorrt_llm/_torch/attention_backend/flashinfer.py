@@ -1461,13 +1461,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     attention_input_type == AttentionInputType.context_only
                     and metadata.enable_context_mla_with_cached_kv
                     and metadata.num_ctx_cached_tokens > 0)
-                has_first_chunk_context = (
-                    attention_input_type == AttentionInputType.context_only
-                    and metadata.enable_context_mla_with_cached_kv
-                    and metadata.num_ctx_cached_tokens == 0)
-                if has_cached_context or has_first_chunk_context:
-                    # Context MLA with cached KV uses paged MLA. The first
-                    # chunk has no cached tokens yet, but still uses this path.
+                if has_cached_context:
+                    # Context MLA with cached KV uses paged MLA.
                     assert latent_cache is not None, (
                         "FlashInfer MLA paged context requires latent_cache.")
                     self._mla_forward_paged_context(q, metadata, output,
