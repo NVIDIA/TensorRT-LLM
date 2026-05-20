@@ -342,8 +342,7 @@ public:
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
     virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence) const
-        = 0;
+        int const num_gen_tokens, int const max_blocks_per_sequence) const = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
         int32_t const token_offset, int32_t const num_tokens, int32_t const predicted_tokens_per_seq,
@@ -1050,6 +1049,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mHeadSize = head_size;
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
+    TORCH_CHECK(!op->mKVCacheQuantMode.hasTurboQuant4KvCache(),
+        "TurboQuant4 KV cache is handled by the dedicated TRTLLM packed-cache path and is not supported by "
+        "trtllm::attention.");
     op->mUseKVCache = use_kv_cache;
     op->mPagedKVCache = op->mPagedKVCache && use_kv_cache; // update mPagedKVCache based on use_kv_cache
     op->mTokensPerBlock = tokens_per_block.value_or(0);
@@ -1284,6 +1286,10 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     op->mHeadSize = head_size;
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
+    if (op->mKVCacheQuantMode.hasTurboQuant4KvCache())
+    {
+        return false;
+    }
     op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mKVCacheQuantMode.hasFp4KvCache();
     op->mUseKVCache = true;
     op->mPagedKVCache = true;
@@ -1370,6 +1376,8 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
     {
         return {};
     }
+    TORCH_CHECK(!quantMode.hasTurboQuant4KvCache(),
+        "TurboQuant4 KV cache requires dedicated packed-cache kernels and cannot use fused paged KV buffers.");
 
     auto const mapping = readKvCachePoolMapping(host_kv_cache_pool_mapping.value(), layer_idx);
     int32_t const poolIndex = mapping.poolIndex;

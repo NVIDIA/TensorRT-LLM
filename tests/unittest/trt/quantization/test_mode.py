@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,7 @@
 # limitations under the License.
 import unittest
 
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.quantization import QuantAlgo, QuantMode
 
 
 class TestQuantMode(unittest.TestCase):
@@ -44,7 +44,14 @@ class TestQuantMode(unittest.TestCase):
 
     def test_count(self):
         # Make sure the COUNT value is as expected - change that test if you add a new flag.
-        self.assertEqual(QuantMode.COUNT.value, 1 << 18)
+        self.assertEqual(QuantMode.COUNT.value, 1 << 19)
+
+    def test_flag_values_stay_in_sync_with_cpp(self):
+        self.assertEqual(QuantMode.W4A8_NVFP4_FP8.value, 1 << 14)
+        self.assertEqual(QuantMode.W4A8_MXFP4_FP8.value, 1 << 15)
+        self.assertEqual(QuantMode.W4A8_MXFP4_MXFP8.value, 1 << 16)
+        self.assertEqual(QuantMode.W4A16_MXFP4.value, 1 << 17)
+        self.assertEqual(QuantMode.TURBOQUANT4_KV_CACHE.value, 1 << 18)
 
     def test_from_description(self):
         # Test weight only.
@@ -168,6 +175,16 @@ class TestQuantMode(unittest.TestCase):
         self.assertTrue(qm.is_weight_only())
         # Make sure it returns True for weight-only.
         self.assertTrue(qm.is_int8_weight_only())
+
+    def test_turboquant4_kv_cache(self):
+        qm = QuantMode.from_quant_algo(
+            kv_cache_quant_algo=QuantAlgo.TURBOQUANT4)
+
+        self.assertTrue(qm.has_turboquant4_kv_cache())
+        self.assertTrue(qm.has_kv_cache_quant())
+        self.assertTrue(qm.has_any_quant())
+        self.assertFalse(qm.has_any_quant(exclude_kv_cache=True))
+        self.assertTrue(qm.to_dict()["turboquant4_kv_cache"])
 
     def test_failure_quant(self):
         # Expect failure if weights are not quantized, but activations are.

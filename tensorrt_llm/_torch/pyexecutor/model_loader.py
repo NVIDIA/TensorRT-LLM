@@ -10,8 +10,10 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
-                                          ModelExpressConfig, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                          ExecutorMemoryType,
+                                          ModelExpressConfig,
+                                          SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -22,7 +24,6 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
-from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
@@ -31,11 +32,119 @@ from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 
 _KV_CACHE_MAP = {
-    "fp8": QuantAlgo.FP8.value,
-    "nvfp4": QuantAlgo.NVFP4.value,
+    "fp8": QuantAlgo.FP8,
+    "nvfp4": QuantAlgo.NVFP4,
+    "turboquant4": QuantAlgo.TURBOQUANT4,
+    "float16": None,
+    "float32": None,
+    "bfloat16": None,
     "auto": "auto"
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = tuple(_KV_CACHE_MAP)
+
+
+def _has_turboquant4_kv_cache(quant_config) -> bool:
+    kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+    kv_cache_quant_algo_value = getattr(kv_cache_quant_algo, "value",
+                                        kv_cache_quant_algo)
+    return (isinstance(kv_cache_quant_algo_value, str)
+            and kv_cache_quant_algo_value.upper() == "TURBOQUANT4")
+
+
+def _sync_model_config_turboquant4_overrides(
+        llm_args: TorchLlmArgs, model_config: ModelConfig) -> None:
+    was_frozen = model_config._frozen
+    model_config._frozen = False
+    try:
+        model_config.attn_backend = llm_args.attn_backend
+        model_config.use_cuda_graph = llm_args.cuda_graph_config is not None
+    finally:
+        model_config._frozen = was_frozen
+
+
+def sync_loaded_turboquant4_kv_cache_config(
+        llm_args: TorchLlmArgs, model_config: ModelConfig) -> bool:
+    """Sync/check llm_args when TurboQuant4 comes from checkpoint config."""
+    if not _has_turboquant4_kv_cache(model_config.quant_config):
+        return False
+
+    if llm_args.sparse_attention_config is not None:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with sparse attention.")
+    if llm_args.speculative_config is not None:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with speculative "
+            "decoding because draft-token KV relocation does not move "
+            "TurboQuant4 scale buffers.")
+    if llm_args.kv_cache_config.max_attention_window is not None:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with sliding-window "
+            "attention because evicted KV blocks do not preserve the "
+            "zero-based packed-cache layout expected by the current "
+            "TurboQuant4 path.")
+    if llm_args.context_parallel_size != 1 or llm_args.cp_config is not None:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with context parallelism.")
+    if llm_args.max_beam_width is not None and llm_args.max_beam_width > 1:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with beam search.")
+    if llm_args.kv_connector_config is not None:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with KV cache connector.")
+    if llm_args.cache_transceiver_config is not None:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with cache transceiver.")
+    if (llm_args.attention_dp_config is not None
+            and llm_args.attention_dp_config.enable_kv_cache_aware_routing):
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with KV-cache-aware "
+            "attention DP routing.")
+    if llm_args.kv_cache_config.event_buffer_max_size > 0:
+        raise ValueError(
+            "TurboQuant4 KV cache is not supported with KV cache event buffers."
+        )
+
+    llm_args.quant_config.kv_cache_quant_algo = QuantAlgo.TURBOQUANT4
+    model_config.quant_config.kv_cache_quant_algo = QuantAlgo.TURBOQUANT4
+    if llm_args.kv_cache_config.dtype != "turboquant4":
+        if llm_args.kv_cache_config.dtype != "auto":
+            logger.warning(
+                "TurboQuant4 KV cache requires "
+                "kv_cache_config.dtype='turboquant4'. "
+                f"Overriding kv_cache_config.dtype={llm_args.kv_cache_config.dtype}."
+            )
+        llm_args.kv_cache_config.dtype = "turboquant4"
+    if llm_args.attn_backend.upper() not in ("TRTLLM", "VANILLA"):
+        logger.warning(
+            "TurboQuant4 KV cache is supported only with TRTLLM or VANILLA "
+            f"attention backend. Overriding attn_backend={llm_args.attn_backend} "
+            "to TRTLLM.")
+        llm_args.attn_backend = "TRTLLM"
+    if llm_args.cuda_graph_config is not None:
+        logger.warning(
+            "TurboQuant4 KV cache currently uses a Python-side TRTLLM "
+            "fallback and does not support CUDA graph capture. "
+            "Overriding cuda_graph_config=None.")
+        llm_args.cuda_graph_config = None
+    if llm_args.torch_compile_config is not None:
+        logger.warning(
+            "TurboQuant4 KV cache currently uses a Python-side TRTLLM "
+            "fallback and does not support torch.compile or piecewise CUDA "
+            "graph capture. Overriding torch_compile_config=None.")
+        llm_args.torch_compile_config = None
+    if llm_args.kv_cache_config.enable_block_reuse:
+        logger.warning(
+            "TurboQuant4 KV cache currently uses packed data plus separate "
+            "scale buffers and does not support KV block reuse. Overriding "
+            "kv_cache_config.enable_block_reuse=False.")
+        llm_args.kv_cache_config.enable_block_reuse = False
+    if not llm_args.kv_cache_config.use_kv_cache_manager_v2:
+        logger.warning(
+            "TurboQuant4 KV cache requires KVCacheManagerV2. "
+            "Overriding kv_cache_config.use_kv_cache_manager_v2=True.")
+        llm_args.kv_cache_config.use_kv_cache_manager_v2 = True
+    _sync_model_config_turboquant4_overrides(llm_args, model_config)
+    return True
 
 
 def validate_and_set_mamba_ssm_cache_dtype(
@@ -411,7 +520,7 @@ class ModelLoader:
             # Ensure everything is at least on CUDA
             # No-op if worked as expected
             model.to("cuda")
-            del memo
+            memo.clear()
 
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
@@ -580,6 +689,7 @@ class ModelLoader:
 
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
+        sync_loaded_turboquant4_kv_cache_config(self.llm_args, config)
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
             self.llm_args.kv_cache_config.mamba_ssm_stochastic_rounding,

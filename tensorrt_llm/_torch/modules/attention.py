@@ -699,14 +699,39 @@ class Attention(nn.Module):
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         has_lora: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ):
         num_tokens = attn_metadata.num_tokens
 
-        q = q[:num_tokens, :]
+        has_turboquant4_kv_cache = (
+            self.quant_config is not None
+            and self.quant_config.layer_quant_mode.has_turboquant4_kv_cache())
+
+        num_q_tokens = num_tokens
+        num_kv_tokens = num_tokens
+        if has_turboquant4_kv_cache:
+            if getattr(attn_metadata, "is_cuda_graph", False):
+                raise NotImplementedError(
+                    "TurboQuant4 KV cache does not support CUDA graph "
+                    "capture.")
+            num_q_tokens = int(attn_metadata.seq_lens.sum().item())
+            num_kv_tokens = int(attn_metadata.seq_lens_kv.sum().item())
+            if not torch.equal(attn_metadata.seq_lens,
+                               attn_metadata.seq_lens_kv):
+                raise NotImplementedError(
+                    "TurboQuant4 KV cache requires matching query and new KV "
+                    "token counts per request.")
+            if self.mapping.has_cp_helix():
+                raise NotImplementedError(
+                    "TurboQuant4 KV cache is not supported with Helix "
+                    "context parallelism.")
+            attn_metadata.position_ids = position_ids
+
+        q = q[:num_q_tokens, :]
         if k is not None:
-            k = k[:num_tokens, :]
+            k = k[:num_kv_tokens, :]
         if v is not None:
-            v = v[:num_tokens, :]
+            v = v[:num_kv_tokens, :]
 
         # Helix CP generation path: get partial outputs with softmax stats,
         # then exchange and combine across CP ranks.
@@ -746,7 +771,8 @@ class Attention(nn.Module):
         # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
         # and keeps attention output in BF16 for better precision when applying pre_quant_scale
         # Also don't set out_scale if LoRA is active - LoRA grouped_gemm doesn't support FP8
-        if self._use_quantize_output() and not has_lora:
+        if (self._use_quantize_output() and not has_lora
+                and not has_turboquant4_kv_cache):
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
@@ -772,7 +798,7 @@ class Attention(nn.Module):
                 mrope_position_deltas=mrope_position_deltas,
                 attention_window_size=attention_window_size,
                 attention_mask_data=attention_mask_data,
-                output=output[:num_tokens, :] if output is not None else None,
+                output=output[:num_q_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
             ))
@@ -795,6 +821,7 @@ class Attention(nn.Module):
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
         has_lora: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
@@ -806,10 +833,14 @@ class Attention(nn.Module):
 
         # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.
         # Only enable custom inplace op when torch compiling.
+        has_turboquant4_kv_cache = (
+            self.quant_config is not None
+            and self.quant_config.layer_quant_mode.has_turboquant4_kv_cache())
         use_custom_inplace_op = (self.register_to_config
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling())
+                                 and is_torch_compiling()
+                                 and not has_turboquant4_kv_cache)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
@@ -841,7 +872,8 @@ class Attention(nn.Module):
                                                 attention_window_size,
                                                 attention_mask_data,
                                                 attention_sinks=attention_sinks,
-                                                has_lora=has_lora)
+                                                has_lora=has_lora,
+                                                position_ids=position_ids)
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
 
@@ -935,7 +967,8 @@ class Attention(nn.Module):
                                         attention_mask_data,
                                         mrope_config=mrope_config,
                                         attention_sinks=attention_sinks,
-                                        has_lora=bool(lora_params))
+                                        has_lora=bool(lora_params),
+                                        position_ids=position_ids)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

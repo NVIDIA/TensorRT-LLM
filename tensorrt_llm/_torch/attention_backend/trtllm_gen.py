@@ -231,6 +231,11 @@ class TrtllmGenSupportChecker:
         if cross_attention:
             return False, "Cross attention is not supported by trtllm-gen backend."
 
+        if (quant_config is not None
+                and quant_config.layer_quant_mode.has_turboquant4_kv_cache()):
+            return False, (
+                "TurboQuant4 KV cache uses dedicated packed-cache kernels and "
+                "is not supported by trtllm-gen backend.")
         has_fp4_kv = (
             quant_config.layer_quant_mode.has_fp4_kv_cache()
             if quant_config is not None
@@ -633,9 +638,7 @@ class FlashInferTrtllmGenAttention:
     def _get_mrope_rotary_cos_sin(
         forward_args: AttentionForwardArgs,
     ) -> Optional[torch.Tensor]:
-        if forward_args.mrope_config is None:
-            return None
-        return forward_args.mrope_config.get("mrope_rotary_cos_sin")
+        return forward_args.mrope_rotary_cos_sin
 
     def is_supported(
         self,

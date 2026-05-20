@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.pyexecutor.resource_manager import Role
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 try:
@@ -153,6 +154,62 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                                                  seq_len, :, :]
         return k_states, v_states
 
+    def _use_turboquant4_kv_cache(self):
+        return (self.quant_config is not None
+                and self.quant_config.layer_quant_mode.has_turboquant4_kv_cache(
+                ))
+
+    def _single_request_update_turboquant4_kv_cache(self, k, v,
+                                                    kv_cache_tensor,
+                                                    kv_cache_scales,
+                                                    past_seen_token, kv_len,
+                                                    cache_idx, dtype):
+        if self.sparse_attention_config is not None:
+            raise NotImplementedError(
+                "TurboQuant4 KV cache is not supported with sparse VANILLA attention."
+            )
+        if kv_cache_scales is None:
+            raise RuntimeError(
+                "TurboQuant4 KV cache requires asymmetric cache buffers from KVCacheManagerV2."
+            )
+
+        from tensorrt_llm._torch.modules.turboquant4 import (
+            read_turboquant4_dense_key_cache,
+            turboquant4_dequantize_value_cache,
+            turboquant4_update_value_cache,
+            update_turboquant4_dense_key_cache,
+        )
+
+        key_cache_tensor, value_cache_tensor = kv_cache_tensor
+        key_cache_idx, value_cache_idx, scale_cache_idx = cache_idx
+        past_seen_token = int(past_seen_token)
+        seq_len = past_seen_token + kv_len
+        tokens_per_block = key_cache_tensor.shape[1]
+        key_block_ids = key_cache_idx if isinstance(key_cache_idx,
+                                                   list) else [key_cache_idx]
+        value_block_ids = (value_cache_idx if isinstance(value_cache_idx, list)
+                           else [value_cache_idx])
+        scale_block_ids = (scale_cache_idx if isinstance(scale_cache_idx, list)
+                           else [scale_cache_idx])
+
+        if k is not None and v is not None:
+            update_turboquant4_dense_key_cache(k.squeeze(0), key_cache_tensor,
+                                               key_block_ids, past_seen_token,
+                                               tokens_per_block)
+            turboquant4_update_value_cache(v.squeeze(0), value_cache_tensor,
+                                           kv_cache_scales, value_block_ids,
+                                           scale_block_ids, past_seen_token,
+                                           tokens_per_block)
+
+        k_states = read_turboquant4_dense_key_cache(
+            key_cache_tensor, key_block_ids, seq_len, tokens_per_block, dtype)
+        v_states = turboquant4_dequantize_value_cache(
+            value_cache_tensor, kv_cache_scales, value_block_ids,
+            scale_block_ids, seq_len, tokens_per_block, dtype)
+        if v is not None and kv_len > 0:
+            v_states[:, past_seen_token:seq_len].copy_(v.to(dtype=dtype))
+        return k_states, v_states
+
     def _single_request_preprocess_inputs(self, q, k, v, kv_dtype):
         bsz = 1
         q_len = q.size(0)
@@ -173,8 +230,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                         f"KV cache should have fp8 dtype, but get {kv_dtype}"
                     k = k.to(torch.float8_e4m3fn)
                     v = v.to(torch.float8_e4m3fn)
-            assert k.dtype == v.dtype == kv_dtype, \
-                f"KV cache dtype {kv_dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
+            if not self._use_turboquant4_kv_cache():
+                assert k.dtype == v.dtype == kv_dtype, \
+                    f"KV cache dtype {kv_dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
 
         return q, k, v, kv_len
 
@@ -265,14 +323,19 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                 v,
                                 attention_mask: AttentionMask,
                                 kv_cache_tensor,
+                                kv_cache_scales,
                                 past_seen_token,
                                 cache_idx,
                                 sample_idx,
                                 metadata: AttentionMetadata,
                                 attention_window_size: Optional[int] = None):
         # preprocess inputs
+        if self._use_turboquant4_kv_cache():
+            kv_dtype = kv_cache_tensor[0].dtype
+        else:
+            kv_dtype = kv_cache_tensor.dtype
         q, k, v, kv_len = self._single_request_preprocess_inputs(
-            q, k, v, kv_cache_tensor.dtype)
+            q, k, v, kv_dtype)
 
         # predict sparse kv indices
         sparse_kv_indices = None
@@ -281,9 +344,14 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 q, k, v, metadata, past_seen_token, sample_idx)
 
         # update kv cache
-        key_states, value_states = self._single_request_update_kv_cache(
-            k, v, kv_cache_tensor, past_seen_token, kv_len, cache_idx,
-            sparse_kv_indices)
+        if self._use_turboquant4_kv_cache():
+            key_states, value_states = self._single_request_update_turboquant4_kv_cache(
+                k, v, kv_cache_tensor, kv_cache_scales, past_seen_token,
+                kv_len, cache_idx, q.dtype)
+        else:
+            key_states, value_states = self._single_request_update_kv_cache(
+                k, v, kv_cache_tensor, past_seen_token, kv_len, cache_idx,
+                sparse_kv_indices)
 
         # predict sparse attn indices
         sparse_indices = None
@@ -397,10 +465,33 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 attention_mask=forward_args.attention_mask)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-        cache_indices = [
-            block_ids[0] for block_ids in metadata.block_ids_per_seq
-        ]
-        kv_cache_tensor = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        if self._use_turboquant4_kv_cache():
+            assert metadata.request_ids is not None
+            key_cache_indices = metadata.kv_cache_manager.get_batch_cache_indices_for_role(
+                metadata.request_ids, self.layer_idx, Role.KEY)
+            value_cache_indices = metadata.kv_cache_manager.get_batch_cache_indices_for_role(
+                metadata.request_ids, self.layer_idx, Role.VALUE)
+            scale_cache_indices = metadata.kv_cache_manager.get_batch_cache_indices_for_role(
+                metadata.request_ids, self.layer_idx, Role.VALUE_BLOCK_SCALE)
+            cache_indices = list(
+                zip(key_cache_indices, value_cache_indices, scale_cache_indices))
+        else:
+            cache_indices = [
+                block_ids[0] for block_ids in metadata.block_ids_per_seq
+            ]
+        kv_cache_scales = None
+        if self._use_turboquant4_kv_cache():
+            kv_cache_tensor = (
+                metadata.kv_cache_manager.get_turboquant4_key_buffers(
+                    self.layer_idx),
+                metadata.kv_cache_manager.get_turboquant4_value_buffers(
+                    self.layer_idx),
+            )
+            kv_cache_scales = metadata.kv_cache_manager.get_turboquant4_value_scale_buffers(
+                self.layer_idx)
+        else:
+            kv_cache_tensor = metadata.kv_cache_manager.get_buffers(
+                self.layer_idx)
 
         q_len = q.size(0)
 
@@ -411,7 +502,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         offset_kv = 0
         attn_outputs = []
         for sample_idx, (seq_len, seq_len_kv) in enumerate(
-                zip(metadata.seq_lens, metadata.seq_lens_kv)):
+                zip(metadata.seq_lens, metadata.seq_lens_kv, strict=True)):
             single_q = q[offset:offset + seq_len]
             single_k = k[
                 offset_kv:offset_kv +
@@ -425,7 +516,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
             attn_output = self._single_request_forward(
                 single_q, single_k, single_v, forward_args.attention_mask,
-                kv_cache_tensor, past_seen_token, cache_idx, sample_idx,
+                kv_cache_tensor, kv_cache_scales, past_seen_token, cache_idx, sample_idx,
                 metadata, forward_args.attention_window_size)
 
             attn_outputs.append(attn_output)

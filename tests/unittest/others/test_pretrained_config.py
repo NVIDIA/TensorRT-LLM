@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
-from tensorrt_llm.models.modeling_utils import PretrainedConfig
+from tensorrt_llm.models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 
 
 def test_pretrained_config_parses_runtime_defaults_correctly():
@@ -31,3 +32,18 @@ def test_pretrained_config_parses_runtime_defaults_correctly():
                 'max_position_embeddings': 1024,
                 'runtime_defaults': defaults,
             }).runtime_defaults)
+
+
+def test_pretrained_config_rejects_turboquant4_kv_dtype():
+    config = PretrainedConfig(
+        architecture='DummyForCausalLM',
+        dtype='float16',
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        vocab_size=1024,
+        quantization=QuantConfig(kv_cache_quant_algo=QuantAlgo.TURBOQUANT4),
+    )
+
+    with pytest.raises(ValueError, match='TurboQuant4 KV cache'):
+        config.kv_dtype

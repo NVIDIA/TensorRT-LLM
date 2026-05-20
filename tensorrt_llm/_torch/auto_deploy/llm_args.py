@@ -88,6 +88,21 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         frozen=True,
     )
 
+    @model_validator(mode="after")
+    def ensure_no_turboquant4_kv_cache(self) -> "LlmArgs":
+        kv_cache_quant_algo = getattr(self.quant_config, "kv_cache_quant_algo", None)
+        kv_cache_quant_algo_value = getattr(kv_cache_quant_algo, "value", kv_cache_quant_algo)
+        has_turboquant4_kv_cache = self.kv_cache_config.dtype == "turboquant4" or (
+            isinstance(kv_cache_quant_algo_value, str)
+            and kv_cache_quant_algo_value.upper() == "TURBOQUANT4"
+        )
+        if has_turboquant4_kv_cache:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with AutoDeploy. "
+                "Use backend='pytorch' with TRTLLM attention backend."
+            )
+        return self
+
     gpus_per_node: int = Field(
         default=torch.cuda.device_count(),
         description="The number of GPUs per node.",

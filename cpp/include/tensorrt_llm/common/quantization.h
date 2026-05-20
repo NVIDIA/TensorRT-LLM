@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -119,19 +119,29 @@ public:
         return QuantMode(BaseType(1u) << 13);
     }
 
-    static constexpr QuantMode w4a8Mxfp4Fp8() noexcept
+    static constexpr QuantMode w4a8Nvfp4Fp8() noexcept
     {
         return QuantMode(BaseType(1u) << 14);
     }
 
-    static constexpr QuantMode w4a8Mxfp4Mxfp8() noexcept
+    static constexpr QuantMode w4a8Mxfp4Fp8() noexcept
     {
         return QuantMode(BaseType(1u) << 15);
     }
 
-    static constexpr QuantMode w4a16Mxfp4() noexcept
+    static constexpr QuantMode w4a8Mxfp4Mxfp8() noexcept
     {
         return QuantMode(BaseType(1u) << 16);
+    }
+
+    static constexpr QuantMode w4a16Mxfp4() noexcept
+    {
+        return QuantMode(BaseType(1u) << 17);
+    }
+
+    static constexpr QuantMode turboQuant4KvCache() noexcept
+    {
+        return QuantMode(BaseType(1u) << 18);
     }
 
     constexpr BaseType value() const noexcept
@@ -194,6 +204,11 @@ public:
         return isSet(fp4KvCache());
     }
 
+    constexpr bool hasTurboQuant4KvCache() const noexcept
+    {
+        return isSet(turboQuant4KvCache());
+    }
+
     constexpr bool hasFp8Qdq() const noexcept
     {
         return isSet(fp8Qdq());
@@ -207,6 +222,11 @@ public:
     constexpr bool hasNvfp4() const noexcept
     {
         return isSet(nvfp4());
+    }
+
+    constexpr bool hasW4a8Nvfp4Fp8() const noexcept
+    {
+        return isSet(w4a8Nvfp4Fp8());
     }
 
     constexpr bool hasW4a8Mxfp4Fp8() const noexcept
@@ -226,13 +246,14 @@ public:
 
     constexpr bool hasKvCacheQuant() const noexcept
     {
-        return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache();
+        return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache() || hasTurboQuant4KvCache();
     }
 
     static constexpr QuantMode fromDescription(bool quantizeWeights, bool quantizeActivations, bool perToken,
         bool perChannel, bool perGroup, bool useInt4Weights, bool useInt8KvCache, bool useFp8KvCache, bool useFp8Qdq,
         bool useFp8RowWise, bool useW4a8QServe, bool useFp4Quant, bool useFp8BlockScales, bool useW4a8Mxfp4Fp8,
-        bool useW4a8Mxfp4Mxfp8, bool useW4a16Mxfp4)
+        bool useW4a8Mxfp4Mxfp8, bool useW4a16Mxfp4, bool useTurboQuant4KvCache = false,
+        bool useW4a8Nvfp4Fp8 = false)
     {
         QuantMode quantMode{};
         if (quantizeWeights)
@@ -296,6 +317,11 @@ public:
             quantMode += nvfp4();
         }
 
+        if (useW4a8Nvfp4Fp8)
+        {
+            quantMode += w4a8Nvfp4Fp8();
+        }
+
         if (useW4a8Mxfp4Fp8)
         {
             quantMode += w4a8Mxfp4Fp8();
@@ -309,6 +335,11 @@ public:
         if (useW4a16Mxfp4)
         {
             quantMode += w4a16Mxfp4();
+        }
+
+        if (useTurboQuant4KvCache)
+        {
+            quantMode += turboQuant4KvCache();
         }
 
         return quantMode;
@@ -409,6 +440,11 @@ public:
             quantMode = fromDescription(false, false, false, false, false, false, false, false, false, false, false,
                 false, false, true, false, false);
         }
+        else if (quantAlgo == "W4A8_NVFP4_FP8")
+        {
+            quantMode = fromDescription(false, false, false, false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, true);
+        }
         else if (quantAlgo == "W4A8_MXFP4_MXFP8")
         {
             quantMode = fromDescription(false, false, false, false, false, false, false, false, false, false, false,
@@ -431,6 +467,10 @@ public:
         else if (kvCacheQuantAlgo == "NVFP4")
         {
             quantMode += fp4KvCache();
+        }
+        else if (kvCacheQuantAlgo == "TURBOQUANT4")
+        {
+            quantMode += turboQuant4KvCache();
         }
 
         return quantMode;

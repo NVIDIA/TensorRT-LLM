@@ -171,6 +171,15 @@ class QuantConfig(StrictBaseModel):
         "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness."
     )
 
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name in ("quant_algo", "kv_cache_quant_algo"):
+            self._reset_cached_quant_modes()
+
+    def _reset_cached_quant_modes(self) -> None:
+        self.__dict__.pop("quant_mode", None)
+        self.__dict__.pop("layer_quant_mode", None)
+
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
         quant_mode_list = [
@@ -197,7 +206,9 @@ class QuantConfig(StrictBaseModel):
         return self.quant_algo in (set(QUANT_ALGO_LIST) - {
             QuantAlgo.W8A16, QuantAlgo.W4A16,
             QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-        }) or self.kv_cache_quant_algo in KV_CACHE_QUANT_ALGO_LIST
+        }) or self.kv_cache_quant_algo in (set(KV_CACHE_QUANT_ALGO_LIST) - {
+            QuantAlgo.TURBOQUANT4
+        })
 
     @property
     def _requires_modelopt_quantization(self):
@@ -228,7 +239,7 @@ class QuantConfig(StrictBaseModel):
             QuantAlgo.W4A8_AWQ: "w4a8_awq",
             QuantAlgo.W8A8_SQ_PER_CHANNEL: "int8_sq",
         }
-        assert self.quant_algo != QuantAlgo.MIXED_PRECISION, f"We don't support mixed precision in QuantConfig"
+        assert self.quant_algo != QuantAlgo.MIXED_PRECISION, "We don't support mixed precision in QuantConfig"
         if self.quant_algo is not None:
             assert self.quant_algo in algo_to_modelopt_map, f"We don't use Modelopt for quantization algorithm {self.quant_algo}, you probably shall not call this"
             return algo_to_modelopt_map[self.quant_algo]
@@ -474,6 +485,11 @@ class PretrainedConfig:
             return 'fp8'
         elif self.quant_mode.has_fp4_kv_cache():
             return 'fp4'
+        elif self.quant_mode.has_turboquant4_kv_cache():
+            raise ValueError(
+                "TurboQuant4 KV cache is supported only by the PyTorch backend; "
+                "the TensorRT backend cannot represent packed cache data with "
+                "FP32 scale buffers.")
         else:
             return self.dtype
 

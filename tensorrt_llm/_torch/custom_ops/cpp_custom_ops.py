@@ -255,6 +255,313 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    def _check_turboquant4_head_dim(head_dim: int) -> None:
+        if not isinstance(head_dim, int):
+            return
+        if head_dim <= 0:
+            raise RuntimeError("TurboQuant4 head_dim must be positive.")
+        if head_dim % 2 != 0:
+            raise RuntimeError(
+                f"TurboQuant4 head_dim must be even, got {head_dim}.")
+        if head_dim & (head_dim - 1) != 0:
+            raise RuntimeError(
+                f"TurboQuant4 head_dim must be a power of 2, got {head_dim}.")
+        if head_dim > 1024:
+            raise RuntimeError(
+                "TurboQuant4 native kernels currently support "
+                f"head_dim <= 1024, got {head_dim}.")
+
+    def _check_turboquant4_output_dtype(
+            output_dtype: Optional[torch.dtype]) -> torch.dtype:
+        dtype = output_dtype or torch.float16
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise NotImplementedError(
+                "TurboQuant4 dequantize supports FP16, BF16, and FP32 output tensors."
+            )
+        return dtype
+
+    def _check_turboquant4_activation_dtype(dtype: torch.dtype,
+                                            op_name: str) -> None:
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise NotImplementedError(
+                f"TurboQuant4 {op_name} supports FP16, BF16, and FP32 tensors."
+            )
+
+    def _check_turboquant4_same_static_dim(lhs, rhs, message: str) -> None:
+        if isinstance(lhs, int) and isinstance(rhs, int) and lhs != rhs:
+            raise RuntimeError(message)
+
+    def _check_turboquant4_head_counts(num_heads, num_kv_heads) -> None:
+        if not isinstance(num_heads, int) or not isinstance(num_kv_heads, int):
+            return
+        if num_heads <= 0:
+            raise RuntimeError(
+                "TurboQuant4 attention requires at least one query head.")
+        if num_kv_heads <= 0:
+            raise RuntimeError(
+                "TurboQuant4 attention requires at least one KV head.")
+        if num_heads % num_kv_heads != 0:
+            raise RuntimeError(
+                "TurboQuant4 attention heads must be divisible by KV heads.")
+
+    def _check_turboquant4_kv_index(kv_index: int, kv_factor) -> None:
+        if isinstance(kv_factor, int) and (kv_index < 0 or kv_index >= kv_factor):
+            raise RuntimeError("TurboQuant4 kv_index is out of range.")
+
+    def _check_turboquant4_tokens_per_block(cache: torch.Tensor,
+                                            tokens_per_block: int) -> None:
+        if isinstance(cache.shape[2],
+                      int) and cache.shape[2] != tokens_per_block:
+            raise RuntimeError(
+                "TurboQuant4 cache tokens_per_block mismatch.")
+
+    def _check_turboquant4_block_capacity(block_ids: torch.Tensor,
+                                          seq_len: int,
+                                          tokens_per_block: int) -> None:
+        if not isinstance(seq_len, int) or not isinstance(block_ids.shape[-1],
+                                                         int):
+            return
+        required_blocks = ((seq_len + tokens_per_block - 1) //
+                           tokens_per_block if seq_len > 0 else 0)
+        if block_ids.shape[-1] < required_blocks:
+            raise RuntimeError(
+                "TurboQuant4 block id tensor is shorter than the requested sequence."
+            )
+
+    def _check_turboquant4_cache_tensors(cache: torch.Tensor,
+                                         scales: torch.Tensor,
+                                         block_ids: torch.Tensor,
+                                         batched_block_ids: bool,
+                                         require_kv: bool) -> None:
+        if cache.dtype != torch.uint8:
+            raise RuntimeError("TurboQuant4 cache must be uint8.")
+        if scales.dtype != torch.float32:
+            raise RuntimeError("TurboQuant4 scale cache must be float32.")
+        if block_ids.dtype != torch.int32:
+            raise RuntimeError("TurboQuant4 block ids must be int32.")
+        if cache.dim() != 5:
+            raise RuntimeError(
+                "TurboQuant4 cache must have shape [blocks, kv, tokens, heads, head_dim / 2]."
+            )
+        if scales.dim() != 5:
+            raise RuntimeError(
+                "TurboQuant4 scale cache must have shape [blocks, kv, tokens, heads, 1]."
+            )
+        expected_block_id_dim = 2 if batched_block_ids else 1
+        if block_ids.dim() != expected_block_id_dim:
+            raise RuntimeError(
+                "TurboQuant4 batched block ids must be a 2D tensor."
+                if batched_block_ids else
+                "TurboQuant4 block ids must be a 1D tensor.")
+        for dim in range(4):
+            _check_turboquant4_same_static_dim(
+                scales.shape[dim], cache.shape[dim],
+                "TurboQuant4 cache/scales leading shapes mismatch.")
+        if isinstance(scales.shape[4], int) and scales.shape[4] != 1:
+            raise RuntimeError("TurboQuant4 scale cache last dimension must be 1.")
+        if require_kv and isinstance(cache.shape[1],
+                                     int) and cache.shape[1] < 2:
+            raise RuntimeError(
+                "TurboQuant4 attention requires key and value cache entries.")
+
+    @torch.library.register_fake("trtllm::turboquant4_quantize")
+    def _(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if input.dim() < 1:
+            raise RuntimeError(
+                "TurboQuant4 input must have at least one dimension.")
+        _check_turboquant4_activation_dtype(input.dtype, "quantize")
+        _check_turboquant4_head_dim(input.shape[-1])
+        code_shape = list(input.shape)
+        code_shape[-1] = code_shape[-1] // 2
+        scale_shape = list(input.shape)
+        scale_shape[-1] = 1
+        return (input.new_empty(code_shape, dtype=torch.uint8),
+                input.new_empty(scale_shape, dtype=torch.float32))
+
+    @torch.library.register_fake("trtllm::turboquant4_dequantize")
+    def _(codes: torch.Tensor,
+          scales: torch.Tensor,
+          output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        if codes.dtype != torch.uint8:
+            raise RuntimeError("TurboQuant4 codes must be uint8.")
+        if scales.dtype != torch.float32:
+            raise RuntimeError("TurboQuant4 scales must be float32.")
+        if codes.dim() < 1:
+            raise RuntimeError(
+                "TurboQuant4 codes must have at least one dimension.")
+        if codes.dim() != scales.dim():
+            raise RuntimeError("TurboQuant4 codes/scales rank mismatch.")
+        if scales.shape[-1] != 1:
+            raise RuntimeError("TurboQuant4 scales last dimension must be 1.")
+        for idx in range(codes.dim() - 1):
+            codes_dim = codes.shape[idx]
+            scales_dim = scales.shape[idx]
+            if (isinstance(codes_dim, int) and isinstance(scales_dim, int)
+                    and codes_dim != scales_dim):
+                raise RuntimeError("TurboQuant4 codes/scales shape mismatch.")
+        dtype = _check_turboquant4_output_dtype(output_dtype)
+        _check_turboquant4_head_dim(codes.shape[-1] * 2)
+        output_shape = list(codes.shape)
+        output_shape[-1] = output_shape[-1] * 2
+        return codes.new_empty(output_shape, dtype=dtype)
+
+    @torch.library.register_fake("trtllm::turboquant4_update_cache")
+    def _(input: torch.Tensor, cache: torch.Tensor, scales: torch.Tensor,
+          block_ids: torch.Tensor, kv_index: int, start_pos: int,
+          tokens_per_block: int) -> None:
+        _check_turboquant4_activation_dtype(input.dtype, "cache update")
+        if input.dim() != 3:
+            raise RuntimeError(
+                "TurboQuant4 cache update input must have shape [seq_len, heads, head_dim]."
+            )
+        if start_pos < 0:
+            raise RuntimeError(
+                "TurboQuant4 cache update start_pos must be non-negative.")
+        if tokens_per_block <= 0:
+            raise RuntimeError("TurboQuant4 tokens_per_block must be positive.")
+        _check_turboquant4_cache_tensors(
+            cache, scales, block_ids, batched_block_ids=False, require_kv=False)
+        _check_turboquant4_kv_index(kv_index, cache.shape[1])
+        _check_turboquant4_tokens_per_block(cache, tokens_per_block)
+        _check_turboquant4_head_dim(input.shape[2])
+        if isinstance(input.shape[0], int):
+            _check_turboquant4_block_capacity(
+                block_ids, start_pos + input.shape[0], tokens_per_block)
+        _check_turboquant4_same_static_dim(
+            input.shape[1], cache.shape[3],
+            "TurboQuant4 cache head count mismatch.")
+        _check_turboquant4_same_static_dim(
+            input.shape[2], cache.shape[4] * 2,
+            "TurboQuant4 cache head_dim mismatch.")
+        return None
+
+    @torch.library.register_fake("trtllm::turboquant4_dequantize_cache")
+    def _(cache: torch.Tensor,
+          scales: torch.Tensor,
+          block_ids: torch.Tensor,
+          kv_index: int,
+          seq_len: int,
+          tokens_per_block: int,
+          output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        if seq_len < 0:
+            raise RuntimeError(
+                "TurboQuant4 cache dequantize seq_len must be non-negative.")
+        if tokens_per_block <= 0:
+            raise RuntimeError("TurboQuant4 tokens_per_block must be positive.")
+        _check_turboquant4_cache_tensors(
+            cache, scales, block_ids, batched_block_ids=False, require_kv=False)
+        _check_turboquant4_kv_index(kv_index, cache.shape[1])
+        _check_turboquant4_tokens_per_block(cache, tokens_per_block)
+        _check_turboquant4_block_capacity(block_ids, seq_len,
+                                          tokens_per_block)
+        dtype = _check_turboquant4_output_dtype(output_dtype)
+        _check_turboquant4_head_dim(cache.shape[4] * 2)
+        output_shape = [1, seq_len, cache.shape[3], cache.shape[4] * 2]
+        return cache.new_empty(output_shape, dtype=dtype)
+
+    @torch.library.register_fake("trtllm::turboquant4_attention")
+    def _(q: torch.Tensor, cache: torch.Tensor, scales: torch.Tensor,
+          block_ids: torch.Tensor, seq_len: int, q_start_pos: int,
+          tokens_per_block: int, q_scaling: float, is_causal: bool,
+          attention_window_size: int) -> torch.Tensor:
+        _check_turboquant4_activation_dtype(q.dtype, "attention")
+        if q.dim() != 3:
+            raise RuntimeError(
+                "TurboQuant4 attention q must have shape [q_len, heads, head_dim]."
+            )
+        if seq_len < 0:
+            raise RuntimeError(
+                "TurboQuant4 attention seq_len must be non-negative.")
+        if q_start_pos < 0:
+            raise RuntimeError(
+                "TurboQuant4 attention q_start_pos must be non-negative.")
+        if tokens_per_block <= 0:
+            raise RuntimeError("TurboQuant4 tokens_per_block must be positive.")
+        if q_scaling <= 0.0:
+            raise RuntimeError("TurboQuant4 attention q_scaling must be positive.")
+        if attention_window_size < 0:
+            raise RuntimeError(
+                "TurboQuant4 attention_window_size must be non-negative.")
+        _check_turboquant4_cache_tensors(
+            cache, scales, block_ids, batched_block_ids=False, require_kv=True)
+        _check_turboquant4_tokens_per_block(cache, tokens_per_block)
+        _check_turboquant4_block_capacity(block_ids, seq_len,
+                                          tokens_per_block)
+        _check_turboquant4_head_dim(q.shape[-1])
+        _check_turboquant4_same_static_dim(
+            q.shape[-1], cache.shape[4] * 2,
+            "TurboQuant4 cache head_dim mismatch.")
+        if isinstance(q.shape[0], int) and isinstance(
+                seq_len, int) and q.shape[0] > 0 and q_start_pos + q.shape[
+                    0] > seq_len:
+            raise RuntimeError(
+                "TurboQuant4 attention query positions must be within the KV sequence length."
+            )
+        _check_turboquant4_head_counts(q.shape[1], cache.shape[3])
+        return torch.empty_like(q)
+
+    @torch.library.register_fake("trtllm::turboquant4_batch_attention")
+    def _(q: torch.Tensor, cache: torch.Tensor, scales: torch.Tensor,
+          block_ids: torch.Tensor, q_batch_indices: torch.Tensor,
+          query_positions: torch.Tensor, seq_lens: torch.Tensor,
+          max_seq_len: int, tokens_per_block: int, q_scaling: float,
+          is_causal: bool, attention_window_size: int) -> torch.Tensor:
+        _check_turboquant4_activation_dtype(q.dtype, "batch attention")
+        if q.dim() != 3:
+            raise RuntimeError(
+                "TurboQuant4 batch attention q must have shape [q_len, heads, head_dim]."
+            )
+        if q_batch_indices.dtype != torch.int32:
+            raise RuntimeError(
+                "TurboQuant4 batch attention q_batch_indices must be int32.")
+        if query_positions.dtype != torch.int32:
+            raise RuntimeError(
+                "TurboQuant4 batch attention query_positions must be int32.")
+        if seq_lens.dtype != torch.int32:
+            raise RuntimeError(
+                "TurboQuant4 batch attention seq_lens must be int32.")
+        if q_batch_indices.dim() != 1:
+            raise RuntimeError(
+                "TurboQuant4 batch attention q_batch_indices must be a 1D tensor."
+            )
+        if query_positions.dim() != 1:
+            raise RuntimeError(
+                "TurboQuant4 batch attention query_positions must be a 1D tensor."
+            )
+        if seq_lens.dim() != 1:
+            raise RuntimeError(
+                "TurboQuant4 batch attention seq_lens must be a 1D tensor.")
+        if max_seq_len < 0:
+            raise RuntimeError(
+                "TurboQuant4 batch attention max_seq_len must be non-negative.")
+        if tokens_per_block <= 0:
+            raise RuntimeError("TurboQuant4 tokens_per_block must be positive.")
+        if q_scaling <= 0.0:
+            raise RuntimeError("TurboQuant4 attention q_scaling must be positive.")
+        if attention_window_size < 0:
+            raise RuntimeError(
+                "TurboQuant4 attention_window_size must be non-negative.")
+        _check_turboquant4_cache_tensors(
+            cache, scales, block_ids, batched_block_ids=True, require_kv=True)
+        _check_turboquant4_tokens_per_block(cache, tokens_per_block)
+        _check_turboquant4_block_capacity(block_ids, max_seq_len,
+                                          tokens_per_block)
+        _check_turboquant4_head_dim(q.shape[-1])
+        _check_turboquant4_same_static_dim(
+            q_batch_indices.numel(), q.shape[0],
+            "TurboQuant4 batch attention q_batch_indices length mismatch.")
+        _check_turboquant4_same_static_dim(
+            query_positions.numel(), q.shape[0],
+            "TurboQuant4 batch attention query_positions length mismatch.")
+        _check_turboquant4_same_static_dim(
+            block_ids.shape[0], seq_lens.numel(),
+            "TurboQuant4 batch attention batch size mismatch.")
+        _check_turboquant4_same_static_dim(
+            q.shape[-1], cache.shape[4] * 2,
+            "TurboQuant4 cache head_dim mismatch.")
+        _check_turboquant4_head_counts(q.shape[1], cache.shape[3])
+        return torch.empty_like(q)
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,

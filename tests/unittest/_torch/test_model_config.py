@@ -4,7 +4,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    sync_loaded_turboquant4_kv_cache_config,
+    validate_and_set_kv_cache_quant,
+)
+from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          NGramDecodingConfig, TorchLlmArgs)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -110,9 +116,66 @@ def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     validate_and_set_kv_cache_quant(model_config, "nvfp4")
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+    assert isinstance(model_config.quant_config.kv_cache_quant_algo, QuantAlgo)
+
+
+def test_validate_and_set_kv_cache_quant_accepts_turboquant4():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "turboquant4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4
+    assert isinstance(model_config.quant_config.kv_cache_quant_algo, QuantAlgo)
 
 
 def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def test_sync_loaded_turboquant4_kv_cache_config_rewrites_loaded_config(tmp_path):
+    model_config = ModelConfig(
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.TURBOQUANT4),
+        attn_backend="FLASHINFER",
+        use_cuda_graph=True,
+    )
+    model_config._frozen = True
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        attn_backend="FLASHINFER",
+        kv_cache_config=KvCacheConfig(dtype="auto"),
+    )
+
+    assert sync_loaded_turboquant4_kv_cache_config(llm_args, model_config)
+    assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4
+    assert llm_args.kv_cache_config.dtype == "turboquant4"
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2
+    assert llm_args.attn_backend == "TRTLLM"
+    assert llm_args.cuda_graph_config is None
+    assert model_config.attn_backend == "TRTLLM"
+    assert not model_config.use_cuda_graph
+    assert model_config._frozen
+
+
+def test_sync_loaded_turboquant4_kv_cache_config_rejects_speculative(tmp_path):
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.TURBOQUANT4)
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(dtype="auto"),
+        speculative_config=NGramDecodingConfig(max_draft_len=1),
+    )
+
+    with pytest.raises(ValueError, match="speculative decoding"):
+        sync_loaded_turboquant4_kv_cache_config(llm_args, model_config)
+
+
+def test_sync_loaded_turboquant4_kv_cache_config_rejects_cache_transceiver(tmp_path):
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.TURBOQUANT4)
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(dtype="auto"),
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+    )
+
+    with pytest.raises(ValueError, match="cache transceiver"):
+        sync_loaded_turboquant4_kv_cache_config(llm_args, model_config)

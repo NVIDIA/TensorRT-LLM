@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,11 +46,15 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A16_MXFP4 = auto()
     NVFP4_AWQ = auto()
     NVFP4_ARC = auto()
+    TURBOQUANT4 = auto()
     NO_QUANT = auto()
 
 
-QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
-KV_CACHE_QUANT_ALGO_LIST = [QuantAlgo.FP8, QuantAlgo.INT8, QuantAlgo.NVFP4]
+QUANT_ALGO_LIST = list(
+    set(QuantAlgo) - {QuantAlgo.INT8, QuantAlgo.TURBOQUANT4})
+KV_CACHE_QUANT_ALGO_LIST = [
+    QuantAlgo.FP8, QuantAlgo.INT8, QuantAlgo.NVFP4, QuantAlgo.TURBOQUANT4
+]
 W8A8_SQ_PLUGIN_LIST = [
     QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN,
     QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
@@ -99,6 +103,8 @@ class QuantMode(IntFlag):
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
     W4A16_MXFP4 = auto()
+    # TurboQuant4 KV cache (4-bit PolarQuant with WHT rotation)
+    TURBOQUANT4_KV_CACHE = auto()
 
     # The smallest power-of-two that is not used by a flag. Do not call auto() after that line.
     COUNT = auto()
@@ -171,9 +177,13 @@ class QuantMode(IntFlag):
     def has_fp4_kv_cache(self):
         return self._any(self.NVFP4_KV_CACHE)
 
+    def has_turboquant4_kv_cache(self):
+        return self._any(self.TURBOQUANT4_KV_CACHE)
+
     def has_kv_cache_quant(self):
         return (self.has_int8_kv_cache() or self.has_fp8_kv_cache()
-                or self.has_fp4_kv_cache())
+                or self.has_fp4_kv_cache()
+                or self.has_turboquant4_kv_cache())
 
     def has_fp8_qdq(self):
         return self._any(self.FP8_QDQ)
@@ -219,7 +229,8 @@ class QuantMode(IntFlag):
             return has_quant
 
         return has_quant | self._any(self.INT8_KV_CACHE | self.FP8_KV_CACHE
-                                     | self.NVFP4_KV_CACHE)
+                                     | self.NVFP4_KV_CACHE
+                                     | self.TURBOQUANT4_KV_CACHE)
 
     def set_int8_kv_cache(self):
         return self | self.INT8_KV_CACHE
@@ -229,6 +240,9 @@ class QuantMode(IntFlag):
 
     def set_fp4_kv_cache(self):
         return self | self.NVFP4_KV_CACHE
+
+    def set_turboquant4_kv_cache(self):
+        return self | self.TURBOQUANT4_KV_CACHE
 
     def set_fp8_qdq(self):
         return self | self.FP8_QDQ
@@ -253,7 +267,8 @@ class QuantMode(IntFlag):
                          use_w4a8_qserve=False,
                          use_w4a8_mxfp4_fp8=False,
                          use_w4a8_mxfp4_mxfp8=False,
-                         use_w4a16_mxfp4=False):
+                         use_w4a16_mxfp4=False,
+                         use_turboquant4_kv_cache=False):
 
         def raise_error():
             raise ValueError(f"Unsupported combination of QuantMode args: "
@@ -269,10 +284,12 @@ class QuantMode(IntFlag):
                              f"{use_fp8_block_scales=}, "
                              f"{use_fp8_rowwise=}, "
                              f"{use_nvfp4=}, "
+                             f"{use_w4a8_nvfp4_fp8=}, "
                              f"{use_w4a8_qserve=}, "
                              f"{use_w4a8_mxfp4_fp8=}, "
                              f"{use_w4a8_mxfp4_mxfp8=}, "
-                             f"{use_w4a16_mxfp4=}")
+                             f"{use_w4a16_mxfp4=}, "
+                             f"{use_turboquant4_kv_cache=}")
 
         # We must quantize weights when we quantize activations.
         if quantize_activations and not quantize_weights:
@@ -338,6 +355,9 @@ class QuantMode(IntFlag):
 
         if use_w4a16_mxfp4:
             mode = mode | QuantMode.W4A16_MXFP4
+
+        if use_turboquant4_kv_cache:
+            mode = mode | QuantMode.TURBOQUANT4_KV_CACHE
 
         return mode
 
@@ -435,6 +455,8 @@ class QuantMode(IntFlag):
             quant_mode = quant_mode.set_fp8_kv_cache()
         elif kv_cache_quant_algo == QuantAlgo.NVFP4:
             quant_mode = quant_mode.set_fp4_kv_cache()
+        elif kv_cache_quant_algo == QuantAlgo.TURBOQUANT4:
+            quant_mode = quant_mode.set_turboquant4_kv_cache()
 
         return quant_mode
 
@@ -468,6 +490,8 @@ class QuantMode(IntFlag):
             self.has_w4a16_mxfp4(),
             'fp8_kv_cache':
             self.has_fp8_kv_cache(),
+            'turboquant4_kv_cache':
+            self.has_turboquant4_kv_cache(),
             'use_weight_only':
             self.is_weight_only(),
             'weight_only_precision':

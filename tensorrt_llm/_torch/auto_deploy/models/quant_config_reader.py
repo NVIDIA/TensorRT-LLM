@@ -32,6 +32,15 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 from ..utils.logger import ad_logger
 
+_TURBOQUANT4_AUTODEPLOY_ERROR = (
+    "TurboQuant4 KV cache is not supported with AutoDeploy. "
+    "Use backend='pytorch' with TRTLLM attention backend."
+)
+
+
+class AutoDeployUnsupportedQuantConfigError(ValueError):
+    pass
+
 
 class QuantConfigReader(ABC):
     """Base class for reading and parsing quantization config."""
@@ -183,6 +192,8 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
     def _handle_kv_cache(self, quant_config: Dict) -> None:
         kv_algo = quant_config.get("kv_cache_quant_algo")
         if kv_algo:
+            if str(kv_algo).upper() == "TURBOQUANT4":
+                raise AutoDeployUnsupportedQuantConfigError(_TURBOQUANT4_AUTODEPLOY_ERROR)
             if kv_algo != "FP8":
                 raise ValueError(f"KV cache quantization format {kv_algo} not supported.")
             quant_config["kv_cache_dtype"] = "fp8"
@@ -229,6 +240,9 @@ class HFQuantConfigReader(QuantConfigReader):
         qconf = config.get("quantization_config")
         if not qconf:
             raise ValueError("HF quantization_config not found.")
+        kv_algo = qconf.get("kv_cache_quant_algo")
+        if kv_algo is not None and str(kv_algo).upper() == "TURBOQUANT4":
+            raise AutoDeployUnsupportedQuantConfigError(_TURBOQUANT4_AUTODEPLOY_ERROR)
 
         # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
         excludes = qconf.get("exclude_modules", [])
@@ -300,6 +314,8 @@ def autodetect_quant_config_reader(
         hf_cls = QuantConfigReaderRegistry.get("hf")
         try:
             result = hf_cls.from_file(fetched_dir)
+        except AutoDeployUnsupportedQuantConfigError:
+            raise
         except Exception:
             # Skip HF reader if it errors out during probing
             result = None

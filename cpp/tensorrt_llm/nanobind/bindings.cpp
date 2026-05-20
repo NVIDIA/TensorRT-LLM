@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -254,6 +254,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_static("per_group_scaling", &tc::QuantMode::perGroupScaling)
         .def_static("int8_kv_cache", &tc::QuantMode::int8KvCache)
         .def_static("fp8_kv_cache", &tc::QuantMode::fp8KvCache)
+        .def_static("turboquant4_kv_cache", &tc::QuantMode::turboQuant4KvCache)
         .def_static("fp8_qdq", &tc::QuantMode::fp8Qdq)
         .def_prop_ro("value", &tc::QuantMode::value)
         .def("is_set", &tc::QuantMode::isSet, nb::arg("mode"))
@@ -267,8 +268,10 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("has_int8_kv_cache", &tc::QuantMode::hasInt8KvCache)
         .def_prop_ro("has_fp4_kv_cache", &tc::QuantMode::hasFp4KvCache)
         .def_prop_ro("has_fp8_kv_cache", &tc::QuantMode::hasFp8KvCache)
+        .def_prop_ro("has_turboquant4_kv_cache", &tc::QuantMode::hasTurboQuant4KvCache)
         .def_prop_ro("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
         .def_prop_ro("has_nvfp4", &tc::QuantMode::hasNvfp4)
+        .def_prop_ro("has_w4a8_nvfp4_fp8", &tc::QuantMode::hasW4a8Nvfp4Fp8)
         .def_prop_ro("has_w4a8_mxfp4_fp8", &tc::QuantMode::hasW4a8Mxfp4Fp8)
 
         .def_prop_ro("has_w4a8_mxfp4_mxfp8", &tc::QuantMode::hasW4a8Mxfp4Mxfp8)
@@ -280,7 +283,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
             nb::arg("use_int4_weights"), nb::arg("use_int8_kv_cache"), nb::arg("use_fp8_kv_kache"),
             nb::arg("use_fp8_qdq"), nb::arg("use_fp8_rowwise"), nb::arg("use_w4a8_qserve"), nb::arg("use_nvfp4"),
             nb::arg("use_fp8_block_scales"), nb::arg("use_w4a8_mxfp4_fp8"), nb::arg("use_w4a8_mxfp4_mxfp8"),
-            nb::arg("use_w4a16_mxfp4"))
+            nb::arg("use_w4a16_mxfp4"), nb::arg("use_turboquant4_kv_cache") = false,
+            nb::arg("use_w4a8_nvfp4_fp8") = false)
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, nb::arg("per_token") = false,
             nb::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, nb::arg("use_int4_weights") = false,

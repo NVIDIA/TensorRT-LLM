@@ -684,7 +684,7 @@ class ChoiceWithAlias(click.Choice):
                   "after allocating model weights and buffers.", "beta"))
 @click.option(
     "--kv_cache_dtype",
-    type=click.Choice(("auto", "fp8", "nvfp4")),
+    type=click.Choice(("auto", "fp8", "nvfp4", "turboquant4")),
     default="auto",
     help=help_info_with_stability_tag(
         "KV cache quantization dtype for PyTorch backend. "
@@ -1491,7 +1491,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
                             f"Child process {_child_p_global.pid} failed to be killed even after 30s."
                         )
             assert _child_p_global.poll(
-            ) is not None, f"the subprocess should be terminated"
+            ) is not None, "the subprocess should be terminated"
 
     # Check if the process was launched and assert it's terminated
     if _child_p_global and hasattr(_child_p_global,

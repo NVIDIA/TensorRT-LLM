@@ -8,7 +8,7 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch._dynamo.config
@@ -72,6 +72,9 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
 class ModelEngine(ABC):
@@ -590,6 +593,10 @@ class PyTorchModelEngine(ModelEngine):
         elif layer_quant_mode.has_fp8_kv_cache(
         ) or layer_quant_mode.has_int8_kv_cache():
             return 1
+        elif layer_quant_mode.has_turboquant4_kv_cache():
+            # Used as packed-cache row stride for draft-token relocation;
+            # TurboQuant4 scale relocation is unsupported and rejected there.
+            return 1 / 2
         else:
             return 2
 
@@ -3541,7 +3548,6 @@ class PyTorchModelEngine(ModelEngine):
                     anchor_len)
                 all_cache_indices = all_cache_indices[
                     num_kvblocks_per_ctx_block:]
-            cache_indices = all_cache_indices[:num_kv_blocks]
             last_query_pos_id = request.ctx_position_blocks[-1][-1]
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])
