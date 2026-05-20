@@ -83,12 +83,14 @@ def make_context_request(
     beam_width: int = 1,
     draft_tokens_len: int = 0,
     context_position: int = 0,
+    encoder_output_len: int = 0,
 ) -> LlmRequest:
     req = _make_request(
         request_id=request_id,
         prompt_len=prompt_len,
         beam_width=beam_width,
         draft_tokens_len=draft_tokens_len,
+        encoder_output_len=encoder_output_len,
         state=LlmRequestState.CONTEXT_INIT,
     )
     if context_position > 0:
@@ -2442,10 +2444,8 @@ class TestPyCapacitySchedulerCrossKVCache:
             cross_kv_cache_manager=cross_kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
-        r0 = make_context_request(0, prompt_len=10)
-        r0.encoder_output_len = 10
-        r1 = make_context_request(1, prompt_len=10)
-        r1.encoder_output_len = 10
+        r0 = make_context_request(0, prompt_len=10, encoder_output_len=10)
+        r1 = make_context_request(1, prompt_len=10, encoder_output_len=10)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) == 2
 
@@ -2459,10 +2459,8 @@ class TestPyCapacitySchedulerCrossKVCache:
             cross_kv_cache_manager=cross_kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
-        r0 = make_context_request(0, prompt_len=10)
-        r0.encoder_output_len = 10
-        r1 = make_context_request(1, prompt_len=10)
-        r1.encoder_output_len = 10
+        r0 = make_context_request(0, prompt_len=10, encoder_output_len=10)
+        r1 = make_context_request(1, prompt_len=10, encoder_output_len=10)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) == 1
 
