@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared interfaces for Grafia op lowerings."""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -10,17 +8,13 @@ from typing import Any
 
 from torch.fx import Node
 
-from ....lowering import (
-    LoweringContext,
-    ModeContext,
-    OpArgumentResolver,
-    ProgramData,
-    SupportDecision,
-)
+from .arguments import OpArgumentResolver
+from .context import LoweringContext
+from .datamodel import ModeContext, ProgramData, SupportDecision
 
 
-class GrafiaOpLowering(ABC):
-    """Backend op lowering with classification and lowering in one unit."""
+class BackendOpLowering(ABC):
+    """Backend op lowering with classification and emission in one unit."""
 
     def __call__(self, ctx: LoweringContext, node: Node) -> Any:
         return self.lower(ctx, node)
@@ -38,15 +32,15 @@ class GrafiaOpLowering(ABC):
         program: ProgramData,
         args: OpArgumentResolver,
     ) -> SupportDecision:
-        """Return whether this Grafia lowering supports the FX node."""
+        """Return whether this backend lowering supports the FX node."""
 
     @abstractmethod
     def lower(self, ctx: LoweringContext, node: Node) -> Any:
         """Emit backend IR for this FX node."""
 
 
-def build_op_lowering_map(*op_lowerings: GrafiaOpLowering) -> dict[Any, GrafiaOpLowering]:
-    lowerings_by_target: dict[Any, GrafiaOpLowering] = {}
+def build_op_lowering_map(*op_lowerings: BackendOpLowering) -> dict[Any, BackendOpLowering]:
+    lowerings_by_target: dict[Any, BackendOpLowering] = {}
     for op_lowering in op_lowerings:
         if not op_lowering.source_ops:
             raise ValueError(f"{type(op_lowering).__name__} must define at least one source op")
@@ -55,7 +49,7 @@ def build_op_lowering_map(*op_lowerings: GrafiaOpLowering) -> dict[Any, GrafiaOp
                 existing = lowerings_by_target.get(key)
                 if existing is not None and existing is not op_lowering:
                     raise ValueError(
-                        f"duplicate Grafia lowering for source op {key!r}: "
+                        f"duplicate lowering for source op {key!r}: "
                         f"{type(existing).__name__} and {type(op_lowering).__name__}"
                     )
                 lowerings_by_target[key] = op_lowering

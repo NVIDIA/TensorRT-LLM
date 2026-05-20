@@ -13,6 +13,7 @@ import torch
 from torch.fx import Node
 
 from ....lowering import (
+    BackendOpLowering,
     LoweringContext,
     ModeContext,
     OpArgumentResolver,
@@ -23,12 +24,11 @@ from ....lowering import (
 from ..constants import RMSNORM_OP_KIND, SUPPORTED_RMSNORM_HIDDEN, SUPPORTED_RMSNORM_ROWS
 from ..errors import GrafiaCompileError, GrafiaUnsupportedError
 from ..metadata import _ctm_dtype_to_torch, _dtype_from_meta, _is_contiguous_meta, _shape_from_meta
-from .base import GrafiaOpLowering
 
 _COMPILE_RESOURCE_ID = "grafia.rmsnorm.cubin"
 
 
-class RmsNormLowering(GrafiaOpLowering):
+class RmsNormLowering(BackendOpLowering):
     """Grafia lowering for canonical AutoDeploy RMSNorm."""
 
     @property

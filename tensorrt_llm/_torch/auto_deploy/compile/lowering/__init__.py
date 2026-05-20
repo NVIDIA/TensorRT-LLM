@@ -28,12 +28,14 @@ from .executor import (
     PlanDispatcher,
 )
 from .hybrid import HybridGraphBuilder, HybridPlanModule
+from .op import BackendOpLowering, build_op_lowering_map
 from .planning import BackendPlugin, MultiModePlanner, default_contiguous_supported_groups
 from .region import lower_region, resolve_get_attr_value
 from .registry import LOWERINGS, LoweringRule
 
 __all__ = [
     "BackendAdapter",
+    "BackendOpLowering",
     "BackendPlugin",
     "BoundaryValue",
     "CompiledPlan",
@@ -61,6 +63,7 @@ __all__ = [
     "SupportKind",
     "ValueType",
     "analyze_region_boundaries",
+    "build_op_lowering_map",
     "default_contiguous_supported_groups",
     "executable_nodes",
     "graph_order",

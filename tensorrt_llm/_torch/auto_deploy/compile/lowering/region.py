@@ -10,7 +10,7 @@ import torch
 from .arguments import OpArgumentResolver
 from .context import BackendAdapter, LoweringContext
 from .datamodel import BoundaryValue, ProgramData, RegionSpec
-from .registry import LOWERINGS, LoweringRule, _get_mapping_lowering
+from .registry import LOWERINGS, LoweringRule
 
 
 def resolve_get_attr_value(program: ProgramData, target: str):
@@ -51,7 +51,7 @@ def lower_region(
 
     lowering_map = LOWERINGS if lowerings is None else lowerings
     for node in region.source_nodes:
-        rule = _get_mapping_lowering(lowering_map, node.target)
+        rule = lowering_map.get(node.target)
         if rule is None:
             raise KeyError(f"No lowering registered for source_op={node.target!r}")
         ctx.env[node] = rule(ctx, node)
