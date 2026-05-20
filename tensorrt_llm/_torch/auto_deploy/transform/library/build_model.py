@@ -21,7 +21,6 @@ from pydantic import Field
 
 from ...models import ModelFactory, hf
 from ...shim.interface import CachedSequenceInterface
-from ...utils.dist_config import use_dist_config
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -58,13 +57,8 @@ class BuildModel(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        # Expose the active DistConfig to modeling code that needs to register
-        # rank-dependent parameter shapes inside ``__init__`` (e.g., GPT-OSS
-        # MXFP4 trtllm-gen experts which slice along intermediate or expert
-        # axes based on MoE-TP / MoE-EP topology).
-        with use_dist_config(shared_config.dist_config):
-            # build the model
-            model = factory.build_model(self.config.device)
+        # build the model
+        model = factory.build_model(self.config.device)
 
         # update the kv cache config
         cm.update_kv_cache_config(**factory.get_cache_config_updates())
@@ -98,10 +92,8 @@ class BuildAndLoadFactoryModel(BuildModel):
         # load model with auto sharding
         assert isinstance(factory, hf.AutoModelFactory), "Only HF models are supported."
 
-        # See ``BuildModel._apply_to_full_model`` for the rationale.
-        with use_dist_config(shared_config.dist_config):
-            # build and load the model
-            model = factory.build_and_load_model(cm.device)
+        # build and load the model
+        model = factory.build_and_load_model(cm.device)
 
         # we set the standard example sequence WITHOUT extra_args to set them to None so that
         # only the text portion of the model gets called.

@@ -21,10 +21,8 @@ needed by the sharding transforms and custom ops, plus serialization
 support for graph-level metadata (e.g., MoE all-to-all dispatch).
 """
 
-import contextvars
 import json
-from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -180,43 +178,3 @@ class DistConfig(BaseModel):
     def print_rank(self) -> str:
         """Human-readable summary of this process's rank assignments."""
         return f"rank: [{self.rank}, {self.moe_tp_rank}, {self.moe_ep_rank}]"
-
-
-# ----------------------------------------------------------------------------
-# Active-DistConfig contextvar
-#
-# The model factory's ``build_model`` runs *outside* of the regular transform
-# argument plumbing (transforms get ``shared_config`` but custom modeling code
-# constructed inside ``factory.build_model`` does not). Some modeling-side
-# weight layouts (e.g., GPT-OSS MXFP4 trtllm-gen parameter shapes that depend
-# on MoE-TP vs MoE-EP slicing) need to know the current ``DistConfig`` at
-# ``__init__`` time so they can register the right per-rank parameter shapes.
-#
-# The ``use_dist_config`` context manager sets the active ``DistConfig`` for
-# the duration of a code block; modeling code reads it via
-# ``get_active_dist_config``. Implemented via ``contextvars`` so it is
-# threadsafe and properly nests under asyncio.
-# ----------------------------------------------------------------------------
-
-_ACTIVE_DIST_CONFIG: contextvars.ContextVar[Optional[DistConfig]] = contextvars.ContextVar(
-    "ad_active_dist_config", default=None
-)
-
-
-def get_active_dist_config() -> Optional[DistConfig]:
-    """Return the ``DistConfig`` currently active in this context, or ``None``."""
-    return _ACTIVE_DIST_CONFIG.get()
-
-
-@contextmanager
-def use_dist_config(dc: Optional[DistConfig]) -> Iterator[None]:
-    """Set the active ``DistConfig`` for the duration of the ``with`` block.
-
-    ``None`` is accepted and clears any active value within the block (useful
-    when a transform wants to explicitly opt out of providing dist info).
-    """
-    token = _ACTIVE_DIST_CONFIG.set(dc)
-    try:
-        yield
-    finally:
-        _ACTIVE_DIST_CONFIG.reset(token)
