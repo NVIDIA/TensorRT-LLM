@@ -362,11 +362,7 @@ class BaseMultimodalInputProcessor(ABC):
         """
         raise NotImplementedError
 
-    def get_max_requests_per_mm_item(
-        self,
-        *,
-        max_encoder_tokens: int = 0,
-    ) -> int:
+    def get_max_requests_per_mm_item(self) -> int:
         """Worst-case attention-layer sequence count produced by one mm item.
 
         Drives ``AttentionMetadata.max_num_requests`` on multimodal encoders.
@@ -374,6 +370,13 @@ class BaseMultimodalInputProcessor(ABC):
         when sizing the encoder's attention buffers; the result is the
         upper bound on attention sequences (= preallocated request-dim
         buffers in :class:`AttentionMetadata`).
+
+        The bound must be derived purely from this processor's own
+        configuration — ``image_grid_pinpoints``, ``max_pixels``,
+        max video frames, etc. — so it stays valid regardless of the
+        engine's per-step token budget. Mirrors vLLM's
+        ``max_tokens_per_mm_item`` (computed from the processor, not from
+        scheduler knobs).
 
         Default returns 1: each mm item produces exactly one attention
         sequence (e.g. plain CLIP, Pixtral, RADIO).
@@ -384,14 +387,8 @@ class BaseMultimodalInputProcessor(ABC):
         - LLaVA-Next splits each image into multiple sub-image patches via
           ``image_grid_pinpoints`` (worst case is the max patch count).
         - Qwen2/2.5-VL applies windowed attention so each image becomes
-          many window sequences (worst case is computed from the per-item
-          encoder-token budget).
-
-        ``max_encoder_tokens`` lets encoders that compute their fan-out
-        from a token-count budget (windowed attention, video temporal
-        patching) take the engine's ``encoder_max_num_tokens`` into
-        account. Encoders whose fan-out is config-driven (LLaVA-Next
-        grid pinpoints) can ignore it.
+          ``ceil(processor.max_pixels / patch_size**2 /
+          (window_size/patch_size)**2)`` window sequences.
         """
         return 1
 

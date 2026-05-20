@@ -1548,7 +1548,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         if isinstance(self.input_processor, BaseMultimodalInputProcessor):
             max_requests_per_item = self.input_processor.get_max_requests_per_mm_item(
-                max_encoder_tokens=self.encoder_max_num_tokens)
+            )
         else:
             max_requests_per_item = 1
         max_num_requests = max(

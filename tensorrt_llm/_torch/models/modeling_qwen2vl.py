@@ -135,37 +135,58 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         merge_size = self.config.vision_config.spatial_merge_size
         return merge_size * merge_size
 
-    def get_max_requests_per_mm_item(
-        self,
-        *,
-        max_encoder_tokens: int = 0,
-    ) -> int:
+    def get_max_requests_per_mm_item(self) -> int:
         """Worst-case windowed-attention sequences produced by one Qwen2/2.5-VL image.
 
-        The vision encoder applies windowed attention with
-        ``vit_merger_window_size = window_size // spatial_merge_size //
-        patch_size`` in post-merger units; each window covers
-        ``(window_size / patch_size) ** 2`` pre-merger patches. A single
-        image's worst-case window count is therefore
-        ``ceil(per_item_encoder_tokens / (window_size / patch_size) ** 2)``.
+        The vision encoder applies windowed attention with each window
+        covering ``(window_size / patch_size) ** 2`` pre-merger patches.
+        A single image's worst-case window count is therefore
+        ``ceil(max_patches_per_image / (window_size / patch_size) ** 2)``,
+        where ``max_patches_per_image`` is the absolute upper bound the
+        HF image processor produces after ``smart_resize`` caps the input
+        at ``max_pixels`` (transformers <5) or ``size["longest_edge"]``
+        (transformers >=5).
 
-        ``max_encoder_tokens`` bounds the per-item encoder budget; we use it
-        directly (rather than ``max_pixels`` from the HF processor) so the
-        engine knob composes correctly across processor configurations.
-        Returns 1 when no upper bound is provided so callers without an
-        explicit budget fall back to the legacy single-sequence assumption.
+        Deriving the bound from the processor config (rather than from
+        the engine's ``encoder_max_num_tokens``) keeps the prealloc valid
+        even when the engine's per-step token budget is smaller than a
+        single image's actual patch count.
         """
-        if max_encoder_tokens <= 0:
-            return 1
         cfg = self.config.vision_config
         window_size = getattr(cfg, "window_size", 0)
         patch_size = cfg.patch_size
         if window_size <= 0 or patch_size <= 0:
             return 1
+
+        max_pixels = self._get_processor_max_pixels()
+        if max_pixels is None or max_pixels <= 0:
+            return 1
+
+        max_patches_per_image = max_pixels // (patch_size * patch_size)
         window_tokens = (window_size // patch_size)**2
         if window_tokens <= 0:
             return 1
-        return math.ceil(max_encoder_tokens / window_tokens)
+        return math.ceil(max_patches_per_image / window_tokens)
+
+    def _get_processor_max_pixels(self) -> Optional[int]:
+        """Return the HF image processor's per-image pixel cap.
+
+        ``transformers<5`` exposes the cap directly on the image processor
+        as ``max_pixels``; ``transformers>=5`` migrated to a
+        ``size={"shortest_edge": ..., "longest_edge": ...}`` dict where
+        ``longest_edge`` carries the same upper bound. Falls back to
+        ``None`` when neither is available so callers degrade to the
+        single-sequence default.
+        """
+        image_proc = getattr(self.processor, "image_processor", None)
+        if image_proc is None:
+            return None
+        if hasattr(image_proc, "max_pixels"):
+            return image_proc.max_pixels
+        size = getattr(image_proc, "size", None)
+        if isinstance(size, dict):
+            return size.get("longest_edge")
+        return None
 
     def get_num_mm_tokens(
         self,
