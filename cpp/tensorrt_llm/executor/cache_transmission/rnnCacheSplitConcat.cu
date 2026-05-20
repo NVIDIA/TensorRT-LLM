@@ -1677,7 +1677,7 @@ void concatUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<
         selfModelConfig.hasConvSections(), "Failed to get conv state info, please double check the model type");
 
     static constexpr int numConvSections = kv_cache::CacheState::RnnModelConfig::kNumConvSections;
-    auto const globalSectionDims = selfModelConfig.getConvSectionDisms();
+    auto const globalSectionDims = selfModelConfig.getConvSectionDims();
 
     std::array<int, numConvSections> sectionDimsLocal;
     std::array<int, numConvSections> sectionDimsDomainTP;

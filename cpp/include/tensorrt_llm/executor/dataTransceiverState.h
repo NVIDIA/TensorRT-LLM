@@ -214,7 +214,7 @@ public:
             {
             case ConvSectionLayout::kXBC: return {dInner, ngDs, ngDs};
             case ConvSectionLayout::kQKV: return {ngDs, ngDs, dInner};
-            default: return {0, 0, 0};
+            default: return {0, 0, 0}; // ConvSectionLayout::kNONE
             }
         }
 
