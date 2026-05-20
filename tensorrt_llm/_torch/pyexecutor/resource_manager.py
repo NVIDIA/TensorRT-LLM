@@ -2018,6 +2018,30 @@ class KVCacheManager(BaseResourceManager):
         self.impl.reset_reuse_state()
 
 
+def compute_default_v2_host_quota(gpu_quota: int) -> int:
+    """Default host cache quota when the user did not set ``host_cache_size``.
+
+    KVCacheManagerV2's MAX_UTILIZATION scheduler relies on suspend/resume which
+    requires a host tier to be present.  When the user has not configured one
+    we provision a tier matching the GPU quota, capped at half of the
+    currently-available host memory to avoid allocation failures.
+
+    Centralised here so callers that need to pre-split the host budget (e.g.
+    one-model spec dec creating both a target and a draft manager) can compute
+    the same quota that ``KVCacheManagerV2.__init__`` would have used, then
+    divide it explicitly between the two managers.
+    """
+    try:
+        mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
+            'SC_AVPHYS_PAGES')
+    except (ValueError, OSError):
+        mem_available = float('inf')
+    host_quota = min(gpu_quota, int(mem_available * 0.5))
+    if host_quota <= 0:
+        host_quota = gpu_quota
+    return host_quota
+
+
 class KVCacheManagerV2(BaseResourceManager):
 
     def __init__(
@@ -2201,23 +2225,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
             host_quota = kv_cache_config.host_cache_size
         else:
-            # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
-            # evict and later restore KV cache pages.  Without a host tier,
-            # suspended pages have nowhere to be offloaded and resume()
-            # always fails, causing a scheduling deadlock where no
-            # generation request can ever make progress.
-            #
-            # Automatically provision a host tier matching the GPU quota so
-            # suspend/resume works out of the box.  Cap at available host
-            # memory to avoid allocation failures.
-            try:
-                mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
-                    'SC_AVPHYS_PAGES')
-            except (ValueError, OSError):
-                mem_available = float('inf')
-            host_quota = min(quota, int(mem_available * 0.5))
-            if host_quota <= 0:
-                host_quota = quota
+            host_quota = compute_default_v2_host_quota(quota)
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(

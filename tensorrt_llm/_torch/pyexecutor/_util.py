@@ -46,7 +46,8 @@ from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
                                PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+                               ResourceManagerType,
+                               compute_default_v2_host_quota)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -899,6 +900,15 @@ class KvCacheCreator:
         budget for both target and draft combined.  This method splits both
         budgets proportionally based on their per-token KV cache sizes.
 
+        For V2, when host_cache_size is not configured, KVCacheManagerV2
+        auto-provisions a host tier in its constructor based on the GPU
+        quota.  If we left host_cache_size unset here, both the target and
+        the draft manager would each auto-provision a full host tier --
+        roughly doubling host memory usage.  To prevent that, we
+        pre-compute what the auto-provision would yield from the combined
+        GPU budget and split it explicitly so each manager sees its own
+        share.
+
         Returns a cloned KvCacheConfig for the draft, or None if no split is
         needed.  Also modifies self._kv_cache_config in-place for the target.
         """
@@ -943,6 +953,17 @@ class KvCacheCreator:
         draft_kv_cache_config.max_gpu_total_bytes = draft_budget
 
         host_budget = self._kv_cache_config.host_cache_size
+        # When V2 would otherwise auto-provision a host tier per manager,
+        # materialise the would-be combined host budget up front so it gets
+        # split here instead of duplicated across target and draft.
+        if ((host_budget is None or host_budget <= 0)
+                and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
+            host_budget = compute_default_v2_host_quota(total_budget)
+            logger.info(
+                f"V2 host cache size not set; pre-splitting auto-provisioned "
+                f"host budget {host_budget / GB:.2f} GiB between target and "
+                f"draft to avoid duplicate allocation.")
+
         if host_budget is not None and host_budget > 0:
             draft_ratio = draft_budget / total_budget
             draft_host_budget = int(host_budget * draft_ratio)
