@@ -85,6 +85,10 @@ struct FmhaOptions : public KernelConfigBase {
   int mNumPagesInMemPool{0};
   // The number of causal-mask spec-decoding tokens (it is fixed in the batch).
   int mNumSpecDecodingTokens{0};
+  // For tree-based custom spec-decoding only: equals max_total_draft_tokens + 1,
+  // fixed at config time. When set with mIsCustomSpecDecodingGen, FmhaAutoTuner
+  // uses it as a deterministic upper bound for kernel selection.
+  int mSpecDecodingTargetMaxGenLen{0};
   // Warmup steps.
   int mNumWarmUpSteps{0};
   // The maximum number of waves for the multiCtasKvMode.
@@ -140,6 +144,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mNumLoopItersForPrint);
     TO_JSON(mNumPagesInMemPool);
     TO_JSON(mNumSpecDecodingTokens);
+    TO_JSON(mSpecDecodingTargetMaxGenLen);
     TO_JSON(mNumWarmUpSteps);
     TO_JSON(mMaxNumWavesForCtasKvMode);
     TO_JSON(mOutputScale);
@@ -238,6 +243,9 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // The number of instances for Q and Kv must be set together.
   TLLM_CHECK_ERROR(optionsFromArgs.mIsNumInstsQSet == optionsFromArgs.mIsNumInstsKvSet,
                    "The number of instances for Q and Kv must be set together");
+
+  TLLM_CHECK_ERROR(options.mNumStagesKv >= 0, "numStagesKv must be >= 0");
+  TLLM_CHECK_ERROR(options.mNumStagesQ >= 0, "numStagesQ must be >= 0");
 
   // Do we swap A/B for the generation kernel.
   bool const swapsMmaAb{isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType)};
@@ -480,8 +488,6 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(options.mDtypeKv != tg::Dtype::E2m1,
-                     "mGroupsTokensHeadsQ doesn't work with E2m1 dtypeKv.");
     TLLM_CHECK_ERROR(!options.mIsMlaGen,
                      "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
   }
