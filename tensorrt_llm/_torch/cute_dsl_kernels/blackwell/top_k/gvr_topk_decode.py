@@ -486,78 +486,81 @@ class GvrTopKKernel:
                 s_iscalars[3] = c0
         cute.arch.barrier()
 
-        # ---- Secant refinement loop (unrolled by jit; per-iter early-exit
-        # via reading s_iscalars[1] == 0). ----
-        for it in range(MAX_REFINE_ITERS):
-            # Check done flag (read once per iter — gates the iter body).
-            if s_iscalars[1] == cutlass.Int32(0):
-                # tid==0 computes new threshold via secant interpolation.
-                if tidx == 0:
-                    vlo = s_thr[1]
-                    vhi = s_thr[2]
-                    clo = s_iscalars[2]
-                    chi = s_iscalars[3]
-                    rng = vhi - vlo
-                    nv = cutlass.Float32(0.0)
-                    if clo > chi and rng > cutlass.Float32(1e-10):
-                        f = cutlass.Float32(clo - cutlass.Int32(kFTarget)) / cutlass.Float32(
-                            clo - chi
-                        )
-                        # clamp f to [0.05, 0.95]
-                        f = cute.arch.fmax(cutlass.Float32(0.05), f)
-                        f = _fmin_f32_inline(f, cutlass.Float32(0.95))
-                        if it == 0:
-                            # iter 0: f = min(f, 0.5)
-                            f = _fmin_f32_inline(f, cutlass.Float32(0.5))
-                        nv = vlo + rng * f
-                    else:
-                        nv = (vlo + vhi) * cutlass.Float32(0.5)
+        # ---- Secant refinement loop ----
+        # Runtime `while` with `done` check in the loop condition, matching
+        # CUDA's `for(iter; iter < MAX_REFINE_ITERS; iter++) { if(done) break; }`
+        # (heuristic_topk.cuh:683-743). Previous Python-unrolled `for it in
+        # range(15)` ran the guard check for all 15 unrolled bodies even
+        # when the kernel converged at iter 3, wasting ~12 LDS+ICMP+branch
+        # per kernel call.
+        it = cutlass.Int32(0)
+        while it < cutlass.Int32(MAX_REFINE_ITERS) and s_iscalars[1] == cutlass.Int32(0):
+            # tid==0 computes new threshold via secant interpolation.
+            if tidx == 0:
+                vlo = s_thr[1]
+                vhi = s_thr[2]
+                clo = s_iscalars[2]
+                chi = s_iscalars[3]
+                rng = vhi - vlo
+                nv = cutlass.Float32(0.0)
+                if clo > chi and rng > cutlass.Float32(1e-10):
+                    f = cutlass.Float32(clo - cutlass.Int32(kFTarget)) / cutlass.Float32(clo - chi)
+                    # clamp f to [0.05, 0.95]
+                    f = cute.arch.fmax(cutlass.Float32(0.05), f)
+                    f = _fmin_f32_inline(f, cutlass.Float32(0.95))
+                    if it == cutlass.Int32(0):
+                        # iter 0: f = min(f, 0.5)  — runtime compare (matches CUDA)
+                        f = _fmin_f32_inline(f, cutlass.Float32(0.5))
+                    nv = vlo + rng * f
+                else:
+                    nv = (vlo + vhi) * cutlass.Float32(0.5)
 
-                    # clamp nv into (vlo, vhi) range
-                    if nv <= vlo:
-                        nv = vlo + rng * cutlass.Float32(0.05)
-                    if nv >= vhi:
-                        nv = vhi - rng * cutlass.Float32(0.05)
+                # clamp nv into (vlo, vhi) range
+                if nv <= vlo:
+                    nv = vlo + rng * cutlass.Float32(0.05)
+                if nv >= vhi:
+                    nv = vhi - rng * cutlass.Float32(0.05)
 
+                if nv == vlo or nv == vhi:
+                    # Bracket exhausted — try midpoint, else give up.
+                    nv = (vlo + vhi) * cutlass.Float32(0.5)
                     if nv == vlo or nv == vhi:
-                        # Bracket exhausted — try midpoint, else give up.
-                        nv = (vlo + vhi) * cutlass.Float32(0.5)
-                        if nv == vlo or nv == vhi:
-                            s_thr[0] = vlo
-                            s_iscalars[1] = cutlass.Int32(2)  # done = 2 (give up)
-                        else:
-                            s_thr[0] = nv
+                        s_thr[0] = vlo
+                        s_iscalars[1] = cutlass.Int32(2)  # done = 2 (give up)
                     else:
                         s_thr[0] = nv
-                cute.arch.barrier()
+                else:
+                    s_thr[0] = nv
+            cute.arch.barrier()
 
-                # Re-check done (tid==0 may have set it to 2)
-                if s_iscalars[1] == cutlass.Int32(0):
-                    new_thr = s_thr[0]
-                    self.block_count_ge(
-                        input_row,
-                        N,
-                        new_thr,
-                        smem_ptcnt,
-                        smem_wcnt,
-                        s_iscalars,
-                        tidx,
-                        warp_id,
-                        lane,
-                    )
-                    # tid==0 classifies the new count.
-                    if tidx == 0:
-                        c_new = s_iscalars[0]
-                        t_new = s_thr[0]
-                        if c_new >= cutlass.Int32(kK) and c_new <= cutlass.Int32(kCC):
-                            s_iscalars[1] = cutlass.Int32(1)
-                        elif c_new > cutlass.Int32(kCC):
-                            s_thr[1] = t_new
-                            s_iscalars[2] = c_new
-                        else:
-                            s_thr[2] = t_new
-                            s_iscalars[3] = c_new
-                    cute.arch.barrier()
+            # Re-check done (tid==0 may have set it to 2)
+            if s_iscalars[1] == cutlass.Int32(0):
+                new_thr = s_thr[0]
+                self.block_count_ge(
+                    input_row,
+                    N,
+                    new_thr,
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_iscalars,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+                # tid==0 classifies the new count.
+                if tidx == 0:
+                    c_new = s_iscalars[0]
+                    t_new = s_thr[0]
+                    if c_new >= cutlass.Int32(kK) and c_new <= cutlass.Int32(kCC):
+                        s_iscalars[1] = cutlass.Int32(1)
+                    elif c_new > cutlass.Int32(kCC):
+                        s_thr[1] = t_new
+                        s_iscalars[2] = c_new
+                    else:
+                        s_thr[2] = t_new
+                        s_iscalars[3] = c_new
+                cute.arch.barrier()
+            it = it + cutlass.Int32(1)
 
         # ---- Post-loop fallback: if still not done, force threshold ----
         if tidx == 0:
@@ -625,36 +628,40 @@ class GvrTopKKernel:
                     s_thr[1] = s_thr[0]  # val_lo = threshold
             cute.arch.barrier()
 
-            # 10-iter shrink (Python-unrolled with runtime break-via-guard)
-            for rs in range(10):
-                if s_iscalars[0] > cutlass.Int32(kCC):
-                    if tidx == 0:
-                        lo = s_thr[1]
-                        hi = s_thr[2]
-                        mid = (lo + hi) * cutlass.Float32(0.5)
-                        if mid == lo:
-                            mid = hi
-                        s_thr[0] = mid
-                    cute.arch.barrier()
-                    new_thr = s_thr[0]
-                    self.block_count_ge(
-                        input_row,
-                        N,
-                        new_thr,
-                        smem_ptcnt,
-                        smem_wcnt,
-                        s_iscalars,
-                        tidx,
-                        warp_id,
-                        lane,
-                    )
-                    if tidx == 0:
-                        c_rs = s_iscalars[0]
-                        if c_rs > cutlass.Int32(kCC):
-                            s_thr[1] = s_thr[0]
-                        elif c_rs < cutlass.Int32(kK):
-                            s_thr[2] = s_thr[0]
-                    cute.arch.barrier()
+            # 10-iter retry-shrink. Runtime while with `cand_count > kCC` in the
+            # loop condition (matches CUDA `for(retry; retry<10 && cand>kCC;)`
+            # at heuristic_topk.cuh:769). Previous `for rs in range(10)` Python
+            # unroll ran 10 guard checks even after early convergence.
+            rs = cutlass.Int32(0)
+            while rs < cutlass.Int32(10) and s_iscalars[0] > cutlass.Int32(kCC):
+                if tidx == 0:
+                    lo = s_thr[1]
+                    hi = s_thr[2]
+                    mid = (lo + hi) * cutlass.Float32(0.5)
+                    if mid == lo:
+                        mid = hi
+                    s_thr[0] = mid
+                cute.arch.barrier()
+                new_thr = s_thr[0]
+                self.block_count_ge(
+                    input_row,
+                    N,
+                    new_thr,
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_iscalars,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+                if tidx == 0:
+                    c_rs = s_iscalars[0]
+                    if c_rs > cutlass.Int32(kCC):
+                        s_thr[1] = s_thr[0]
+                    elif c_rs < cutlass.Int32(kK):
+                        s_thr[2] = s_thr[0]
+                cute.arch.barrier()
+                rs = rs + cutlass.Int32(1)
 
         # ---- Warp prefix sum over smem_ptcnt ----
         # my_total_qual = per-thread count cached by last block_count_ge.
