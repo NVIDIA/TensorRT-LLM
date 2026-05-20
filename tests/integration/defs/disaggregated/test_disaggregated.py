@@ -2194,14 +2194,14 @@ def get_deepseek_v4_pro_disagg_env(llm_venv, gen_only: bool):
         8192,
         1024,
         1,
-        marks=pytest.mark.skip_less_device(8),
+        marks=pytest.mark.skip_less_mpi_world_size(8),
     ),
     pytest.param(
         "deepseek_v4_pro_dep16_gen_only",
         1024,
         1024,
         16384,
-        marks=pytest.mark.skip_less_device(16),
+        marks=pytest.mark.skip_less_mpi_world_size(16),
     ),
 ],
                          ids=lambda x: str(x))
@@ -2231,7 +2231,7 @@ def test_disaggregated_deepseek_v4_pro_gen_only(disaggregated_test_root,
 
 
 @pytest.mark.timeout(12600)
-@pytest.mark.skip_less_device(24)
+@pytest.mark.skip_less_mpi_world_size(24)
 @skip_pre_blackwell
 @pytest.mark.parametrize("concurrency", [256], ids=lambda x: f"conc{x}")
 def test_disaggregated_deepseek_v4_pro_ctx2dep4_gen1dep16(
