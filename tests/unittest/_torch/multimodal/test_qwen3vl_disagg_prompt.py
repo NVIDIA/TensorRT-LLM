@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_qwen2vl import (
-    Qwen2_5VLInputProcessorBase,
+from tensorrt_llm._torch.models.modeling_qwen3vl import (
+    Qwen3VLInputProcessorBase,
     _expand_prompt_token_ids_for_mm_handoff,
 )
 
@@ -22,18 +22,19 @@ class _FakeTokenizer:
         return SimpleNamespace(input_ids=torch.tensor([self.input_ids]))
 
 
-def test_qwen25vl_disagg_video_prompt_expands_video_placeholder():
+def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
     vision_start_token_id = 151652
     vision_end_token_id = 151653
     image_token_id = 151655
     video_token_id = 151656
     placeholder_id = 200000
-    processor = object.__new__(Qwen2_5VLInputProcessorBase)
+    processor = object.__new__(Qwen3VLInputProcessorBase)
     processor._config = SimpleNamespace(
         image_token_id=image_token_id,
         video_token_id=video_token_id,
         vision_start_token_id=vision_start_token_id,
         text_config=SimpleNamespace(hidden_size=16),
+        vision_config=SimpleNamespace(deepstack_visual_indexes=[]),
     )
     processor._tokenizer = _FakeTokenizer(
         [11, vision_start_token_id, video_token_id, vision_end_token_id, 12]

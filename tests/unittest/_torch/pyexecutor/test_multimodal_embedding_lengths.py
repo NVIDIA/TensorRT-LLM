@@ -6,14 +6,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequestState,
+    get_multimodal_embedding_lengths,
+)
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, MultimodalResult
 from tensorrt_llm.bindings.executor import FinishReason
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequestState
 
 
 @pytest.mark.parametrize(
-    "request,expected",
+    "req,expected",
     [
         (SimpleNamespace(multimodal_lengths=[3, 5]), None),
         (
@@ -36,12 +38,12 @@ from tensorrt_llm.bindings.internal.batch_manager import LlmRequestState
         ),
     ],
 )
-def test_multimodal_embedding_lengths_returns_top_level_metadata(request, expected):
-    assert get_multimodal_embedding_lengths(request) == expected
+def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
+    assert get_multimodal_embedding_lengths(req) == expected
 
 
 @pytest.mark.parametrize(
-    "request,exception,match",
+    "req,exception,match",
     [
         (
             SimpleNamespace(
@@ -95,9 +97,9 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(request, expect
         ),
     ],
 )
-def test_multimodal_embedding_lengths_rejects_invalid_metadata(request, exception, match):
+def test_multimodal_embedding_lengths_rejects_invalid_metadata(req, exception, match):
     with pytest.raises(exception, match=match):
-        get_multimodal_embedding_lengths(request)
+        get_multimodal_embedding_lengths(req)
 
 
 class _FakePyResult:
