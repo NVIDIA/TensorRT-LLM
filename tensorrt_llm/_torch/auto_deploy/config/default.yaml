@@ -191,16 +191,6 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
-  # NOTE: ``quantize_mxfp4_moe_trtllm_gen`` (legacy POST_LOAD_FUSION transform
-  # for gpt-oss) was removed. The TRT-LLM-Gen MXFP4 MoE path is now selected
-  # via ``quantize_mxfp4_moe.backend: trtllm`` (default on SM>=100). The
-  # transform pair is:
-  #   * ``quantize_mxfp4_moe`` (pattern_matcher): rewrites the MoE op to the
-  #     trtllm-gen variant + registers raw HF MXFP4 params + EP/TP sharding
-  #     hook.
-  #   * ``fuse_mxfp4_moe`` (post_load_fusion): runs the GPU-side kernel-layout
-  #     prep (H-axis pad + TMA shuffle + dtype convert + bias / tp_size) and
-  #     re-points the op args to the prepared params.
   fuse_mxfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
