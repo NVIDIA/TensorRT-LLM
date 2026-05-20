@@ -17,6 +17,7 @@ from typing import Optional, Union
 
 from transformers import AutoConfig
 
+from ..._utils import get_hf_rope_theta
 from ...layers import MoeConfig
 from ...mapping import Mapping
 from ..modeling_utils import PretrainedConfig, QuantConfig
@@ -129,7 +130,7 @@ class DeepSeekV2Config(PretrainedConfig):
                    max_position_embeddings=hf_config.max_position_embeddings,
                    hidden_act='swiglu',
                    norm_epsilon=hf_config.rms_norm_eps,
-                   rotary_base=hf_config.rope_theta,
+                   rotary_base=get_hf_rope_theta(hf_config, 10000.0),
                    rotary_scaling=rotary_scaling,
                    moe_inter_size=hf_config.moe_intermediate_size,
                    moe=moe_config,

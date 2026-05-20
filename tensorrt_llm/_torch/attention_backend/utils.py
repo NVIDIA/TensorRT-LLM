@@ -52,6 +52,7 @@ def create_attention(
     qk_rope_head_dim: Optional[int] = None,
     qk_nope_head_dim: Optional[int] = None,
     v_head_dim: Optional[int] = None,
+    rope_append: Optional[bool] = None,
     hidden_size: Optional[int] = None,
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
@@ -77,6 +78,7 @@ def create_attention(
             qk_rope_head_dim=qk_rope_head_dim,
             qk_nope_head_dim=qk_nope_head_dim,
             v_head_dim=v_head_dim,
+            rope_append=True if rope_append is None else rope_append,
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             hidden_size=hidden_size,
         )

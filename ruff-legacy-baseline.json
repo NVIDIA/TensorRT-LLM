@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5252,
-    "total_files": 485
+    "total_violations": 5231,
+    "total_files": 481
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -555,9 +555,6 @@
   "tensorrt_llm/_torch/models/modeling_qwen2vl.py": {
     "F811": 1
   },
-  "tensorrt_llm/_torch/models/modeling_qwen3_next.py": {
-    "F821": 1
-  },
   "tensorrt_llm/_torch/models/modeling_siglip.py": {
     "F811": 1
   },
@@ -598,9 +595,6 @@
   "tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py": {
     "E731": 1
   },
-  "tensorrt_llm/_torch/pyexecutor/_util.py": {
-    "F811": 1
-  },
   "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py": {
     "F821": 1
   },
@@ -614,7 +608,7 @@
   "tensorrt_llm/_torch/pyexecutor/py_executor.py": {
     "E712": 1,
     "E721": 1,
-    "F821": 2
+    "F821": 3
   },
   "tensorrt_llm/_torch/pyexecutor/resource_manager.py": {
     "F821": 2
@@ -897,12 +891,12 @@
     "D205": 4
   },
   "tensorrt_llm/llmapi/llm_args.py": {
-    "D200": 23,
+    "D200": 24,
     "D202": 1,
-    "D205": 11,
+    "D205": 10,
     "D208": 2,
     "D210": 7,
-    "D212": 37,
+    "D212": 36,
     "D300": 8,
     "D415": 2
   },
@@ -950,9 +944,9 @@
     "D202": 1,
     "D205": 5,
     "D209": 1,
-    "D210": 14,
+    "D210": 13,
     "D212": 5,
-    "D300": 8,
+    "D300": 7,
     "E722": 1
   },
   "tensorrt_llm/mapping.py": {
@@ -1518,10 +1512,6 @@
     "PLE0302": 1
   },
   "tensorrt_llm/scaffolding/task.py": {
-    "F811": 1,
-    "F821": 1
-  },
-  "tensorrt_llm/scaffolding/task_collection.py": {
     "F821": 1
   },
   "tensorrt_llm/scaffolding/worker.py": {
@@ -1544,7 +1534,6 @@
   },
   "tensorrt_llm/serve/openai_server.py": {
     "D205": 1,
-    "D212": 2,
     "F821": 2
   },
   "tensorrt_llm/serve/responses_utils.py": {
@@ -1645,10 +1634,6 @@
     "D403": 9,
     "D415": 11
   },
-  "tests/integration/defs/accuracy/accuracy_core.py": {
-    "D205": 1,
-    "D212": 1
-  },
   "tests/integration/defs/accuracy/test_disaggregated_serving.py": {
     "D212": 1,
     "F601": 1
@@ -1659,14 +1644,12 @@
   },
   "tests/integration/defs/accuracy/test_llm_api_autodeploy.py": {
     "D205": 1,
-    "D415": 1,
-    "F811": 2
+    "D415": 1
   },
   "tests/integration/defs/accuracy/test_llm_api_pytorch.py": {
     "D212": 1,
     "D300": 3,
-    "D415": 3,
-    "E402": 7
+    "D415": 3
   },
   "tests/integration/defs/common.py": {
     "D200": 1,
@@ -1911,8 +1894,7 @@
   },
   "tests/integration/defs/test_e2e.py": {
     "D200": 5,
-    "D205": 3,
-    "D415": 10,
+    "D415": 8,
     "F811": 2
   },
   "tests/integration/defs/test_list_parser.py": {
@@ -2034,7 +2016,7 @@
     "E731": 1
   },
   "tests/unittest/_torch/modeling/test_modeling_exaone4.py": {
-    "E402": 12
+    "E402": 11
   },
   "tests/unittest/api_stability/api_stability_core.py": {
     "D202": 1,
@@ -2108,7 +2090,8 @@
     "F811": 1
   },
   "tests/unittest/llmapi/test_executor.py": {
-    "D205": 1
+    "D205": 3,
+    "D209": 2
   },
   "tests/unittest/llmapi/test_llm.py": {
     "D200": 1,

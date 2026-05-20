@@ -11,7 +11,7 @@ import safetensors.torch
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
@@ -739,6 +739,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         _assert_resolution(height, width, is_two_stage=True)
         pipeline_start = time.time()
+        # Two-stage timing: stage 1 is reported as ``denoise``; stage 2
+        # (spatial upsample + refinement denoise + decode) folds into
+        # ``post_denoise``. Only the outer timer's numbers reach
+        # ``PipelineOutput``.
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
         height_s1 = height // 2
         width_s1 = width // 2
         logger.info(f"LTX2 two-stage: stage1 at {height_s1}x{width_s1}, final {height}x{width}")
@@ -746,6 +752,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 1: denoise at half resolution
         # ================================================================
+        timer.mark_denoise_start()
         out = super().forward(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -772,10 +779,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         video_latents = out.video  # (B, C, F_lat, H_lat_s1, W_lat_s1)
         audio_latents = out.audio  # (B, C, F_aud, M) or None
 
+        timer.mark_post_start()
+
         # Non-primary workers (rank != 0) receive None from
         # decode_latents and exit here.  Rank 0 continues with Stage 2.
         if video_latents is None:
-            return MediaOutput(video=None, audio=None)
+            timer.mark_end()
+            return timer.fill(PipelineOutput(video=None, audio=None, frame_rate=float(frame_rate)))
 
         # ================================================================
         # Spatial upsample: 2x via learned upsampler
@@ -856,7 +866,20 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         if output_type == "latent":
             if self.rank == 0:
                 logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-            return MediaOutput(video=video_latents, audio=audio_latents)
+            timer.mark_end()
+            return timer.fill(
+                PipelineOutput(
+                    video=video_latents,
+                    audio=audio_latents,
+                    frame_rate=float(frame_rate),
+                    audio_sample_rate=(
+                        int(self.audio_sampling_rate)
+                        if getattr(self, "audio_sampling_rate", None) is not None
+                        and audio_latents is not None
+                        else None
+                    ),
+                )
+            )
 
         logger.info("Decoding upsampled video (tiled)...")
         video_latents = video_latents.to(self.dtype)
@@ -878,7 +901,20 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         if self.rank == 0:
             logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-        return MediaOutput(video=video, audio=audio_out)
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                audio=audio_out,
+                frame_rate=float(frame_rate),
+                audio_sample_rate=(
+                    int(self.audio_sampling_rate)
+                    if getattr(self, "audio_sampling_rate", None) is not None
+                    and audio_out is not None
+                    else None
+                ),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Helpers

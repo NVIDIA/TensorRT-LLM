@@ -300,6 +300,7 @@ def create_py_executor(
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -314,6 +315,9 @@ def create_py_executor(
         tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
         profiling_stage_data: Optional dict for collecting per-stage memory
             profiling data during executor construction.
+        resource_governor_queue: Optional queue for resource governor
+            requests. When provided, it is installed before the worker thread
+            starts so all ranks observe the same collective sequence.
 
     Returns:
         A fully initialized PyExecutor instance.
@@ -442,9 +446,13 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        if hasattr(spec_config,
-                   'max_batch_size') and spec_config.max_batch_size is None:
-            spec_config.max_batch_size = max_batch_size
+        # Eagle3DecodingConfig._max_batch_size is internally managed: the
+        # dynamic-tree worker pre-allocates batch-indexed CUDA buffers sized
+        # by this value, and runtime indexes them with no bounds check. It
+        # MUST equal the global max_batch_size to avoid OOB; we populate it
+        # here as the single source of truth.
+        if hasattr(spec_config, '_max_batch_size'):
+            spec_config._max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
@@ -616,10 +624,10 @@ def create_py_executor(
 
     config = model_engine.model.model_config.pretrained_config
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
-            spec_config is not None or cache_transceiver_config is not None
+            cache_transceiver_config is not None
             and cache_transceiver_config.backend is not None):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when MTP or disagg is enabled"
+            "Disabling block reuse for MambaHybridCacheManager-based models when disagg is enabled"
         )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
@@ -913,6 +921,7 @@ def create_py_executor(
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
+            resource_governor_queue=resource_governor_queue,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
@@ -985,6 +994,7 @@ def create_py_executor(
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
+                resource_governor_queue=resource_governor_queue,
                 max_seq_len=max_seq_len,
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,

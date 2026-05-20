@@ -6,8 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
-from transformers.modeling_utils import get_parameter_device
 
+from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
@@ -17,6 +17,15 @@ from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import get_parameter_device
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
+
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -271,9 +280,9 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV
-        # Default fuse_qk_norm_rope=False: flashinfer QKRMSNorm is faster for WAN's
-        # full-dim norm. User can override via config.attention.fuse_qk_norm_rope=True.
+        # Self-attention with fused QKV.
+        # fuse_qk_norm_rope=True: use fused cross-head QK Norm + RoPE CUDA kernel
+        # to eliminate extra global memory round-trip between separate norm and RoPE.
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -281,7 +290,7 @@ class WanBlock(nn.Module):
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
             eps=eps,
-            fuse_qk_norm_rope=False,
+            fuse_qk_norm_rope=True,
             config=model_config,
             layer_idx=_layer_idx,
         )

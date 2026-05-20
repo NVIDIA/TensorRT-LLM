@@ -1,3 +1,17 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import os
 import time
@@ -280,6 +294,10 @@ class Router(ABC):
     @property
     def servers(self) -> List[str]:
         return self._servers
+
+    @property
+    def num_prepared_servers(self) -> int:
+        return len(self._prepared_ready_servers)
 
     @staticmethod
     def _ensure_url(server: str) -> str:
@@ -677,8 +695,15 @@ class BlockHashMixin:
                 self._tokenizers[model] = load_custom_tokenizer(
                     self._custom_tokenizer, model)
             else:
-                self._tokenizers[model] = AutoTokenizer.from_pretrained(
+                from tensorrt_llm.tokenizer import \
+                    maybe_fix_byte_level_tokenizer
+                tokenizer = AutoTokenizer.from_pretrained(
                     model, trust_remote_code=True)
+                # Work around Transformers 5.x LlamaTokenizer overriding
+                # tokenizer.json's ByteLevel pre-tokenizer with Metaspace,
+                # which silently strips spaces from prompts (see tokenizer.py).
+                self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
+                    tokenizer, model, trust_remote_code=True)
         return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
@@ -694,6 +719,7 @@ class BlockHashMixin:
                 ],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
+                return_dict=False,
             )
             # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
             # string from apply_chat_template even with tokenize=True.
@@ -737,6 +763,20 @@ class BlockHashMixin:
                                      None if t == 0 else hash_list[-1]))
             block_hashes.append(hash_list)
         return block_hashes
+
+    def _tokenize_and_compute_block_hashes(
+            self,
+            request: OpenAIRequest) -> tuple[list[list[int]], list[list[int]]]:
+        """Synchronous tokenize + block-hash, combined for thread offload.
+
+        Factored into one method so ``get_next_server`` can offload the whole
+        CPU-bound step via ``asyncio.to_thread`` in a single call, keeping
+        the orchestrator's asyncio event loop free to dispatch other
+        requests in parallel.
+        """
+        token_lists = self._tokenize(request)
+        block_hashes = self._compute_block_hashes(token_lists)
+        return token_lists, block_hashes
 
     @staticmethod
     def _text_to_int_sequences(texts: list[str]) -> list[list[int]]:
@@ -782,32 +822,49 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ]
-        token_lists = self._tokenize(request)
-        block_hashes = self._compute_block_hashes(token_lists)
-        padded_tokens = sum(
-            len(hash_list)
-            for hash_list in block_hashes) * self._tokens_per_block
-        # select the server by (KV match - load)
-        # TODO: more options
-        workloads = [
-            state.num_active_requests()
-            for state in self._server_state.values()
-        ]
-        scores = []
+        block_hashes = []
+        token_lists = []
         matches = []
-        for i in range(len(servers)):
-            server = servers[i]
-            # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            matches.append(
-                await self._server_state[server].matched_tokens(block_hashes))
-            score = matches[-1] / padded_tokens - workloads[
-                i] / self._max_batch_size
-            scores.append(score)
-        max_score = max(scores)
-        tied = [i for i, s in enumerate(scores) if s == max_score]
-        winner = tied[self._rr_counter % len(tied)]
-        self._rr_counter += 1
-        server = servers[winner]
+        if len(servers) == 0:
+            raise RuntimeError(
+                f"No available servers after excluding {exclude_server}")
+        elif len(servers) == 1:
+            server = servers[0]
+        else:
+            # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
+            # chat request with a Rust-backed tokenizer). Running it directly
+            # inside the async handler blocks the orchestrator's event loop and
+            # serializes all concurrent requests through it; with HuggingFace
+            # tokenizers releasing the GIL, offloading to a thread lets multiple
+            # tokenize calls run in parallel and frees the event loop to
+            # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
+            token_lists, block_hashes = await asyncio.to_thread(
+                self._tokenize_and_compute_block_hashes, request)
+            padded_tokens = sum(
+                len(hash_list)
+                for hash_list in block_hashes) * self._tokens_per_block
+            # select the server by (KV match - load)
+            # TODO: more options
+            workloads = [
+                state.num_active_requests()
+                for state in self._server_state.values()
+            ]
+            scores = []
+            matches = []
+            for i in range(len(servers)):
+                server = servers[i]
+                # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
+                matches.append(
+                    await
+                    self._server_state[server].matched_tokens(block_hashes))
+                score = matches[-1] / padded_tokens - workloads[
+                    i] / self._max_batch_size
+                scores.append(score)
+            max_score = max(scores)
+            tied = [i for i, s in enumerate(scores) if s == max_score]
+            winner = tied[self._rr_counter % len(tied)]
+            self._rr_counter += 1
+            server = servers[winner]
         async with self._lock:
             await self._register_request(server, request)
         return server, {

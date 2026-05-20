@@ -72,6 +72,8 @@ struct FmhaOptions : public KernelConfigBase {
   int mMinSeqLenQ{INT_MAX};
   // The minimum sequence length (used to generate variable Kv sequence length).
   int mMinSeqLenKv{INT_MAX};
+  // The minimum sparse MLA topK length.
+  int mMinSparseMlaTopK{1};
   // Benchmark steps.
   int mNumBenchmarkSteps{1};
   // The number of Ctas per sequenceKv from the arguments.
@@ -83,6 +85,10 @@ struct FmhaOptions : public KernelConfigBase {
   int mNumPagesInMemPool{0};
   // The number of causal-mask spec-decoding tokens (it is fixed in the batch).
   int mNumSpecDecodingTokens{0};
+  // For tree-based custom spec-decoding only: equals max_total_draft_tokens + 1,
+  // fixed at config time. When set with mIsCustomSpecDecodingGen, FmhaAutoTuner
+  // uses it as a deterministic upper bound for kernel selection.
+  int mSpecDecodingTargetMaxGenLen{0};
   // Warmup steps.
   int mNumWarmUpSteps{0};
   // The maximum number of waves for the multiCtasKvMode.
@@ -132,11 +138,13 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mMinFirstSparseMaskOffsetKv);
     TO_JSON(mMinSeqLenQ);
     TO_JSON(mMinSeqLenKv);
+    TO_JSON(mMinSparseMlaTopK);
     TO_JSON(mNumBenchmarkSteps);
     TO_JSON(mNumCtasPerSeqKv);
     TO_JSON(mNumLoopItersForPrint);
     TO_JSON(mNumPagesInMemPool);
     TO_JSON(mNumSpecDecodingTokens);
+    TO_JSON(mSpecDecodingTargetMaxGenLen);
     TO_JSON(mNumWarmUpSteps);
     TO_JSON(mMaxNumWavesForCtasKvMode);
     TO_JSON(mOutputScale);
@@ -155,6 +163,8 @@ struct FmhaOptions : public KernelConfigBase {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct FmhaOptionsFromArgs {
+  // Attention window size.
+  bool mIsAttentionWindowSizeSet{false};
   // Relative error tolerance.
   bool mIsAtolSet{false};
   // The head dimension per stage for Kv.
@@ -234,6 +244,9 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   TLLM_CHECK_ERROR(optionsFromArgs.mIsNumInstsQSet == optionsFromArgs.mIsNumInstsKvSet,
                    "The number of instances for Q and Kv must be set together");
 
+  TLLM_CHECK_ERROR(options.mNumStagesKv >= 0, "numStagesKv must be >= 0");
+  TLLM_CHECK_ERROR(options.mNumStagesQ >= 0, "numStagesQ must be >= 0");
+
   // Do we swap A/B for the generation kernel.
   bool const swapsMmaAb{isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType)};
   // Check if tileSizeQ is valid.
@@ -258,8 +271,9 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Check if head dim is valid.
   auto headDimQk{options.mHeadDimQk}, headDimV{options.mHeadDimV};
   if (swapsMmaAb && headDimQk == headDimV) {
-    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 128 || headDimQk == 256 || headDimQk == 512,
-                     "The headDim must be 64, 128, 256 or 512");
+    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 80 || headDimQk == 128 || headDimQk == 256 ||
+                       headDimQk == 512,
+                     "The headDim must be 64, 80, 128, 256 or 512");
   }
   // MLA kernels.
   if (headDimQk != headDimV) {
@@ -439,6 +453,16 @@ inline void checkFmhaOptions(FmhaOptions const& options,
       options.mSparseAttnTopK % 4 == 0,
       "SparseAttnTopK must be a multiple of 4 in order to use 16bytes cpAsync loads");
   }
+  if (options.mHasSlidingWindowKvPool) {
+    TLLM_CHECK_ERROR(
+      supportsVarSparseMlaTopKLens(options),
+      "The sliding-window KV pool is only supported by dynamic-token sparse MLA kernels.");
+    TLLM_CHECK_ERROR(options.mSingleTokenQPerCta,
+                     "mSingleTokenQPerCta must be true when sliding-window KV pool is enabled.");
+    TLLM_CHECK_ERROR(options.mAttentionWindowSize == options.mTileSizeKv,
+                     "attentionWindowSize must equal tileSizeKv when sliding-window KV pool is "
+                     "enabled.");
+  }
 
   // Always enable skipsSoftmaxWhenPossible for outputSkipSoftmaxStats.
   if (options.mOutputSkipSoftmaxStats) {
@@ -464,8 +488,6 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(options.mDtypeKv != tg::Dtype::E2m1,
-                     "mGroupsTokensHeadsQ doesn't work with E2m1 dtypeKv.");
     TLLM_CHECK_ERROR(!options.mIsMlaGen,
                      "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
   }

@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -254,7 +258,7 @@ class Starcoder2Model(PreTrainedModel):
         self.rotary_emb = Starcoder2RotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=config.rope_parameters["rope_theta"],
         )
 
         self.post_init()
@@ -302,7 +306,7 @@ class Starcoder2ForCausalLM(PreTrainedModel, GenerationMixin):
     base_model_prefix = "model"
     _no_split_modules = ["Starcoder2DecoderLayer"]
     supports_gradient_checkpointing = False
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Starcoder2Config, **kwargs):
         super().__init__(config)

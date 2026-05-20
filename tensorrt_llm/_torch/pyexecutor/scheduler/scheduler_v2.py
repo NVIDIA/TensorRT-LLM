@@ -149,9 +149,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.draft_kv_cache_manager = draft_kv_cache_manager
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
-                "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, got %s, setting to MAX_UTILIZATION",
-                scheduler_policy,
+                "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
+                f"got {scheduler_policy.name}, setting to MAX_UTILIZATION"
             )
+            scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
         self.policy = scheduler_policy
         self.peft_cache_manager = peft_cache_manager
 
@@ -160,12 +161,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.chunk_unit_size = 0
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
+        draft_mgr_name = (
+            type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
+        )
         logger.info(
-            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, max_batch_size=%s, draft_mgr=%s",
-            self.tokens_per_block,
-            max_num_tokens,
-            max_batch_size,
-            type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None",
+            f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
+            f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
+            f"draft_mgr={draft_mgr_name}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -388,7 +390,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
         )
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for encoder request %s", req.py_request_id)
+            logger.debug(f"prepare_context failed for encoder request {req.py_request_id}")
             return ScheduleAction.STOP, 0
         if not self.kv_cache_manager.resize_context(req, req_tokens):
             return ScheduleAction.STOP, 0
@@ -416,7 +418,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare first so block reuse updates context_remaining_length
         # before budget check.
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for context request %s", req.py_request_id)
+            logger.debug(f"prepare_context failed for context request {req.py_request_id}")
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -456,7 +458,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self.kv_cache_manager.prepare_context(req):
-            logger.debug("prepare_context failed for chunked context request %s", req.py_request_id)
+            logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -482,6 +484,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
+        chunk_size = self._align_chunk_to_mm_block(
+            req, chunk_size, remaining_budget, context_remaining
+        )
+        # Alignment returns 0 when neither snap-up nor snap-down can preserve
+        # bidirectional MM attention this iteration — defer the request rather
+        # than schedule a chunk that would corrupt attention. Next iteration
+        # gets a fresh budget; under steady-state load this resolves quickly.
+        if chunk_size <= 0:
+            return ScheduleAction.SKIP, 0, False
+
         req.context_chunk_size = chunk_size
 
         # Draft tokens only matter for last chunk (budget + resize)
@@ -498,6 +510,169 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _align_chunk_to_mm_block(
+        self,
+        req: LlmRequest,
+        chunk_size: int,
+        remaining_budget: Optional[int],
+        context_remaining: int,
+    ) -> int:
+        """Adjust *chunk_size* so a boundary never lands inside a multimodal
+        soft-token run that requires intact bidirectional attention.
+
+        Returns the adjusted chunk size, or ``0`` to signal that the caller
+        should SKIP this request this iteration (defer to next iteration with
+        a fresh budget).
+
+        Two-pronged strategy:
+          1. snap-UP: extend the chunk to swallow the rest of the block
+             (preferred — block lands wholly in this iteration).
+          2. snap-DOWN fallback: if budget / max_context_length / context_remaining
+             can't absorb snap-up, shrink the chunk to end *before* the block
+             starts; the block lands wholly in the next iteration.
+
+        Last-resort defer (return 0): if the block starts at the chunk's
+        left boundary (snap-down would zero the chunk anyway), defer the
+        request. We never let a bidirectional MM block straddle a chunk
+        boundary — it would silently break attention correctness.
+
+        Raises ``ValueError`` if the block itself exceeds max_context_length —
+        no chunk size can fit it, deferring would livelock; surface the
+        config error loudly rather than spin silently.
+
+        Gated on ``mm_bidirectional_blocks`` written by the input processor —
+        causal-MM models (Llava, Qwen-VL) skip this entirely.
+        """
+        # `getattr(..., None) or {}` is not enough: on a Mock req the attribute
+        # exists as a Mock (truthy) and `.get` returns another Mock (also
+        # truthy). Require an actual dict — that's also what the input
+        # processor writes in inputs/registry.py.
+        mm_data = getattr(req, "py_multimodal_data", None)
+        if not isinstance(mm_data, dict):
+            return chunk_size
+        if not mm_data.get("mm_bidirectional_blocks", False):
+            return chunk_size
+        cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+        if cumsum is None:
+            return chunk_size
+
+        unit_size = self.chunk_unit_size
+        lo = req.context_current_position
+        end_abs = lo + chunk_size
+        prompt_len = lo + context_remaining
+        if end_abs >= prompt_len or end_abs <= 0:
+            return chunk_size
+
+        # Cumsum is INCLUSIVE [P] (length prompt_len) with
+        # cumsum[i] = sum(mask[0..i]). So mask[i] = cumsum[i]-cumsum[i-1] for
+        # i>=1, and mask[0] = cumsum[0]. Aligned with inputs/registry.py
+        # (``embed_mask.cumsum(0)``) and MultimodalRuntimeData.
+        #
+        # Three-cumsum boundary-in-block detection: positions end_abs-1 and
+        # end_abs are both MM iff mask[end_abs-1]==1 AND mask[end_abs]==1.
+        # Gemma4's HF processor wraps every soft-token run with non-MM
+        # specials (boi/eoi/boa/eoa, embed_mask=0), so two consecutive
+        # embed_mask=1 positions always belong to the same block.
+        cs_prev = int(cumsum[end_abs - 1].item())
+        cs_cur = int(cumsum[end_abs].item())
+        if (cs_cur - cs_prev) != 1:
+            return chunk_size  # mask[end_abs] != 1
+        if end_abs == 1:
+            if cs_prev != 1:
+                return chunk_size  # mask[0] != 1
+        else:
+            if (cs_prev - int(cumsum[end_abs - 2].item())) != 1:
+                return chunk_size  # mask[end_abs - 1] != 1
+
+        # --- compute block extent (forward + backward walks from end_abs) ---
+        # Forward walk: advance while position block_end_abs is MM
+        # (mask[block_end_abs] == cumsum[block_end_abs]-cumsum[block_end_abs-1]).
+        # Final block_end_abs is the first non-MM position (exclusive end),
+        # or prompt_len if the block extends through EOS.
+        # Backward walk uses ``> 0`` (not ``> lo``) so block_size below
+        # reflects the TRUE block size — important for the impossibility
+        # check, which must not be undercounted if a prior iteration somehow
+        # advanced into a block (would otherwise mask a real config error).
+        block_end_abs = end_abs
+        while block_end_abs < prompt_len:
+            if (int(cumsum[block_end_abs].item()) - int(cumsum[block_end_abs - 1].item())) != 1:
+                break
+            block_end_abs += 1
+
+        # Backward walk: decrement while position (block_start_abs - 1) is MM.
+        # Final block_start_abs is the first MM position (inclusive start),
+        # or 0 if the block extends to BOS.
+        block_start_abs = end_abs
+        while block_start_abs > 1:
+            if (
+                int(cumsum[block_start_abs - 1].item()) - int(cumsum[block_start_abs - 2].item())
+            ) != 1:
+                break
+            block_start_abs -= 1
+        # Position 0: mask[0] == cumsum[0]; no cumsum[-1] sentinel.
+        if block_start_abs == 1 and int(cumsum[0].item()) == 1:
+            block_start_abs = 0
+
+        # --- impossibility check ---
+        # If the block itself exceeds max_context_length, no chunk size can
+        # ever fit it. Deferring would livelock the request. Raise a clear
+        # config error rather than letting the scheduler thrash silently.
+        block_size = block_end_abs - block_start_abs
+        if self.max_context_length is not None and block_size > self.max_context_length:
+            raise ValueError(
+                f"req {req.py_request_id}: bidirectional multimodal block of "
+                f"{block_size} tokens exceeds max_context_length="
+                f"{self.max_context_length}. The block must fit in a single "
+                f"chunk to preserve bidirectional attention; deferring would "
+                f"livelock. Increase max_num_tokens to at least {block_size}."
+            )
+
+        # --- snap-up target ---
+        # Round up to unit_size so setPrepopulatedPromptLen's downstream
+        # floor() doesn't clip the extension back into the block.
+        if unit_size > 0 and block_end_abs < prompt_len:
+            up_block_end = ((block_end_abs + unit_size - 1) // unit_size) * unit_size
+        else:
+            up_block_end = block_end_abs
+        up_block_end = min(up_block_end, prompt_len)
+        up_chunk_size = up_block_end - lo
+
+        up_fits_budget = remaining_budget is None or up_chunk_size <= remaining_budget
+        up_fits_max_ctx = (
+            self.max_context_length is None or up_chunk_size <= self.max_context_length
+        )
+        up_fits_remaining = up_chunk_size <= context_remaining
+
+        if up_fits_budget and up_fits_max_ctx and up_fits_remaining and up_chunk_size > chunk_size:
+            return up_chunk_size
+
+        # --- snap-down fallback ---
+        # Round down to unit_size so the next chunk starts on a kv-block boundary.
+        if unit_size > 0:
+            down_block_start = (block_start_abs // unit_size) * unit_size
+        else:
+            down_block_start = block_start_abs
+
+        if down_block_start <= lo:
+            logger.warning(
+                "req %s: MM block at chunk left edge "
+                "(lo=%s, block=[%s, %s)); snap-up does not fit "
+                "(up_size=%s, budget=%s, max_ctx=%s, ctx_rem=%s) and "
+                "snap-down would zero the chunk. Deferring request to next "
+                "iteration to preserve bidirectional MM attention.",
+                req.py_request_id,
+                lo,
+                block_start_abs,
+                block_end_abs,
+                up_chunk_size,
+                remaining_budget,
+                self.max_context_length,
+                context_remaining,
+            )
+            return 0
+
+        return down_block_start - lo
 
     def _try_schedule_generation(
         self,
@@ -541,9 +716,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # that frees no pages.
         if self.kv_cache_manager.is_request_active(req.py_request_id):
             logger.debug(
-                "[V2Scheduler] Self-evicting request %s (state=%s) to free GPU pages",
-                req.py_request_id,
-                req.state,
+                f"[V2Scheduler] Self-evicting request {req.py_request_id} "
+                f"(state={req.state.name}) to free GPU pages"
             )
             self._suspend_request(req)
             evicted.append(req)
@@ -570,9 +744,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         remains "active" on device, which could cause ensure_batch to
         fail if it needs to load a different adapter into a full cache.
         """
+        self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)
+
+    def _clear_request_runtime_state(self, req: LlmRequest) -> None:
+        req.py_batch_idx = None
 
     def _is_evictable(self, req: LlmRequest) -> bool:
         """A started request whose KV cache is still active on GPU.
@@ -611,10 +789,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             victim = requests_list[victim_idx]
             logger.debug(
-                "[V2Scheduler] Evicting request %s (state=%s) to free pages for request %s",
-                victim.py_request_id,
-                victim.state,
-                req.py_request_id,
+                f"[V2Scheduler] Evicting request {victim.py_request_id} "
+                f"(state={victim.state.name}) to free pages for request {req.py_request_id}"
             )
             self._suspend_request(victim)
             evicted.append(victim)
