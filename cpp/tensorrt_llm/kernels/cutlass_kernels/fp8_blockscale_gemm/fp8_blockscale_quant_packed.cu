@@ -63,6 +63,11 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
 
     if (m_idx >= m)
     {
+        // Zero the TMA-aligned M tail without a separate cudaMemset from the host wrapper.
+        if (m_idx < scale_leading_dim_uint32 && lane_id == 0)
+        {
+            packed_scale_output[static_cast<int64_t>(packed_sf_k_idx) * scale_leading_dim_uint32 + m_idx] = 0;
+        }
         return;
     }
 
@@ -184,7 +189,7 @@ void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32
 {
     constexpr int kWarpsPerBlock = 4;
     int const num_packed_sf_k = (((k + 127) / 128) + 3) / 4;
-    int const m_blocks = (m + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    int const m_blocks = (scale_leading_dim_uint32 + kWarpsPerBlock - 1) / kWarpsPerBlock;
     dim3 const grid(num_packed_sf_k, m_blocks, 1);
     dim3 const block(kWarpsPerBlock * 32, 1, 1);
     fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock>

@@ -187,9 +187,6 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     // Allocate physical buffer [num_packed_sf_k, m_aligned] (K-major in memory).
     at::Tensor packedBuf = at::detail::empty_cuda(
         {num_packed_sf_k, m_aligned}, at::ScalarType::Int, self.device(), /* stride */ std::nullopt);
-    // Zero-fill so the [m, m_aligned) tail and out-of-range scale slots are deterministic.
-    packedBuf.zero_();
-
     auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
 
     tensorrt_llm::kernels::fp8_blockscale_gemm::launch_fp8_quantize_1x128_packed_bf16_e4m3(
