@@ -17,6 +17,7 @@ l0_b200_ds:
   # ------------- DeepSeek-V4 unit tests (single B200) ---------------
   # Sparse-attention kernels + cache manager + compressor + indices_transform
   # + o_proj. Only path to V4 sparse-attention kernel coverage in CI.
+  - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_indices_transform.py TIMEOUT (60)
