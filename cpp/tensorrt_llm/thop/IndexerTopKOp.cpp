@@ -123,35 +123,28 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
         if (blocks_per_row > 1)
         {
-            // Prefer caller-owned scratch with stable address (CUDA Graph safe;
-            // matches the heuristic_scratch convention noted above). Falls
-            // back to per-call th::empty when the caller did not supply one
-            // (back-compat for bench scripts / older callers — exposes the
-            // CUDA-Graph stale-pointer hazard at high CONC, see SKILL G4).
+            // Require caller-owned scratch with stable address (CUDA Graph safe;
+            // matches the heuristic_scratch convention noted above). All
+            // in-tree callers go through dsa.py's DSAtrtllmAttentionMetadata
+            // which always pre-allocates these buffers.
             int64_t const needed_elts = static_cast<int64_t>(num_rows) * blocks_per_row * index_topk;
-            if (radix_aux_indices.has_value() && radix_aux_logits.has_value())
-            {
-                auto const& ai = radix_aux_indices.value();
-                auto const& al = radix_aux_logits.value();
-                TORCH_CHECK(ai.is_cuda() && al.is_cuda(), "radix_aux_{indices,logits} must be CUDA tensors");
-                TORCH_CHECK(ai.device() == logits.device() && al.device() == logits.device(),
-                    "radix_aux_{indices,logits} must be on the same device as logits");
-                TORCH_CHECK(ai.is_contiguous() && al.is_contiguous(), "radix_aux_{indices,logits} must be contiguous");
-                TORCH_CHECK(ai.scalar_type() == th::kInt32, "radix_aux_indices must be int32");
-                TORCH_CHECK(al.scalar_type() == th::kFloat32, "radix_aux_logits must be float32");
-                TORCH_CHECK(ai.numel() >= needed_elts && al.numel() >= needed_elts,
-                    "radix_aux_{indices,logits} must hold at least num_rows*blocks_per_row*index_topk elements (got ",
-                    ai.numel(), " / ", al.numel(), ", need ", needed_elts, ")");
-                aux_indices = ai;
-                aux_logits = al;
-            }
-            else
-            {
-                aux_indices = th::empty({num_rows, blocks_per_row, index_topk},
-                    th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-                aux_logits = th::empty({num_rows, blocks_per_row, index_topk},
-                    th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
-            }
+            TORCH_CHECK(radix_aux_indices.has_value() && radix_aux_logits.has_value(),
+                "radix_aux_{indices,logits} must be pre-allocated by the caller when blocks_per_row > 1 "
+                "(got blocks_per_row=",
+                blocks_per_row, "). Required for CUDA Graph safety.");
+            auto const& ai = radix_aux_indices.value();
+            auto const& al = radix_aux_logits.value();
+            TORCH_CHECK(ai.is_cuda() && al.is_cuda(), "radix_aux_{indices,logits} must be CUDA tensors");
+            TORCH_CHECK(ai.device() == logits.device() && al.device() == logits.device(),
+                "radix_aux_{indices,logits} must be on the same device as logits");
+            TORCH_CHECK(ai.is_contiguous() && al.is_contiguous(), "radix_aux_{indices,logits} must be contiguous");
+            TORCH_CHECK(ai.scalar_type() == th::kInt32, "radix_aux_indices must be int32");
+            TORCH_CHECK(al.scalar_type() == th::kFloat32, "radix_aux_logits must be float32");
+            TORCH_CHECK(ai.numel() >= needed_elts && al.numel() >= needed_elts,
+                "radix_aux_{indices,logits} must hold at least num_rows*blocks_per_row*index_topk elements (got ",
+                ai.numel(), " / ", al.numel(), ", need ", needed_elts, ")");
+            aux_indices = ai;
+            aux_logits = al;
         }
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
             aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
