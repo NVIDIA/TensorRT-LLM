@@ -775,8 +775,6 @@ class _KVCache:
                     slot = slots[lc].pop()
                     self._scratch_slots[lc].append(ScratchSlotLock(slot, self, lc, skip_wait=True))
 
-            normal_slots = tuple(chain.from_iterable(slots))
-            new_slot_ready_events = tuple(slot.ready_event for slot in normal_slots)
             for beam_indices in self._base_page_indices:
                 for indices in beam_indices:
                     if type(indices) is array.array:
@@ -819,9 +817,7 @@ class _KVCache:
                             if stale_beg <= ordinal < stale_end:
                                 continue
                         slot = slots[lc].pop()
-                        # Slot ready events are already handled above: either
-                        # synchronized for host-visible page-index buffers, or
-                        # enqueued as stream waits for internal buffers.
+                        # We have already waited for ready_event of the slots.
                         block[beam_index][lc] = UncommittedPage(
                             self, ordinal, lc, GPU_LEVEL, slot, beam_index
                         ).lock(self, beam_index, ordinal, lc, skip_wait=True)
