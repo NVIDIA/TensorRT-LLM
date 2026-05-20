@@ -204,7 +204,12 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             fp8_a_weight = fp8_a_weight.reshape(n_local_groups, o_lora_rank, dim)
             mla.o_a_proj.data = fp8_a_weight
             mla.o_a_proj_scale.data = fp8_a_scale
-            mla.o_a_proj_dequant.data = o_a_proj_bf16
+            # mla.o_a_proj_dequant is None for DSv4 on SM100: PR #14254
+            # decouples the FP8-native o_a_proj path from
+            # use_cute_dsl_blockscaling_bmm, so DSv4 unconditionally uses the
+            # fused inv-RoPE + FP8 quant + cute-dsl BMM chain and never needs
+            # the bf16-dequant fallback buffer. The reference path below uses
+            # o_a_proj_bf16 directly.
 
         # Initialize o_b_proj weights
         if dtype_str == "bf16":
