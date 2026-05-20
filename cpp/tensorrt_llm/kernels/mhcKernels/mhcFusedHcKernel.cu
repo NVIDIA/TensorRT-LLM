@@ -33,6 +33,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -540,8 +541,9 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     FmaKsplitFn fn = pickFhcFma(tile_n, num_k_splits);
     dim3 const grid(static_cast<unsigned>(M), static_cast<unsigned>(N / tile_n), static_cast<unsigned>(num_k_splits));
     dim3 const block(256);
-    fn<<<grid, block, 0, stream>>>(residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, y_acc_workspace,
-        r_acc_workspace, hidden_size, N, K, residual_cur);
+    tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_ksplit", fn, grid, block, 0, stream,
+        residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, y_acc_workspace, r_acc_workspace, hidden_size, N, K,
+        residual_cur);
 
     // ---- Step 2: big-fuse postlogue (reduces ks splits internally) ----
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
@@ -817,10 +819,10 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     dim3 const grid(
         static_cast<unsigned>(m_batches), static_cast<unsigned>(N / tile_n), static_cast<unsigned>(num_k_splits));
     dim3 const block(256);
-    fn<<<grid, block, 0, stream>>>(residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale, hc_base,
-        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace,
-        done_counter_workspace, M, K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat, norm_weight, norm_eps);
+    tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_allinone", fn, grid, block, 0, stream,
+        residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale, hc_base, residual_cur, post_mix_cur,
+        comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, done_counter_workspace, M, K, hidden_size,
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps);
 }
 
 } // namespace kernels::mhc
