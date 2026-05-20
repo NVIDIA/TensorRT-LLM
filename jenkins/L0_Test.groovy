@@ -3886,7 +3886,9 @@ def launchTestJobs(pipeline, testFilter)
 
     x86SlurmTestConfigs = [
         // DGX A100 tests on draco-oci-iad cluster
-        "DGX_A100-PyTorch-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
+        "DGX_A100-PyTorch-1": ["auto:dgx-a100-x1", "l0_a100", 1, 3],
+		"DGX_A100-PyTorch-2": ["auto:dgx-a100-x1", "l0_a100", 2, 3],
+		"DGX_A100-PyTorch-3": ["auto:dgx-a100-x1", "l0_a100", 3, 3],
         "DGX_A100-Triton-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 2],
         "DGX_A100-Triton-Post-Merge-2": ["auto:dgx-a100-x1", "l0_a100", 2, 2],
         "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
