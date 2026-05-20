@@ -150,7 +150,14 @@ class MiniMaxRMSNorm(nn.Module):
         # consistent with how duplicate_kv_weight handles k_proj/v_proj.
         full_size = self.mapping.tp_size * self.hidden_size
         if src.shape[0] < full_size and self.head_dim is not None:
+            assert src.shape[0] % self.head_dim == 0, (
+                f"checkpoint weight size {src.shape[0]} is not divisible by head_dim {self.head_dim}"
+            )
             num_total_heads = src.shape[0] // self.head_dim
+            assert self.mapping.tp_size % num_total_heads == 0, (
+                f"tp_size {self.mapping.tp_size} must be divisible by num_total_heads {num_total_heads} "
+                f"for head-level weight replication"
+            )
             reps = self.mapping.tp_size // num_total_heads
             src = (
                 src.reshape(num_total_heads, self.head_dim)
