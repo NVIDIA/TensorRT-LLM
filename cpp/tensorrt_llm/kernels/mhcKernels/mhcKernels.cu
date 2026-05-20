@@ -33,11 +33,11 @@ namespace kernels::mhc
 //    NUM_SPLITS:  split-K reduction (1 = direct, >1 = sum across splits)
 //    BLOCK_SIZE:  threads per CTA (multiple of 32, >= 64)
 //
-//  Phase 1a (warp 0, lanes 0-3): RMS norm + sigmoid → s_pre_mix, post_mix
-//  ── __syncthreads ──
-//  Phase 1b (warp 0, lanes 0-3) ‖ Phase 2 (remaining warps) — overlapped
+//  Phase 1a (lanes 0-3 of every warp): RMS norm + sigmoid → pre_mix
+//    Warp 0 also produces post_mix and comb_mix logits.
+//  Phase 1b (warp 0, lanes 0-3) ‖ Phase 2 (all warps) — overlapped
 //    1b: parallel Sinkhorn (4 lanes, __shfl_xor col normalize) → comb_mix
-//     2: stream residual × pre_mix → layer_input
+//     2: stream residual × local pre_mix → layer_input
 // ===================================================================
 
 template <int NUM_SPLITS, int BLOCK_SIZE, bool kFuseNorm = false>
@@ -56,46 +56,64 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     constexpr int HC_MULT3 = HC_MULT * (2 + HC_MULT); // 24 = pre(4) + post(4) + comb(16)
     constexpr int WARP_SIZE = 32;
     constexpr int BF16_VEC = 8;                       // bf16 elements per uint4 load
+    constexpr unsigned FULL_WARP_MASK = 0xffffffffu;
 
     int const token = blockIdx.x;
     int const tid = threadIdx.x;
     int const warp_id = tid / WARP_SIZE;
     int const lane = tid % WARP_SIZE;
 
-    __shared__ float s_pre_mix[HC_MULT];
-
+    float pre_mix_local = 0.0f;
     float cm[HC_MULT];
 
-    // ---- Phase 1a (warp 0, lanes 0..3): split-K reduce → RMS norm → sigmoid ----
-    // Each lane handles one of the 4 hc_mult slots.
-    // Produces: s_pre_mix[4] (shared), post_mix[4] (global), cm[4×4] (registers).
-    if (warp_id == 0 && lane < HC_MULT)
+    // ---- Phase 1a: split-K reduce → RMS norm → sigmoid ----
+    // Lanes 0..3 in every warp compute pre_mix locally so all warps can stream
+    // layer_input without waiting on a CTA-wide shared-memory handoff. Warp 0
+    // additionally computes the token's post_mix and comb_mix logits.
+    if (lane < HC_MULT)
     {
         float r_val;
-        float y_local[HC_MULT3];
+        float y_pre;
+        float y_post = 0.0f;
+        float y_comb[HC_MULT];
 
         if constexpr (NUM_SPLITS == 1)
         {
             r_val = r_acc[token];
             float const* y_row = y_acc + token * HC_MULT3;
+            y_pre = y_row[lane];
+            if (warp_id == 0)
+            {
+                y_post = y_row[HC_MULT + lane];
 #pragma unroll
-            for (int c = 0; c < HC_MULT3; c++)
-                y_local[c] = y_row[c];
+                for (int k = 0; k < HC_MULT; k++)
+                    y_comb[k] = y_row[2 * HC_MULT + lane * HC_MULT + k];
+            }
         }
         else
         {
             // Reduce across split-K partials
             r_val = 0.0f;
+            y_pre = 0.0f;
+            if (warp_id == 0)
+            {
+                y_post = 0.0f;
 #pragma unroll
-            for (int c = 0; c < HC_MULT3; c++)
-                y_local[c] = 0.0f;
+                for (int k = 0; k < HC_MULT; k++)
+                    y_comb[k] = 0.0f;
+            }
             for (int s = 0; s < NUM_SPLITS; s++)
             {
                 r_val += r_acc[s * M + token];
                 float const* y_row = y_acc + (static_cast<long long>(s) * M + token) * HC_MULT3;
+                y_pre += y_row[lane];
+                if (warp_id == 0)
+                {
+                    y_post += y_row[HC_MULT + lane];
 #pragma unroll
-                for (int c = 0; c < HC_MULT3; c++)
-                    y_local[c] += y_row[c];
+                    for (int k = 0; k < HC_MULT; k++)
+                        y_comb[k] += y_row[2 * HC_MULT + lane * HC_MULT + k];
+                }
             }
         }
 
@@ -103,22 +121,28 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         float const rstd = rsqrtf(r_val / static_cast<float>(K) + rms_eps);
         float const s0 = hc_scale[0], s1 = hc_scale[1], s2 = hc_scale[2];
 
-        // y_local layout: [pre_mix(4) | post_mix(4) | comb_mix(4×4)]
-        // pre_mix: sigmoid(norm * scale0 + base) + eps → shared for Phase 2
-        float v = y_local[lane] * rstd * s0 + hc_base[lane];
-        s_pre_mix[lane] = 1.0f / (1.0f + expf(-v)) + hc_pre_eps;
+        // y_acc layout: [pre_mix(4) | post_mix(4) | comb_mix(4×4)]
+        // pre_mix: sigmoid(norm * scale0 + base) + eps.
+        float v = y_pre * rstd * s0 + hc_base[lane];
+        pre_mix_local = 1.0f / (1.0f + expf(-v)) + hc_pre_eps;
 
-        // post_mix: sigmoid(norm * scale1 + base) * mult → global
-        v = y_local[HC_MULT + lane] * rstd * s1 + hc_base[HC_MULT + lane];
-        post_mix[token * HC_MULT + lane] = 1.0f / (1.0f + expf(-v)) * hc_post_mult_value;
+        if (warp_id == 0)
+        {
+            // post_mix: sigmoid(norm * scale1 + base) * mult → global
+            v = y_post * rstd * s1 + hc_base[HC_MULT + lane];
+            post_mix[token * HC_MULT + lane] = 1.0f / (1.0f + expf(-v)) * hc_post_mult_value;
 
-        // comb_mix init: norm * scale2 + base → cm[4] per lane (one row of 4×4 matrix)
+            // comb_mix init: norm * scale2 + base → cm[4] per lane (one row of 4×4 matrix)
 #pragma unroll
-        for (int k = 0; k < HC_MULT; k++)
-            cm[k] = y_local[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
+            for (int k = 0; k < HC_MULT; k++)
+                cm[k] = y_comb[k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
+        }
     }
 
-    __syncthreads();
+    float pm[HC_MULT];
+#pragma unroll
+    for (int j = 0; j < HC_MULT; j++)
+        pm[j] = __shfl_sync(FULL_WARP_MASK, pre_mix_local, j);
 
     // ---- Phase 1b (warp 0, lanes 0..3): Sinkhorn normalization ----
     // Each lane holds one row of the 4×4 comb matrix.
@@ -179,13 +203,13 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             cm_out[lane * HC_MULT + k] = cm[k];
     }
 
-    // s_sumsq is shared between Phase 2 (writers: bigfuse warps) and the
-    // rsqrt reduction (reader: warp 0). Single allocation across both blocks.
-    constexpr int kBigFuseWarps = BLOCK_SIZE / WARP_SIZE - 1;
+    // s_sumsq is shared between Phase 2 (writers: all warps) and the rsqrt
+    // reduction (reader: warp 0). Single allocation across both blocks.
+    constexpr int kBigFuseWarps = BLOCK_SIZE / WARP_SIZE;
     __shared__ float s_sumsq[kBigFuseWarps];
     __shared__ float s_rsqrt;
 
-    // ---- Phase 2 (warps 1..N, overlapped with Phase 1b): weighted residual sum ----
+    // ---- Phase 2 (all warps, overlapped with Phase 1b): weighted residual sum ----
     // layer_input[h] = sum_j pre_mix[j] * residual[j][h]
     // Vectorized: 8 bf16 per thread per iteration via uint4 (LDG.128).
     //
@@ -194,91 +218,70 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     // L2 (hot from pass 1's just-issued STGs), multiplies by rsqrt*norm_weight
     // and re-STGs the normalized bf16. Saves a separate flashinfer.rmsnorm
     // kernel launch + its HBM round-trip on layer_input.
-    if (warp_id > 0)
+    __nv_bfloat16 const* rbase = residual + static_cast<long long>(token) * HC_MULT * hidden_size;
+    __nv_bfloat16* obase = layer_input + static_cast<long long>(token) * hidden_size;
+
+    int const p2_tid = tid;
+    constexpr int p2_threads = BLOCK_SIZE;
+    float sum_sq_local = 0.0f;
+
+    for (int h = p2_tid * BF16_VEC; h < hidden_size; h += p2_threads * BF16_VEC)
     {
-        float pm[HC_MULT];
+        float acc[BF16_VEC] = {};
+
 #pragma unroll
         for (int j = 0; j < HC_MULT; j++)
-            pm[j] = s_pre_mix[j];
-
-        __nv_bfloat16 const* rbase = residual + static_cast<long long>(token) * HC_MULT * hidden_size;
-        __nv_bfloat16* obase = layer_input + static_cast<long long>(token) * hidden_size;
-
-        int const p2_tid = tid - WARP_SIZE;
-        constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
-
-        float sum_sq_local = 0.f;
-        for (int h = p2_tid * BF16_VEC; h < hidden_size; h += p2_threads * BF16_VEC)
         {
-            float acc[BF16_VEC] = {};
-
-#pragma unroll
-            for (int j = 0; j < HC_MULT; j++)
-            {
-                uint4 raw = *reinterpret_cast<uint4 const*>(&rbase[j * hidden_size + h]);
-                __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
-#pragma unroll
-                for (int v = 0; v < BF16_VEC / 2; v++)
-                {
-                    float2 f = __bfloat1622float2(pairs[v]);
-                    acc[2 * v + 0] += pm[j] * f.x;
-                    acc[2 * v + 1] += pm[j] * f.y;
-                }
-            }
-
-            uint4 out_raw;
-            __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+            uint4 raw = *reinterpret_cast<uint4 const*>(&rbase[j * hidden_size + h]);
+            __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
 #pragma unroll
             for (int v = 0; v < BF16_VEC / 2; v++)
-                opairs[v] = __float22bfloat162_rn(make_float2(acc[2 * v], acc[2 * v + 1]));
-            *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
-
-            if constexpr (kFuseNorm)
             {
-                // Square the bf16-rounded values so sum_sq matches a separate
-                // RMSNorm kernel's behavior (which reads the bf16 layer_input).
-#pragma unroll
-                for (int v = 0; v < BF16_VEC / 2; v++)
-                {
-                    float2 b = __bfloat1622float2(opairs[v]);
-                    sum_sq_local += b.x * b.x + b.y * b.y;
-                }
+                float2 f = __bfloat1622float2(pairs[v]);
+                acc[2 * v + 0] += pm[j] * f.x;
+                acc[2 * v + 1] += pm[j] * f.y;
             }
         }
+
+        uint4 out_raw;
+        __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+        for (int v = 0; v < BF16_VEC / 2; v++)
+            opairs[v] = __float22bfloat162_rn(make_float2(acc[2 * v], acc[2 * v + 1]));
+        *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
 
         if constexpr (kFuseNorm)
         {
-            // Reduce sum_sq across all (BLOCK_SIZE - WARP_SIZE) threads on the
-            // bigfuse warps.  Warp-internal __shfl_xor first, then SMEM ladder
-            // across warps 1..N.  Warp 0 was idle since Phase 1b — we can also
-            // use it as a clean reducer to avoid an extra sync round-trip.
-            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 16);
-            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 8);
-            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 4);
-            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 2);
-            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 1);
-
-            int const warp_in_bf = warp_id - 1; // bigfuse warps are 1..N
-            if ((tid & 31) == 0)
-                s_sumsq[warp_in_bf] = sum_sq_local;
+            // Square the bf16-rounded values so sum_sq matches a separate
+            // RMSNorm kernel's behavior (which reads the bf16 layer_input).
+#pragma unroll
+            for (int v = 0; v < BF16_VEC / 2; v++)
+            {
+                float2 b = __bfloat1622float2(opairs[v]);
+                sum_sq_local += b.x * b.x + b.y * b.y;
+            }
         }
-    }
-    else if constexpr (kFuseNorm)
-    {
-        // Warp 0 idle threads: still need to participate in __syncthreads
-        // alongside warps 1..N when fusing norm (the syncthreads below).
     }
 
     if constexpr (kFuseNorm)
     {
+        // Reduce sum_sq across all BLOCK_SIZE threads. Warp-internal
+        // __shfl_xor first, then SMEM ladder across all warps.
+        sum_sq_local += __shfl_xor_sync(FULL_WARP_MASK, sum_sq_local, 16);
+        sum_sq_local += __shfl_xor_sync(FULL_WARP_MASK, sum_sq_local, 8);
+        sum_sq_local += __shfl_xor_sync(FULL_WARP_MASK, sum_sq_local, 4);
+        sum_sq_local += __shfl_xor_sync(FULL_WARP_MASK, sum_sq_local, 2);
+        sum_sq_local += __shfl_xor_sync(FULL_WARP_MASK, sum_sq_local, 1);
+
+        if (lane == 0)
+            s_sumsq[warp_id] = sum_sq_local;
         __syncthreads();
 
         // All threads now collaborate on pass 2: re-LDG layer_input bf16 from
         // L2, multiply by rsqrt * norm_weight, STG normalized bf16.
-        // Lane 0 of warp 0 reduces the partial sums; broadcasts via SMEM cell.
-        if (warp_id == 0 && (tid & 31) == 0)
+        if (warp_id == 0 && lane == 0)
         {
-            float total = 0.f;
+            float total = 0.0f;
 #pragma unroll
             for (int w = 0; w < kBigFuseWarps; w++)
                 total += s_sumsq[w];
@@ -286,30 +289,23 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         }
         __syncthreads();
 
-        if (warp_id > 0)
+        float const rsqrt_val = s_rsqrt;
+        for (int h = p2_tid * BF16_VEC; h < hidden_size; h += p2_threads * BF16_VEC)
         {
-            __nv_bfloat16* obase = layer_input + static_cast<long long>(token) * hidden_size;
-            int const p2_tid = tid - WARP_SIZE;
-            constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
-            float const rsqrt_val = s_rsqrt;
-            for (int h = p2_tid * BF16_VEC; h < hidden_size; h += p2_threads * BF16_VEC)
-            {
-                uint4 li_raw = *reinterpret_cast<uint4 const*>(&obase[h]);
-                uint4 nw_raw = *reinterpret_cast<uint4 const*>(&norm_weight[h]);
-                __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
-                __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
-                uint4 out_raw;
-                __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+            uint4 li_raw = *reinterpret_cast<uint4 const*>(&obase[h]);
+            uint4 nw_raw = *reinterpret_cast<uint4 const*>(&norm_weight[h]);
+            __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
+            __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
+            uint4 out_raw;
+            __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
 #pragma unroll
-                for (int v = 0; v < BF16_VEC / 2; v++)
-                {
-                    float2 lif = __bfloat1622float2(li_pairs[v]);
-                    float2 nwf = __bfloat1622float2(nw_pairs[v]);
-                    opairs[v]
-                        = __float22bfloat162_rn(make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
-                }
-                *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+            for (int v = 0; v < BF16_VEC / 2; v++)
+            {
+                float2 lif = __bfloat1622float2(li_pairs[v]);
+                float2 nwf = __bfloat1622float2(nw_pairs[v]);
+                opairs[v] = __float22bfloat162_rn(make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
             }
+            *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
         }
     }
 }
