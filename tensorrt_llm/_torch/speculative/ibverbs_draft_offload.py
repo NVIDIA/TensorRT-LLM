@@ -551,11 +551,11 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
     def _build_target_to_draft_message(
         self, request_id, accepted_tokens, num_accepted_tokens, row, request_start_position
     ):
-        # One packet carries exactly the target-verified token for this
-        # position. Initially this is t_f from target prefill; later it is
-        # t_g/t_h/... from target verification. The draft side compares it
-        # against its already-generated token at position+1 and either keeps
-        # generating on that branch or rolls back before regenerating.
+        # One packet carries exactly the target-verified/correction token and
+        # that token's absolute position.  The draft side compares it against
+        # its local speculative token at the same position.  A match commits
+        # through that position; a mismatch rolls back to the previous token
+        # and appends this target correction.
         tokens = [0] * self._protocol.kMaxTokens
         tokens[0] = self._extract_last_accepted_token(accepted_tokens, num_accepted_tokens, row)
         return self._protocol.Message(

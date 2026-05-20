@@ -260,6 +260,36 @@ class DraftExecutorRunner:
         }
 
 
+def _make_pearl_draft_server_request_cls(llm_request_cls):
+    """Build a resident PEARL draft request subclass.
+
+    The draft server owns a long-lived request and repeatedly rolls its KV/cache
+    state backward when target rejects speculative tokens.  That makes the
+    request's cumulative generation lifetime different from its effective
+    committed prefix length.  Keep the C++ request allocation bounded by
+    ``max_new_tokens``, but keep Python-side stop checks from completing the
+    resident request only because it has sampled many discarded draft tokens.
+    """
+
+    class LlmPearlDraftServerRequest(llm_request_cls):
+        _PEARL_UNBOUNDED_MAX_NEW_TOKENS = 1 << 30
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.py_max_new_tokens = self._PEARL_UNBOUNDED_MAX_NEW_TOKENS
+            self.py_pearl_draft_server_request = True
+
+        def will_complete_next_iteration(self):
+            return False
+
+        def finish_by(self, reason, beam):
+            if getattr(self, "py_pearl_draft_server_request", False):
+                return
+            return super().finish_by(reason, beam)
+
+    return LlmPearlDraftServerRequest
+
+
 class _TrtLlmBackend:
     """Direct PyExecutor draft backend with explicit request/KV ownership.
 
@@ -311,7 +341,6 @@ class _TrtLlmBackend:
         # committed prefix plus draft tokens that we have already consumed
         # from the active stream.
         self._sessions = {}
-        self._next_branch_id = 1
         _pearl_log(
             "draft",
             "draft_executor_runner_init",
@@ -333,7 +362,7 @@ class _TrtLlmBackend:
         except Exception as exc:
             raise RuntimeError("failed to import PyExecutor request/scheduler internals") from exc
 
-        self._LlmRequest = LlmRequest
+        self._LlmRequest = _make_pearl_draft_server_request_cls(LlmRequest)
         self._LlmRequestState = LlmRequestState
         self._SamplingConfig = SamplingConfig
         self._ScheduledRequests = ScheduledRequests
@@ -455,11 +484,32 @@ class _TrtLlmBackend:
 
     def _make_batch(self, req, is_context=False):
         batch = self._ScheduledRequests()
-        if is_context or req.state != self._LlmRequestState.GENERATION_IN_PROGRESS:
+        if is_context:
             batch.append_context_request(req)
         else:
+            if req.state != self._LlmRequestState.GENERATION_IN_PROGRESS:
+                raise RuntimeError(
+                    "manual draft request is not in generation state: "
+                    f"request_id={int(req.py_request_id)} state={req.state}"
+                )
             batch.append_generation_request(req)
         return batch
+
+    def _keep_resident_request_alive(self, req, where):
+        if not getattr(req, "py_pearl_draft_server_request", False):
+            return
+        if req.state != self._LlmRequestState.GENERATION_COMPLETE:
+            return
+        req.state = self._LlmRequestState.GENERATION_IN_PROGRESS
+        _pearl_log(
+            "draft",
+            "manual_request_keep_alive",
+            request_id=int(req.py_request_id),
+            where=str(where),
+            token_count=int(req.get_num_tokens(0)),
+            py_max_new_tokens=int(getattr(req, "py_max_new_tokens", -1)),
+            max_new_tokens=int(getattr(req, "max_new_tokens", -1)),
+        )
 
     def _update_kv_resources(self, batch):
         model_engine = self.executor_runner.draft_model_engine
@@ -531,7 +581,9 @@ class _TrtLlmBackend:
             self.executor_runner.py_executor._update_requests(
                 sample_state, self.executor_runner.resource_manager
             )
+            self._keep_resident_request_alive(req, "after_update_requests")
             self.executor_runner.py_executor._update_request_states(batch)
+            self._keep_resident_request_alive(req, "after_update_request_states")
             self._update_kv_resources(batch)
             self.executor_runner.py_executor.iter_counter += 1
 
@@ -572,35 +624,32 @@ class _TrtLlmBackend:
         token = int(last_token)
 
         # This is the manual PyExecutor version of the PEARL state machine:
-        # target sends the verified token for the next position; if the token
-        # already sitting at position+1 is the same draft token, keep the
-        # resident KV branch. Otherwise rewind to before that token, append
-        # target's correction, and regenerate subsequent draft tokens.
-        prefix_len_before_last = max(0, pos + 1)
-        already_has_last_at_next = (
-            0 <= prefix_len_before_last < len(before_tokens)
-            and int(before_tokens[prefix_len_before_last]) == token
-        )
-        already_has_last_at_pos = 0 <= pos < len(before_tokens) and int(before_tokens[pos]) == token
-        if already_has_last_at_next:
-            desired_len = prefix_len_before_last + 1
-        elif already_has_last_at_pos:
-            desired_len = pos + 1
-        else:
-            desired_len = prefix_len_before_last
-        pearl_preverify_match = bool(already_has_last_at_next)
+        # target sends (token, exact_position).  If the local speculative token
+        # at that exact position matches, commit through that position and
+        # discard any speculative tail after it. If it does not match, position
+        # is the reject point: discard every local speculative token with
+        # position >= pos, rollback KV to the token before pos, append the
+        # correction token, and continue.
+        already_matches = 0 <= pos < len(before_tokens) and int(before_tokens[pos]) == token
+        pearl_preverify_match = bool(already_matches)
 
         rewind_len = 0
-        if desired_len < len(before_tokens):
-            rewind_len = self._apply_manual_rollback(sess, desired_len)
-            restart_reason = "rollback" if rewind_len > 0 else "token_tail_trim"
-
-        tokens = self._request_tokens(req)
-        if not tokens or int(tokens[-1]) != token:
-            tokens = tokens[:prefix_len_before_last]
-            if len(tokens) < prefix_len_before_last:
-                tokens = tokens + before_tokens[len(tokens) : prefix_len_before_last]
-            self._set_request_tokens(req, tokens)
+        if already_matches:
+            desired_len = pos + 1
+            if desired_len < len(before_tokens):
+                rewind_len = self._apply_manual_rollback(sess, desired_len)
+                restart_reason = (
+                    "rollback_speculative_tail" if rewind_len > 0 else "token_tail_trim"
+                )
+        else:
+            desired_len = max(0, pos)
+            if desired_len < len(before_tokens):
+                rewind_len = self._apply_manual_rollback(sess, desired_len)
+                restart_reason = "rollback" if rewind_len > 0 else "token_tail_trim"
+            tokens = self._request_tokens(req)
+            if len(tokens) > desired_len:
+                tokens = tokens[:desired_len]
+                self._set_request_tokens(req, tokens)
             self._append_request_token(req, token)
             sess["tokens"] = self._request_tokens(req)
             restart_reason = restart_reason or "target_token_mismatch"
@@ -608,7 +657,7 @@ class _TrtLlmBackend:
         return {
             "before_len": len(before_tokens),
             "after_len": len(sess["tokens"]),
-            "prefix_len_before_last": prefix_len_before_last,
+            "verified_position": pos,
             "desired_len": desired_len,
             "restart_reason": restart_reason,
             "pearl_preverify_match": pearl_preverify_match,
@@ -616,71 +665,43 @@ class _TrtLlmBackend:
             "kv_token_len": int(sess.get("kv_token_len", 0)),
         }
 
-    def step(self, request_id, last_token, position, round_seq, num_tokens=None):
-        with self._manual_lock:
-            sess = self._ensure_session(request_id)
-            before_tokens = self._request_tokens(sess["request"])
-            sync_info = self._sync_to_target(sess, last_token, position)
-            compute_prefix = self._request_tokens(sess["request"])
-            n = int(num_tokens or self.max_draft_len)
-            draft_tokens = [self._manual_forward_one(sess, is_context=False) for _ in range(n)]
-            _pearl_log(
-                "draft",
-                "backend_step",
-                backend="trtllm",
-                runner="manual_pyexecutor",
-                request_id=int(request_id),
-                round_seq=int(round_seq),
-                received_last_token=int(last_token),
-                received_position=int(position),
-                requested_num_tokens=n,
-                stream_restart_reason=sync_info["restart_reason"],
-                pearl_preverify_match=bool(sync_info["pearl_preverify_match"]),
-                manual_rewind_len=int(sync_info["rewind_len"]),
-                manual_kv_token_len=int(sess.get("kv_token_len", 0)),
-                sync_prefix_len_before_last=int(sync_info["prefix_len_before_last"]),
-                sync_desired_len=int(sync_info["desired_len"]),
-                forward_count=int(sess.get("forward_count", 0)),
-                session_tokens_before=before_tokens,
-                compute_prefix_tokens=compute_prefix,
-                generated_draft_tokens=[int(t) for t in draft_tokens],
-                session_tokens_after=self._request_tokens(sess["request"]),
-            )
-            return draft_tokens
-
-    def create_speculative_branch(self, request_id):
-        with self._manual_lock:
-            sess = self._ensure_session(request_id)
-            branch = {
-                "branch_id": self._next_branch_id,
-                "request_id": int(request_id),
-                "snapshot_tokens": self._request_tokens(sess["request"]),
-                "snapshot_kv_token_len": int(sess.get("kv_token_len", 0)),
-                "snapshot_forward_count": int(sess.get("forward_count", 0)),
-            }
-            self._next_branch_id += 1
-            return branch
-
-    def discard_speculative_branch(self, branch):
-        if branch is None:
-            return
-        with self._manual_lock:
-            sess = self._sessions.get(int(branch["request_id"]))
-            if sess is None:
-                return
-            self._apply_manual_rollback(sess, len(branch["snapshot_tokens"]))
-            self._set_request_tokens(sess["request"], branch["snapshot_tokens"])
-            sess["tokens"] = self._request_tokens(sess["request"])
-            sess["kv_token_len"] = min(int(branch["snapshot_kv_token_len"]), len(sess["tokens"]))
-
-    def commit_speculative_branch(self, request_id, branch):
-        # The manual branch runs on the resident request/KV cache directly.
-        # A cache hit therefore only means "keep the already advanced state".
-        return
-
-    def step_branch(
+    def _draft_tokens_after_position(
         self,
-        branch,
+        sess,
+        position,
+        num_tokens,
+        *,
+        on_token=None,
+        cancel_event=None,
+    ):
+        start = int(position) + 1
+        n = int(num_tokens)
+        req = sess["request"]
+        published = 0
+
+        def maybe_publish(tokens):
+            nonlocal published
+            while published < min(len(tokens), n):
+                if on_token is not None:
+                    keep_going = on_token(int(tokens[published]), published, None)
+                    if keep_going is False:
+                        return False
+                published += 1
+            return True
+
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return self._request_tokens(req)[start : start + published]
+            current = self._request_tokens(req)
+            draft_tokens = current[start : start + n]
+            if not maybe_publish(draft_tokens):
+                return draft_tokens[:published]
+            if len(draft_tokens) >= n:
+                return draft_tokens[:n]
+            self._manual_forward_one(sess, is_context=False)
+
+    def step(
+        self,
         request_id,
         last_token,
         position,
@@ -695,29 +716,21 @@ class _TrtLlmBackend:
             sync_info = self._sync_to_target(sess, last_token, position)
             compute_prefix = self._request_tokens(sess["request"])
             n = int(num_tokens or self.max_draft_len)
-            draft_tokens = []
-            cancelled = False
-            for idx in range(n):
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    break
-                token = self._manual_forward_one(sess, is_context=False)
-                draft_tokens.append(token)
-                if on_token is not None:
-                    keep_going = on_token(int(token), idx, branch)
-                    if keep_going is False:
-                        cancelled = True
-                        break
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    break
+            draft_tokens = self._draft_tokens_after_position(
+                sess,
+                position,
+                n,
+                on_token=on_token,
+                cancel_event=cancel_event,
+            )
             _pearl_log(
                 "draft",
                 "backend_step",
                 backend="trtllm",
-                runner="manual_pyexecutor_branch",
+                runner="manual_pyexecutor_prefetch"
+                if on_token is not None
+                else "manual_pyexecutor",
                 request_id=int(request_id),
-                branch_id=int(branch.get("branch_id", 0)) if branch else 0,
                 round_seq=int(round_seq),
                 received_last_token=int(last_token),
                 received_position=int(position),
@@ -726,9 +739,8 @@ class _TrtLlmBackend:
                 pearl_preverify_match=bool(sync_info["pearl_preverify_match"]),
                 manual_rewind_len=int(sync_info["rewind_len"]),
                 manual_kv_token_len=int(sess.get("kv_token_len", 0)),
-                sync_prefix_len_before_last=int(sync_info["prefix_len_before_last"]),
+                sync_verified_position=int(sync_info["verified_position"]),
                 sync_desired_len=int(sync_info["desired_len"]),
-                cancelled=cancelled,
                 forward_count=int(sess.get("forward_count", 0)),
                 session_tokens_before=before_tokens,
                 compute_prefix_tokens=compute_prefix,

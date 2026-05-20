@@ -62,10 +62,12 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
 
     After sending the response for round N, we predict that the target
     will accept all gamma draft tokens (the common case under good
-    alignment), and we immediately run ``backend.step`` for round N+1.
-    On round N+1 arrival, if the actual (last_token, position) matches
-    the prediction we send the cached tokens; otherwise we fall back to
-    a normal (non-pipelined) step.
+    alignment).  The next target packet should then carry the last draft
+    token from round N and that token's exact position.  We immediately
+    generate the following gamma draft tokens and cache them.  On round
+    N+1 arrival, if the actual (last_token, position) matches this
+    prediction we send the cached tokens; otherwise we fall back to a
+    normal (non-pipelined) step.
     """
 
     def __init__(self, args, backend=None):
@@ -89,38 +91,33 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
         )
 
     def _enqueue_prefetch(self, request_id, seed_last_token, seed_position, round_seq):
-        """Queue speculative bonus + next-draft generation.
+        """Queue speculative next-draft generation.
 
-        The target's next request starts from the target bonus token, not
-        from ``draft_tokens[-1]``.  We approximate that bonus with one
-        extra draft-model token, then cache the following gamma tokens.
+        ``seed_last_token`` is the last draft token we just sent to target,
+        and ``seed_position`` is its exact position.  If target accepts the
+        whole window, it will send back exactly this pair. The prefetch worker
+        therefore only needs to generate the following gamma tokens on the same
+        resident draft request. If the prediction is wrong, the normal sync path
+        rolls the resident request back to target's returned position.
         """
-        branch = None
-        if hasattr(self._backend, "create_speculative_branch"):
-            with self._backend_step_lock:
-                branch = self._backend.create_speculative_branch(int(request_id))
         job = {
             "request_id": int(request_id),
             "seed_last_token": int(seed_last_token),
             "seed_position": int(seed_position),
             "round_seq": int(round_seq) + 1,
-            "bonus_ready": threading.Event(),
             "draft_ready": threading.Event(),
             "cancel_event": threading.Event(),
-            "branch": branch,
         }
         entry = {
-            "predicted_last_token": None,
+            "predicted_last_token": int(seed_last_token),
             "predicted_position": int(seed_position),
             "round_seq": int(round_seq) + 1,
             "draft_tokens": None,
             "generated_tokens": [],
             "seed_last_token": int(seed_last_token),
             "seed_position": int(seed_position),
-            "bonus_ready": job["bonus_ready"],
             "draft_ready": job["draft_ready"],
             "cancel_event": job["cancel_event"],
-            "branch": branch,
         }
         old_entry = None
         with self._prefetch_lock:
@@ -129,7 +126,6 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
             self._prefetch_queue.append(job)
         if old_entry is not None:
             self._cancel_prefetch(old_entry)
-            self._discard_prefetch_branch(old_entry)
         _pearl_log(
             "draft",
             "prefetch_enqueue",
@@ -137,7 +133,6 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
             seed_last_token=job["seed_last_token"],
             seed_position=job["seed_position"],
             round_seq=job["round_seq"],
-            branch_id=int(branch.get("branch_id", 0)) if branch is not None else None,
         )
         self._prefetch_event.set()
 
@@ -146,34 +141,20 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
             return self._backend.step(**kwargs)
 
     def _backend_prefetch_step(self, job, **kwargs):
-        branch = job.get("branch")
         with self._backend_step_lock:
-            if branch is not None and hasattr(self._backend, "step_branch"):
-                return self._backend.step_branch(
-                    branch=branch,
-                    **kwargs,
-                )
-            kwargs.pop("on_token", None)
-            kwargs.pop("cancel_event", None)
+            code = getattr(getattr(self._backend, "step", None), "__code__", None)
+            arg_names = set(getattr(code, "co_varnames", ())[: getattr(code, "co_argcount", 0)])
+            if "on_token" not in arg_names:
+                kwargs.pop("on_token", None)
+            if "cancel_event" not in arg_names:
+                kwargs.pop("cancel_event", None)
             return self._backend.step(**kwargs)
-
-    def _discard_prefetch_branch(self, entry_or_job):
-        branch = None if entry_or_job is None else entry_or_job.get("branch")
-        if branch is not None and hasattr(self._backend, "discard_speculative_branch"):
-            with self._backend_step_lock:
-                self._backend.discard_speculative_branch(branch)
 
     @staticmethod
     def _cancel_prefetch(entry_or_job):
         cancel_event = None if entry_or_job is None else entry_or_job.get("cancel_event")
         if cancel_event is not None:
             cancel_event.set()
-
-    def _commit_prefetch_branch(self, request_id, entry):
-        branch = None if entry is None else entry.get("branch")
-        if branch is not None and hasattr(self._backend, "commit_speculative_branch"):
-            with self._backend_step_lock:
-                self._backend.commit_speculative_branch(int(request_id), branch)
 
     def _prefetch_loop(self):
         while not self._stop:
@@ -191,44 +172,23 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                     still_current = (
                         current_entry is not None
                         and current_entry.get("round_seq") == job["round_seq"]
-                        and current_entry.get("branch") is job.get("branch")
                     )
                 if not still_current:
                     self._cancel_prefetch(job)
-                    self._discard_prefetch_branch(job)
                     continue
                 try:
                     draft_len = self._draft_len()
                     generated_tokens = []
 
-                    def publish_token(token, token_index, _branch):
+                    def publish_token(token, token_index, _unused):
                         generated_tokens.append(int(token))
-                        if token_index == 0:
-                            predicted_bonus = int(token)
-                            with self._prefetch_lock:
-                                entry = self._prefetch_cache.get(job["request_id"])
-                                if entry is not None and entry.get("round_seq") == job["round_seq"]:
-                                    entry["predicted_last_token"] = predicted_bonus
-                                    entry["generated_tokens"] = [predicted_bonus]
-                                    entry["bonus_ready"].set()
-                                else:
-                                    job["cancel_event"].set()
-                                    return False
-                            _pearl_log(
-                                "draft",
-                                "prefetch_bonus_computed",
-                                request_id=int(job["request_id"]),
-                                round_seq=int(job["round_seq"]),
-                                seed_last_token=int(job["seed_last_token"]),
-                                seed_position=int(job["seed_position"]),
-                                predicted_last_token=predicted_bonus,
-                                predicted_position=int(job["seed_position"]),
-                                branch_id=(
-                                    int(job["branch"].get("branch_id", 0))
-                                    if job.get("branch") is not None
-                                    else None
-                                ),
-                            )
+                        with self._prefetch_lock:
+                            entry = self._prefetch_cache.get(job["request_id"])
+                            if entry is not None and entry.get("round_seq") == job["round_seq"]:
+                                entry["generated_tokens"] = list(generated_tokens)
+                            else:
+                                job["cancel_event"].set()
+                                return False
                         return not job["cancel_event"].is_set()
 
                     step_tokens = self._backend_prefetch_step(
@@ -237,20 +197,12 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                         last_token=job["seed_last_token"],
                         position=job["seed_position"],
                         round_seq=job["round_seq"],
-                        num_tokens=1 + draft_len,
+                        num_tokens=draft_len,
                         on_token=publish_token,
                         cancel_event=job["cancel_event"],
                     )
                     if not generated_tokens:
                         generated_tokens = [int(t) for t in list(step_tokens or [])]
-                        if generated_tokens:
-                            predicted_bonus = int(generated_tokens[0])
-                            with self._prefetch_lock:
-                                entry = self._prefetch_cache.get(job["request_id"])
-                                if entry is not None and entry.get("round_seq") == job["round_seq"]:
-                                    entry["predicted_last_token"] = predicted_bonus
-                                    entry["generated_tokens"] = [predicted_bonus]
-                                    entry["bonus_ready"].set()
                 except Exception as exc:
                     # Speculative failures are non-fatal — they just mean
                     # the actual request will run a regular step.
@@ -259,11 +211,9 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                         % (job["request_id"], exc),
                         flush=True,
                     )
-                    self._discard_prefetch_branch(job)
                     continue
 
                 if not generated_tokens:
-                    self._discard_prefetch_branch(job)
                     continue
 
                 if job["cancel_event"].is_set():
@@ -275,31 +225,22 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                         seed_last_token=int(job["seed_last_token"]),
                         seed_position=int(job["seed_position"]),
                         generated_tokens=[int(t) for t in generated_tokens],
-                        branch_id=(
-                            int(job["branch"].get("branch_id", 0))
-                            if job.get("branch") is not None
-                            else None
-                        ),
                     )
-                    self._discard_prefetch_branch(job)
                     continue
 
-                predicted_bonus = int(generated_tokens[0])
-                draft_tokens = list(generated_tokens[1 : 1 + draft_len])
+                draft_tokens = list(generated_tokens[:draft_len])
                 if len(draft_tokens) < draft_len:
-                    self._discard_prefetch_branch(job)
                     continue
                 with self._prefetch_lock:
                     entry = self._prefetch_cache.get(job["request_id"])
                     if entry is not None and entry.get("round_seq") == job["round_seq"]:
                         entry["draft_tokens"] = list(draft_tokens)
-                        entry["generated_tokens"] = [predicted_bonus] + list(draft_tokens)
+                        entry["generated_tokens"] = list(draft_tokens)
                         entry["draft_ready"].set()
                     else:
                         entry = None
                 if entry is None:
                     self._cancel_prefetch(job)
-                    self._discard_prefetch_branch(job)
                     continue
                 _pearl_log(
                     "draft",
@@ -308,15 +249,10 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                     round_seq=int(job["round_seq"]),
                     seed_last_token=int(job["seed_last_token"]),
                     seed_position=int(job["seed_position"]),
-                    predicted_last_token=predicted_bonus,
+                    predicted_last_token=int(job["seed_last_token"]),
                     predicted_position=int(job["seed_position"]),
-                    generated_tokens=[int(predicted_bonus)] + [int(t) for t in draft_tokens],
+                    generated_tokens=[int(t) for t in draft_tokens],
                     draft_tokens=[int(t) for t in draft_tokens],
-                    branch_id=(
-                        int(job["branch"].get("branch_id", 0))
-                        if job.get("branch") is not None
-                        else None
-                    ),
                 )
 
     def _take_matching_prefetch(self, rid, last_token, position, round_seq):
@@ -331,7 +267,6 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                     return None, None
                 predicted = entry.get("predicted_last_token")
                 predicted_position = entry.get("predicted_position")
-                bonus_ready = entry.get("bonus_ready")
                 draft_ready = entry.get("draft_ready")
                 draft_tokens = entry.get("draft_tokens")
 
@@ -379,7 +314,7 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                 )
 
             waited = True
-            event = draft_ready if predicted is not None else bonus_ready
+            event = draft_ready
             if event is None:
                 time.sleep(min(remaining, 0.001))
             else:
@@ -545,16 +480,15 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                 # Data-plane PEARL state machine, matching the design note:
                 #
                 #   draft prompt_init already generated d_f.
-                #   target sends t_f/t_g/... as last_token.
+                #   target sends t_f/t_g/... with its exact position.
                 #
                 #   if last_token matches the draft token already sitting at
-                #   position+1, backend.step keeps that branch and continues
-                #   generating the following draft tokens.
+                #   that position, backend.step commits through that position
+                #   and returns the speculative tail after it.
                 #
-                #   if it does not match, backend.step rolls back to before that
-                #   position, appends target's correct token, and regenerates the
-                #   following draft tokens. The response below is therefore the
-                #   next speculative segment after the verified/correct token.
+                #   if it does not match, backend.step rolls back to the token
+                #   before that position, appends target's correction, and
+                #   regenerates the following draft tokens.
                 _pearl_log(
                     "draft",
                     "recv_target_to_draft",
@@ -583,7 +517,6 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                 )
                 if entry is not None:
                     cached_tokens = entry["draft_tokens"]
-                    self._commit_prefetch_branch(rid, entry)
                     self._pearl_hits += 1
                     _pearl_log(
                         "draft",
@@ -592,16 +525,10 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                         round_seq=round_seq,
                         cached_round_seq=int(entry["round_seq"]),
                         draft_tokens=[int(t) for t in cached_tokens],
-                        branch_id=(
-                            int(entry["branch"].get("branch_id", 0))
-                            if entry.get("branch") is not None
-                            else None
-                        ),
                     )
                 else:
                     self._pearl_misses += 1
                     if stale_entry is not None:
-                        self._discard_prefetch_branch(stale_entry)
                         _pearl_log(
                             "draft",
                             "prefetch_discard",
@@ -620,11 +547,6 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                             discarded_draft_tokens=[
                                 int(t) for t in (stale_entry.get("draft_tokens") or [])
                             ],
-                            branch_id=(
-                                int(stale_entry["branch"].get("branch_id", 0))
-                                if stale_entry.get("branch") is not None
-                                else None
-                            ),
                         )
 
                 if cached_tokens is not None:
@@ -696,15 +618,14 @@ class PEARLDraftServer(_drs.IzzyCompatibleDraftServer):
                 )
 
                 # Schedule the next round's speculative pre-draft. We predict
-                # the target will accept ALL gamma tokens; then it will produce
-                # one bonus token.  The prefetch worker generates that predicted
-                # bonus plus the following gamma draft tokens.  A later cache hit
-                # requires the target's actual bonus token and position to match.
+                # the target will accept ALL gamma tokens; then its next packet
+                # will carry the last draft token and exact position.  The
+                # prefetch worker generates the following gamma tokens.
                 if draft_tokens:
                     self._enqueue_prefetch(
                         request_id=rid,
                         seed_last_token=int(draft_tokens[-1]),
-                        seed_position=int(position) + len(draft_tokens) + 1,
+                        seed_position=int(position) + len(draft_tokens),
                         round_seq=int(round_seq),
                     )
 
@@ -780,7 +701,7 @@ def main():
         default=float(os.environ.get("PEARL_PREFETCH_WAIT_TIMEOUT_S", "0.05")),
         help=(
             "Seconds to wait for an in-flight PEARL prefetch when the predicted "
-            "bonus token already matches the target request. Default: 0.05."
+            "verified token/position matches the target request. Default: 0.05."
         ),
     )
     ap.add_argument(

@@ -391,6 +391,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     request_ids=getattr(spec_metadata, "request_ids", None),
                     input_ids=input_ids,
                     attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
                 )
             next_draft_tokens = self._tp_broadcast_offload_tensor(next_draft_tokens)
             next_new_tokens = self._prepare_next_new_tokens(
@@ -533,6 +534,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         request_ids: Optional[list] = None,
         input_ids: Optional[torch.Tensor] = None,
         attn_metadata: Optional["AttentionMetadata"] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> torch.Tensor:
         # V2 path: izzy-compatible 96-byte WRITE_WITH_IMM via
         # ``IbverbsDraftOffloadLayer``.  All bookkeeping (round_seq,
@@ -557,26 +559,44 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     [last_pos] * int(batch_size), dtype=torch.int64, device=logits.device
                 )
 
-            # The draft server's PEARL state machine interprets ``position``
-            # as the token position immediately BEFORE the target token carried
-            # in this packet.  For context rows the raw position already has
-            # that meaning: prompt last position precedes t_f.
-            #
-            # For generation rows, TRT-LLM's position_ids point at the end of
-            # the verify window.  If gamma=4 and target accepted only the
-            # correction token, raw position is P+4 but the packet token belongs
-            # after P.  If target accepted all draft tokens plus the bonus,
-            # raw position is already correct.  Shift by the number of accepted
-            # draft tokens so draft rollback/cache-hit logic lines up.
             num_contexts = (
                 int(getattr(attn_metadata, "num_contexts", 0)) if attn_metadata is not None else 0
             )
             raw_per_request_positions = per_request_positions.clone()
-            if int(batch_size) > num_contexts:
-                raw_positions = [int(v) for v in raw_per_request_positions.detach().cpu().tolist()]
-                accepted_counts = [
-                    int(v) for v in num_accepted_tokens.reshape(-1).detach().cpu().tolist()
-                ]
+            raw_positions = [int(v) for v in raw_per_request_positions.detach().cpu().tolist()]
+            accepted_counts = [
+                int(v) for v in num_accepted_tokens.reshape(-1).detach().cpu().tolist()
+            ]
+            is_pearl = bool(
+                spec_metadata is not None and spec_metadata.spec_dec_mode.is_pearl_one_model()
+            )
+            if is_pearl:
+                # PEARL's draft server interprets ``position`` as the exact
+                # position of the token carried in this packet.
+                #
+                # Context rows: raw position is the last prompt position; the
+                # sampled target token is at raw + 1.
+                #
+                # Generation rows: TRT-LLM's position_ids point at the last draft
+                # input in the verify window.  If raw is P+gamma and target
+                # returns the token at accepted count K, then the exact token
+                # position is P+K = raw - gamma + K.
+                adjusted_positions = []
+                for row, raw_pos in enumerate(raw_positions):
+                    if row < num_contexts:
+                        adjusted_positions.append(raw_pos + 1)
+                        continue
+                    accepted_count = max(
+                        1,
+                        min(int(self.max_draft_len), int(accepted_counts[row])),
+                    )
+                    adjusted_positions.append(
+                        max(0, raw_pos - int(self.max_draft_len) + accepted_count)
+                    )
+                position_semantics = "exact_token_position"
+            else:
+                # Legacy draft-target offload path: ``position`` is the token
+                # position immediately before the carried target token.
                 adjusted_positions = []
                 for row, raw_pos in enumerate(raw_positions):
                     if row < num_contexts:
@@ -589,18 +609,20 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     adjusted_positions.append(
                         max(0, raw_pos - int(self.max_draft_len) + accepted_draft_tokens)
                     )
-                per_request_positions = torch.tensor(
-                    adjusted_positions, dtype=torch.int64, device=logits.device
-                )
-                _pearl_log(
-                    "target",
-                    "offload_position_resolved",
-                    raw_positions=raw_positions,
-                    positions=adjusted_positions,
-                    accepted_token_counts=accepted_counts[: int(batch_size)],
-                    num_contexts=int(num_contexts),
-                    max_draft_len=int(self.max_draft_len),
-                )
+                position_semantics = "previous_token_position"
+            per_request_positions = torch.tensor(
+                adjusted_positions, dtype=torch.int64, device=logits.device
+            )
+            _pearl_log(
+                "target",
+                "offload_position_resolved",
+                raw_positions=raw_positions,
+                positions=adjusted_positions,
+                accepted_token_counts=accepted_counts[: int(batch_size)],
+                num_contexts=int(num_contexts),
+                max_draft_len=int(self.max_draft_len),
+                position_semantics=position_semantics,
+            )
 
             # Auto prompt push on context phase: when ``num_contexts > 0``
             # the request is being prefilled on the target side this step,

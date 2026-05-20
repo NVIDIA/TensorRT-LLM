@@ -65,6 +65,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.sampler import DEFAULT_BEAM_IDX, TorchSampler, add_token
 from .draft_target import (
     DraftTargetOneModelSampler,
     DraftTargetOneModelSpecMetadata,
@@ -107,7 +108,56 @@ class PEARLSpecMetadata(DraftTargetOneModelSpecMetadata):
 
 
 class PEARLOneModelSampler(DraftTargetOneModelSampler):
-    """PEARL uses greedy verification; sampler matches draft-target's."""
+    """PEARL greedy pipeline sampler.
+
+    Unlike standard speculative decoding, PEARL's target packet returns the
+    verified/correction token at an exact position.  When a full gamma window
+    matches, the last emitted token is still a draft token, not an extra target
+    bonus token.  The generic speculative sampler assumes
+    ``new_tokens_lens = accepted_draft_tokens + 1``; PEARL only follows that
+    convention on rejection.  On a full match we detect that the final emitted
+    token equals the final draft token and keep all gamma draft tokens.
+    """
+
+    def update_requests(self, state, resource_manager=None) -> None:
+        assert isinstance(state, self.SampleState)
+
+        state.sampler_event.synchronize()
+        new_tokens = state.host.new_tokens.tolist()
+        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        next_draft_tokens_list = state.host.next_draft_tokens.tolist()
+        beam_idx = DEFAULT_BEAM_IDX
+        runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
+
+        for req in state.requests:
+            if req.state.name == "GENERATION_COMPLETE":
+                continue
+
+            seq_slot = req.py_seq_slot
+            num_new_tokens = int(new_tokens_lens_list[seq_slot])
+            previous_draft_tokens = list(getattr(req, "py_draft_tokens", []) or [])
+
+            for step in range(num_new_tokens):
+                new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=step)
+                if TorchSampler._handle_stop_criteria(
+                    req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
+                ):
+                    break
+
+            accepted_draft_tokens = max(0, num_new_tokens - 1)
+            if (
+                runtime_draft_len > 0
+                and num_new_tokens == runtime_draft_len
+                and len(previous_draft_tokens) >= runtime_draft_len
+            ):
+                last_emitted = int(new_tokens[runtime_draft_len - 1][seq_slot][beam_idx])
+                last_draft = int(previous_draft_tokens[runtime_draft_len - 1])
+                if last_emitted == last_draft:
+                    accepted_draft_tokens = runtime_draft_len
+
+            req.py_num_accepted_draft_tokens = accepted_draft_tokens
+            req.py_rewind_len = runtime_draft_len - accepted_draft_tokens
+            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
 
 class PEARLOneModelWorker(DraftTargetOneModelWorker):
@@ -260,23 +310,23 @@ class PEARLOneModelWorker(DraftTargetOneModelWorker):
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
     ):
-        """Greedy verification (argmax == draft_token).
+        """Greedy exact-match verification for token/position PEARL.
 
-        Reuses the base implementation since
-        ``_sample_and_accept_draft_tokens_base`` is already a cumulative-
-        product strict-acceptance comparison. Under greedy sampling
-        (``allow_advanced_sampling=False``), it samples via ``argmax`` and
-        accepts draft tokens iff they match. We additionally maintain the
-        per-request ``pre_verify`` flag from request_ids so the PEARL
-        protocol can drive draft-side rollback semantics.
+        Target emits the verified/correction token at its exact position.  We
+        therefore do not accept the extra target bonus token produced by the
+        standard speculative window.  If all gamma draft tokens match, the
+        output length is gamma and the last token is the last matched draft
+        token.  If token k mismatches, the output length is k + 1 and the last
+        token is target's correction at that same position.
         """
-        accepted_tokens, num_accepted_tokens = super().sample_and_accept_draft_tokens(
+        accepted_tokens, num_accepted_tokens = self._sample_and_accept_pearl_tokens(
             logits, attn_metadata, spec_metadata
         )
 
         # Update pre_verify state based on whether the full gamma batch was
-        # accepted. Note: num_accepted_tokens includes the bonus target
-        # token, so "fully accepted" means num_accepted == gamma + 1.
+        # accepted. In PEARL token/position mode, full acceptance means the
+        # emitted length is gamma and the last emitted token equals the last
+        # draft token.
         request_ids = getattr(spec_metadata, "request_ids", None)
         if request_ids is not None:
             num_gens = attn_metadata.num_seqs - attn_metadata.num_contexts
@@ -295,7 +345,13 @@ class PEARLOneModelWorker(DraftTargetOneModelWorker):
                 )
                 for offset, count in enumerate(gen_counts):
                     rid = int(request_ids[attn_metadata.num_contexts + offset])
-                    fully_accepted = int(count) >= gamma + 1
+                    row = attn_metadata.num_contexts + offset
+                    fully_accepted = int(count) >= gamma
+                    if fully_accepted and spec_metadata.draft_tokens is not None:
+                        draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, gamma)
+                        fully_accepted = int(
+                            accepted_tokens[row, gamma - 1].detach().cpu().item()
+                        ) == int(draft_tokens[offset, gamma - 1].detach().cpu().item())
                     if fully_accepted:
                         self._pre_verify_state[rid] = False
                         self._total_accepted += gamma
@@ -314,6 +370,68 @@ class PEARLOneModelWorker(DraftTargetOneModelWorker):
                     )
                     spec_metadata.pre_verify_mask[: len(flags)].copy_(flags, non_blocking=True)
 
+        return accepted_tokens, num_accepted_tokens
+
+    def _sample_and_accept_pearl_tokens(
+        self,
+        logits: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
+    ):
+        batch_size = int(attn_metadata.num_seqs)
+        num_contexts = int(attn_metadata.num_contexts)
+        num_gens = batch_size - num_contexts
+        runtime_draft_len = int(spec_metadata.runtime_draft_len or self.max_draft_len)
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        if spec_metadata.draft_tokens is None:
+            draft_tokens = torch.zeros(
+                (num_gens, runtime_draft_len),
+                dtype=torch.int,
+                device=logits.device,
+            )
+        else:
+            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, runtime_draft_len)
+
+        accepted_tokens = torch.zeros(
+            (batch_size, runtime_draft_len + 1),
+            dtype=torch.int,
+            device=logits.device,
+        )
+        num_accepted_tokens = torch.ones(
+            batch_size,
+            dtype=torch.int,
+            device=logits.device,
+        )
+
+        target_tokens = self._sample_tokens_for_batch(
+            logits, spec_metadata, num_contexts, batch_size
+        )
+        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
+
+        if num_gens > 0:
+            gen_target_tokens = target_tokens[num_contexts:].reshape(
+                num_gens, runtime_draft_len + 1
+            )
+            accepted_tokens[num_contexts:, : runtime_draft_len + 1] = gen_target_tokens
+
+            accepted_draft_counts = torch.cumprod(
+                (draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
+                dim=-1,
+            ).sum(1)
+            # PEARL sends the exact verified/correction token.  Full match
+            # returns gamma tokens; rejection at index k returns k accepted
+            # draft tokens plus one correction token.
+            num_accepted_tokens[num_contexts:] = torch.minimum(
+                accepted_draft_counts + 1,
+                torch.full_like(accepted_draft_counts, runtime_draft_len),
+            )
+
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, runtime_draft_len
+        )
         return accepted_tokens, num_accepted_tokens
 
     # ------------------------------------------------------------------

@@ -15,6 +15,7 @@ NIC="${PEARL_DRAFT_NIC:-mlx5_0}"
 TRANSPORT="${PEARL_DRAFT_TRANSPORT:-ibverbs}"
 TRACE_LOG="${PEARL_DRAFT_TRACE_LOG:-/code/tensorrt_llm/tmp/pearl_draft_server.jsonl}"
 PYTHONPATH_VALUE="${PYTHONPATH:-/code/tensorrt_llm}"
+STREAM_MAX_TOKENS="${PEARL_TRTLLM_STREAM_MAX_TOKENS:-16384}"
 
 mkdir -p "$(dirname "${TRACE_LOG}")"
 
@@ -28,6 +29,8 @@ if [[ -n "${MODEL}" ]]; then
   MODEL_ARGS+=(--model "${MODEL}")
 fi
 
+echo "trtllm_stream_max_tokens: ${STREAM_MAX_TOKENS}"
+
 exec python3 examples/llm-api/rdma/trtllm_pearl_draft_server.py \
   "${MODEL_ARGS[@]}" \
   --backend trtllm \
@@ -36,6 +39,6 @@ exec python3 examples/llm-api/rdma/trtllm_pearl_draft_server.py \
   --control-port "${CONTROL_PORT}" \
   --data-port 0 \
   --backend-init-timeout-s 3600 \
-  --trtllm-stream-max-tokens "${PEARL_TRTLLM_STREAM_MAX_TOKENS:-2048}" \
+  --trtllm-stream-max-tokens "${STREAM_MAX_TOKENS}" \
   --prefetch-wait-timeout-s "${PEARL_PREFETCH_WAIT_TIMEOUT_S:-0.05}" \
   --trace-log "${TRACE_LOG}"
