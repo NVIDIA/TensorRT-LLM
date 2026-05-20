@@ -438,7 +438,7 @@
      bh.cumLogProbsCBA[dstBeam] = bh.cumLogProbs[srcBeam];
      bh.normedScoresCBA[dstBeam] = applyLengthPenalty(
          bh.cumLogProbs[srcBeam], 
-         step - bh.inputLengths[bid] + 1, 
+         step - bh.inputLengths[srcBeam] + 1, 
          bh.lengthPenalties[bid]
      );
  
