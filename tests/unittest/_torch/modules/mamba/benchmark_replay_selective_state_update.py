@@ -788,8 +788,26 @@ _CUPTI_KEEP_KERNEL_SUBSTRINGS = (
     "_persistent_main",
     "selective_scan_update",
     "selective_state_update",
+    "checkpointing_ssu",
     "causal_conv1d_update",
 )
+
+_SR_SUPPORTED_DTYPES = (
+    torch.float16,
+    torch.int8,
+    torch.int16,
+    torch.float8_e4m3fn,
+)
+
+
+def _sr_modes_for_dtype(state_dtype: torch.dtype,
+                        requested_modes: list[str]) -> list[str]:
+    """Return the rounding modes that should run for one state dtype."""
+    if state_dtype == torch.float32:
+        return ["RN"]
+    if state_dtype not in _SR_SUPPORTED_DTYPES:
+        return [mode for mode in requested_modes if mode == "RN"]
+    return requested_modes
 
 
 def _kernels_per_iter_incremental(
@@ -2300,7 +2318,7 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
             prev_ks = _resolve_prev_ks(args, mtp_len)
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
-                    for sr_mode in sr_modes_list:
+                    for sr_mode in _sr_modes_for_dtype(state_dtype, sr_modes_list):
                         for mode in modes_list:
                             for rect in rect_list:
                                 can_sort = (
@@ -2618,15 +2636,11 @@ def _bench_config(
 
     # SR rounding: allow fp16 and the quantized dtypes (int8/int16/fp8).
     # bf16/fp32 SR is not supported (no PTX path for bf16; fp32 doesn't need
-    # rounding).  When sweeping --sr-modes RN,SR over a mixed dtype set,
-    # silently skip the SR cell for unsupported dtypes — the RN cell still
-    # prints, and other dtypes still get their SR row.
+    # rounding).  _sr_modes_for_dtype maps fp32 to RN so production sweeps can
+    # request SR once while still getting fp32/RN.
     rand_seed = None
-    _SR_SUPPORTED = (
-        torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn,
-    )
     if use_philox:
-        if state_dtype not in _SR_SUPPORTED:
+        if state_dtype not in _SR_SUPPORTED_DTYPES:
             return
         rand_seed = torch.randint(0, 2**62, (1,), device="cuda", dtype=torch.int64)
     mode = _resolve_effective_replay_mode(
@@ -4107,6 +4121,7 @@ def _run_benchmark(args) -> None:
     # Print header
     mix_enabled = args.mix_csv is not None or getattr(args, "pmix", False)
     headline_name = "score_us" if mix_enabled else "median_us"
+    print(f"conv1d: {'enabled' if args.with_conv1d else 'disabled'}")
     if mix_enabled:
         print(
             "kmix bucket score: mix rows report bucket-weighted score_us; "
@@ -4195,7 +4210,7 @@ def _run_benchmark(args) -> None:
 
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
-                    for sr_mode in sr_modes_list:
+                    for sr_mode in _sr_modes_for_dtype(state_dtype, sr_modes_list):
                         for mode in modes_list:
                             for rect in rect_list:
                                 for nowrite_first in nowrite_first_list:
@@ -4584,10 +4599,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--with-conv1d",
-        action="store_true",
-        help="Include conv1d kernel before replay SSM. "
-        "Uses realistic L2 flush: cold caches flushed, hot in_proj output "
-        "kept warm. Measures conv1d → precompute → main span.",
+        "--with-conv-1d",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="with_conv1d",
+        help="Include conv1d kernel before replay SSM. Default on; pass "
+        "--no-with-conv1d to time state update only. Uses realistic L2 flush: "
+        "cold caches flushed, hot in_proj output kept warm. Measures "
+        "conv1d → precompute → main span.",
     )
     parser.add_argument(
         "--external-pdl",
