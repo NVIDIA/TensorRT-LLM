@@ -1660,108 +1660,28 @@ class GlobalState {
     static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
 }
 
-def parseLongOrDefault(def value, long defaultValue)
-{
-    if (value == null) {
-        return defaultValue
-    }
-    if (value instanceof Number) {
-        return value.longValue()
-    }
-    try {
-        return Long.parseLong(value.toString().trim())
-    } catch (NumberFormatException ignored) {
-        return defaultValue
-    }
-}
-
-long durationSecondsToMillis(def durationSeconds)
-{
-    if (durationSeconds == null) {
-        return 0L
-    }
-    double seconds
-    if (durationSeconds instanceof Number) {
-        seconds = durationSeconds.doubleValue()
-    } else {
-        seconds = Double.parseDouble(durationSeconds.toString().trim())
-    }
-    return Math.round(seconds * 1000D)
-}
-
-def durationLookupKeys(String rawLine)
-{
-    if (rawLine == null) {
-        return []
-    }
-    def testName = rawLine.trim()
-    if (!testName || testName.startsWith("#")) {
-        return []
-    }
-    testName = testName.replaceAll(/\s+(SKIP|TIMEOUT|ISOLATION)(\s*\([^)]*\))?.*$/, "").trim()
-    if (!testName) {
-        return []
-    }
-    def keys = [testName]
-    def wrapperMatch = (testName =~ '^(?:.*/)?test\\w+\\.py::(?:\\w+::)*\\w+\\[(.+)\\]$')
-    if (wrapperMatch.matches()) {
-        keys << wrapperMatch[0][1]
-    }
-    return keys.unique()
-}
-
 def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount)
 {
-    long defaultUnknownMs = stageName.contains("-Perf") ? 20L * 60L * 1000L : 10L * 60L * 1000L
-    long renderedCount = parseLongOrDefault(renderedTestCount, 0L)
-    long estimatedMs = renderedCount * defaultUnknownMs
-    int knownCount = 0
-    int unknownCount = renderedCount as int
-
-    try {
-        def durationText = readFile(file: "${llmSrc}/tests/integration/defs/.test_durations")
-        def durations = new groovy.json.JsonSlurperClassic().parseText(durationText)
-        long knownMs = 0L
-        int totalCount = 0
-        int missingCount = 0
-        readFile(file: testListPath).readLines().each { line ->
-            def keys = durationLookupKeys(line)
-            if (keys) {
-                totalCount++
-                def durationSeconds = keys.collect { durations[it] }.find { it != null }
-                if (durationSeconds != null) {
-                    knownCount++
-                    knownMs += durationSecondsToMillis(durationSeconds)
-                } else {
-                    missingCount++
-                }
-            }
-        }
-        if (totalCount > 0) {
-            unknownCount = missingCount
-            estimatedMs = knownMs + (missingCount * defaultUnknownMs)
-        }
-    } catch (Exception e) {
-        echo "[CI-BUDGET] ${stageName}: failed to read .test_durations; using count-based estimate. Error: ${e.toString()}"
+    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount)
+    if (estimate.error) {
+        echo "[CI-BUDGET] ${stageName}: failed to read .test_durations; using count-based estimate. Error: ${estimate.error}"
     }
 
-    if (estimatedMs <= 0L && renderedCount > 0L) {
-        estimatedMs = renderedCount * defaultUnknownMs
-    }
-    GlobalState.stageAttemptEstimateMs[stageName] = estimatedMs
+    GlobalState.stageAttemptEstimateMs[stageName] = estimate.estimatedMs
     GlobalState.stageAttemptEstimateDetails[stageName] = [
-        renderedCount: renderedCount,
-        knownCount: knownCount,
-        unknownCount: unknownCount,
+        renderedCount: estimate.renderedCount,
+        knownCount: estimate.knownCount,
+        unknownCount: estimate.unknownCount,
     ]
     echo "[CI-BUDGET] ${stageName}: recorded test runtime estimate " +
-         "${trtllm_utils.formatCiBudgetMillis(estimatedMs)} " +
-         "(rendered=${renderedCount}, known=${knownCount}, unknown=${unknownCount})"
+         "${trtllm_utils.formatCiBudgetMillis(estimate.estimatedMs)} " +
+         "(rendered=${estimate.renderedCount}, known=${estimate.knownCount}, unknown=${estimate.unknownCount})"
 }
 
 long estimateStageRetryRuntimeMs(String stageName, String scope)
 {
-    long testEstimateMs = parseLongOrDefault(GlobalState.stageAttemptEstimateMs[stageName], 0L)
+    Long testEstimateValue = trtllm_utils.parseCiBudgetLong(GlobalState.stageAttemptEstimateMs[stageName])
+    long testEstimateMs = testEstimateValue != null ? testEstimateValue : 0L
     if (testEstimateMs > 0L) {
         long overheadMs = scope == InfraFailure.SLURM ? 45L * 60L * 1000L : 30L * 60L * 1000L
         return testEstimateMs + overheadMs
@@ -1809,9 +1729,11 @@ boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error,
     if (!(classified instanceof InfraFailure)) {
         return false
     }
-    int attempt = parseLongOrDefault(retryContext.attempt, 1L) as int
+    Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
+    int attempt = parsedAttempt != null ? parsedAttempt as int : 1
     int effectiveMax = retryMaxForFailure(scope, classified)
-    long backoffMs = parseLongOrDefault(retryContext.backoffMs, 60L * 1000L)
+    Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
+    long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
     return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
 }
 
