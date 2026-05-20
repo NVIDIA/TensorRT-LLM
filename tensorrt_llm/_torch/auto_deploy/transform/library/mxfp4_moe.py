@@ -584,9 +584,7 @@ class InsertMXFP4MLP(BaseTransform):
             top_k = _get_topk_from_router(routing_node)
 
             gu_w_name = gate_up_w_node.target
-            gu_b_name = gate_up_b_node.target
             dn_w_name = down_w_node.target
-            dn_b_name = down_b_node.target
 
             # Shapes from the bf16 placeholders (meta is fine — only .shape is read).
             # gu_w shape: [E, H, 2I]; dn_w shape: [E, I, H] (we infer I from gu_w).
