@@ -275,6 +275,20 @@ def _extract_generation_params(mapping: dict[str, Any]) -> dict[str, Any]:
     return _normalize_steps_alias(params)
 
 
+def _deep_merge_mappings(
+    base: dict[str, Any],
+    overrides: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overrides.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_mappings(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _normalize_dataset(
     loaded: Any,
     dataset_path: pathlib.Path,
@@ -357,7 +371,7 @@ def _normalize_dataset(
         if generated_path is None and not isinstance(prompt, str):
             raise ValueError(f"Dataset sample {sample_id} must provide a string prompt.")
 
-        sample_params = defaults | _extract_generation_params(sample)
+        sample_params = _deep_merge_mappings(defaults, _extract_generation_params(sample))
         samples.append(
             {
                 "id": sample_id,
@@ -462,8 +476,20 @@ def _extract_video(output: Any) -> Any:
     if isinstance(video, (list, tuple)):
         if not video:
             raise ValueError("VisualGen returned an empty video list.")
+        if len(video) > 1:
+            raise ValueError(
+                f"VisualGen returned {len(video)} videos for one sample; batch size > 1 "
+                "is not supported by this LPIPS evaluator."
+            )
         video = video[0]
     if isinstance(video, torch.Tensor):
+        if video.dim() == 5:
+            if video.shape[0] != 1:
+                raise ValueError(
+                    f"VisualGen returned video batch size {video.shape[0]}; batch size > 1 "
+                    "is not supported by this LPIPS evaluator."
+                )
+            video = video[0]
         return video.detach().cpu()
     return video
 
@@ -558,9 +584,15 @@ def _resolve_output_path(
 
     if output_path.is_absolute():
         return output_path
-    if output_dir is not None:
-        return output_dir / output_path
-    return dataset_dir / output_path
+
+    base_dir = output_dir if output_dir is not None else dataset_dir
+    resolved_base_dir = base_dir.resolve(strict=False)
+    resolved_output_path = (resolved_base_dir / output_path).resolve(strict=False)
+    try:
+        resolved_output_path.relative_to(resolved_base_dir)
+    except ValueError as exc:
+        raise ValueError(f"Output path escapes base directory: {output_path}") from exc
+    return resolved_output_path
 
 
 def _save_image(image: Any, output_path: pathlib.Path) -> None:
@@ -741,7 +773,7 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     scores = [sample["lpips_score"] for sample in sample_results]
     mean_score = float(sum(scores) / len(scores))
-    passed = None if threshold is None else mean_score < threshold
+    passed = None if threshold is None else mean_score <= threshold
     return {
         "model": args.model,
         "resolved_model": resolved_model,
@@ -787,7 +819,7 @@ def main() -> None:
     if result["passed"] is False:
         raise RuntimeError(
             f"Mean LPIPS score {result['mean_lpips_score']:.6f} "
-            f"exceeds threshold {result['threshold']:.6f}."
+            f"must be <= threshold {result['threshold']:.6f}."
         )
 
 
