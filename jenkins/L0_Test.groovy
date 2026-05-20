@@ -1665,27 +1665,49 @@ def parseLongOrDefault(def value, long defaultValue)
     if (value == null) {
         return defaultValue
     }
+    if (value instanceof Number) {
+        return value.longValue()
+    }
     try {
-        return new BigDecimal(value.toString().trim()).longValue()
-    } catch (Exception ignored) {
+        return Long.parseLong(value.toString().trim())
+    } catch (NumberFormatException ignored) {
         return defaultValue
     }
 }
 
-def normalizeDurationLookupKey(String rawLine)
+long durationSecondsToMillis(def durationSeconds)
+{
+    if (durationSeconds == null) {
+        return 0L
+    }
+    double seconds
+    if (durationSeconds instanceof Number) {
+        seconds = durationSeconds.doubleValue()
+    } else {
+        seconds = Double.parseDouble(durationSeconds.toString().trim())
+    }
+    return Math.round(seconds * 1000D)
+}
+
+def durationLookupKeys(String rawLine)
 {
     if (rawLine == null) {
-        return null
+        return []
     }
     def testName = rawLine.trim()
     if (!testName || testName.startsWith("#")) {
-        return null
+        return []
     }
     testName = testName.replaceAll(/\s+(SKIP|TIMEOUT|ISOLATION)(\s*\([^)]*\))?.*$/, "").trim()
-    if (testName.startsWith("test_unittests.py::test_unittests_v2[") && testName.endsWith("]")) {
-        testName = testName.substring(testName.indexOf("[") + 1, testName.lastIndexOf("]"))
+    if (!testName) {
+        return []
     }
-    return testName ?: null
+    def keys = [testName]
+    def wrapperMatch = (testName =~ /^[^/]*test\w+\.py::(?:\w+::)*\w+\[(.+)\]$/)
+    if (wrapperMatch.matches()) {
+        keys << wrapperMatch[0][1]
+    }
+    return keys.unique()
 }
 
 def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount)
@@ -1703,13 +1725,13 @@ def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListP
         int totalCount = 0
         int missingCount = 0
         readFile(file: testListPath).readLines().each { line ->
-            def key = normalizeDurationLookupKey(line)
-            if (key) {
+            def keys = durationLookupKeys(line)
+            if (keys) {
                 totalCount++
-                def durationSeconds = durations[key]
+                def durationSeconds = keys.collect { durations[it] }.find { it != null }
                 if (durationSeconds != null) {
                     knownCount++
-                    knownMs += (new BigDecimal(durationSeconds.toString()) * 1000G).longValue()
+                    knownMs += durationSecondsToMillis(durationSeconds)
                 } else {
                     missingCount++
                 }
