@@ -1,30 +1,51 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ``prepare_trtllm_gen_moe_mxfp4_weights``.
+"""Unit tests for the trtllm-gen MXFP4 MoE custom-op family.
 
-These tests mirror the gpt-oss-120b MoE/GEMM structure (small E/H/I) and pin
-the kernel-layout invariants the trtllm-gen ``bf16_mxe2m1_block_scale_moe_runner``
-relies on:
+Covers two layers of the same code path:
 
-* fc1 / fc2 biases must go through the SAME row permutation as fc1 / fc2
-  weights (gated-act-gemm interleave + epilogue-tile reorder for w3/w1; only
-  the epilogue-tile reorder for w2). Without this the kernel adds the wrong
-  bias to each post-shuffle output row and MoE output is garbage (~2% on
-  gpt-oss-120b GSM8K instead of ~90%).
+1. **Weight preparation** (``prepare_trtllm_gen_moe_mxfp4_weights``) — pins the
+   kernel-layout invariants the trtllm-gen ``bf16_mxe2m1_block_scale_moe_runner``
+   relies on:
+
+   * fc1 / fc2 biases must go through the SAME row permutation as fc1 / fc2
+     weights (gated-act-gemm interleave + epilogue-tile reorder for w3/w1;
+     only the epilogue-tile reorder for w2). Without this the kernel adds the
+     wrong bias to each post-shuffle output row and MoE output is garbage
+     (~2% on gpt-oss-120b GSM8K instead of ~90%).
+   * Byte-identical match against PT's MXFP4 reference loader.
+
+2. **Unified op dispatch** (``trtllm_quant_mxfp4_trtllm_gen_moe_fused``) —
+   the op dispatches to either the bf16 (W4A16) or the MXFP8 (W4A8)
+   trtllm-gen runner depending on the ``act_dtype`` arg. The focus is the
+   dispatch contract: both branches run end-to-end, invalid values raise.
 """
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
-# Permute helpers are CUDA-only because shuffle_matrix is registered there.
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 (op registration)
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
+    prepare_trtllm_gen_moe_mxfp4_weights,
+)
+
+# Both the prep helper and the op rely on ``torch.ops.trtllm.shuffle_matrix``,
+# which is CUDA-only. The op-dispatch tests additionally require Blackwell+
+# (decorated individually).
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="prepare_trtllm_gen_moe_mxfp4_weights relies on torch.ops.trtllm.shuffle_matrix",
+    reason="trtllm-gen MXFP4 MoE prep + op rely on torch.ops.trtllm.shuffle_matrix (CUDA only)",
 )
 
 
-# Sized to match the gpt-oss-120b layout exactly (H=2880, I=2880) but with a
-# small expert count to keep the test cheap.
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+# gpt-oss-120b layout (H=2880, I=2880) for the prep tests (kernel-layout
+# invariants depend on the real padded shapes); op-dispatch tests use a
+# smaller H/I to keep runtime down.
 GPTOSS_HIDDEN_SIZE = 2880
 GPTOSS_INTERMEDIATE_SIZE = 2880
 NUM_EXPERTS = 4
@@ -53,6 +74,73 @@ def _build_synthetic_mxfp4_inputs(
     return gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias
 
 
+def _make_random_mxfp4_inputs(
+    *,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: str = "cuda",
+):
+    """Build a minimal set of raw HF-layout MXFP4 weights + scales + biases for op-dispatch tests.
+
+    Values are random but consistent in shape with HF MXFP4 safetensors:
+      * blocks  ``[E, 2I, H/32, 16]``  uint8 (packed nibbles)
+      * scales  ``[E, 2I, H/32]``      uint8 (UE8M0)
+      * biases  ``[E, 2I]``            bf16
+    and mirrored for ``down_*`` with H and I swapped.
+    """
+    H = hidden_size
+    I = intermediate_size  # noqa: E741
+    E = num_experts
+    assert H % 32 == 0 and I % 32 == 0, "H and I must be multiples of 32 (MXFP4 block size)."
+
+    gate_up_blocks = torch.randint(
+        0, 256, (E, 2 * I, H // 32, 16), dtype=torch.uint8, device=device
+    )
+    gate_up_scales = torch.randint(126, 130, (E, 2 * I, H // 32), dtype=torch.uint8, device=device)
+    gate_up_bias = torch.randn(E, 2 * I, dtype=torch.bfloat16, device=device) * 0.01
+
+    down_blocks = torch.randint(0, 256, (E, H, I // 32, 16), dtype=torch.uint8, device=device)
+    down_scales = torch.randint(126, 130, (E, H, I // 32), dtype=torch.uint8, device=device)
+    down_bias = torch.randn(E, H, dtype=torch.bfloat16, device=device) * 0.01
+
+    return (
+        gate_up_blocks,
+        gate_up_scales,
+        gate_up_bias,
+        down_blocks,
+        down_scales,
+        down_bias,
+    )
+
+
+def _call_op(prep, *, act_dtype, x, router_weight, router_bias, top_k=2):
+    return torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_moe_fused(
+        x,
+        router_weight,
+        router_bias,
+        top_k,
+        prep.fc1_weights_mxfp4,
+        prep.fc2_weights_mxfp4,
+        prep.fc1_weights_scale_ue8m0,
+        prep.fc2_weights_scale_ue8m0,
+        prep.fc1_bias_f32,
+        prep.fc2_bias_f32,
+        # SwiGLU constants (gpt-oss defaults).
+        torch.full((prep.fc1_bias_f32.shape[0],), 1.702, dtype=torch.float32, device=x.device),
+        torch.full((prep.fc1_bias_f32.shape[0],), 1.0, dtype=torch.float32, device=x.device),
+        torch.full((prep.fc1_bias_f32.shape[0],), 7.0, dtype=torch.float32, device=x.device),
+        prep.valid_hidden_size,
+        prep.valid_intermediate_size,
+        act_dtype,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section 1: weight-preparation invariants (CPU/CUDA, SM-agnostic shuffle ops)
+# ---------------------------------------------------------------------------
+
+
 def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
     """Regression: fc1 bias must follow the gated-act-gemm + TMA row permute.
 
@@ -60,9 +148,6 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
     padded (not shuffled), causing the trtllm-gen kernel to add the wrong
     bias to each output row.
     """
-    from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
-        prepare_trtllm_gen_moe_mxfp4_weights,
-    )
     from tensorrt_llm._torch.modules.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w3_w1_permute_indices,
     )
@@ -118,9 +203,6 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
 
 def test_fc2_bias_is_shuffled_with_same_row_permutation_as_fc2_weights():
     """Regression: fc2 bias must follow the (non-gated) TMA row permute used by w2."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
-        prepare_trtllm_gen_moe_mxfp4_weights,
-    )
     from tensorrt_llm._torch.modules.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w2_permute_indices,
     )
@@ -172,9 +254,6 @@ def test_prep_against_pt_reference_loader_byte_identical():
     load_expert_w2_weight_scale_mxfp4}`` is the gold standard the AD prep
     helper must mirror.  Any divergence here is a kernel-layout bug.
     """
-    from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
-        prepare_trtllm_gen_moe_mxfp4_weights,
-    )
     from tensorrt_llm._torch.modules.fused_moe.quantization import (
         _get_weight_alignment,
         maybe_pad_for_mxfp4,
@@ -297,3 +376,76 @@ def test_prep_against_pt_reference_loader_byte_identical():
     assert torch.equal(prep.fc2_weights_mxfp4, fc2_weight_ref_t)
     assert torch.equal(prep.fc2_weights_scale_ue8m0, fc2_scale_ref_t)
     torch.testing.assert_close(prep.fc2_bias_f32, fc2_bias_ref_t, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Section 2: unified op act_dtype dispatch (Blackwell+ only)
+# ---------------------------------------------------------------------------
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("act_dtype", ["bf16", "mxfp8"])
+def test_trtllm_quant_mxfp4_trtllm_gen_moe_fused_act_dtype_dispatch(act_dtype):
+    """Both ``act_dtype`` branches run end-to-end on Blackwell.
+
+    Verifies that each branch yields a finite output of the expected shape/dtype.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    E, H, I_, top_k = 4, 256, 64, 2
+    B = 8
+
+    inputs = _make_random_mxfp4_inputs(
+        num_experts=E, hidden_size=H, intermediate_size=I_, device=device
+    )
+    prep = prepare_trtllm_gen_moe_mxfp4_weights(
+        *inputs, hidden_size=H, intermediate_size=I_, tp_size=1, tp_rank=0
+    )
+
+    x = torch.randn(B, H, dtype=torch.bfloat16, device=device)
+    router_weight = torch.randn(E, H, dtype=torch.bfloat16, device=device) * 0.02
+    router_bias = torch.zeros(E, dtype=torch.bfloat16, device=device)
+
+    y = _call_op(
+        prep,
+        act_dtype=act_dtype,
+        x=x,
+        router_weight=router_weight,
+        router_bias=router_bias,
+        top_k=top_k,
+    )
+
+    assert y.shape == (B, H), f"unexpected output shape {tuple(y.shape)}, want {(B, H)}"
+    assert y.dtype == torch.bfloat16, f"unexpected output dtype {y.dtype}"
+    assert torch.isfinite(y).all(), f"non-finite output for act_dtype={act_dtype!r}"
+
+
+@skip_pre_blackwell
+def test_trtllm_quant_mxfp4_trtllm_gen_moe_fused_invalid_act_dtype():
+    """Invalid ``act_dtype`` raises ``ValueError``.
+
+    Loud failure, no silent dispatch to one of the two real branches.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    E, H, I_ = 4, 256, 64
+
+    inputs = _make_random_mxfp4_inputs(
+        num_experts=E, hidden_size=H, intermediate_size=I_, device=device
+    )
+    prep = prepare_trtllm_gen_moe_mxfp4_weights(
+        *inputs, hidden_size=H, intermediate_size=I_, tp_size=1, tp_rank=0
+    )
+
+    x = torch.randn(8, H, dtype=torch.bfloat16, device=device)
+    router_weight = torch.randn(E, H, dtype=torch.bfloat16, device=device) * 0.02
+    router_bias = torch.zeros(E, dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(ValueError, match="act_dtype"):
+        _call_op(
+            prep,
+            act_dtype="fp16_invalid",
+            x=x,
+            router_weight=router_weight,
+            router_bias=router_bias,
+        )
