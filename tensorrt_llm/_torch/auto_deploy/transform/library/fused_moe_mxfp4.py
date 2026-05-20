@@ -30,7 +30,7 @@ from ..interface import BaseTransform, TransformConfig, TransformInfo, Transform
 
 # MXFP4 layout constants (mirror the on-disk HF format the trtllm-gen kernel
 # consumes). Used by both the load hook below and the TP-aware pre-pad math
-# in ``InsertMXFP4MLP._apply_trtllm``.
+# in ``QuantizeMXFP4MOE._apply_trtllm``.
 _MXFP4_SCALING_VECTOR_SIZE = 32
 _WEIGHT_ALIGNMENT = 128
 
@@ -94,7 +94,7 @@ def _moe_dense_mlp_repl(
 
 
 @TransformRegistry.register("match_dense_moe_pattern")
-class MatchMOEDenseMLP(BaseTransform):
+class MatchMXFP4MoePattern(BaseTransform):
     def _apply(
         self,
         gm: GraphModule,
@@ -422,7 +422,7 @@ def make_swiglu_param_tensors(
     return a, b, c
 
 
-class InsertMXFP4MLPConfig(TransformConfig):
+class QuantizeMXFP4MOEConfig(TransformConfig):
     """Configuration for ``quantize_mxfp4_moe``."""
 
     backend: Optional[MxFP4Backend] = Field(
@@ -448,7 +448,7 @@ class InsertMXFP4MLPConfig(TransformConfig):
 
 
 @TransformRegistry.register("quantize_mxfp4_moe")
-class InsertMXFP4MLP(BaseTransform):
+class QuantizeMXFP4MOE(BaseTransform):
     """Quantize MXFP4 MoE: dispatch to triton or trtllm-gen backend.
 
     Replaces ``(torch_moe_router -> torch_moe_dense_mlp)`` with a single fused
@@ -466,11 +466,11 @@ class InsertMXFP4MLP(BaseTransform):
     """
 
     algo_name: str = "mxfp4"
-    config: InsertMXFP4MLPConfig
+    config: QuantizeMXFP4MOEConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return InsertMXFP4MLPConfig
+        return QuantizeMXFP4MOEConfig
 
     def _resolve_backend(self) -> MxFP4Backend:
         """Resolve the effective backend from config + runtime SM.
@@ -1034,32 +1034,14 @@ class FuseMXFP4MoeConfig(TransformConfig):
 
 @TransformRegistry.register("fuse_mxfp4_moe")
 class FuseMXFP4Moe(BaseTransform):
-    """GPU-side MXFP4 MoE weight prep for the trtllm-gen backend.
+    """POST_LOAD_FUSION transform: GPU-side MXFP4 MoE weight prep for the trtllm-gen backend.
 
-    Runs at POST_LOAD_FUSION, after raw HF MXFP4 buffers have been loaded onto the experts
-    modules by ``quantize_mxfp4_moe`` (backend=trtllm) + the slim EP-slice load hook.
+    Runs after ``QuantizeMXFP4MOE`` registered raw HF MXFP4 buffers and the EP-slice load hook
+    populated them. For each ``trtllm_mxfp4_w4a{8,16}_moe_fused`` node, calls
+    :func:`prepare_trtllm_gen_moe_mxfp4_weights` on the loaded GPU tensors to produce the kernel
+    layout, swaps the op args to the prepared params, and deletes the raw buffers.
 
-    For each ``trtllm_mxfp4_w4a{8,16}_moe_fused`` node whose first weight argument still
-    references a raw ``gate_up_proj_blocks`` buffer:
-
-    1. Read the six raw GPU buffers (gate_up_proj_{blocks,scales,bias} and
-       down_proj_{blocks,scales,bias}) from the experts module.
-    2. Call :func:`prepare_trtllm_gen_moe_mxfp4_weights` on GPU to produce the trtllm-gen kernel
-       layout (pad + shuffle + interleave + bf16->fp32 bias). Intermediate-axis TP slicing
-       happens inside the prep helper.
-    3. Register the six prepared params on the experts module (``fc1_w_trtllm``,
-       ``fc1_w_scale_trtllm``, ``fc1_bias_trtllm``, ``fc2_w_trtllm``, ``fc2_w_scale_trtllm``,
-       ``fc2_bias_trtllm``).
-    4. Update the op call's weight args + insert new ``get_attr`` nodes pointing at the prepared
-       params; old raw ``get_attr`` nodes are erased by graph cleanup if their use-count drops to
-       zero.
-    5. Delete the raw module params and tighten ``_dtype_protected_params`` to the prepared-name
-       list (so any later ``.to(dtype)`` walk protects the kernel-required dtypes).
-
-    Skipping rules:
-      - Op target not ``trtllm_mxfp4_w4a{8,16}_moe_fused``: ignore.
-      - First weight arg's get_attr target name doesn't end in ``gate_up_proj_blocks``: assume
-        already prepped, ignore.
+    Skipped when the op already references prepared params (idempotent).
     """
 
     config: FuseMXFP4MoeConfig
