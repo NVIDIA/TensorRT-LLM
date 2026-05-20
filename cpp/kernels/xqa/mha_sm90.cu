@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -318,9 +318,10 @@ struct KVTilePartLoader
 
     CUtensorMap const& tensorMap;
 #if USE_PAGED_KV_CACHE
-    uint32_t const nbPages; // for bound check
+    uint32_t const nbPages;            // for bound check
+    uint32_t const nbSkipLeadingPages; // pages fully outside the sliding window
     Vec<KVCachePageIndex, nbPagesPerTile>& pages;
-    uint32_t idxTileRef;    // idxTile used to load the pages
+    uint32_t idxTileRef;               // idxTile used to load the pages
 #endif
     uint32_t const baseOffset;
 
@@ -328,7 +329,7 @@ struct KVTilePartLoader
         uint32_t idxReq, uint32_t idxHeadGrp, CUtensorMap const& tensorMap
 #if USE_PAGED_KV_CACHE
         ,
-        uint32_t nbPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
+        uint32_t nbPages, uint32_t nbSkipLeadingPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
 #endif
     );
     // tensorMap is for one whole page ([nbKHeads*tokensPerPage][headElems]) or whole cache
@@ -760,6 +761,9 @@ CUBIN_EXPORT __global__
 #else
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
+#endif
+#if USE_PAGED_KV_CACHE
+    uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
 #endif
     uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / tileSize;
     uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % tileSize;
@@ -1501,7 +1505,7 @@ CUBIN_EXPORT __global__
 #else
                     tensorMap,
 #endif
-                    nbPages, smem.pages[0]
+                    nbPages, nbSkipLeadingPages, smem.pages[0]
 #else
                     tensorMap
 #endif
@@ -1575,7 +1579,7 @@ CUBIN_EXPORT __global__
 #else
                     tensorMap,
 #endif
-                    nbPages, smem.pages[1]
+                    nbPages, nbSkipLeadingPages, smem.pages[1]
 #else
                     tensorMap
 #endif
@@ -1970,7 +1974,7 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(bool isK, uint32_t nbKHeads
     KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq, uint32_t idxHeadGrp, CUtensorMap const& tensorMap
 #if USE_PAGED_KV_CACHE
     ,
-    uint32_t nbPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
+    uint32_t nbPages, uint32_t nbSkipLeadingPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
 #endif
     )
     : nbKHeads{nbKHeads}
@@ -1980,6 +1984,7 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(bool isK, uint32_t nbKHeads
     , tensorMap{tensorMap}
 #if USE_PAGED_KV_CACHE
     , nbPages{nbPages}
+    , nbSkipLeadingPages{nbSkipLeadingPages}
     , pages{pageBuf}
 #if PAGED_KV_CACHE_LAYOUT == 1
     , baseOffset{idxReq * cacheList.maxNbPagesPerSeq}
@@ -2040,7 +2045,9 @@ __device__ inline void KVTilePartLoader::loadPages(uint32_t idxTile)
     for (uint32_t i = 0; i < nbPagesPerTile; i++)
     {
         uint32_t const idxPage = idxPageBeg + i;
-        auto const page = idxPage < nbPages ? cacheList.kvCachePageList[baseOffset + idxPage] : kBAD_PAGE_INDEX;
+        auto const page = (idxPage >= nbSkipLeadingPages && idxPage < nbPages)
+            ? cacheList.kvCachePageList[baseOffset + idxPage]
+            : kBAD_PAGE_INDEX;
         if (warpElectSync())
         {
             pages[i] = page;
