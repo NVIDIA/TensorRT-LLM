@@ -336,6 +336,7 @@ def main():
         config = yaml.safe_load(f)
 
     is_gb300 = "GB300" in args.stage_name.upper()
+    is_b200 = "B200" in args.stage_name.upper() and "GB200" not in args.stage_name.upper()
 
     # Determine install script path
     install_script = args.install_sh
@@ -392,16 +393,13 @@ def main():
 
     pytest_common_vars = ""
 
-    ucx_tls_cmd = (
-        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        if is_gb300
-        else "unset UCX_TLS UCX_NET_DEVICES &&"
-    )
-    ucx_tls_server_cmd = (
-        "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        if is_gb300
-        else "unset UCX_TLS UCX_NET_DEVICES &&"
-    )
+    if is_gb300:
+        ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
+    elif is_b200:
+        ucx_tls_cmd = "export UCX_TLS=^ib &&"
+    else:
+        ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+    ucx_tls_server_cmd = ucx_tls_cmd
 
     script_prefix_lines.extend(
         [

@@ -334,6 +334,24 @@ class DeepseekV3WeightLoader:
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
 
+        def detect_shared_mtp_weights() -> bool:
+            # Detect if MTP layers share checkpoint weights (model requests more
+            # MTP layers than the checkpoint provides). In this case, multiple
+            # model MTP layers map to the same checkpoint layer via modulo, and
+            # mark_consumed must be skipped to avoid deleting weights that later
+            # MTP layers still need.
+            ckpt_nextn = self.config.num_nextn_predict_layers or 0
+            spec_config = self.model_config.spec_config
+            if spec_config is not None and hasattr(
+                    spec_config, 'spec_dec_mode'
+            ) and spec_config.spec_dec_mode.is_mtp_one_model():
+                model_nextn = spec_config.num_nextn_predict_layers or 0
+            else:
+                model_nextn = 0
+            return model_nextn > ckpt_nextn > 0
+
+        has_shared_mtp_weights = detect_shared_mtp_weights()
+
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -343,14 +361,17 @@ class DeepseekV3WeightLoader:
             else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
+                is_shared_mtp_layer = False
                 if "model.layers" in name and int(
                         names[2]) >= self.config.num_hidden_layers:
+                    is_shared_mtp_layer = has_shared_mtp_weights
                     mtp_layer_idx = int(
                         names[2]) - self.config.num_hidden_layers
                     names[2] = str(mtp_layer_idx %
                                    self.config.num_nextn_predict_layers +
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
+                mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
                     dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
@@ -410,7 +431,7 @@ class DeepseekV3WeightLoader:
                                 ).view(*attn_module.v_b_proj_dequant.shape).to(
                                     attn_module.v_b_proj_dequant.dtype))
                     # Mark consumed kv_b_proj weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = self.model_config.get_quant_config(
@@ -535,7 +556,7 @@ class DeepseekV3WeightLoader:
                                 0:fused_a_scale.shape[0]].copy_(fused_a_scale)
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                     # Mark consumed kv_a_proj_with_mqa and q_a_proj weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         parent_prefix = '.'.join(names[:-1])
                         weights.mark_consumed(
                             f"{parent_prefix}.kv_a_proj_with_mqa")
@@ -549,7 +570,7 @@ class DeepseekV3WeightLoader:
                                            weights))
                     module.load_weights(weights=module_weights)
                     # Mark consumed source weights (e.g., gate_proj, up_proj)
-                    if can_mark_consumed:
+                    if mark_consumed:
                         for src_name in params_map[names[-1]]:
                             weights.mark_consumed('.'.join(names[:-1] +
                                                            [src_name]))
@@ -562,7 +583,7 @@ class DeepseekV3WeightLoader:
                     })
                     module.load_weights(weights=[module_weights])
                     # Mark consumed experts weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
@@ -580,7 +601,7 @@ class DeepseekV3WeightLoader:
                     })
                     module.load_weights(weights=[module_weights])
                     # Mark consumed MoE weights using parent name
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     continue
@@ -594,7 +615,7 @@ class DeepseekV3WeightLoader:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
                     # Mark consumed weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
 
 

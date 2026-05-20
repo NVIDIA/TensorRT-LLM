@@ -154,10 +154,6 @@ CI is triggered by posting comments on the PR. Basic commands:
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 
-### Retrieving CI Test Failures from a PR
-
-See the CI failure retrieval skill (`.claude/skills/ci-failure-retrieval/SKILL.md`) for step-by-step scripts to query Jenkins test results via the API.
-
 ### Trouble Shooting
 
 - Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.

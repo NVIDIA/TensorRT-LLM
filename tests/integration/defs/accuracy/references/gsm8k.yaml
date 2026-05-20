@@ -205,8 +205,9 @@ Qwen/Qwen3.5-4B:
     kv_cache_quant_algo: FP8
     accuracy: 80.5
 Qwen/Qwen3.5-35B-A3B:
-  - dtype: bfloat16
-    accuracy: 89.196
+  - accuracy: 89.196
+  - extra_acc_spec: h20
+    accuracy: 83.9
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88.32
 Qwen/Qwen3.5-397B-A17B:
@@ -283,6 +284,10 @@ google/gemma-3-27b-it:
     accuracy: 90.66
 google/gemma-4-26B-A4B-it:
   - accuracy: 90.83
+google/gemma-3n-E2B-it:
+  - accuracy: 72.176
+google/gemma-4-E2B-it:
+  - accuracy: 85.709
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 79.25
   - quant_algo: FP8

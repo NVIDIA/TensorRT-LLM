@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -12,7 +16,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Adapted from: https://huggingface.co/nvidia/Nemotron-Flash-3B-Instruct/tree/main
+# Adapted from NVIDIA's Nemotron-Flash-3B-Instruct model (Apache-2.0, NVIDIA CORPORATION):
+# https://huggingface.co/nvidia/Nemotron-Flash-3B-Instruct/tree/main
 import copy
 import math
 from typing import List, Optional, Tuple, Union
@@ -892,7 +897,7 @@ class NemotronFlashPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["NemotronFlashAttentionDecoderLayer", "NemotronFlashMambaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_cache_class = True
 
