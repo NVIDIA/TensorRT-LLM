@@ -639,6 +639,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_manager_py_config = config
 
         self.impl = KVCacheManagerPy(config)
+        # Order V2 storage migration copies after the executor forward stream.
+        self.impl._storage._execution_stream = self._stream.cuda_stream
 
         self.num_pools = len(self.impl.layer_grouping)
 

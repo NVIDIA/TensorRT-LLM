@@ -29,6 +29,7 @@ from ._common import (
     BlockOrdinal,
     CacheLevel,
     CacheTier,
+    CudaStream,
     LayerId,
     MemAddress,
     PageStatus,
@@ -549,6 +550,14 @@ class StorageManager:
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
+            # Like V1's syncWithBufferManager(): record a fresh event on
+            # execution_stream so the copy stream waits for all prior
+            # forward-pass work, not just the (potentially stale) page
+            # ready_events.  This is the V2 equivalent of the explicit
+            # two-way sync that V1 performs between its BufferManager
+            # stream and offload/onboard streams.
+            if self._execution_stream is not None and not defrag:
+                prior_events.add(CachedCudaEvent(self._execution_stream))
             tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
                 lambda _: list[CopyTask](), num_pools
             )
