@@ -41,23 +41,9 @@ two-kernel pair in ``_deepseek_v4_o_proj``. The output is consumed verbatim by
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
-
-# Lazy import of the CuTe DSL backend. Triton is the default path; CuTe DSL
-# is a perf-tied alternative (microbench-verified within ~0.05% of Triton at
-# M >= 2048, and within the cross-allocation noise floor at M <= 1024). Opt
-# in via `TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1` for future kernel work (TMA /
-# warp-spec V2 will build on this scaffold). Import failure is non-fatal.
-try:
-    from ..cute_dsl_kernels.blackwell import (  # noqa: F401
-        fused_inv_rope_fp8_quant as _cute_dsl_backend,
-    )
-except Exception:
-    _cute_dsl_backend = None  # type: ignore[assignment]
 
 
 @triton.jit
@@ -338,27 +324,6 @@ def _fused_inv_rope_fp8_quant_impl(
     quant_group_size: int,
     is_neox: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Optional CuTe DSL backend. Microbench-tied with the Triton kernel
-    # below (within 0.05 % at M >= 2048 and within the cross-allocation
-    # noise floor at M <= 1024 — 4-allocation median on B200 GB200). Kept
-    # in tree as an alternative implementation that future TMA / warp-spec
-    # work (V2) can build on. Opt in via `TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1`.
-    if (
-        _cute_dsl_backend is not None
-        and _cute_dsl_backend._fused_inv_rope_fp8_quant_impl_cute_dsl is not None
-        and os.environ.get("TLLM_USE_CUTE_DSL_FUSED_INV_ROPE", "0") == "1"
-    ):
-        return _cute_dsl_backend._fused_inv_rope_fp8_quant_impl_cute_dsl(
-            o,
-            positions,
-            cos_sin_cache,
-            n_groups,
-            heads_per_group,
-            nope_dim,
-            rope_dim,
-            quant_group_size,
-            is_neox,
-        )
     num_tokens, num_heads, head_dim = o.shape
     assert num_heads == n_groups * heads_per_group, (
         f"num_heads={num_heads} != n_groups({n_groups}) * heads_per_group({heads_per_group})"

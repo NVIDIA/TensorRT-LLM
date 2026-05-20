@@ -5,17 +5,11 @@ Numerical-equivalence test for the vLLM-ported fused inverse-RoPE +
 FP8 1x128 quantize op.
 
 Compares (mla_rope_inplace -> fp8_batched_quantize_1x128_permute102) against
-the new fused op `trtllm::fused_inv_rope_fp8_quant_vllm_port` on each of its
-backends:
-
-  - default — optimized Triton kernel
-  - `TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1` — opt-in CuTe DSL backend
-    (perf-tied with Triton; kept as scaffold for future TMA / warp-spec V2)
+the new fused op `trtllm::fused_inv_rope_fp8_quant_vllm_port` (optimized
+Triton kernel).
 
 Run inside a CUDA Blackwell (SM100f) container (the TRT-LLM build sqsh).
 """
-
-import os
 
 import pytest
 import torch
@@ -62,13 +56,9 @@ def _fused_path(
     return fp8_fused, scale_fused
 
 
-def _run_neox_compare(num_tokens, backend_env):
-    """Compare the fused op (under the given backend env) against the reference
-    (mla_rope_inplace -> fp8_batched_quantize_1x128_permute102) path.
-
-    `backend_env` is a dict of env vars to set for the duration of the call;
-    pass `{}` for the default (Triton) backend.
-    """
+@pytest.mark.parametrize("num_tokens", [3, 64, 257, 512, 1024, 2048, 8192])
+def test_fused_inv_rope_fp8_quant_neox(num_tokens):
+    """Optimized Triton kernel vs the legacy 2-kernel reference."""
     torch.manual_seed(0)
     device = "cuda"
     n_groups = 4
@@ -91,29 +81,16 @@ def _run_neox_compare(num_tokens, backend_env):
     fp8_ref, scale_ref = _ref_path(
         o_bf16, position_ids, rotary_cos_sin, num_heads, n_groups, nope_dim, rope_dim, is_neox=True
     )
-
-    # Apply backend env vars (e.g. TLLM_FUSED_INV_ROPE_FP8_USE_CUTE_DSL=1)
-    # only for the duration of the fused call.
-    saved = {k: os.environ.get(k) for k in backend_env}
-    try:
-        for k, v in backend_env.items():
-            os.environ[k] = v
-        fp8_fused, scale_fused = _fused_path(
-            o_bf16,
-            position_ids,
-            rotary_cos_sin,
-            n_groups,
-            heads_per_group,
-            nope_dim,
-            rope_dim,
-            is_neox=True,
-        )
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    fp8_fused, scale_fused = _fused_path(
+        o_bf16,
+        position_ids,
+        rotary_cos_sin,
+        n_groups,
+        heads_per_group,
+        nope_dim,
+        rope_dim,
+        is_neox=True,
+    )
 
     assert fp8_ref.shape == fp8_fused.shape, (fp8_ref.shape, fp8_fused.shape)
     assert scale_ref.shape == scale_fused.shape, (scale_ref.shape, scale_fused.shape)
@@ -134,9 +111,8 @@ def _run_neox_compare(num_tokens, backend_env):
     deq_fused = dequant(fp8_fused, scale_fused)
     abs_diff = (deq_ref - deq_fused).abs()
     rel = abs_diff.mean() / (deq_ref.abs().mean() + 1e-9)
-    backend_str = ",".join(f"{k}={v}" for k, v in backend_env.items()) or "triton-default"
     print(
-        f"[NEOX num_tokens={num_tokens} backend={backend_str}] "
+        f"[NEOX num_tokens={num_tokens}] "
         f"mean abs diff = {abs_diff.mean().item():.4e}  rel = {rel.item():.4e}  "
         f"max = {abs_diff.max().item():.4e}"
     )
@@ -145,21 +121,7 @@ def _run_neox_compare(num_tokens, backend_env):
     assert rel.item() < 1e-2, f"relative mismatch {rel.item()}"
 
 
-@pytest.mark.parametrize("num_tokens", [3, 64, 257, 512, 1024, 2048, 8192])
-def test_fused_inv_rope_fp8_quant_neox(num_tokens):
-    """Default backend (optimized Triton)."""
-    _run_neox_compare(num_tokens, backend_env={})
-
-
-@pytest.mark.parametrize("num_tokens", [3, 64, 257, 512, 1024, 2048, 8192])
-def test_fused_inv_rope_fp8_quant_neox_cute_dsl(num_tokens):
-    """Opt-in CuTe DSL backend (`TLLM_USE_CUTE_DSL_FUSED_INV_ROPE=1`)."""
-    _run_neox_compare(num_tokens, backend_env={"TLLM_USE_CUTE_DSL_FUSED_INV_ROPE": "1"})
-
-
 if __name__ == "__main__":
     test_fused_inv_rope_fp8_quant_neox(64)
     test_fused_inv_rope_fp8_quant_neox(257)
-    test_fused_inv_rope_fp8_quant_neox_cute_dsl(64)
-    test_fused_inv_rope_fp8_quant_neox_cute_dsl(257)
     print("OK")
