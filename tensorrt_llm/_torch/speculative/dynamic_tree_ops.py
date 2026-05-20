@@ -135,6 +135,8 @@ class DynamicTreeOpsConverter:
                 Use bit-packed mask for memory efficiency.
         """
         bs = topk_score_indices.shape[0]
+        if bs == 0:
+            return
         # +1 because num_draft_tokens includes root node in SGLang's convention
         num_draft_tokens = topk_score_indices.shape[1] + 1
         tree_mask_mode = 2 if use_packed_mask else 1  # QLEN_ONLY_BITPACKING / QLEN_ONLY
