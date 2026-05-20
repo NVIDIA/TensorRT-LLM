@@ -493,7 +493,7 @@ class InsertMXFP4MLP(BaseTransform):
            ``config.trtllm_quant_act``) with args pointing at the **raw**
            params for now. The downstream :class:`FuseMXFP4Moe`
            POST_LOAD_FUSION transform will run
-           :func:`prepare_mxfp4_weights_for_trtllm` on the actually-loaded
+           :func:`swizzle_moe_mxfp4_weights` on the actually-loaded
            GPU tensors, register prepared-shape params, and re-point the op
            args. The op call is therefore not runnable between PATTERN_MATCHER
            and POST_LOAD_FUSION, but no forward pass happens in that window.
@@ -510,7 +510,7 @@ class InsertMXFP4MLP(BaseTransform):
         """
         import re
 
-        from ...custom_ops.fused_moe.mxfp4_weight_prep import (
+        from ...custom_ops.fused_moe.swizzle_moe_mxfp4_weights import (
             make_mxfp4_sharding_load_hook,
             make_swiglu_param_tensors,
         )
@@ -518,7 +518,7 @@ class InsertMXFP4MLP(BaseTransform):
         # MoE topology: prefer the build-time ``DistConfig`` set on
         # ``shared_config`` (mirrors the legacy transform path). The
         # ``_resolve_moe_dist_info`` analogue from modeling code lives in
-        # mxfp4_weight_prep.py as ``_get_default_dist_info``; here we trust
+        # swizzle_moe_mxfp4_weights.py as ``_get_default_dist_info``; here we trust
         # the explicit shared_config first.
         dc = getattr(shared_config, "dist_config", None)
         moe_tp_size = int(getattr(dc, "moe_tp_size", 1)) if dc is not None else 1
@@ -907,7 +907,7 @@ class FuseMXFP4Moe(BaseTransform):
 
     1. Read the six raw GPU buffers (gate_up_proj_{blocks,scales,bias} and
        down_proj_{blocks,scales,bias}) from the experts module.
-    2. Call :func:`prepare_mxfp4_weights_for_trtllm` on GPU to produce the
+    2. Call :func:`swizzle_moe_mxfp4_weights` on GPU to produce the
        trtllm-gen kernel layout (pad + shuffle + interleave + bf16->fp32 bias).
        Intermediate-axis TP slicing happens inside the prep helper.
     3. Register the six prepared params on the experts module
@@ -939,156 +939,224 @@ class FuseMXFP4Moe(BaseTransform):
         factory,
         shared_config,
     ) -> Tuple[GraphModule, TransformInfo]:
-        from ...custom_ops.fused_moe.mxfp4_weight_prep import (
-            prepare_mxfp4_weights_for_trtllm,
+        """Two-pass GPU prep with shared scratch + contiguous prepared blocks.
+
+        Pass 1 (``_collect_moe_nodes``): walk the graph, find every
+        ``trtllm_mxfp4_w4a*_moe_fused`` op whose weight args still reference
+        raw HF buffers, record the per-layer info (experts module path, raw
+        ``get_attr`` nodes, shapes). Cross-layer consistency is asserted
+        (gpt-oss guarantees same H/I/E across all MoE layers).
+
+        Pass 2: allocate ``MXFP4PrepScratch`` once for the per-rank shape.
+        Reused for every layer's pad + shuffle work.
+
+        Pass 3: pre-allocate the SIX prepared ``nn.Parameter`` storages on
+        every experts module *before* any layer's prep runs. This is the
+        fragmentation-prevention step — all prepared blocks for all layers
+        come from the allocator's frontier in one back-to-back run, so no
+        transient alloc/free cycle from the prep work can interleave them.
+
+        Pass 4: per layer, run ``swizzle_moe_mxfp4_weights`` with
+        ``scratch=`` (pad + shuffle outputs land in scratch buffers, no
+        per-layer transient allocations of the big intermediates). Then
+        ``data.copy_`` scratch outputs into the pre-allocated prepared
+        params, re-point the op args, delete raw params + raw get_attrs.
+        """
+        from ...custom_ops.fused_moe.swizzle_moe_mxfp4_weights import (
+            MXFP4PrepScratch,
+            swizzle_moe_mxfp4_weights,
         )
 
-        # Resolve runtime topology — used for TP slicing inside the prep
-        # helper. Mirrors the values read by ``_apply_trtllm`` at
-        # PATTERN_MATCHER time so per-rank shapes stay consistent.
+        # Resolve runtime topology — used to divide ``fc2_bias`` by
+        # ``moe_tp_size`` (the prep helper's tp_size > 1 branch is skipped in
+        # the scratch path, so we do the division ourselves after).
         dc = getattr(shared_config, "dist_config", None)
         moe_tp_size = int(getattr(dc, "moe_tp_size", 1)) if dc is not None else 1
-        moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
 
-        # Identify candidate ops: both w4a8 and w4a16 share the same first-arg
-        # structure (raw ``gate_up_proj_blocks`` get_attr).
+        # Candidate ops: both w4a8 and w4a16 share the same arg layout.
         target_ops = (
             torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused.default,
             torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default,
         )
 
-        num_matches = 0
+        # ---- Pass 1: collect MoE node info, validate consistent shape ----
+        # Arg index layout from ``_apply_trtllm`` (kept in sync; comment
+        # block there documents the full slot list).
+        ARG_FC1_W, ARG_FC2_W, ARG_FC1_S, ARG_FC2_S, ARG_FC1_B, ARG_FC2_B = 4, 5, 6, 7, 8, 9
+
+        layer_infos: list = []
+        e_local_g: Optional[int] = None
+        per_rank_i_g: Optional[int] = None
+        H_g: Optional[int] = None
+        device_g: Optional[torch.device] = None
         for n in list(gm.graph.nodes):
             if n.op != "call_function" or n.target not in target_ops:
                 continue
             if len(n.args) < 13:
                 continue
 
-            # Arg layout from ``_apply_trtllm`` (see comment block there):
-            #   [0]  hidden_node
-            #   [1]  router_weight
-            #   [2]  router_bias
-            #   [3]  top_k
-            #   [4]  fc1_weights_mxfp4      <- raw gate_up_proj_blocks
-            #   [5]  fc2_weights_mxfp4      <- raw down_proj_blocks
-            #   [6]  fc1_weights_scale      <- raw gate_up_proj_scales
-            #   [7]  fc2_weights_scale      <- raw down_proj_scales
-            #   [8]  fc1_bias               <- raw gate_up_proj_bias (bf16)
-            #   [9]  fc2_bias               <- raw down_proj_bias (bf16)
-            #   [10] swiglu_alpha
-            #   [11] swiglu_beta
-            #   [12] swiglu_limit
-            #   [13] valid_hidden_size
-            #   [14] valid_intermediate_size
-            #   [15] local_expert_offset
-            #   [16] num_local_experts
-            #   [17] routing_method_type
-            gu_blocks_node = n.args[4]
-            dn_blocks_node = n.args[5]
-            gu_scales_node = n.args[6]
-            dn_scales_node = n.args[7]
-            gu_bias_node = n.args[8]
-            dn_bias_node = n.args[9]
-
-            # All six must be ``get_attr`` nodes pointing at raw HF buffers.
             raw_get_attrs = (
-                gu_blocks_node,
-                dn_blocks_node,
-                gu_scales_node,
-                dn_scales_node,
-                gu_bias_node,
-                dn_bias_node,
+                n.args[ARG_FC1_W],  # gate_up_proj_blocks
+                n.args[ARG_FC2_W],  # down_proj_blocks
+                n.args[ARG_FC1_S],  # gate_up_proj_scales
+                n.args[ARG_FC2_S],  # down_proj_scales
+                n.args[ARG_FC1_B],  # gate_up_proj_bias
+                n.args[ARG_FC2_B],  # down_proj_bias
             )
             if not all(
                 isinstance(a, Node) and a.op == "get_attr" for a in raw_get_attrs
             ):
                 continue
-            if not str(gu_blocks_node.target).endswith("gate_up_proj_blocks"):
+            if not str(raw_get_attrs[0].target).endswith("gate_up_proj_blocks"):
                 # Already prepped or unexpected layout — skip.
                 continue
 
-            # Locate the experts module via the raw param path.
-            gu_blocks_name = gu_blocks_node.target
+            gu_blocks_name = raw_get_attrs[0].target
             experts_mod, experts_path, _ = get_submodule_of_param(gm, gu_blocks_name)
-
-            # Read raw GPU tensors and run kernel-layout prep on GPU.
-            # The load hook already did EP + TP slicing on CPU, so the
-            # tensors here are at the per-rank intermediate size. We pass
-            # ``tp_size=1`` to the prep helper to skip its TP-slice path
-            # (would slice again otherwise), and divide the bias by the
-            # *actual* ``moe_tp_size`` ourselves afterwards.
             gu_blocks = gm.get_parameter(gu_blocks_name).data
-            gu_scales = gm.get_parameter(gu_scales_node.target).data
-            gu_bias = gm.get_parameter(gu_bias_node.target).data
-            dn_blocks = gm.get_parameter(dn_blocks_node.target).data
-            dn_scales = gm.get_parameter(dn_scales_node.target).data
-            dn_bias = gm.get_parameter(dn_bias_node.target).data
+            dn_blocks = gm.get_parameter(raw_get_attrs[1].target).data
 
-            # Infer per-rank dims from the (already EP+TP-sliced) raw shapes.
             e_local = int(gu_blocks.shape[0])
             two_i_local = int(gu_blocks.shape[1])
             per_rank_i = two_i_local // 2
             H = int(dn_blocks.shape[1])
+            device = gu_blocks.device
 
-            prep = prepare_mxfp4_weights_for_trtllm(
+            if e_local_g is None:
+                e_local_g, per_rank_i_g, H_g, device_g = e_local, per_rank_i, H, device
+            else:
+                if (e_local, per_rank_i, H) != (e_local_g, per_rank_i_g, H_g):
+                    raise ValueError(
+                        f"fuse_mxfp4_moe: cross-layer shape mismatch — layer "
+                        f"got (E={e_local}, I={per_rank_i}, H={H}) but previous "
+                        f"layers had (E={e_local_g}, I={per_rank_i_g}, H={H_g})."
+                    )
+
+            layer_infos.append(
+                {
+                    "node": n,
+                    "experts_mod": experts_mod,
+                    "experts_path": experts_path,
+                    "raw_get_attrs": raw_get_attrs,
+                    "raw_names": tuple(a.target for a in raw_get_attrs),
+                }
+            )
+
+        num_matches = len(layer_infos)
+        if num_matches == 0:
+            info = TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+            return gm, info
+
+        # ---- Pass 2: allocate scratch ONCE ----
+        scratch = MXFP4PrepScratch.allocate(
+            e_local=e_local_g,
+            per_rank_i=per_rank_i_g,
+            hidden_size=H_g,
+            device=device_g,
+        )
+
+        # ---- Pass 3: pre-allocate ALL prepared params (no data yet) ----
+        # The six prepared kinds (fc1/fc2 × {w, s, b}). Shape + dtype mirror
+        # scratch fields; allocating them now (before any per-layer prep
+        # work) places them at the allocator frontier in one contiguous run,
+        # with no per-layer transient alloc/free in between.
+        prepared_kinds = (
+            ("fc1_w_trtllm", scratch.fc1_w_buf.shape, scratch.fc1_w_buf.dtype),
+            ("fc1_w_scale_trtllm", scratch.fc1_s_buf.shape, scratch.fc1_s_buf.dtype),
+            ("fc1_bias_trtllm", scratch.fc1_b_buf.shape, scratch.fc1_b_buf.dtype),
+            ("fc2_w_trtllm", scratch.fc2_w_buf.shape, scratch.fc2_w_buf.dtype),
+            ("fc2_w_scale_trtllm", scratch.fc2_s_buf.shape, scratch.fc2_s_buf.dtype),
+            ("fc2_bias_trtllm", scratch.fc2_b_buf.shape, scratch.fc2_b_buf.dtype),
+        )
+        for info_dict in layer_infos:
+            experts_mod = info_dict["experts_mod"]
+            for name, shape, dtype in prepared_kinds:
+                experts_mod.register_parameter(
+                    name,
+                    nn.Parameter(
+                        torch.empty(shape, dtype=dtype, device=device_g),
+                        requires_grad=False,
+                    ),
+                )
+
+        # ---- Pass 4: per-layer prep into scratch + copy into prepared ----
+        for info_dict in layer_infos:
+            n = info_dict["node"]
+            experts_mod = info_dict["experts_mod"]
+            experts_path = info_dict["experts_path"]
+            raw_get_attrs = info_dict["raw_get_attrs"]
+            raw_names = info_dict["raw_names"]
+
+            gu_blocks = gm.get_parameter(raw_names[0]).data
+            dn_blocks_t = gm.get_parameter(raw_names[1]).data
+            gu_scales = gm.get_parameter(raw_names[2]).data
+            dn_scales = gm.get_parameter(raw_names[3]).data
+            gu_bias = gm.get_parameter(raw_names[4]).data
+            dn_bias = gm.get_parameter(raw_names[5]).data
+
+            # Run prep with shared scratch — outputs are views into scratch,
+            # we copy_ them into the pre-allocated prepared params below.
+            prep = swizzle_moe_mxfp4_weights(
                 gu_blocks,
                 gu_scales,
                 gu_bias,
-                dn_blocks,
+                dn_blocks_t,
                 dn_scales,
                 dn_bias,
-                hidden_size=H,
-                # Pass the per-rank intermediate dim because the helper
-                # treats this as the local size (no further slicing).
-                intermediate_size=per_rank_i,
+                hidden_size=H_g,
+                intermediate_size=per_rank_i_g,
                 tp_size=1,
                 tp_rank=0,
+                scratch=scratch,
             )
 
-            # Bias-on-rank correction: kernel sums per-rank outputs across
-            # all moe_tp ranks via the post-MoE all_reduce, which would add
-            # the fc2 bias ``moe_tp_size`` times. Divide once here to make
-            # the post-AR sum reproduce the unsharded bias. Matches the prep
-            # helper's ``tp_size > 1`` branch (which we skip above).
-            fc2_bias = prep.fc2_bias_f32
+            # Copy scratch outputs into the pre-allocated prepared params.
+            # ``fc2_bias`` gets divided by ``moe_tp_size`` so the post-AR sum
+            # reproduces the unsharded bias (mirrors the prep helper's
+            # ``tp_size > 1`` branch which we skip in the scratch path).
+            getp = experts_mod.get_parameter
+            getp("fc1_w_trtllm").data.copy_(prep.fc1_weights_mxfp4)
+            getp("fc1_w_scale_trtllm").data.copy_(prep.fc1_weights_scale_ue8m0)
+            getp("fc1_bias_trtllm").data.copy_(prep.fc1_bias_f32)
+            getp("fc2_w_trtllm").data.copy_(prep.fc2_weights_mxfp4)
+            getp("fc2_w_scale_trtllm").data.copy_(prep.fc2_weights_scale_ue8m0)
             if moe_tp_size > 1:
-                fc2_bias = fc2_bias / moe_tp_size
+                getp("fc2_bias_trtllm").data.copy_(prep.fc2_bias_f32 / moe_tp_size)
+            else:
+                getp("fc2_bias_trtllm").data.copy_(prep.fc2_bias_f32)
 
-            prepared_specs = [
-                ("fc1_w_trtllm", prep.fc1_weights_mxfp4),
-                ("fc1_w_scale_trtllm", prep.fc1_weights_scale_ue8m0),
-                ("fc1_bias_trtllm", prep.fc1_bias_f32),
-                ("fc2_w_trtllm", prep.fc2_weights_mxfp4),
-                ("fc2_w_scale_trtllm", prep.fc2_weights_scale_ue8m0),
-                ("fc2_bias_trtllm", fc2_bias),
-            ]
-            for short, tensor in prepared_specs:
-                experts_mod.register_parameter(
-                    short,
-                    nn.Parameter(tensor.contiguous(), requires_grad=False),
-                )
-
-            # Build prepared get_attr nodes inserted right before the op call.
+            # Build prepared get_attr nodes inserted right before the op call,
+            # then re-point the op's weight args to the prepared get_attrs.
             prefix_path = (experts_path + ".") if experts_path else ""
             with gm.graph.inserting_before(n):
-                fc1_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_trtllm")
-                fc2_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_trtllm")
+                fc1_w_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "fc1_w_trtllm"
+                )
+                fc2_w_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "fc2_w_trtllm"
+                )
                 fc1_s_attr = gm.graph.create_node(
                     "get_attr", prefix_path + "fc1_w_scale_trtllm"
                 )
                 fc2_s_attr = gm.graph.create_node(
                     "get_attr", prefix_path + "fc2_w_scale_trtllm"
                 )
-                fc1_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_bias_trtllm")
-                fc2_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_bias_trtllm")
+                fc1_b_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "fc1_bias_trtllm"
+                )
+                fc2_b_attr = gm.graph.create_node(
+                    "get_attr", prefix_path + "fc2_bias_trtllm"
+                )
 
             new_args = list(n.args)
-            new_args[4] = fc1_w_attr
-            new_args[5] = fc2_w_attr
-            new_args[6] = fc1_s_attr
-            new_args[7] = fc2_s_attr
-            new_args[8] = fc1_b_attr
-            new_args[9] = fc2_b_attr
+            new_args[ARG_FC1_W] = fc1_w_attr
+            new_args[ARG_FC2_W] = fc2_w_attr
+            new_args[ARG_FC1_S] = fc1_s_attr
+            new_args[ARG_FC2_S] = fc2_s_attr
+            new_args[ARG_FC1_B] = fc1_b_attr
+            new_args[ARG_FC2_B] = fc2_b_attr
             n.args = tuple(new_args)
 
             # Erase raw get_attr nodes if no other consumer.
@@ -1108,23 +1176,29 @@ class FuseMXFP4Moe(BaseTransform):
                 _delete_module_attr(experts_mod, raw_name)
 
             # Update dtype protection to the prepared-name list.
-            experts_mod._dtype_protected_params = tuple(name for name, _ in prepared_specs) + (
+            experts_mod._dtype_protected_params = tuple(
+                name for name, _, _ in prepared_kinds
+            ) + (
                 "swiglu_alpha_trtllm",
                 "swiglu_beta_trtllm",
                 "swiglu_limit_trtllm",
             )
 
-            num_matches += 1
+        # Scratch goes out of scope here → CUDA caching allocator reclaims
+        # the scratch region. The persistent prepared blocks remain
+        # contiguous (allocated before scratch was freed and after raw was
+        # being deleted layer by layer).
+        del scratch
 
-        if num_matches > 0:
-            ad_logger.info(
-                f"fuse_mxfp4_moe: GPU-prepped {num_matches} MoE node(s)"
-            )
+        ad_logger.info(
+            f"fuse_mxfp4_moe: GPU-prepped {num_matches} MoE node(s) "
+            f"with shared scratch (E={e_local_g}, I={per_rank_i_g}, H={H_g})"
+        )
 
         info = TransformInfo(
-            skipped=(num_matches == 0),
+            skipped=False,
             num_matches=num_matches,
-            is_clean=(num_matches == 0),
-            has_valid_shapes=(num_matches == 0),
+            is_clean=False,
+            has_valid_shapes=True,
         )
         return gm, info

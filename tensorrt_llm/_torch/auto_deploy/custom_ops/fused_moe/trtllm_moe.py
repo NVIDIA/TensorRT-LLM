@@ -1322,7 +1322,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
 #   * weight_alignment        = 128 (TMA 16U4 alignment)
 #
 # This op assumes the caller has already done the pad/shard/shuffle dance
-# (see `prepare_mxfp4_weights_for_trtllm_gen` in `mxfp4_weight_prep.py`).
+# (see `swizzle_moe_mxfp4_weights` in `swizzle_moe_mxfp4_weights.py`).
 # At forward time we only pad activations to the kernel's expected hidden dim.
 
 
@@ -1494,7 +1494,7 @@ def trtllm_mxfp4_w4a16_moe_fused_fake(
 #
 # Weight layout requirements are *identical* to the W4A16 path — the
 # weights ARE the same MXFP4 blocks/scales/bias prepared by
-# ``prepare_mxfp4_weights_for_trtllm_gen``. No checkpoint / weight prep
+# ``swizzle_moe_mxfp4_weights``. No checkpoint / weight prep
 # changes needed.
 
 
@@ -1527,7 +1527,7 @@ def trtllm_mxfp4_w4a8_moe_fused(
     ``torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner``.
 
     Weight layout is unchanged from W4A16: the same MXFP4 blocks/scales/bias
-    produced by ``prepare_mxfp4_weights_for_trtllm_gen`` are used as-is.
+    produced by ``swizzle_moe_mxfp4_weights`` are used as-is.
 
     Args: same as ``trtllm_mxfp4_w4a16_moe_fused`` — the runtime path
     differs only in (a) inserting an ``mxfp8_quantize`` call on the
