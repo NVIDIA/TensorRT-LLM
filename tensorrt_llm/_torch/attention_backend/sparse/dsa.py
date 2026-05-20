@@ -99,13 +99,27 @@ def warmup_heuristic_topk_decode(top_k: int = 2048,
     indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
     pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
     scratch = torch.empty((top_k, ), dtype=torch.float32, device=device)
+    # The default warmup geometry (num_cols=4096) falls below kSeqSmall=12288
+    # and routes to the Radix path with blocks_per_row=2 (num_rows=1 sweeps
+    # bp ∈ [2, maxByCols=2]). The cpp op rejects blocks_per_row > 1 without
+    # caller-owned radix aux scratch, so supply worst-case (kMaxBlocksPerRowDecode=10)
+    # buffers here. Cost is negligible (~80 KB) and the warmup is a one-shot.
+    _radix_max_bp = 10
+    radix_aux_indices = torch.empty((1, _radix_max_bp, top_k),
+                                    dtype=torch.int32,
+                                    device=device)
+    radix_aux_logits = torch.empty((1, _radix_max_bp, top_k),
+                                   dtype=torch.float32,
+                                   device=device)
     torch.ops.trtllm.indexer_topk_decode(logits,
                                          seq_lens,
                                          indices,
                                          1,
                                          top_k,
                                          pre_idx=pre_idx,
-                                         heuristic_scratch=scratch)
+                                         heuristic_scratch=scratch,
+                                         radix_aux_indices=radix_aux_indices,
+                                         radix_aux_logits=radix_aux_logits)
     torch.cuda.synchronize()
 
 
