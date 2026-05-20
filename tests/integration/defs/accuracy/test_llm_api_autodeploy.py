@@ -338,6 +338,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
 
     def get_default_kwargs(self, attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
@@ -349,6 +350,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         compile_backend = "torch-cudagraph" if attn_backend == "trtllm" else "torch-simple"
 
         kwargs = {
+            "yaml_extra": yaml_paths,
             "attn_backend": attn_backend,
             "compile_backend": compile_backend,
             "skip_tokenizer_init": False,
@@ -406,7 +408,9 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
                            attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         config = {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "attn_backend": attn_backend,
@@ -840,7 +844,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
                            attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra("zai-org/GLM-4.7-Flash")
         config = {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "attn_backend": attn_backend,
@@ -933,7 +939,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
     def get_default_kwargs(self):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         return {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "skip_loading_weights": False,
@@ -1109,7 +1117,9 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
     def get_default_kwargs(self):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         return {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "skip_loading_weights": False,
