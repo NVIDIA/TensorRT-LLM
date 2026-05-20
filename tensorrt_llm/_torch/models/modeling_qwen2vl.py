@@ -135,6 +135,38 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         merge_size = self.config.vision_config.spatial_merge_size
         return merge_size * merge_size
 
+    def get_max_requests_per_mm_item(
+        self,
+        *,
+        max_encoder_tokens: int = 0,
+    ) -> int:
+        """Worst-case windowed-attention sequences produced by one Qwen2/2.5-VL image.
+
+        The vision encoder applies windowed attention with
+        ``vit_merger_window_size = window_size // spatial_merge_size //
+        patch_size`` in post-merger units; each window covers
+        ``(window_size / patch_size) ** 2`` pre-merger patches. A single
+        image's worst-case window count is therefore
+        ``ceil(per_item_encoder_tokens / (window_size / patch_size) ** 2)``.
+
+        ``max_encoder_tokens`` bounds the per-item encoder budget; we use it
+        directly (rather than ``max_pixels`` from the HF processor) so the
+        engine knob composes correctly across processor configurations.
+        Returns 1 when no upper bound is provided so callers without an
+        explicit budget fall back to the legacy single-sequence assumption.
+        """
+        if max_encoder_tokens <= 0:
+            return 1
+        cfg = self.config.vision_config
+        window_size = getattr(cfg, "window_size", 0)
+        patch_size = cfg.patch_size
+        if window_size <= 0 or patch_size <= 0:
+            return 1
+        window_tokens = (window_size // patch_size)**2
+        if window_tokens <= 0:
+            return 1
+        return math.ceil(max_encoder_tokens / window_tokens)
+
     def get_num_mm_tokens(
         self,
         *,
@@ -939,15 +971,11 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                             max_num_tokens: int) -> None:
         # Override: Qwen2/2.5-VL uses two metadata objects (full + window
         # attention) instead of the mixin's single ``attn_metadata``.
-        #
-        # Windowed attention splits each image into many attention sequences
-        # (one per window grid cell), so ``max_num_requests`` here is the
-        # **window** count, not the image count. The legacy hardcoded value
-        # was 8192; preserve that as a floor so callers that leave
-        # ``encoder_max_batch_size`` unset (and thus inherit the LLM-side
-        # ``max_batch_size``, which is far smaller) still get a buffer large
-        # enough for the worst-case window split.
-        max_num_requests = max(max_num_requests, 8192)
+        # The engine already converts encoder_max_batch_size to attention
+        # sequences using
+        # ``Qwen2VLInputProcessorBase.get_max_requests_per_mm_item``, so
+        # ``max_num_requests`` arrives sized for the worst-case windowed
+        # split — no extra floor needed here.
         kwargs = dict(max_num_requests=max_num_requests,
                       max_num_tokens=max_num_tokens,
                       kv_cache_manager=None)

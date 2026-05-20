@@ -1534,14 +1534,32 @@ class PyTorchModelEngine(ModelEngine):
         the LLM-side `max_batch_size` / `max_num_tokens`).
 
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
-        by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
-        so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
-        than being hardcoded inside each encoder's ``__init__``.
+        by inheriting `MultimodalEncoderMixin`, and the engine drives the
+        construction so the sizes match
+        ``llm_args.get_encoder_runtime_sizes()`` rather than being hardcoded
+        inside each encoder's ``__init__``.
+
+        ``encoder_max_batch_size`` is a user-facing knob measured in mm items,
+        but ``AttentionMetadata.max_num_requests`` sizes request-dim buffers
+        in attention sequences. Some encoders fan a single mm item out into
+        many attention sequences (LLaVA-Next sub-image patches, Qwen-VL
+        windowed attention), so the conversion factor is asked of the input
+        processor via :meth:`BaseMultimodalInputProcessor.get_max_requests_per_mm_item`.
         """
+        if isinstance(self.input_processor, BaseMultimodalInputProcessor):
+            max_requests_per_item = self.input_processor.get_max_requests_per_mm_item(
+                max_encoder_tokens=self.encoder_max_num_tokens)
+        else:
+            max_requests_per_item = 1
+        max_num_requests = max(
+            self.encoder_batch_size * max_requests_per_item,
+            self.encoder_batch_size,
+        )
+
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
-                    max_num_requests=self.encoder_batch_size,
+                    max_num_requests=max_num_requests,
                     max_num_tokens=self.encoder_max_num_tokens)
 
     def _set_up_spec_metadata(
