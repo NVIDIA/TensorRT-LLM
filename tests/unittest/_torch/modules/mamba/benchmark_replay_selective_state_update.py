@@ -2547,6 +2547,7 @@ def _bench_config(
     mix_samples_cpu=None,
     mix_label: str = "",
     hardcode_sort: bool = False,
+    nowrite_first: bool = False,
     mix_samples_sorted_cpu=None,
     mix_write_frac: float | None = None,
     warmup_only: bool = False,
@@ -2626,6 +2627,8 @@ def _bench_config(
     mode = _resolve_effective_replay_mode(
         args, batch, state_dtype, use_philox, mode
     )
+    if mode != "persistent_main" and nowrite_first:
+        return
 
     state_work = state0.clone()
     state_scales_work = state_scales0.clone() if state_scales0 is not None else None
@@ -3228,6 +3231,7 @@ def _bench_config(
                     x_call, B_call, C_call = x, B, C
                     extra_kwargs = {}
                 extra_kwargs["rectangle_for_nowrite"] = rectangle_for_nowrite
+                extra_kwargs["nowrite_first"] = nowrite_first
                 extra_kwargs["mode"] = mode
                 extra_kwargs["n_writes"] = scenario_n_writes
                 extra_kwargs["replay_work_items"] = replay_work_items_buf
@@ -3348,6 +3352,10 @@ def _bench_config(
             parts.append(f"TMAWS={_val(use_tma_replay_write_store)}")
             parts.append(f"SR={1 if use_philox else 0}")
             parts.append(f"RECT={'auto' if rectangle_for_nowrite is None else (1 if rectangle_for_nowrite else 0)}")
+            nowrite_first_list_for_tags = getattr(args, "nowrite_first_list", [False])
+            nowrite_first_in_cell_list = "NWF" in getattr(args, "_cell_list_keys", ())
+            if nowrite_first or len(nowrite_first_list_for_tags) > 1 or nowrite_first_in_cell_list:
+                parts.append(f"NWF={1 if nowrite_first else 0}")
             parts.append(f"MODE={_val(mode)}")
             hsort_list_for_tags = getattr(args, "hardcode_sort_list", [False])
             hsort_in_cell_list = "HSORT" in getattr(args, "_cell_list_keys", ())
@@ -3418,6 +3426,7 @@ def _bench_config(
                     bool(args.internal_pdl),
                     bool(use_philox),
                     bool(rectangle_for_nowrite),
+                    bool(nowrite_first),
                     bool(hardcode_sort),
                     bool(args.use_cache_slot),
                     scenario_pre_iter is not None,
@@ -3712,6 +3721,7 @@ _CELL_LIST_KEY_TO_ARG = {
     "TMANL": "use_tma_replay_nowrite_load",
     "TMAWS": "use_tma_replay_write_store",
     "RECT":  "rectangle_for_nowrite",
+    "NWF":   "nowrite_first",
     "HSORT": "hardcode_sort",
     # MODE and SR get special handling (string values):
     # MODE → args.modes (single mode name)
@@ -3827,6 +3837,7 @@ _CELL_LIST_KEY_TO_LOCAL = {
     "TMANL": "use_tma_replay_nowrite_load",
     "TMAWS": "use_tma_replay_write_store",
     "RECT":  "rectangle_for_nowrite",
+    "NWF":   "nowrite_first",
     "MODE":  "mode",
     "HSORT": "hardcode_sort",
     "SR":    "use_philox",
@@ -3984,7 +3995,7 @@ def _run_benchmark(args) -> None:
     # Each entry in the JSON file is a dict of canonical knob keys → values,
     # using the same names that appear in the sweep_tag (Mw/Mnw, Ww/Wnw,
     # Sw/Snw, pW, pS, H, R, CT, CPSw/CPSnw, LSw/LSnw, FL, WS, TMARL,
-    # TMAWL, TMANL, TMAWS, SR, RECT, MODE). Optional diagnostic HSORT cells
+    # TMAWL, TMANL, TMAWS, SR, RECT, NWF, MODE). Optional diagnostic HSORT cells
     # are accepted for compatibility. Each cell may also use the tied forms
     # M / W / S / CPS / LS (single value applied to both write and nowrite
     # halves).
@@ -4116,6 +4127,7 @@ def _run_benchmark(args) -> None:
     rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
     modes_list = getattr(args, "modes_list", ["persistent_dynamic"])
     hsort_list = getattr(args, "hardcode_sort_list", [False])
+    nowrite_first_list = getattr(args, "nowrite_first_list", [False])
 
     # Pre-load AL distribution for mix mode.
     mix_al = None
@@ -4177,27 +4189,29 @@ def _run_benchmark(args) -> None:
                     for sr_mode in sr_modes_list:
                         for mode in modes_list:
                             for rect in rect_list:
-                                can_sort = mix_samples_cpu is not None
-                                cell_list_active = bool(
-                                    getattr(args, "_cell_list_keys", ())
-                                )
-                                effective_hsort_list = (
-                                    hsort_list if (can_sort or cell_list_active)
-                                    else [False]
-                                )
-                                for hardcode_sort in effective_hsort_list:
-                                    _bench_config(
-                                        args, batch, mtp_len, prev_ks,
-                                        state_dtype, act_dtype, baseline_fn,
-                                        sr_mode=sr_mode,
-                                        rectangle_for_nowrite=rect,
-                                        mode=mode,
-                                        mix_samples_cpu=mix_samples_cpu,
-                                        mix_label=mix_label,
-                                        hardcode_sort=hardcode_sort,
-                                        mix_samples_sorted_cpu=mix_samples_sorted_cpu,
-                                        mix_write_frac=mix_write_frac,
+                                for nowrite_first in nowrite_first_list:
+                                    can_sort = mix_samples_cpu is not None
+                                    cell_list_active = bool(
+                                        getattr(args, "_cell_list_keys", ())
                                     )
+                                    effective_hsort_list = (
+                                        hsort_list if (can_sort or cell_list_active)
+                                        else [False]
+                                    )
+                                    for hardcode_sort in effective_hsort_list:
+                                        _bench_config(
+                                            args, batch, mtp_len, prev_ks,
+                                            state_dtype, act_dtype, baseline_fn,
+                                            sr_mode=sr_mode,
+                                            rectangle_for_nowrite=rect,
+                                            mode=mode,
+                                            mix_samples_cpu=mix_samples_cpu,
+                                            mix_label=mix_label,
+                                            hardcode_sort=hardcode_sort,
+                                            nowrite_first=nowrite_first,
+                                            mix_samples_sorted_cpu=mix_samples_sorted_cpu,
+                                            mix_write_frac=mix_write_frac,
+                                        )
 
     _drain_pending_results(args, force=True)
 
@@ -4658,6 +4672,14 @@ def _parse_args() -> argparse.Namespace:
         "sr) cell.",
     )
     parser.add_argument(
+        "--nowrite-first",
+        type=str,
+        default="0",
+        help="Comma-separated 0/1 values for mode=persistent_main launch order. "
+        "0 launches write before nowrite; 1 launches nowrite before write. "
+        "Ignored for persistent_dynamic.",
+    )
+    parser.add_argument(
         "--use-tma-rect-load",
         type=str,
         default=None,
@@ -4876,6 +4898,20 @@ def _parse_args() -> argparse.Namespace:
         if not rect_list:
             rect_list = [None]
     args.rectangle_for_nowrite_list = rect_list
+
+    nowrite_first_modes = [
+        v.strip()
+        for v in (args.nowrite_first if args.nowrite_first is not None else "0").split(",")
+        if v.strip()
+    ]
+    nowrite_first_list = []
+    for v in nowrite_first_modes:
+        if v not in ("0", "1"):
+            parser.error(f"--nowrite-first value must be 0 or 1, got {v!r}")
+        nowrite_first_list.append(v == "1")
+    if not nowrite_first_list:
+        nowrite_first_list = [False]
+    args.nowrite_first_list = nowrite_first_list
 
     hsort_modes = [
         v.strip()
