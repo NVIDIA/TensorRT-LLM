@@ -182,11 +182,6 @@ class ScheduledRequests:
         else:
             self.context_requests_chunking.append(request)
 
-    def reset_encoder_requests(self, encoder_requests: RequestList | None = None) -> None:
-        self.encoder_requests = (
-            encoder_requests if encoder_requests is not None else self.encoder_requests
-        )
-
     def append_generation_request(self, request: LlmRequest) -> None:
         self.generation_requests.append(request)
 
