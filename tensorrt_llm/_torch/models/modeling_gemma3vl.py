@@ -297,7 +297,8 @@ class Gemma3VLM(PreTrainedModel):
             input_ids=input_ids,
             mm_embeds=mm_embeds,
             mm_token_ids=self.image_token_ids,
-            **kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,

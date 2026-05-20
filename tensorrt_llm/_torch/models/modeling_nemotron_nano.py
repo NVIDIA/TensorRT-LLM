@@ -2637,6 +2637,16 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.video_context_token_id = config.video_context_token_id
         self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.post_config()
+        # Expose the in-vocab context tokens to the model engine so
+        # `_prepare_multimodal_indices` selects the torch.isin predicate
+        # instead of the OOV fallback. Without this, the executor produces
+        # empty mm_token_indices (img/sound IDs are < vocab_size), and the
+        # propagated indices then trip the count-equality check inside
+        # fuse_input_embeds against the encoder-provided rows.
+        _mm_token_ids = [self.img_context_token_id]
+        if self.sound_context_token_id is not None:
+            _mm_token_ids.append(self.sound_context_token_id)
+        self.mm_token_ids = torch.tensor(_mm_token_ids, dtype=torch.int32)
         self.is_loaded = True
         # Use config value if explicitly set (EVS enabled), otherwise default to 0.0 (EVS disabled)
         self.video_pruning_rate = (
@@ -3181,14 +3191,13 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
             mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)
 
-        mm_token_ids_list = [self.img_context_token_id]
-        if self.sound_context_token_id is not None:
-            mm_token_ids_list.append(self.sound_context_token_id)
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=torch.tensor(mm_token_ids_list, dtype=torch.int32),
+            mm_token_ids=self.mm_token_ids,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
 
         output_prob = self.llm.forward(

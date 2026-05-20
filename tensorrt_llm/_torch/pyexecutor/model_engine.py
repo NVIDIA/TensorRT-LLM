@@ -3988,6 +3988,18 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
             "num_tokens should be less than or equal to max_num_tokens")
+        # Compute MM/text token indices on CPU input_ids so that
+        # fuse_input_embeds can skip its torch.where host sync. Must run before
+        # the input_ids list is rebound to a tensor below. Skipped in
+        # mm_encoder_only mode, where self.model is the vision encoder whose
+        # config has no vocab_size (and the encoder forward doesn't consume
+        # these indices anyway).
+        if (len(multimodal_params_list) > 0
+                and not getattr(self.llm_args, "mm_encoder_only", False)):
+            _, mm_token_indices_cpu = self._prepare_multimodal_indices(
+                input_ids)
+        else:
+            mm_token_indices_cpu = None
         input_ids = torch.tensor(input_ids,
                                  dtype=torch.int,
                                  pin_memory=prefer_pinned())
@@ -4056,6 +4068,17 @@ class PyTorchModelEngine(ModelEngine):
             "multimodal_params": multimodal_params_list,
             'resource_manager': resource_manager,
         }
+
+        if mm_token_indices_cpu is not None:
+            # Build the text complement on CPU and async H2D both to keep
+            # fuse_input_embeds off the torch.where host-sync fallback.
+            mask = torch.ones(num_tokens, dtype=torch.bool)
+            mask[mm_token_indices_cpu] = False
+            mm_idx = maybe_pin_memory(mm_token_indices_cpu)
+            inputs['mm_token_indices'] = mm_idx.to("cuda", non_blocking=True)
+            text_idx = maybe_pin_memory(torch.where(mask)[0])
+            inputs['text_token_indices'] = text_idx.to("cuda",
+                                                       non_blocking=True)
 
         if bool(lora_params):
             inputs['lora_params'] = lora_params

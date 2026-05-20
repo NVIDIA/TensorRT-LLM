@@ -352,6 +352,13 @@ def find_input_mm_embeds(
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
         - Example: if a request has 8 MM embed rows, 2 cached rows, and 3 rows
           in the current chunk, this keeps rows [2:5].
+        - This function reads only CPU-resident counts from
+          ``MultimodalParams.multimodal_runtime`` and never touches GPU
+          tensors, so it does not introduce host-device synchronization.
+          The companion ``torch.where`` host sync sits in ``fuse_input_embeds``
+          (via ``filter_mm_token_from_input_ids``) and is avoided by routing
+          executor-precomputed ``mm_token_indices`` / ``text_token_indices``
+          through to that call — see the contract there.
     """
     if not isinstance(mm_embeds, list):
         raise TypeError("mm_embeds must be a list")
@@ -470,7 +477,17 @@ def fuse_input_embeds(
         - Example: len(torch.cat(mm_embeds)) must match len(mm_token_indices);
           for chunked prefill, pass only the current chunk's mm_embeds or
           explicit indices for the active MM token positions.
-        - This function may involve host-device synchronization if indices are not provided and filtering is performed. See filter_mm_token_from_input_ids for details.
+        - Sync-free contract: passing both ``text_token_indices`` and
+          ``mm_token_indices`` skips the GPU ``torch.where`` host sync. The
+          executor (``model_engine._prepare_inputs`` /
+          ``_prepare_tp_inputs_no_cache``) precomputes them on a CPU
+          ``input_ids`` copy via ``_prepare_multimodal_indices`` (which uses
+          ``filter_mm_token_from_input_ids`` against ``self.model.mm_token_ids``
+          when present, else the OOV fallback ``>= vocab_size``) and ships
+          them as pinned async H2D tensors in the inputs dict. VLM forwards
+          are expected to forward these explicitly rather than relying on a
+          ``**kwargs`` splat — if they don't, this function falls back to the
+          host-syncing ``filter_mm_token_from_input_ids`` on GPU ``input_ids``.
     """
     if len(mm_embeds) == 0:
         if extra_embeds is not None and len(extra_embeds) > 0:
