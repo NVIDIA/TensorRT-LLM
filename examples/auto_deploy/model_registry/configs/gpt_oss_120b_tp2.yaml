@@ -7,12 +7,6 @@ transforms:
   apply_sharding_hints:
     enabled: true
     requires_shape_prop: true
-    # Include "moe" so ``GptOssMLP.forward``'s
-    # ``auto_deploy.all_reduce(out, "moe")`` placeholder (emitted after the
-    # MoE op) is resolved to a real dist all_reduce by
-    # ``AllReduceShardableNode``. Without "moe" in this list, the filter at
-    # ``sharding_ir.py`` line ~1108 would skip the MoE AR placeholder, leaving
-    # the per-rank intermediate-TP partial sums un-reduced.
     shard_layers: ["mha", "moe"]
     dist_mapping:
       tp: 2

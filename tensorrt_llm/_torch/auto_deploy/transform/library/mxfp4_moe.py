@@ -19,12 +19,20 @@ import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from tensorrt_llm._torch.modules.fused_moe.quantization import _get_weight_alignment
+
 from ..._compat import get_sm_version
 from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+
+# MXFP4 layout constants (mirror the on-disk HF format the trtllm-gen kernel
+# consumes). Used by both the load hook below and the TP-aware pre-pad math
+# in ``InsertMXFP4MLP._apply_trtllm``.
+_MXFP4_SCALING_VECTOR_SIZE = 32
+_WEIGHT_ALIGNMENT = 128
 
 # Backend selection for MXFP4 MoE quantization.
 # - "triton": use the triton_mxfp4_moe kernel (Ampere/Hopper compatible).
@@ -234,6 +242,190 @@ def _register_mxfp4_expert_params(
         prefix + dn_blocks_name,
         prefix + dn_scales_name,
     )
+
+
+# ============================================================================
+# Slim EP-slice-only load hook (post-load fusion design)
+# ============================================================================
+#
+# Companion to the ``fuse_mxfp4_moe`` POST_LOAD_FUSION transform: the
+# dispatcher at PATTERN_MATCHER registers raw HF MXFP4 params at the
+# EP-sliced shape (E_local = num_experts // moe_ep_size). The standard load
+# path would then refuse to copy [E_full] state_dict tensors into [E_local]
+# module params. This hook fixes that by slicing the leading expert axis
+# in-place inside ``state_dict`` *without* touching key names or running any
+# kernel-layout prep. The prep is deferred to the GPU-side fuse transform.
+#
+# When ``moe_ep_size == 1`` and ``moe_tp_size == 1`` no slicing is needed and
+# the hook is a no-op.
+
+
+def make_mxfp4_sharding_load_hook(
+    *,
+    num_layers: int,
+    num_experts: int,
+    intermediate_size: int,
+    moe_ep_size: int,
+    moe_ep_rank: int,
+    moe_tp_size: int,
+    moe_tp_rank: int,
+    layer_prefix: str = "model.layers",
+    experts_subpath: str = "mlp.experts",
+):
+    """Build a ``load_state_dict`` pre-hook that EP+TP-shards raw HF MXFP4 keys.
+
+    Companion to the GPU-side :class:`FuseMXFP4Moe` POST_LOAD_FUSION
+    transform. This hook handles the *sharding* axes (expert + intermediate)
+    on CPU before tensors are copied to GPU, so per-rank GPU memory only
+    holds this rank's slice. The kernel-layout work (H-axis padding,
+    per-expert TMA shuffle, bf16->fp32 bias conversion, bias / tp_size) is
+    deferred to ``FuseMXFP4Moe`` on GPU.
+
+    For each layer's six raw HF MXFP4 keys
+    (``gate_up_proj_{blocks,scales,bias}``,
+    ``down_proj_{blocks,scales,bias}``) the hook applies in order:
+
+    1. **EP slice (leading expert axis)** —
+       ``t[ep_start:ep_stop]`` where
+       ``experts_per_rank = num_experts / moe_ep_size``.
+       No-op when ``moe_ep_size == 1``.
+
+    2. **TP-aware pre-pad + slice (intermediate axis)** —
+       only when ``moe_tp_size > 1``. The intermediate dim ``I`` is padded
+       to ``i_padded_tp = ceil(I, alignment_tp)`` where
+       ``alignment_tp = _get_weight_alignment(128, 32, moe_tp_size, I)``,
+       guaranteeing ``per_rank_i = i_padded_tp / moe_tp_size`` is itself a
+       multiple of 128 (the kernel's TMA weight alignment). Then each
+       tensor is sliced on its intermediate-encoding axis:
+
+       * ``gate_up_proj_blocks``  ``[E, 2I, H/32, 16]``  — axis 1, range
+         ``[2*tp_start : 2*tp_stop]``. Works on the interleaved 2I layout
+         because gate/up indices alternate: index ``2k`` is gate(k), index
+         ``2k+1`` is up(k). The contiguous range ``[2k : 2k+2m]`` therefore
+         covers gate(k:k+m) ∪ up(k:k+m) — same semantics as a
+         de-interleaved per-half slice.
+       * ``gate_up_proj_scales`` ``[E, 2I, H/32]``      — axis 1, same range.
+       * ``gate_up_proj_bias``   ``[E, 2I]``            — axis 1, same range.
+       * ``down_proj_blocks``    ``[E, H, I/32, 16]``   — axis 2 (I_blk), range
+         ``[tp_start/32 : tp_stop/32]``. ``per_rank_i`` is a multiple of 32
+         (in fact 128), so block boundaries are integer.
+       * ``down_proj_scales``    ``[E, H, I/32]``       — axis 2, same range.
+       * ``down_proj_bias``      ``[E, H]``             — H axis isn't TP-split,
+         so the bias is left intact. ``FuseMXFP4Moe`` will divide it by
+         ``moe_tp_size`` after dtype conversion.
+
+    Args:
+        num_layers: number of decoder layers to scan.
+        num_experts: total expert count (``E_full``) on disk.
+        intermediate_size: per-expert intermediate dim ``I`` on disk
+            (i.e. before any padding/slicing).
+        moe_ep_size / moe_ep_rank: expert-parallel group size + this rank.
+        moe_tp_size / moe_tp_rank: MoE tensor-parallel group size + this rank
+            (intermediate-axis split).
+        layer_prefix: where layers live, default ``"model.layers"``.
+        experts_subpath: where the experts module sits within each layer,
+            default ``"mlp.experts"``.
+
+    Returns:
+        A hook with the standard ``(state_dict, prefix, ...)`` signature.
+    """
+    if num_experts % moe_ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
+        )
+    experts_per_rank = num_experts // moe_ep_size
+    ep_start = moe_ep_rank * experts_per_rank
+    ep_stop = ep_start + experts_per_rank
+
+    # TP-aware pre-pad/slice math (only used when moe_tp_size > 1).
+    if moe_tp_size > 1:
+        alignment_tp = _get_weight_alignment(
+            _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, intermediate_size
+        )
+        i_padded_tp = ((intermediate_size + alignment_tp - 1) // alignment_tp) * alignment_tp
+        per_rank_i = i_padded_tp // moe_tp_size
+        tp_start = moe_tp_rank * per_rank_i
+        tp_stop = (moe_tp_rank + 1) * per_rank_i
+        if per_rank_i % _MXFP4_SCALING_VECTOR_SIZE != 0:
+            raise ValueError(
+                f"per_rank_i ({per_rank_i}) must be divisible by "
+                f"_MXFP4_SCALING_VECTOR_SIZE ({_MXFP4_SCALING_VECTOR_SIZE}); "
+                f"check _get_weight_alignment output."
+            )
+        # Block-axis bounds for down_proj's I_blk = I / 32 axis.
+        blk_pad = i_padded_tp // _MXFP4_SCALING_VECTOR_SIZE
+        blk_start = tp_start // _MXFP4_SCALING_VECTOR_SIZE
+        blk_stop = tp_stop // _MXFP4_SCALING_VECTOR_SIZE
+    else:
+        i_padded_tp = intermediate_size
+        per_rank_i = intermediate_size
+        tp_start = 0
+        tp_stop = intermediate_size
+        blk_pad = intermediate_size // _MXFP4_SCALING_VECTOR_SIZE
+        blk_start = 0
+        blk_stop = blk_pad
+
+    def _pad_axis(t: torch.Tensor, dim: int, target: int) -> torch.Tensor:
+        cur = t.shape[dim]
+        if cur >= target:
+            return t
+        pad_amount = target - cur
+        # F.pad spec is (pad_lastdim_left, pad_lastdim_right, ..., pad_dim_left, pad_dim_right)
+        pad = [0, 0] * (t.dim() - dim - 1) + [0, pad_amount] + [0, 0] * dim
+        return torch.nn.functional.pad(t, pad)
+
+    def hook(state_dict, prefix, *args, local_metadata=None, **kwargs):
+        do_ep = moe_ep_size > 1
+        do_tp = moe_tp_size > 1
+        if not (do_ep or do_tp):
+            # Nothing to slice — leave state_dict alone.
+            return
+        for layer_idx in range(num_layers):
+            base = f"{prefix}{layer_prefix}.{layer_idx}.{experts_subpath}."
+
+            # ---- EP slice (leading expert axis) ----
+            if do_ep:
+                for s in (
+                    "gate_up_proj_blocks",
+                    "gate_up_proj_scales",
+                    "gate_up_proj_bias",
+                    "down_proj_blocks",
+                    "down_proj_scales",
+                    "down_proj_bias",
+                ):
+                    k = base + s
+                    t = state_dict.get(k)
+                    if t is None:
+                        continue
+                    state_dict[k] = t[ep_start:ep_stop].contiguous()
+
+            # ---- TP-aware pre-pad + slice (intermediate axis) ----
+            if do_tp:
+                # gate_up_*: axis 1 (the 2I interleaved axis); pad to
+                # 2*i_padded_tp, then slice [2*tp_start : 2*tp_stop].
+                for s in ("gate_up_proj_blocks", "gate_up_proj_scales", "gate_up_proj_bias"):
+                    k = base + s
+                    t = state_dict.get(k)
+                    if t is None:
+                        continue
+                    t = _pad_axis(t, 1, 2 * i_padded_tp)
+                    state_dict[k] = t[:, 2 * tp_start : 2 * tp_stop].contiguous()
+
+                # down_proj_blocks / scales: axis 2 (I_blk = I / 32); pad to
+                # blk_pad, then slice [blk_start : blk_stop]. Inner 16 axis
+                # (blocks only) is untouched.
+                for s in ("down_proj_blocks", "down_proj_scales"):
+                    k = base + s
+                    t = state_dict.get(k)
+                    if t is None:
+                        continue
+                    t = _pad_axis(t, 2, blk_pad)
+                    state_dict[k] = t[:, :, blk_start:blk_stop].contiguous()
+                # down_proj_bias [E, H]: H axis is not TP-split. Leave as-is
+                # and let FuseMXFP4Moe divide by moe_tp_size after dtype
+                # conversion (matches the prep helper's tp-aware bias path).
+
+    return hook
 
 
 class InsertMXFP4MLPConfig(TransformConfig):
@@ -493,7 +685,7 @@ class InsertMXFP4MLP(BaseTransform):
            ``config.trtllm_quant_act``) with args pointing at the **raw**
            params for now. The downstream :class:`FuseMXFP4Moe`
            POST_LOAD_FUSION transform will run
-           :func:`swizzle_moe_mxfp4_weights` on the actually-loaded
+           :func:`prepare_trtllm_gen_moe_mxfp4_weights` on the actually-loaded
            GPU tensors, register prepared-shape params, and re-point the op
            args. The op call is therefore not runnable between PATTERN_MATCHER
            and POST_LOAD_FUSION, but no forward pass happens in that window.
@@ -503,23 +695,20 @@ class InsertMXFP4MLP(BaseTransform):
         Then once for the whole module:
 
         9. Register a top-level ``load_state_dict`` pre-hook
-           (:func:`make_mxfp4_ep_slice_load_hook`) that slices raw HF MXFP4
+           (:func:`make_mxfp4_sharding_load_hook`) that slices raw HF MXFP4
            tensors on the expert axis when ``moe_ep_size > 1``. The hook
            does **not** run any kernel-layout prep — that runs on GPU in
            :class:`FuseMXFP4Moe` after the weights are loaded.
         """
         import re
 
-        from ...custom_ops.fused_moe.swizzle_moe_mxfp4_weights import (
-            make_mxfp4_sharding_load_hook,
+        from ...custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
             make_swiglu_param_tensors,
         )
 
-        # MoE topology: prefer the build-time ``DistConfig`` set on
-        # ``shared_config`` (mirrors the legacy transform path). The
-        # ``_resolve_moe_dist_info`` analogue from modeling code lives in
-        # swizzle_moe_mxfp4_weights.py as ``_get_default_dist_info``; here we trust
-        # the explicit shared_config first.
+        # MoE topology comes from the build-time ``DistConfig`` on
+        # ``shared_config``; passed directly into the sharding load hook
+        # below.
         dc = getattr(shared_config, "dist_config", None)
         moe_tp_size = int(getattr(dc, "moe_tp_size", 1)) if dc is not None else 1
         moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
@@ -531,12 +720,6 @@ class InsertMXFP4MLP(BaseTransform):
         allreduce_strategy = (
             str(dc.allreduce_strategy) if dc is not None and _tp_size > 1 else "NCCL"
         )
-
-        # Pre-compute the same dist tuple for the load hook factory so it
-        # honours this transform's view of the MoE topology rather than
-        # falling back to ``_get_default_dist_info`` at hook-fire time.
-        def _hook_dist_info_fn():
-            return (moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank)
 
         quant_act = self.config.trtllm_quant_act
         if quant_act == "mxfp8":
@@ -635,18 +818,10 @@ class InsertMXFP4MLP(BaseTransform):
             # ``_get_weight_alignment``, so it's also the per-rank kernel
             # weight-alignment size that the trtllm-gen runner expects.
             if moe_tp_size > 1:
-                from tensorrt_llm._torch.modules.fused_moe.quantization import (
-                    _get_weight_alignment,
-                )
-
-                _MXFP4_SCALING_VECTOR_SIZE = 32
-                _WEIGHT_ALIGNMENT = 128
                 alignment_tp = _get_weight_alignment(
                     _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, i_size
                 )
-                i_padded_tp = (
-                    (i_size + alignment_tp - 1) // alignment_tp
-                ) * alignment_tp
+                i_padded_tp = ((i_size + alignment_tp - 1) // alignment_tp) * alignment_tp
                 per_rank_i = i_padded_tp // moe_tp_size
                 slice_start = moe_tp_rank * per_rank_i
                 slice_stop = (moe_tp_rank + 1) * per_rank_i
@@ -724,18 +899,10 @@ class InsertMXFP4MLP(BaseTransform):
                 gu_scales_attr = gm.graph.create_node(
                     "get_attr", prefix_path + "gate_up_proj_scales"
                 )
-                gu_bias_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "gate_up_proj_bias"
-                )
-                dn_blocks_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "down_proj_blocks"
-                )
-                dn_scales_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "down_proj_scales"
-                )
-                dn_bias_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "down_proj_bias"
-                )
+                gu_bias_attr = gm.graph.create_node("get_attr", prefix_path + "gate_up_proj_bias")
+                dn_blocks_attr = gm.graph.create_node("get_attr", prefix_path + "down_proj_blocks")
+                dn_scales_attr = gm.graph.create_node("get_attr", prefix_path + "down_proj_scales")
+                dn_bias_attr = gm.graph.create_node("get_attr", prefix_path + "down_proj_bias")
                 sa_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_alpha_trtllm")
                 sb_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_beta_trtllm")
                 sl_attr = gm.graph.create_node("get_attr", prefix_path + "swiglu_limit_trtllm")
@@ -758,8 +925,8 @@ class InsertMXFP4MLP(BaseTransform):
                 dn_blocks_attr,  # fc2_weights_mxfp4 (raw uint8)
                 gu_scales_attr,  # fc1_weights_scale_ue8m0 (raw uint8)
                 dn_scales_attr,  # fc2_weights_scale_ue8m0 (raw uint8)
-                gu_bias_attr,    # fc1_bias_f32 (raw bf16; FuseMXFP4Moe converts/pads/shuffles)
-                dn_bias_attr,    # fc2_bias_f32 (raw bf16)
+                gu_bias_attr,  # fc1_bias_f32 (raw bf16; FuseMXFP4Moe converts/pads/shuffles)
+                dn_bias_attr,  # fc2_bias_f32 (raw bf16)
                 sa_attr,
                 sb_attr,
                 sl_attr,
@@ -787,9 +954,7 @@ class InsertMXFP4MLP(BaseTransform):
             # which emitted an unconditional AR placeholder at this exact
             # spot (commit bad1871004 + 93f78e962c, validated EP=2 GSM8K
             # 88.02%).
-            tp_size = (
-                int(getattr(dc, "tp_size", 1)) if dc is not None else 1
-            )
+            tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
             if tp_size > 1:
                 from .sharding import _get_dist_ops
 
@@ -905,7 +1070,7 @@ class FuseMXFP4Moe(BaseTransform):
 
     1. Read the six raw GPU buffers (gate_up_proj_{blocks,scales,bias} and
        down_proj_{blocks,scales,bias}) from the experts module.
-    2. Call :func:`swizzle_moe_mxfp4_weights` on GPU to produce the
+    2. Call :func:`prepare_trtllm_gen_moe_mxfp4_weights` on GPU to produce the
        trtllm-gen kernel layout (pad + shuffle + interleave + bf16->fp32 bias).
        Intermediate-axis TP slicing happens inside the prep helper.
     3. Register the six prepared params on the experts module
@@ -954,15 +1119,15 @@ class FuseMXFP4Moe(BaseTransform):
         come from the allocator's frontier in one back-to-back run, so no
         transient alloc/free cycle from the prep work can interleave them.
 
-        Pass 4: per layer, run ``swizzle_moe_mxfp4_weights`` with
+        Pass 4: per layer, run ``prepare_trtllm_gen_moe_mxfp4_weights`` with
         ``scratch=`` (pad + shuffle outputs land in scratch buffers, no
         per-layer transient allocations of the big intermediates). Then
         ``data.copy_`` scratch outputs into the pre-allocated prepared
         params, re-point the op args, delete raw params + raw get_attrs.
         """
-        from ...custom_ops.fused_moe.swizzle_moe_mxfp4_weights import (
+        from ...custom_ops.fused_moe.prepare_trtllm_gen_moe_mxfp4_weights import (
             MXFP4PrepScratch,
-            swizzle_moe_mxfp4_weights,
+            prepare_trtllm_gen_moe_mxfp4_weights,
         )
 
         # Resolve runtime topology — used to divide ``fc2_bias`` by
@@ -1001,9 +1166,7 @@ class FuseMXFP4Moe(BaseTransform):
                 n.args[ARG_FC1_B],  # gate_up_proj_bias
                 n.args[ARG_FC2_B],  # down_proj_bias
             )
-            if not all(
-                isinstance(a, Node) and a.op == "get_attr" for a in raw_get_attrs
-            ):
+            if not all(isinstance(a, Node) and a.op == "get_attr" for a in raw_get_attrs):
                 continue
             if not str(raw_get_attrs[0].target).endswith("gate_up_proj_blocks"):
                 # Already prepped or unexpected layout — skip.
@@ -1042,9 +1205,7 @@ class FuseMXFP4Moe(BaseTransform):
 
         num_matches = len(layer_infos)
         if num_matches == 0:
-            info = TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
             return gm, info
 
         # ---- Pass 2: allocate scratch ONCE ----
@@ -1096,7 +1257,7 @@ class FuseMXFP4Moe(BaseTransform):
 
             # Run prep with shared scratch — outputs are views into scratch,
             # we copy_ them into the pre-allocated prepared params below.
-            prep = swizzle_moe_mxfp4_weights(
+            prep = prepare_trtllm_gen_moe_mxfp4_weights(
                 gu_blocks,
                 gu_scales,
                 gu_bias,
@@ -1129,24 +1290,12 @@ class FuseMXFP4Moe(BaseTransform):
             # then re-point the op's weight args to the prepared get_attrs.
             prefix_path = (experts_path + ".") if experts_path else ""
             with gm.graph.inserting_before(n):
-                fc1_w_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "fc1_w_trtllm"
-                )
-                fc2_w_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "fc2_w_trtllm"
-                )
-                fc1_s_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "fc1_w_scale_trtllm"
-                )
-                fc2_s_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "fc2_w_scale_trtllm"
-                )
-                fc1_b_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "fc1_bias_trtllm"
-                )
-                fc2_b_attr = gm.graph.create_node(
-                    "get_attr", prefix_path + "fc2_bias_trtllm"
-                )
+                fc1_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_trtllm")
+                fc2_w_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_trtllm")
+                fc1_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_w_scale_trtllm")
+                fc2_s_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_w_scale_trtllm")
+                fc1_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc1_bias_trtllm")
+                fc2_b_attr = gm.graph.create_node("get_attr", prefix_path + "fc2_bias_trtllm")
 
             new_args = list(n.args)
             new_args[ARG_FC1_W] = fc1_w_attr
@@ -1174,9 +1323,7 @@ class FuseMXFP4Moe(BaseTransform):
                 _delete_module_attr(experts_mod, raw_name)
 
             # Update dtype protection to the prepared-name list.
-            experts_mod._dtype_protected_params = tuple(
-                name for name, _, _ in prepared_kinds
-            ) + (
+            experts_mod._dtype_protected_params = tuple(name for name, _, _ in prepared_kinds) + (
                 "swiglu_alpha_trtllm",
                 "swiglu_beta_trtllm",
                 "swiglu_limit_trtllm",

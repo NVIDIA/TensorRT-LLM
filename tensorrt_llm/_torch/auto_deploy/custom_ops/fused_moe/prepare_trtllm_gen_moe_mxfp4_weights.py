@@ -43,10 +43,6 @@ byte-identical:
 * ``trtllmgen_maybe_get_cached_w3_w1_permute_indices`` — gated GEMM shuffle
 * ``trtllmgen_maybe_get_cached_w2_permute_indices`` — non-gated GEMM shuffle
 * ``_get_weight_alignment``                         — alignment derivation
-
-The first version of this helper (Step 2 of the V4 plan) supports
-``tp_size = 1`` only; TP slicing is added in Step 5 alongside a new
-``ShardingInfo``.
 """
 
 from dataclasses import dataclass
@@ -74,9 +70,27 @@ _WEIGHT_ALIGNMENT: int = 128
 _EPILOGUE_TILE_M: int = 128
 
 
+def _compute_padded_dims(per_rank_i: int, hidden_size: int) -> Tuple[int, int, int]:
+    """Returns ``(i_pad, h_w1_pad, h_w2_pad)`` for the trtllm-gen layout.
+
+    ``i_pad`` aligns the per-rank intermediate dim to ``_WEIGHT_ALIGNMENT``
+    (128, TMA weight alignment). ``h_w1_pad`` aligns hidden to
+    ``_INPUT_HIDDEN_ALIGNMENT`` (512, TMA input constraint) for w1's K-axis.
+    ``h_w2_pad`` aligns hidden to ``_WEIGHT_ALIGNMENT`` (128) for w2's
+    weight N-axis. Used by :class:`MXFP4PrepScratch.allocate` and the
+    main prep helper so all sites share one ceiling formula.
+    """
+    i_pad = ((per_rank_i + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT) * _WEIGHT_ALIGNMENT
+    h_w1_pad = (
+        (hidden_size + _INPUT_HIDDEN_ALIGNMENT - 1) // _INPUT_HIDDEN_ALIGNMENT
+    ) * _INPUT_HIDDEN_ALIGNMENT
+    h_w2_pad = ((hidden_size + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT) * _WEIGHT_ALIGNMENT
+    return i_pad, h_w1_pad, h_w2_pad
+
+
 @dataclass(frozen=True)
-class PreparedMXFP4Weights:
-    """Output of :func:`swizzle_moe_mxfp4_weights`."""
+class TRTLLMGenMXFP4MoEWeights:
+    """Output of :func:`prepare_trtllm_gen_moe_mxfp4_weights`."""
 
     fc1_weights_mxfp4: torch.Tensor  # [E, 2I_pad, H_pad/2]  uint8 (shuffled)
     fc1_weights_scale_ue8m0: torch.Tensor  # [E, 2I_pad, H_pad/32] uint8 (shuffled)
@@ -92,10 +106,10 @@ class PreparedMXFP4Weights:
 
 @dataclass
 class MXFP4PrepScratch:
-    """Reusable GPU scratch buffers for ``swizzle_moe_mxfp4_weights``.
+    """Reusable GPU scratch buffers for ``prepare_trtllm_gen_moe_mxfp4_weights``.
 
     Use :meth:`allocate` to pre-allocate once for the per-rank kernel-layout
-    shape; pass to :func:`swizzle_moe_mxfp4_weights` via the
+    shape; pass to :func:`prepare_trtllm_gen_moe_mxfp4_weights` via the
     ``scratch=`` kwarg on every MoE layer in a build/fuse pass. The helper
     writes its pad + shuffle outputs into these buffers in-place, so no
     transient pad/shuffle tensors accumulate or are freed per layer.
@@ -160,27 +174,15 @@ class MXFP4PrepScratch:
         intermediate dim already TP-sliced (or full ``I`` if no TP), and
         ``hidden_size`` is the model's hidden dim ``H``.
         """
-        i_pad = (
-            (per_rank_i + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT
-        ) * _WEIGHT_ALIGNMENT
-        h_w1_pad = (
-            (hidden_size + _INPUT_HIDDEN_ALIGNMENT - 1) // _INPUT_HIDDEN_ALIGNMENT
-        ) * _INPUT_HIDDEN_ALIGNMENT
-        h_w2_pad = (
-            (hidden_size + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT
-        ) * _WEIGHT_ALIGNMENT
+        i_pad, h_w1_pad, h_w2_pad = _compute_padded_dims(per_rank_i, hidden_size)
         u8 = dict(dtype=torch.uint8, device=device)
         f32 = dict(dtype=torch.float32, device=device)
         return cls(
             fc1_w_buf=torch.empty(e_local, 2 * i_pad, h_w1_pad // 2, **u8),
-            fc1_s_buf=torch.empty(
-                e_local, 2 * i_pad, h_w1_pad // _MXFP4_SCALING_VECTOR_SIZE, **u8
-            ),
+            fc1_s_buf=torch.empty(e_local, 2 * i_pad, h_w1_pad // _MXFP4_SCALING_VECTOR_SIZE, **u8),
             fc1_b_buf=torch.empty(e_local, 2 * i_pad, **f32),
             fc2_w_buf=torch.empty(e_local, h_w2_pad, i_pad // 2, **u8),
-            fc2_s_buf=torch.empty(
-                e_local, h_w2_pad, i_pad // _MXFP4_SCALING_VECTOR_SIZE, **u8
-            ),
+            fc2_s_buf=torch.empty(e_local, h_w2_pad, i_pad // _MXFP4_SCALING_VECTOR_SIZE, **u8),
             fc2_b_buf=torch.empty(e_local, h_w2_pad, **f32),
             fc1_w_pad_buf=torch.empty(e_local, 2 * i_pad, h_w1_pad // 2, **u8),
             fc1_s_pad_buf=torch.empty(
@@ -188,9 +190,7 @@ class MXFP4PrepScratch:
             ),
             fc1_b_pad_buf=torch.empty(e_local, 2 * i_pad, **f32),
             fc2_w_pad_buf=torch.empty(e_local, h_w2_pad, i_pad // 2, **u8),
-            fc2_s_pad_buf=torch.empty(
-                e_local, h_w2_pad, i_pad // _MXFP4_SCALING_VECTOR_SIZE, **u8
-            ),
+            fc2_s_pad_buf=torch.empty(e_local, h_w2_pad, i_pad // _MXFP4_SCALING_VECTOR_SIZE, **u8),
             fc2_b_pad_buf=torch.empty(e_local, h_w2_pad, **f32),
             e_local=e_local,
             hidden_size=hidden_size,
@@ -416,7 +416,7 @@ def _shuffle_per_expert_bias_w2(
     return out
 
 
-def swizzle_moe_mxfp4_weights(
+def prepare_trtllm_gen_moe_mxfp4_weights(
     gate_up_blocks: torch.Tensor,  # [E, 2I, H/32, 16]  or  [E, 2I, H/2]   uint8
     gate_up_scales: torch.Tensor,  # [E, 2I, H/32]                         uint8
     gate_up_bias: torch.Tensor,  # [E, 2I]                               bf16
@@ -429,7 +429,7 @@ def swizzle_moe_mxfp4_weights(
     tp_size: int = 1,
     tp_rank: int = 0,
     scratch: MXFP4PrepScratch | None = None,
-) -> PreparedMXFP4Weights:
+) -> TRTLLMGenMXFP4MoEWeights:
     """Convert HF on-disk MXFP4 expert weights into trtllm-gen-ready stacked tensors.
 
     Mirrors the algorithm in
@@ -437,7 +437,7 @@ def swizzle_moe_mxfp4_weights(
     load_expert_w3_w1_weight, load_expert_w2_weight,
     load_expert_w3_w1_weight_scale_mxfp4, load_expert_w2_weight_scale_mxfp4}``.
 
-    For ``tp_size > 1`` (TP-MoE / V6, Step 5 of MOE_TRTLLM_GEN_PLAN.md):
+    For ``tp_size > 1`` (TP-MoE):
     intermediate dim is sharded across ``tp_size`` ranks before the kernel-
     layout pad+shuffle.  PT does this in
     ``load_expert_w3_w1_weight`` / ``load_expert_w2_weight`` via
@@ -464,7 +464,7 @@ def swizzle_moe_mxfp4_weights(
     Scratch path (``scratch != None``): all kernel-layout outputs (pad +
     shuffle results and the fp32 biases) are written into the pre-allocated
     GPU buffers in :class:`MXFP4PrepScratch`. The returned
-    :class:`PreparedMXFP4Weights` fields are VIEWS of those buffers, so
+    :class:`TRTLLMGenMXFP4MoEWeights` fields are VIEWS of those buffers, so
     the caller MUST consume / copy them out before the next call to this
     function overwrites the scratch. Scratch path only supports
     ``tp_size == 1`` (the intended use case is ``FuseMXFP4Moe`` calling
@@ -481,7 +481,7 @@ def swizzle_moe_mxfp4_weights(
         # would double-slice on the intermediate axis. Loud error rather
         # than silent corruption.
         raise ValueError(
-            "swizzle_moe_mxfp4_weights: scratch is only supported with "
+            "prepare_trtllm_gen_moe_mxfp4_weights: scratch is only supported with "
             f"tp_size=1 (got tp_size={tp_size}). The caller is expected to do "
             "TP slicing before this helper when using scratch."
         )
@@ -613,13 +613,9 @@ def swizzle_moe_mxfp4_weights(
     # We replicate that exactly so the kernel's args.hidden_size /
     # output_hidden_size match what PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod``
     # exercises.
-    intermediate_size_pad = (
-        (intermediate_size_for_local + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT
-    ) * _WEIGHT_ALIGNMENT
-    hidden_w1_pad = (
-        (hidden_size + _INPUT_HIDDEN_ALIGNMENT - 1) // _INPUT_HIDDEN_ALIGNMENT
-    ) * _INPUT_HIDDEN_ALIGNMENT
-    hidden_w2_pad = ((hidden_size + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT) * _WEIGHT_ALIGNMENT
+    intermediate_size_pad, hidden_w1_pad, hidden_w2_pad = _compute_padded_dims(
+        intermediate_size_for_local, hidden_size
+    )
 
     # gate_up weights — pad each half [E, I, H/2] to [E, I_pad, H_w1_pad/2]
     # SEPARATELY so the zero-pad rows live inside each half, then stack as
@@ -633,9 +629,7 @@ def swizzle_moe_mxfp4_weights(
     # tensor + no concat alloc).
     if scratch is None:
         up_padded_w = _pad_per_expert_2d(up_rows_w, hidden_w1_pad // 2, intermediate_size_pad)
-        gate_padded_w = _pad_per_expert_2d(
-            gate_rows_w, hidden_w1_pad // 2, intermediate_size_pad
-        )
+        gate_padded_w = _pad_per_expert_2d(gate_rows_w, hidden_w1_pad // 2, intermediate_size_pad)
         gu_padded = torch.cat(
             [up_padded_w, gate_padded_w], dim=1
         ).contiguous()  # [E, 2I_pad, H_w1_pad/2]
@@ -664,9 +658,7 @@ def swizzle_moe_mxfp4_weights(
         dn_padded = _pad_per_expert_2d(dn_3d, intermediate_size_pad // 2, hidden_w2_pad)
     else:
         dn_padded = scratch.fc2_w_pad_buf
-        _pad_per_expert_2d(
-            dn_3d, intermediate_size_pad // 2, hidden_w2_pad, out=dn_padded
-        )
+        _pad_per_expert_2d(dn_3d, intermediate_size_pad // 2, hidden_w2_pad, out=dn_padded)
 
     # 4. Pad scales — same per-half logic for w1; col_alignment uses
     #    scaling-vector size.
@@ -787,9 +779,7 @@ def swizzle_moe_mxfp4_weights(
     if scratch is None:
         fc1_bias_padded = _shuffle_per_expert_bias_w3_w1(fc1_bias_padded)
     else:
-        fc1_bias_padded = _shuffle_per_expert_bias_w3_w1(
-            fc1_bias_padded, out=scratch.fc1_b_buf
-        )
+        fc1_bias_padded = _shuffle_per_expert_bias_w3_w1(fc1_bias_padded, out=scratch.fc1_b_buf)
 
     if scratch is None:
         fc2_bias_padded = (
@@ -817,14 +807,12 @@ def swizzle_moe_mxfp4_weights(
             out=scratch.fc2_b_pad_buf.unsqueeze(-1),
         )
         # tp_size > 1 is rejected for scratch above, so no /tp_size needed.
-        fc2_bias_padded = _shuffle_per_expert_bias_w2(
-            scratch.fc2_b_pad_buf, out=scratch.fc2_b_buf
-        )
+        fc2_bias_padded = _shuffle_per_expert_bias_w2(scratch.fc2_b_pad_buf, out=scratch.fc2_b_buf)
 
     intermediate_size_padded = fc1_weights.shape[1] // 2  # 2I_pad / 2 = I_pad
     hidden_size_padded = fc1_weights.shape[-1] * 2  # (H_pad/2) * 2 = H_pad
 
-    return PreparedMXFP4Weights(
+    return TRTLLMGenMXFP4MoEWeights(
         fc1_weights_mxfp4=fc1_weights,
         fc1_weights_scale_ue8m0=fc1_weights_scale,
         fc1_bias_f32=fc1_bias_padded,
@@ -856,439 +844,3 @@ def make_swiglu_param_tensors(
     b = torch.full((num_local_experts,), beta, dtype=torch.float32, device=dev)
     c = torch.full((num_local_experts,), limit, dtype=torch.float32, device=dev)
     return a, b, c
-
-
-# ============================================================================
-# Load hook helper: GLM5-style state_dict pre-hook that runs trtllm-gen
-# MXFP4 weight prep at weight-load time instead of in a post-load transform.
-# ============================================================================
-#
-# Motivation: the previous flow allocated raw HF MXFP4 expert weights
-# (gate_up_proj_blocks / _scales / _bias and down_proj_blocks / _scales /
-# _bias) on each experts module, then a post-load transform read those raw
-# tensors, ran ``swizzle_moe_mxfp4_weights``, registered NEW
-# prepared-shape parameters (fc1_weights_mxfp4 etc.), retargeted the FX op,
-# and deleted the raw parameters. Peak memory included both raw + prepared
-# tensors briefly (~150 GB on gpt-oss-120b 128 experts × 36 layers).
-#
-# The hook here folds the prep into ``load_state_dict``. The state-dict
-# pre-hook receives raw HF MXFP4 keys, runs the prep helper, writes the
-# results back under the prepared key names, and pops the raw keys. The
-# module only ever allocates prepared-shape parameters, so peak memory
-# matches the steady-state working set.
-#
-# TP info is read from ``torch.distributed`` at hook fire time (rank 0 / TP=1
-# fallback when uninitialised). This assumes ``moe_tp_size == world_size``
-# (true for gpt-oss configurations on the standalone yaml). For models that
-# decouple MoE-TP from data-TP, plumb a closure that returns the right pair.
-
-
-def _get_default_dist_info() -> Tuple[int, int, int, int]:
-    """Return ``(moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank)``.
-
-    Defaults to assigning all of ``world_size`` to MoE-TP (no EP). Falls
-    back to ``(1, 0, 1, 0)`` when distributed is not initialised. This
-    matches the legacy behaviour of the load hook when no ``DistConfig``
-    is plumbed.
-    """
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        ws = torch.distributed.get_world_size()
-        rk = torch.distributed.get_rank()
-        return ws, rk, 1, 0
-    return 1, 0, 1, 0
-
-
-def make_mxfp4_trtllm_load_hook(
-    *,
-    num_layers: int,
-    hidden_size: int,
-    intermediate_size: int,
-    num_experts: int,
-    layer_prefix: str = "model.layers",
-    experts_subpath: str = "mlp.experts",
-    dist_info_fn=_get_default_dist_info,
-):
-    """Build a ``load_state_dict`` pre-hook that converts raw HF MXFP4 expert
-    state-dict entries into trtllm-gen-ready prepared tensors.
-
-    Use with ``module._register_load_state_dict_pre_hook(hook)`` on any
-    ancestor of the experts modules; the hook walks ``num_layers`` layers and
-    looks for raw keys at ``{prefix}{layer_prefix}.{i}.{experts_subpath}.``.
-
-    For each layer that has raw MXFP4 keys, the hook:
-
-    1. Selects this rank's expert subset on the leading axis using
-       ``moe_ep_size`` / ``moe_ep_rank`` from ``dist_info_fn``. When
-       ``moe_ep_size == 1`` the full expert set is kept.
-    2. Calls :func:`swizzle_moe_mxfp4_weights` on the
-       EP-sliced tensors with ``tp_size=moe_tp_size`` / ``tp_rank=moe_tp_rank``
-       to apply intermediate-axis TP slicing + the trtllm-gen layout
-       transforms.
-    3. Pops the six raw keys (``gate_up_proj_{blocks,scales,bias}``,
-       ``down_proj_{blocks,scales,bias}``) from the state dict.
-    4. Inserts the six prepared keys (``fc1_w_trtllm``,
-       ``fc1_w_scale_trtllm``, ``fc1_bias_trtllm``,
-       ``fc2_w_trtllm``, ``fc2_w_scale_trtllm``,
-       ``fc2_bias_trtllm``) at the same experts subpath, plus the three
-       SwiGLU constants (``swiglu_alpha_trtllm`` / beta / limit).
-
-    Args:
-        num_layers: number of decoder layers to scan.
-        hidden_size: model hidden dim (H), used to compute prepared shapes.
-        intermediate_size: per-expert intermediate dim (I); will be sliced
-            per-rank by the prep helper using ``dist_info_fn``.
-        num_experts: total expert count (E); used to compute the EP slice.
-        layer_prefix: where layers live, default ``"model.layers"``.
-        experts_subpath: where the experts module sits within each layer,
-            default ``"mlp.experts"``.
-        dist_info_fn: zero-arg callable returning
-            ``(moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank)``.
-            Default reads from ``torch.distributed`` and assigns all of
-            world_size to MoE-TP.
-
-    Returns:
-        A hook with signature ``(state_dict, prefix, local_metadata, strict,
-        missing_keys, unexpected_keys, error_msgs)`` suitable for
-        ``Module._register_load_state_dict_pre_hook(hook, with_module=False)``.
-    """
-
-    _RAW_SUFFIXES = (
-        "gate_up_proj_blocks",
-        "gate_up_proj_scales",
-        "gate_up_proj_bias",
-        "down_proj_blocks",
-        "down_proj_scales",
-        "down_proj_bias",
-    )
-    # Names match those registered by ``quantize_mxfp4_moe`` (backend=trtllm)
-    # so the standard state_dict load path resolves to the prepared-shape
-    # parameters that the transform allocated at PATTERN_MATCHER time.
-    _PREPARED_SUFFIXES = (
-        "fc1_w_trtllm",
-        "fc1_w_scale_trtllm",
-        "fc1_bias_trtllm",
-        "fc2_w_trtllm",
-        "fc2_w_scale_trtllm",
-        "fc2_bias_trtllm",
-    )
-    # SwiGLU constants. These are NOT in HF safetensors, but the modeling code
-    # registers them as parameters expected by the trtllm-gen op call. Under
-    # ``init_empty_weights`` they get demoted to meta during ``__init__`` and
-    # then ``model.to(cuda)`` lands undefined values on the device. The hook
-    # injects them into ``state_dict`` so the regular load path populates them
-    # correctly. Constants match gpt-oss config (alpha=1.702, beta=1.0,
-    # limit=7.0).
-    _SWIGLU_SUFFIXES = (
-        ("swiglu_alpha_trtllm", 1.702),
-        ("swiglu_beta_trtllm", 1.0),
-        ("swiglu_limit_trtllm", 7.0),
-    )
-
-    def hook(state_dict, prefix, *args, local_metadata=None, **kwargs):
-        import sys as _sys
-
-        moe_tp_size, moe_tp_rank, moe_ep_size, moe_ep_rank = dist_info_fn()
-        if num_experts % moe_ep_size != 0:
-            raise ValueError(
-                f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
-            )
-        experts_per_rank = num_experts // moe_ep_size
-        ep_start = moe_ep_rank * experts_per_rank
-        ep_stop = ep_start + experts_per_rank
-
-        _matched_layers = 0
-        # Diagnostic: dtype/shape of raw vs prepared layer 0 for sanity.
-        _layer0_diag = None
-        for layer_idx in range(num_layers):
-            base = f"{prefix}{layer_prefix}.{layer_idx}.{experts_subpath}."
-            raw_keys = [base + s for s in _RAW_SUFFIXES]
-
-            # All raw keys must be present together; otherwise this layer is
-            # either non-MXFP4 or already prepped — skip.
-            if not all(k in state_dict for k in raw_keys):
-                if layer_idx == 0:
-                    # Diagnostic: layer 0 raw keys missing. Print what we got
-                    # so the cause (prefix mismatch / wrong subpath) is obvious.
-                    present_under_prefix = sorted(
-                        k for k in state_dict if k.startswith(f"{prefix}{layer_prefix}.0.")
-                    )[:10]
-                    print(
-                        f"[mxfp4_load_hook] layer 0 raw MXFP4 keys not found at "
-                        f"prefix={prefix!r}, sub={experts_subpath!r}. Want={raw_keys}. "
-                        f"State dict has under {prefix}{layer_prefix}.0.*: "
-                        f"{present_under_prefix}",
-                        file=_sys.stderr,
-                        flush=True,
-                    )
-                continue
-            _matched_layers += 1
-
-            (
-                gu_blocks_key,
-                gu_scales_key,
-                gu_bias_key,
-                dn_blocks_key,
-                dn_scales_key,
-                dn_bias_key,
-            ) = raw_keys
-
-            # EP slicing on the leading expert axis (no-op when moe_ep_size==1).
-            # The intermediate-axis TP slicing happens inside prepare_*().
-            gu_blocks = state_dict[gu_blocks_key][ep_start:ep_stop]
-            gu_scales = state_dict[gu_scales_key][ep_start:ep_stop]
-            gu_bias = state_dict[gu_bias_key][ep_start:ep_stop]
-            dn_blocks = state_dict[dn_blocks_key][ep_start:ep_stop]
-            dn_scales = state_dict[dn_scales_key][ep_start:ep_stop]
-            dn_bias = state_dict[dn_bias_key][ep_start:ep_stop]
-
-            prepared = swizzle_moe_mxfp4_weights(
-                gu_blocks,
-                gu_scales,
-                gu_bias,
-                dn_blocks,
-                dn_scales,
-                dn_bias,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                tp_size=moe_tp_size,
-                tp_rank=moe_tp_rank,
-            )
-
-            # Drop raw keys so load_state_dict doesn't complain about
-            # "unexpected" entries; the matching prepared keys take their place.
-            for k in raw_keys:
-                state_dict.pop(k, None)
-
-            prepared_tensors = (
-                prepared.fc1_weights_mxfp4,
-                prepared.fc1_weights_scale_ue8m0,
-                prepared.fc1_bias_f32,
-                prepared.fc2_weights_mxfp4,
-                prepared.fc2_weights_scale_ue8m0,
-                prepared.fc2_bias_f32,
-            )
-            for suffix, tensor in zip(_PREPARED_SUFFIXES, prepared_tensors):
-                state_dict[base + suffix] = tensor.contiguous()
-
-            # Inject swiglu constants for this layer too — they are not in
-            # state_dict, but the modeling code registers them as parameters
-            # which will be missing-keys (and stay zero/meta) without this.
-            num_local_experts_layer = int(prepared.fc1_weights_mxfp4.shape[0])
-            for suffix, value in _SWIGLU_SUFFIXES:
-                state_dict[base + suffix] = torch.full(
-                    (num_local_experts_layer,), float(value), dtype=torch.float32
-                )
-
-            if layer_idx == 0:
-                # One-shot post-prep summary for layer 0: lets us tell at a
-                # glance whether shapes/dtypes look right vs the transform path.
-                _layer0_diag = {
-                    "fc1_w_dtype": str(prepared.fc1_weights_mxfp4.dtype),
-                    "fc1_w_shape": tuple(prepared.fc1_weights_mxfp4.shape),
-                    "fc1_bias_dtype": str(prepared.fc1_bias_f32.dtype),
-                    "fc1_bias_abs_max": float(prepared.fc1_bias_f32.abs().max().item()),
-                }
-
-        if _matched_layers > 0:
-            if _layer0_diag is not None:
-                print(
-                    f"[mxfp4_load_hook] layer0 diag: {_layer0_diag}",
-                    file=_sys.stderr,
-                    flush=True,
-                )
-            print(
-                f"[mxfp4_load_hook] prefix={prefix!r} prepped {_matched_layers}/"
-                f"{num_layers} layers "
-                f"(moe_tp={moe_tp_size}r{moe_tp_rank}, moe_ep={moe_ep_size}r{moe_ep_rank})",
-                file=_sys.stderr,
-                flush=True,
-            )
-
-    return hook
-
-
-# ============================================================================
-# Slim EP-slice-only load hook (post-load fusion design)
-# ============================================================================
-#
-# Companion to the new ``fuse_mxfp4_moe`` POST_LOAD_FUSION transform: the
-# dispatcher at PATTERN_MATCHER registers raw HF MXFP4 params at the
-# EP-sliced shape (E_local = num_experts // moe_ep_size). The standard load
-# path would then refuse to copy [E_full] state_dict tensors into [E_local]
-# module params. This hook fixes that by slicing the leading expert axis
-# in-place inside ``state_dict`` *without* touching key names or running any
-# kernel-layout prep. The prep is deferred to the GPU-side fuse transform.
-#
-# When ``moe_ep_size == 1`` no slicing is needed — caller should not register
-# this hook in that case (it would still be a no-op, but skipping it avoids
-# unnecessary state_dict iteration).
-
-
-def make_mxfp4_sharding_load_hook(
-    *,
-    num_layers: int,
-    num_experts: int,
-    intermediate_size: int,
-    moe_ep_size: int,
-    moe_ep_rank: int,
-    moe_tp_size: int,
-    moe_tp_rank: int,
-    layer_prefix: str = "model.layers",
-    experts_subpath: str = "mlp.experts",
-):
-    """Build a ``load_state_dict`` pre-hook that EP+TP-shards raw HF MXFP4 keys.
-
-    Companion to the GPU-side :class:`FuseMXFP4Moe` POST_LOAD_FUSION
-    transform. This hook handles the *sharding* axes (expert + intermediate)
-    on CPU before tensors are copied to GPU, so per-rank GPU memory only
-    holds this rank's slice. The kernel-layout work (H-axis padding,
-    per-expert TMA shuffle, bf16->fp32 bias conversion, bias / tp_size) is
-    deferred to ``FuseMXFP4Moe`` on GPU.
-
-    For each layer's six raw HF MXFP4 keys
-    (``gate_up_proj_{blocks,scales,bias}``,
-    ``down_proj_{blocks,scales,bias}``) the hook applies in order:
-
-    1. **EP slice (leading expert axis)** —
-       ``t[ep_start:ep_stop]`` where
-       ``experts_per_rank = num_experts / moe_ep_size``.
-       No-op when ``moe_ep_size == 1``.
-
-    2. **TP-aware pre-pad + slice (intermediate axis)** —
-       only when ``moe_tp_size > 1``. The intermediate dim ``I`` is padded
-       to ``i_padded_tp = ceil(I, alignment_tp)`` where
-       ``alignment_tp = _get_weight_alignment(128, 32, moe_tp_size, I)``,
-       guaranteeing ``per_rank_i = i_padded_tp / moe_tp_size`` is itself a
-       multiple of 128 (the kernel's TMA weight alignment). Then each
-       tensor is sliced on its intermediate-encoding axis:
-
-       * ``gate_up_proj_blocks``  ``[E, 2I, H/32, 16]``  — axis 1, range
-         ``[2*tp_start : 2*tp_stop]``. Works on the interleaved 2I layout
-         because gate/up indices alternate: index ``2k`` is gate(k), index
-         ``2k+1`` is up(k). The contiguous range ``[2k : 2k+2m]`` therefore
-         covers gate(k:k+m) ∪ up(k:k+m) — same semantics as a
-         de-interleaved per-half slice.
-       * ``gate_up_proj_scales`` ``[E, 2I, H/32]``      — axis 1, same range.
-       * ``gate_up_proj_bias``   ``[E, 2I]``            — axis 1, same range.
-       * ``down_proj_blocks``    ``[E, H, I/32, 16]``   — axis 2 (I_blk), range
-         ``[tp_start/32 : tp_stop/32]``. ``per_rank_i`` is a multiple of 32
-         (in fact 128), so block boundaries are integer.
-       * ``down_proj_scales``    ``[E, H, I/32]``       — axis 2, same range.
-       * ``down_proj_bias``      ``[E, H]``             — H axis isn't TP-split,
-         so the bias is left intact. ``FuseMXFP4Moe`` will divide it by
-         ``moe_tp_size`` after dtype conversion.
-
-    Args:
-        num_layers: number of decoder layers to scan.
-        num_experts: total expert count (``E_full``) on disk.
-        intermediate_size: per-expert intermediate dim ``I`` on disk
-            (i.e. before any padding/slicing).
-        moe_ep_size / moe_ep_rank: expert-parallel group size + this rank.
-        moe_tp_size / moe_tp_rank: MoE tensor-parallel group size + this rank
-            (intermediate-axis split).
-        layer_prefix: where layers live, default ``"model.layers"``.
-        experts_subpath: where the experts module sits within each layer,
-            default ``"mlp.experts"``.
-
-    Returns:
-        A hook with the standard ``(state_dict, prefix, ...)`` signature.
-    """
-    if num_experts % moe_ep_size != 0:
-        raise ValueError(
-            f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
-        )
-    experts_per_rank = num_experts // moe_ep_size
-    ep_start = moe_ep_rank * experts_per_rank
-    ep_stop = ep_start + experts_per_rank
-
-    # TP-aware pre-pad/slice math (only used when moe_tp_size > 1).
-    if moe_tp_size > 1:
-        alignment_tp = _get_weight_alignment(
-            _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, intermediate_size
-        )
-        i_padded_tp = (
-            (intermediate_size + alignment_tp - 1) // alignment_tp
-        ) * alignment_tp
-        per_rank_i = i_padded_tp // moe_tp_size
-        tp_start = moe_tp_rank * per_rank_i
-        tp_stop = (moe_tp_rank + 1) * per_rank_i
-        if per_rank_i % _MXFP4_SCALING_VECTOR_SIZE != 0:
-            raise ValueError(
-                f"per_rank_i ({per_rank_i}) must be divisible by "
-                f"_MXFP4_SCALING_VECTOR_SIZE ({_MXFP4_SCALING_VECTOR_SIZE}); "
-                f"check _get_weight_alignment output."
-            )
-        # Block-axis bounds for down_proj's I_blk = I / 32 axis.
-        blk_pad = i_padded_tp // _MXFP4_SCALING_VECTOR_SIZE
-        blk_start = tp_start // _MXFP4_SCALING_VECTOR_SIZE
-        blk_stop = tp_stop // _MXFP4_SCALING_VECTOR_SIZE
-    else:
-        i_padded_tp = intermediate_size
-        per_rank_i = intermediate_size
-        tp_start = 0
-        tp_stop = intermediate_size
-        blk_pad = intermediate_size // _MXFP4_SCALING_VECTOR_SIZE
-        blk_start = 0
-        blk_stop = blk_pad
-
-    def _pad_axis(t: torch.Tensor, dim: int, target: int) -> torch.Tensor:
-        cur = t.shape[dim]
-        if cur >= target:
-            return t
-        pad_amount = target - cur
-        # F.pad spec is (pad_lastdim_left, pad_lastdim_right, ..., pad_dim_left, pad_dim_right)
-        pad = [0, 0] * (t.dim() - dim - 1) + [0, pad_amount] + [0, 0] * dim
-        return torch.nn.functional.pad(t, pad)
-
-    def hook(state_dict, prefix, *args, local_metadata=None, **kwargs):
-        do_ep = moe_ep_size > 1
-        do_tp = moe_tp_size > 1
-        if not (do_ep or do_tp):
-            # Nothing to slice — leave state_dict alone.
-            return
-        for layer_idx in range(num_layers):
-            base = f"{prefix}{layer_prefix}.{layer_idx}.{experts_subpath}."
-
-            # ---- EP slice (leading expert axis) ----
-            if do_ep:
-                for s in (
-                    "gate_up_proj_blocks",
-                    "gate_up_proj_scales",
-                    "gate_up_proj_bias",
-                    "down_proj_blocks",
-                    "down_proj_scales",
-                    "down_proj_bias",
-                ):
-                    k = base + s
-                    t = state_dict.get(k)
-                    if t is None:
-                        continue
-                    state_dict[k] = t[ep_start:ep_stop].contiguous()
-
-            # ---- TP-aware pre-pad + slice (intermediate axis) ----
-            if do_tp:
-                # gate_up_*: axis 1 (the 2I interleaved axis); pad to
-                # 2*i_padded_tp, then slice [2*tp_start : 2*tp_stop].
-                for s in ("gate_up_proj_blocks", "gate_up_proj_scales", "gate_up_proj_bias"):
-                    k = base + s
-                    t = state_dict.get(k)
-                    if t is None:
-                        continue
-                    t = _pad_axis(t, 1, 2 * i_padded_tp)
-                    state_dict[k] = t[:, 2 * tp_start : 2 * tp_stop].contiguous()
-
-                # down_proj_blocks / scales: axis 2 (I_blk = I / 32); pad to
-                # blk_pad, then slice [blk_start : blk_stop]. Inner 16 axis
-                # (blocks only) is untouched.
-                for s in ("down_proj_blocks", "down_proj_scales"):
-                    k = base + s
-                    t = state_dict.get(k)
-                    if t is None:
-                        continue
-                    t = _pad_axis(t, 2, blk_pad)
-                    state_dict[k] = t[:, :, blk_start:blk_stop].contiguous()
-                # down_proj_bias [E, H]: H axis is not TP-split. Leave as-is
-                # and let FuseMXFP4Moe divide by moe_tp_size after dtype
-                # conversion (matches the prep helper's tp-aware bias path).
-
-    return hook

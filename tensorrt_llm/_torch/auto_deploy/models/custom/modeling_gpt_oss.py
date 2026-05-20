@@ -27,7 +27,7 @@ convention):
   * MoE router (``torch_moe_router``) and experts (``torch_moe_dense_mlp``)
     are unchanged from ``modeling_gpt_oss.py`` -- expert weights stay
     replicated under sharding-IR; EP/TP-MoE for the trtllm-gen path
-    happens via a separate ``ShardableNode`` (Step 5 of the V4 plan).
+    happens via a separate ``ShardableNode``.
   * ``lm_head`` is left as a plain ``nn.Linear`` -- there is no canonical
     sharding-IR pattern for col-parallel-linear-then-all-gather in this
     codebase, and the absolute gain (~80 us / token at TP=4 for
