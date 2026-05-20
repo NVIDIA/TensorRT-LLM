@@ -503,11 +503,13 @@ class Sender(SenderBase):
                     str(write_meta.slice_id).encode("ascii"),
                     b"True",  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED.value.encode("ascii"),
+                    b"0",
                 ]
             )
             return
 
         agent_result = AgentResult.SUCCESS
+        transferred_bytes = int(write_meta.sizes.sum()) if write_meta.sizes.size > 0 else 0
         if write_meta.src_ptrs.size > 0:
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
@@ -543,9 +545,14 @@ class Sender(SenderBase):
                 str(write_meta.slice_id).encode("ascii"),
                 str(write_meta.is_last_slice).encode("ascii"),
                 agent_result.value.encode("ascii"),
+                str(transferred_bytes if agent_result == AgentResult.SUCCESS else 0).encode(
+                    "ascii"
+                ),
             ]
         )
 
+        if agent_result == AgentResult.SUCCESS:
+            session.record_kv_transfer_bytes(transferred_bytes)
         if timer:
             timer.record_task_end(write_meta.peer_rank)
         ri = self._registrar.self_rank_info
@@ -975,6 +982,7 @@ class Sender(SenderBase):
                     str(slice_id).encode("ascii"),
                     b"True",  # is_last_slice
                     AgentResult.FAILED.value.encode("ascii"),
+                    b"0",
                 ]
             )
         except Exception as e:
@@ -1100,6 +1108,7 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
+        self._transferred_kv_bytes = 0
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -1119,6 +1128,15 @@ class TxSession(TxSessionBase):
         if params.ctx_request_id is not None:
             return params.ctx_request_id
         return self.request_id
+
+    def record_kv_transfer_bytes(self, transferred_bytes: int) -> None:
+        with self.lock:
+            self._transferred_kv_bytes += transferred_bytes
+
+    @property
+    def transferred_kv_bytes(self) -> int:
+        with self.lock:
+            return self._transferred_kv_bytes
 
     @property
     def status(self) -> SessionStatus:
@@ -1538,12 +1556,26 @@ class Receiver(ReceiverBase):
             session.cancel()
 
     def _process_kv_agent_result(self, _send_id: bytes, message: list[bytes]):
-        msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = decode_message(
-            message
-        )
+        decoded_message = decode_message(message)
+        if len(decoded_message) == 6:
+            msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = (
+                decoded_message
+            )
+            transferred_bytes = 0
+        else:
+            (
+                msg_type,
+                peer_rank,
+                unique_rid,
+                slice_id_str,
+                is_last_slice_str,
+                status,
+                transferred_bytes,
+            ) = decoded_message
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
         sender_slice_id = int(slice_id_str)
+        transferred_bytes = int(transferred_bytes)
         if msg_type.encode("ascii") != MessageType.KV_AGENT_RESULT:
             logger.error(
                 f"_process_kv_agent_result: unexpected msg_type={msg_type!r}, expected KV_AGENT_RESULT"
@@ -1556,7 +1588,11 @@ class Receiver(ReceiverBase):
             )
             return
         session.process_kv_agent_result(
-            peer_rank, sender_slice_id, is_last_slice_str == "True", AgentResult(status)
+            peer_rank,
+            sender_slice_id,
+            is_last_slice_str == "True",
+            AgentResult(status),
+            transferred_bytes,
         )
 
     def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
@@ -1616,6 +1652,7 @@ class RxSession(RxSessionBase):
         self._aux_status: TaskStatus = TaskStatus.INIT
         self._sender_endpoints: set[str] = set()
         self.lock = threading.Lock()
+        self._transferred_kv_bytes = 0
         self._receiver.setup_session(self)
 
     @property
@@ -1629,6 +1666,11 @@ class RxSession(RxSessionBase):
         if params.ctx_request_id is not None:
             return params.ctx_request_id
         return self.request_id
+
+    @property
+    def transferred_kv_bytes(self) -> int:
+        with self.lock:
+            return self._transferred_kv_bytes
 
     @property
     def status(self) -> SessionStatus:
@@ -1664,7 +1706,12 @@ class RxSession(RxSessionBase):
         self._receiver.dispatch_task(task)
 
     def process_kv_agent_result(
-        self, peer_rank: int, sender_slice_id: int, is_last_slice: bool, status: AgentResult
+        self,
+        peer_rank: int,
+        sender_slice_id: int,
+        is_last_slice: bool,
+        status: AgentResult,
+        transferred_bytes: int = 0,
     ):
         with self.lock:
             assert sender_slice_id < len(self._kv_tasks), (
@@ -1674,6 +1721,7 @@ class RxSession(RxSessionBase):
             )
             task = self._kv_tasks[sender_slice_id]
             if status == AgentResult.SUCCESS:
+                self._transferred_kv_bytes += transferred_bytes
                 if is_last_slice:
                     task.last_slice_count += 1
                     if task.last_slice_count == task.expected_transfers:

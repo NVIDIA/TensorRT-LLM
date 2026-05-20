@@ -63,6 +63,30 @@ MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 
+# From _stats.py
+@dataclass(slots=True)
+class KVCacheStatsDelta:
+    alloc_total_blocks: int = 0
+    alloc_new_blocks: int = 0
+    reused_blocks: int = 0
+    missed_blocks: int = 0
+
+@dataclass(slots=True)
+class KVCacheIterationStatsDelta:
+    iter_alloc_total_blocks: int = 0
+    iter_alloc_new_blocks: int = 0
+    iter_reused_blocks: int = 0
+    iter_full_reused_blocks: int = 0
+    iter_partial_reused_blocks: int = 0
+    iter_missed_blocks: int = 0
+    iter_gen_alloc_blocks: int = 0
+    iter_onboard_blocks: int = 0
+    iter_onboard_bytes: int = 0
+    iter_offload_blocks: int = 0
+    iter_offload_bytes: int = 0
+    iter_intra_device_copy_blocks: int = 0
+    iter_intra_device_copy_bytes: int = 0
+
 # From _config.py
 DataRole = NewType("DataRole", str)
 
@@ -149,6 +173,7 @@ class KVCacheManagerConfig:
     typical_step: BatchDesc | None = None
     ssm_reuse_interval: int = 512
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
+    enable_stats: bool = True
     helix_config: HelixConfig | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
@@ -286,6 +311,8 @@ class _KVCache:
     def finish_event(self) -> Any: ...
     @property
     def num_blocks(self) -> int: ...
+    def commit_pending_stats(self) -> KVCacheStatsDelta: ...
+    def discard_pending_stats(self) -> None: ...
     def close(self) -> None: ...
     @property
     def beam_width(self) -> BeamIndex: ...
@@ -411,7 +438,7 @@ class KVCacheManager:
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
-        cache_salt_id: int | None = None,
+        expected_prompt_length: int | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,
@@ -420,6 +447,14 @@ class KVCacheManager:
     ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
+    def get_committed_stats(self) -> KVCacheStatsDelta: ...
+    def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...
+    def mark_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def is_stats_excluded(self, kv_cache_id: int | None) -> bool: ...
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property

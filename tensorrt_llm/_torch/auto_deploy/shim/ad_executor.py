@@ -91,6 +91,191 @@ class ReportingInfo:
     enable_iter_req_stats: bool = False
 
 
+class ADHiddenStateManager(Eagle3ResourceManager):
+    def __init__(
+        self,
+        cache_seq_interface: CachedSequenceInterface,
+        config: EagleDecodingConfig,
+        max_num_requests: int,
+        max_seq_len: int,
+        max_num_tokens: int,
+    ):
+        hidden_state_buffer = self._get_hidden_state_buffers(cache_seq_interface)[0]
+        dtype = hidden_state_buffer.dtype
+        hidden_size = hidden_state_buffer.shape[1]
+
+        super().__init__(config, dtype, hidden_size, max_num_requests, max_seq_len, max_num_tokens)
+
+        self.hidden_state_write_indices: torch.Tensor = torch.empty(
+            max_num_tokens, dtype=torch.long, device="cuda"
+        )
+
+    def _get_hidden_state_buffers(
+        self, cache_seq_interface: CachedSequenceInterface
+    ) -> List[torch.Tensor]:
+        hidden_state_buffers = []
+        for name, tensor in cache_seq_interface.named_args.items():
+            if "hidden_states_cache" in name:
+                hidden_state_buffers.append(tensor)
+
+        if not hidden_state_buffers:
+            raise ValueError(
+                "No hidden_state_buffers found in cache_seq_interface. Check if we are actually running Eagle3."
+            )
+        return hidden_state_buffers
+
+    def prepare_hidden_states_capture(
+        self, ordered_requests: RequestList, cache_seq_interface: CachedSequenceInterface
+    ) -> None:
+        """Prepare the hidden states for capture by establishing indices that the hidden states will be written to."""
+        seq_lens = cache_seq_interface.info.get_arg("seq_len", truncate=True).tolist()
+        num_tokens = cache_seq_interface.info.total_num_tokens
+
+        start_idx = 0
+        hidden_states_write_indices = []
+        for request, seq_len in zip(ordered_requests, seq_lens):
+            request_id = request.request_id
+            slot_id = self.slot_manager.get_slot(request_id)
+            self.start_indices[slot_id] = start_idx
+            hidden_states_write_indices.extend(range(start_idx, start_idx + seq_len))
+            start_idx += max(seq_len, self.max_total_draft_tokens + 1)
+            assert start_idx < self.hidden_states.shape[0], (
+                f"start_idx {start_idx} exceeds hidden_states capacity {self.hidden_states.shape[0]}"
+            )
+
+        if len(hidden_states_write_indices) != num_tokens:
+            raise ValueError(
+                f"len(hidden_state_write_indices) ({len(hidden_states_write_indices)}) != num_tokens \
+                ({num_tokens}). Check whether ordered_requests matches up with seq_lens."
+            )
+
+        hidden_state_write_indices_host = torch.tensor(
+            hidden_states_write_indices, dtype=torch.long
+        )
+
+        self.hidden_state_write_indices[:num_tokens].copy_(
+            hidden_state_write_indices_host, non_blocking=True
+        )
+
+    def capture_hidden_states(self, cache_seq_interface: CachedSequenceInterface) -> None:
+        """Capture configured hidden states that have been written by the model,
+        in a format that can be used by the draft model.
+        """
+        full_hidden_states = self._get_hidden_state_buffers(cache_seq_interface)
+        if not full_hidden_states:
+            return
+
+        num_tokens = cache_seq_interface.info.total_num_tokens
+
+        hidden_states = [hidden_state[:num_tokens] for hidden_state in full_hidden_states]
+        hidden_states = torch.cat(hidden_states, dim=1)
+        hidden_states = hidden_states.to(dtype=self.dtype)
+
+        token_idx = self.hidden_state_write_indices[:num_tokens]
+        self.hidden_states[:, : hidden_states.shape[1]].index_copy_(0, token_idx, hidden_states)
+
+
+def construct_draft_llm_args(
+    ad_config: LlmArgs,
+) -> TorchLlmArgs:
+    """Construct a TorchLlmArgs for the draft model from AutoDeploy config.
+
+    Args:
+        ad_config: The AutoDeploy LLM configuration
+
+    Returns:
+        A TorchLlmArgs instance suitable for creating a PyTorchModelEngine
+    """
+    # Extract common fields as a dict
+    common_fields = {
+        "model": ad_config.model,
+        "tokenizer": ad_config.tokenizer,
+        "max_batch_size": ad_config.max_batch_size,
+        "max_seq_len": ad_config.max_seq_len,
+        "max_beam_width": ad_config.max_beam_width,
+        "max_num_tokens": ad_config.max_num_tokens,
+        "max_input_len": ad_config.max_input_len,
+        "kv_cache_config": ad_config.kv_cache_config,
+        "enable_chunked_prefill": ad_config.enable_chunked_prefill,
+        "attn_backend": ad_config.attn_backend,
+        "disable_overlap_scheduler": ad_config.disable_overlap_scheduler,
+        "speculative_config": ad_config.speculative_config,
+        "checkpoint_loader": getattr(ad_config, "draft_checkpoint_loader", None),
+    }
+
+    # Add other fields that may exist in ad_config
+    optional_fields = [
+        "dtype",
+        "trust_remote_code",
+        "sparse_attention_config",
+        "lora_config",
+        "scheduler_config",
+        "garbage_collection_gen0_threshold",
+        "skip_tokenizer_init",
+        "tokenizer_mode",
+        "revision",
+        "tokenizer_revision",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "context_parallel_size",
+        "gpus_per_node",
+        "enable_lora",
+        "guided_decoding_backend",
+        "peft_cache_config",
+        "cache_transceiver_config",
+        "decoding_config",
+    ]
+
+    for field in optional_fields:
+        if hasattr(ad_config, field):
+            value = getattr(ad_config, field)
+            if value is not None:  # Only add if not None
+                common_fields[field] = value
+
+    draft_llm_args = TorchLlmArgs(**common_fields)
+
+    # Handle load_format separately
+    if ad_config.speculative_config.load_format == "dummy":
+        draft_llm_args.load_format = LoadFormat.DUMMY
+
+    draft_llm_args.tensor_parallel_size = ad_config.world_size
+
+    return draft_llm_args
+
+
+def create_draft_kv_cache_manager_maybe(
+    draft_model_engine: Optional[PyTorchModelEngine],
+    ad_config: LlmArgs,
+    kv_cache_config_tuned: KvCacheConfig,
+    dist_mapping: Mapping,
+) -> Optional[KVCacheManager]:
+    if draft_model_engine is None or not draft_model_engine.model.model_config.is_generation:
+        return None
+
+    # Get the appropriate KV cache manager class
+    kv_cache_manager_cls = get_kv_cache_manager_cls(
+        draft_model_engine.model.model_config, kv_cache_config_tuned
+    )
+
+    return _create_kv_cache_manager(
+        model_engine=draft_model_engine,
+        kv_cache_manager_cls=kv_cache_manager_cls,
+        mapping=dist_mapping,
+        kv_cache_config=kv_cache_config_tuned,
+        tokens_per_block=kv_cache_config_tuned.tokens_per_block,
+        max_seq_len=ad_config.max_seq_len,
+        max_batch_size=ad_config.max_batch_size,
+        spec_config=ad_config.speculative_config,
+        sparse_attn_config=ad_config.sparse_attention_config,
+        max_num_tokens=ad_config.max_num_tokens,
+        max_beam_width=ad_config.max_beam_width,
+        kv_connector_manager=None,  # KV connector manager not used in AutoDeploy (no disagg support)
+        estimating_kv_cache=False,
+        enable_kv_cache_stats=ad_config.enable_iter_perf_stats
+        or getattr(ad_config, "return_perf_metrics", False),
+    )
+
+
 def _round_up_to_closest(batch_sizes: List[int], bs: int) -> Optional[int]:
     """Return closest batch size larger or equal to bs."""
     if bs > max(batch_sizes, default=0):
