@@ -1892,6 +1892,7 @@ def _persistent_main_kernel(
     USE_TMA_LOAD_WRITE: tl.constexpr = False,
     USE_TMA_LOAD_NOWRITE: tl.constexpr = False,
     USE_TMA_STORE: tl.constexpr = False,
+    USE_REPLAY_CACHE_SLOT: tl.constexpr = True,
 ):
     # PDL signal: fire once at kernel entry (not per work unit).
     if LAUNCH_DEPENDENT_KERNELS:
@@ -1949,9 +1950,12 @@ def _persistent_main_kernel(
             pid_b = tl.load(
                 work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH
             )
-            cache_batch_idx = tl.load(
-                work_item_base + _REPLAY_WORK_CACHE_SLOT
-            ).to(tl.int64)
+            if USE_REPLAY_CACHE_SLOT:
+                cache_batch_idx = tl.load(
+                    work_item_base + _REPLAY_WORK_CACHE_SLOT
+                ).to(tl.int64)
+            else:
+                cache_batch_idx = work_item_idx.to(tl.int64)
             pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
             active_buf = tl.load(
                 work_item_base + _REPLAY_WORK_CACHE_BUF_IDX
@@ -2304,6 +2308,7 @@ def replay_selective_state_update(
     _use_tma_replay_write_load: bool | None = None,   # SSM state load when WRITE_CHECKPOINT=True
     _use_tma_replay_write_store: bool | None = None,  # SSM state store when WRITE_CHECKPOINT=True
     _use_tma_replay_nowrite_load: bool | None = None, # SSM state load when WRITE_CHECKPOINT=False
+    _use_replay_cache_slot: bool = True,
     # Persistent-mode tuning kwargs (consulted for both pd and pm; pd uses
     # _cta_per_sm / _num_loop_stages, pm uses the _write/_nowrite splits):
     # _cta_per_sm : int — CTAs per SM in the 1D persistent grid.  Internally
@@ -3013,6 +3018,7 @@ def replay_selective_state_update(
                 and not write_checkpoint
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint),
+            USE_REPLAY_CACHE_SLOT=bool(_use_replay_cache_slot),
             num_warps=_nw,
             **({"num_stages": _ns} if _ns else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
@@ -3087,6 +3093,7 @@ def replay_selective_state_update(
                 _use_tma_rect_load if rectangle else _use_tma_replay_nowrite_load
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store),
+            USE_REPLAY_CACHE_SLOT=bool(_use_replay_cache_slot),
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
