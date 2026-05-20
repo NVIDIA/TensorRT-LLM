@@ -3059,10 +3059,22 @@ class BaseLlmArgs(StrictBaseModel):
         default=8192, description="The maximum number of tokens.")
 
     encoder_max_batch_size: Optional[PositiveInt] = Field(
-        default=None,
+        default=64,
         description=(
-            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
-            "Falls back to `max_batch_size` when unset."),
+            "Maximum number of multimodal items the encoder is sized for in a "
+            "single forward pass. Drives ``AttentionMetadata.max_num_requests`` "
+            "on the encoder side via ``encoder_max_batch_size * "
+            "get_max_requests_per_mm_item()``. Setting too small risks "
+            "request-dim buffer underflow at runtime ("
+            "``output with shape [N] doesn't match the broadcast shape [M]``); "
+            "setting too large only wastes a few MB of preallocated buffers. "
+            "Default 64 fits typical multimodal serving capacity; explicit "
+            "``None`` falls back to ``max_batch_size`` (legacy behavior, "
+            "over-allocates with the LLM-side default of 2048). "
+            "TODO: once the scheduler enforces ``encoder_max_num_tokens`` "
+            "at admission (mirroring vLLM's ``max_num_encoder_input_tokens``), "
+            "switch to deriving this from the token budget instead of using "
+            "a fixed cap."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[PositiveInt] = Field(
