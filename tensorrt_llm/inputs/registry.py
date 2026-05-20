@@ -881,6 +881,7 @@ def _get_single_mm_token_lengths(
     multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> Optional[List[int]]:
     """Get the single set of MM token lengths (first value from find_mm_token_lengths). Returns None if empty."""
+    # TODO: Just like in multimodal_hashing_process, here we assume there is only one modality for now
     num_mm_tokens_by_key = find_mm_token_lengths(
         mm_data, input_processor, multimodal_data=multimodal_data)
     if not num_mm_tokens_by_key:
@@ -1003,11 +1004,19 @@ def create_input_processor_with_hash(
             multimodal_data=(extra_processed_inputs
                              or {}).get("multimodal_data"),
         )
+        # Raise (rather than returning ([], None)) so process_prompt_maybe_hash
+        # treats this as a failed hashing attempt: it falls back to the basic
+        # input processor and caches multimodal_hashing_supported=False instead
+        # of marking hashing as supported and forwarding an empty prompt
+        # downstream.
         if not num_mm_tokens_by_key:
-            return [], None
+            raise ValueError(
+                "multimodal hashing could not determine multimodal token "
+                "lengths for the provided input.")
         num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
         if len(num_mm_tokens) <= 0:
-            return [], None
+            raise ValueError("multimodal hashing produced an empty multimodal "
+                             "token-length list.")
 
         vocab_size = input_processor.get_vocab_size()
         mm_ids = input_processor.get_mm_token_ids()
