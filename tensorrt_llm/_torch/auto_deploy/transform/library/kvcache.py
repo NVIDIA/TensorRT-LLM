@@ -397,6 +397,10 @@ class _InsertCachedOperator(BaseTransform):
         is_multi_group = num_groups >= 2
         vswa_group_nodes: dict[int, dict[str, "Node"]] = {}
 
+        has_unmanaged_paged = num_groups == 0 and any(
+            h.is_paged for h in cm._resource_lookup.values()
+        )
+
         if num_groups >= 1:
             group_windows = [
                 h.sliding_window if h.sliding_window > 0 else cm.info.max_seq_len
@@ -404,6 +408,26 @@ class _InsertCachedOperator(BaseTransform):
             ]
             cm.info.register_window_groups(group_windows)
             cm.set_kv_groups(group_windows)
+        elif has_unmanaged_paged:
+            # MLA-only (and any future paged-handler family that does not contribute
+            # to handler_groups): no KVPagedResourceHandler entries, but at least one
+            # paged cache still consumes cache_loc/cu_num_pages metadata. Register a
+            # single full-attention pool so ad_executor.py:740 stages those tensors
+            # instead of passing None to nest_sequences.
+            # TODO: unify paged-handler grouping (KV + MLA) under a shared abstraction
+            # so the predicate at line 361 covers all paged handlers naturally.
+            group_windows = [cm.info.max_seq_len]
+            cm.info.register_window_groups(group_windows)
+            cm.set_kv_groups(group_windows)
+        else:
+            # No paged caches at all (cache-less or state-only models like Mamba
+            # without attention). nest_sequences will correctly skip cache_loc
+            # staging because no kernel in the graph consumes it. Intentional no-op.
+            ad_logger.debug(
+                "kvcache transform: no paged KV resources registered; "
+                "cache_loc staging will be skipped. Expected for state-only or "
+                "cache-less models."
+            )
 
         if is_multi_group:
             # Create per-group graph placeholders for groups 1..N-1
