@@ -1875,7 +1875,7 @@ CUBIN_EXPORT __global__
     }
 #else
 #if GENERATE_CUBIN
-    static_assert("This kernel is for Hopper only");
+    static_assert(false, "This kernel is for Hopper only");
 #else
     asm volatile("trap;\n");
 #endif
