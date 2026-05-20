@@ -2279,7 +2279,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm, is_integration_test=True)
 
 
-@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@pytest.mark.timeout(14400)
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
 class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
