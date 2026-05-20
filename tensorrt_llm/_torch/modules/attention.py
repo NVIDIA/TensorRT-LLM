@@ -2408,13 +2408,15 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
-            return self.forward_absorption_context(q,
-                                                   compressed_kv,
-                                                   k_pe,
-                                                   attn_metadata,
-                                                   output,
-                                                   position_ids=position_ids,
-                                                   latent_cache=latent_cache)
+            if attn_metadata.runtime_features.chunked_prefill:
+                return self.forward_absorption_context(
+                    q,
+                    compressed_kv,
+                    k_pe,
+                    attn_metadata,
+                    output,
+                    position_ids=position_ids,
+                    latent_cache=latent_cache)
 
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
