@@ -304,7 +304,7 @@ class TestTokenBudget:
         sched = make_encoder_scheduler(mgr, max_num_tokens=100)
         reqs = [make_encoder_request(0, encoder_output_len=200)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_gen_with_draft_tokens(self):
         mgr = make_kv_cache_manager()
@@ -912,7 +912,7 @@ class TestPEFT:
         sched = make_encoder_scheduler(mgr, peft_cache_manager=peft)
         reqs = [make_encoder_request(0, encoder_output_len=100, lora_task_id=1)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_mixed_peft_gen_claims_reduce_ctx(self):
         """[gen(task1), ctx(task2)], pages for 2 total → both ok."""
@@ -970,14 +970,15 @@ class TestEncoder:
         sched = make_encoder_scheduler(mgr, max_num_tokens=200)
         reqs = [make_encoder_request(0, encoder_output_len=100)]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
 
     def test_encoder_budget_overflow(self):
         mgr = make_kv_cache_manager()
         sched = make_encoder_scheduler(mgr, max_num_tokens=100)
         reqs = [make_encoder_request(0, encoder_output_len=200)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_encoder_exceeds_budget(self):
         """encoder_output_len > max_num_tokens → break (not scheduled)."""
@@ -985,7 +986,7 @@ class TestEncoder:
         sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
         reqs = [make_encoder_request(0, encoder_output_len=2000)]
         out = sched.schedule_request(reqs, set())
-        assert len(out.context_requests) == 0
+        assert len(out.encoder_requests) == 0
 
     def test_encoder_plus_gen(self):
         mgr = make_kv_cache_manager()
@@ -995,7 +996,8 @@ class TestEncoder:
             make_gen_request(1),
         ]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
         assert ids(out.generation_requests) == [1]
 
     def test_multiple_encoders(self):
@@ -1006,7 +1008,8 @@ class TestEncoder:
             make_encoder_request(1, encoder_output_len=50),
         ]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0, 1]
+        assert ids(out.encoder_requests) == [0, 1]
+        assert ids(out.context_requests) == []
 
     def test_encoder_counts_toward_batch(self):
         """Gen wins phase 1; encoder scheduled in phase 2 still occupies a batch slot."""
@@ -1020,7 +1023,8 @@ class TestEncoder:
         out = sched.schedule_request(reqs, set())
         # gen(1) scheduled first (phase 1), encoder(0) fills remaining slot (phase 2)
         assert ids(out.generation_requests) == [1]
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
         # encoder(2) excluded — encoder(0) counted toward batch
 
     def test_encoder_does_not_touch_kv_pools(self):
@@ -1036,7 +1040,8 @@ class TestEncoder:
         )
         req = make_encoder_request(0, encoder_output_len=100)
         out = sched.schedule_request([req], set())
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
         # Self pool stays untouched.
         self_mgr.prepare_context.assert_not_called()
         self_mgr.resize_context.assert_not_called()
@@ -1084,7 +1089,8 @@ class TestEncoder:
         # Iteration 1: ENCODER_INIT → encoder compute admission.
         enc_req = make_encoder_request(0, encoder_output_len=80)
         out1 = sched.schedule_request([enc_req], set())
-        assert ids(out1.context_requests) == [0]
+        assert ids(out1.encoder_requests) == [0]
+        assert ids(out1.context_requests) == []
         self_mgr.prepare_context.assert_not_called()
         self_mgr.resize_context.assert_not_called()
         cross_mgr.prepare_context.assert_not_called()
@@ -1596,6 +1602,7 @@ class TestSchedulerOutput:
             make_disagg_request(2),
         ]
         out = sched.schedule_request(reqs, set())
+        assert len(out.encoder_requests) == 0
         assert len(out.context_requests) == 1
         assert len(out.generation_requests) == 1
         assert len(out.fitting_disagg_gen_init_requests) == 1
@@ -1695,7 +1702,8 @@ class TestMixedOrdering:
             make_gen_request(1),
         ]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.context_requests) == [0]
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.context_requests) == []
         assert ids(out.generation_requests) == [1]
 
     def test_ctx_fail_budget_preserved(self):
@@ -1805,7 +1813,8 @@ class TestEdgeCases:
         # Single encoder (needs widened state range)
         enc_sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
         out = enc_sched.schedule_request([make_encoder_request(2, 50)], set())
-        assert len(out.context_requests) == 1
+        assert len(out.encoder_requests) == 1
+        assert len(out.context_requests) == 0
 
     def test_all_inflight(self):
         mgr = make_kv_cache_manager()

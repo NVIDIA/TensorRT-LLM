@@ -39,6 +39,7 @@ def _make_mock_kv_cache_config(
     use_kv_cache_manager_v2=True,
     max_tokens=None,
     free_gpu_memory_fraction=0.9,
+    host_cache_size=None,
 ):
     """Create a mock KvCacheConfig with the fields KvCacheCreator needs."""
     config = Mock()
@@ -47,6 +48,7 @@ def _make_mock_kv_cache_config(
     config.use_kv_cache_manager_v2 = use_kv_cache_manager_v2
     config.max_tokens = max_tokens
     config.free_gpu_memory_fraction = free_gpu_memory_fraction
+    config.host_cache_size = host_cache_size
     config.max_attention_window = None
     config.event_buffer_max_size = 0
 
@@ -57,6 +59,7 @@ def _make_mock_kv_cache_config(
         c.use_kv_cache_manager_v2 = config.use_kv_cache_manager_v2
         c.max_tokens = config.max_tokens
         c.free_gpu_memory_fraction = config.free_gpu_memory_fraction
+        c.host_cache_size = config.host_cache_size
         c.max_attention_window = config.max_attention_window
         c.event_buffer_max_size = config.event_buffer_max_size
         return c
@@ -295,6 +298,41 @@ class TestSplitKvCacheBudgetForCross:
         assert (self_config.max_gpu_total_bytes + cross_config.max_gpu_total_bytes) == total
         assert config.max_gpu_total_bytes == total
 
+    def test_host_cache_budget_is_split_without_mutating_base_config(self):
+        """Self + cross host cache budgets sum to the original host budget."""
+        total_host = 7 * (1 << 30) + 123
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.4,
+            max_gpu_total_bytes=8 * (1 << 30),
+            host_cache_size=total_host,
+        )
+
+        creator = _make_creator(config, is_enc_dec=True)
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        expected_cross_host = int(total_host * 0.4)
+        expected_self_host = total_host - expected_cross_host
+        assert cross_config.host_cache_size == expected_cross_host
+        assert self_config.host_cache_size == expected_self_host
+        assert (self_config.host_cache_size + cross_config.host_cache_size) == total_host
+        assert config.host_cache_size == total_host
+
+    def test_host_cache_budget_counts_as_split_budget_source(self):
+        total_host = 4 * (1 << 30)
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.25,
+            max_gpu_total_bytes=None,
+            free_gpu_memory_fraction=None,
+            host_cache_size=total_host,
+        )
+
+        creator = _make_creator(config, is_enc_dec=True)
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        assert cross_config.host_cache_size == total_host // 4
+        assert self_config.host_cache_size == total_host - total_host // 4
+        assert config.host_cache_size == total_host
+
 
 # ---------------------------------------------------------------------------
 # Tests: ResourceManagerType enum
@@ -364,6 +402,62 @@ class TestCrossKvCacheConstruction:
         assert kwargs["kv_cache_type"] == (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
         )
+
+    def test_cross_layout_uses_max_input_len_for_encoder_capacity(self):
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+        )
+        model_config = _make_mock_model_config(
+            is_encoder_decoder=True,
+            max_position_embeddings=4096,
+        )
+        creator = _make_creator(config, model_config=model_config)
+        creator._llm_args.max_input_len = 1536
+        creator._max_seq_len = 864
+
+        _, _, _, max_seq_len = creator._get_cross_kv_cache_layout(fallback_max_seq_len=2048)
+
+        assert max_seq_len == 1536
+
+    def test_build_managers_cross_pool_ignores_mutated_self_max_seq_len(self):
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+        )
+        model_config = _make_mock_model_config(
+            is_encoder_decoder=True,
+            max_position_embeddings=4096,
+        )
+        creator = _make_creator(config, model_config=model_config)
+        creator._llm_args.max_input_len = None
+        creator._max_seq_len = 2048
+        creator.configure_kv_cache_capacity = Mock()
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+
+        def create_self_manager(*_args, **_kwargs):
+            creator._max_seq_len = 864
+            manager = Mock()
+            manager.max_seq_len = 864
+            return manager
+
+        captured_cross_max_seq_lens = []
+
+        def create_cross_manager(*_args, **kwargs):
+            captured_cross_max_seq_lens.append(kwargs["max_seq_len"])
+            manager = Mock()
+            manager.max_seq_len = kwargs["max_seq_len"]
+            return manager
+
+        creator._create_kv_cache_manager = Mock(side_effect=create_self_manager)
+        with patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+            side_effect=create_cross_manager,
+        ):
+            creator.build_managers({}, estimating_kv_cache=False)
+
+        assert creator._max_seq_len == 864
+        assert captured_cross_max_seq_lens == [2048]
 
     def test_get_kv_size_per_token_includes_cross_pool_for_enc_dec(self):
         config = _make_mock_kv_cache_config(

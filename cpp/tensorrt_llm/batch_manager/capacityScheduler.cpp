@@ -115,6 +115,25 @@ bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const&
     return false;
 }
 
+void checkEncoderInitCrossKvCacheManager(RequestList const& activeRequests, LlmRequestState noScheduleUntilState,
+    LlmRequestState noScheduleAfterState, OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager)
+{
+    if (crossKvCacheManager)
+    {
+        return;
+    }
+
+    auto const encoderInitRequestIt = std::find_if(activeRequests.begin(), activeRequests.end(),
+        [noScheduleUntilState, noScheduleAfterState](std::shared_ptr<LlmRequest> const& req)
+        {
+            return req->isEncoderInitState() && req->hasReachedState(noScheduleUntilState)
+                && !req->hasReachedState(noScheduleAfterState);
+        });
+
+    TLLM_CHECK_WITH_INFO(encoderInitRequestIt == activeRequests.end(),
+        "Encoder-init request %lu requires a cross_kv_cache_manager.", (*encoderInitRequestIt)->mRequestId);
+}
+
 } // namespace
 
 MaxRequestsScheduler::MaxRequestsScheduler(
@@ -192,6 +211,9 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
     RequestVector scheduledRequests;
+
+    checkEncoderInitCrossKvCacheManager(
+        activeRequests, getNoScheduleUntilState(), getNoScheduleAfterState(), crossKvCacheManager);
 
     // Now check if we can add pending requests
     auto const maxPeftCachePages
@@ -319,16 +341,6 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                     crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                 }
-                if (isEncoderInit)
-                {
-                    // Encoder admission does not reserve self- or cross-pool
-                    // blocks. Without a cross manager the dual-pool contract
-                    // cannot be satisfied later by decoder context, so fail
-                    // fast instead of admitting a request that cannot complete.
-                    TLLM_CHECK_WITH_INFO(reservedCrossBlocks.has_value(),
-                        "Encoder-init request %lu requires a cross_kv_cache_manager.", req->mRequestId);
-                }
-
                 // Beneficial-to-skip check using the cached summary
                 if (!StaticBatchScheduling && skippingIsRelevant && (isFirstChunkContext || isEncoderInit)
                     && beneficialToSkip(
@@ -344,28 +356,18 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 
                 if (isEncoderInit)
                 {
-                    bool enoughCrossBlocks = reservedCrossBlocks->enoughAvailableBlocks(*req, crossSummary);
                     bool reqHasLora = req->getLoraTaskId().has_value();
                     bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
                     auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
 
-                    if (enoughCrossBlocks && neededPeftPages <= availablePeftPages)
+                    if (neededPeftPages <= availablePeftPages)
                     {
                         scheduledRequests.emplace_back(req);
-                        reservedCrossBlocks->commitBlocks();
                         availablePeftPages -= neededPeftPages;
                         if (isNewTask)
                         {
                             uniqTaskIds.insert(req->getLoraTaskId().value());
                         }
-                    }
-                    else if (!enoughCrossBlocks)
-                    {
-                        // This is only expected if the cross manager reports
-                        // a nonzero encoder-init need.  Stop trying to admit
-                        // further encoders/contexts for this iteration,
-                        // matching the existing context-init break behavior.
-                        break;
                     }
                 }
                 else if (req->isContextInitState() || req->isDisaggGenerationInitState())
@@ -423,6 +425,9 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
+    checkEncoderInitCrossKvCacheManager(
+        activeRequests, getNoScheduleUntilState(), getNoScheduleAfterState(), crossKvCacheManager);
+
     kvCacheManager.startScheduling();
     if (crossKvCacheManager)
     {
@@ -562,15 +567,11 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
 
         if (req->isEncoderInitState())
         {
-            // Encoder admission does not reserve KV blocks. Without a cross
-            // manager we cannot honour the dual-pool contract at the later
-            // decoder-context admission, so fail before running encoder work.
-            TLLM_CHECK_WITH_INFO(crossBlocksManager.has_value(),
-                "Encoder-init request %lu requires a cross_kv_cache_manager.", req->mRequestId);
-            auto const crossScheduledIfFits = crossBlocksManager->prepareNewNumberOfBlocksIfWeEndUpScheduling(*req);
-            if (crossScheduledIfFits && fitsPeft)
+            // Encoder admission does not reserve KV blocks. The scheduler
+            // entry point verifies the cross manager globally before encoder
+            // work can be admitted.
+            if (fitsPeft)
             {
-                crossBlocksManager->updateScheduledBlocks(crossScheduledIfFits.value());
                 numScheduledPeftPages += numRequiredPeftPages;
                 scheduledRequests.emplace_back(req);
                 if (isNewTask)

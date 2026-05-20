@@ -37,7 +37,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     PyMicroBatchScheduler,
     SimpleScheduler,
     SimpleUnifiedScheduler,
-    filter_unready_decoder_context_requests,
+    drop_decoder_context_requests_waiting_for_encoder_output,
 )
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
@@ -232,7 +232,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(1, prompt_len=10),
             make_context_request(2, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         assert len(gen) == 0
         assert ctx[0].request_id == 0
@@ -246,7 +246,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_generation_request(1),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 0
         assert len(gen) == 2
         assert gen[0].request_id == 0
@@ -264,7 +264,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(2, prompt_len=10),
             make_generation_request(3),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         assert len(gen) == 2
         assert {r.request_id for r in ctx} == {0, 2}
@@ -281,7 +281,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(0, prompt_len=10),
             make_context_request(1, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # Only 1 fits within token budget
         assert len(ctx) == 1
         assert ctx[0].request_id == 0
@@ -297,7 +297,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_generation_request(1, beam_width=1),
             make_generation_request(2, beam_width=1),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # context: 10 tokens, gen1: 1 token, gen2: 1 token => total 12
         assert len(ctx) == 1
         assert len(gen) == 2
@@ -310,7 +310,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_generation_request(1),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # batch_size=2: should schedule context_0 + gen_1
         assert len(ctx) + len(gen) == 2
 
@@ -326,7 +326,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_generation_request(2, beam_width=1),
             make_generation_request(3, beam_width=1),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # context: 10, gen: 1+1 = 12 total. Can't fit gen_3 (would be 13).
         assert len(ctx) == 1
         assert len(gen) == 2
@@ -342,7 +342,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_generation_request(1, beam_width=4),
             make_generation_request(2, beam_width=4),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # context: 10, gen1: 4 = 14. gen2: +4 = 18 > 15.
         assert len(ctx) == 1
         assert len(gen) == 1
@@ -358,7 +358,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_generation_request(1, beam_width=4),
             make_generation_request(2, beam_width=1),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # gen_0 sets beam_width=1, gen_1 is skipped (beam_width=4), gen_2 fits
         assert len(gen) == 2
         assert gen[0].request_id == 0
@@ -375,7 +375,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(0, prompt_len=10, draft_tokens_len=3),
             make_generation_request(1, draft_tokens_len=2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # context: 10+3=13, gen: 1+2=3, total=16 > 15 => only context fits
         assert len(ctx) == 1
         assert len(gen) == 0
@@ -391,7 +391,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_generation_request(1, beam_width=1, draft_tokens_len=3),
             make_generation_request(2, beam_width=1, draft_tokens_len=3),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # Each gen costs 1+3=4. Two fit (8), three don't (12 > 10).
         assert len(gen) == 2
 
@@ -403,7 +403,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(1, prompt_len=10),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, {0, 2})
+        _enc, ctx, gen = scheduler.schedule(requests, {0, 2})
         # Only request 1 is not in flight
         assert len(ctx) == 1
         assert ctx[0].request_id == 1
@@ -417,7 +417,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_completed_request(1),
             make_generation_request(2),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # Completed request 1 is filtered by state gating
         assert len(ctx) == 1
         assert len(gen) == 1
@@ -438,7 +438,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(2, prompt_len=10),
             make_context_request(3, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         assert len(gen) == 0
         assert ctx[0].request_id == 0
@@ -452,7 +452,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(2, prompt_len=10),
             make_context_request(3, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(gen) == 2
         assert gen[0].request_id == 0
         assert gen[1].request_id == 1
@@ -464,7 +464,7 @@ class TestPyMicroBatchSchedulerBasic:
             make_context_request(2, prompt_len=10),
             make_context_request(3, prompt_len=10),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         assert ctx[0].request_id == 2
         assert ctx[1].request_id == 3
@@ -484,7 +484,7 @@ class TestPyMicroBatchSchedulerBasic:
         # C++: Req 0: (0,1,2,3,4), Req 1: ()
         r0 = make_context_request(0, prompt_len=12)
         r1 = make_context_request(1, prompt_len=12)
-        ctx, gen = scheduler.schedule([r0, r1], set())
+        _enc, ctx, gen = scheduler.schedule([r0, r1], set())
         assert len(ctx) >= 1
         # First request gets a chunk within budget
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -508,7 +508,7 @@ class TestPyMicroBatchSchedulerBasic:
         # Two requests with promptLen=10 fit within maxContextLength=12
         r0 = make_context_request(0, prompt_len=10)
         r1 = make_context_request(1, prompt_len=10)
-        ctx, gen = scheduler.schedule([r0, r1], set())
+        _enc, ctx, gen = scheduler.schedule([r0, r1], set())
         assert len(ctx) == 2
         # Each chunk should be at most max_context_length
         for r in ctx:
@@ -516,7 +516,7 @@ class TestPyMicroBatchSchedulerBasic:
 
         # Request with promptLen=17 needs chunking (17 > 12)
         r3 = make_context_request(3, prompt_len=17)
-        ctx2, gen2 = scheduler.schedule([r3], set())
+        _enc2, ctx2, _ = scheduler.schedule([r3], set())
         assert len(ctx2) == 1
         assert ctx2[0].context_chunk_size <= 12
 
@@ -536,17 +536,17 @@ class TestPyMicroBatchSchedulerBasic:
         requests = [make_context_request(i, prompt_len=10) for i in range(4)]
 
         # Step 1: slot 0 — req0, req1 scheduled
-        ctx0, _ = scheduler.schedule(requests, set())
+        _enc0, ctx0, _ = scheduler.schedule(requests, set())
         assert {r.request_id for r in ctx0} == {0, 1}
         slot0_inflight = {r.request_id for r in ctx0}
 
         # Step 2: slot 1 — req0/req1 still inflight, req2/req3 scheduled
-        ctx1, _ = scheduler.schedule(requests, slot0_inflight)
+        _enc1, ctx1, _ = scheduler.schedule(requests, slot0_inflight)
         assert {r.request_id for r in ctx1} == {2, 3}
         slot1_inflight = {r.request_id for r in ctx1}
 
         # Step 3: slot 0 freed (inflight = slot1 only) — req0/req1 scheduled again
-        ctx2, _ = scheduler.schedule(requests, slot1_inflight)
+        _enc2, ctx2, _ = scheduler.schedule(requests, slot1_inflight)
         assert {r.request_id for r in ctx2} == {0, 1}
 
     def test_gen_draft_tokens_max_num_tokens(self):
@@ -559,7 +559,7 @@ class TestPyMicroBatchSchedulerBasic:
         """
         scheduler = PyMicroBatchScheduler(max_batch_size=64, max_num_tokens=128)
         requests = [make_generation_request(i, beam_width=1, draft_tokens_len=63) for i in range(4)]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # Each request costs 1 + 63 = 64 tokens; 2 fit (128 = budget), 3 don't (192 > 128).
         assert len(gen) == 2
         assert gen[0].request_id == 0
@@ -568,7 +568,7 @@ class TestPyMicroBatchSchedulerBasic:
 
 
 class TestEncoderOutputReadinessFiltering:
-    def test_filter_unready_decoder_context_requests(self):
+    def test_drop_decoder_context_requests_waiting_for_encoder_output(self):
         ready_ctx = make_context_request(1)
         ready_ctx.py_encoder_output_ready_event = Mock()
         ready_ctx.py_encoder_output_ready_event.query.return_value = True
@@ -579,7 +579,9 @@ class TestEncoderOutputReadinessFiltering:
 
         gen_req = make_generation_request(3)
 
-        filtered = filter_unready_decoder_context_requests([ready_ctx, blocked_ctx, gen_req])
+        filtered = drop_decoder_context_requests_waiting_for_encoder_output(
+            [ready_ctx, blocked_ctx, gen_req]
+        )
 
         assert [req.request_id for req in filtered] == [1, 3]
 
@@ -602,11 +604,24 @@ class TestEncoderOutputReadinessFiltering:
         assert [req.request_id for req in out.context_requests] == [1]
         assert [req.request_id for req in out.generation_requests] == [3]
 
+    def test_py_micro_batch_scheduler_skips_unready_context_request(self):
+        scheduler = PyMicroBatchScheduler(max_batch_size=8, max_num_tokens=128)
+        ready_ctx = make_context_request(1)
+        blocked_ctx = make_context_request(2)
+        blocked_ctx.py_encoder_output_ready_event = Mock()
+        blocked_ctx.py_encoder_output_ready_event.query.return_value = False
+        gen_req = make_generation_request(3)
+
+        _enc, ctx, gen = scheduler.schedule([ready_ctx, blocked_ctx, gen_req], set())
+
+        assert [req.request_id for req in ctx] == [1]
+        assert [req.request_id for req in gen] == [3]
+
     def test_simple_scheduler_prefilters_before_capacity(self):
         capacity_scheduler = Mock()
         capacity_scheduler.schedule_request.return_value = ([], [], [])
         micro_batch_scheduler = Mock()
-        micro_batch_scheduler.schedule.return_value = ([], [])
+        micro_batch_scheduler.schedule.return_value = ([], [], [])
         scheduler = SimpleScheduler(capacity_scheduler, micro_batch_scheduler)
 
         ready_ctx = make_context_request(1)
@@ -649,7 +664,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(0, prompt_len=20),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         # Each should get ~5 tokens (equal progress, unit=5, total=10)
         total_chunk = sum(r.context_chunk_size for r in ctx)
@@ -669,7 +684,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(0, prompt_len=3),  # Only 3 tokens remaining
             make_context_request(1, prompt_len=20),  # Lots remaining
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         # Look up by request_id since sort reorders (not-last-chunk first)
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -691,7 +706,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(0, prompt_len=20),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # FCFS: request 0 gets up to budget, request 1 gets remainder
         assert len(ctx) >= 1
         # First request should get more tokens
@@ -708,7 +723,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(0, prompt_len=10),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         # Look up by request_id since sort reorders (not-last-chunk first)
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -732,7 +747,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(1, prompt_len=20),
             make_context_request(2, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(gen) == 1
         # Remaining budget for context: 15 - 1 = 14
         total_ctx_tokens = sum(r.context_chunk_size for r in ctx)
@@ -751,7 +766,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(0, prompt_len=20),
             make_context_request(1, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # With budget 5, at most one request gets chunk_size=5, the other might get 0
         for r in ctx:
             assert r.context_chunk_size > 0
@@ -768,7 +783,7 @@ class TestPyMicroBatchSchedulerChunking:
         requests = [
             make_context_request(0, prompt_len=20),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 1
         # max_context_length = max_num_tokens = 12, so chunk <= 12
         assert ctx[0].context_chunk_size <= 12
@@ -784,7 +799,7 @@ class TestPyMicroBatchSchedulerChunking:
         )
         req = make_context_request(0, prompt_len=20, context_position=10)
         # remaining = 20 - 10 = 10
-        ctx, gen = scheduler.schedule([req], set())
+        _enc, ctx, gen = scheduler.schedule([req], set())
         assert len(ctx) == 1
         assert ctx[0].context_chunk_size <= 10  # remaining context
 
@@ -801,7 +816,7 @@ class TestPyMicroBatchSchedulerChunking:
         # prompt_len=8, so chunk_size will be 8. Unit=10, remainder=2.
         # Draft tokens=2 fits in remainder.
         req = make_context_request(0, prompt_len=8, draft_tokens_len=2)
-        ctx, gen = scheduler.schedule([req], set())
+        _enc, ctx, gen = scheduler.schedule([req], set())
         assert len(ctx) == 1
         assert req.is_last_context_chunk
 
@@ -816,7 +831,7 @@ class TestPyMicroBatchSchedulerChunking:
         )
         # prompt_len=5, chunk_size=5, unit=5, remainder=0. Draft=3 won't fit.
         req = make_context_request(0, prompt_len=5, draft_tokens_len=3)
-        ctx, gen = scheduler.schedule([req], set())
+        _enc, ctx, gen = scheduler.schedule([req], set())
         assert len(ctx) == 1
 
     def test_chunked_context_draft_tokens_max_num_tokens(self):
@@ -835,7 +850,7 @@ class TestPyMicroBatchSchedulerChunking:
             ctx_chunk_config=config,
         )
         requests = [make_context_request(i, prompt_len=2041, draft_tokens_len=8) for i in range(4)]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 4
         for req in ctx:
             assert req.num_draft_tokens == 7
@@ -861,7 +876,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(0, prompt_len=6, draft_tokens_len=5),
             make_context_request(1, prompt_len=6, draft_tokens_len=5),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 2
         for req in ctx:
             assert req.num_draft_tokens == 4
@@ -872,7 +887,7 @@ class TestPyMicroBatchSchedulerChunking:
             max_batch_size=4, max_num_tokens=20, ctx_chunk_config=None
         )
         req = make_context_request(0, prompt_len=15)
-        ctx, gen = scheduler.schedule([req], set())
+        _enc, ctx, gen = scheduler.schedule([req], set())
         assert len(ctx) == 1
 
     def test_no_chunking_context_exceeds_budget(self):
@@ -887,7 +902,7 @@ class TestPyMicroBatchSchedulerChunking:
             make_context_request(0, prompt_len=8),
             make_context_request(1, prompt_len=8),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         # First request (8) fits (8 <= 10). Second (8+8=16 > 10) breaks the loop.
         assert len(ctx) == 1
         assert ctx[0].request_id == 0
@@ -901,7 +916,7 @@ class TestPyMicroBatchSchedulerChunking:
         r0 = _make_request(0, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=5)
         r1 = _make_request(1, state=LlmRequestState.GENERATION_IN_PROGRESS)
         r2 = _make_request(2, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=3)
-        ctx, gen = scheduler.schedule([r0, r1, r2], set())
+        _enc, ctx, gen = scheduler.schedule([r0, r1, r2], set())
         # None < any value, so order should be: r1(None), r2(3), r0(5)
         assert gen[0].request_id == 1
         assert gen[1].request_id == 2
@@ -942,7 +957,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         req0.estimated_reusable_tokens = 15
         req1.estimated_reusable_tokens = 15
 
-        ctx, gen = scheduler.schedule([req0, req1], set())
+        _enc, ctx, gen = scheduler.schedule([req0, req1], set())
         assert len(ctx) == 2
 
     def test_reusable_tokens_zero_has_no_effect(self):
@@ -961,7 +976,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         req0.estimated_reusable_tokens = 0
         req1.estimated_reusable_tokens = 0
 
-        ctx, gen = scheduler.schedule([req0, req1], set())
+        _enc, ctx, gen = scheduler.schedule([req0, req1], set())
         assert len(ctx) == 1
         assert ctx[0].request_id == 0
 
@@ -982,7 +997,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         req = make_context_request(0, prompt_len=20)
         req.estimated_reusable_tokens = 10
 
-        ctx, gen = scheduler.schedule([req], set())
+        _enc, ctx, gen = scheduler.schedule([req], set())
         assert len(ctx) == 1
         # Full context fits — chunk_size equals the full prompt length.
         assert ctx[0].context_chunk_size == 20
@@ -1006,7 +1021,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         req0.estimated_reusable_tokens = 20
         assert not req0.is_first_context_chunk
 
-        ctx, gen = scheduler.schedule([req0], set())
+        _enc, ctx, gen = scheduler.schedule([req0], set())
         assert len(ctx) == 1
         # Remaining tokens = 30 - 10 = 20; reuse ignored → compute = 20
         # Budget = 30, 20 <= 30, so it fits.
@@ -1016,7 +1031,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         scheduler2 = PyMicroBatchScheduler(
             max_batch_size=4, max_num_tokens=30, ctx_chunk_config=None
         )
-        ctx2, _ = scheduler2.schedule([req0, req1], set())
+        _enc2, ctx2, _ = scheduler2.schedule([req0, req1], set())
         req0_again = make_context_request(0, prompt_len=30, context_position=10)
         req0_again.estimated_reusable_tokens = 20
         # Confirm: fresh req0 (non-first chunk) + req1 → only req0 fits
@@ -1030,7 +1045,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         scheduler3 = PyMicroBatchScheduler(
             max_batch_size=4, max_num_tokens=30, ctx_chunk_config=None
         )
-        ctx3, _ = scheduler3.schedule([req2, req3], set())
+        _enc3, ctx3, _ = scheduler3.schedule([req2, req3], set())
         # req2 compute = max(1, 30-20) = 10; req3 compute = 20; total = 30 → both fit.
         assert len(ctx3) == 2
 
@@ -1050,7 +1065,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         req0.estimated_reusable_tokens = 15  # exceeds prompt length
         req1 = make_context_request(1, prompt_len=10)
 
-        ctx, gen = scheduler.schedule([req0, req1], set())
+        _enc, ctx, gen = scheduler.schedule([req0, req1], set())
         # req0 compute = 1; req1 compute = 10; 1 + 10 = 11 > 10 → only req0 fits.
         assert len(ctx) == 1
         assert ctx[0].request_id == 0
@@ -1084,7 +1099,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         req1.estimated_reusable_tokens = 8
         req2.estimated_reusable_tokens = 8
 
-        ctx, gen = scheduler.schedule([req0, req1, req2], set())
+        _enc, ctx, gen = scheduler.schedule([req0, req1, req2], set())
 
         # Note: ctx is sorted — partially-chunked requests come before full-context ones.
         # Look up by request_id rather than by position.
@@ -1130,7 +1145,7 @@ class TestPyMicroBatchSchedulerReusableTokens:
         req0.estimated_reusable_tokens = 10
         req1.estimated_reusable_tokens = 0
 
-        ctx, gen = scheduler.schedule([req0, req1], set())
+        _enc, ctx, gen = scheduler.schedule([req0, req1], set())
 
         chunks = {r.request_id: r.context_chunk_size for r in ctx}
         assert len(ctx) == 2, "Both requests should be scheduled"
@@ -1679,7 +1694,7 @@ class TestForceChunkPolicy:
             max_batch_size=4, max_num_tokens=100, ctx_chunk_config=config
         )
         req = make_context_request(0, prompt_len=30)
-        ctx, gen = scheduler.schedule([req], set())
+        _enc, ctx, gen = scheduler.schedule([req], set())
         # Despite budget=100 >> prompt=30, FORCE_CHUNK limits chunk to unit_size=10.
         assert len(ctx) == 1
         assert ctx[0].context_chunk_size == 10
@@ -1699,7 +1714,7 @@ class TestForceChunkPolicy:
             make_context_request(1, prompt_len=15),
             make_context_request(2, prompt_len=5),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(ctx) == 3
         # Find by request_id since sorting may reorder.
         chunks = {r.request_id: r.context_chunk_size for r in ctx}
@@ -1721,7 +1736,7 @@ class TestForceChunkPolicy:
             make_generation_request(0),  # costs 1 token
             make_context_request(1, prompt_len=30),
         ]
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(gen) == 1
         assert len(ctx) == 1
         # Budget remaining = 15 - 1 (gen) = 14; chunk = min(30, 10) = 10
@@ -1760,7 +1775,7 @@ class TestDraftTokensGreaterThanChunkSize:
             make_context_request(2, prompt_len=3, draft_tokens_len=17),
         ]
 
-        ctx, gen = scheduler.schedule(requests, set())
+        _enc, ctx, gen = scheduler.schedule(requests, set())
 
         assert len(ctx) == 3
         req0 = next(r for r in ctx if r.request_id == 0)
@@ -1807,7 +1822,7 @@ class TestDraftTokensGreaterThanChunkSize:
             make_context_request(1, prompt_len=8, draft_tokens_len=0),
             make_context_request(2, prompt_len=3, draft_tokens_len=13),
         ]
-        ctx, _ = scheduler.schedule(requests, set())
+        _enc, ctx, _ = scheduler.schedule(requests, set())
         assert len(ctx) == 3
         r0 = next(r for r in ctx if r.request_id == 0)
         r1 = next(r for r in ctx if r.request_id == 1)
@@ -1838,7 +1853,7 @@ class TestDraftTokensGreaterThanChunkSize:
             make_context_request(1, prompt_len=3, draft_tokens_len=13),
             make_context_request(2, prompt_len=3, draft_tokens_len=13),
         ]
-        ctx, _ = scheduler.schedule(requests, set())
+        _enc, ctx, _ = scheduler.schedule(requests, set())
         assert len(ctx) == 3
 
         r0 = next(r for r in ctx if r.request_id == 0)
@@ -1869,7 +1884,7 @@ class TestDraftTokensGreaterThanChunkSize:
         )
         # Requests with zero draft tokens, large enough to exhaust budget.
         requests = [make_context_request(i, prompt_len=24, draft_tokens_len=0) for i in range(4)]
-        ctx, _ = scheduler.schedule(requests, set())
+        _enc, ctx, _ = scheduler.schedule(requests, set())
         assert ctx, "expected at least one context request to be scheduled"
         # All scheduled requests must still report 0 draft tokens — no discard happened.
         for r in ctx:
@@ -2350,6 +2365,7 @@ class TestSimpleUnifiedScheduler:
             make_generation_request(1),
         ]
         output = scheduler.schedule_request(requests, set())
+        assert hasattr(output, "encoder_requests")
         assert hasattr(output, "context_requests")
         assert hasattr(output, "generation_requests")
         assert hasattr(output, "paused_requests")
@@ -2357,8 +2373,32 @@ class TestSimpleUnifiedScheduler:
         assert hasattr(output, "num_fitting_requests")
         assert len(output.context_requests) == 1
         assert len(output.generation_requests) == 1
+        assert len(output.encoder_requests) == 0
         assert output.context_requests[0].request_id == 0
         assert output.generation_requests[0].request_id == 1
+
+    def test_full_pipeline_separates_encoder_requests(self):
+        """Encoder admission should not be exposed as decoder context."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        cross_kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        scheduler = SimpleUnifiedScheduler(
+            max_batch_size=4,
+            max_num_tokens=100,
+            kv_cache_manager=kv,
+            peft_cache_manager=None,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            cross_kv_cache_manager=cross_kv,
+            no_schedule_until_state=LlmRequestState.ENCODER_INIT,
+        )
+        requests = [
+            make_encoder_request(0, encoder_output_len=10),
+            make_context_request(1, prompt_len=10),
+        ]
+
+        output = scheduler.schedule_request(requests, set())
+
+        assert [req.request_id for req in output.encoder_requests] == [0]
+        assert [req.request_id for req in output.context_requests] == [1]
 
     def test_paused_requests_propagated(self):
         """Paused requests from capacity scheduler appear in output."""
@@ -2466,8 +2506,16 @@ class TestPyCapacitySchedulerEncoderInit:
     def test_guaranteed_no_evict_encoder_does_not_consume_cross_pool(self):
         """Cross pool pressure does not throttle encoder admission."""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
-        # Only 1 cross block free, but encoder admission does not consume it.
-        cross_kv = MockKVCacheManager(num_free_blocks=1, blocks_per_request=2)
+
+        class CrossPoolThatWouldRejectEncoder(MockKVCacheManager):
+            def get_remaining_blocks_to_completion(self, req, window_size: int) -> int:
+                if req.is_encoder_init_state:
+                    return self._blocks_per_request
+                return super().get_remaining_blocks_to_completion(req, window_size)
+
+        # Only 1 cross block free. If encoder admission reserved cross blocks,
+        # this would reject each encoder request.
+        cross_kv = CrossPoolThatWouldRejectEncoder(num_free_blocks=1, blocks_per_request=2)
         scheduler = self._make_scheduler(kv, cross_kv, CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
         requests = [
             make_encoder_request(0, encoder_output_len=10),
@@ -2512,6 +2560,30 @@ class TestPyCapacitySchedulerEncoderInit:
         requests = [
             make_encoder_request(0, encoder_output_len=10),
             make_generation_request(1),
+        ]
+        fitting, disagg, paused = scheduler.schedule_request(requests)
+        assert {r.request_id for r in fitting} == {0, 1}
+        assert len(paused) == 0
+
+    def test_max_utilization_encoder_does_not_consume_cross_pool(self):
+        """Cross pool pressure does not throttle MaxUtilization encoder admission."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+
+        class CrossPoolThatWouldRejectEncoder(MockKVCacheManager):
+            def get_needed_blocks_one_step(
+                self, req, two_step_lookahead: bool, window_size: int
+            ) -> int:
+                if req.is_encoder_init_state:
+                    return self._blocks_per_request
+                return super().get_needed_blocks_one_step(req, two_step_lookahead, window_size)
+
+        # Only 1 cross block free. If encoder admission reserved cross blocks,
+        # this would reject each encoder request.
+        cross_kv = CrossPoolThatWouldRejectEncoder(num_free_blocks=1, blocks_per_request=2)
+        scheduler = self._make_scheduler(kv, cross_kv, CapacitySchedulerPolicy.MAX_UTILIZATION)
+        requests = [
+            make_encoder_request(0, encoder_output_len=10),
+            make_encoder_request(1, encoder_output_len=10),
         ]
         fitting, disagg, paused = scheduler.schedule_request(requests)
         assert {r.request_id for r in fitting} == {0, 1}

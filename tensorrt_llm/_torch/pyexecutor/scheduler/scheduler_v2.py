@@ -24,7 +24,8 @@ from .scheduler import (
     RequestList,
     RequestScheduler,
     SchedulerOutput,
-    filter_unready_decoder_context_requests,
+    _get_lora_task_id,
+    drop_decoder_context_requests_waiting_for_encoder_output,
 )
 
 
@@ -198,27 +199,35 @@ class KVCacheV2Scheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
-        active_requests = filter_unready_decoder_context_requests(active_requests)
+        active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
-        (scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking) = (
-            self._schedule_loop(active_requests, inflight_request_ids)
-        )
+        (
+            scheduled_encoder,
+            scheduled_ctx,
+            scheduled_gen,
+            evicted,
+            disagg_candidates,
+            has_chunking,
+        ) = self._schedule_loop(active_requests, inflight_request_ids)
 
         # Sort by LoRA task ID
+        scheduled_encoder.sort(key=_get_lora_task_id)
         self._sort_requests(scheduled_ctx, scheduled_gen, has_chunking)
 
         return SchedulerOutput(
+            encoder_requests=scheduled_encoder,
             context_requests=scheduled_ctx,
             generation_requests=scheduled_gen,
             paused_requests=evicted,
             fitting_disagg_gen_init_requests=disagg_candidates,
-            num_fitting_requests=len(scheduled_ctx) + len(scheduled_gen),
+            num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
 
     # ---- Main scheduling loop ----
 
     def _schedule_loop(self, active_requests, inflight_request_ids):
         scheduled_ctx: RequestList = []
+        scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
         evicted: RequestList = []
         disagg_candidates: RequestList = []
@@ -347,7 +356,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 action, tokens = self._try_schedule_encoder(req, budget)
                 if action is ScheduleAction.STOP:
                     break
-                scheduled_ctx.append(req)
+                scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
                 action, tokens, chunking_flag = self._try_schedule_context(req, budget)
@@ -382,7 +391,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"kv_cache_config.max_tokens."
                 )
 
-        return scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking
+        return (
+            scheduled_encoder,
+            scheduled_ctx,
+            scheduled_gen,
+            evicted,
+            disagg_candidates,
+            has_chunking,
+        )
 
     # ---- Per-type scheduling methods ----
 
@@ -740,24 +756,13 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     @staticmethod
     def _lora_key(req: LlmRequest):
-        lora_id = getattr(req, "lora_task_id", None)
-        if lora_id is None:
-            return (0, 0)
-        return (1, lora_id)
+        return _get_lora_task_id(req)
 
     def _sort_requests(self, context_requests, generation_requests, has_chunks):
         """Sort by LoRA task ID. Non-last chunks before last chunks."""
         if has_chunks:
-            not_last = [
-                r
-                for r in context_requests
-                if r.is_encoder_init_state or not r.is_last_context_chunk
-            ]
-            last = [
-                r
-                for r in context_requests
-                if not r.is_encoder_init_state and r.is_last_context_chunk
-            ]
+            not_last = [r for r in context_requests if not r.is_last_context_chunk]
+            last = [r for r in context_requests if r.is_last_context_chunk]
             not_last.sort(key=self._lora_key)
             last.sort(key=self._lora_key)
             context_requests.clear()

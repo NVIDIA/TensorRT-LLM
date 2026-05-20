@@ -400,8 +400,6 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        self.cross_kv_cache_manager = self.resource_manager.resource_managers.get(
-            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         # V2 manager owns KV alloc + suspend during scheduling: it
         # eagerly grows ctx/gen capacity in the schedule loop and calls
         # suspend_request() when needed (offloads GPU pages while
@@ -621,6 +619,11 @@ class PyExecutor:
                     "Overlap scheduler is not yet wired for encoder-decoder "
                     "models. Set disable_overlap_scheduler=True for "
                     "encoder-decoder runs.")
+            if getattr(self.model_engine, "cuda_graph_config",
+                       None) is not None:
+                raise NotImplementedError(
+                    "CUDA graph is not supported for encoder-decoder models. "
+                    "Disable cuda_graph_config for encoder-decoder runs.")
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -1178,7 +1181,10 @@ class PyExecutor:
             req_stat.reused_blocks_per_request = req.reused_blocks
             req_stat.missed_blocks_per_request = req.missed_blocks
             req_stat.kv_cache_hit_rate_per_request = req.kv_cache_hit_rate
-            req_stat.scheduled = req in scheduled_requests.context_requests or req in scheduled_requests.generation_requests
+            req_stat.scheduled = (req in scheduled_requests.encoder_requests
+                                  or req in scheduled_requests.context_requests
+                                  or req
+                                  in scheduled_requests.generation_requests)
             if req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY or req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 req_stat.dis_serving_stats = DisServingRequestStats()
                 req_stat.dis_serving_stats.kv_cache_transfer_ms = req.kv_cache_transfer_time_ms
@@ -1740,7 +1746,8 @@ class PyExecutor:
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
-                    f'scheduled {scheduled_batch.num_context_requests} context requests and '
+                    f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
+                    f'{scheduled_batch.num_context_requests} context requests and '
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
 
@@ -2315,7 +2322,8 @@ class PyExecutor:
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
-            f'scheduled {scheduled_batch.num_context_requests} context requests and '
+            f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
+            f'{scheduled_batch.num_context_requests} context requests and '
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
@@ -2443,22 +2451,14 @@ class PyExecutor:
 
                 finished_requests = []
 
-                # Split off encoder-init requests before any decoder-side
-                # preparation so the self-pool ``prepare_resources`` and
-                # the decoder forward step never see them. Decoder context is
-                # dispatched in a later iteration, so encoder admission does
-                # not need cross-pool blocks for same-iteration decoder work.
-                encoder_requests = self._split_encoder_decoder_context_requests(
-                    scheduled_batch)
-
                 # Run the encoder iteration first.  After scatter the
                 # encoder requests transition to ``CONTEXT_INIT`` and are
                 # picked up by the next scheduler iteration as decoder
                 # context. The encoder pass is independent of the decoder
                 # ``can_queue`` gate, so an iteration with only encoder-init
                 # requests still makes forward progress.
-                if encoder_requests:
-                    self._run_encoder_step(encoder_requests)
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
 
@@ -3459,6 +3459,7 @@ class PyExecutor:
             self._revert_ctx_alloc(dropped)
 
         scheduled_requests = ScheduledRequests()
+        scheduled_requests.encoder_requests = scheduler_output.encoder_requests
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
@@ -3468,11 +3469,9 @@ class PyExecutor:
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.
     #
-    # At a scheduling pass, the capacity scheduler may admit encoder-init
-    # requests alongside decoder-context and generation requests, all
-    # under the same ``ScheduledRequests.context_requests`` bucket
-    # (encoder-init is shaped like a one-shot context request from the
-    # admission point of view).  The executor splits that bucket into:
+    # At a scheduling pass, the scheduler may admit encoder-init requests
+    # alongside decoder-context and generation requests.  It returns them in
+    # disjoint buckets:
     #
     #   * encoder requests (``LlmRequestState.ENCODER_INIT``), which run
     #     through ``ModelEngine.forward_encoder`` on this iteration.
@@ -3487,37 +3486,6 @@ class PyExecutor:
     # micro-batch; this preserves the cross-KV lifecycle and the
     # dual-pool budget.
     # ---------------------------------------------------------------
-    def _split_encoder_decoder_context_requests(
-            self, scheduled_batch: ScheduledRequests) -> List[LlmRequest]:
-        """Pull encoder-init requests out of the scheduled context bucket.
-
-        Returns the list of encoder-init requests pulled out (in the
-        scheduler's order).  The remaining ``context_requests_*`` lists
-        on ``scheduled_batch`` are rewritten in-place to contain only
-        decoder-context (``CONTEXT_INIT`` / ``DISAGG_GENERATION_INIT``)
-        requests, so the downstream decoder forward step is unchanged.
-        """
-        encoder_requests: List[LlmRequest] = []
-        if not scheduled_batch.context_requests:
-            return encoder_requests
-
-        decoder_chunking: List[LlmRequest] = []
-        decoder_last_chunk: List[LlmRequest] = []
-        for req in scheduled_batch.context_requests_chunking:
-            if req.is_encoder_init_state:
-                encoder_requests.append(req)
-            else:
-                decoder_chunking.append(req)
-        for req in scheduled_batch.context_requests_last_chunk:
-            if req.is_encoder_init_state:
-                encoder_requests.append(req)
-            else:
-                decoder_last_chunk.append(req)
-
-        scheduled_batch.context_requests_chunking = decoder_chunking
-        scheduled_batch.context_requests_last_chunk = decoder_last_chunk
-        return encoder_requests
-
     @nvtx_range("_run_encoder_step")
     def _run_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
         """Drive one encoder iteration for ``encoder_requests``.
@@ -3605,7 +3573,8 @@ class PyExecutor:
         Per-request encoder output tensors are produced on the dedicated
         ``encoder_stream`` and consumed by the decoder forward on
         ``execution_stream``. Cross-stream correctness is guaranteed by
-        the scheduler: ``filter_unready_decoder_context_requests`` excludes
+        the scheduler:
+        ``drop_decoder_context_requests_waiting_for_encoder_output`` excludes
         any ``CONTEXT_INIT`` request whose ``py_encoder_output_ready_event``
         has not completed, so by the time a request reaches this point the
         encoder kernels for that request are already done. No

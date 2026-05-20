@@ -91,7 +91,7 @@ def test_executor_request_to_llm_request_preserves_encoder_tokens():
     assert llm_request.is_encoder_init_state
 
 
-def test_scheduled_requests_does_not_query_encoder_context_chunk_state():
+def test_scheduled_requests_keeps_encoder_requests_separate():
     class EncoderInitRequest:
         is_encoder_init_state = True
 
@@ -102,9 +102,10 @@ def test_scheduled_requests_does_not_query_encoder_context_chunk_state():
     request = EncoderInitRequest()
     scheduled_requests = ScheduledRequests()
 
-    scheduled_requests.append_context_request(request)
+    scheduled_requests.append_encoder_request(request)
 
-    assert scheduled_requests.context_requests_chunking == [request]
+    assert scheduled_requests.encoder_requests == [request]
+    assert scheduled_requests.context_requests_chunking == []
     assert scheduled_requests.context_requests_last_chunk == []
 
 

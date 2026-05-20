@@ -142,61 +142,67 @@ def _test_case(
 
 
 _TEST_CASES = [
-    # Primary coverage: v1 cache manager, CUDA graph, and beam search.
-    _test_case("t5-small", "bfloat16", False, True, 2, 2, False, "bf16-kv-v1-cuda-graph-on-beam2"),
+    # Primary coverage: v1 cache manager and beam search.
     _test_case(
-        "flan-t5-small", "bfloat16", False, True, 2, 2, False, "bf16-kv-v1-cuda-graph-on-beam2"
-    ),
-    _test_case("t5-base", "bfloat16", False, True, 2, 2, False, "bf16-kv-v1-cuda-graph-on-beam2"),
-    _test_case("t5-large", "bfloat16", False, True, 2, 2, False, "bf16-kv-v1-cuda-graph-on-beam2"),
-    _test_case(
-        "flan-t5-base", "bfloat16", False, True, 2, 2, False, "bf16-kv-v1-cuda-graph-on-beam2"
+        "t5-small", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"
     ),
     _test_case(
-        "flan-t5-large", "bfloat16", False, True, 2, 2, False, "bf16-kv-v1-cuda-graph-on-beam2"
+        "flan-t5-small", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"
+    ),
+    _test_case("t5-base", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"),
+    _test_case(
+        "t5-large", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"
     ),
     _test_case(
-        "flan-t5-xl", "bfloat16", False, True, 2, 2, False, "bf16-kv-v1-cuda-graph-on-beam2"
+        "flan-t5-base", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"
+    ),
+    _test_case(
+        "flan-t5-large", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"
+    ),
+    _test_case(
+        "flan-t5-xl", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"
     ),
     _test_case(
         "flan-t5-xxl",
         "bfloat16",
         False,
-        True,
+        False,
         2,
         2,
         False,
-        "bf16-kv-v1-cuda-graph-on-beam2",
+        "bf16-kv-v1-cuda-graph-off-beam2",
         marks=pytest.mark.skip_less_device_memory(_FLAN_T5_XXL_MIN_GPU_MEMORY_MB),
     ),
     # Non-CUDA-graph smoke for the same v1 beam path.
     _test_case(
         "t5-small", "bfloat16", False, False, 2, 2, False, "bf16-kv-v1-cuda-graph-off-beam2"
     ),
-    # Greedy smoke for the priority v1 CUDA graph path.
-    _test_case("t5-small", "bfloat16", False, True, 1, 1, True, "bf16-kv-v1-cuda-graph-on-greedy"),
+    # Greedy smoke for the priority v1 path.
+    _test_case(
+        "t5-small", "bfloat16", False, False, 1, 1, True, "bf16-kv-v1-cuda-graph-off-greedy"
+    ),
     # Precision coverage for beam search. KVCacheManagerV2 currently requires
     # max_beam_width == 1, so beam-search precision coverage uses v1.
-    _test_case("t5-small", "float16", False, True, 2, 2, False, "fp16-kv-v1-cuda-graph-on-beam2"),
-    _test_case("t5-small", "float32", False, True, 2, 2, False, "fp32-kv-v1-cuda-graph-on-beam2"),
+    _test_case("t5-small", "float16", False, False, 2, 2, False, "fp16-kv-v1-cuda-graph-off-beam2"),
+    _test_case("t5-small", "float32", False, False, 2, 2, False, "fp32-kv-v1-cuda-graph-off-beam2"),
     _test_case(
-        "flan-t5-small", "float16", False, True, 2, 2, False, "fp16-kv-v1-cuda-graph-on-beam2"
+        "flan-t5-small", "float16", False, False, 2, 2, False, "fp16-kv-v1-cuda-graph-off-beam2"
     ),
     _test_case(
-        "flan-t5-small", "float32", False, True, 2, 2, False, "fp32-kv-v1-cuda-graph-on-beam2"
+        "flan-t5-small", "float32", False, False, 2, 2, False, "fp32-kv-v1-cuda-graph-off-beam2"
     ),
-    # Precision coverage for v2 on its supported CUDA graph path.
-    _test_case("t5-small", "bfloat16", True, True, 1, 1, True, "bf16-kv-v2-cuda-graph-on-greedy"),
-    _test_case("t5-small", "float16", True, True, 1, 1, True, "fp16-kv-v2-cuda-graph-on-greedy"),
-    _test_case("t5-small", "float32", True, True, 1, 1, True, "fp32-kv-v2-cuda-graph-on-greedy"),
+    # Precision coverage for v2 on its supported greedy path.
+    _test_case("t5-small", "bfloat16", True, False, 1, 1, True, "bf16-kv-v2-cuda-graph-off-greedy"),
+    _test_case("t5-small", "float16", True, False, 1, 1, True, "fp16-kv-v2-cuda-graph-off-greedy"),
+    _test_case("t5-small", "float32", True, False, 1, 1, True, "fp32-kv-v2-cuda-graph-off-greedy"),
     _test_case(
-        "flan-t5-small", "bfloat16", True, True, 1, 1, True, "bf16-kv-v2-cuda-graph-on-greedy"
-    ),
-    _test_case(
-        "flan-t5-small", "float16", True, True, 1, 1, True, "fp16-kv-v2-cuda-graph-on-greedy"
+        "flan-t5-small", "bfloat16", True, False, 1, 1, True, "bf16-kv-v2-cuda-graph-off-greedy"
     ),
     _test_case(
-        "flan-t5-small", "float32", True, True, 1, 1, True, "fp32-kv-v2-cuda-graph-on-greedy"
+        "flan-t5-small", "float16", True, False, 1, 1, True, "fp16-kv-v2-cuda-graph-off-greedy"
+    ),
+    _test_case(
+        "flan-t5-small", "float32", True, False, 1, 1, True, "fp32-kv-v2-cuda-graph-off-greedy"
     ),
     # ByT5 sanity coverage keeps the known-stable expected output path.
     _test_case(
@@ -243,7 +249,7 @@ _MIXED_BATCH_TEST_CASES = [
         2,
         2,
         False,
-        "bf16-kv-v1-cuda-graph-on-beam2-batch2",
+        "bf16-kv-v1-cuda-graph-off-beam2-batch2",
     ),
     _mixed_batch_test_case(
         "flan-t5-small",
@@ -252,7 +258,7 @@ _MIXED_BATCH_TEST_CASES = [
         2,
         2,
         False,
-        "bf16-kv-v1-cuda-graph-on-beam2-batch2",
+        "bf16-kv-v1-cuda-graph-off-beam2-batch2",
     ),
     _mixed_batch_test_case(
         "t5-small",
@@ -261,7 +267,7 @@ _MIXED_BATCH_TEST_CASES = [
         1,
         1,
         True,
-        "bf16-kv-v1-cuda-graph-on-greedy-batch2",
+        "bf16-kv-v1-cuda-graph-off-greedy-batch2",
     ),
     _mixed_batch_test_case(
         "t5-small",
@@ -270,7 +276,7 @@ _MIXED_BATCH_TEST_CASES = [
         1,
         1,
         True,
-        "bf16-kv-v2-cuda-graph-on-greedy-batch2",
+        "bf16-kv-v2-cuda-graph-off-greedy-batch2",
     ),
 ]
 
@@ -439,7 +445,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
     "num_beams,num_return_sequences,exact_match",
     _MIXED_BATCH_TEST_CASES,
 )
-def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_batch(
+def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str,
     expected_output_token_ids_by_request: list[list[list[int]] | None] | None,
@@ -457,16 +463,14 @@ def test_t5_pytorch_generate_encoder_decoder_cuda_graph_mixed_encoder_lengths_ba
     sampling_params = _sampling_params(num_beams, num_return_sequences)
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph=True, beams={num_beams}, returns={num_return_sequences}, "
+        f"cuda_graph=False, beams={num_beams}, returns={num_return_sequences}, "
         "mixed_encoder_lengths=True, batch_size=2"
     )
     with LLM(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_cuda_graph_config(
-            True, batch_sizes=[1, len(_MIXED_ENCODER_SOURCE_TEXTS)]
-        ),
+        cuda_graph_config=None,
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,

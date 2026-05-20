@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the encoder iteration helpers in PyExecutor.
 
-Covers the two pure-Python helpers that drive the encoder branch of
+Covers the pure-Python helpers that drive the encoder branch of
 ``_executor_loop`` for encoder-decoder models:
 
-* ``_split_encoder_decoder_context_requests`` — splits the scheduler's
-  context bucket into encoder-init vs decoder-context subsets.
 * ``_scatter_encoder_output`` — slices packed encoder hidden states
   back into per-request tensors and transitions request state from
   ``ENCODER_INIT`` to ``CONTEXT_INIT``.
@@ -47,107 +45,15 @@ def _make_request(req_id: int, *, is_encoder_init: bool, is_last_chunk: bool):
 
 
 def _build_scheduled_batch(
-    encoder_chunking=(),
-    encoder_last_chunk=(),
+    encoder_requests=(),
     decoder_chunking=(),
     decoder_last_chunk=(),
 ):
     sb = ScheduledRequests()
-    sb.context_requests_chunking = list(encoder_chunking) + list(decoder_chunking)
-    sb.context_requests_last_chunk = list(encoder_last_chunk) + list(decoder_last_chunk)
+    sb.encoder_requests = list(encoder_requests)
+    sb.context_requests_chunking = list(decoder_chunking)
+    sb.context_requests_last_chunk = list(decoder_last_chunk)
     return sb
-
-
-class TestSplitEncoderDecoderContextRequests:
-    def test_no_context_requests(self):
-        executor = MagicMock(spec=PyExecutor)
-        executor._split_encoder_decoder_context_requests = (
-            PyExecutor._split_encoder_decoder_context_requests.__get__(executor, PyExecutor)
-        )
-        sb = ScheduledRequests()
-
-        encoder_requests = executor._split_encoder_decoder_context_requests(sb)
-
-        assert encoder_requests == []
-        assert sb.num_context_requests == 0
-
-    def test_pure_decoder_context_unchanged(self):
-        executor = MagicMock(spec=PyExecutor)
-        executor._split_encoder_decoder_context_requests = (
-            PyExecutor._split_encoder_decoder_context_requests.__get__(executor, PyExecutor)
-        )
-        d1 = _make_request(1, is_encoder_init=False, is_last_chunk=False)
-        d2 = _make_request(2, is_encoder_init=False, is_last_chunk=True)
-        sb = _build_scheduled_batch(decoder_chunking=(d1,), decoder_last_chunk=(d2,))
-
-        encoder_requests = executor._split_encoder_decoder_context_requests(sb)
-
-        assert encoder_requests == []
-        assert sb.context_requests_chunking == [d1]
-        assert sb.context_requests_last_chunk == [d2]
-
-    def test_pure_encoder_init_drained(self):
-        executor = MagicMock(spec=PyExecutor)
-        executor._split_encoder_decoder_context_requests = (
-            PyExecutor._split_encoder_decoder_context_requests.__get__(executor, PyExecutor)
-        )
-        e1 = _make_request(10, is_encoder_init=True, is_last_chunk=True)
-        e2 = _make_request(11, is_encoder_init=True, is_last_chunk=True)
-        sb = _build_scheduled_batch(encoder_last_chunk=(e1, e2))
-
-        encoder_requests = executor._split_encoder_decoder_context_requests(sb)
-
-        assert encoder_requests == [e1, e2]
-        assert sb.context_requests_chunking == []
-        assert sb.context_requests_last_chunk == []
-
-    def test_mixed_preserves_order_and_buckets(self):
-        """Encoder-init requests can be admitted alongside decoder context.
-
-        After the split, decoder-context requests must remain in their
-        original chunking / last-chunk buckets so the downstream
-        decoder forward step is unchanged.
-        """
-        executor = MagicMock(spec=PyExecutor)
-        executor._split_encoder_decoder_context_requests = (
-            PyExecutor._split_encoder_decoder_context_requests.__get__(executor, PyExecutor)
-        )
-        e1 = _make_request(20, is_encoder_init=True, is_last_chunk=True)
-        d1 = _make_request(21, is_encoder_init=False, is_last_chunk=False)
-        e2 = _make_request(22, is_encoder_init=True, is_last_chunk=True)
-        d2 = _make_request(23, is_encoder_init=False, is_last_chunk=True)
-        sb = _build_scheduled_batch(
-            encoder_chunking=(),
-            encoder_last_chunk=(e1, e2),
-            decoder_chunking=(d1,),
-            decoder_last_chunk=(d2,),
-        )
-
-        encoder_requests = executor._split_encoder_decoder_context_requests(sb)
-
-        # Encoder requests are returned in scheduler order across both
-        # chunking and last-chunk buckets.
-        assert encoder_requests == [e1, e2]
-        assert sb.context_requests_chunking == [d1]
-        assert sb.context_requests_last_chunk == [d2]
-
-    def test_encoder_init_in_chunking_bucket(self):
-        """Encoder-init requests appear in last_chunk in practice, but the
-        split helper must still pull them out of the chunking bucket if
-        a future scheduler routes them differently."""
-        executor = MagicMock(spec=PyExecutor)
-        executor._split_encoder_decoder_context_requests = (
-            PyExecutor._split_encoder_decoder_context_requests.__get__(executor, PyExecutor)
-        )
-        e = _make_request(30, is_encoder_init=True, is_last_chunk=False)
-        d = _make_request(31, is_encoder_init=False, is_last_chunk=True)
-        sb = _build_scheduled_batch(encoder_chunking=(e,), decoder_last_chunk=(d,))
-
-        encoder_requests = executor._split_encoder_decoder_context_requests(sb)
-
-        assert encoder_requests == [e]
-        assert sb.context_requests_chunking == []
-        assert sb.context_requests_last_chunk == [d]
 
 
 class TestScatterEncoderOutput:
@@ -226,7 +132,8 @@ class TestAttachEncoderOutputToExecutionStream:
     """Tests for ``_attach_encoder_output_to_execution_stream``.
 
     Under Option 1 (scheduler-side filter + per-request event), the
-    scheduler-side ``filter_unready_decoder_context_requests`` already
+    scheduler-side
+    ``drop_decoder_context_requests_waiting_for_encoder_output`` already
     excludes any ``CONTEXT_INIT`` request whose encoder event is not
     complete.  By the time the executor calls this helper, the encoder
     work for every admitted request is finished, so the helper does

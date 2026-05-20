@@ -991,7 +991,10 @@ class KvCacheCreator:
                 return value
         return None
 
-    def _get_cross_kv_cache_layout(self) -> tuple[int, int, int, int]:
+    def _get_cross_kv_cache_layout(
+        self,
+        fallback_max_seq_len: Optional[int] = None
+    ) -> tuple[int, int, int, int]:
         """Return decoder-layer count and encoder KV geometry for cross cache."""
         config = self._model_engine.model.model_config.pretrained_config
 
@@ -1036,7 +1039,10 @@ class KvCacheCreator:
         if head_dim is None:
             head_dim = encoder_hidden_size // encoder_num_heads
 
-        max_seq_len = self._max_seq_len
+        max_seq_len = fallback_max_seq_len or self._max_seq_len
+        max_input_len = getattr(self._llm_args, "max_input_len", None)
+        if isinstance(max_input_len, int) and max_input_len > 0:
+            max_seq_len = max_input_len
         encoder_limit = self._get_config_int_attr(
             config,
             ("max_encoder_input_len", "encoder_max_input_length",
@@ -1089,9 +1095,10 @@ class KvCacheCreator:
         The cross manager must exist for every encoder-decoder runtime. During
         both estimation and final construction, split the same memory-derived
         budget sources used by the legacy TRT path: the free-memory fraction,
-        and any explicit ``max_gpu_total_bytes`` override. ``max_tokens`` is a
-        logical cap, not a memory split knob, so it is intentionally left
-        unchanged. The creator's base config is not mutated.
+        any explicit ``max_gpu_total_bytes`` override, and any explicit host
+        cache budget. ``max_tokens`` is a logical cap, not a memory split knob,
+        so it is intentionally left unchanged. The creator's base config is not
+        mutated.
         """
         base_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                 else self._kv_cache_config)
@@ -1130,10 +1137,24 @@ class KvCacheCreator:
             cross_kv_cache_config.max_gpu_total_bytes = cross_budget
             split_any_budget = True
 
+        host_cache_size = base_kv_cache_config.host_cache_size
+        if host_cache_size is not None and host_cache_size > 0:
+            cross_host_cache_size = int(host_cache_size * fraction)
+            self_host_cache_size = host_cache_size - cross_host_cache_size
+            logger.info(
+                f"Splitting KV cache host budget for encoder-decoder: "
+                f"total={host_cache_size / GB:.2f} GiB, "
+                f"self={self_host_cache_size / GB:.2f} GiB ({1 - fraction:.0%}), "
+                f"cross={cross_host_cache_size / GB:.2f} GiB ({fraction:.0%})")
+            self_kv_cache_config.host_cache_size = self_host_cache_size
+            cross_kv_cache_config.host_cache_size = cross_host_cache_size
+            split_any_budget = True
+
         if not split_any_budget:
             raise ValueError("Unable to size the encoder-decoder cross KV "
                              "cache pool: neither free_gpu_memory_fraction nor "
-                             "max_gpu_total_bytes is available.")
+                             "max_gpu_total_bytes nor host_cache_size is "
+                             "available.")
 
         return self_kv_cache_config, cross_kv_cache_config
 
@@ -1141,6 +1162,7 @@ class KvCacheCreator:
         self,
         cross_kv_cache_config: KvCacheConfig,
         estimating_kv_cache: bool = False,
+        fallback_max_seq_len: Optional[int] = None,
     ) -> KVCacheManager:
         """Create a KV cache manager for the cross-attention pool.
 
@@ -1155,7 +1177,7 @@ class KvCacheCreator:
         production target for encoder-decoder models.
         """
         (num_layers, num_kv_heads, head_dim,
-         max_seq_len) = self._get_cross_kv_cache_layout()
+         max_seq_len) = self._get_cross_kv_cache_layout(fallback_max_seq_len)
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         return _create_kv_cache_manager(
             model_engine=self._model_engine,
@@ -1185,6 +1207,7 @@ class KvCacheCreator:
         """Construct KV caches for model and draft model (if applicable)."""
         if self._skip_est:
             self.configure_kv_cache_capacity()
+        original_max_seq_len = self._max_seq_len
 
         # For encoder-decoder models, split the self/cross budgets first so
         # every enc-dec build creates a real cross pool.  This must happen
@@ -1258,7 +1281,8 @@ class KvCacheCreator:
         cross_kv_cache_manager = None
         if cross_kv_cache_config is not None:
             cross_kv_cache_manager = self._create_cross_kv_cache_manager(
-                cross_kv_cache_config, estimating_kv_cache)
+                cross_kv_cache_config, estimating_kv_cache,
+                original_max_seq_len)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
