@@ -16,7 +16,7 @@
 """Normalization operations.
 
 This module provides various normalization implementations:
-- rms_norm: RMSNorm implementations (FlashInfer, Triton, Grafia, reference)
+- rms_norm: RMSNorm implementations (FlashInfer, Triton, reference)
 - triton_rms_norm: Low-level Triton RMSNorm kernel
 - triton_fused_add_rms_norm_quant_fp8: Fused Add + RMSNorm + FP8 quantization
 - l2norm: L2 normalization operations

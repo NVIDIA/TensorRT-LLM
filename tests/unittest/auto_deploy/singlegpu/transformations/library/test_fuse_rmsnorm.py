@@ -1,5 +1,3 @@
-from dataclasses import dataclass
-
 import pytest
 import torch
 from _graph_test_helpers import run_test_transformed_gm
@@ -12,25 +10,6 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.rms_norm import FuseRMSNorm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-
-
-@dataclass
-class _TensorMeta:
-    shape: tuple[int, ...]
-    dtype: torch.dtype
-    device: torch.device
-    strides: tuple[int, ...]
-
-    def stride(self, dim):
-        return self.strides[dim]
-
-    def is_contiguous(self):
-        expected = []
-        stride = 1
-        for size in reversed(self.shape):
-            expected.append(stride)
-            stride *= size
-        return self.strides == tuple(reversed(expected))
 
 
 class RMSNorm(torch.nn.Module):
@@ -160,19 +139,10 @@ def test_fuse_rmsnorm_preserves_node_metadata():
     assert all("val" in n.meta and hasattr(n.meta["val"], "dtype") for n in rms_nodes)
 
 
-def _make_torch_rmsnorm_gm(input_meta: _TensorMeta, weight_meta: _TensorMeta):
+def _make_passthrough_gm():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
-    weight = graph.placeholder("weight")
-    x.meta["val"] = input_meta
-    weight.meta["val"] = weight_meta
-    rms = graph.call_function(
-        torch.ops.auto_deploy.torch_rmsnorm.default,
-        args=(x, weight, 1e-5),
-    )
-    rms.meta["val"] = input_meta
-    rms.meta["marker"] = "preserve-me"
-    graph.output(rms)
+    graph.output(x)
     return GraphModule(torch.nn.Module(), graph)
 
 
@@ -182,42 +152,6 @@ def _apply_fuse_rmsnorm(gm, **kwargs):
     return transformed
 
 
-def test_fuse_rmsnorm_grafia_routes_supported_metadata():
-    gm = _make_torch_rmsnorm_gm(
-        _TensorMeta((107, 2880), torch.bfloat16, torch.device("cuda:0"), (2880, 1)),
-        _TensorMeta((2880,), torch.bfloat16, torch.device("cuda:0"), (1,)),
-    )
-
-    gm = _apply_fuse_rmsnorm(gm, rmsnorm_backend="grafia")
-    nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.grafia_rms_norm)]
-
-    assert len(nodes) == 1
-    assert nodes[0].meta["marker"] == "preserve-me"
-
-
-def test_fuse_rmsnorm_grafia_falls_back_for_unsupported_metadata():
-    gm = _make_torch_rmsnorm_gm(
-        _TensorMeta((2, 1024), torch.float16, torch.device("cuda:0"), (1024, 1)),
-        _TensorMeta((1024,), torch.float16, torch.device("cuda:0"), (1,)),
-    )
-
-    gm = _apply_fuse_rmsnorm(gm, rmsnorm_backend="grafia")
-
-    assert not any(is_op(n, torch.ops.auto_deploy.grafia_rms_norm) for n in gm.graph.nodes)
-    nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm)]
-    assert len(nodes) == 1
-    assert nodes[0].meta["marker"] == "preserve-me"
-
-
-def test_fuse_rmsnorm_grafia_strict_raises_for_unsupported_metadata():
-    gm = _make_torch_rmsnorm_gm(
-        _TensorMeta((2, 1024), torch.float16, torch.device("cuda:0"), (1024, 1)),
-        _TensorMeta((1024,), torch.float16, torch.device("cuda:0"), (1,)),
-    )
-
-    with pytest.raises(ValueError, match="rmsnorm_backend='grafia'.*supported nodes"):
-        _apply_fuse_rmsnorm(
-            gm,
-            rmsnorm_backend="grafia",
-            grafia_rmsnorm_strict=True,
-        )
+def test_fuse_rmsnorm_grafia_backend_is_invalid():
+    with pytest.raises(ValueError, match="Invalid rmsnorm_backend"):
+        _apply_fuse_rmsnorm(_make_passthrough_gm(), rmsnorm_backend="grafia")

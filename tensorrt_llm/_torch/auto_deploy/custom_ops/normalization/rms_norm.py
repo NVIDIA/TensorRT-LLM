@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom operator for FlashInfer, Triton, and Grafia RMSNorm implementations."""
-
-import importlib
+"""Custom operators for FlashInfer, Triton, and reference RMSNorm implementations."""
 
 import flashinfer
 import torch
@@ -37,118 +35,6 @@ try:
 except (ModuleNotFoundError, ImportError):
     _layer_norm_fwd = None
 from .triton_rms_norm import rms_norm
-
-_GRAFIA_RMS_NORM_HIDDEN_SIZE = 2880
-_GRAFIA_RMS_NORM_ROWS = 107
-_GRAFIA_RMS_NORM_CACHE = {}
-
-
-def _validate_grafia_rms_norm_inputs(input: torch.Tensor, weight: torch.Tensor) -> None:
-    if not input.is_cuda or not weight.is_cuda:
-        raise ValueError("grafia_rms_norm requires CUDA input and weight tensors")
-    if input.device != weight.device:
-        raise ValueError(
-            f"grafia_rms_norm requires input and weight on the same device, "
-            f"got {input.device} and {weight.device}"
-        )
-    if input.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16:
-        raise ValueError(
-            "grafia_rms_norm supports only BF16 input and BF16 weight tensors"
-        )
-    if input.dim() < 1:
-        raise ValueError("grafia_rms_norm requires input with at least one dimension")
-    if input.shape[-1] != _GRAFIA_RMS_NORM_HIDDEN_SIZE:
-        raise ValueError(
-            f"grafia_rms_norm supports hidden_size == {_GRAFIA_RMS_NORM_HIDDEN_SIZE}, "
-            f"got {input.shape[-1]}"
-        )
-    if input.numel() // input.shape[-1] != _GRAFIA_RMS_NORM_ROWS:
-        raise ValueError(
-            f"grafia_rms_norm supports flattened rows == {_GRAFIA_RMS_NORM_ROWS}, "
-            f"got {input.numel() // input.shape[-1]}"
-        )
-    if input.stride(-1) != 1:
-        raise ValueError("grafia_rms_norm requires contiguous input last dimension")
-    if tuple(weight.shape) != (_GRAFIA_RMS_NORM_HIDDEN_SIZE,):
-        raise ValueError(
-            f"grafia_rms_norm requires weight shape ({_GRAFIA_RMS_NORM_HIDDEN_SIZE},), "
-            f"got {tuple(weight.shape)}"
-        )
-    if not weight.is_contiguous():
-        raise ValueError("grafia_rms_norm requires contiguous weight")
-
-
-def _load_grafia_rms_norm_deps():
-    try:
-        importlib.import_module("grafia_runtime")
-        importlib.import_module("backends.ctm.factories.rmsnorm_rts")
-        ctm = importlib.import_module("backends.ctm")
-        compile_mod = importlib.import_module("graph.compile")
-        core_mod = importlib.import_module("graph.core")
-        norm_mod = importlib.import_module("graph.ops.grafia.norm")
-        types_mod = importlib.import_module("graph.types")
-    except ImportError as exc:
-        raise RuntimeError(
-            "grafia_rms_norm requires optional Grafia dependencies "
-            "(grafia_runtime and ThinIR/CTM) to be importable"
-        ) from exc
-
-    return ctm, compile_mod, core_mod, norm_mod, types_mod
-
-
-def _resolve_grafia_rms_norm_cubin_path() -> str | None:
-    try:
-        factory_mod = importlib.import_module("backends.ctm.factories.rmsnorm_rts")
-        default_cubin_path = getattr(factory_mod, "_default_cubin_path", None)
-        if default_cubin_path is None:
-            return None
-        cubin_path = default_cubin_path()
-        return str(cubin_path) if cubin_path is not None else None
-    except ImportError:
-        return None
-
-
-def _compile_grafia_rms_norm_artifact(input: torch.Tensor, eps: float, cubin_path: str | None):
-    ctm, compile_mod, core_mod, norm_mod, types_mod = _load_grafia_rms_norm_deps()
-
-    rows = input.numel() // input.shape[-1]
-    cols = input.shape[-1]
-
-    g = core_mod.Graph()
-    x_t = g.input(shape=(rows, cols), dtype=types_mod.DType.BF16, name="x")
-    gamma_t = g.input(shape=(cols,), dtype=types_mod.DType.BF16, name="gamma")
-    y_t = norm_mod.fast_low_latency_rms_norm(g, x_t, gamma_t, eps=eps)
-    g.mark_output(y_t)
-
-    mk = compile_mod.MegaKernel(name="auto_deploy_grafia_rms_norm", graph=g, eager_fn=lambda *a: a)
-    device_index = input.device.index if input.device.index is not None else torch.cuda.current_device()
-    backend = ctm.CTMBackend(device=f"cuda:{device_index}")
-    if cubin_path is not None:
-        backend.kernel_config.setdefault("grafia.fast_low_latency_rms_norm", {})[
-            "cubin_path"
-        ] = cubin_path
-    artifact = backend.compile(mk)
-    return backend, artifact
-
-
-def _get_grafia_rms_norm_artifact(input: torch.Tensor, weight: torch.Tensor, eps: float):
-    device_index = input.device.index if input.device.index is not None else torch.cuda.current_device()
-    compute_capability = torch.cuda.get_device_capability(device_index)
-    cubin_path = _resolve_grafia_rms_norm_cubin_path()
-    key = (
-        device_index,
-        tuple(input.shape),
-        input.dtype,
-        weight.dtype,
-        float(eps),
-        cubin_path,
-        compute_capability,
-    )
-    artifact = _GRAFIA_RMS_NORM_CACHE.get(key)
-    if artifact is None:
-        artifact = _compile_grafia_rms_norm_artifact(input, float(eps), cubin_path)
-        _GRAFIA_RMS_NORM_CACHE[key] = artifact
-    return artifact
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_rms_norm", mutates_args=())
@@ -200,32 +86,6 @@ def triton_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
 
 
 @triton_rmsnorm.register_fake
-def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Fake implementation for the custom operator during tracing."""
-    return torch.empty_like(input)
-
-
-@torch.library.custom_op("auto_deploy::grafia_rms_norm", mutates_args=())
-def grafia_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Custom operator for Grafia CTM RMSNorm implementation.
-
-    This wraps the current CTM ``FastLowLatencyRMSNorm`` cubin specialization:
-    CUDA BF16, hidden size 2880, flattened rows 107, contiguous last dimension.
-    Grafia and ThinIR are optional dependencies and are imported only on this
-    runtime path.
-    """
-    _validate_grafia_rms_norm_inputs(input, weight)
-    input_shape = input.shape
-    input_flat = input.reshape(_GRAFIA_RMS_NORM_ROWS, _GRAFIA_RMS_NORM_HIDDEN_SIZE)
-
-    with torch.cuda.device(input.device):
-        backend, artifact = _get_grafia_rms_norm_artifact(input, weight, float(eps))
-        (output_flat,) = backend.launch(artifact, input_flat, weight)
-
-    return output_flat.reshape(input_shape)
-
-
-@grafia_rmsnorm.register_fake
 def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Fake implementation for the custom operator during tracing."""
     return torch.empty_like(input)
