@@ -1412,7 +1412,9 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 103
+    MAX_SUPPORTED_SM_VERSION_W4A8 = 103
+    # W4A16 (FP16/BF16 activation): SM120/121 dispatch via cutlass::arch::Sm80.
+    MAX_SUPPORTED_SM_VERSION_W4A16 = 121
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1445,9 +1447,16 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
                 do_preparation: bool = False,
                 **kwargs) -> torch.Tensor:
 
-        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+        sm = get_sm_version()
+        if (self.activation_dtype == torch.float8_e4m3fn
+                and sm > self.MAX_SUPPORTED_SM_VERSION_W4A8):
             raise ValueError(
-                f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
+                f"SM version {sm} is not supported for W4A8 finegrained mixed dtype GEMM"
+            )
+        if (self.activation_dtype in (torch.float16, torch.bfloat16)
+                and sm > self.MAX_SUPPORTED_SM_VERSION_W4A16):
+            raise ValueError(
+                f"SM version {sm} is not supported for W4A16 finegrained mixed dtype GEMM"
             )
 
         activation, weights_packed, scales = inputs
