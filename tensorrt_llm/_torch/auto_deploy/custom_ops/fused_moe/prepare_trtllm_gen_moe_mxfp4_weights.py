@@ -10,7 +10,7 @@
 
 Transforms HF on-disk MXFP4 expert tensors (``gate_up_proj_*``, ``down_proj_*`` registered by
 ``quantize_mxfp4_moe``) into the kernel-ready stacked layout that
-``auto_deploy::trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused`` expects: ``[E_local, 2I_pad, H_pad/2]`` weights,
+``auto_deploy::trtllm_quant_mxfp4_trtllm_gen_moe_fused`` expects: ``[E_local, 2I_pad, H_pad/2]`` weights,
 ``[E_local, 2I_pad]`` fp32 biases, etc., all run through ``torch.ops.trtllm.shuffle_matrix`` for
 the TMA layout.
 

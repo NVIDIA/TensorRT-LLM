@@ -80,10 +80,11 @@ def simple(
     Returns:
         Output tensor of shape ``(..., out_features)``.
     """
-    # Blackwell (sm>=100): route bf16 linear to trtllm::cublas_mm. This matches
-    # PT's GPT-OSS path (modeling_gpt_oss.py: use_custom_cublas_mm = sm>=100) and
-    # selects single-pass cluster-mode cubins instead of cuBLAS-default
+    # Blackwell (sm>=100) + bf16: route any bf16 linear to trtllm::cublas_mm.
+    # Selects single-pass cluster-mode cubins instead of cuBLAS-default
     # split-K + reduce + zero-fill for small-M (decode) projection GEMMs.
+    # (Same trick PT introduced for GPT-OSS via use_custom_cublas_mm in
+    # modeling_gpt_oss.py; we apply it model-agnostically based on dtype + SM.)
     if _sm_version() >= 100 and input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         # cublas_mm requires 2D mat_a/mat_b. Flatten leading dims and unflatten on exit.
         in_shape = input.shape
