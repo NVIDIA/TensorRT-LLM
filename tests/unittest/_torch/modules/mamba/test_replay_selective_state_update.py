@@ -269,12 +269,12 @@ def test_replay_selective_state_update(
     )
 
     # Build cache tensors for the replay kernel.
-    # old_x: (cache, max_window, nheads, dim) bf16 — single-buffered
+    # old_x: (cache, 2, max_window, nheads, dim) bf16 — double-buffered
     # old_B: (cache, 2, max_window, ngroups, dstate) bf16 — double-buffered
     # old_dt: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
     # old_dA_cumsum: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
     # cache_buf_idx: random 0s and 1s to verify indexing correctness
-    old_x = torch.zeros(cache_size, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_x = torch.randn(cache_size, 2, max_window, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
     old_dt = torch.randn(cache_size, 2, nheads, max_window, device=device, dtype=torch.float32)
     old_dA_cumsum = torch.randn(cache_size, 2, nheads, max_window, device=device, dtype=torch.float32)
@@ -285,7 +285,8 @@ def test_replay_selective_state_update(
     # values up to max_window are exercised.  Inactive buffer has random
     # garbage to catch indexing bugs.
     slots = state_batch_indices if paged_cache else slice(None)
-    old_x[slots, :step1_T] = x1
+    # old_x active-buffer fill is done in the per-slot loop below (same pattern
+    # as old_B/old_dt/old_dA_cumsum since old_x is now double-buffered too).
 
     # Compute processed dt and dA_cumsum for step 1
     dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
@@ -296,6 +297,7 @@ def test_replay_selective_state_update(
     for i, slot in enumerate(slot_indices):
         buf = cache_buf_idx[slot].item()
         batch_idx = i  # maps slot back to the batch index
+        old_x[slot, buf, :step1_T] = x1[batch_idx]
         old_B[slot, buf, :step1_T] = B1[batch_idx]
         old_dt[slot, buf, :, :step1_T] = dt1[batch_idx].T  # (step1_T, nheads) → (nheads, step1_T)
         old_dA_cumsum[slot, buf, :, :step1_T] = dA_cumsum1[batch_idx].T
@@ -537,25 +539,31 @@ def test_replay_selective_state_update(
             active = cache_buf_idx[slot].item()
             wb = (1 - active) if write_checkpoint else active
 
-            # --- old_x (single-buffered): write at [write_offset : +T) of slot ---
-            written_x = old_x_w[slot, write_offset : write_offset + T]
+            # --- old_x (double-buffered): write at wb, [write_offset : +T) ---
+            written_x = old_x_w[slot, wb, write_offset : write_offset + T]
             torch.testing.assert_close(
                 written_x, x2[batch_idx], rtol=0, atol=0,
                 msg=f"old_x written region wrong at k={k} write={write_checkpoint}",
             )
-            # Untouched ranges of old_x[slot]
+            # Untouched ranges of old_x[slot, wb]
             if write_offset > 0:
                 torch.testing.assert_close(
-                    old_x_w[slot, :write_offset], old_x[slot, :write_offset],
+                    old_x_w[slot, wb, :write_offset], old_x[slot, wb, :write_offset],
                     rtol=0, atol=0,
                     msg=f"old_x [0:{write_offset}) modified at k={k} write={write_checkpoint}",
                 )
             if write_offset + T < max_window:
                 torch.testing.assert_close(
-                    old_x_w[slot, write_offset + T:], old_x[slot, write_offset + T:],
+                    old_x_w[slot, wb, write_offset + T:], old_x[slot, wb, write_offset + T:],
                     rtol=0, atol=0,
                     msg=f"old_x [{write_offset+T}:) modified at k={k} write={write_checkpoint}",
                 )
+            # Other-buffer (= 1-wb) untouched
+            torch.testing.assert_close(
+                old_x_w[slot, 1 - wb], old_x[slot, 1 - wb],
+                rtol=0, atol=0,
+                msg=f"old_x inactive buffer modified at k={k} write={write_checkpoint}",
+            )
 
             # --- old_B (double-buffered): write at write_buf, [write_offset:+T) ---
             torch.testing.assert_close(
@@ -706,7 +714,7 @@ def test_replay_selective_state_update_scenarios(
         disable_state_update=True,
     )
 
-    old_x = torch.zeros(batch, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_x = torch.randn(batch, 2, max_window, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
     old_dt = torch.randn(batch, 2, nheads, max_window, device=device, dtype=torch.float32)
     old_dA_cumsum = torch.randn(
@@ -714,11 +722,11 @@ def test_replay_selective_state_update_scenarios(
     )
     cache_buf_idx = torch.randint(0, 2, (batch,), device=device, dtype=torch.int32)
 
-    old_x[:, :step1_T] = x1
     dt1_processed = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_processed, dim=1)
     for i in range(batch):
         buf = cache_buf_idx[i].item()
+        old_x[i, buf, :step1_T] = x1[i]
         old_B[i, buf, :step1_T] = B1[i]
         old_dt[i, buf, :, :step1_T] = dt1_processed[i].T
         old_dA_cumsum[i, buf, :, :step1_T] = dA_cumsum1[i].T
@@ -873,7 +881,7 @@ def test_replay_selective_state_update_persistent_main_device_n_writes(
         disable_state_update=True,
     )
 
-    old_x = torch.zeros(batch, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_x = torch.randn(batch, 2, max_window, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
     old_dt = torch.randn(batch, 2, nheads, max_window, device=device, dtype=torch.float32)
     old_dA_cumsum = torch.randn(
@@ -886,11 +894,11 @@ def test_replay_selective_state_update_persistent_main_device_n_writes(
     )
     torch.testing.assert_close(_n_writes_check, n_writes)
 
-    old_x[:, :step1_T] = x1
     dt1_processed = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_processed, dim=1)
     for i in range(batch):
         buf = cache_buf_idx[i].item()
+        old_x[i, buf, :step1_T] = x1[i]
         old_B[i, buf, :step1_T] = B1[i]
         old_dt[i, buf, :, :step1_T] = dt1_processed[i].T
         old_dA_cumsum[i, buf, :, :step1_T] = dA_cumsum1[i].T
@@ -1012,8 +1020,8 @@ def test_replay_selective_state_update_philox(
         )
         state0_scales = None
 
-    # Cache tensors
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    # Cache tensors (old_x now double-buffered like the others)
+    old_x = torch.randn(cache_size, 2, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
     old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     old_dA_cumsum = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
@@ -1028,8 +1036,8 @@ def test_replay_selective_state_update_philox(
 
     prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
 
-    # max_window is old_x.shape[1] per the wrapper convention; the philox
-    # test sets old_x = (cache_size, T, ...) so max_window = T here.
+    # max_window is old_x.shape[2] per the wrapper convention (after dbuf);
+    # the philox test sets old_x's window axis = T, so max_window = T here.
     _max_window_philox = T
     _n_writes_philox, _replay_work_items_philox = _make_replay_work_items(
         prev_tokens, cache_buf_idx, T, _max_window_philox, batch,
@@ -1197,7 +1205,7 @@ def test_philox_rounding_unbiased(state_dtype):
         batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
 
-    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    old_x = torch.randn(batch, 2, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
     old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
     old_dA_cumsum = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
@@ -1211,7 +1219,7 @@ def test_philox_rounding_unbiased(state_dtype):
 
     prev_tokens = torch.full((batch,), T, device=device, dtype=torch.int32)
 
-    # max_window = old_x.shape[1] = T
+    # max_window = old_x.shape[2] = T (after dbuf at axis 1)
     _n_writes_unb, _replay_work_items_unb = _make_replay_work_items(
         prev_tokens, cache_buf_idx, T, T, batch, None, device,
     )
@@ -1401,12 +1409,12 @@ def test_replay_heads_per_block(
         disable_state_update=True,
     )
 
-    # Pre-fill cache buffers.  old_x is single-buffer (no dbuf dim); old_B,
-    # old_dt, old_dA_cumsum are double-buffered.  Initialize BOTH buffers
-    # with controlled random data so "outside write range / other buffer
-    # unchanged" assertions have well-defined expected values for both.
+    # Pre-fill cache buffers.  All four (old_x, old_B, old_dt, old_dA_cumsum)
+    # are double-buffered.  Initialize BOTH buffers with controlled random
+    # data so "outside write range / other buffer unchanged" assertions have
+    # well-defined expected values for both.
     old_x_init = torch.randn(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+        cache_size, 2, max_window, nheads, head_dim, device=device, dtype=dtype
     )
     old_B_init = torch.randn(
         cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
@@ -1426,9 +1434,9 @@ def test_replay_heads_per_block(
     dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    old_x_init[:] = x1  # single buffer
     for slot in range(cache_size):
         buf = int(cache_buf_idx[slot].item())
+        old_x_init[slot, buf] = x1[slot]
         old_B_init[slot, buf] = B1[slot]
         old_dt_init[slot, buf] = dt1_proc[slot].T            # (nheads, max_window)
         old_dA_cumsum_init[slot, buf] = dA_cumsum1[slot].T   # (nheads, max_window)
@@ -1594,16 +1602,16 @@ def test_replay_heads_per_block(
             write_offset = pnat
         write_end = write_offset + T
 
-        # ----- old_x (single-buffer) -----
+        # ----- old_x (double-buffer (cache, 2, max_window, nheads, dim)) -----
         expected_old_x_slot = old_x_pre[slot].clone()
-        expected_old_x_slot[write_offset:write_end] = x2[slot]
+        expected_old_x_slot[target_buf, write_offset:write_end] = x2[slot]
         torch.testing.assert_close(
             old_x_test[slot], expected_old_x_slot,
             rtol=0, atol=0,
             msg=(
                 f"old_x slot {slot} (PNAT={pnat}, is_write={is_write}, "
-                f"write_offset={write_offset}): mismatch "
-                f"(HPB={heads_per_block}, T={T}, nheads={nheads}, "
+                f"target_buf={target_buf}, write_offset={write_offset}): "
+                f"mismatch (HPB={heads_per_block}, T={T}, nheads={nheads}, "
                 f"ngroups={ngroups}, rect={rectangle_nowrite})"
             ),
         )
@@ -1788,7 +1796,7 @@ def test_replay_heads_per_block_multistep(
         ref_outs.append(out_step)
 
     test_state = state_init.clone()
-    old_x = torch.zeros(cache_size, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_x = torch.zeros(cache_size, 2, max_window, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.zeros(cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
     old_dt = torch.zeros(cache_size, 2, nheads, max_window, device=device, dtype=torch.float32)
     old_dA_cumsum = torch.zeros(cache_size, 2, nheads, max_window, device=device, dtype=torch.float32)
