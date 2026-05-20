@@ -512,6 +512,20 @@ class GenerationResultBase:
                     self._disaggregated_params.first_gen_log_probs = \
                         first_gen_lp
 
+                first_gen_cum_log_probs = getattr(
+                    response_result, "first_gen_cum_log_probs", None)
+                if first_gen_cum_log_probs is None:
+                    first_gen_cum_log_probs = getattr(response_result,
+                                                      "cum_log_probs", None)
+                if first_gen_cum_log_probs is None:
+                    first_gen_cum_log_probs = [
+                        out.cumulative_logprob for out in self._outputs
+                        if out.cumulative_logprob is not None
+                    ]
+                if first_gen_cum_log_probs:
+                    self._disaggregated_params.first_gen_cum_log_probs = \
+                        list(first_gen_cum_log_probs)
+
                 first_gen_logits = [
                     out.generation_logits for out in self._outputs
                     if out.generation_logits is not None

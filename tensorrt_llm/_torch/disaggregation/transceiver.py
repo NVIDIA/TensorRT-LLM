@@ -157,6 +157,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         token_range: Optional[TokenRange] = None,
         is_last_slice: bool = True,
     ) -> KVSlice:
+        logger.info(f"create_kv_slice: py_request_id={req.py_request_id}")
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
@@ -178,18 +179,35 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 groups.append(np.array([], dtype=np.int64))
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
+            logger.info(
+                f"create_kv_slice block_ids: py_request_id={req.py_request_id} "
+                f"group_idx={idx} shape={block_ids.shape} "
+                f"block_ids={block_ids.tolist()}")
             window_size = lg.sliding_window_size
+
+            beam_width = req.sampling_config.beam_width
+            if block_ids.ndim == 1:
+                block_ids_by_beam = block_ids.reshape(1, -1)
+            elif block_ids.ndim == 2:
+                block_ids_by_beam = block_ids
+            else:
+                raise ValueError(
+                    f"Expected 1-D or 2-D block ids, got shape {block_ids.shape}"
+                )
+            assert block_ids_by_beam.shape[0] == beam_width, (
+                f"Expected {beam_width} beam block-id rows, got "
+                f"{block_ids_by_beam.shape[0]}")
 
             if window_size is not None:
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 total_blocks = (req.prompt_len + tpb - 1) // tpb
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, total_blocks - stale_end)
-                if block_ids.size > expected_valid:
-                    block_ids = (
-                        block_ids[-expected_valid:]
+                if block_ids_by_beam.shape[1] > expected_valid:
+                    block_ids_by_beam = (
+                        block_ids_by_beam[:, -expected_valid:]
                         if expected_valid > 0
-                        else np.array([], dtype=np.int64)
+                        else np.empty((beam_width, 0), dtype=np.int64)
                     )
                 # Adapter contract: SWA cached_tokens >= stale_end*tpb (clamped).
                 cache_skip = cached_per_lg[idx] // tpb - stale_end
@@ -201,12 +219,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 cache_skip = cached_per_lg[idx] // tpb
 
             if cache_skip > 0:
-                block_ids = (
-                    block_ids[cache_skip:]
-                    if cache_skip < block_ids.size
-                    else np.array([], dtype=np.int64)
+                block_ids_by_beam = (
+                    block_ids_by_beam[:, cache_skip:]
+                    if cache_skip < block_ids_by_beam.shape[1]
+                    else np.empty((beam_width, 0), dtype=np.int64)
                 )
 
+            block_ids = (block_ids_by_beam[0]
+                         if beam_width == 1 else block_ids_by_beam)
+            logger.info(
+                f"create_kv_slice final block_ids: py_request_id={req.py_request_id} "
+                f"is_gen_only={is_gen_only} group_idx={idx} "
+                f"token_range={token_range} prompt_len={req.prompt_len} "
+                f"tokens_per_block={tpb} beam_width={beam_width} "
+                f"cache_skip={cache_skip} window_size={window_size} "
+                f"shape={block_ids.shape} block_ids={block_ids.tolist()}")
             groups.append(block_ids)
 
         mamba_state_index = None

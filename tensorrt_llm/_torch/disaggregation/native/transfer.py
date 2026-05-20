@@ -61,6 +61,14 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
 
+def _block_ids_debug_summary(block_ids_per_layer_groups: list[np.ndarray]) -> list[dict]:
+    return [{
+        "layer_group": idx,
+        "shape": tuple(arr.shape),
+        "block_ids": arr.tolist(),
+    } for idx, arr in enumerate(block_ids_per_layer_groups)]
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -83,9 +91,10 @@ class RecvReqInfo:
                 "sender_req_id": self.sender_req_id,
                 "instance_name": self.instance_name,
                 "instance_rank": self.instance_rank,
-                "block_ids_per_layer_groups": [
-                    arr.tobytes() for arr in self.block_ids_per_layer_groups
-                ],
+                "block_ids_per_layer_groups": [{
+                    "data": arr.tobytes(),
+                    "shape": arr.shape,
+                } for arr in self.block_ids_per_layer_groups],
                 "unique_rid": self.unique_rid,
                 "dst_start_token": self.dst_start_token,
                 "aux_slot": self.aux_slot,
@@ -97,9 +106,24 @@ class RecvReqInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
         d = msgpack.unpackb(data, raw=False)
-        d["block_ids_per_layer_groups"] = [
-            np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
-        ]
+        block_ids_per_layer_groups = []
+        for item in d["block_ids_per_layer_groups"]:
+            if isinstance(item, dict):
+                arr = np.frombuffer(item["data"], dtype=np.int64).copy()
+                block_ids_per_layer_groups.append(arr.reshape(item["shape"]))
+            else:
+                # Backward compatibility for pre-shape metadata, where each
+                # layer group was serialized as raw bytes for a 1-D array.
+                block_ids_per_layer_groups.append(
+                    np.frombuffer(item, dtype=np.int64).copy())
+        d["block_ids_per_layer_groups"] = block_ids_per_layer_groups
+        logger.info(
+            "RecvReqInfo.from_bytes: "
+            f"sender_req_id={d['sender_req_id']} unique_rid={d['unique_rid']} "
+            f"instance={d['instance_name']}:{d['instance_rank']} "
+            f"dst_start_token={d['dst_start_token']} slice_id={d['slice_id']} "
+            f"block_ids={_block_ids_debug_summary(block_ids_per_layer_groups)}"
+        )
         return cls(**d)
 
 
@@ -569,6 +593,14 @@ class Sender(SenderBase):
             )
 
     @staticmethod
+    def _as_beam_block_ids(block_ids: np.ndarray) -> np.ndarray:
+        if block_ids.ndim == 1:
+            return block_ids.reshape(1, -1)
+        if block_ids.ndim == 2:
+            return block_ids
+        raise ValueError(f"Expected 1-D or 2-D block ids, got shape {block_ids.shape}")
+
+    @staticmethod
     def _align_kv_blocks(
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
@@ -637,19 +669,39 @@ class Sender(SenderBase):
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 dst_block_ids = dst_block_ids_per_groups[peer_lg]
+                src_block_ids_by_beam = Sender._as_beam_block_ids(src_block_ids)
+                dst_block_ids_by_beam = Sender._as_beam_block_ids(dst_block_ids)
+                logger.info(
+                    "Sender._build_kv_write_meta input: "
+                    f"unique_rid={task._unique_rid} slice_id={task.slice_id} "
+                    f"self_lg={self_lg} peer_lg={peer_lg} "
+                    f"self_pool={self_pi} peer_pool={peer_pi} "
+                    f"token_range={task._slice.token_range} "
+                    f"src_shape={src_block_ids_by_beam.shape} "
+                    f"dst_shape={dst_block_ids_by_beam.shape} "
+                    f"src_block_ids={src_block_ids_by_beam.tolist()} "
+                    f"dst_block_ids={dst_block_ids_by_beam.tolist()}")
+                if src_block_ids_by_beam.shape[0] != dst_block_ids_by_beam.shape[0]:
+                    raise ValueError(
+                        f"src/dst beam count mismatch: "
+                        f"{src_block_ids_by_beam.shape[0]} vs "
+                        f"{dst_block_ids_by_beam.shape[0]}")
 
                 # Speculative decoding: generation may have one extra draft-token block.
-                block_diff = dst_block_ids.size - src_block_ids.size
+                block_diff = (dst_block_ids_by_beam.shape[1] -
+                              src_block_ids_by_beam.shape[1])
                 if block_diff == 1:
                     logger.debug(
                         f"Trimming 1 extra dst block for draft tokens: "
-                        f"src={src_block_ids.size}, dst={dst_block_ids.size}"
+                        f"src={src_block_ids_by_beam.shape}, "
+                        f"dst={dst_block_ids_by_beam.shape}"
                     )
-                    dst_block_ids = dst_block_ids[:-1]
+                    dst_block_ids_by_beam = dst_block_ids_by_beam[:, :-1]
                 elif block_diff > 1:
                     raise ValueError(
-                        f"src/dst block count mismatch: {src_block_ids.size} vs "
-                        f"{dst_block_ids.size} (expected diff <= 1)"
+                        f"src/dst block count mismatch: "
+                        f"{src_block_ids_by_beam.shape} vs "
+                        f"{dst_block_ids_by_beam.shape} (expected diff <= 1)"
                     )
                 tpb = extractor.page_table.tokens_per_block
                 token_range = task._slice.token_range
@@ -660,37 +712,75 @@ class Sender(SenderBase):
                 # is implicit in their size. token_start = (total_blocks - n) * tpb.
                 slice_end = token_range.end if token_range is not None else 0
                 total_blocks = (slice_end + tpb - 1) // tpb
-                assert src_block_ids.size <= total_blocks, (
-                    f"src block list ({src_block_ids.size}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                assert dst_block_ids.size <= total_blocks, (
-                    f"dst block list ({dst_block_ids.size}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                src_start = (total_blocks - src_block_ids.size) * tpb
-                dst_start = (total_blocks - dst_block_ids.size) * tpb
-                if req_info.dst_start_token is not None:
-                    dst_start = max(dst_start, req_info.dst_start_token)
-                if window_size is not None:
-                    # SWA stale_end uses the request prompt_len (not slice_end —
-                    # they differ for non-final slices). prompt_len must be plumbed
-                    # via the session; falling back to slice_end is wrong on
-                    # non-final slices.
-                    assert task._prompt_len is not None, (
-                        "SWA layer requires session.prompt_len; "
-                        "set TxSession(prompt_len=request.prompt_len)."
+                logger.info(
+                    "Sender._build_kv_write_meta range: "
+                    f"unique_rid={task._unique_rid} slice_id={task.slice_id} "
+                    f"self_lg={self_lg} peer_lg={peer_lg} "
+                    f"slice_end={slice_end} total_blocks={total_blocks} "
+                    f"tokens_per_block={tpb} window_size={window_size} "
+                    f"dst_start_token={req_info.dst_start_token} "
+                    f"prompt_len={task._prompt_len}")
+                src_aligned_parts: list[np.ndarray] = []
+                dst_aligned_parts: list[np.ndarray] = []
+                for beam_idx in range(src_block_ids_by_beam.shape[0]):
+                    src_beam_block_ids = src_block_ids_by_beam[beam_idx]
+                    dst_beam_block_ids = dst_block_ids_by_beam[beam_idx]
+                    assert src_beam_block_ids.size <= total_blocks, (
+                        f"src block list ({src_beam_block_ids.size}) exceeds "
+                        f"total slice blocks ({total_blocks}) for beam "
+                        f"{beam_idx}; slice_end={slice_end}, tpb={tpb}")
+                    assert dst_beam_block_ids.size <= total_blocks, (
+                        f"dst block list ({dst_beam_block_ids.size}) exceeds "
+                        f"total slice blocks ({total_blocks}) for beam "
+                        f"{beam_idx}; slice_end={slice_end}, tpb={tpb}")
+                    src_start = (total_blocks - src_beam_block_ids.size) * tpb
+                    dst_start = (total_blocks - dst_beam_block_ids.size) * tpb
+                    if req_info.dst_start_token is not None:
+                        dst_start = max(dst_start, req_info.dst_start_token)
+                    if window_size is not None:
+                        # SWA stale_end uses the request prompt_len (not slice_end;
+                        # they differ for non-final slices). prompt_len must be plumbed
+                        # via the session; falling back to slice_end is wrong on
+                        # non-final slices.
+                        assert task._prompt_len is not None, (
+                            "SWA layer requires session.prompt_len; "
+                            "set TxSession(prompt_len=request.prompt_len)."
+                        )
+                        stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
+                        src_start = max(stale_end * tpb, src_start)
+                        dst_start = max(stale_end * tpb, dst_start)
+                    src_aligned, dst_aligned = Sender._align_kv_blocks(
+                        src_beam_block_ids,
+                        dst_beam_block_ids,
+                        src_token_start=src_start,
+                        dst_token_start=dst_start,
+                        tokens_per_block=tpb,
                     )
-                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                    src_start = max(stale_end * tpb, src_start)
-                    dst_start = max(stale_end * tpb, dst_start)
-                src_block_ids, dst_block_ids = Sender._align_kv_blocks(
-                    src_block_ids,
-                    dst_block_ids,
-                    src_token_start=src_start,
-                    dst_token_start=dst_start,
-                    tokens_per_block=tpb,
-                )
+                    logger.info(
+                        "Sender._build_kv_write_meta aligned beam: "
+                        f"unique_rid={task._unique_rid} slice_id={task.slice_id} "
+                        f"beam_idx={beam_idx} src_start={src_start} "
+                        f"dst_start={dst_start} "
+                        f"src_beam_block_ids={src_beam_block_ids.tolist()} "
+                        f"dst_beam_block_ids={dst_beam_block_ids.tolist()} "
+                        f"src_aligned={src_aligned.tolist()} "
+                        f"dst_aligned={dst_aligned.tolist()}")
+                    if src_aligned.size > 0:
+                        src_aligned_parts.append(src_aligned)
+                        dst_aligned_parts.append(dst_aligned)
+
+                if src_aligned_parts:
+                    src_block_ids = np.concatenate(src_aligned_parts)
+                    dst_block_ids = np.concatenate(dst_aligned_parts)
+                else:
+                    src_block_ids = np.array([], dtype=np.int64)
+                    dst_block_ids = np.array([], dtype=np.int64)
+                logger.info(
+                    "Sender._build_kv_write_meta final flattened: "
+                    f"unique_rid={task._unique_rid} slice_id={task.slice_id} "
+                    f"self_lg={self_lg} peer_lg={peer_lg} "
+                    f"src_block_ids={src_block_ids.tolist()} "
+                    f"dst_block_ids={dst_block_ids.tolist()}")
 
                 src_region = extractor.extract(
                     src_block_ids, layer_group_id=self_lg, pool_idx=self_pi
@@ -702,6 +792,13 @@ class Sender(SenderBase):
                 region_pair = mapper.map(src_region, dst_region)
                 region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
                 for rp in region_pairs:
+                    logger.info(
+                        "Sender._build_kv_write_meta region pair: "
+                        f"unique_rid={task._unique_rid} slice_id={task.slice_id} "
+                        f"self_lg={self_lg} peer_lg={peer_lg} "
+                        f"src_ptr_count={rp.src.memory.ptrs.size} "
+                        f"dst_ptr_count={rp.dst.memory.ptrs.size} "
+                        f"bytes_per_region={rp.src.memory.bytes_per_region}")
                     src_frag_parts.append(rp.src.memory.ptrs)
                     dst_frag_parts.append(rp.dst.memory.ptrs)
                     size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
@@ -1309,7 +1406,7 @@ class Receiver(ReceiverBase):
         )
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
         # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
-        return RecvReqInfo(
+        req_info = RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
@@ -1320,6 +1417,15 @@ class Receiver(ReceiverBase):
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
         )
+        token_range = task._kv_slice.token_range
+        logger.info(
+            "Receiver._build_recv_req_info: "
+            f"unique_rid={task._unique_rid} ctx_request_id={task._params.ctx_request_id} "
+            f"slice_id={task.slice_id} token_range={token_range} "
+            f"aux_slot={task._aux_slot} "
+            f"block_ids={_block_ids_debug_summary(req_info.block_ids_per_layer_groups)}"
+        )
+        return req_info
 
     def dispatch_task(self, task: KVRecvTask):
         params = task._params

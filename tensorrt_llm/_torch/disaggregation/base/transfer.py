@@ -61,7 +61,7 @@ class KVSlice:
     layer_range: Optional[LayerRange] = None
     block_ids_per_layer_groups: List[np.ndarray] = field(
         default_factory=list
-    )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
+    )  # Physical block IDs per layer group, shape [blocks] or [beams, blocks].
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
 

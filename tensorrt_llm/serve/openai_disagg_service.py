@@ -340,6 +340,20 @@ class OpenAIDisaggregatedService(OpenAIService):
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.conversation_id = conversation_id
+            logger.info(
+                "_get_gen_request from ctx_response: "
+                f"disagg_request_id={disagg_request_id} "
+                f"num_choices={len(ctx_response.choices)} "
+                f"n={getattr(request, 'n', None)} "
+                f"best_of={getattr(request, 'best_of', None)} "
+                f"use_beam_search={getattr(request, 'use_beam_search', None)} "
+                f"first_gen_tokens={request.disaggregated_params.first_gen_tokens} "
+                f"first_gen_cum_log_probs="
+                f"{request.disaggregated_params.first_gen_cum_log_probs} "
+                f"ctx_request_id={request.disaggregated_params.ctx_request_id} "
+                f"ctx_dp_rank={request.disaggregated_params.ctx_dp_rank} "
+                f"ctx_info_endpoint={request.disaggregated_params.ctx_info_endpoint}"
+            )
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
@@ -354,6 +368,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                 schedule_style=self._schedule_style,
                 conversation_id=conversation_id,
             )
+            logger.info(
+                "_get_gen_request without ctx_response: "
+                f"disagg_request_id={disagg_request_id} "
+                f"n={getattr(request, 'n', None)} "
+                f"best_of={getattr(request, 'best_of', None)} "
+                f"use_beam_search={getattr(request, 'use_beam_search', None)}")
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
             if disaggregated_params:
@@ -506,11 +526,18 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
+        logger.info("_verify_ctx_response")
         if ctx_response:
-            if len(ctx_response.choices) != 1:
-                raise ValueError(
-                    f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
-                )
+            logger.info("ctx_response is not None")
+            # if len(ctx_response.choices) != 1:
+            #     raise ValueError(
+            #         f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
+            #     )
+            for idx, choice in enumerate(ctx_response.choices):
+                if choice.disaggregated_params is not None:
+                    logger.info(f"Choice {idx} first_gen_tokens: {choice.disaggregated_params.first_gen_tokens}")
+                else:
+                    logger.info(f"Choice {idx} no disaggregated params")
             choice = ctx_response.choices[0]
             if choice.disaggregated_params is None:
                 raise ValueError(

@@ -1,0 +1,8 @@
+disable_overlap_scheduler: True
+max_beam_width: 4
+kv_cache_config:
+  use_kv_cache_manager_v2: false
+cache_transceiver_config:
+  backend: NIXL
+  max_tokens_in_buffer: 2048
+  transceiver_runtime: PYTHON

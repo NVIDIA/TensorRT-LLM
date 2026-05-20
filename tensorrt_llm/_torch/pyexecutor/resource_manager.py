@@ -93,6 +93,18 @@ def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
 
 
+def compute_block_token_counts(num_tokens: int, tokens_per_block: int,
+                               num_blocks: int) -> List[int]:
+    """Token count per KV block (all full except possibly the last)."""
+    if num_blocks <= 0:
+        return []
+    if num_tokens <= 0:
+        return [0] * num_blocks
+    counts = [tokens_per_block] * (num_blocks - 1)
+    counts.append(num_tokens - (num_blocks - 1) * tokens_per_block)
+    return counts
+
+
 class BaseResourceManager(ABC):
 
     @abstractmethod
@@ -1185,7 +1197,9 @@ class KVCacheManager(BaseResourceManager):
         self,
         request_ids: List[int],
         layer_idx: Optional[int] = None,
+        beam_width: Optional[int] = 1,
     ) -> List[List[int]]:
+        beam_width = beam_width or 1
         if layer_idx is None:
             if len(self.max_attention_window_vec) > 1:
                 raise ValueError("layer_idx must be provided for VSWA")
@@ -1196,9 +1210,68 @@ class KVCacheManager(BaseResourceManager):
                 self.max_attention_window_vec)]
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
+        tpb = self.tokens_per_block
+        token_layout = []
+        for req_id, req_blocks in zip(request_ids, result):
+            num_tokens = self.impl.get_token_count(req_id)
+            beam_layout = []
+            for beam_blocks in req_blocks:
+                num_blocks = len(beam_blocks)
+                beam_layout.append({
+                    "block_ids": beam_blocks,
+                    "num_tokens": num_tokens,
+                    "tokens_per_block": tpb,
+                    "tokens_in_each_block":
+                    compute_block_token_counts(num_tokens, tpb, num_blocks),
+                })
+            token_layout.append({
+                "request_id": req_id,
+                "sequence_num_tokens": num_tokens,
+                "beams": beam_layout,
+            })
+        logger.info(
+            f"get_batch_cache_indices raw block_ids: request_ids={request_ids} "
+            f"layer_idx={layer_idx} window_size={window_size} "
+            f"beam_width={beam_width} tokens_per_block={tpb} "
+            f"result={result} token_layout={token_layout}")
         for i in range(len(result)):
-            assert (len(result[i])) == 1
-            result[i] = result[i][0]
+            # Materialize the CacheBlockIds (a nanobind-bound opaque
+            # std::vector<std::vector<int>>) into nested Python lists.
+            # Indexing the bound type returns copies of the inner vectors.
+            beams = [list(beam) for beam in result[i]]
+            assert len(beams) == beam_width, (
+                f"Expected {beam_width} index arrays per request, got {len(beams)}"
+            )
+            result[i] = beams[0] if beam_width == 1 else beams
+        shaped_layout = []
+        for req_id, shaped_blocks in zip(request_ids, result):
+            num_tokens = self.impl.get_token_count(req_id)
+            if beam_width == 1:
+                block_layout = {
+                    "block_ids":
+                    shaped_blocks,
+                    "tokens_in_each_block":
+                    compute_block_token_counts(num_tokens, tpb,
+                                               len(shaped_blocks)),
+                }
+            else:
+                block_layout = [{
+                    "block_ids":
+                    beam_blocks,
+                    "tokens_in_each_block":
+                    compute_block_token_counts(num_tokens, tpb,
+                                               len(beam_blocks)),
+                } for beam_blocks in shaped_blocks]
+            shaped_layout.append({
+                "request_id": req_id,
+                "sequence_num_tokens": num_tokens,
+                "tokens_per_block": tpb,
+                "block_layout": block_layout,
+            })
+        logger.info(
+            f"get_batch_cache_indices shaped block_ids: "
+            f"request_ids={request_ids} result={result} "
+            f"token_layout={shaped_layout}")
         return result
 
     def get_num_free_blocks(self) -> int:

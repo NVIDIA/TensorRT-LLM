@@ -128,6 +128,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
     first_gen_tokens: Optional[List[int]] = None
     first_gen_log_probs: Optional[List] = None
+    first_gen_cum_log_probs: Optional[List[float]] = None
     first_gen_logits: Optional[List] = None
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
@@ -1233,6 +1234,7 @@ def to_disaggregated_params(
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
         first_gen_log_probs=_serialize_first_gen_log_probs(
             tllm_disagg_params.first_gen_log_probs),
+        first_gen_cum_log_probs=tllm_disagg_params.first_gen_cum_log_probs,
         first_gen_logits=_serialize_first_gen_logits(
             tllm_disagg_params.first_gen_logits),
         ctx_request_id=tllm_disagg_params.ctx_request_id,
@@ -1255,6 +1257,7 @@ def to_llm_disaggregated_params(
         first_gen_tokens=disaggregated_params.first_gen_tokens,
         first_gen_log_probs=_deserialize_first_gen_log_probs(
             disaggregated_params.first_gen_log_probs),
+        first_gen_cum_log_probs=disaggregated_params.first_gen_cum_log_probs,
         first_gen_logits=_deserialize_first_gen_logits(
             disaggregated_params.first_gen_logits),
         ctx_request_id=disaggregated_params.ctx_request_id,

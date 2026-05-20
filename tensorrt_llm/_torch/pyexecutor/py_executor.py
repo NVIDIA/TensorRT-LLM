@@ -1658,9 +1658,9 @@ class PyExecutor:
                         for req in self.active_requests)
                     if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
                         if not all_gen_first:
-                            logger.warning(
-                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                            )
+                            # logger.warning(
+                            #     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                            # )
                             self._check_disagg_ctx_cache_transfer_status(1)
                         elif self.async_transfer_manager.has_any_inflight_requests(
                         ):
@@ -2203,9 +2203,9 @@ class PyExecutor:
                 for req in self.active_requests)
             if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
                 if not all_gen_first:
-                    logger.warning(
-                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                    )
+                    # logger.warning(
+                    #     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                    # )
                     self._check_disagg_ctx_cache_transfer_status(1)
                 elif self.async_transfer_manager.has_any_inflight_requests():
                     # Non-blocking cleanup of completed/timed-out transfers
@@ -3568,10 +3568,86 @@ class PyExecutor:
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
+                logger.info(
+                    "disagg generation transfer complete: "
+                    f"request_id={req.py_request_id} beam_width={beam_width} "
+                    f"first_gen_tokens={first_gen_tokens} "
+                    f"first_gen_cum_log_probs="
+                    f"{getattr(getattr(req, 'py_disaggregated_params', None), 'first_gen_cum_log_probs', None)} "
+                    f"draft_tokens={req.py_draft_tokens} "
+                    f"ctx_request_id={req.context_phase_params.req_id} "
+                    f"tokens_before="
+                    f"{self._debug_request_tokens(req, beam_width)}"
+                )
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
+                self._seed_disagg_beam_cum_log_probs(req, beam_width)
+                logger.info(
+                    "disagg generation first tokens appended: "
+                    f"request_id={req.py_request_id} "
+                    f"tokens_after="
+                    f"{self._debug_request_tokens(req, beam_width)}"
+                )
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+
+    @staticmethod
+    def _debug_request_tokens(req, beam_width, max_tokens=16):
+        return [{
+            "beam": beam,
+            "num_tokens": len(tokens),
+            "tail": tokens[-max_tokens:],
+        } for beam in range(beam_width)
+                for tokens in [list(req.get_tokens(beam))]]
+
+    def _seed_disagg_beam_cum_log_probs(self, req, beam_width):
+        """Seed gen-side beam scores from context-side first-token scores."""
+        if beam_width <= 1:
+            return
+
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return
+
+        first_gen_cum_log_probs = getattr(disagg_params,
+                                          'first_gen_cum_log_probs', None)
+        if first_gen_cum_log_probs is None:
+            logger.warning(
+                "No first_gen_cum_log_probs available for disagg beam "
+                f"request {req.py_request_id}; beam scores remain reset.")
+            return
+
+        if len(first_gen_cum_log_probs) != beam_width:
+            logger.warning(
+                "Invalid first_gen_cum_log_probs length for disagg beam "
+                f"request {req.py_request_id}: "
+                f"{len(first_gen_cum_log_probs)} != {beam_width}")
+            return
+
+        seq_slot = req.py_seq_slot
+        if seq_slot is None:
+            logger.warning(
+                "Cannot seed disagg beam scores for request "
+                f"{req.py_request_id}: seq slot is not assigned.")
+            return
+
+        sampler_store = getattr(self.sampler, 'store', None)
+        beam_search_store = getattr(sampler_store, 'beam_search_store', None)
+        if beam_search_store is None:
+            logger.warning(
+                "Cannot seed disagg beam scores for request "
+                f"{req.py_request_id}: sampler has no beam search store.")
+            return
+
+        cum_log_probs = beam_search_store.cum_log_probs
+        values = torch.tensor(first_gen_cum_log_probs,
+                              device=cum_log_probs.device,
+                              dtype=cum_log_probs.dtype)
+        cum_log_probs[seq_slot, :beam_width].copy_(values)
+        logger.info(
+            "Seeded disagg generation beam cum_log_probs: "
+            f"request_id={req.py_request_id} seq_slot={seq_slot} "
+            f"first_gen_cum_log_probs={first_gen_cum_log_probs}")
 
     def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
         """Prepend logprobs and generation logits for first_gen_tokens

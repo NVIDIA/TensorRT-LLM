@@ -103,8 +103,11 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         first_layer = get_global_layer_ids(lg)[0]
+        beam_width = req.sampling_config.beam_width
         return np.asarray(
-            self._mgr.get_batch_cache_indices([req.py_request_id], layer_idx=first_layer)[0],
+            self._mgr.get_batch_cache_indices(
+                [req.py_request_id], layer_idx=first_layer, beam_width=beam_width
+            )[0],
             dtype=np.int64,
         )
 
@@ -138,12 +141,16 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         return (kv_cache.num_committed_tokens // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
-        return np.fromiter(
+        block_ids = np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
             ),
             dtype=np.int64,
         )
+        beam_width = req.sampling_config.beam_width
+        if beam_width <= 1:
+            return block_ids
+        return np.tile(block_ids, (beam_width, 1))
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:

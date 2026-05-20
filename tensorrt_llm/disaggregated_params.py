@@ -31,6 +31,8 @@ class DisaggregatedParams:
          as underlying request id.
         first_gen_log_probs (List): The logprobs for first_gen_tokens, produced during prefill.
          Each entry is a list (one per beam) of TokenLogprobs (list of dict[int, Logprob]).
+        first_gen_cum_log_probs (List[float]): Cumulative beam scores after first_gen_tokens,
+         produced during prefill.
         first_gen_logits (List): The generation logits for first_gen_tokens, produced during prefill.
          Each entry is a torch.Tensor of shape [num_tokens, vocab_size] (one per beam/sequence).
 
@@ -42,6 +44,7 @@ class DisaggregatedParams:
     # P-D Disaggregated Params
     first_gen_tokens: Optional[List[int]] = None
     first_gen_log_probs: Optional[List] = None
+    first_gen_cum_log_probs: Optional[List[float]] = None
     first_gen_logits: Optional[List] = None
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None

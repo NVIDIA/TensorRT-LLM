@@ -37,6 +37,7 @@ from typing import (
 import numpy as np
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
     MakeDecodingBatchInputOutput,
 )
@@ -113,6 +114,87 @@ if TYPE_CHECKING:
     _ConfigType = TypeVar("_ConfigType", bound=PretrainedConfig)
 
 T = TypeVar("T")
+
+
+def _debug_tensor_slice(
+    tensor: torch.Tensor,
+    indices: torch.Tensor | None = None,
+    dim: int = 0,
+):
+    try:
+        view = (
+            tensor.index_select(dim, indices.to(tensor.device).long())
+            if indices is not None
+            else tensor
+        )
+        return view.detach().cpu().tolist()
+    except (RuntimeError, TypeError, ValueError) as err:
+        return f"<unavailable: {err}>"
+
+
+def _debug_new_tokens_host(
+    new_tokens_host: torch.Tensor,
+    seq_slots: torch.Tensor,
+    req_num_generated_tokens: torch.Tensor,
+):
+    try:
+        new_tokens = new_tokens_host.tolist()
+        seq_slots_host = seq_slots.detach().cpu().tolist()
+        req_num_generated_tokens_host = req_num_generated_tokens.detach().cpu().tolist()
+        return [
+            {
+                "seq_slot": seq_slot,
+                "tokens": [
+                    new_tokens[step][seq_slot]
+                    for step in range(req_num_generated_tokens_host[req_idx])
+                ],
+            }
+            for req_idx, seq_slot in enumerate(seq_slots_host)
+        ]
+    except (RuntimeError, TypeError, ValueError, IndexError) as err:
+        return f"<unavailable: {err}>"
+
+
+def _debug_cache_indirection_prefix(
+    cache_indirection: torch.Tensor,
+    seq_slots: torch.Tensor,
+    prefix_lens: torch.Tensor | int,
+    max_positions: int = 16,
+):
+    try:
+        seq_slots_host = seq_slots.detach().cpu().tolist()
+        if isinstance(prefix_lens, int):
+            prefix_lens_host = [prefix_lens] * len(seq_slots_host)
+        else:
+            prefix_lens_host = prefix_lens.detach().cpu().tolist()
+
+        result = []
+        for req_idx, seq_slot in enumerate(seq_slots_host):
+            prefix_len = int(prefix_lens_host[req_idx])
+            start = max(0, prefix_len - max_positions)
+            values = cache_indirection[
+                seq_slot, :, start:prefix_len
+            ].detach().cpu().tolist()
+            result.append({
+                "seq_slot": seq_slot,
+                "prefix_len": prefix_len,
+                "shown_range": [start, prefix_len],
+                "values": values,
+            })
+        return result
+    except (RuntimeError, TypeError, ValueError, IndexError) as err:
+        return f"<unavailable: {err}>"
+
+
+def _debug_batch_next_tokens(
+    batch_next_tokens: torch.Tensor,
+    batch_req_indices: torch.Tensor,
+):
+    try:
+        valid_rows = batch_req_indices.numel()
+        return batch_next_tokens[:valid_rows].detach().cpu().tolist()
+    except (RuntimeError, TypeError, ValueError, IndexError) as err:
+        return f"<unavailable: {err}>"
 
 
 @dataclass(kw_only=True)
@@ -2801,6 +2883,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         ``seq_slots_long`` must be int64 (required by ``index_fill_``).
         """
+        logger.info(
+            "TorchSampler._prepare_beam_search before reset: "
+            f"seq_slots={_debug_tensor_slice(seq_slots_long)} "
+            f"max_prompt_len={max_prompt_len} "
+            f"cum_log_probs={_debug_tensor_slice(beam_search_store.cum_log_probs, seq_slots_long)} "
+            f"cache_indirection_prefix="
+            f"{_debug_cache_indirection_prefix(beam_search_store.cache_indirection, seq_slots_long, max_prompt_len)} "
+            f"cache_indirection_buffer_prefix="
+            f"{_debug_cache_indirection_prefix(beam_search_store.cache_indirection_buffer, seq_slots_long, max_prompt_len)} "
+            f"predecessor_beams={_debug_tensor_slice(beam_search_store.predecessor_beams, seq_slots_long)}"
+        )
         beam_search_store.cache_indirection.narrow(2, 0, max_prompt_len).index_fill_(
             0, seq_slots_long, 0
         )
@@ -2812,6 +2905,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             0, seq_slots_long, FinishReason.NOT_FINISHED.value
         )
         beam_search_store.original_tokens.index_fill_(0, seq_slots_long, 0)
+        logger.info(
+            "TorchSampler._prepare_beam_search after reset: "
+            f"seq_slots={_debug_tensor_slice(seq_slots_long)} "
+            f"cum_log_probs={_debug_tensor_slice(beam_search_store.cum_log_probs, seq_slots_long)} "
+            f"cache_indirection_prefix="
+            f"{_debug_cache_indirection_prefix(beam_search_store.cache_indirection, seq_slots_long, max_prompt_len)} "
+            f"cache_indirection_buffer_prefix="
+            f"{_debug_cache_indirection_prefix(beam_search_store.cache_indirection_buffer, seq_slots_long, max_prompt_len)} "
+            f"predecessor_beams={_debug_tensor_slice(beam_search_store.predecessor_beams, seq_slots_long)} "
+            f"first_finish_reasons={_debug_tensor_slice(beam_search_store.first_finish_reasons, seq_slots_long)}"
+        )
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
@@ -3224,6 +3328,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     seq_offsets=beam_search_store.seq_offsets,
                     beam_idx_arange=beam_search_store.beam_idx_arange,
                 )
+                logger.info(
+                    "TorchSampler._add_metadata_to_grouped_requests beam metadata: "
+                    f"group_indices={_debug_tensor_slice(value.indices)} "
+                    f"seq_slots={_debug_tensor_slice(metadata.seq_slots)} "
+                    f"seq_lens={_debug_tensor_slice(metadata.seq_lens)} "
+                    f"cum_log_probs={_debug_tensor_slice(metadata.cum_log_probs, metadata.seq_slots)} "
+                    f"cache_indirection_prefix="
+                    f"{_debug_cache_indirection_prefix(metadata.cache_indirection, metadata.seq_slots, metadata.seq_lens)} "
+                    f"cache_indirection_buffer_prefix="
+                    f"{_debug_cache_indirection_prefix(metadata.cache_indirection_buffer, metadata.seq_slots, metadata.seq_lens)} "
+                    f"predecessor_beams={_debug_tensor_slice(metadata.predecessor_beams, metadata.seq_slots)} "
+                    f"finished_beams={_debug_tensor_slice(metadata.finished_beams, metadata.seq_slots)}"
+                )
             elif metadata_type is None:
                 metadata = None
             else:
@@ -3324,7 +3441,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 continue
 
             if req.sampling_config.beam_width > 1:
+                logger.info(
+                    "TorchSampler.update_requests beam before append: "
+                    f"request_id={req.py_request_id} req_idx={req_idx} "
+                    f"seq_slot={req.py_seq_slot} "
+                    f"beam_width={req.sampling_config.beam_width} "
+                    f"py_decoding_iter={req.py_decoding_iter} "
+                    f"new_tokens_for_slot="
+                    f"{new_tokens_list[0][req.py_seq_slot] if req.py_seq_slot is not None else None} "
+                    f"tokens_before="
+                    f"{[list(req.get_tokens(beam_idx)) for beam_idx in range(req.sampling_config.beam_width)]}"
+                )
                 if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
+                    logger.info(
+                        "TorchSampler.update_requests beam_history available: "
+                        f"request_id={req.py_request_id} "
+                        f"beam_width={req.sampling_config.beam_width}")
                     self._finalize_beam(req, beam_history)
                 else:
                     for beam_idx in range(req.sampling_config.beam_width):
@@ -3335,6 +3467,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 assert first_finish_reasons_host is not None
                 self._handle_first_finish_reasons(
                     req, first_finish_reasons_host, first_finish_reasons
+                )
+                if req.is_context_only_request:
+                    beam_search_store = self.store.beam_search_store
+                    assert beam_search_store is not None
+                    assert req.py_seq_slot is not None
+                    first_gen_cum_log_probs = beam_search_store.cum_log_probs[
+                        req.py_seq_slot, :req.sampling_config.beam_width
+                    ].detach().cpu().tolist()
+                    req.py_result.set_first_gen_cum_log_probs(
+                        first_gen_cum_log_probs)
+                    logger.info(
+                        "TorchSampler.update_requests stored first_gen_cum_log_probs: "
+                        f"request_id={req.py_request_id} "
+                        f"first_gen_cum_log_probs={first_gen_cum_log_probs}")
+                logger.info(
+                    "TorchSampler.update_requests beam after append: "
+                    f"request_id={req.py_request_id} "
+                    f"py_decoding_iter={req.py_decoding_iter} "
+                    f"tokens_after="
+                    f"{[list(req.get_tokens(beam_idx)) for beam_idx in range(req.sampling_config.beam_width)]} "
+                    f"first_finish_reasons={first_finish_reasons[req.py_seq_slot] if req.py_seq_slot is not None else None}"
                 )
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
@@ -3778,6 +3931,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # if no beam search is used, the shape is (batch_size,), so we need to unsqueeze it to (batch_size, 1)
             if group_next_tokens_cuda.dim() == 1:
                 group_next_tokens_cuda = group_next_tokens_cuda.unsqueeze(1)
+            if isinstance(group_metadata, BeamSearchMetadata):
+                logger.info(
+                    "TorchSampler._sample_batched_by_strategy beam group: "
+                    f"strategy={strategy_key} "
+                    f"group_req_indices={_debug_tensor_slice(group_req_indices)} "
+                    f"seq_slots={_debug_tensor_slice(group_metadata.seq_slots)} "
+                    f"seq_lens={_debug_tensor_slice(group_metadata.seq_lens)} "
+                    f"next_tokens={_debug_tensor_slice(group_next_tokens_cuda)} "
+                    f"cum_log_probs={_debug_tensor_slice(group_metadata.cum_log_probs, group_metadata.seq_slots)} "
+                    f"new_log_probs={_debug_tensor_slice(group_metadata.new_log_probs, group_metadata.seq_slots)} "
+                    f"cache_indirection_prefix="
+                    f"{_debug_cache_indirection_prefix(group_metadata.cache_indirection, group_metadata.seq_slots, group_metadata.seq_lens)} "
+                    f"cache_indirection_buffer_prefix="
+                    f"{_debug_cache_indirection_prefix(group_metadata.cache_indirection_buffer, group_metadata.seq_slots, group_metadata.seq_lens)} "
+                    f"predecessor_beams={_debug_tensor_slice(group_metadata.predecessor_beams, group_metadata.seq_slots)} "
+                    f"finished_beams={_debug_tensor_slice(group_metadata.finished_beams, group_metadata.seq_slots)}"
+                )
             batch_next_tokens_cuda_int[
                 batch_next_tokens_offset_start:batch_next_tokens_offset_end
             ].copy_(group_next_tokens_cuda, non_blocking=True)
@@ -3858,6 +4028,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #     they currently need to be handled within TorchSampler.
         if needs_d2t:
             self._apply_d2t(batch_next_tokens_cuda_int, model_outputs)
+        if self._use_beam_search:
+            logger.info(
+                "TorchSampler._sample_batched_by_strategy batch result: "
+                f"batch_req_indices={_debug_tensor_slice(batch_req_indices)} "
+                f"batch_next_tokens="
+                f"{_debug_batch_next_tokens(batch_next_tokens_cuda_int, batch_req_indices)}"
+            )
 
         return _BatchedSamplingResult(
             batch_req_indices=batch_req_indices,
@@ -3906,6 +4083,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             0, batch_dest_indices_1d_cuda, batch_next_tokens_cuda_int
         )
         new_tokens_host = self._copy_to_host(new_tokens_cuda)
+        if self._use_beam_search:
+            logger.info(
+                "TorchSampler._unbatch_sampling_results: "
+                f"batch_req_indices={_debug_tensor_slice(batch_req_indices)} "
+                f"seq_slots={_debug_tensor_slice(seq_slots)} "
+                f"req_num_generated_tokens={_debug_tensor_slice(req_num_generated_tokens)} "
+                f"batch_next_tokens="
+                f"{_debug_batch_next_tokens(batch_next_tokens_cuda_int, batch_req_indices)} "
+                f"new_tokens_active="
+                f"{_debug_new_tokens_host(new_tokens_host, seq_slots, req_num_generated_tokens)}"
+            )
 
         return new_tokens_host
 
