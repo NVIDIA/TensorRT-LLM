@@ -18,6 +18,9 @@ from torch.export import Dim
 from transformers.activations import ACT2FN
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_backend_attention import (
+    TorchBackendAttention,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
     ADGemma4ImageProcessor,
@@ -149,6 +152,117 @@ def _small_dense_text_config() -> Gemma4TextConfig:
         num_kv_shared_layers=0,
         use_double_wide_mlp=False,
         use_bidirectional_attention="vision",
+        rope_parameters={
+            "full_attention": {
+                "rope_type": "proportional",
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+            },
+        },
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+        tie_word_embeddings=True,
+    )
+    config._attn_implementation = "eager"
+    return config
+
+
+def _shared_kv_text_config() -> Gemma4TextConfig:
+    config = Gemma4TextConfig(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=32,
+        hidden_activation="gelu_pytorch_tanh",
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        attention_bias=False,
+        attention_dropout=0.0,
+        attention_k_eq_v=True,
+        sliding_window=16,
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        enable_moe_block=False,
+        num_experts=None,
+        top_k_experts=None,
+        expert_intermediate_size=None,
+        final_logit_softcapping=30.0,
+        hidden_size_per_layer_input=0,
+        num_kv_shared_layers=2,
+        use_double_wide_mlp=False,
+        use_bidirectional_attention="vision",
+        rope_parameters={
+            "full_attention": {
+                "rope_type": "proportional",
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+            },
+        },
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+        tie_word_embeddings=True,
+    )
+    config._attn_implementation = "eager"
+    return config
+
+
+def _small_e2b_text_config() -> Gemma4TextConfig:
+    config = Gemma4TextConfig(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        num_global_key_value_heads=None,
+        head_dim=16,
+        global_head_dim=32,
+        hidden_activation="gelu_pytorch_tanh",
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        attention_bias=False,
+        attention_dropout=0.0,
+        attention_k_eq_v=False,
+        sliding_window=16,
+        layer_types=[
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        enable_moe_block=False,
+        num_experts=None,
+        top_k_experts=None,
+        expert_intermediate_size=None,
+        final_logit_softcapping=30.0,
+        hidden_size_per_layer_input=8,
+        num_kv_shared_layers=2,
+        use_double_wide_mlp=True,
+        use_bidirectional_attention=None,
+        vocab_size_per_layer_input=256,
         rope_parameters={
             "full_attention": {
                 "rope_type": "proportional",
@@ -703,6 +817,87 @@ def test_conditional_generation_wrapper():
     assert out.logits is not None
     assert out.logits.shape == (B, S, config.text_config.vocab_size)
     assert torch.isfinite(out.logits).all()
+
+
+def test_shared_kv_layer_metadata_matches_config():
+    model = Gemma4ForCausalLM(_shared_kv_text_config())
+    layer_expectations = [
+        (False, None),
+        (False, None),
+        (False, None),
+        (False, None),
+        (True, 2),
+        (True, 3),
+    ]
+
+    for layer, (is_shared, source_idx) in zip(model.model.layers, layer_expectations, strict=True):
+        assert layer.self_attn.is_kv_shared_layer is is_shared
+        assert layer.self_attn.kv_shared_layer_index == source_idx
+
+
+def test_export_uses_shared_kv_attention_for_shared_layers():
+    config = _shared_kv_text_config()
+    model = Gemma4ForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    position_ids = _position_ids(1, 4, "cpu")
+
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+    )
+
+    attn_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
+    attn_nodes = [
+        node for node in attn_nodes if node.target == torch.ops.auto_deploy.torch_attention.default
+    ]
+    regular_nodes = [
+        node
+        for node in attn_nodes
+        if TorchBackendAttention.get_shared_kv_source_layer_idx(node) is None
+    ]
+    shared_nodes = [
+        node
+        for node in attn_nodes
+        if TorchBackendAttention.get_shared_kv_source_layer_idx(node) is not None
+    ]
+
+    assert len(attn_nodes) == config.num_hidden_layers
+    assert len(regular_nodes) == config.num_hidden_layers - config.num_kv_shared_layers
+    assert len(shared_nodes) == config.num_kv_shared_layers
+    assert [TorchBackendAttention.get_layer_idx(regular) for regular in regular_nodes] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert [TorchBackendAttention.get_layer_idx(shared) for shared in shared_nodes] == [4, 5]
+    assert [
+        TorchBackendAttention.get_shared_kv_source_layer_idx(shared) for shared in shared_nodes
+    ] == [2, 3]
+
+
+def test_shared_kv_eager_layers_ignore_local_kv_weights():
+    device, dtype = _device_and_dtype()
+    config = _shared_kv_text_config()
+    model = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    input_ids = torch.randint(0, config.vocab_size, (1, 6), device=device)
+    position_ids = _position_ids(1, 6, device)
+
+    with torch.no_grad():
+        baseline = model(input_ids=input_ids, position_ids=position_ids).logits
+
+        shared_layer = model.model.layers[4].self_attn
+        assert shared_layer.is_kv_shared_layer
+        shared_layer.k_proj.weight.zero_()
+        if shared_layer.v_proj is not None:
+            shared_layer.v_proj.weight.zero_()
+        shared_layer.k_norm.weight.zero_()
+
+        perturbed = model(input_ids=input_ids, position_ids=position_ids).logits
+
+    torch.testing.assert_close(perturbed, baseline, rtol=1e-4, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -1656,3 +1851,181 @@ def test_gemma4_text_export_uses_semantic_multimodal_mask():
     if attention_mask_arg is None and len(attention_nodes[0].args) > 3:
         attention_mask_arg = attention_nodes[0].args[3]
     assert attention_mask_arg is semantic_nodes[0]
+
+
+def test_e2b_like_full_attention_uses_distinct_v_proj():
+    config = _small_e2b_text_config()
+    full_layer_idx = 3
+    attn = Gemma4TextAttention(config, full_layer_idx)
+
+    assert not attn.is_sliding
+    assert not attn.use_k_eq_v
+    assert attn.v_proj is not None
+    assert attn.head_dim == config.global_head_dim
+    assert attn.num_kv_heads == config.num_key_value_heads
+
+
+def test_e2b_like_double_wide_mlp_applies_to_shared_kv_tail():
+    config = _small_e2b_text_config()
+    regular_mlp = Gemma4TextMLP(config, layer_idx=3)
+    doubled_mlp = Gemma4TextMLP(config, layer_idx=4)
+
+    assert regular_mlp.gate_proj.weight.shape == (config.intermediate_size, config.hidden_size)
+    assert regular_mlp.up_proj.weight.shape == (config.intermediate_size, config.hidden_size)
+    assert regular_mlp.down_proj.weight.shape == (config.hidden_size, config.intermediate_size)
+    assert doubled_mlp.gate_proj.weight.shape == (config.intermediate_size * 2, config.hidden_size)
+    assert doubled_mlp.up_proj.weight.shape == (config.intermediate_size * 2, config.hidden_size)
+    assert doubled_mlp.down_proj.weight.shape == (config.hidden_size, config.intermediate_size * 2)
+
+
+def test_e2b_like_inputs_embeds_require_explicit_per_layer_inputs():
+    device, dtype = _device_and_dtype()
+    config = _small_e2b_text_config()
+    model = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 6), device=device)
+    position_ids = _position_ids(2, 6, device)
+    inputs_embeds = model.model.embed_tokens(input_ids)
+
+    with pytest.raises(ValueError, match="per_layer_inputs must be provided"):
+        model(inputs_embeds=inputs_embeds, position_ids=position_ids)
+
+
+def test_e2b_like_explicit_per_layer_inputs_match_implicit_path():
+    device, dtype = _device_and_dtype()
+    config = _small_e2b_text_config()
+    model = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 6), device=device)
+    position_ids = _position_ids(2, 6, device)
+    inputs_embeds = model.model.embed_tokens(input_ids)
+    per_layer_inputs = model.model.get_per_layer_inputs(input_ids)
+
+    assert per_layer_inputs is not None
+
+    with torch.no_grad():
+        implicit_outputs = model.model(input_ids=input_ids, position_ids=position_ids)
+        explicit_outputs = model.model(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            per_layer_inputs=per_layer_inputs,
+        )
+        implicit_logits = model(input_ids=input_ids, position_ids=position_ids).logits
+        explicit_logits = model(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            per_layer_inputs=per_layer_inputs,
+        ).logits
+
+    torch.testing.assert_close(
+        explicit_outputs.last_hidden_state,
+        implicit_outputs.last_hidden_state,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    torch.testing.assert_close(explicit_logits, implicit_logits, rtol=1e-4, atol=1e-4)
+
+
+@torch.no_grad()
+def test_e2b_like_input_ids_per_layer_path_is_cuda_graph_capturable():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA graph capture coverage")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    config = _small_e2b_text_config()
+    model = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
+    position_ids = _position_ids(1, 4, device)
+
+    eager_logits = model(input_ids=input_ids, position_ids=position_ids).logits.clone()
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            model(input_ids=input_ids, position_ids=position_ids)
+    warmup_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_logits = model(input_ids=input_ids, position_ids=position_ids).logits
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(graph_logits).all()
+    torch.testing.assert_close(graph_logits, eager_logits, rtol=1e-4, atol=1e-4)
+
+
+def test_e2b_like_conditional_wrapper_forwards_explicit_per_layer_inputs():
+    device, dtype = _device_and_dtype()
+    config = Gemma4Config(
+        text_config=_small_e2b_text_config(),
+        vision_config=Gemma4VisionConfig(hidden_size=32),
+    )
+    model = Gemma4ForConditionalGeneration(config).to(device=device, dtype=dtype).eval()
+
+    input_ids = torch.randint(0, config.text_config.vocab_size, (2, 6), device=device)
+    position_ids = _position_ids(2, 6, device)
+    inputs_embeds = model.model.language_model.embed_tokens(input_ids)
+    per_layer_inputs = model.model.language_model.get_per_layer_inputs(input_ids)
+
+    assert per_layer_inputs is not None
+
+    with torch.no_grad():
+        implicit_logits = model(input_ids=input_ids, position_ids=position_ids).logits
+        explicit_logits = model(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            per_layer_inputs=per_layer_inputs,
+        ).logits
+
+    torch.testing.assert_close(explicit_logits, implicit_logits, rtol=1e-4, atol=1e-4)
+
+
+def test_e2b_like_hf_per_layer_state_dict_keys_are_present_and_loadable():
+    config = Gemma4Config(
+        text_config=_small_e2b_text_config(),
+        vision_config=Gemma4VisionConfig(hidden_size=32),
+    )
+    model = Gemma4ForConditionalGeneration(config).eval()
+    expected_per_layer_keys = {
+        "model.language_model.embed_tokens_per_layer.weight",
+        "model.language_model.per_layer_model_projection.weight",
+        "model.language_model.per_layer_projection_norm.weight",
+    }
+    expected_per_layer_keys.update(
+        {
+            f"model.language_model.layers.{layer_idx}.per_layer_input_gate.weight"
+            for layer_idx in range(config.text_config.num_hidden_layers)
+        }
+    )
+    expected_per_layer_keys.update(
+        {
+            f"model.language_model.layers.{layer_idx}.per_layer_projection.weight"
+            for layer_idx in range(config.text_config.num_hidden_layers)
+        }
+    )
+    expected_per_layer_keys.update(
+        {
+            f"model.language_model.layers.{layer_idx}.post_per_layer_input_norm.weight"
+            for layer_idx in range(config.text_config.num_hidden_layers)
+        }
+    )
+
+    actual_per_layer_keys = {key for key in model.state_dict() if "per_layer" in key}
+    per_layer_state = {
+        key: value.clone()
+        for key, value in model.state_dict().items()
+        if key in expected_per_layer_keys
+    }
+
+    missing, unexpected = model.load_state_dict(per_layer_state, strict=False)
+
+    assert actual_per_layer_keys == expected_per_layer_keys
+    assert not unexpected
+    assert set(per_layer_state) == expected_per_layer_keys
+    assert not (expected_per_layer_keys & set(missing))
+    assert "model.language_model.lm_head.weight" in missing
