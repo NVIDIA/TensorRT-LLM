@@ -20,6 +20,23 @@ Drop-in alternative to ``torch.ops.trtllm.indexer_topk_decode`` (CUDA
 preIdxOffset = (row_idx % next_n) + 1 (V3.2 decode semantics).
 
 Supported (dtype, K): fp32/bf16/fp16 × 512/1024/2048.
+
+
+TODO:
+1. 对齐cuda gvr的性能：看看有那里的实现，没对齐？
+=》 check sass. 找差异.
+(1) check instructions: ldg, stg, sts, lds...
+(2) check smem usage.
+(3) check register usage.
+
+After aligned, next, continue to tune:
+1. why use fp32 even for half-prec? I think we can use dtype for all.
+2. tune num_threads_per_block.
+3. optimize smem_ptcnt.
+4. tune vec_size: 128->256.
+5. block prefix sum parallelization.
+6. fmin/fmax有向量化指令吗？如果有，可以向量化。
+7.
 """
 
 from dataclasses import dataclass
@@ -168,6 +185,7 @@ class GvrTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def _load_fp32(self, ptr_view, idx):
+        # TODO: instructions?
         v = ptr_view[idx]
         if cutlass.const_expr(self.dtype == cutlass.Float32):
             return v
@@ -1353,8 +1371,6 @@ class GvrTopKKernel:
 # =============================================================================
 
 import torch  # noqa: E402
-from cuda.bindings import driver as cuda  # noqa: E402
-from cutlass.cute.runtime import from_dlpack  # noqa: E402
 
 _DTYPE_TORCH_TO_CUTE = {
     torch.float32: cutlass.Float32,
@@ -1367,7 +1383,6 @@ _DTYPE_TORCH_TO_CUTE = {
 _gvr_topk_compile_cache: dict = {}
 
 
-# TODO: use fake_tensor (dynamic for some dim), not from_dlpack.
 def gvr_topk_decode(
     logits: torch.Tensor,
     pre_idx: torch.Tensor,
@@ -1410,21 +1425,48 @@ def gvr_topk_decode(
     if out_indices is None:
         out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
 
-    in_t = from_dlpack(logits, assumed_align=16)
-    pre_t = from_dlpack(pre_idx, assumed_align=16)
-    seq_t = from_dlpack(seq_lens, assumed_align=16)
-    out_v_t = from_dlpack(out_values, assumed_align=16)
-    out_i_t = from_dlpack(out_indices, assumed_align=16)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
+    # Cache key is only the truly static config — (dtype, top_k, next_n).
+    # Shapes (num_rows, num_tokens, batch) are made dynamic via `sym_int`
+    # placeholders on fake tensors at compile, so one compiled kernel
+    # serves any shape at call time. Pattern mirrors
+    # ``CuteDSLTopKDecodeSingleCTARunner._compile`` (cute_dsl_custom_ops.py).
     key = (cute_dtype, top_k, next_n)
     if key not in _gvr_topk_compile_cache:
+        n_rows = cute.sym_int()
+        n_cols = cute.sym_int()
+        n_batch = cute.sym_int()
+        input_fake = cute.runtime.make_fake_compact_tensor(
+            cute_dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
+        )
+        pre_idx_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_batch, top_k), stride_order=(1, 0), assumed_align=16
+        )
+        seq_lens_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_batch,), stride_order=(0,)
+        )
+        out_values_fake = cute.runtime.make_fake_compact_tensor(
+            cute_dtype, (n_rows, top_k), stride_order=(1, 0), assumed_align=16
+        )
+        out_indices_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_rows, top_k), stride_order=(1, 0), assumed_align=16
+        )
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
         kernel = GvrTopKKernel(dtype=cute_dtype, top_k=top_k, next_n=next_n)
         _gvr_topk_compile_cache[key] = cute.compile(
-            kernel, in_t, pre_t, seq_t, out_v_t, out_i_t, stream
+            kernel,
+            input_fake,
+            pre_idx_fake,
+            seq_lens_fake,
+            out_values_fake,
+            out_indices_fake,
+            stream=fake_stream,
+            options="--enable-tvm-ffi",
         )
 
-    _gvr_topk_compile_cache[key](in_t, pre_t, seq_t, out_v_t, out_i_t, stream)
+    # TVM FFI path: pass raw torch tensors directly (no from_dlpack), no
+    # stream argument (env stream is picked up automatically).
+    _gvr_topk_compile_cache[key](logits, pre_idx, seq_lens, out_values, out_indices)
     return out_values, out_indices
 
 
