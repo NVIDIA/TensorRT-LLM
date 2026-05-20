@@ -21,7 +21,8 @@ from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             check_mm_embed_cumsum_if_needed)
-from tensorrt_llm.inputs.registry import (create_input_processor,
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
                                           TorchLlmArgs)
@@ -44,6 +45,8 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -67,6 +70,7 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .multimodal_budget import MultimodalEncoderBudget
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                KVCacheManagerV2, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -204,6 +208,12 @@ class PyTorchModelEngine(ModelEngine):
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
+        # Multimodal encoder runtime sizes; fall back to LLM-side values when
+        # the encoder-specific knobs are unset.
+        (
+            self.encoder_batch_size,
+            self.encoder_max_num_tokens,
+        ) = llm_args.get_encoder_runtime_sizes()
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -288,6 +298,7 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
+        self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
@@ -1477,6 +1488,45 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         return self.attn_metadata
+
+    @property
+    def is_multimodal(self) -> bool:
+        """True iff this engine drives a multimodal model.
+
+        Primary signal: :class:`MultimodalModelMixin` (PR #13866) is the
+        canonical marker — multimodal LM classes inherit from it. Until
+        every model has migrated (Mistral done; Qwen-VL, Nemotron, Gemma,
+        Phi-4-MM, etc. pending), fall back to whether the input processor
+        subclasses :class:`BaseMultimodalInputProcessor`, which every
+        multimodal model necessarily provides at the data boundary.
+
+        TODO: Once all multimodal models inherit ``MultimodalModelMixin``
+        (tracked separately as the ``MultimodalModelMixin`` migration),
+        drop the input-processor fallback so the model class itself is
+        the single source of truth.
+        """
+        if isinstance(self.model, MultimodalModelMixin):
+            return True
+        return isinstance(self.input_processor, BaseMultimodalInputProcessor)
+
+    def _set_up_multimodal_encoder_attn_metadata(self) -> None:
+        """Construct AttentionMetadata for any multimodal encoders inside the
+        loaded model, using the engine's encoder runtime budget.
+
+        Reads the budget through
+        :class:`tensorrt_llm._torch.pyexecutor.multimodal_budget.MultimodalEncoderBudget`,
+        which encapsulates the encoder-specific knobs (``encoder_max_batch_size``
+        / ``encoder_max_num_tokens``) with their fallback to LLM-side
+        sizes. Encoders opt in by inheriting :class:`MultimodalEncoderMixin`;
+        the engine drives the construction so sizes are consistent with
+        the rest of the dummy-profile flow.
+        """
+        budget = MultimodalEncoderBudget.from_llm_args(self.llm_args)
+        for module in self.model.modules():
+            if isinstance(module, MultimodalEncoderMixin):
+                module.setup_attn_metadata(
+                    max_num_requests=budget.max_items_per_step,
+                    max_num_tokens=budget.max_tokens_per_step)
 
     def _set_up_spec_metadata(
             self,

@@ -7,8 +7,6 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.models.modeling_utils import \
-    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
@@ -43,6 +41,7 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager,
                                   use_cpp_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
+from .multimodal_budget import MultimodalEncoderBudget
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
                                PeftCacheManager, ResourceManager,
@@ -341,11 +340,48 @@ class KvCacheCreator:
         max_beam_width = self._max_beam_width
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
 
-        input_seq_len = min(max_num_tokens, input_seq_len)
+        # Per-request dummies are sized to the encoder budget so the
+        # multimodal encoder allocates a workspace fitting
+        # ``encoder_max_num_tokens`` attention tokens during
+        # ``configure_kv_cache_capacity``. The budget object encapsulates
+        # both the encoder/LLM unit conversion and the per-modality
+        # iteration that warms up each encoder in a multi-encoder model
+        # (e.g. Nemotron Nano VL2 with separate vision + audio encoders).
+        budget = MultimodalEncoderBudget.from_llm_args(self._llm_args)
+        spatial_merge_unit = getattr(input_processor, "spatial_merge_unit", 1)
+        encoder_llm_visible = budget.llm_visible_tokens(spatial_merge_unit)
+
+        input_seq_len = min(max_num_tokens, input_seq_len, encoder_llm_visible)
         remaining_tokens = max_num_tokens
+
+        # First pass: one dummy per supported modality. Guarantees each
+        # encoder in a multi-encoder model gets its workspace sized.
+        # Modalities that nominally share an encoder (e.g. Qwen-VL's
+        # image/video) still get separate dummies because a "shared"
+        # encoder may diverge later — e.g. video adding a temporal
+        # attention path that the image dummy would not exercise.
+        modalities_to_run: list = [
+            modality
+            for modality, _ in budget.iter_modality_dummies(input_processor)
+        ]
+        # Subsequent passes fill the remaining LLM batch budget so
+        # peak-memory measurement still reflects a full batch. The choice
+        # of fill modality is immaterial for encoder workspace (already
+        # sized in the first pass); we reuse the last supported modality
+        # for simplicity.
+        fill_modality = modalities_to_run[-1] if modalities_to_run else None
+
+        def _next_modality(idx: int):
+            if idx < len(modalities_to_run):
+                return modalities_to_run[idx]
+            return fill_modality
+
+        iteration = 0
         while remaining_tokens > 0:
-            input_seq_len = min(input_seq_len, remaining_tokens)
-            dummy_mm_prompt = input_processor.get_dummy_prompt(input_seq_len)
+            current_seq_len = min(input_seq_len, remaining_tokens)
+            current_modality = _next_modality(iteration)
+            dummy_mm_prompt = input_processor.get_dummy_prompt(
+                current_seq_len, modality=current_modality)
 
             if dummy_mm_prompt is not None:
                 prompt_token_ids, extra_processed_inputs = self._model_engine.input_processor_with_hash(
@@ -377,9 +413,9 @@ class KvCacheCreator:
                                          multimodal_input=req_mm_input)
                 request.py_multimodal_data = multimodal_data
             else:
-                # Fall back to text-only prompt when we could not find the small image size.
+                # Fall back to text-only prompt when no modality was usable.
                 prompt_token_ids = torch.randint(
-                    low=0, high=vocab_size, size=(input_seq_len, )).tolist()
+                    low=0, high=vocab_size, size=(current_seq_len, )).tolist()
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,
                                          streaming=False,
@@ -391,13 +427,17 @@ class KvCacheCreator:
                     request.py_multimodal_data = {
                         "mrope_config": {
                             "mrope_position_ids":
-                            torch.zeros(3, 1, input_seq_len, dtype=torch.int32),
+                            torch.zeros(3,
+                                        1,
+                                        current_seq_len,
+                                        dtype=torch.int32),
                             "mrope_position_deltas":
                             torch.zeros(1, 1, dtype=torch.int32)
                         }
                     }
             remaining_tokens -= len(prompt_token_ids)
             requests.append(request)
+            iteration += 1
 
         if self._mapping.enable_attention_dp:
             requests = requests * self._mapping.tp_size
@@ -407,9 +447,11 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        # Route to the multimodal dummy path when the engine drives a
+        # multimodal model, independent of *which* modality (audio-only,
+        # vision-only, or mixed). The discriminator hides behind
+        # ``is_multimodal``; see PyTorchModelEngine for the signals used.
+        if self._model_engine.is_multimodal:
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case

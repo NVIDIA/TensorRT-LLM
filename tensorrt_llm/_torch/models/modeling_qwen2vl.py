@@ -1,4 +1,5 @@
 import copy
+import math
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -34,6 +35,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor,
                        support_multimodal_disaggregated)
+from ...inputs.modality import Modality
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -42,6 +44,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (bypass_processor_output_validation,
                                         find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
@@ -99,6 +102,130 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    # ------------------------------------------------------------------
+    # Deterministic dummy-input sizing for multimodal profiling.
+    #
+    # `get_num_mm_tokens` / `get_size_with_most_features` are the encoder-
+    # side counterpart to the LLM's `max_num_tokens`: they report (and
+    # invert) the exact number of attention tokens the vision encoder will
+    # process for a given input size. The unit is **pre-merger patches** so
+    # that values are directly comparable with ``encoder_max_num_tokens``
+    # and ``AttentionMetadata.max_num_tokens``. Callers working in
+    # LLM-visible (post-merger) units multiply/divide by
+    # ``spatial_merge_unit`` at the boundary.
+    # ------------------------------------------------------------------
+    @property
+    def supported_modalities(self) -> Tuple[Modality, ...]:
+        return (Modality.IMAGE, Modality.VIDEO)
+
+    @property
+    def spatial_merge_unit(self) -> int:
+        """Encoder→LLM token ratio. Qwen2/2.5-VL applies a ``merge_size`` × ``merge_size`` spatial merger."""
+        merge_size = self.config.vision_config.spatial_merge_size
+        return merge_size * merge_size
+
+    def get_num_mm_tokens(
+        self,
+        modality: Modality,
+        *,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        **kwargs,
+    ) -> int:
+        """Return encoder attention tokens (pre-merger) for image/video.
+
+        Image and video share the same vision encoder in Qwen2/2.5-VL;
+        ``modality`` is accepted for interface uniformity. The math
+        mirrors HF's ``smart_resize`` + patchify.
+        """
+        if modality not in (Modality.IMAGE, Modality.VIDEO):
+            raise NotImplementedError(
+                f"Qwen2/2.5-VL does not support modality={modality}")
+        if width is None or height is None:
+            raise ValueError("width and height are required")
+        return self._vision_tokens(
+            width=int(width),
+            height=int(height),
+            num_frames=int(num_frames) if num_frames is not None else 1,
+        )
+
+    def get_size_with_most_features(
+        self,
+        modality: Modality,
+        *,
+        max_tokens: int,
+    ) -> Dict[str, int]:
+        """Invert ``get_num_mm_tokens``: pick the size whose token count is
+        the largest value ``<= max_tokens`` under the aspect-ratio bound.
+
+        Single-frame for both IMAGE and VIDEO — the caller scales
+        ``num_frames`` if they want to spend budget on temporal extent.
+        """
+        if modality not in (Modality.IMAGE, Modality.VIDEO):
+            raise NotImplementedError(
+                f"Qwen2/2.5-VL does not support modality={modality}")
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+
+        width, height = self._vision_size_for_budget(max_tokens)
+        size: Dict[str, int] = {"width": width, "height": height}
+        if modality == Modality.VIDEO:
+            size["num_frames"] = 1
+        return size
+
+    def _vision_tokens(self, *, width: int, height: int,
+                       num_frames: int) -> int:
+        """Encoder attention tokens for the shared image/video vision tower."""
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+        factor = patch_size * merge_size
+
+        # Round half-up to the nearest multiple of ``factor`` (matches the
+        # smart_resize grid the HF Qwen-VL processor uses).
+        resized_w = max(((width + factor // 2) // factor) * factor, factor)
+        resized_h = max(((height + factor // 2) // factor) * factor, factor)
+        grid_h = resized_h // patch_size
+        grid_w = resized_w // patch_size
+
+        padded_frames = ((num_frames + temporal_patch_size - 1) //
+                         temporal_patch_size) * temporal_patch_size
+        grid_t = max(padded_frames // temporal_patch_size, 1)
+
+        return grid_t * grid_h * grid_w
+
+    def _vision_size_for_budget(self, max_tokens: int) -> Tuple[int, int]:
+        """Largest ``(width, height)`` whose pre-merger token count
+        is ``<= max_tokens`` under the model's aspect-ratio bound."""
+
+        def closest_factor_pair(n: int) -> Tuple[int, int]:
+            """Closest ``h*w=n`` to square; keeps dummy aspect ratio near 1:1."""
+            for d in range(math.isqrt(n), 0, -1):
+                if n % d == 0:
+                    return d, n // d
+            return 1, n
+
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        unit = patch_size * merge_size
+
+        # Pre-merger tokens factor into (grid_h * grid_w) and each grid
+        # dimension is ``merge_size`` × the post-merger factor. Searching in
+        # post-merger units bounds the inner loop and lets us reuse the
+        # familiar near-square factor pair for aspect ratio bounds.
+        post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
+        h_factor, w_factor = closest_factor_pair(post_merger_budget)
+        for seq_len in range(post_merger_budget, 0, -1):
+            h_f, w_f = closest_factor_pair(seq_len)
+            if w_f / max(h_f, 1) <= 200:
+                h_factor, w_factor = h_f, w_f
+                break
+
+        return (unit * w_factor, unit * h_factor)
 
     @classmethod
     def get_rope_index(
@@ -674,7 +801,7 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         return hidden_states
 
 
-class Qwen2_5_VisionModel(torch.nn.Module):
+class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
@@ -704,17 +831,27 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         self.merger = Qwen2_5_VLPatchMerger(self.model_config, )
         self.metadata_cls = get_attention_backend(
             self.model_config.attn_backend).Metadata
+        self.full_attn_metadata: Optional[AttentionMetadata] = None
+        self.window_attn_metadata: Optional[AttentionMetadata] = None
 
-        self.full_attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
-        self.window_attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # Override: Qwen2/2.5-VL uses two metadata objects (full + window
+        # attention) instead of the mixin's single ``attn_metadata``.
+        #
+        # Windowed attention splits each image into many attention sequences
+        # (one per window grid cell), so ``max_num_requests`` here is the
+        # **window** count, not the image count. The legacy hardcoded value
+        # was 8192; preserve that as a floor so callers that leave
+        # ``encoder_max_batch_size`` unset (and thus inherit the LLM-side
+        # ``max_batch_size``, which is far smaller) still get a buffer large
+        # enough for the worst-case window split.
+        max_num_requests = max(max_num_requests, 8192)
+        kwargs = dict(max_num_requests=max_num_requests,
+                      max_num_tokens=max_num_tokens,
+                      kv_cache_manager=None)
+        self.full_attn_metadata = self.metadata_cls(**kwargs)
+        self.window_attn_metadata = self.metadata_cls(**kwargs)
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
@@ -1020,7 +1157,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             elif not getattr(self, "support_mm_disagg", False):
                 raise NotImplementedError(
                     "Qwen2VLModel does not support disaggregated inference yet. Please unset "
-                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                    "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
 
