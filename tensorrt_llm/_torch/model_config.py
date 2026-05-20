@@ -590,6 +590,16 @@ class ModelConfig(Generic[TConfig]):
         return None
 
     @staticmethod
+    def _is_deepseek_v4_base_checkpoint(checkpoint_dir: str) -> bool:
+        tensor_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
+        if tensor_info is None:
+            return False
+
+        return ModelConfig._detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir) not in ("mxfp4", "nvfp4")
+
+    @staticmethod
     def _has_deepseek_v4_layer_only_modelopt_quant_config(
             quant_config_file: str) -> bool:
         with open(quant_config_file) as f:
@@ -815,6 +825,11 @@ class ModelConfig(Generic[TConfig]):
                             indexer_k_dtype=indexer_k_dtype)
                 elif pretrained_config.architectures[
                         0] == "DeepseekV4ForCausalLM":
+                    if cls._is_deepseek_v4_base_checkpoint(checkpoint_dir):
+                        logger.warning(
+                            "Support for DeepSeek-V4 Base checkpoints is "
+                            "experimental. For better supported behavior, use "
+                            "a DeepSeek-V4 Instruct checkpoint.")
                     indexer_config = update_sparse_attention_indexer_config(
                         pretrained_config, kwargs)
                     checkpoint_compress_ratios = getattr(
