@@ -1916,7 +1916,7 @@ def test_priority_request_completes_before_low_priority():
     prompt = "A B C D E F G H I J"
     completion_order = []
 
-    async def run():
+    async def run(llm):
         # Submit all three requests before the event loop can schedule any of
         # them – they all land in the waiting queue simultaneously.
         # Request 1 uses ignore_eos so it keeps the batch slot busy for the
@@ -1943,7 +1943,7 @@ def test_priority_request_completes_before_low_priority():
             timeout=55,
         )
 
-    asyncio.run(run())
+    asyncio.run(run(llm))
     del llm
 
     assert 2 in completion_order and 3 in completion_order, (
