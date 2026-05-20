@@ -65,11 +65,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         self.image_token_index = config.image_token_index
         self.vocab_size = config.vocab_size
 
-    def get_max_requests_per_mm_item(
-        self,
-        *,
-        max_encoder_tokens: int = 0,
-    ) -> int:
+    def get_max_requests_per_mm_item(self) -> int:
         """Worst-case CLIP attention sequences produced by one LLaVA-Next image.
 
         LLaVA-Next splits each image into a base view plus
