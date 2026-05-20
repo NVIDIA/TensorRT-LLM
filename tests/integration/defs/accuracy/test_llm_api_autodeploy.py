@@ -1264,20 +1264,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "reasoning_effort": "low",
         },
     }
-    GSM8K_MAX_OUTPUT_LEN = 8192  # match PT test_w4_1gpu
+    GSM8K_MAX_OUTPUT_LEN = 8192
     MODEL_PATHS = {
         "20b": f"{llm_models_root()}/gpt_oss/gpt-oss-20b",
         "120b": f"{llm_models_root()}/gpt_oss/gpt-oss-120b",
     }
 
-    # Each entry: (model_id, model_name, world_size_override, moe_topology).
-    # ``world_size_override=None`` keeps the per-model yaml's ``world_size``
-    # (TP=1 for both 20b and 120b). A non-None value overrides the yaml so we
-    # can exercise the TP > 1 path with the same accuracy bar.
-    # ``moe_topology``:
-    #   ``None``  -> default (no MoE sharding override; only valid on TP=1).
-    #   ``"tp"``  -> ``moe_tp=world_size, moe_ep=1`` (intermediate-TP MoE).
-    #   ``"ep"``  -> ``moe_tp=1, moe_ep=world_size`` (expert-parallel MoE).
     MODEL_PARAMS = [
         pytest.param(
             "20b",
@@ -1292,7 +1284,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "openai/gpt-oss-120b",
             None,
             None,
-            # marks=pytest.mark.skip_less_device(4),
             id="120b",
         ),
         pytest.param(
