@@ -550,6 +550,7 @@ def _build_tensors(
       x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
       A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
       prev_tokens              : (batch,)
+      state_batch_indices      : identity cache-slot indirection (batch,)
       replay_work_items        : packed per-slot replay metadata (batch, 4)
       out_incr                 : pre-allocated output for replay kernel (batch, mtp_len, nheads, head_dim)
       out_base                 : pre-allocated output for baseline kernel   (batch, mtp_len, nheads, head_dim)
@@ -579,6 +580,7 @@ def _build_tensors(
             cached["dt_bias"],
             cached["D"],
             cached["prev_tokens"][:b],
+            cached["state_batch_indices"][:b],
             cached["replay_work_items"][:b],
             cached["out_incr"][:b],
             cached["out_base"][:b],
@@ -666,14 +668,14 @@ def _build_tensors(
 
     # prev_tokens placeholder — overwritten per-run
     prev_tokens = torch.zeros(batch, device=device, dtype=torch.int32)
+    state_batch_indices = torch.arange(batch, device=device, dtype=torch.int32)
     replay_work_items = torch.empty(
         batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32
     )
-    position_in_decode_batch = torch.arange(batch, device=device, dtype=torch.int32)
     replay_work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = (
-        position_in_decode_batch
+        state_batch_indices
     )
-    replay_work_items[:, REPLAY_WORK_CACHE_SLOT] = position_in_decode_batch
+    replay_work_items[:, REPLAY_WORK_CACHE_SLOT] = state_batch_indices
     replay_work_items[:, REPLAY_WORK_PNAT] = 0
     replay_work_items[:, REPLAY_WORK_CACHE_BUF_IDX] = 0
 
@@ -719,6 +721,7 @@ def _build_tensors(
         "dt_bias": dt_bias,
         "D": D,
         "prev_tokens": prev_tokens,
+        "state_batch_indices": state_batch_indices,
         "replay_work_items": replay_work_items,
         "out_incr": out_incr,
         "out_base": out_base,
@@ -746,6 +749,7 @@ def _build_tensors(
         dt_bias,
         D,
         prev_tokens[:rb],
+        state_batch_indices[:rb],
         replay_work_items[:rb],
         out_incr[:rb],
         out_base[:rb],
@@ -2583,6 +2587,7 @@ def _bench_config(
         dt_bias,
         D,
         prev_tokens,
+        state_batch_indices,
         replay_work_items_buf,
         out_incr,
         out_base,
@@ -2998,7 +3003,9 @@ def _bench_config(
                     D=D,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=None,
+                    state_batch_indices=(
+                        state_batch_indices if args.use_cache_slot else None
+                    ),
                     state_scale=state_scales_work,
                     rand_seed=rand_seed,
                     philox_rounds=args.philox_rounds,
