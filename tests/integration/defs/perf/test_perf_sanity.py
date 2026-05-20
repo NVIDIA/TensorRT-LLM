@@ -480,6 +480,7 @@ class ClientConfig:
         client_config_data: dict,
         model_name: str,
         env_vars: str = "",
+        spec_decoding: bool = False,
     ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
@@ -495,6 +496,9 @@ class ClientConfig:
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
         self.env_vars = env_vars
+        # --ignore-eos must be off when spec decoding is enabled: forcing generation
+        # past EOS produces unstable acceptance rates.
+        self.spec_decoding = spec_decoding
 
         # Generate default name if not provided
         self.name = client_config_data.get("name", "")
@@ -525,7 +529,6 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--random-input-len",
             str(self.isl),
             "--random-output-len",
@@ -536,6 +539,8 @@ class ClientConfig:
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        if not self.spec_decoding:
+            benchmark_cmd.append("--ignore-eos")
         if self.backend:
             benchmark_cmd.extend(["--backend", self.backend])
         if self.trust_remote_code:
@@ -560,11 +565,12 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        if not self.spec_decoding:
+            benchmark_cmd.append("--ignore-eos")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -1269,6 +1275,7 @@ class PerfSanityTestConfig:
                     client_config_data,
                     server_config_data["model_name"],
                     env_vars=client_env_var,
+                    spec_decoding=bool(server_config.spec_decoding_type),
                 )
                 client_configs.append(client_config)
 
@@ -1395,6 +1402,13 @@ class PerfSanityTestConfig:
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
         use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
+        if benchmark_mode == "ctx_only":
+            spec_decoding = bool(ctx_server_config.spec_decoding_type)
+        else:
+            spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
+                gen_server_config.spec_decoding_type
+            )
+
         client_configs = []
         for concurrency in concurrency_values:
             client_config_data = {
@@ -1415,6 +1429,7 @@ class PerfSanityTestConfig:
                 client_config_data,
                 model_name,
                 env_vars=client_env_var,
+                spec_decoding=spec_decoding,
             )
             client_configs.append(client_config)
 
