@@ -44,10 +44,25 @@ _MARATHON_CONFIGS: list[str] = [
 def test_disagg_cancellation_marathon(config_filename: str) -> None:
     """Drive a long-running disagg cancellation marathon and assert pass criteria.
 
-    Skeleton stage: this test exercises the harness lifecycle only.
-    Once the harness thread bodies are implemented, this test will
-    additionally assert the marathon pass criteria (canary error
-    rate, KV-cache growth bound, post-injection recovery time).
+    Current scope: only what the already-implemented thread bodies
+    can contribute. The marathon entry point exists; the marathon
+    *content* lands incrementally as each thread body is wired up:
+
+    - lifecycle plumbing (setup -> start -> wait -> stop ->
+      collect_results, fail-fast event propagation, dict-shape
+      contract).
+    - log-pattern fail-fast — a hard-zero pattern in any worker log
+      trips ``failure_reason`` via the log_scanner thread
+      (component-level coverage in ``test_log_scanner.py``).
+
+    Marathon pass criteria not yet enforced here (will land alongside
+    their owning thread bodies in follow-up changes): canary error
+    rate, recovery time after each injection, KV-cache utilization
+    growth bound, injection-schedule completeness, sustained load
+    throughput. Until those land, this test passes trivially after
+    the lifecycle smoke completes; the value at this stage is that
+    the entry point and result-dict contract are pinned down so the
+    follow-up commits can extend in place rather than restructure.
     """
     config_path = _CONFIG_DIR / config_filename
     assert config_path.exists(), (

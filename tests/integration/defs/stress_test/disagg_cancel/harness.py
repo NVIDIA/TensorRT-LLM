@@ -29,10 +29,11 @@ suite matures.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import IO, Any, Callable, Optional
 
 import yaml
 
@@ -128,6 +129,114 @@ class WorkerLaunchSpec:
     port: int  # the originally-allocated port; respawn may end up on a different one
     device: str  # CUDA_VISIBLE_DEVICES string, e.g. "0" or "0,1"
     env: dict[str, str]
+    # Worker stdout/stderr log path (from ``ProcessWrapper.log_path``).
+    # ``None`` when launched with ``save_log=False`` (output inherits
+    # pytest stdout); log_scanner skips ``None`` paths with a warning.
+    log_path: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Log-scanner helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _LogSource:
+    r"""One tailed log file plus the per-file state the scanner needs.
+
+    The scanner runs in a poll loop (single thread, single file
+    descriptor per source) rather than a per-source thread, because
+    file tailing is bursty and the number of sources is small (3 ctx
+    + 3 gen + 1 disagg server = 7 fds in the common 3P3D shape).
+
+    Why ``_carry`` exists: ``trtllm-serve``'s C++ stack is
+    block-buffered when stdout is a file, so reads are chunked rather
+    than line-bounded. A naive ``for line in fh:`` loop would either
+    block waiting for newlines (defeating the whole point of polling)
+    or silently swallow the partial trailing line. We read all
+    available bytes per poll, prepend the previous tail-byte carry,
+    split on ``\n``, and treat the final element as either a complete
+    line (if the chunk ended on a newline) or carry for the next
+    poll.
+    """
+
+    spec: WorkerLaunchSpec
+    path: Path
+    _fh: Optional[IO[str]] = None
+    _carry: str = ""
+
+    def poll(
+        self,
+        patterns: list[tuple[str, re.Pattern[str]]],
+        mark_failed: Callable[[str], None],
+    ) -> bool:
+        """Read new content and scan; return True if a pattern hit was reported.
+
+        Returns False if no new content was available, if no pattern
+        matched, or if the file is not yet readable (handled silently
+        so the scanner can be started before every worker has flushed
+        its first bytes).
+        """
+        if self._fh is None:
+            if not self.path.exists():
+                return False
+            self._fh = self.path.open("r", encoding="utf-8", errors="replace")
+
+        chunk = self._fh.read()
+        if not chunk:
+            return False
+
+        buf = self._carry + chunk
+        lines = buf.split("\n")
+        # If buf ended on '\n', lines[-1] == "" (a complete line
+        # terminator). Either way, lines[-1] is the partial-or-empty
+        # tail carried into the next poll.
+        self._carry = lines[-1]
+
+        for line in lines[:-1]:
+            for pat_str, pat in patterns:
+                if pat.search(line):
+                    role_idx = f"{self.spec.role}_{self.spec.index}"
+                    mark_failed(
+                        f"hard-zero log pattern hit in {role_idx} "
+                        f"({self.path.name}): {pat_str!r} matched {line.strip()!r}"
+                    )
+                    return True
+        return False
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                logger.debug("[log_scanner] closing %s raised; ignoring", self.path)
+            self._fh = None
+
+
+def _compile_patterns(raw_patterns: list[Any]) -> list[tuple[str, re.Pattern[str]]]:
+    """Compile the YAML's ``log_scan.hard_zero_patterns`` list.
+
+    Patterns that fail to compile are skipped with an ERROR log so
+    config typos surface during the scanner's startup banner rather
+    than as silent misses at marathon hour 1.5.
+    """
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    for entry in raw_patterns:
+        if not isinstance(entry, str):
+            logger.error(
+                "[log_scanner] hard_zero_patterns entry %r is not a string; skipping",
+                entry,
+            )
+            continue
+        try:
+            compiled.append((entry, re.compile(entry)))
+        except re.error as exc:
+            logger.error(
+                "[log_scanner] failed to compile hard_zero pattern %r: %s; skipping",
+                entry,
+                exc,
+            )
+    return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +276,12 @@ class DisaggCancellationStressHarness:
         self.failed_event: threading.Event = threading.Event()
         self._failure_reason: Optional[str] = None
         self._failure_lock = threading.Lock()
+
+        # Per-thread tunables (overridable in tests). Defaults pick a
+        # cadence that's reactive enough for human-scale debugging
+        # (~0.5 s lag from log line to fail-fast) without becoming a
+        # measurable load source on its own.
+        self._log_scanner_poll_interval_s: float = 0.5
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
@@ -354,11 +469,67 @@ class DisaggCancellationStressHarness:
     def _log_scanner_thread_body(self) -> None:
         """Tail all worker logs; fail-fast on any hard-zero pattern hit.
 
-        Stub: no-op. Real implementation opens each worker's
-        ``log_path``, follows it line-by-line, and calls
-        ``mark_failed`` when a hard-zero pattern matches.
+        Reads ``hard_zero_patterns`` from ``stress_config.log_scan``,
+        compiles each as a regex, then poll-tails every worker's
+        ``log_path`` at ``_log_scanner_poll_interval_s``. On the first
+        match in any worker, ``mark_failed`` is called (idempotent —
+        first-reason-wins in the existing skeleton plumbing) and the
+        thread continues polling until ``stop_event`` /
+        ``failed_event``: the first failure is enough for fail-fast,
+        but tailing past it costs us nothing and keeps the file
+        handles drained until teardown.
+
+        Workers without a ``log_path`` (``save_log=False`` at launch)
+        are skipped with a warning. The scanner is intentionally
+        permissive about not-yet-created files: ``_LogSource.poll``
+        retries lazily on each cycle, so the thread can be started
+        before every worker has flushed its first bytes.
         """
-        logger.debug("[log_scanner_thread] stub — exiting immediately")
+        raw_log_scan = self.config.raw.get("log_scan") or {}
+        patterns = _compile_patterns(raw_log_scan.get("hard_zero_patterns") or [])
+        if not patterns:
+            logger.warning(
+                "[log_scanner] no usable hard_zero_patterns; exiting immediately. "
+                "Check stress_config.log_scan.hard_zero_patterns in the YAML."
+            )
+            return
+
+        sources: list[_LogSource] = []
+        for spec in self._worker_specs:
+            if spec.log_path is None:
+                logger.warning(
+                    "[log_scanner] worker %s_%d has no log_path; skipping "
+                    "(launch with save_log=True to capture worker output)",
+                    spec.role,
+                    spec.index,
+                )
+                continue
+            sources.append(_LogSource(spec=spec, path=Path(spec.log_path)))
+
+        if not sources:
+            logger.warning(
+                "[log_scanner] no log sources to tail; exiting immediately. "
+                "The marathon will run without log-pattern fail-fast coverage."
+            )
+            return
+
+        logger.info(
+            "[log_scanner] tailing %d worker log(s) against %d hard_zero pattern(s)",
+            len(sources),
+            len(patterns),
+        )
+
+        try:
+            while not self.stop_event.is_set() and not self.failed_event.is_set():
+                for source in sources:
+                    if self.stop_event.is_set() or self.failed_event.is_set():
+                        break
+                    source.poll(patterns, self.mark_failed)
+                self.stop_event.wait(timeout=self._log_scanner_poll_interval_s)
+        finally:
+            for source in sources:
+                source.close()
+            logger.debug("[log_scanner] exiting; closed %d source(s)", len(sources))
 
     def _metrics_thread_body(self) -> None:
         """Scrape ``/prometheus/metrics`` for KV-cache utilization at ~30 s cadence.
