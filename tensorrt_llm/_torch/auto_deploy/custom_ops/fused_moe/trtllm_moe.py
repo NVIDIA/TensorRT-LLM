@@ -1326,8 +1326,10 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
 # At forward time we only pad activations to the kernel's expected hidden dim.
 
 
-@torch.library.custom_op("auto_deploy::trtllm_mxfp4_w4a16_moe_fused", mutates_args=())
-def trtllm_mxfp4_w4a16_moe_fused(
+@torch.library.custom_op(
+    "auto_deploy::trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused", mutates_args=()
+)
+def trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused(
     x: torch.Tensor,
     router_weight: torch.Tensor,
     router_bias: torch.Tensor,
@@ -1450,8 +1452,8 @@ def trtllm_mxfp4_w4a16_moe_fused(
     return result.view(*x_shape[:-1], valid_hidden_size)
 
 
-@trtllm_mxfp4_w4a16_moe_fused.register_fake
-def trtllm_mxfp4_w4a16_moe_fused_fake(
+@trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused.register_fake
+def trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused_fake(
     x: torch.Tensor,
     router_weight: torch.Tensor,
     router_bias: torch.Tensor,
@@ -1498,8 +1500,10 @@ def trtllm_mxfp4_w4a16_moe_fused_fake(
 # changes needed.
 
 
-@torch.library.custom_op("auto_deploy::trtllm_mxfp4_w4a8_moe_fused", mutates_args=())
-def trtllm_mxfp4_w4a8_moe_fused(
+@torch.library.custom_op(
+    "auto_deploy::trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused", mutates_args=()
+)
+def trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused(
     x: torch.Tensor,
     router_weight: torch.Tensor,
     router_bias: torch.Tensor,
@@ -1521,7 +1525,7 @@ def trtllm_mxfp4_w4a8_moe_fused(
 ) -> torch.Tensor:
     """TensorRT-LLM Gen MoE for MXFP4 weights x MXFP8 activations (w4a8_mxfp4_mxfp8).
 
-    Same op shape as ``trtllm_mxfp4_w4a16_moe_fused`` but pre-quantizes
+    Same op shape as ``trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused`` but pre-quantizes
     the bf16 activations to MXFP8 (E4M3 + UE8M0 block scales) before the
     MoE GEMM, dispatching to
     ``torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner``.
@@ -1529,7 +1533,7 @@ def trtllm_mxfp4_w4a8_moe_fused(
     Weight layout is unchanged from W4A16: the same MXFP4 blocks/scales/bias
     produced by ``prepare_trtllm_gen_moe_mxfp4_weights`` are used as-is.
 
-    Args: same as ``trtllm_mxfp4_w4a16_moe_fused`` — the runtime path
+    Args: same as ``trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused`` — the runtime path
     differs only in (a) inserting an ``mxfp8_quantize`` call on the
     padded hidden states, and (b) calling the MXFP8-input MoE runner
     with the produced ``hidden_states_scale``.
@@ -1603,8 +1607,8 @@ def trtllm_mxfp4_w4a8_moe_fused(
     return result.view(*x_shape[:-1], valid_hidden_size)
 
 
-@trtllm_mxfp4_w4a8_moe_fused.register_fake
-def trtllm_mxfp4_w4a8_moe_fused_fake(
+@trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused.register_fake
+def trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused_fake(
     x: torch.Tensor,
     router_weight: torch.Tensor,
     router_bias: torch.Tensor,

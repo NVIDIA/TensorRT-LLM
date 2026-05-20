@@ -439,9 +439,9 @@ class QuantizeMXFP4MOEConfig(TransformConfig):
         description=(
             "Only used when ``backend='trtllm'``. Activation precision for the "
             "trtllm-gen MoE GEMM: ``bf16`` dispatches to "
-            "``trtllm_mxfp4_w4a16_moe_fused`` (bf16 input), ``mxfp8`` "
+            "``trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused`` (bf16 input), ``mxfp8`` "
             "pre-quantizes the activation to MXFP8 and dispatches to "
-            "``trtllm_mxfp4_w4a8_moe_fused`` (faster cubin family). "
+            "``trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused`` (faster cubin family). "
             "Default ``mxfp8`` matches the modeling-side default."
         ),
     )
@@ -458,7 +458,7 @@ class QuantizeMXFP4MOE(BaseTransform):
     * ``backend="triton"`` → ``auto_deploy::triton_mxfp4_moe`` with raw HF
       MXFP4 layout (``_blocks`` / ``_scales`` / ``_bias``). Lazy weight
       swizzling happens inside the Triton kernel on first forward.
-    * ``backend="trtllm"`` → ``auto_deploy::trtllm_mxfp4_*_moe_fused`` with
+    * ``backend="trtllm"`` → ``auto_deploy::trtllm_quant_mxfp4_*_moe_fused`` with
       trtllm-gen prepared layout (``fc1_w_trtllm`` / ``fc1_w_scale_trtllm`` /
       ...). Weight preparation (shuffle + interleave) is done on CPU inside
       a state-dict pre-hook registered by this transform, so the raw HF
@@ -667,7 +667,7 @@ class QuantizeMXFP4MOE(BaseTransform):
            registration time.
         6. Tag the experts module with ``_dtype_protected_params`` (raw uint8 weights, uint8
            scales, bf16 biases, fp32 SwiGLU constants must all survive ``model.to(dtype)``).
-        7. Rewrite the ``torch_moe_dense_mlp`` node to ``trtllm_mxfp4_w4a{8,16}_moe_fused``
+        7. Rewrite the ``torch_moe_dense_mlp`` node to ``trtllm_quant_mxfp4_trtllm_gen_w4a{8,16}_moe_fused``
            (selected by ``config.trtllm_quant_act``) with args pointing at the **raw** params for
            now. The downstream :class:`FuseMXFP4Moe` POST_LOAD_FUSION transform will run
            :func:`prepare_trtllm_gen_moe_mxfp4_weights` on the actually-loaded GPU tensors,
@@ -703,9 +703,9 @@ class QuantizeMXFP4MOE(BaseTransform):
 
         quant_act = self.config.trtllm_quant_act
         if quant_act == "mxfp8":
-            target_op = torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused.default
+            target_op = torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused.default
         else:
-            target_op = torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default
+            target_op = torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused.default
 
         # Module-level info needed once for the load hook factory.
         hidden_size_global: Optional[int] = None
@@ -892,8 +892,8 @@ class QuantizeMXFP4MOE(BaseTransform):
             # NOT runnable until ``FuseMXFP4Moe`` (POST_LOAD_FUSION) swaps in
             # the prepared layout. That is safe because no forward pass runs
             # between PATTERN_MATCHER and POST_LOAD_FUSION.
-            #   - "bf16"  -> trtllm_mxfp4_w4a16_moe_fused (bf16 input)
-            #   - "mxfp8" -> trtllm_mxfp4_w4a8_moe_fused  (MXFP8 input)
+            #   - "bf16"  -> trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused (bf16 input)
+            #   - "mxfp8" -> trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused  (MXFP8 input)
             n.target = target_op
             n.kwargs = {}
             n.args = (
@@ -1037,7 +1037,7 @@ class FuseMXFP4Moe(BaseTransform):
     """POST_LOAD_FUSION transform: GPU-side MXFP4 MoE weight prep for the trtllm-gen backend.
 
     Runs after ``QuantizeMXFP4MOE`` registered raw HF MXFP4 buffers and the EP-slice load hook
-    populated them. For each ``trtllm_mxfp4_w4a{8,16}_moe_fused`` node, calls
+    populated them. For each ``trtllm_quant_mxfp4_trtllm_gen_w4a{8,16}_moe_fused`` node, calls
     :func:`prepare_trtllm_gen_moe_mxfp4_weights` on the loaded GPU tensors to produce the kernel
     layout, swaps the op args to the prepared params, and deletes the raw buffers.
 
@@ -1060,7 +1060,7 @@ class FuseMXFP4Moe(BaseTransform):
         """Two-pass GPU prep with shared scratch + contiguous prepared blocks.
 
         Pass 1 (``_collect_moe_nodes``): walk the graph, find every
-        ``trtllm_mxfp4_w4a*_moe_fused`` op whose weight args still reference
+        ``trtllm_quant_mxfp4_trtllm_gen_w4a*_moe_fused`` op whose weight args still reference
         raw HF buffers, record the per-layer info (experts module path, raw
         ``get_attr`` nodes, shapes). Cross-layer consistency is asserted
         (gpt-oss guarantees same H/I/E across all MoE layers).
@@ -1093,8 +1093,8 @@ class FuseMXFP4Moe(BaseTransform):
 
         # Candidate ops: both w4a8 and w4a16 share the same arg layout.
         target_ops = (
-            torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused.default,
-            torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default,
+            torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_w4a8_moe_fused.default,
+            torch.ops.auto_deploy.trtllm_quant_mxfp4_trtllm_gen_w4a16_moe_fused.default,
         )
 
         # ---- Pass 1: collect MoE node info, validate consistent shape ----
