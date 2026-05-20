@@ -308,6 +308,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_triton.yaml",
         "qwen3_5_4b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
+        "qwen3_32b_fp8_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
@@ -339,6 +341,13 @@ def setup_model_symlink(llm_venv, model_root, dest_subpath):
     if not os.path.islink(dst):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         os.symlink(model_root, dst, target_is_directory=True)
+
+
+def resolve_llm_model_path(model_path: str) -> str:
+    """Resolve a model subpath relative to the test LLM model root."""
+    if os.path.isabs(model_path):
+        return model_path
+    return os.path.join(llm_models_root(), model_path)
 
 
 ClientTestSet = namedtuple('ClientTestSet', [
@@ -492,6 +501,11 @@ def run_client_tests(example_dir,
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
                     ]
+                elif "qwen3_32b_fp8" in test_desc:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio in Python is a library"
+                    ]
                 else:
                     expected_strings = [
                         "The capital of Germany is Berlin",
@@ -618,6 +632,13 @@ def setup_disagg_cluster(
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
 
+    speculative_config = config.get("speculative_config")
+    if isinstance(speculative_config, dict):
+        speculative_model = speculative_config.get("speculative_model")
+        if speculative_model:
+            speculative_config["speculative_model"] = resolve_llm_model_path(
+                speculative_model)
+
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
@@ -648,6 +669,8 @@ def setup_disagg_cluster(
 
     # Launch workers
     model = model_name or config.get("model")
+    if model:
+        model = resolve_llm_model_path(model)
     ctx_workers = []
     gen_workers = []
     disagg_server = None
@@ -2288,6 +2311,22 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['Qwen3/Qwen3-32B-FP8'])
+def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
+                                     disaggregated_example_root, llm_venv,
+                                     model_path):
+    model_dir = resolve_llm_model_path(model_path)
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "qwen3_32b_fp8_stress",
+                           env=llm_venv._new_env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.timeout(12600)
 @pytest.mark.parametrize("test_config", [
     pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
@@ -2349,6 +2388,11 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
+    pytest.param(TestConfig(model_path='Qwen3/Qwen3-32B-FP8',
+                            test_desc='qwen3_32b_fp8_stress',
+                            request_count=10000,
+                            accuracy_threshold=0.42),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
 ],
                          ids=lambda x: x.test_desc)
 @pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
@@ -2363,7 +2407,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
-    model_dir = f"{llm_models_root()}/{model_path}"
+    model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
     config_file = get_test_config(test_desc, disaggregated_example_root,

@@ -1287,9 +1287,11 @@ def parse_gsm8k_output(output_text: str) -> float:
         float: The accuracy value (0.7582 in the example)
     """
 
-    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    # Look for the specific pattern:
+    # |gsm8k|...|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    # lm-eval pads table cells, so allow whitespace around the value.
     patterns = [
-        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
+        r'flexible-extract\s*\|\s*\d+\s*\|\s*exact_match\s*\|\s*↑\s*\|\s*(\d+(?:\.\d+)?)',
     ]
 
     for pattern in patterns:
