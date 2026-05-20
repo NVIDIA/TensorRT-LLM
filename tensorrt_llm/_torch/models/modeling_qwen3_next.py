@@ -24,12 +24,13 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.modules.fused_shared_expert import \
+    fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
@@ -38,7 +39,7 @@ from tensorrt_llm._utils import get_sm_version
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams)
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -223,11 +224,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states,
                 lora_params=lora_params,
             )
-            shared_expert_output = F.sigmoid(
-                self.shared_expert_gate(hidden_states)) * shared_expert_output
-            return shared_expert_output
+            shared_expert_gate_logits = self.shared_expert_gate(hidden_states)
+            return shared_expert_output, shared_expert_gate_logits
 
-        final_hidden_states, shared_expert_output = maybe_execute_in_parallel(
+        final_hidden_states, shared_expert_outputs = maybe_execute_in_parallel(
             _compute_routed_output,
             _compute_shared_output,
             self.event_dict[EventType.Main],
@@ -238,22 +238,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if not do_finalize:
             return final_hidden_states
 
+        shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
-            if isinstance(shared_expert_output, torch.Tensor):
-                output_tensor, _ = torch.ops.trtllm.allocate_output(
-                    final_hidden_states, self.allreduce.output_buffer_kind,
-                    self.mapping.tp_group)
-                final_hidden_states = torch.add(
-                    final_hidden_states,
-                    shared_expert_output,
-                    out=output_tensor,
-                )
-            else:
-                final_hidden_states = final_hidden_states + shared_expert_output
+            output_tensor, _ = torch.ops.trtllm.allocate_output(
+                final_hidden_states, self.allreduce.output_buffer_kind,
+                self.mapping.tp_group)
+            final_hidden_states = fused_sigmoid_gate_mul_add(
+                final_hidden_states,
+                shared_expert_gate_logits,
+                shared_expert_output,
+                output=output_tensor,
+            )
             final_hidden_states = self.allreduce(
                 final_hidden_states, all_reduce_params=all_reduce_params)
         else:
-            final_hidden_states = final_hidden_states + shared_expert_output
+            final_hidden_states = fused_sigmoid_gate_mul_add(
+                final_hidden_states, shared_expert_gate_logits,
+                shared_expert_output)
         return final_hidden_states.view(orig_shape)
 
 

@@ -587,7 +587,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         return get_candidate_configs_sm100(config_type_param, sm);
     }
-    if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
+    // Use the Blackwell (SM120+) specialized candidate list only for these cases:
+    //   - FP4 dense GEMM (FP4_ONLY)
+    //   - Mixed FP8/FP4 (FP8FP4_MIXED, e.g., W4A8_MXFP4_*)
+    // If neither applies, fall through (e.g. pure int W4A16/W8A16 handled elsewhere).
+    if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)
+        && ((config_type_param & CutlassGemmConfig::FP4_ONLY) || (config_type_param & CutlassGemmConfig::FP8FP4_MIXED)))
     {
         return get_candidate_configs_sm120(config_type_param);
     }

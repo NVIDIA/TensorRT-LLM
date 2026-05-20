@@ -1016,6 +1016,9 @@ def test_multimodal_input():
     assert config.multimodal_lengths == multimodal_lengths
     # Default value for multimodal_uuids should be None
     assert config.multimodal_uuids is None
+    assert config.multimodal_item_run_cu_offsets is None
+    assert config.multimodal_run_positions is None
+    assert config.multimodal_run_lengths is None
 
 
 @pytest.mark.parametrize(
@@ -1046,6 +1049,34 @@ def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
     assert config.multimodal_uuids == expected_uuids
 
 
+def test_multimodal_input_with_exact_run_buffers():
+    """Test MultimodalInput with exact flat run buffers."""
+    multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
+    multimodal_positions = [1, 8]
+    multimodal_lengths = [3, 2]
+    multimodal_uuids = ["item-a", None]
+    item_run_cu_offsets = [0, 2, 3]
+    run_positions = [1, 5, 8]
+    run_lengths = [2, 1, 2]
+
+    config = trtllm.MultimodalInput(
+        multimodal_hashes,
+        multimodal_positions,
+        multimodal_lengths,
+        multimodal_uuids,
+        item_run_cu_offsets,
+        run_positions,
+        run_lengths,
+    )
+    assert config.multimodal_hashes == multimodal_hashes
+    assert config.multimodal_positions == multimodal_positions
+    assert config.multimodal_lengths == multimodal_lengths
+    assert config.multimodal_uuids == multimodal_uuids
+    assert config.multimodal_item_run_cu_offsets == item_run_cu_offsets
+    assert config.multimodal_run_positions == run_positions
+    assert config.multimodal_run_lengths == run_lengths
+
+
 def test_multimodal_input_pickle_with_uuids():
     """Test pickling and unpickling of MultimodalInput with UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
@@ -1064,6 +1095,26 @@ def test_multimodal_input_pickle_with_uuids():
     assert restored.multimodal_positions == multimodal_positions
     assert restored.multimodal_lengths == multimodal_lengths
     assert restored.multimodal_uuids == multimodal_uuids
+    assert restored.multimodal_item_run_cu_offsets is None
+    assert restored.multimodal_run_positions is None
+    assert restored.multimodal_run_lengths is None
+
+    item_run_cu_offsets = [0, 2, 3]
+    run_positions = [10, 20, 100]
+    run_lengths = [5, 45, 60]
+    config_with_runs = trtllm.MultimodalInput(
+        multimodal_hashes,
+        multimodal_positions,
+        multimodal_lengths,
+        multimodal_uuids,
+        item_run_cu_offsets,
+        run_positions,
+        run_lengths,
+    )
+    restored_with_runs = pickle.loads(pickle.dumps(config_with_runs))
+    assert restored_with_runs.multimodal_item_run_cu_offsets == item_run_cu_offsets
+    assert restored_with_runs.multimodal_run_positions == run_positions
+    assert restored_with_runs.multimodal_run_lengths == run_lengths
 
     # Test with None UUIDs
     config_no_uuids = trtllm.MultimodalInput(multimodal_hashes,

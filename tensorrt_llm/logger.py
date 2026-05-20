@@ -83,13 +83,13 @@ _MODULE_ABBREVIATIONS = {
 
 
 def _format_module(name: str) -> str:
-    """Return a fixed-width display string for *name* (``_MODULE_WIDTH`` chars).
+    """Return a display string for *name*.
 
-    Long names are abbreviated via ``_MODULE_ABBREVIATIONS``;
-    short names are right-padded with spaces.
+    Long names are abbreviated via ``_MODULE_ABBREVIATIONS``; no padding is
+    applied, so short names print at their natural width.
     """
     display = _MODULE_ABBREVIATIONS.get(name, name)
-    return display[:_MODULE_WIDTH].ljust(_MODULE_WIDTH)
+    return display[:_MODULE_WIDTH]
 
 
 # Cache: filename -> module name (avoids repeated frame inspection).
@@ -278,10 +278,13 @@ class Logger(metaclass=Singleton):
             return
         parts = [f"[{self.PREFIX}]"]
         parts.append(severity)
+        module_rank = ""
         if module:
-            parts.append(f"[{_format_module(module)}]")
+            module_rank += f"[{_format_module(module)}]"
         if self.rank is not None:
-            parts.append(f"[RANK {self.rank}]")
+            module_rank += f"[RANK {self.rank}]"
+        if module_rank:
+            parts.append(module_rank)
         parts.extend(map(str, msg))
         self._func_wrapper(severity)(" ".join(parts))
 
