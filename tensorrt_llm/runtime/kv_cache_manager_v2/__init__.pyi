@@ -284,7 +284,7 @@ class _KVCache:
         self,
         manager: "KVCacheManager",
         reuse_scope: ReuseScope,
-        input_tokens: Sequence[TokenIdExt] | None,
+        reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
         cache_salt_id: int | None = None,
@@ -429,6 +429,11 @@ class KVCacheManager:
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
     ) -> _KVCache: ...
+    def probe_reuse(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
