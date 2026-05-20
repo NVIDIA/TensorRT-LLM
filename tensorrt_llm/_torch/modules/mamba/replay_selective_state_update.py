@@ -2269,6 +2269,7 @@ def replay_selective_state_update(
     use_internal_pdl=True,
     write_checkpoint: bool = True,
     rectangle_for_nowrite: bool | None = None,
+    nowrite_first: bool = False,
     mode: str | None = None,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
@@ -2385,6 +2386,8 @@ def replay_selective_state_update(
         use_internal_pdl: enable internal PDL (precompute → main overlap).
             Defaults True; override for testing only.
             Ignored on hardware that doesn't support PDL (sm < 90).
+        nowrite_first: benchmark/tuning knob for mode="persistent_main".
+            When true, launch the nowrite half before the write half.
 
         _-prefixed kwargs (_block_size_m, _num_warps, _num_stages,
         _precompute_num_warps, _precompute_num_stages, _heads_per_block,
@@ -2408,7 +2411,8 @@ def replay_selective_state_update(
     #       write-first; the n_writes tensor partitions the persistent loop
     #       into the two halves with the right WRITE_CHECKPOINT constexpr
     #       each time.  RECTANGLE constexpr (= rectangle_for_nowrite) picks
-    #       rect vs replay for the nowrite half.  write_checkpoint is ignored.
+    #       rect vs replay for the nowrite half.  nowrite_first controls
+    #       launch order only.  write_checkpoint is ignored.
     # Note: mode-and-knob resolution from the default-tuning table happens
     # below, after we have `batch` and `nheads`.
 
@@ -3113,26 +3117,35 @@ def replay_selective_state_update(
         elif mode == "persistent_main":
             # Persistent-CTA main kernel.  One shared dynamic_precompute
             # (per-slot dispatch via PNAT) feeds two persistent_main
-            # launches (write half + nowrite half).  Both halves ALWAYS
-            # launch; the kernel's runtime check iterates only the slots
-            # belonging to its half (write: [0, n_writes), nowrite:
-            # [n_writes, batch)).
+            # launches (write half + nowrite half).  The first main launch in
+            # program order signals the second one when internal PDL is on.
             #
             # Caller-provided contract: `n_writes` is a (1,) int32 device
             # tensor (the kernel reads it at runtime, after the precompute);
             # `replay_work_items` is a (batch, 4) int32 device tensor
             # pre-sorted write-first.
+            def launch_nowrite(launch_dependent_kernels: bool):
+                launch_persistent_main(
+                    write_checkpoint=False,
+                    launch_dependent_kernels=launch_dependent_kernels,
+                    rectangle=rectangle_for_nowrite,
+                )
+
             launch_dynamic_precompute(rectangle=rectangle_for_nowrite)
-            launch_persistent_main(
-                write_checkpoint=True,
-                launch_dependent_kernels=True,
-                rectangle=False,  # write always replay-style
-            )
-            launch_persistent_main(
-                write_checkpoint=False,
-                launch_dependent_kernels=False,
-                rectangle=rectangle_for_nowrite,
-            )
+            if nowrite_first:
+                launch_nowrite(launch_dependent_kernels=True)
+                launch_persistent_main(
+                    write_checkpoint=True,
+                    launch_dependent_kernels=False,
+                    rectangle=False,  # write always replay-style
+                )
+            else:
+                launch_persistent_main(
+                    write_checkpoint=True,
+                    launch_dependent_kernels=True,
+                    rectangle=False,  # write always replay-style
+                )
+                launch_nowrite(launch_dependent_kernels=False)
         else:
             raise ValueError(
                 f"mode={mode!r} is not supported.  Supported modes: "
