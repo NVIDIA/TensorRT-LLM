@@ -1057,7 +1057,7 @@ class PyExecutor:
                     f"iter = {self.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
-                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
+                    f"num_scheduled_requests = {self.num_scheduled_requests}, "
                     f"kv_cache_util = {kv_util_str}, "
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                     f"{self.num_fetch_requests}, "
