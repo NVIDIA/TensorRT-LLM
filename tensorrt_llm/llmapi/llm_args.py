@@ -107,9 +107,7 @@ def Field(default: Any = ...,
 
 
 class CudaGraphConfig(StrictBaseModel):
-    """
-    Configuration for CUDA graphs.
-    """
+    """Configuration for CUDA graphs."""
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
         default=None,
@@ -253,9 +251,7 @@ class GuidedDecodingConfig(StrictBaseModel):
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
-    """
-    Configuration for sparse attention.
-    """
+    """Configuration for sparse attention."""
     algorithm: str
 
     seq_len_threshold: Optional[int] = Field(
@@ -285,9 +281,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for RocketKV sparse attention.
-    """
+    """Configuration for RocketKV sparse attention."""
     algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
         default=32, description="The window size for RocketKV.")
@@ -312,9 +306,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for DeepSeek Sparse Attention.
-    """
+    """Configuration for DeepSeek Sparse Attention."""
     algorithm: Literal["dsa"] = "dsa"
     index_n_heads: Optional[int] = Field(
         default=None, description="The number of heads for the indexer.")
@@ -405,9 +397,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for skip softmax attention.
-    """
+    """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = "skip_softmax"
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
@@ -563,9 +553,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
-        """
-        Retrieves the initial global assignments for a specific layer.
-        """
+        """Retrieves the initial global assignments for a specific layer."""
         if self.initial_global_assignments is None:
             return None
 
@@ -589,9 +577,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
 
 class MoeConfig(StrictBaseModel):
-    """
-    Configuration for MoE.
-    """
+    """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
         "DENSEGEMM", "VANILLA", "TRITON"] = Field(
@@ -634,9 +620,7 @@ TOKENIZER_ALIASES = {
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
-    """
-    Configuration for NVFP4 GEMM backend selection.
-    """
+    """Configuration for NVFP4 GEMM backend selection."""
     allowed_backends: List[Nvfp4Backend] = Field(
         default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
         min_length=1,
@@ -647,9 +631,7 @@ class Nvfp4GemmConfig(StrictBaseModel):
 
 
 class AttentionDpConfig(StrictBaseModel):
-    """
-    Configuration for attention DP.
-    """
+    """Configuration for attention DP."""
     enable_balance: bool = Field(default=False,
                                  description="Whether to enable balance.")
     timeout_iters: int = Field(
@@ -708,9 +690,7 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class CpConfig(StrictBaseModel):
-    """
-    Configuration for context parallelism.
-    """
+    """Configuration for context parallelism."""
     # TODO: given that multiple fields here are only used with specific cp_types, consider
     # making this a Pydantic discriminated union.
     cp_type: CpType = Field(default=CpType.ULYSSES,
@@ -816,9 +796,7 @@ class _ParallelConfig(StrictBaseModel):
 
 
 class CalibConfig(StrictBaseModel):
-    """
-    Calibration configuration.
-    """
+    """Calibration configuration."""
     device: Literal['cuda',
                     'cpu'] = Field(default='cuda',
                                    description="The device to run calibration.")
@@ -1102,9 +1080,7 @@ class KvCacheConnectorConfig(StrictBaseModel):
 
 
 class LayerwiseBenchmarksConfig(StrictBaseModel):
-    """
-    Configuration for layer-wise benchmarks calibration.
-    """
+    """Configuration for layer-wise benchmarks calibration."""
     calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
         default="NONE",
         description=
@@ -1488,9 +1464,7 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for NGram drafter speculative decoding.
-    """
+    """Configuration for NGram drafter speculative decoding."""
     decoding_type: Literal["NGram"] = "NGram"
     max_matching_ngram_size: PositiveInt = Field(
         default=2,
@@ -2020,8 +1994,7 @@ class ExecutorMemoryType(StrEnum):
 
 @dataclass
 class _SleepConfigDefaultFactory:
-    """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict.
-    """
+    """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict."""
 
     default_mode: Any
 
@@ -2030,8 +2003,7 @@ class _SleepConfigDefaultFactory:
 
 
 class SleepConfig(StrictBaseModel):
-    """Configuration for the LLM sleep/wakeup feature.
-    """
+    """Configuration for the LLM sleep/wakeup feature."""
 
     restore_modes: dict[
         ExecutorMemoryType, Literal["NONE", "MEMSET", "CPU", "PINNED"]
@@ -2275,9 +2247,7 @@ class PybindMirrorMeta(type(PybindMirror)):
 
 
 class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
-    """
-    Combined metaclass for Enum and PybindMirror.  This is crucial.
-    """
+    """Combined metaclass for Enum and PybindMirror.  This is crucial."""
 
 
 @PybindMirror.mirror_pybind_enum(_BatchingType)
@@ -2381,9 +2351,7 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
 class PeftCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the PEFT cache.
-    """
+    """Configuration for the PEFT cache."""
     num_host_module_layer: int = Field(
         default=0,
         description=
@@ -2451,9 +2419,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
 class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
-    """
-    Configuration for lookahead speculative decoding.
-    """
+    """Configuration for lookahead speculative decoding."""
 
     decoding_type: Literal["Lookahead"] = "Lookahead"
     max_window_size: PositiveInt = Field(
@@ -2556,9 +2522,7 @@ class ReorderRequestPolicyConfig(StrictBaseModel):
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the KV cache.
-    """
+    """Configuration for the KV cache."""
     enable_block_reuse: bool = Field(
         default=True,
         description=
@@ -2771,9 +2735,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
 class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for extended runtime performance knobs.
-    """
+    """Configuration for extended runtime performance knobs."""
 
     multi_block_mode: bool = Field(
         default=True, description="Whether to use multi-block mode.")
@@ -2802,9 +2764,7 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the cache transceiver.
-    """
+    """Configuration for the cache transceiver."""
 
     backend: Optional[Literal[
         "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
@@ -2914,9 +2874,7 @@ class DwdpConfig(StrictBaseModel):
 
 
 class BaseLlmArgs(StrictBaseModel):
-    """
-    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
-    """
+    """Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     # Explicit arguments
@@ -3431,9 +3389,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def init_build_config(self):
-        """
-        Creating a default BuildConfig if none is provided
-        """
+        """Creating a default BuildConfig if none is provided."""
         build_config = getattr(self, "build_config", None)
         if build_config is None:
             kwargs = {}
@@ -3758,9 +3714,7 @@ class SamplerType(StrEnum):
 
 
 class TorchCompileConfig(StrictBaseModel):
-    """
-    Configuration for torch.compile.
-    """
+    """Configuration for torch.compile."""
     enable_fullgraph: bool = Field(
         default=True,
         description="Enable full graph compilation in torch.compile.")
