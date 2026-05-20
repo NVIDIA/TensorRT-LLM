@@ -197,11 +197,102 @@ class BaseMultimodalInputProcessor(ABC):
         """The dtype for this model."""
         ...
 
-    @abstractmethod
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """Dispatch between text-prompt and tokenized+MM fast paths.
+
+        - Tokenized+MM fast path (`prompt_token_ids` set, `multi_modal_data` set,
+          no `prompt`): delegate to `call_with_token_ids`, which builds dummy
+          placeholder text, runs `call_with_txt_prompt` on it to populate the
+          multimodal payload, then expands the real token IDs via
+          `expand_prompt_token_ids_for_mm`.
+        - Else (text prompt with/without MM data, or tokenize-only requests):
+          delegate to `call_with_txt_prompt`.
+
+        Non-fast-path VLMs are detokenized upstream in `llm.py`, so this
+        dispatcher only sees fast-path-eligible inputs in the first branch.
+        """
+        if (inputs.get("prompt_token_ids") is not None
+                and inputs.get("multi_modal_data") is not None
+                and inputs.get("prompt") is None):
+            return self.call_with_token_ids(inputs, sampling_params)
+        return self.call_with_txt_prompt(inputs, sampling_params)
+
+    @abstractmethod
+    def call_with_txt_prompt(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """Process `inputs` containing a text `prompt` (and optionally `multi_modal_data`).
+
+        Subclasses implement this with the HF processor pipeline that turns
+        `(text_prompt, mm_data)` into `(token_ids, extra_processed_inputs)`.
+        """
         ...
+
+    def call_with_token_ids(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """Fast path for `prompt_token_ids + multi_modal_data` without detokenizing.
+
+        Requires the subclass to implement `get_text_with_mm_placeholders` and
+        `expand_prompt_token_ids_for_mm`. Otherwise raises `NotImplementedError`
+        (callers should detokenize upstream — see `llm.py`).
+        """
+        get_text = getattr(self, "get_text_with_mm_placeholders", None)
+        expand_ids = getattr(self, "expand_prompt_token_ids_for_mm", None)
+        if get_text is None or expand_ids is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement the tokenized+MM "
+                "fast path. Detokenize `prompt_token_ids` to a text prompt "
+                "before calling.")
+
+        prompt_token_ids = inputs["prompt_token_ids"]
+        mm_data = inputs["multi_modal_data"]
+        mm_counts = _mm_data_to_counts(mm_data)
+
+        # Run the HF processor / vision encoder on a synthetic placeholder
+        # prompt to populate `extra_processed_inputs["multimodal_data"]`. Some
+        # auxiliary streams (e.g. video evs_ids) computed against this dummy
+        # text are stale w.r.t. the real prompt and get overwritten below.
+        extra_processed_inputs = _process_multimodal_with_dummy_placeholders(
+            self,
+            mm_data,
+            mm_counts,
+            inputs.get("mm_processor_kwargs"),
+            sampling_params,
+        )
+
+        num_mm_tokens = _get_single_mm_token_lengths(
+            mm_data,
+            self,
+            multimodal_data=(extra_processed_inputs
+                             or {}).get("multimodal_data"),
+        )
+        if num_mm_tokens is None:
+            raise ValueError(
+                "call_with_token_ids: find_mm_token_lengths returned no token "
+                "lengths for the provided multi_modal_data.")
+
+        expanded_ids, mm_data_updates = expand_ids(
+            prompt_token_ids,
+            num_mm_tokens,
+            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
+            mm_data=mm_data,
+        )
+
+        # Merge any model-specific auxiliary streams (e.g. video evs_ids for
+        # EVS-enabled runs) into extra_processed_inputs["multimodal_data"],
+        # overwriting the stale values produced from the dummy prompt above so
+        # downstream consumers (`merge_evs_mm_embeds` etc.) read the values
+        # rebuilt from the real prompt token IDs.
+        if mm_data_updates:
+            mm_container = extra_processed_inputs.setdefault(
+                "multimodal_data", {})
+            for modality, field_updates in mm_data_updates.items():
+                mm_container.setdefault(modality, {}).update(field_updates)
+
+        return expanded_ids, extra_processed_inputs
 
     @property
     def use_fast(self) -> bool:
@@ -879,90 +970,16 @@ def create_input_processor_with_hash(
         A wrapped processor that modifies prompts before processing.
     """
 
-    def tokenized_multimodal_process(
-        inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Process prompt_token_ids and multi_modal_data without detokenizing.
-
-        Runs the input processor with dummy text placeholders for multi-modal slots,
-        then replaces placeholder token IDs with the actual feature token IDs and
-        delegates to multimodal_hashing_process.
-
-        Args:
-            inputs: TextPrompt with "prompt_token_ids" and "multi_modal_data" (and optional "mm_processor_kwargs").
-            sampling_params: Sampling parameters for the input processor.
-
-        Returns:
-            (prompt_token_ids, extra_processed_inputs) from multimodal_hashing_process.
-            ([], None) if multi-modal token lengths cannot be determined.
-        """
-        prompt_token_ids = inputs["prompt_token_ids"]
-        mm_data = inputs["multi_modal_data"]
-        mm_counts = _mm_data_to_counts(mm_data)
-        extra_processed_inputs = _process_multimodal_with_dummy_placeholders(
-            input_processor,
-            mm_data,
-            mm_counts,
-            inputs.get("mm_processor_kwargs"),
-            sampling_params,
-        )
-        num_mm_tokens = _get_single_mm_token_lengths(
-            mm_data,
-            input_processor,
-            multimodal_data=(extra_processed_inputs
-                             or {}).get("multimodal_data"),
-        )
-        if num_mm_tokens is None:
-            raise ValueError(
-                "tokenized_multimodal_process: find_mm_token_lengths returned "
-                "no token lengths for the provided multi_modal_data.")
-
-        expanded_ids, mm_data_updates = input_processor.expand_prompt_token_ids_for_mm(
-            prompt_token_ids,
-            num_mm_tokens,
-            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
-            mm_data=mm_data,
-        )
-
-        # Merge any model-specific auxiliary streams (e.g. video evs_ids for
-        # EVS-enabled runs) into extra_processed_inputs["multimodal_data"].
-        # The dummy-placeholder pass above produced these against the synthetic
-        # placeholder text, so they're stale w.r.t. the real prompt; overwrite
-        # them with the values rebuilt from `prompt_token_ids` here so
-        # `merge_evs_mm_embeds` picks up the correct stream at LLM forward time.
-        if mm_data_updates:
-            mm_container = extra_processed_inputs.setdefault(
-                "multimodal_data", {})
-            for modality, field_updates in mm_data_updates.items():
-                mm_container.setdefault(modality, {}).update(field_updates)
-
-        return multimodal_hashing_process(
-            inputs,
-            sampling_params,
-            precomputed_token_ids=expanded_ids,
-            precomputed_extra=extra_processed_inputs,
-            precomputed_num_mm_tokens=num_mm_tokens,
-        )
-
     def multimodal_hashing_process(
-        inputs: TextPrompt,
-        sampling_params: SamplingParams,
-        *,
-        precomputed_token_ids: Optional[List[int]] = None,
-        precomputed_extra: Optional[ExtraProcessedInputs] = None,
-        precomputed_num_mm_tokens: Optional[List[int]] = None,
+        inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
         Process multimodal hashing for media tokens if possible.
 
-        precomputed_token_ids and precomputed_extra must be provided together or
-        both be None. When both are provided (tokenized+MM path), skips the
-        input_processor call and uses them; when both are None, calls input_processor.
-
-        precomputed_num_mm_tokens is optional and independent: if provided, skips
-        the otherwise-duplicate find_mm_token_lengths call (the tokenized+MM path
-        already computes it upstream to expand the prompt).
+        Delegates the raw `(token_ids, extra_processed_inputs)` production to
+        the input processor's `__call__` (which itself dispatches between the
+        text-prompt and tokenized+MM fast paths), then computes hashes,
+        positions, and masks on top.
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
         When a UUID is provided for a multimodal item, it will be used as the
@@ -976,30 +993,19 @@ def create_input_processor_with_hash(
 
         mm_hashes, mm_uuid_list = apply_mm_hashes(mm_data, mm_uuids, hash_lib)
 
-        if precomputed_token_ids is not None and precomputed_extra is not None:
-            prompt_token_ids = precomputed_token_ids
-            extra_processed_inputs = precomputed_extra
-        elif precomputed_token_ids is None and precomputed_extra is None:
-            prompt_token_ids, extra_processed_inputs = input_processor(
-                inputs, sampling_params)
-        else:
-            raise ValueError(
-                "precomputed_token_ids and precomputed_extra must be provided "
-                "together or both be None; got one without the other.")
+        prompt_token_ids, extra_processed_inputs = input_processor(
+            inputs, sampling_params)
 
-        if precomputed_num_mm_tokens is not None:
-            num_mm_tokens = precomputed_num_mm_tokens
-        else:
-            # TODO: here we assume there is only one modality for now
-            num_mm_tokens_by_key = find_mm_token_lengths(
-                mm_data,
-                input_processor,
-                multimodal_data=(extra_processed_inputs
-                                 or {}).get("multimodal_data"),
-            )
-            if not num_mm_tokens_by_key:
-                return [], None
-            num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
+        # TODO: here we assume there is only one modality for now
+        num_mm_tokens_by_key = find_mm_token_lengths(
+            mm_data,
+            input_processor,
+            multimodal_data=(extra_processed_inputs
+                             or {}).get("multimodal_data"),
+        )
+        if not num_mm_tokens_by_key:
+            return [], None
+        num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
         if len(num_mm_tokens) <= 0:
             return [], None
 
@@ -1050,15 +1056,6 @@ def create_input_processor_with_hash(
                 mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list,
                 item_run_cu_offsets, run_positions, run_lengths)
         return prompt_token_ids, extra_processed_inputs
-
-    def process_tokenized_prompt_maybe_hash(
-        inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        try:
-            return tokenized_multimodal_process(inputs, sampling_params)
-        except Exception as e:
-            logger.warning(f"Tokenized+MM path failed: {e}")
-            raise
 
     def process_prompt_maybe_hash(
         inputs: TextPrompt, sampling_params: SamplingParams
@@ -1116,21 +1113,11 @@ def create_input_processor_with_hash(
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        # Tokenized prompt + multi_modal_data path: requires the optional hooks.
-        # If the processor lacks them, fall through to the regular prompt path.
-        has_tokenized_multimodal_prompt = (
-            inputs.get("prompt_token_ids") is not None
-            and inputs.get("multi_modal_data") is not None
-            and inputs.get("prompt") is None
-            and hasattr(input_processor, "get_text_with_mm_placeholders")
-            and hasattr(input_processor, "expand_prompt_token_ids_for_mm"))
-
-        if has_tokenized_multimodal_prompt:
-            prompt_token_ids, extra_processed_inputs = (
-                process_tokenized_prompt_maybe_hash(inputs, sampling_params))
-        else:
-            prompt_token_ids, extra_processed_inputs = (
-                process_prompt_maybe_hash(inputs, sampling_params))
+        # The input processor's __call__ dispatches between the text-prompt
+        # and tokenized+MM fast paths internally; this wrapper only adds
+        # hashing/masking/cumsum on top.
+        prompt_token_ids, extra_processed_inputs = process_prompt_maybe_hash(
+            inputs, sampling_params)
 
         maybe_compute_mm_embed_cumsum(prompt_token_ids, extra_processed_inputs,
                                       input_processor)

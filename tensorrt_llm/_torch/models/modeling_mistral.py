@@ -414,7 +414,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         return self._dtype
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_txt_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], ExtraProcessedInputs | None]:
         images = inputs.get("multi_modal_data", {}).get("image")

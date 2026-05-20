@@ -2128,7 +2128,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return num_tokens_per_frame_lst
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_txt_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get("multi_modal_data", {})

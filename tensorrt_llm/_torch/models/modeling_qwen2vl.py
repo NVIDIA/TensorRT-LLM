@@ -353,7 +353,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
     @torch.inference_mode()
-    def __call__(
+    def call_with_txt_prompt(
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,
