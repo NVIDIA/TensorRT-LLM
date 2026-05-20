@@ -3759,7 +3759,7 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
 def test_llmapi_lora(E2E_MODEL_NAME, TENSOR_PARALLEL_SIZE,
                      llm_backend_inflight_batcher_llm_root, llm_backend_venv,
                      tiny_llama_model_root, tiny_llama_lora_model_root):
-    """E2E LoRA test for the new llmapi triton backend (closes #11257).
+    """E2E LoRA test for the new llmapi triton backend.
 
     Templates `model.yaml` with `lora_config:` pointing at a TinyLlama
     HF LoRA adapter, launches Triton with the llmapi backend, and sends
