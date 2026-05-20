@@ -565,13 +565,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
 
-        # Upper bound on the per-rank token count used for warmup forward passes
-        # (both the max-shape general warmup and the autotuner warmup). Each
-        # tunable op currently generates tuning buckets only up to 8192 (see
-        # MAX_PROFILE_BUCKET in trtllm_gen_custom_ops.py and related files), so
-        # warmup shapes larger than this do not improve tuning quality.
-        self.max_warmup_tokens = 8192
-
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
@@ -752,8 +745,7 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1),
-                                    self.max_warmup_tokens)
+                                    self.batch_size * (self.max_seq_len - 1))
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -902,8 +894,7 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1),
-                                    self.max_warmup_tokens)
+                                    self.batch_size * (self.max_seq_len - 1))
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -2649,7 +2640,7 @@ class PyTorchModelEngine(ModelEngine):
         _n_gen = len(generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
-            beam_width = generation_requests[0].sampling_config.beam_width
+            beam_width = generation_requests[0].py_beam_width
 
             # Pre-extend constant-value lists to avoid per-request append
             # overhead (saves ~3 append calls per request).

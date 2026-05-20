@@ -162,6 +162,11 @@ class CachedSequenceInterface:
         """Return all the named arguments owned by this interface."""
         return {**self.info.named_args, **self._caches}
 
+    @property
+    def resource_names(self) -> Tuple[str, ...]:
+        """Return names of cache/resource arguments owned by this interface."""
+        return tuple(self._caches.keys() or self._resource_lookup.keys())
+
     def get_arg(
         self, name: str, truncate: Optional[bool] = None, unflatten: Optional[bool] = None
     ) -> torch.Tensor:

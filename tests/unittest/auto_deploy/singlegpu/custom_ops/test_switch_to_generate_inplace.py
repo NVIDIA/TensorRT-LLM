@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,6 +74,27 @@ def _nest_prefill(si: SequenceInfo, input_ids, pages_per_seq, cache_loc, **kw):
         **kw,
     )
     return si
+
+
+def _snapshot_host_views(si: SequenceInfo):
+    """Snapshot full host buffers so current-length updates do not hide host writes."""
+    return {
+        name: si._input_buffer.get_host_view(name).clone() for name in si._input_buffer.tensor_names
+    }
+
+
+def _host_views_unchanged(si: SequenceInfo, snapshots):
+    """Return whether host staging buffers are byte-for-byte unchanged."""
+    return all(
+        torch.equal(si._input_buffer.get_host_view(name), expected)
+        for name, expected in snapshots.items()
+    )
+
+
+def _has_active_host_arg(si: SequenceInfo):
+    """Return whether any managed host mirror is an active graph input."""
+    host_mirrors = {name + si._host_suffix for name in si._input_buffer.tensor_names}
+    return bool(host_mirrors & set(si._active_args))
 
 
 class TestSwitchToGeneratePackedToDecode:
@@ -291,6 +312,68 @@ class TestSwitchToGeneratePageBoundary:
 
 class TestSwitchToGenerateHostArgHandling:
     """Validate host arg warning and d2h sync behavior."""
+
+    def test_inactive_host_mirrors_not_synced_by_switch_to_generate(self):
+        """Inactive host mirrors should keep pre-transition staging values."""
+        si = _make_seq_info()
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        assert not _has_active_host_arg(si)
+        host_views_before = _snapshot_host_views(si)
+
+        si.switch_to_generate_()
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+
+        assert _host_views_unchanged(si, host_views_before)
+        assert si._input_buffer.get_host_view("cu_seqlen")[:3].tolist() == [0, 3, 7]
+
+    def test_inactive_host_mirrors_not_synced_by_offset_pos_and_cache(self):
+        """Inactive host mirrors should keep pre-offset staging values."""
+        si = _make_seq_info()
+        si.nest_sequences(
+            [1, 2],
+            cu_seqlen=[0, 1, 2],
+            input_pos=[5, 10],
+            batch_info=[0, 0, 0, 0, 2, 2],
+            cache_loc=[10, 11, 20, 21, 22],
+            cu_num_pages=[0, 2, 5],
+            extra_page_per_seq=[-1, -1],
+        )
+
+        assert not _has_active_host_arg(si)
+        host_views_before = _snapshot_host_views(si)
+
+        increment = torch.tensor([1, 1], dtype=torch.int32, device=si.device)
+        si.offset_pos_and_cache_(increment)
+
+        device_pos = si._input_buffer.get_view("position_ids")
+        assert device_pos[:2].tolist() == [6, 11]
+
+        assert _host_views_unchanged(si, host_views_before)
+
+    def test_active_host_mirror_synced_by_switch_to_generate(self):
+        """Active host mirrors should be refreshed from device metadata."""
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        si.switch_to_generate_()
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+        assert host_cu[:3].tolist() == [0, 1, 2]
 
     def test_non_native_host_arg_syncs_device_to_host(self):
         """Activating a non-native host arg should sync device -> host instead of raising."""

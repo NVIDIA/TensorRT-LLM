@@ -341,8 +341,6 @@ l0_b200:
   - unittest/auto_deploy/singlegpu/transformations/library/test_quant_moe.py
   - unittest/auto_deploy/singlegpu/transformations/library/test_quantization.py
   - unittest/auto_deploy/singlegpu/transformations/library/test_trtllm_gen_diag.py
-  # ------------- AutoDeploy Perf Sanity ---------------
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)
 
 - condition:
     ranges:

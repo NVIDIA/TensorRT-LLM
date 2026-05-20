@@ -457,7 +457,13 @@ class BaseWorker(GenerationExecutor):
                     multimodal_lengths=request.multimodal_params.
                     multimodal_input.multimodal_lengths,
                     multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids)
+                    multimodal_uuids,
+                    multimodal_item_run_cu_offsets=request.multimodal_params.
+                    multimodal_input.multimodal_item_run_cu_offsets,
+                    multimodal_run_positions=request.multimodal_params.
+                    multimodal_input.multimodal_run_positions,
+                    multimodal_run_lengths=request.multimodal_params.
+                    multimodal_input.multimodal_run_lengths)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 

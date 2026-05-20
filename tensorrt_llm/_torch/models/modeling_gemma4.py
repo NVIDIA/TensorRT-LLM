@@ -980,23 +980,41 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         self,
         mm_token_type_ids: torch.Tensor,
         effective_sliding_window: Optional[int] = None,
+        prefix_len: int = 0,
     ):
-        """Build context mask with causal + bidirectional for MM tokens."""
-        device = mm_token_type_ids.device
-        sequence_length = len(mm_token_type_ids)
+        """Build context mask with causal + bidirectional for MM tokens.
 
-        if effective_sliding_window is None or effective_sliding_window >= sequence_length:
-            causal_mask = torch.arange(sequence_length, device=device).unsqueeze(0) <= torch.arange(
-                sequence_length, device=device
+        Returns a [extend_len, prefix_len + extend_len] mask where:
+        - The first `prefix_len` columns (cached/paged history) are True for
+          all rows. SWA window enforcement is delegated to the kernel's
+          window_left clip. Bidirectional MM across the prefix/extend
+          boundary is NOT supported here; callers must ensure chunk
+          boundaries do not split a multimodal block.
+        - The last `extend_len` columns follow the original causal +
+          (optional) sliding window + MM-bidirectional logic.
+        """
+        device = mm_token_type_ids.device
+        extend_len = len(mm_token_type_ids)
+
+        if effective_sliding_window is None or effective_sliding_window >= extend_len:
+            causal_mask = torch.arange(extend_len, device=device).unsqueeze(0) <= torch.arange(
+                extend_len, device=device
             ).unsqueeze(1)
         else:
-            pos = torch.arange(sequence_length, device=device)
+            pos = torch.arange(extend_len, device=device)
             causal_mask = (pos.unsqueeze(0) <= pos.unsqueeze(1)) & (
                 pos.unsqueeze(0) > pos.unsqueeze(1) - effective_sliding_window
             )
 
         token_type_mask = self._get_token_type_mask(mm_token_type_ids)
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
+
+        if prefix_len > 0:
+            prefix_block = torch.ones(
+                extend_len, prefix_len, dtype=causal_mask.dtype, device=device
+            )
+            causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
+
         return causal_mask
 
     def get_flashinfer_attention_mask(
@@ -1014,13 +1032,14 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
 
         qo_indptr = attn_metadata.qo_indptr[: num_contexts + 1]
         cached_token_lens = attn_metadata.cached_token_lens[:num_contexts]
-        assert (cached_token_lens == 0).all()
 
         context_mask_list = []
         for i in range(num_contexts):
+            prefix_len = int(cached_token_lens[i].item())
             mask_i = self.get_context_mask(
                 mm_token_type_ids=mm_token_type_ids[qo_indptr[i] : qo_indptr[i + 1]],
                 effective_sliding_window=effective_sliding_window,
+                prefix_len=prefix_len,
             )
             context_mask_list.append(mask_i.flatten())
         return torch.cat(context_mask_list, dim=0).contiguous()
