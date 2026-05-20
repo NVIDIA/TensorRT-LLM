@@ -800,6 +800,17 @@ class QwenImageTransformer2DModel(nn.Module):
     def device(self) -> torch.device:
         return self.proj_out.weight.device
 
+    def _weight_loading_device(self) -> torch.device:
+        for param in self.parameters():
+            if param.device.type != "meta":
+                return param.device
+        for buffer in self.buffers():
+            if buffer.device.type != "meta":
+                return buffer.device
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
     @classmethod
     def from_config_dict(cls, cfg: Dict[str, Any], **kwargs) -> "QwenImageTransformer2DModel":
         """Build from a transformer/config.json dict."""
@@ -823,9 +834,11 @@ class QwenImageTransformer2DModel(nn.Module):
         """
         weights = _remap_checkpoint_keys(weights)
 
+        device = self._weight_loading_device()
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
+                module.to(device)
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
