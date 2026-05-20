@@ -46,6 +46,134 @@ enum class BufferKind : uint8_t
     kRNN = 2
 };
 
+class BaseTransBufferManager;
+
+/// @brief RAII scoped holder for a buffer index acquired from
+///        BaseTransBufferManager::assignBufferIndexForRecv /
+///        assignBufferIndexForSend. Releases the index on destruction,
+///        including stack unwind from exceptions.
+///
+/// Motivation: CacheReceiver::Impl::requestSync has at least six exit
+/// paths (normal, early-cancel, not-ready, cancel-after-ready,
+/// receiveReadySignal cancelled, exception from requestSync). Pre-fix,
+/// the buffer-index release lived inside receiveSync's formatter, so any
+/// exit path that skipped receiveSync leaked one index. Under saturation
+/// even a single leaked index permanently wedged the (default size-1)
+/// pool, so every subsequent request waited forever for an index that
+/// would never be released.
+///
+/// This holder closes that class of bug rather than patching the one
+/// observed branch. Move-only so ownership is unambiguous; `detach()`
+/// hands off ownership when the formatter inside receiveSync takes the
+/// buffer's release responsibility on the happy path.
+class BufferIndexHolder
+{
+public:
+    BufferIndexHolder() = default;
+
+    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv,
+        std::optional<uint64_t> requestIdForLog = std::nullopt) noexcept
+        : mMgr(&mgr)
+        , mIndex(index)
+        // mHeld means this object is responsible for either releasing a
+        // concrete preallocated slot or poisoning dynamic transfer memory on an
+        // unsafe exit. It is therefore true even when index == std::nullopt.
+        , mHeld(true)
+        , mIsRecv(isRecv)
+        , mRequestIdForLog(requestIdForLog)
+    {
+    }
+
+    // The destructor is inline but `release()` is out-of-line in
+    // baseTransBuffer.cpp because it dereferences BaseTransBufferManager and
+    // needs the full definition; defining it inline would create an include
+    // cycle between this header and the manager definition.
+    ~BufferIndexHolder()
+    {
+        release();
+    }
+
+    BufferIndexHolder(BufferIndexHolder const&) = delete;
+    BufferIndexHolder& operator=(BufferIndexHolder const&) = delete;
+
+    BufferIndexHolder(BufferIndexHolder&& other) noexcept
+        : mMgr(other.mMgr)
+        , mIndex(other.mIndex)
+        , mHeld(other.mHeld)
+        , mIsRecv(other.mIsRecv)
+        , mRequestIdForLog(other.mRequestIdForLog)
+    {
+        other.mHeld = false;
+    }
+
+    BufferIndexHolder& operator=(BufferIndexHolder&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            mMgr = other.mMgr;
+            mIndex = other.mIndex;
+            mHeld = other.mHeld;
+            mIsRecv = other.mIsRecv;
+            mRequestIdForLog = other.mRequestIdForLog;
+            other.mHeld = false;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] std::optional<int> index() const noexcept
+    {
+        return mIndex;
+    }
+
+    /// @brief Whether this holder still owns release/poison responsibility.
+    ///        For dynamic-buffer paths, mIndex can be std::nullopt while this
+    ///        remains true so poison() can still fail closed on unsafe exits.
+    [[nodiscard]] bool held() const noexcept
+    {
+        return mHeld;
+    }
+
+    /// @brief Relinquish ownership without releasing. Use when a downstream
+    ///        owner (e.g. the formatter inside receiveSync) takes over the
+    ///        release responsibility on the happy path.
+    std::optional<int> detach() noexcept
+    {
+        mHeld = false;
+        return mIndex;
+    }
+
+    /// @brief Happy-path release. Frees the slot immediately and disarms the
+    ///        destructor. Use this on any path where the caller has confirmed
+    ///        the slot is no longer needed and the release is the expected
+    ///        outcome (e.g. the sender formatter after sendAllBuffers
+    ///        returns). After this call, the holder owns nothing; subsequent
+    ///        destructor or move-assignment is a no-op.
+    ///
+    ///        If the holder goes out of scope with mHeld still true (exception
+    ///        or early return that forgot to call release/detach), the
+    ///        destructor calls release() to free the slot.
+    void release() noexcept;
+
+    /// @brief Fail-closed release for paths where transport quiescence is not
+    ///        known. The buffer slot is marked poisoned, is not returned to
+    ///        the pool, and later assignments fail so the process must restart
+    ///        before serving more transfer traffic.
+    void poison() noexcept;
+
+private:
+    BaseTransBufferManager* mMgr{nullptr};
+    std::optional<int> mIndex{};
+    bool mHeld{false};
+    bool mIsRecv{true};
+    std::optional<uint64_t> mRequestIdForLog{};
+};
+
+/// @brief Default per-iteration slice for the buffer-acquire CV wait. Chosen
+///        small enough to keep cancellation latency under ~100 ms and large
+///        enough to avoid spinning under saturation.
+inline constexpr int64_t kBufferAcquireSliceMs = 100;
+
 /// @brief Base class for cache transfer buffer management.
 /// Handles buffer pool allocation, index assignment, and slicing.
 /// Derived classes provide cache-specific size calculations.
@@ -57,20 +185,50 @@ public:
     [[nodiscard]] virtual BufferKind getBufferKind() const = 0;
 
     /// @brief Assign a buffer index for sending.
+    /// @param perRequestCancel Optional per-request cancel flag. When non-null
+    ///        and flipped true while this call is parked on the pool-exhausted
+    ///        CV wait, the function throws so the caller (sender worker) can
+    ///        unwind instead of blocking indefinitely. Checked every
+    ///        `waitSliceMs` during the wait. Parity with
+    ///        assignBufferIndexForRecv.
+    /// @param waitSliceMs Per-iteration timeout for the internal condition
+    ///        variable wait (ms). Defaults to kBufferAcquireSliceMs.
+    /// @param requestIdForLog Optional request id used to tag any
+    ///        diagnostic log lines so a pool-exhausted wedge on the send
+    ///        side can be attributed to a specific reqId.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
-    std::optional<int> assignBufferIndexForSend();
+    std::optional<int> assignBufferIndexForSend(std::atomic<bool> const* perRequestCancel = nullptr,
+        int64_t waitSliceMs = kBufferAcquireSliceMs, std::optional<uint64_t> requestIdForLog = std::nullopt);
 
     /// @brief Free a buffer index used for sending.
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForSend(std::optional<int> bufferId);
 
+    /// @brief Poison a send buffer index after an unquiesced transfer exit.
+    void poisonBufferIndexForSend(std::optional<int> bufferId) noexcept;
+
     /// @brief Assign a buffer index for receiving.
+    /// @param perRequestCancel Optional per-request cancel flag. When non-null
+    ///        and flipped true while this call is parked on the pool-exhausted
+    ///        CV wait, the function throws so the caller (drain worker) can
+    ///        unwind instead of blocking indefinitely. Checked every
+    ///        `waitSliceMs` during the wait; also bounds the wait by polling
+    ///        for recovery even without an explicit cancel.
+    /// @param waitSliceMs Per-iteration timeout for the internal condition
+    ///        variable wait (ms). Defaults to kBufferAcquireSliceMs.
+    /// @param requestIdForLog Optional request id used to tag any
+    ///        diagnostic log lines so a pool-exhausted wedge can be
+    ///        attributed to a specific reqId.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
-    std::optional<int> assignBufferIndexForRecv();
+    std::optional<int> assignBufferIndexForRecv(std::atomic<bool> const* perRequestCancel = nullptr,
+        int64_t waitSliceMs = kBufferAcquireSliceMs, std::optional<uint64_t> requestIdForLog = std::nullopt);
 
     /// @brief Free a buffer index used for receiving.
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForRecv(std::optional<int> bufferId);
+
+    /// @brief Poison a receive buffer index after an unquiesced transfer exit.
+    void poisonBufferIndexForRecv(std::optional<int> bufferId) noexcept;
 
     /// @brief Get or allocate send buffers for cache transfer.
     /// @param bufferId The assigned buffer ID.
@@ -125,6 +283,7 @@ protected:
         std::mutex mBuffersMutex;
         std::condition_variable mBuffersCV;
         std::atomic<int> mConcurrence{0};
+        std::atomic<bool> mPoisoned{false};
     };
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
@@ -132,9 +291,13 @@ protected:
         runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
 
     void allocateBuffer();
-    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);
+    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer,
+        std::atomic<bool> const* perRequestCancel = nullptr, int64_t waitSliceMs = kBufferAcquireSliceMs,
+        std::optional<uint64_t> requestIdForLog = std::nullopt);
     void freeBufferIndex(
         ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
+    void poisonBufferIndex(ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount,
+        bool onlyUseDynamicBuffer, char const* direction) noexcept;
 
     size_t mPreAllocBufferSize;
     size_t mRecvBufferCount;

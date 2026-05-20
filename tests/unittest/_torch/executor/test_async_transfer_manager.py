@@ -15,7 +15,7 @@
 
 from unittest.mock import MagicMock
 
-from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager
+from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -81,7 +81,9 @@ def test_start_transfer_single_request():
     # Check seq slot manager was called to free resources
     seq_slot_manager.free_resources.assert_called_once_with(request)
 
-    manager.end_transfer(request)
+    transfer_result = manager.end_transfer(request)
+    assert transfer_result.completed
+    assert not transfer_result.needs_termination
     kv_cache_manager.unpin_blocks_by_id.assert_called_once()
 
 
@@ -105,10 +107,13 @@ def test_start_transfer_multiple_transfers_same_request():
     kv_cache_manager.store_blocks_for_reuse.assert_called_once()
 
     for _ in range(2):
-        manager.end_transfer(request)
+        transfer_result = manager.end_transfer(request)
+        assert not transfer_result.completed
         kv_cache_manager.unpin_blocks_by_id.assert_not_called()
 
-    manager.end_transfer(request)
+    transfer_result = manager.end_transfer(request)
+    assert transfer_result.completed
+    assert not transfer_result.needs_termination
     kv_cache_manager.unpin_blocks_by_id.assert_called_once()
 
 
@@ -135,7 +140,9 @@ def test_transfer_without_storing_blocks():
     kv_cache_manager.store_blocks_for_reuse.assert_not_called()
     spec_resource_manager.free_resources.assert_called_once_with(request)
 
-    assert manager.end_transfer(request)
+    transfer_result = manager.end_transfer(request)
+    assert transfer_result.completed
+    assert not transfer_result.needs_termination
 
     kv_cache_manager.unpin_blocks_by_id.assert_not_called()
 
@@ -153,7 +160,9 @@ def test_end_transfer_preserves_error_state():
     # Set error state before end_transfer
     request.state = LlmRequestState.DISAGG_TRANS_ERROR
 
-    manager.end_transfer(request)
+    transfer_result = manager.end_transfer(request)
+    assert transfer_result.completed
+    assert not transfer_result.needs_termination
 
     # Error state should be preserved
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
@@ -180,3 +189,91 @@ def test_requests_in_transfer():
     assert in_transfer[1] is request1
     assert in_transfer[2] is request2
     assert in_transfer[3] is request3
+
+
+def test_end_transfer_reports_deferred_termination_needed():
+    """End transfer reports when deferred termination must be retried."""
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = [100]
+    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
+    manager = AsyncTransferManager(resource_manager, should_store_blocks=True)
+    request = create_mock_request(42)
+    manager.start_transfer(request)
+    manager.mark_termination_requested(request)
+
+    transfer_result = manager.end_transfer(request)
+
+    assert transfer_result.completed
+    assert transfer_result.needs_termination
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with([100])
+
+
+def test_deferred_termination_survives_until_transfer_completion():
+    """Termination requested during transfer is retried after transfer ends.
+
+    This mock-driven test covers the cleanup contract directly; the
+    cancellation timing that triggered the rc13 block-reuse wedge is covered by
+    the disaggregated serving stress harness.
+    """
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = [100]
+    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
+    manager = AsyncTransferManager(resource_manager, should_store_blocks=True)
+    request = create_mock_request(42)
+    manager.start_transfer(request)
+    manager.mark_termination_requested(request)
+
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.active_requests = []
+    executor.async_transfer_manager = manager
+    executor._terminate_request = MagicMock(return_value=True)
+
+    executor._end_transfer_and_maybe_terminate(request)
+
+    executor._terminate_request.assert_called_once_with(request)
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with([100])
+
+
+def test_no_deferred_termination_preserves_partial_reuse_skip():
+    """Partial-reuse path still skips termination if none was requested."""
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = [100]
+    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
+    manager = AsyncTransferManager(resource_manager, should_store_blocks=True)
+    request = create_mock_request(42)
+    manager.start_transfer(request)
+
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.active_requests = []
+    executor.async_transfer_manager = manager
+    executor._terminate_request = MagicMock(return_value=True)
+
+    executor._end_transfer_and_maybe_terminate(request)
+
+    executor._terminate_request.assert_not_called()
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with([100])
+
+
+def test_resources_freed_clears_deferred_termination():
+    """Successful early resource free prevents duplicate termination."""
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = [100]
+    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
+    manager = AsyncTransferManager(resource_manager, should_store_blocks=True)
+    request = create_mock_request(42)
+    manager.start_transfer(request)
+    manager.mark_termination_requested(request)
+    manager.mark_resources_freed(request)
+
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.active_requests = []
+    executor.async_transfer_manager = manager
+    executor._terminate_request = MagicMock(return_value=True)
+
+    executor._end_transfer_and_maybe_terminate(request)
+
+    executor._terminate_request.assert_not_called()
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with([100])
