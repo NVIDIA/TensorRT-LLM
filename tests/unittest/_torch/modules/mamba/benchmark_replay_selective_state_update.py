@@ -219,7 +219,7 @@ def _import_mamba_kernels_fast():
         spec.loader.exec_module(mod)
         return mod
 
-    # 1. Package __init__ (defines PAD_SLOT_ID = -1)
+    # 1. Package __init__ (defines replay work-item constants)
     _load("", "__init__.py")
     # 2. softplus helper (used by both kernel modules)
     _load("softplus", "softplus.py")
@@ -2803,10 +2803,14 @@ def _bench_config(
     # kernels read the metadata cold.
     if mix_samples_cpu is not None:
         device = state_work.device
-        # Hardcode-sort: per-iter prev_tokens are CPU-sorted write-first.
-        # Output is scrambled (we don't permute x/B/C/dt to match) but
-        # timing is meaningful as a clustering experiment.
-        src = mix_samples_sorted_cpu if (hardcode_sort and mix_samples_sorted_cpu is not None) else mix_samples_cpu
+        # Hardcode-sort is a precluster diagnostic: sort PNAT samples before
+        # building replay_work_items. Production keeps decode rows unsorted
+        # and only sorts the secondary replay metadata.
+        src = (
+            mix_samples_sorted_cpu
+            if (hardcode_sort and mix_samples_sorted_cpu is not None)
+            else mix_samples_cpu
+        )
         samples_gpu = torch.from_numpy(src).to(device=device, dtype=torch.int32)
 
         n_writes_per_iter_all, replay_work_items_samples_cpu = (
@@ -2926,8 +2930,13 @@ def _bench_config(
 
         if baseline_fn is not None and is_pr3324_baseline:
             baseline_suffix_parts = [f"SR={int(use_philox)}"]
-            hsort_is_swept = len(getattr(args, "hardcode_sort_list", [False])) > 1
-            if scn["fill"] is None and (hardcode_sort or hsort_is_swept):
+            hsort_list_for_tags = getattr(args, "hardcode_sort_list", [False])
+            hsort_in_cell_list = "HSORT" in getattr(args, "_cell_list_keys", ())
+            emit_hsort_tag = (
+                hardcode_sort or len(hsort_list_for_tags) > 1
+                or hsort_in_cell_list
+            )
+            if scn["fill"] is None and emit_hsort_tag:
                 baseline_suffix_parts.append(f"HSORT={1 if hardcode_sort else 0}")
             baseline_sweep_suffix = ",".join(baseline_suffix_parts)
             baseline_key = _build_json_key(
@@ -3340,7 +3349,10 @@ def _bench_config(
             parts.append(f"SR={1 if use_philox else 0}")
             parts.append(f"RECT={'auto' if rectangle_for_nowrite is None else (1 if rectangle_for_nowrite else 0)}")
             parts.append(f"MODE={_val(mode)}")
-            parts.append(f"HSORT={1 if hardcode_sort else 0}")
+            hsort_list_for_tags = getattr(args, "hardcode_sort_list", [False])
+            hsort_in_cell_list = "HSORT" in getattr(args, "_cell_list_keys", ())
+            if hardcode_sort or len(hsort_list_for_tags) > 1 or hsort_in_cell_list:
+                parts.append(f"HSORT={1 if hardcode_sort else 0}")
             if not args.use_cache_slot:
                 parts.append("CSLOT=0")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
@@ -3972,9 +3984,10 @@ def _run_benchmark(args) -> None:
     # Each entry in the JSON file is a dict of canonical knob keys → values,
     # using the same names that appear in the sweep_tag (Mw/Mnw, Ww/Wnw,
     # Sw/Snw, pW, pS, H, R, CT, CPSw/CPSnw, LSw/LSnw, FL, WS, TMARL,
-    # TMAWL, TMANL, TMAWS, SR, RECT, MODE, HSORT).  Each
-    # cell may also use the tied forms M / W / S / CPS / LS (single value
-    # applied to both write and nowrite halves).
+    # TMAWL, TMANL, TMAWS, SR, RECT, MODE). Optional diagnostic HSORT cells
+    # are accepted for compatibility. Each cell may also use the tied forms
+    # M / W / S / CPS / LS (single value applied to both write and nowrite
+    # halves).
     #
     # On load we:
     #   - Override the bench's CLI knob args (`args.block_size_m_write`,
@@ -4412,8 +4425,9 @@ def _parse_args() -> argparse.Namespace:
         help="Path to a JSON list of cell dicts (one per cell to time).  "
         "Each dict has canonical knob keys → values: Mw, Mnw, Ww, Wnw, Sw, "
         "Snw, pW, pS, H, R, CT, CPSw, CPSnw, LSw, LSnw, FL, WS, TMARL, "
-        "TMAWL, TMANL, TMAWS, SR, RECT, MODE, HSORT (tied forms M / W / S / "
-        "CPS / LS are also accepted and auto-expanded). "
+        "TMAWL, TMANL, TMAWS, SR, RECT, MODE; optional diagnostic HSORT is "
+        "also accepted (tied forms M / W / S / CPS / LS are also accepted "
+        "and auto-expanded). "
         "When set, bench's CLI knob ranges are auto-overridden to the "
         "per-knob union across all cells, and the inner-loop filter skips "
         "any iteration whose knob-value tuple isn't in the list.  All cells "
@@ -4565,7 +4579,7 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Use the cache-slot field from replay_work_items in persistent_main. "
         "--no-use-cache-slot keeps the old identity-cache-slot shortcut for "
-        "diagnostic comparisons only.",
+        "diagnostic comparisons only and requires --hardcode-sort 1.",
     )
     parser.add_argument(
         "--heads-per-block",
@@ -4729,13 +4743,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hardcode-sort",
         type=str,
-        default="0",
-        help="Comma-separated 0/1.  When 1, the per-iter prev_tokens "
-        "samples are pre-sorted write-first OFFLINE (CPU-side) before "
-        "the timed region — kernel runs unchanged (USE_PERM=False) but "
-        "the EO gate sees sorted PNAT so early-outs cluster naturally. "
-        "Output is scrambled (we don't permute x/B/C/dt) but timing is "
-        "meaningful.",
+        default=None,
+        help="Comma-separated 0/1, default 0.  Diagnostic only: when 1, "
+        "per-iter PNAT samples are preclustered write-first before "
+        "replay_work_items are built. Production-like mixed runs leave PNAT "
+        "unsorted and sort only replay_work_items.",
     )
     parser.add_argument(
         "--mix-iters",
@@ -4865,12 +4877,25 @@ def _parse_args() -> argparse.Namespace:
             rect_list = [None]
     args.rectangle_for_nowrite_list = rect_list
 
-    hsort_modes = [v.strip() for v in (args.hardcode_sort or "0").split(",") if v.strip()]
+    hsort_modes = [
+        v.strip()
+        for v in (
+            args.hardcode_sort if args.hardcode_sort is not None else "0"
+        ).split(",")
+        if v.strip()
+    ]
     hsort_list = []
     for v in hsort_modes:
         if v not in ("0", "1"):
             parser.error(f"--hardcode-sort value must be 0 or 1, got {v!r}")
         hsort_list.append(v == "1")
+    if not hsort_list:
+        hsort_list = [False]
+    if not args.use_cache_slot and not all(hsort_list):
+        parser.error(
+            "--no-use-cache-slot is a diagnostic shortcut and requires "
+            "--hardcode-sort 1"
+        )
     args.hardcode_sort_list = hsort_list
 
     # mode=None means "let the wrapper resolve from _DEFAULT_TUNING".  Same

@@ -23,7 +23,6 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._utils import get_sm_version
 
 from .mamba2_metadata import (REPLAY_WORK_CACHE_BUF_IDX,
@@ -181,7 +180,6 @@ def _replay_precompute_impl(
     # on no-replay-write steps).
     prev_num_accepted_tokens_ptr,
     state_batch_indices_ptr,
-    pad_slot_id,
     # Dimensions
     T: tl.constexpr,
     dstate: tl.constexpr,
@@ -251,8 +249,6 @@ def _replay_precompute_impl(
     # Resolve cache index for writes
     if HAS_CACHE_BATCH_INDICES:
         cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-        if cache_batch_idx == pad_slot_id:
-            return
     else:
         cache_batch_idx = pid_b.to(tl.int64)
 
@@ -450,7 +446,6 @@ def _rectangle_precompute_impl(
     cache_buf_idx_ptr,
     prev_num_accepted_tokens_ptr,
     state_batch_indices_ptr,
-    pad_slot_id,
     # Dimensions
     T: tl.constexpr,
     MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,  # rectangle K-axis bound
@@ -514,8 +509,6 @@ def _rectangle_precompute_impl(
 
     if HAS_CACHE_BATCH_INDICES:
         cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-        if cache_batch_idx == pad_slot_id:
-            return
     else:
         cache_batch_idx = pid_b.to(tl.int64)
 
@@ -811,7 +804,6 @@ def _dynamic_precompute_kernel(
     cache_buf_idx_ptr,
     prev_num_accepted_tokens_ptr,
     state_batch_indices_ptr,
-    pad_slot_id,
     # Dimensions
     T: tl.constexpr,
     MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
@@ -879,8 +871,6 @@ def _dynamic_precompute_kernel(
     pid_b = tl.program_id(axis=0)
     if HAS_CACHE_BATCH_INDICES:
         cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-        if cache_batch_idx == pad_slot_id:
-            return
     else:
         cache_batch_idx = pid_b.to(tl.int64)
 
@@ -905,7 +895,6 @@ def _dynamic_precompute_kernel(
             cache_buf_idx_ptr,
             prev_num_accepted_tokens_ptr,
             state_batch_indices_ptr,
-            pad_slot_id,
             T,
             dstate,
             nheads_ngroups_ratio,
@@ -966,7 +955,6 @@ def _dynamic_precompute_kernel(
             cache_buf_idx_ptr,
             prev_num_accepted_tokens_ptr,
             state_batch_indices_ptr,
-            pad_slot_id,
             T,
             MAX_REPLAY_BUFFER_LENGTH,
             dstate,
@@ -1774,7 +1762,6 @@ def _persistent_main_kernel(
     state_batch_indices_ptr,
     replay_work_items_ptr,
     rand_seed_ptr,
-    pad_slot_id,
     # Persistent-loop work-distribution scalars.  Caller pre-sorts the batch
     # write-first; the kernel uses (n_writes, batch_total, WRITE_CHECKPOINT)
     # to derive its own slot range.  Write half processes [0, n_writes),
@@ -1941,111 +1928,58 @@ def _persistent_main_kernel(
         pid_h = tile_id // (NUM_PID_M_BLOCKS * n_slots_local)
         work_item_idx = pid_b_local + slot_lo
         if IS_DYNAMIC:
-            pid_b = work_item_idx
             if HAS_CACHE_BATCH_INDICES:
+                pid_b = work_item_idx
                 cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-                is_pad = cache_batch_idx == pad_slot_id
             else:
+                pid_b = work_item_idx
                 cache_batch_idx = pid_b.to(tl.int64)
-                is_pad = False
             active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
             pnat = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
         else:
             work_item_base = replay_work_items_ptr + work_item_idx * _REPLAY_WORK_ITEM_WIDTH
-            pid_b = tl.load(
-                work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH
-            )
             if USE_REPLAY_CACHE_SLOT:
+                pid_b = tl.load(
+                    work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH
+                )
                 cache_batch_idx = tl.load(
                     work_item_base + _REPLAY_WORK_CACHE_SLOT
                 ).to(tl.int64)
+                pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
+                active_buf = tl.load(
+                    work_item_base + _REPLAY_WORK_CACHE_BUF_IDX
+                ).to(tl.int32)
             else:
+                pid_b = tl.load(
+                    work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH
+                )
                 cache_batch_idx = work_item_idx.to(tl.int64)
-            pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
-            active_buf = tl.load(
-                work_item_base + _REPLAY_WORK_CACHE_BUF_IDX
-            ).to(tl.int32)
-            is_pad = cache_batch_idx == pad_slot_id
-
-        if not is_pad:
-            # Dispatch: when RECTANGLE is set, send nowrite slots to the rectangle
-            # impl.  `replay_work_items` carries the cache slot, PNAT and active
-            # buffer for persistent_main; persistent_dynamic resolves those once
-            # here from the existing tensors.
-            if RECTANGLE:
-                if IS_DYNAMIC:
-                    is_w = (pnat + T) > MAX_REPLAY_BUFFER_LENGTH
-                else:
-                    is_w = WRITE_CHECKPOINT
-                if is_w:
-                    # Pass WRITE_CHECKPOINT=True constexpr to specialize this
-                    # impl call for the write path.  Under IS_DYNAMIC=True, the
-                    # kernel-level WRITE_CHECKPOINT is False (launcher default),
-                    # but the OUTER is_w branch we are inside narrows the
-                    # runtime path to writes-only, so we override to True here
-                    # so the impl's constexpr-gated `if is_write:` blocks DCE
-                    # to the write-only codegen.  Under IS_DYNAMIC=False
-                    # (persistent_main), the kernel-level WRITE_CHECKPOINT is
-                    # itself True for this half (write half launches with
-                    # WRITE_CHECKPOINT=True), and the outer is_w = WRITE_CHECKPOINT = True
-                    # constexpr-folds; passing literal True here is consistent
-                    # and constexpr-equivalent.
-                    _persistent_main_impl(
-                        pid_m, pid_b, pid_h,
-                        cache_batch_idx, active_buf, pnat,
-                        state_ptr, state_tma_descriptor, state_scales_ptr,
-                        old_x_ptr, old_B_ptr, old_dt_ptr, old_dA_cumsum_ptr,
-                        x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
-                        cb_scaled_ptr, decay_vec_ptr,
-                        rand_seed_ptr,
-                        T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
-                        stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
-                        stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                        stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
-                        stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T,
-                        stride_old_B_group, stride_old_B_dstate,
-                        stride_old_dt_cache, stride_old_dt_dbuf, stride_old_dt_head, stride_old_dt_T,
-                        stride_old_dA_cumsum_cache, stride_old_dA_cumsum_dbuf,
-                        stride_old_dA_cumsum_head, stride_old_dA_cumsum_T,
-                        stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
-                        stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
-                        stride_D_head, stride_D_dim,
-                        stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
-                        stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
-                        stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
-                        stride_dv_batch, stride_dv_head, stride_dv_t,
-                        BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
-                        BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_WINDOW,
-                        LAUNCH_WITH_PDL, USE_RS_ROUNDING, PHILOX_ROUNDS, QUANT_MAX,
-                        True, IS_DYNAMIC,  # WRITE_CHECKPOINT=True (write arm)
-                        True,  # WRITE_CHECKPOINT_IS_CONSTEXPR
-                        USE_TMA_LOAD_WRITE, USE_TMA_LOAD_NOWRITE, USE_TMA_STORE,
-                    )
-                else:
-                    _persistent_rectangle_impl(
-                        pid_m, pid_b, pid_h,
-                        cache_batch_idx, active_buf, pnat,
-                        state_ptr, state_tma_descriptor, state_scales_ptr,
-                        old_x_ptr,
-                        x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
-                        cb_scaled_ptr, decay_vec_ptr,
-                        T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
-                        stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
-                        stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                        stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
-                        stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
-                        stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
-                        stride_D_head, stride_D_dim,
-                        stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
-                        stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
-                        stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
-                        stride_dv_batch, stride_dv_head, stride_dv_t,
-                        BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
-                        BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_K,
-                        LAUNCH_WITH_PDL, QUANT_MAX,
-                        USE_TMA_LOAD_NOWRITE,  # rect-load TMA toggle
-                    )
+                pnat = tl.load(work_item_base + _REPLAY_WORK_PNAT)
+                active_buf = tl.load(
+                    work_item_base + _REPLAY_WORK_CACHE_BUF_IDX
+                ).to(tl.int32)
+        # Dispatch: when RECTANGLE is set, send nowrite slots to the rectangle
+        # impl.  `replay_work_items` carries the cache slot, PNAT and active
+        # buffer for persistent_main; persistent_dynamic resolves those once
+        # here from the existing tensors.
+        if RECTANGLE:
+            if IS_DYNAMIC:
+                is_w = (pnat + T) > MAX_REPLAY_BUFFER_LENGTH
             else:
+                is_w = WRITE_CHECKPOINT
+            if is_w:
+                # Pass WRITE_CHECKPOINT=True constexpr to specialize this
+                # impl call for the write path.  Under IS_DYNAMIC=True, the
+                # kernel-level WRITE_CHECKPOINT is False (launcher default),
+                # but the OUTER is_w branch we are inside narrows the
+                # runtime path to writes-only, so we override to True here
+                # so the impl's constexpr-gated `if is_write:` blocks DCE
+                # to the write-only codegen.  Under IS_DYNAMIC=False
+                # (persistent_main), the kernel-level WRITE_CHECKPOINT is
+                # itself True for this half (write half launches with
+                # WRITE_CHECKPOINT=True), and the outer is_w = WRITE_CHECKPOINT = True
+                # constexpr-folds; passing literal True here is consistent
+                # and constexpr-equivalent.
                 _persistent_main_impl(
                     pid_m, pid_b, pid_h,
                     cache_batch_idx, active_buf, pnat,
@@ -2073,10 +2007,66 @@ def _persistent_main_kernel(
                     BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
                     BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_WINDOW,
                     LAUNCH_WITH_PDL, USE_RS_ROUNDING, PHILOX_ROUNDS, QUANT_MAX,
-                    WRITE_CHECKPOINT, IS_DYNAMIC,
-                    False,  # WRITE_CHECKPOINT_IS_CONSTEXPR
+                    True, IS_DYNAMIC,  # WRITE_CHECKPOINT=True (write arm)
+                    True,  # WRITE_CHECKPOINT_IS_CONSTEXPR
                     USE_TMA_LOAD_WRITE, USE_TMA_LOAD_NOWRITE, USE_TMA_STORE,
                 )
+            else:
+                _persistent_rectangle_impl(
+                    pid_m, pid_b, pid_h,
+                    cache_batch_idx, active_buf, pnat,
+                    state_ptr, state_tma_descriptor, state_scales_ptr,
+                    old_x_ptr,
+                    x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
+                    cb_scaled_ptr, decay_vec_ptr,
+                    T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
+                    stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
+                    stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
+                    stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
+                    stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
+                    stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
+                    stride_D_head, stride_D_dim,
+                    stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
+                    stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
+                    stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
+                    stride_dv_batch, stride_dv_head, stride_dv_t,
+                    BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
+                    BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_K,
+                    LAUNCH_WITH_PDL, QUANT_MAX,
+                    USE_TMA_LOAD_NOWRITE,  # rect-load TMA toggle
+                )
+        else:
+            _persistent_main_impl(
+                pid_m, pid_b, pid_h,
+                cache_batch_idx, active_buf, pnat,
+                state_ptr, state_tma_descriptor, state_scales_ptr,
+                old_x_ptr, old_B_ptr, old_dt_ptr, old_dA_cumsum_ptr,
+                x_ptr, C_ptr, D_ptr, z_ptr, out_ptr,
+                cb_scaled_ptr, decay_vec_ptr,
+                rand_seed_ptr,
+                T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
+                stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
+                stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
+                stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
+                stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T,
+                stride_old_B_group, stride_old_B_dstate,
+                stride_old_dt_cache, stride_old_dt_dbuf, stride_old_dt_head, stride_old_dt_T,
+                stride_old_dA_cumsum_cache, stride_old_dA_cumsum_dbuf,
+                stride_old_dA_cumsum_head, stride_old_dA_cumsum_T,
+                stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
+                stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
+                stride_D_head, stride_D_dim,
+                stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
+                stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
+                stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
+                stride_dv_batch, stride_dv_head, stride_dv_t,
+                BLOCK_SIZE_M, HAS_D, HAS_Z, HAS_CACHE_BATCH_INDICES,
+                BLOCK_SIZE_DSTATE, BLOCK_SIZE_T, BLOCK_SIZE_WINDOW,
+                LAUNCH_WITH_PDL, USE_RS_ROUNDING, PHILOX_ROUNDS, QUANT_MAX,
+                WRITE_CHECKPOINT, IS_DYNAMIC,
+                False,  # WRITE_CHECKPOINT_IS_CONSTEXPR
+                USE_TMA_LOAD_WRITE, USE_TMA_LOAD_NOWRITE, USE_TMA_STORE,
+            )
 
 
 # ============================================================================
@@ -2272,7 +2262,6 @@ def replay_selective_state_update(
     dt_bias: torch.Tensor | None = None,
     dt_softplus: bool = False,
     state_batch_indices: torch.Tensor | None = None,
-    pad_slot_id: int = PAD_SLOT_ID,
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 10,
     state_scales: torch.Tensor | None = None,
@@ -2890,7 +2879,7 @@ def replay_selective_state_update(
             cb_scaled, decay_vec,
             old_B, old_dt, old_dA_cumsum,
             cache_buf_idx, prev_num_accepted_tokens,
-            state_batch_indices, pad_slot_id,
+            state_batch_indices,
             T, max_window, dstate, nheads // ngroups,
             dt.stride(0), dt.stride(1), dt.stride(2),
             dt_bias.stride(0) if dt_bias is not None else 0,
@@ -2982,7 +2971,7 @@ def replay_selective_state_update(
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
             cb_scaled, decay_vec,
-            state_batch_indices, replay_work_items_arg, rand_seed, pad_slot_id,
+            state_batch_indices, replay_work_items_arg, rand_seed,
             n_writes, batch, nheads,
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
@@ -3058,7 +3047,7 @@ def replay_selective_state_update(
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
             cb_scaled, decay_vec,
-            state_batch_indices, replay_work_items_arg, rand_seed, pad_slot_id,
+            state_batch_indices, replay_work_items_arg, rand_seed,
             n_writes_tensor, batch, nheads,
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
