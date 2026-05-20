@@ -120,7 +120,7 @@ def test_replay_update_mamba_states_uses_history_window():
     mgr = _make_mgr(max_batch_size=4, max_draft_len=5, use_replay_state_update=True)
     assert mgr.replay_step_width == 6
     assert mgr.replay_history_size == 16
-    assert mgr.mamba_cache.old_x.shape[2] == 16
+    assert mgr.mamba_cache.old_x.shape[3] == 16
     assert mgr.mamba_cache.old_B.shape[3] == 16
     assert mgr.mamba_cache.old_dt.shape[4] == 16
     assert mgr.mamba_cache.old_dA_cumsum.shape[4] == 16
