@@ -708,7 +708,8 @@ class AttentionForwardArgs:
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
-    mrope_config: Optional[dict] = None
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
+    mrope_position_deltas: Optional[torch.Tensor] = None
 
     softmax_stats_tensor: Optional[torch.Tensor] = None
     chunked_prefill_buffer_batch_size: int = 1
@@ -726,9 +727,7 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
-    enable_attn_nvfp4_output: bool = True
     topk_indices: Optional[torch.Tensor] = None
-    is_generation: bool = False
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
