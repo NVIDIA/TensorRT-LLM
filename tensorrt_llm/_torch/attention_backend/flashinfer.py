@@ -1468,9 +1468,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     self._mla_forward_paged_context(q, metadata, output,
                                                     latent_cache)
                 elif attention_input_type == AttentionInputType.context_only:
-                    raise ValueError(
-                        "FlashInfer MLA context without cached KV "
-                        "requires key/value tensors.")
+                    raise ValueError("FlashInfer MLA context without cached KV "
+                                     "requires key/value tensors.")
                 else:
                     # MLA generation phase: paged decode + slice
                     self._mla_forward_generation(q, metadata, output,
