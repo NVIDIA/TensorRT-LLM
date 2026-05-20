@@ -826,8 +826,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Uses persistent buffers (only allocate if None) for CUDA graph compatibility.
         """
         if self.spec_decoding_bl_tree_mask_offset is None:
+            # +1: extra slot at the end used as atomic counter in prepareCustomMask.cu
+            # (replaces cudaMallocAsync which is not CUDA-graph-capturable)
             self.spec_decoding_bl_tree_mask_offset = torch.zeros(
-                [self.max_num_requests],
+                [self.max_num_requests + 1],
                 dtype=torch.int64,
                 device='cuda',
             )
@@ -908,15 +910,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 ``[num_contexts:batch_size]`` rather than ``[:batch_size]``.
         '''
 
-        # Disable spec decoding on Blackwell (sm100+). The trtllmGen FMHA
-        # kernels do not yet support speculative decoding mode.
+        # Disable spec decoding on Blackwell (sm100+) for non-dynamic-tree paths.
+        # The trtllmGen FMHA kernels' spec-dec path has only been validated for
+        # dynamic tree mask (host-side compact packed_mask + cumSeqLensQ-based
+        # row offset in prepareCustomMask). Linear/static-tree modes on Blackwell
+        # remain disabled until their packed_mask layout is verified end-to-end.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
-            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
+            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version())
+            or is_spec_dec_dynamic_tree)
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+        # Persist on metadata so plan() can forward it to the FMHA dispatcher.
+        # Used by FmhaAutoTuner::selectSpecDecTreeKernel() to compute
+        # numTokensHeadsQ = numHeadsQPerKv * (max_total_draft_tokens + 1) and
+        # pick tileSizeQ + kernelType (SwapsMmaAb Q8/16/32 vs KeepsMmaAb Q128).
+        self.max_total_draft_tokens = max_total_draft_tokens
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
@@ -1673,6 +1684,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # stay as literal ``None`` until DeepSeek V4 sparse-MLA lands.
                 sparse_mla_topk_lens=None,
                 compressed_kv_cache_pool_ptr=None,
+                spec_decoding_target_max_draft_tokens=getattr(
+                    metadata, 'max_total_draft_tokens', None),
             )
 
         if self.print_skip_softmax_stat:

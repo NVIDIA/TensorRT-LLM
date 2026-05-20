@@ -282,6 +282,8 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mMaskType
             = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
+        tllmRunnerParams.mSpecDecodingMaxDraftTokens = mFixedParams.specDecodingMaxGenLen;
+        tllmRunnerParams.mSpecDecodingTargetMaxGenLen = mFixedParams.specDecodingTargetMaxGenLen;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
         tllmRunnerParams.mMultiCtasKvMode = true;
@@ -350,7 +352,19 @@ void XqaDispatcher::runImpl(
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        KvCacheDataType cache_type = cacheTypeFromQuantMode(params.kv_cache_quant_mode);
+        KvCacheDataType cache_type{KvCacheDataType::BASE};
+        if (params.kv_cache_quant_mode.hasInt8KvCache())
+        {
+            cache_type = KvCacheDataType::INT8;
+        }
+        else if (params.kv_cache_quant_mode.hasFp8KvCache())
+        {
+            cache_type = KvCacheDataType::FP8;
+        }
+        else if (params.kv_cache_quant_mode.hasFp4KvCache())
+        {
+            cache_type = KvCacheDataType::NVFP4;
+        }
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;
@@ -494,7 +508,27 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+        // For spec-dec tree, cap mMaxSeqLenQ to spec_decoding_max_generation_length.
+        // During warmup, generation_input_length may equal context length (131072),
+        // but actual draft tokens are bounded by spec_decoding_max_generation_length (~60).
+        // Without cap, SwapsMmaAb Custom mask with groupsTokensHeadsQ=false creates
+        // excessive CTAs (one per token) causing OOM during warmup.
+        if (params.is_spec_dec_tree && params.multi_query_tokens && params.spec_decoding_max_generation_length > 0)
+        {
+            tllmRunnerParams.mMaxSeqLenQ
+                = std::min(tllmRunnerParams.mMaxSeqLenQ, params.spec_decoding_max_generation_length);
+        }
+        // Pin mMaxSeqLenKv to a static per-layer value so warmup and runtime pick the same
+        // FMHA kernel (no JIT miss). For PagedKv we use the per-layer attention window:
+        // strides do not depend on mMaxSeqLenKv, and extra KV CTAs exit early via
+        // seqLensKvPtr. ContiguousKv keeps its true past-kv length because its strides
+        // depend on it.
+        // For spec-dec tree, the KV range also includes the current generation span so
+        // FmhaAutoTuner sees the true upper bound for kernel selection.
+        tllmRunnerParams.mMaxSeqLenKv = (params.is_spec_dec_tree && params.multi_query_tokens)
+            ? std::max(params.max_past_kv_length, params.max_past_kv_length + params.generation_input_length)
+            : ((tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv) ? params.max_attention_window_size
+                                                                   : params.max_past_kv_length);
         tllmRunnerParams.mJITWarmup = params.trtllm_gen_jit_warmup;
         tllmRunnerParams.mJITWarmupMaxNumRequests = params.trtllm_gen_jit_warmup_max_num_requests;
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = params.trtllm_gen_jit_warmup_max_seq_len_q;
@@ -520,6 +554,8 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
         tllmRunnerParams.mPackedMaskMaxSeqLenQ = params.spec_decoding_max_generation_length;
+        tllmRunnerParams.mSpecDecodingMaxDraftTokens = params.spec_decoding_max_generation_length;
+        tllmRunnerParams.mSpecDecodingTargetMaxGenLen = mFixedParams.specDecodingTargetMaxGenLen;
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;

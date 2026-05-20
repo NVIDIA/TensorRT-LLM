@@ -61,6 +61,10 @@ struct XqaFixedParams
     bool isPagedKv;
     // Is speculative decoding enabled.
     bool isSpecDecoding;
+    // Max generation length for spec decoding (max_total_draft_tokens).
+    int specDecodingMaxGenLen;
+    // max_total_draft_tokens + 1, used ONLY for kernel type selection in fmhaKernels.h.
+    int specDecodingTargetMaxGenLen = 0;
     // Do we apply alibi ?
     bool hasAlibi;
     // Use trtllm-gen sparse attention kernel.

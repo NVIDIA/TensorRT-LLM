@@ -491,6 +491,11 @@ public:
     bool mIsSpecDecTree = true;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
+    // Config-time max gen length for FmhaAutoTuner spec-dec tree kernel selection.
+    // Set once at AttentionOp init from Python max_total_draft_tokens + 1 via
+    // thop/attentionOp.cpp; propagated to fixedParams.specDecodingTargetMaxGenLen
+    // so the auto tuner picks numTokensHeadsQ = numHeadsQPerKv * targetMaxGenLen.
+    int32_t mSpecDecodingTargetMaxGenLen = 0;
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
@@ -559,7 +564,8 @@ public:
             mCrossAttention, mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput,
             mFP8ContextMLA, mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention,
+            mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen, mIsMLAEnabled, mIsGenerationMLA,
+            mUseGenFlashMLA, mUseSparseAttention,
             mUseTllmGenSparseAttentionPaged, mUseTllmGenSparseAttention, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,
             mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank,
             mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
