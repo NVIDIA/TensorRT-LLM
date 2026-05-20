@@ -21,10 +21,6 @@ kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
 transforms:
-  detect_sharding:
-    enabled: false
-  sharding_transform_executor:
-    enabled: false
   apply_sharding_hints:
     enabled: true
     requires_shape_prop: true
