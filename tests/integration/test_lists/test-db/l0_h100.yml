@@ -456,6 +456,7 @@ l0_h100:
   - unittest/kv_cache_manager_v2_tests/ # 4 min
   # ------------- KV Cache Iteration Stats ---------------
   - unittest/executor/test_stats_serializer.py
+  - unittest/disaggregated/test_kv_cache_transfer_perf_metrics.py
   - unittest/metrics/test_collector.py
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse

@@ -17,6 +17,7 @@
 #include "mhcKernels.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -61,6 +62,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     int const tid = threadIdx.x;
     int const warp_id = tid / WARP_SIZE;
     int const lane = tid % WARP_SIZE;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
 
     __shared__ float s_pre_mix[HC_MULT];
 
@@ -312,6 +317,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             }
         }
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 #define INST_BIGFUSE(NS, BS)                                                                                           \
@@ -777,9 +785,9 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
     dim3 grid(static_cast<unsigned int>(M));
 
 #define LAUNCH_BF(BS)                                                                                                  \
-    mhcBigFuseKernel<NUM_SPLITS, BS, kFuseNorm><<<grid, BS, 0, stream>>>(y_acc, r_acc, residual, hc_scale, hc_base,    \
-        post_mix, comb_mix, layer_input, M, K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,  \
-        sinkhorn_repeat, norm_weight, norm_eps)
+    tensorrt_llm::common::launchWithPdlWhenEnabled("mhcBigFuseKernel", mhcBigFuseKernel<NUM_SPLITS, BS, kFuseNorm>,    \
+        grid, dim3(BS), 0, stream, y_acc, r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K,   \
+        hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps)
 
     if (block_size >= 512)
     {
