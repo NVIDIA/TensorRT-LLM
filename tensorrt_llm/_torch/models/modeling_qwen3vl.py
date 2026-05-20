@@ -1282,7 +1282,8 @@ class Qwen3VLModelBase(PreTrainedModel):
             input_ids,
             mm_embeds,
             extra_embeds=deepstack_embeds,
-            **kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
         if len(deepstack_embeds) > 0:
             input_ids, input_embeds, deepstack_embeds = result

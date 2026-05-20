@@ -1528,9 +1528,13 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                     for multimodal_param in multimodal_params
                 ]
 
-        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embeds,
-                                                     **kwargs)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.model.embed_tokens,
+            input_ids,
+            mm_embeds,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
+        )
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

@@ -1,6 +1,9 @@
+from unittest import mock
+
 import pytest
 import torch
 
+import tensorrt_llm._torch.models.modeling_multimodal_utils as multimodal_utils
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     filter_mm_token_from_input_ids, find_input_mm_embeds, fuse_input_embeds)
 from tensorrt_llm._torch.modules.embedding import Embedding
@@ -238,6 +241,77 @@ def test_fuse_input_embeds_empty_multimodal_params_falls_through(device):
     assert out_ids is None
     assert out_embeds is not None
     assert out_embeds.shape == (input_ids.numel(), hidden)
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_skips_filter_when_indices_provided(device):
+    """
+    Sync-free contract: when both ``text_token_indices`` and
+    ``mm_token_indices`` are passed in, ``fuse_input_embeds`` must NOT call
+    ``filter_mm_token_from_input_ids`` (which is the source of the torch.where
+    host sync on GPU input_ids).
+    """
+    hidden = 8
+    vocab_size = 40
+    emb = make_embedding(num_embeddings=vocab_size,
+                         hidden_size=hidden,
+                         device=device)
+
+    input_ids = torch.tensor([0, 1, 41, 2, 42, 3, 43, 4],
+                             dtype=torch.long,
+                             device=device)
+    text_idx, mm_idx = filter_mm_token_from_input_ids(input_ids,
+                                                      vocab_size=vocab_size)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+
+    with mock.patch.object(
+            multimodal_utils,
+            "filter_mm_token_from_input_ids",
+            wraps=multimodal_utils.filter_mm_token_from_input_ids) as spy:
+        fuse_input_embeds(
+            emb,
+            input_ids,
+            mm_embeds=[mm_emb],
+            mm_token_ids=None,
+            text_token_indices=text_idx,
+            mm_token_indices=mm_idx,
+        )
+    spy.assert_not_called()
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_calls_filter_when_indices_missing(device):
+    """
+    Negative half of the sync-free contract: when indices are absent the
+    function falls back to ``filter_mm_token_from_input_ids`` (the host-sync
+    path). Pairs with the test above so a regression that silently drops the
+    sync-free fast path is caught.
+    """
+    hidden = 8
+    vocab_size = 40
+    emb = make_embedding(num_embeddings=vocab_size,
+                         hidden_size=hidden,
+                         device=device)
+
+    input_ids = torch.tensor([0, 1, 41, 2, 42, 3, 43, 4],
+                             dtype=torch.long,
+                             device=device)
+    _, mm_idx = filter_mm_token_from_input_ids(input_ids, vocab_size=vocab_size)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+
+    with mock.patch.object(
+            multimodal_utils,
+            "filter_mm_token_from_input_ids",
+            wraps=multimodal_utils.filter_mm_token_from_input_ids) as spy:
+        fuse_input_embeds(
+            emb,
+            input_ids,
+            mm_embeds=[mm_emb],
+            mm_token_ids=None,
+        )
+    spy.assert_called_once()
 
 
 @pytest.mark.parametrize("device", ["cpu"] +

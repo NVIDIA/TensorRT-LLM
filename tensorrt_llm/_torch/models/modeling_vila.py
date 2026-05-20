@@ -1266,7 +1266,8 @@ class VilaModel(PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
-            **kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
