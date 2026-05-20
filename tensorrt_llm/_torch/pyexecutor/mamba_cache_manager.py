@@ -269,7 +269,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         # 0 means temporal saved state is actually the last state, not two back.
         prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
         cache_buf_idx: torch.Tensor | None = None  # (cache,) int32 — shared across layers
-        old_x: torch.Tensor | None = None  # (layers, cache, history, nheads, dim)
+        old_x: torch.Tensor | None = None  # (layers, cache, 2, history, nheads, dim)
         old_B: torch.Tensor | None = None  # (layers, cache, 2, history, ngroups, dstate)
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
         old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
@@ -382,9 +382,6 @@ class PythonMambaCacheManager(BaseResourceManager):
                 self.replay_history_size = max(16, T)
 
                 # Compact replay cache.
-                # old_x is single-buffered (written by main kernel after replay).
-                # old_B, old_dt, old_dA_cumsum are double-buffered (written by
-                # precompute kernel concurrently with main kernel via PDL).
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
                     max_batch_size, dtype=int, device=device)
                 spec_kwargs['cache_buf_idx'] = torch.zeros(max_batch_size,
@@ -392,6 +389,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                            device=device)
                 spec_kwargs['old_x'] = torch.zeros(num_local_layers,
                                                    max_batch_size,
+                                                   2,
                                                    self.replay_history_size,
                                                    nheads,
                                                    head_dim,
@@ -1662,9 +1660,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cache_buf_idx = torch.zeros(cache_size,
                                          dtype=torch.int32,
                                          device=device)
-        # x is not double-buffered
         self.old_x = torch.zeros(num_local_mamba_layers,
                                  cache_size,
+                                 2,
                                  history_size,
                                  nheads,
                                  head_dim,
