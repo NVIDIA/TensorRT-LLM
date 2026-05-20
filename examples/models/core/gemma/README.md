@@ -802,7 +802,6 @@ trtllm-serve \
     google/gemma-4-E4B-it \
     --host 0.0.0.0 \
     --port 8000 \
-    --backend pytorch \
     --tp_size 1 \
     --max_batch_size 16
 ```
@@ -832,7 +831,6 @@ The `/v1/chat/completions` endpoint applies the Gemma 4 chat template automatica
 # MMMU (vision multiple-choice; works on E2B / E4B / 26B-A4B / 31B)
 trtllm-eval \
     --model google/gemma-4-E4B-it \
-    --backend pytorch \
     --tp_size 1 \
     --max_batch_size 64 \
     mmmu \
@@ -841,7 +839,6 @@ trtllm-eval \
 # CoVoST 2 BLEU (English → Chinese speech translation; E2B / E4B only)
 trtllm-eval \
     --model google/gemma-4-E4B-it \
-    --backend pytorch \
     --tp_size 1 \
     --max_batch_size 64 \
     covost2 \
@@ -849,7 +846,7 @@ trtllm-eval \
     --num_samples 500
 ```
 
-`trtllm-eval mmmu` forces `apply_chat_template=True` internally (it is a multimodal benchmark); `trtllm-eval covost2` defaults `--apply_chat_template` to `True`. Both match the chat template Gemma 4 was trained with.
+Internally, `trtllm-eval mmmu` forces `apply_chat_template=True` because it is a multimodal benchmark, while `trtllm-eval covost2` sets `--apply_chat_template` to `True` by default. Both configurations align with the chat template that Gemma 4 was trained on.
 
 ### Run Modelopt Quantization
 
