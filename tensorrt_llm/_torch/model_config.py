@@ -48,15 +48,19 @@ def _unified_kv_pool_includes_mamba(
 
       * disaggregated serving forces the C++ mamba manager
         (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
+      * ``TRTLLM_USE_PY_MAMBA=1`` forces the Python mamba manager locally
+        (agg-mode override), or
       * one-model speculative decoding splits mamba and attention into
         separate caches.
 
     Single source of truth for the binding-side layer-counting decision; do
     not duplicate the predicate at call sites.
     """
-    use_disagg = is_disagg or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    use_split_pool = is_disagg \
+        or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+        or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
     use_spec = spec_config is not None
-    return not (use_disagg or use_spec)
+    return not (use_split_pool or use_spec)
 
 
 @contextlib.contextmanager
