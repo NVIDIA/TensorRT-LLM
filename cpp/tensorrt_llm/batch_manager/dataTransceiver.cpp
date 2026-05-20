@@ -586,6 +586,10 @@ private:
                 // not be removed from mCancelledRequests. This should be handled by timeout.
                 auto it = mReadyResponses.find(mCurrentRequest.value());
                 TLLM_CHECK(it != mReadyResponses.end());
+                auto cancelledException
+                    = TLLM_REQUEST_EXCEPTION(reqId, tensorrt_llm::common::RequestErrorCode::kNETWORK_ERROR,
+                        "Context KV cache transfer cancelled after ready-signal for request %zu", reqId);
+                it->second.mPromise.set_exception(std::make_exception_ptr(cancelledException));
                 {
                     std::scoped_lock lkResp(mSenderMutex);
                     mReadyResponses.erase(it);
