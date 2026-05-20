@@ -106,21 +106,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
-    kv_lens_cuda_runtime: Optional[torch.Tensor] = field(init=False,
-                                                         default=None,
-                                                         repr=False)
-
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
 
-    # MLA ragged prefill wrapper (for context phase with expanded K, V)
+    # MLA wrappers and stable buffers.
+    # Cached plan params + is-planned flag let prepare() refresh the plan
+    # outside stream capture (flashinfer plan() does device->host syncs).
     _ragged_prefill_wrapper: Optional[
         flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper] = field(
             init=False, default=None)
-
-    # MLA wrappers (BatchMLAPagedAttentionWrapper) and stable buffers.
-    # Cached plan params + is-planned flag let prepare() refresh the plan
-    # outside stream capture (flashinfer plan() does device->host syncs).
     _mla_decode_wrapper: Optional[object] = field(init=False, default=None)
     _mla_context_wrapper: Optional[object] = field(init=False, default=None)
     _mla_ragged_plan_params: Optional[RaggedPlanParams] = field(init=False,
@@ -186,6 +180,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         if self._mla_ragged_planned:
             return self._ragged_prefill_wrapper
+
+        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Cannot plan() flashinfer MLA ragged prefill while the stream "
+                "is capturing. Make sure prepare() has run at least one "
+                "warmup forward pass before capture.")
 
         # Split append_paged_mla_kv_cache from plan() when this wrapper needs a
         # new plan. Reusing a cached plan avoids this sync on later layers.
@@ -275,17 +275,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 backend="auto",
             )
 
-        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
-            raise ValueError(
-                "Cannot plan() flashinfer MLA context while the stream is "
-                "capturing. Chunked MLA prefill with FlashInfer does not "
-                "support CUDA graph capture.")
         if self._mla_context_plan_params != plan_params:
             self._mla_context_planned = False
             self._mla_context_plan_params = plan_params
 
         if self._mla_context_planned:
             return self._mla_context_wrapper
+
+        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Cannot plan() flashinfer MLA context while the stream is "
+                "capturing. Make sure prepare() has run at least one warmup "
+                "forward pass before capture.")
 
         # Split append_paged_mla_kv_cache from plan() when this wrapper needs a
         # new plan. Reusing a cached plan avoids this sync on later layers.
@@ -334,15 +335,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     def _do_plan_mla_decode(self, plan_params: MLAPlanParams) -> None:
         """Compute MLA decode plan inputs and call wrapper.plan().
 
-        Must run outside of CUDA graph capture. kv_indptr / kv_indices are
-        cloned because they alias the wrapper's own buffers and
-        flashinfer.plan() would otherwise do a self-copy.
+        Must run outside of CUDA graph capture.
         """
         num_gen = self.num_generations
         kv_indptr = self.paged_kv_indptr_decode[:num_gen + 1]
         kv_indices = self._paged_kv_indices[self.num_context_blocks:self.
                                             num_context_blocks +
-                                            self.num_generation_blocks].clone()
+                                            self.num_generation_blocks]
         kv_last_page = self._paged_kv_last_page_len[self.num_contexts:self.
                                                     num_contexts + num_gen]
 
@@ -355,8 +354,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         num_pages_per_seq = kv_indptr[1:] - kv_indptr[:-1]
         kv_len_arr = (num_pages_per_seq -
                       1) * plan_params.page_size + kv_last_page
-
-        kv_indptr = kv_indptr.clone()
 
         self._mla_decode_wrapper.plan(
             qo_indptr,
@@ -564,6 +561,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             capture_graph=capture_graph,
         )
         # Rebind the wrapper to the freshly allocated buffers.
+        self._ragged_prefill_wrapper = None
         self._mla_decode_wrapper = None
         self._mla_context_wrapper = None
         self._mla_ragged_plan_params = None
@@ -691,7 +689,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             n = self.num_seqs
             self._cached_token_lens[:n].zero_()
             self.num_ctx_cached_tokens = 0
-            self.kv_lens_cuda_runtime = self.seq_lens_cuda[:n]
             for plan_params in list(self._plan_params_to_wrappers.keys()):
                 if plan_params.attention_mask_data is None:
                     self._plan_params_to_wrappers[
@@ -720,7 +717,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
-        self.kv_lens_cuda_runtime = kv_lens[:self.num_seqs]
 
         # start and end indices of each sequence in the ragged key and value
         # for self attention it's the same as qo_indptr so avoid computing twice.
@@ -866,6 +862,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # cached by prior warmup forwards. Forward still handles first-use or
         # dtype/shape changes by syncing only on a plan cache miss.
         self._mla_ragged_planned = False
+        self._mla_context_planned = False
+        self._mla_decode_planned = False
         if (self.num_contexts > 0 and self._mla_ragged_plan_params is not None
                 and self._ragged_prefill_wrapper is not None):
             ragged_indptr = self.qo_indptr[:self.num_contexts + 1]
@@ -873,7 +871,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                  self._mla_ragged_plan_params)
             self._mla_ragged_planned = True
 
-        self._mla_context_planned = False
         if (self.num_contexts > 0 and self._mla_context_plan_params is not None
                 and self._mla_context_wrapper is not None):
             num_contexts = self.num_contexts
@@ -895,7 +892,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if (self.num_generations > 0
                 and self._mla_decode_plan_params is not None
                 and self._mla_decode_wrapper is not None):
-            self._mla_decode_planned = False
             self._do_plan_mla_decode(self._mla_decode_plan_params)
             self._mla_decode_planned = True
 

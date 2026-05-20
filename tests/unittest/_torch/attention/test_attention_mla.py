@@ -782,7 +782,10 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 max_num_requests=len(context_sequence_lengths),
                 num_contexts=0,
                 prompt_lens=context_sequence_lengths,
-                max_num_tokens=sum(context_sequence_lengths),
+                max_num_tokens=max(
+                    sum(context_sequence_lengths),
+                    generation_seq_len_q * len(context_sequence_lengths),
+                ),
                 kv_cache_manager=kv_cache_manager,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -794,9 +797,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 mapping=mapping,
             )
             if backend_name == "TRTLLM":
-                gen_metadata_kwargs[
-                    'enable_flash_mla'] = torch.cuda.get_device_capability(
-                    ) == (9, 0)
+                gen_metadata_kwargs["enable_flash_mla"] = (
+                    torch.cuda.get_device_capability() == (9, 0))
             attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
             attn_metadata.prepare()
         for layer_idx in range(num_layers):

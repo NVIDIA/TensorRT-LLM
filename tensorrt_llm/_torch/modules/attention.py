@@ -2469,7 +2469,7 @@ class MLA(nn.Module):
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
-        num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+        num_seqs = attn_metadata.num_seqs
 
         cu_q_seqlens = torch.empty(num_seqs + 1,
                                    dtype=torch.int32,
