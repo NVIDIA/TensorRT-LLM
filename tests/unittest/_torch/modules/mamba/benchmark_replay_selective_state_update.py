@@ -645,8 +645,8 @@ def _build_tensors(
     # placeholder/degenerate case where every step is a checkpoint step).
     # For real replay-style checkpointing, max_window > mtp_len.
     cache_T = max_window if max_window is not None else mtp_len
-    # old_x: single-buffered (cache, max_window, nheads, dim)
-    old_x = torch.randn(batch, cache_T, nheads, head_dim, device=device, dtype=act_dtype)
+    # old_x: double-buffered (cache, 2, max_window, nheads, dim)
+    old_x = torch.randn(batch, 2, cache_T, nheads, head_dim, device=device, dtype=act_dtype)
     # old_B: double-buffered (cache, 2, max_window, ngroups, dstate)
     old_B = torch.randn(batch, 2, cache_T, ngroups, d_state, device=device, dtype=act_dtype)
     # old_dt: double-buffered (cache, 2, nheads, max_window) fp32 — T contiguous

@@ -1053,8 +1053,9 @@ def _persistent_main_impl(
     stride_state_scales_cache,
     stride_state_scales_head,
     stride_state_scales_dim,
-    # old_x strides
+    # old_x strides (double-buffered: cache, dbuf, T, head, dim)
     stride_old_x_cache,
+    stride_old_x_dbuf,
     stride_old_x_T,
     stride_old_x_head,
     stride_old_x_dim,
@@ -1172,8 +1173,10 @@ def _persistent_main_impl(
         is_write = WRITE_CHECKPOINT
     if is_write:
         write_offset = 0
+        write_buf = 1 - active_buf
     else:
         write_offset = prev_num_accepted_tokens
+        write_buf = active_buf
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
@@ -1264,9 +1267,25 @@ def _persistent_main_impl(
 
     coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
 
-    old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
+    # Double-buffered old_x: load from active_buf (the "previous step" buffer);
+    # store at the end writes to write_buf (= 1 - active_buf when is_write,
+    # else active_buf — same as old_dt / old_dA_cumsum / old_B).  Splitting
+    # the read and write into separate dbuf slots when is_write eliminates
+    # the same-thread store-vs-load race we previously saw on old_x.
+    old_x_read_base = (
+        old_x_ptr
+        + cache_batch_idx * stride_old_x_cache
+        + active_buf * stride_old_x_dbuf
+        + pid_h * stride_old_x_head
+    )
+    old_x_write_base = (
+        old_x_ptr
+        + cache_batch_idx * stride_old_x_cache
+        + write_buf * stride_old_x_dbuf
+        + pid_h * stride_old_x_head
+    )
     old_x_all = tl.load(
-        old_x_base + offs_window[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
+        old_x_read_base + offs_window[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
         mask=old_window_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
@@ -1438,7 +1457,7 @@ def _persistent_main_impl(
         other=0.0,
     )
     tl.store(
-        old_x_base
+        old_x_write_base
         + (write_offset + offs_t)[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
         x_all,
@@ -1522,8 +1541,9 @@ def _persistent_rectangle_impl(
     stride_state_scales_cache,
     stride_state_scales_head,
     stride_state_scales_dim,
-    # old_x strides
+    # old_x strides (double-buffered: cache, dbuf, T, head, dim)
     stride_old_x_cache,
+    stride_old_x_dbuf,
     stride_old_x_T,
     stride_old_x_head,
     stride_old_x_dim,
@@ -1626,7 +1646,17 @@ def _persistent_rectangle_impl(
     if HAS_Z:
         z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
-    old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
+    # Rectangle path: nowrite-only.  write_buf == active_buf (no flip), so the
+    # read and write paths target the same dbuf slot.  No race: write_offset=
+    # PNAT puts new tokens at [PNAT, PNAT+T), disjoint from the read range
+    # [0, PNAT).
+    old_x_read_base = (
+        old_x_ptr
+        + cache_batch_idx * stride_old_x_cache
+        + active_buf * stride_old_x_dbuf
+        + pid_h * stride_old_x_head
+    )
+    old_x_write_base = old_x_read_base
 
     if HAS_D:
         D = tl.load(
@@ -1635,7 +1665,7 @@ def _persistent_rectangle_impl(
 
     # Hoist: old_x doesn't depend on conv1d/precompute; load before gdc_wait.
     old_x_load = tl.load(
-        old_x_base
+        old_x_read_base
         + safe_old_k[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
         mask=is_old_k[:, None] & m_mask[None, :],
@@ -1656,7 +1686,7 @@ def _persistent_rectangle_impl(
         other=0.0,
     )
     tl.store(
-        old_x_base
+        old_x_write_base
         + offs_k[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
         x_K,
@@ -1789,8 +1819,9 @@ def _persistent_main_kernel(
     stride_state_scales_cache,
     stride_state_scales_head,
     stride_state_scales_dim,
-    # old_x strides
+    # old_x strides (double-buffered: cache, dbuf, T, head, dim)
     stride_old_x_cache,
+    stride_old_x_dbuf,
     stride_old_x_T,
     stride_old_x_head,
     stride_old_x_dim,
@@ -1991,7 +2022,7 @@ def _persistent_main_kernel(
                     T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
                     stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
                     stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                    stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
+                    stride_old_x_cache, stride_old_x_dbuf, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
                     stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T,
                     stride_old_B_group, stride_old_B_dstate,
                     stride_old_dt_cache, stride_old_dt_dbuf, stride_old_dt_head, stride_old_dt_T,
@@ -2022,7 +2053,7 @@ def _persistent_main_kernel(
                     T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
                     stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
                     stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                    stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
+                    stride_old_x_cache, stride_old_x_dbuf, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
                     stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
                     stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
                     stride_D_head, stride_D_dim,
@@ -2047,7 +2078,7 @@ def _persistent_main_kernel(
                 T, MAX_REPLAY_BUFFER_LENGTH, dim, dstate, nheads_ngroups_ratio,
                 stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
                 stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
-                stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
+                stride_old_x_cache, stride_old_x_dbuf, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
                 stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T,
                 stride_old_B_group, stride_old_B_dstate,
                 stride_old_dt_cache, stride_old_dt_dbuf, stride_old_dt_head, stride_old_dt_T,
@@ -2353,7 +2384,7 @@ def replay_selective_state_update(
     Arguments:
         state: (cache, nheads, dim, dstate) in-place.  After the call, contains
             the state after replaying prev_num_accepted_tokens old tokens.
-        old_x: (cache, T, nheads, dim) bf16 — old x cache (single-buffered).
+        old_x: (cache, 2, T, nheads, dim) bf16 — double-buffered old x cache.
         old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
         old_dt: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
         old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
@@ -2601,7 +2632,7 @@ def replay_selective_state_update(
     # `prev_num_accepted_tokens` can be 0..max_window.  Window-axis kernel
     # tiles (BLOCK_SIZE_WINDOW, BLOCK_SIZE_K) are derived independently from
     # MAX_REPLAY_BUFFER_LENGTH so max_window can exceed BLOCK_SIZE_T freely.
-    max_window = old_x.shape[1]
+    max_window = old_x.shape[2]
     assert T <= max_window, f"T={T} exceeds cache max_window={max_window}"
 
     assert x.shape == (batch, T, nheads, dim)
@@ -2609,7 +2640,7 @@ def replay_selective_state_update(
     assert A.shape == (nheads, dim, dstate)
     assert B.shape == (batch, T, ngroups, dstate)
     assert C.shape == B.shape
-    assert old_x.shape == (cache_size, max_window, nheads, dim)
+    assert old_x.shape == (cache_size, 2, max_window, nheads, dim)
     assert old_B.shape == (cache_size, 2, max_window, ngroups, dstate)
     assert old_dt.shape == (cache_size, 2, nheads, max_window)
     assert old_dA_cumsum.shape == (cache_size, 2, nheads, max_window)
@@ -2980,7 +3011,7 @@ def replay_selective_state_update(
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
             state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
-            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3), old_x.stride(4),
             old_B.stride(0), old_B.stride(1), old_B.stride(2),
             old_B.stride(3), old_B.stride(4),
             old_dt.stride(0), old_dt.stride(1),
@@ -3056,7 +3087,7 @@ def replay_selective_state_update(
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
             state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
-            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3), old_x.stride(4),
             old_B.stride(0), old_B.stride(1), old_B.stride(2),
             old_B.stride(3), old_B.stride(4),
             old_dt.stride(0), old_dt.stride(1),
