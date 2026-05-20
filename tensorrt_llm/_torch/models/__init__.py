@@ -1,5 +1,10 @@
 import transformers
 
+# Importing _torch.configs triggers AutoConfig registration for TRT-LLM-only
+# model_types (deepseek_v32, kimi_k2) so AutoTokenizer.from_pretrained works
+# under transformers >= 5.5; see _torch/configs/__init__.py.
+import tensorrt_llm._torch.configs  # noqa: F401
+
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_bart import (BartForConditionalGeneration,
                             MBartForConditionalGeneration)

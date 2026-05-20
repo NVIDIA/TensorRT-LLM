@@ -14,7 +14,8 @@ from transformers.utils import HF_MODULES_CACHE
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
     load_pretrained_config)
-from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
@@ -284,12 +285,16 @@ class ModelConfig(Generic[TConfig]):
         # once ModelType is used in pytorch flow.
 
     @staticmethod
-    def resolve_moe_backend(moe_backend: str, architecture: str) -> str:
+    def resolve_moe_backend(moe_backend: str,
+                            architecture: str,
+                            quant_config: Optional[QuantConfig] = None) -> str:
         """Resolve AUTO moe_backend to a specific backend based on model architecture.
 
         Args:
             moe_backend: The configured moe_backend (may be "AUTO")
             architecture: The model architecture name (e.g., "GptOssForCausalLM")
+            quant_config: Optional quantization config for resolving quantized
+                MoE checkpoints.
 
         Returns:
             Resolved backend name (never "AUTO")
@@ -306,6 +311,12 @@ class ModelConfig(Generic[TConfig]):
                 return "TRITON"
             else:
                 return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
+
+        quant_algo = quant_config.quant_algo if quant_config is not None else None
+        is_fp8_block_scales = quant_algo in (QuantAlgo.FP8_BLOCK_SCALES,
+                                             "FP8_BLOCK_SCALES")
+        if is_fp8_block_scales and is_sm_100f():
+            return "TRTLLM"
 
         return "CUTLASS"
 
@@ -680,26 +691,34 @@ class ModelConfig(Generic[TConfig]):
 
         quant_config = QuantConfig()
         layer_quant_config = None
-        moe_backend = kwargs.get('moe_backend', 'AUTO')
-        # Resolve AUTO to specific backend based on model architecture
+        requested_moe_backend = kwargs.get('moe_backend', 'AUTO')
         architecture = pretrained_config.architectures[
             0] if pretrained_config.architectures else ""
-        moe_backend = cls.resolve_moe_backend(moe_backend, architecture)
-        kwargs['moe_backend'] = moe_backend
+        # Use an architecture-only backend hint for quant config parsing. Some
+        # quant formats choose the quant_algo from the backend name, so the final
+        # quant-aware AUTO resolution happens after quant_config is loaded.
+        moe_backend_hint = cls.resolve_moe_backend(requested_moe_backend,
+                                                   architecture)
 
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,
                                             'hf_quant_config.json'):
             quant_config, layer_quant_config = cls.load_modelopt_quant_config(
-                quant_config_file, checkpoint_dir, moe_backend)
+                quant_config_file, checkpoint_dir, moe_backend_hint)
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):
             hf_quant_config = pretrained_config.quantization_config
             quant_config, layer_quant_config = cls.load_hf_quant_config(
-                hf_quant_config, moe_backend)
+                hf_quant_config, moe_backend_hint)
         elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
-                quant_config_file, moe_backend)
+                quant_config_file, moe_backend_hint)
+
+        kwargs['moe_backend'] = cls.resolve_moe_backend(
+            requested_moe_backend,
+            architecture,
+            quant_config=quant_config,
+        )
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

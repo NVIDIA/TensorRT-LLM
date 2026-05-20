@@ -564,7 +564,8 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "model_id",
         [
-            "bf16",
+            pytest.param("bf16",
+                         marks=pytest.mark.skip_less_device_memory(80000)),
             pytest.param("fp8", marks=skip_pre_hopper),
             pytest.param("nvfp4", marks=skip_pre_blackwell),
         ],
@@ -1290,6 +1291,119 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
                 sampling_params=sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
+
+
+class TestGemmaE2B(LlmapiAccuracyTestHarness):
+    """Accuracy coverage for Gemma E2B AutoDeploy configs.
+
+    Runs the models via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    """
+
+    GEMMA3N_MODEL_NAME = "google/gemma-3n-E2B-it"
+    GEMMA4_MODEL_NAME = "google/gemma-4-E2B-it"
+    GEMMA4_GSM8K_MAX_OUTPUT_LEN = 1024
+    GEMMA3N_MMLU_EVALUATOR_KWARGS = {
+        "apply_chat_template": False,
+    }
+    GEMMA4_MMLU_EVALUATOR_KWARGS = {
+        "apply_chat_template":
+        True,
+        "system_prompt":
+        ("You are taking a multiple-choice test. Answer with only the "
+         "single letter A, B, C, or D."),
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
+    }
+    GEMMA3N_GSM8K_EVALUATOR_KWARGS = {
+        "apply_chat_template":
+        True,
+        "system_prompt":
+        ("Solve each math problem. End your answer with exactly one final "
+         "line in this format: #### <number>"),
+    }
+    GEMMA4_GSM8K_EVALUATOR_KWARGS = {
+        "apply_chat_template":
+        True,
+        "system_prompt":
+        ("Solve each math problem. End your answer with exactly one final "
+         "line in this format: #### <number>"),
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
+    }
+
+    # Set the seq len from the largest task budget for test speed and memory usage.
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GEMMA4_GSM8K_MAX_OUTPUT_LEN)
+    MAX_NUM_TOKENS = MAX_SEQ_LEN
+
+    def get_default_sampling_params(self):
+        # Unset temperature/top_p/top_k means greedy decoding, which keeps
+        # the accuracy checks deterministic.
+        return SamplingParams(end_id=None,
+                              pad_id=None,
+                              n=1,
+                              use_beam_search=False)
+
+    def get_gemma4_mmlu_sampling_params(self):
+        sampling_params = self.get_default_sampling_params()
+        # Gemma4 MMLU uses the chat template and a system prompt. Keep the
+        # truncation budget aligned with this test's max_seq_len so those
+        # instruction tokens are not cut by MMLU's default raw-prompt limit.
+        sampling_params.truncate_prompt_tokens = (self.MAX_SEQ_LEN -
+                                                  MMLU.MAX_OUTPUT_LEN)
+        return sampling_params
+
+    def get_default_kwargs(self, config_name, keep_tokenizer=False):
+        config = _load_ad_config(config_name)
+        world_size = config.pop("world_size", 1)
+        if not keep_tokenizer:
+            config.pop("tokenizer", None)
+        config["max_seq_len"] = self.MAX_SEQ_LEN
+        config["max_num_tokens"] = self.MAX_NUM_TOKENS
+        return config, world_size
+
+    def evaluate_tasks(self, llm, model_name, mmlu_sampling_params,
+                       mmlu_evaluator_kwargs, gsm8k_evaluator_kwargs) -> None:
+        task = MMLU(model_name)
+        task.evaluate(llm,
+                      sampling_params=mmlu_sampling_params,
+                      extra_evaluator_kwargs=mmlu_evaluator_kwargs)
+        task = GSM8K(model_name)
+        task.evaluate(llm, extra_evaluator_kwargs=gsm8k_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_gemma3n_e2b_it(self):
+        kwargs, world_size = self.get_default_kwargs("gemma3n_e2b_it.yaml")
+        sampling_params = self.get_default_sampling_params()
+        model_path = hf_id_to_local_model_dir(self.GEMMA3N_MODEL_NAME)
+        with AutoDeployLLM(
+                model=model_path,
+                tokenizer=model_path,
+                world_size=world_size,
+                yaml_extra=[str(_AD_CONFIGS_DIR / "gemma3n_e2b_it.yaml")],
+                **kwargs) as llm:
+            self.evaluate_tasks(llm, self.GEMMA3N_MODEL_NAME, sampling_params,
+                                self.GEMMA3N_MMLU_EVALUATOR_KWARGS,
+                                self.GEMMA3N_GSM8K_EVALUATOR_KWARGS)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_gemma4_e2b_it(self, monkeypatch):
+        monkeypatch.setattr(GSM8K, "MAX_OUTPUT_LEN",
+                            self.GEMMA4_GSM8K_MAX_OUTPUT_LEN)
+        kwargs, world_size = self.get_default_kwargs("gemma4_e2b.yaml",
+                                                     keep_tokenizer=True)
+        sampling_params = self.get_gemma4_mmlu_sampling_params()
+        model_path = hf_id_to_local_model_dir(self.GEMMA4_MODEL_NAME)
+        with AutoDeployLLM(
+                model=model_path,
+                world_size=world_size,
+                yaml_extra=[str(_AD_CONFIGS_DIR / "gemma4_e2b.yaml")],
+                **kwargs) as llm:
+            self.evaluate_tasks(llm, self.GEMMA4_MODEL_NAME, sampling_params,
+                                self.GEMMA4_MMLU_EVALUATOR_KWARGS,
+                                self.GEMMA4_GSM8K_EVALUATOR_KWARGS)
 
 
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):

@@ -48,7 +48,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -199,6 +199,13 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     processing using the image processor saved in the model directory.
     """
 
+    # Default class-level fallback. Real value computed per-instance below
+    # from text_config.use_bidirectional_attention. Only 26B/31B set
+    # use_bidirectional_attention="vision" — their image blocks need intact
+    # bidirectional attention. E2B/E4B set None (fully causal) — audio (and
+    # image, when present) can be split across chunks safely.
+    mm_bidirectional_blocks = False
+
     def __init__(
         self,
         model_path: str,
@@ -218,6 +225,16 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         self._tokenizer = tokenizer
         self._model_path = model_path
         self._dtype = getattr(config, "torch_dtype", torch.bfloat16)
+
+        # Per-instance bidir gate. text_config.use_bidirectional_attention is
+        # "vision" on 26B/31B, None on E2B/E4B. Read once here so the V2
+        # scheduler's chunk-alignment only engages on variants that actually
+        # need it — avoids livelock on E4B audio (causal, 451-token blocks
+        # would otherwise exceed max_num_tokens).
+        text_cfg = getattr(config, "text_config", config)
+        self.mm_bidirectional_blocks = (
+            getattr(text_cfg, "use_bidirectional_attention", None) == "vision"
+        )
 
         self._processor = None
         try:
@@ -272,6 +289,45 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         if vocab_size is not None:
             return int(vocab_size)
         return super().get_vocab_size()
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        # Gemma4 image/audio/video soft-token IDs (e.g. 258880/258881/258884)
+        # live INSIDE text_config.vocab_size (262144), so the base-class
+        # fallback `input_ids >= vocab_size` in `_compute_mm_masks` would mark
+        # zero MM positions, producing an all-zero embed_mask cumsum and
+        # making chunked-prefill drop every MM embedding row. HF's
+        # `Gemma4Processor` does not expose `mm_token_ids` either, so we
+        # build the list from the config here.
+        ids = []
+        for name in ("image_token_id", "audio_token_id", "video_token_id"):
+            tid = getattr(self._config, name, None)
+            if tid is not None:
+                ids.append(int(tid))
+        if not ids:
+            raise RuntimeError(
+                "Gemma4 config missing image_token_id/audio_token_id/video_token_id "
+                "at the top level. Falling back to the base-class "
+                "`input_ids >= vocab_size` heuristic would mark zero MM positions "
+                "(soft-token IDs live inside text_config.vocab_size), silently "
+                "dropping every MM embedding row in chunked prefill."
+            )
+        return torch.tensor(ids, dtype=torch.int32)
+
+    def get_num_tokens_per_audio(self, *, audio, **kwargs) -> int:
+        # Gemma4 audio token count is dynamic: HF Gemma4Processor inserts
+        # placeholders via _compute_audio_num_tokens(waveform, sampling_rate),
+        # which mirrors the audio encoder's mel-frame + 2x SSCP-conv stride
+        # math and caps at audio_seq_length (=750, the 30s window). HF's
+        # `_get_num_multimodal_tokens` evaluates the formula at
+        # `feature_extractor.sampling_rate` (16 kHz), so the predicted count
+        # must use the post-resample length. Run the same
+        # `_normalize_audio_inputs` step that the prompt-side `_preprocess`
+        # path applies (mono downmix + scipy.signal.resample_poly to 16 kHz)
+        # so the predictor and the actual placeholder count agree exactly.
+        target_sr = self.processor.feature_extractor.sampling_rate
+        normalized = _normalize_audio_inputs([audio], target_sr=target_sr)
+        n_samples = len(normalized[0])
+        return self.get_num_multimodal_tokens(audio_lengths=[n_samples])["num_audio_tokens"][0]
 
     @property
     def dtype(self) -> torch.dtype:
@@ -890,6 +946,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 mm_token_ids_for_mask = fuse_token_ids.to(input_ids.device)
                 mm_mask = torch.isin(input_ids, mm_token_ids_for_mask)
                 ple_input_ids = torch.where(mm_mask, torch.full_like(input_ids, pad_id), input_ids)
+
+        # Slice mm_embeds to the current chunk window for chunked prefill /
+        # KV reuse. Without this, the full request's mm_embeds is passed to
+        # fuse_input_embeds even when input_ids is a chunk slice, which trips
+        # the count-equality check in fuse_input_embeds. Mirrors the call in
+        # modeling_qwen2vl / modeling_phi4mm / modeling_mistral.
+        mm_embeds = find_input_mm_embeds(mm_embeds, multimodal_params)
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
