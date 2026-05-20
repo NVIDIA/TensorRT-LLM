@@ -82,7 +82,7 @@ from .._utils import (
     unwrap_rawref,
     value_or,
 )
-from ._moving_average import Average
+from ._moving_average import Average, TimeWeightedAverage
 
 if TYPE_CHECKING:
     from ._kv_cache_manager import KVCacheManager, ScratchDesc
@@ -224,7 +224,7 @@ class _KVCache:
     _finish_event: CachedCudaEvent | None
 
     _tokens_per_block: int
-    _avg_history_length: Average
+    _avg_history_length: TimeWeightedAverage
     _avg_capacity: Average
 
     _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]
@@ -276,9 +276,9 @@ class _KVCache:
         self.__rawref__ = rawref.NULL
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
-        self._avg_history_length = Average()
+        self._avg_history_length = TimeWeightedAverage(self.history_length)
         self._avg_capacity = Average()
-        self._avg_history_length.update(self.history_length)
+        self._avg_capacity.update(self.capacity)
         manager._living_kv_caches.add(rawref.ref(self))
         manager._avg_reused_length.update(self.history_length)
         manager._num_created_kv_caches += 1
@@ -342,7 +342,6 @@ class _KVCache:
         assert NDEBUG or self._check_sanity()
         manager = self.manager
         if self.capacity > 0:
-            self._avg_capacity.update(self.capacity)
             manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
             manager._num_sampled_kv_caches += 1
@@ -351,6 +350,7 @@ class _KVCache:
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
+        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
