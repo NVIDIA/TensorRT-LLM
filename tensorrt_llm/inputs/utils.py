@@ -3,20 +3,14 @@
 
 import asyncio
 import base64
-import ipaddress
-import math
-import os
-import socket
 import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import urlparse
 
-import aiohttp
 import numpy as np
-import requests
 import soundfile
 import torch
 from PIL import Image
@@ -26,9 +20,15 @@ from transformers.utils import logging
 
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
+from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
+                                          _load_and_convert_image,
+                                          _load_video_by_cv2,
+                                          _normalize_file_uri,
+                                          _safe_aiohttp_get, _safe_request_get)
+from tensorrt_llm.inputs.media_io import \
+    convert_image_mode as convert_image_mode
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
-from tensorrt_llm.inputs.multimodal_data import AudioData as AudioData
 from tensorrt_llm.inputs.multimodal_data import \
     BaseModalityData as BaseModalityData
 from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
@@ -39,204 +39,6 @@ from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
-
-# Module-level aiohttp session shared across all media fetch calls.
-# Created lazily on first use inside the async event loop, then reused so that
-# TCP connections are kept alive and not re-established per request.
-_global_aiohttp_session: aiohttp.ClientSession | None = None
-
-
-async def _get_aiohttp_session() -> aiohttp.ClientSession:
-    """Return the shared aiohttp.ClientSession, creating it on first call."""
-    global _global_aiohttp_session
-    if _global_aiohttp_session is None or _global_aiohttp_session.closed:
-        _global_aiohttp_session = aiohttp.ClientSession()
-    return _global_aiohttp_session
-
-
-def rgba_to_rgb(
-    image: Image.Image,
-    background_color: Union[tuple[int, int, int], list[int]] = (255, 255, 255)
-) -> Image.Image:
-    """Convert an RGBA image to RGB with filled background color.
-
-    Uses white (255, 255, 255) as the default background color because:
-    1. It's the most neutral and commonly expected background for images
-    2. Maintains backward compatibility with existing code
-    """
-    if image.mode != "RGBA":
-        raise ValueError(
-            f"Expected image mode to be 'RGBA', but got '{image.mode}'")
-    converted = Image.new("RGB", image.size, background_color)
-    converted.paste(image, mask=image.split()[3])  # 3 is the alpha channel
-    return converted
-
-
-def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
-    """Convert image to specified mode with proper handling of RGBA to RGB conversion."""
-    if image.mode == to_mode:
-        return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
-        return rgba_to_rgb(image)
-    else:
-        return image.convert(to_mode)
-
-
-# Maximum allowed response size for remote fetches (200 MB).
-_MAX_RESPONSE_BYTES = 200 * 1024 * 1024
-
-# Chunk size used while enforcing the response size cap.
-_RESPONSE_CHUNK_BYTES = 1024 * 1024
-
-# Maximum number of redirects allowed for remote fetches.
-_MAX_REDIRECTS = 5
-
-_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
-
-
-def _validate_url(url: str) -> None:
-    """Validate that *url* points to a public, non-internal HTTP(S) resource.
-
-    Raises ``RuntimeError`` for URLs that target non-global addresses or that
-    use a scheme other than http / https.
-
-    Note: validation is performed at DNS-resolution time. A DNS-rebinding
-    attack (TTL=0, resolves to a public IP during validation then a private IP
-    during the actual TCP connect) could bypass this check. For strict
-    isolation, supplement with network-level egress filtering that blocks
-    non-global address ranges at the host firewall.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise RuntimeError(
-            f"Only http and https URLs are allowed, got: {parsed.scheme!r}")
-
-    hostname = parsed.hostname
-    if not hostname:
-        raise RuntimeError("URL has no hostname")
-
-    # Resolve to IP and check address range.
-    try:
-        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
-
-    for _family, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global or ip.is_multicast:
-            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
-
-
-def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
-    """Read a requests response with a hard size limit."""
-    content = BytesIO()
-    total = 0
-    try:
-        for chunk in resp.iter_content(chunk_size=_RESPONSE_CHUNK_BYTES):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > _MAX_RESPONSE_BYTES:
-                raise RuntimeError("Response exceeds maximum allowed size")
-            content.write(chunk)
-    except Exception:
-        resp.close()
-        raise
-
-    data = content.getvalue()
-    resp._content = data
-    resp.raw = BytesIO(data)
-    return resp
-
-
-def _safe_request_get(url: str,
-                      *,
-                      stream: bool = False,
-                      timeout: int = 30) -> "requests.Response":
-    """``requests.get`` wrapper that validates URLs and bounds response size."""
-    del stream  # Kept for API compatibility; responses are always bounded.
-
-    current_url = url
-    _validate_url(current_url)
-
-    for redirect_count in range(_MAX_REDIRECTS + 1):
-        resp = requests.get(
-            current_url,
-            stream=True,
-            timeout=timeout,
-            allow_redirects=False,
-        )
-        if resp.status_code not in _REDIRECT_STATUSES:
-            try:
-                resp.raise_for_status()
-            except Exception:
-                resp.close()
-                raise
-            return _buffer_requests_response(resp)
-
-        if redirect_count == _MAX_REDIRECTS:
-            resp.close()
-            raise RuntimeError("Too many redirects")
-
-        redirect_url = resp.headers.get("Location", "")
-        next_url = urljoin(current_url, redirect_url)
-        resp.close()
-        _validate_url(next_url)
-        current_url = next_url
-
-    raise RuntimeError("Too many redirects")
-
-
-async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
-    """Read an aiohttp response to EOF with a hard size limit."""
-    content = BytesIO()
-    total = 0
-    while True:
-        chunk = await response.content.read(_RESPONSE_CHUNK_BYTES)
-        if not chunk:
-            return content.getvalue()
-        total += len(chunk)
-        if total > _MAX_RESPONSE_BYTES:
-            raise RuntimeError("Response exceeds maximum allowed size")
-        content.write(chunk)
-
-
-async def _safe_aiohttp_get(
-        url: str,
-        timeout_sec: int = 30,
-        session: Optional[aiohttp.ClientSession] = None) -> bytes:
-    """Aiohttp GET wrapper that validates every redirect hop before following."""
-    await asyncio.to_thread(_validate_url, url)
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
-
-    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
-        current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
-            async with fetch_session.get(current_url,
-                                         timeout=timeout,
-                                         allow_redirects=False) as response:
-                if response.status in _REDIRECT_STATUSES:
-                    redirect_url = response.headers.get("Location", "")
-                    current_url = urljoin(current_url, redirect_url)
-                    await asyncio.to_thread(_validate_url, current_url)
-                    continue
-                maybe_coro = response.raise_for_status()
-                if asyncio.iscoroutine(maybe_coro):
-                    await maybe_coro
-                return await _read_aiohttp_content(response)
-        raise RuntimeError("Too many redirects")
-
-    if session is not None:
-        return await _fetch(session)
-
-    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
-        return await _fetch(owned_session)
-
-
-def _load_and_convert_image(image):
-    image = Image.open(image)
-    image.load()
-    return convert_image_mode(image, "RGB")
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:
@@ -316,188 +118,6 @@ async def async_load_image(
                                        (image).to(device=device))
     else:
         return image
-
-
-def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
-    """Convert a PyAV audio frame to a NumPy array, averaging channels if mono."""
-    chunk = frame.to_ndarray()
-    if mono and chunk.ndim > 1:
-        chunk = chunk.mean(axis=0)
-    return chunk
-
-
-# TODO(TRTLLM-12001): Add unit tests for this.
-def extract_audio_from_video(
-    source: Union[str, BytesIO],
-    *,
-    sr: Optional[float] = None,
-    mono: bool = True,
-) -> Tuple[np.ndarray, int]:
-    """Extract the audio track from a video file using PyAV.
-
-    Args:
-        source: File path, URL, or BytesIO containing the video.
-        sr: Target sample rate. If `None`, the native sample rate is kept.
-        mono: If `True` (default), average channels to produce a mono waveform.
-
-    Returns:
-        `(waveform, sample_rate)` where *waveform* is a 1-D float32
-        NumPy array and *sample_rate* is an integer in Hz.
-
-    Raises:
-        ValueError: If the video has no audio stream or the data is corrupt.
-    """
-    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
-        raise RuntimeError(
-            "PyAV is required for audio extraction from video. "
-            "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it.")
-    try:
-        import av
-    except ImportError:
-        raise ImportError(
-            "PyAV is required for audio extraction from video but is not installed."
-        )
-
-    try:
-        with av.open(source) as container:
-            if not container.streams.audio:
-                raise ValueError("No audio stream found in the video.")
-            stream = container.streams.audio[0]
-            stream.thread_type = "AUTO"
-            native_sr = stream.rate
-            target_sr = int(sr) if sr is not None else native_sr
-
-            chunks: List[np.ndarray] = []
-            target_layout = "mono" if mono else stream.layout.name
-            needs_resampling = (not math.isclose(
-                float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
-                                or stream.format.name != "fltp"
-                                or stream.layout.name != target_layout)
-            resampler = (av.AudioResampler(
-                format="fltp",
-                layout=target_layout,
-                rate=target_sr,
-            ) if needs_resampling else None)
-            for frame in container.decode(stream):
-                if needs_resampling:
-                    for out_frame in resampler.resample(frame):
-                        chunks.append(_audio_frame_to_array(out_frame, mono))
-                else:
-                    chunks.append(_audio_frame_to_array(frame, mono))
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            "Invalid or corrupted video data when extracting audio. "
-            "Ensure the input is a valid video file.") from e
-
-    if not chunks:
-        raise ValueError("No audio frames decoded from the video.")
-
-    audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
-
-    return audio, target_sr
-
-
-def _load_video_by_cv2(video: str,
-                       num_frames: int = 10,
-                       fps: int = 30,
-                       format: str = "pt",
-                       device: str = "cpu",
-                       extract_audio: bool = False) -> VideoData:
-    # Keep this import local to avoid importing cv2 if not needed
-    import cv2
-
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-
-    vidcap = cv2.VideoCapture(video)
-
-    try:
-        if not vidcap.isOpened():
-            raise ValueError(
-                f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
-            )
-
-        frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-        original_fps = vidcap.get(cv2.CAP_PROP_FPS)
-
-        if frame_count <= 0 or original_fps <= 0:
-            raise ValueError("Video has no frames or invalid FPS.")
-
-        duration = frame_count / original_fps
-        num_frames_to_sample = frame_count
-        if num_frames > 0:
-            num_frames_to_sample = min(num_frames, frame_count)
-        if fps > 0:
-            num_frames_to_sample = min(num_frames_to_sample,
-                                       math.floor(duration * fps))
-        num_frames_to_sample = max(1,
-                                   num_frames_to_sample)  # at least one sample
-
-        indices = np.linspace(0,
-                              frame_count - 1,
-                              num_frames_to_sample,
-                              dtype=int).tolist()
-
-        # Sequential forward scan — grab() without per-frame seek
-        target_set = set(indices)
-        max_idx = indices[-1]
-        raw_frames: dict[int, np.ndarray] = {}
-        frame_idx = 0
-        while frame_idx <= max_idx:
-            grab_succeeded = vidcap.grab()
-            if not grab_succeeded:
-                break
-            if frame_idx in target_set:
-                # cv2 decodes frames in BGR order; convert to RGB for downstream use
-                retrieve_succeeded, bgr_frame = vidcap.retrieve()
-                if retrieve_succeeded:
-                    raw_frames[frame_idx] = cv2.cvtColor(
-                        bgr_frame, cv2.COLOR_BGR2RGB)
-            frame_idx += 1
-        vidcap.release()
-
-        if not raw_frames:
-            raise ValueError("Video has no readable frames.")
-
-        valid_indices = [i for i in indices if i in raw_frames]
-        if format == "pt":
-            # Bypass PIL: direct numpy HWC uint8 -> torch CHW float32
-            loaded_frames = [
-                torch.from_numpy(raw_frames[i]).permute(
-                    2, 0, 1).float().div_(255.0).to(device=device)
-                for i in valid_indices
-            ]
-        else:
-            loaded_frames = [
-                Image.fromarray(raw_frames[i]) for i in valid_indices
-            ]
-
-        metadata = {
-            "total_num_frames": frame_count,
-            "fps": original_fps,
-            "duration": duration,
-            "frames_indices": valid_indices,
-        }
-    finally:
-        # Release the OpenCV handle before any downstream re-open (e.g. PyAV
-        # audio extraction on Windows) and to avoid leaking descriptors.
-        vidcap.release()
-
-    audio = None
-    if extract_audio:
-        try:
-            audio_samples, audio_sample_rate = extract_audio_from_video(video)
-            audio = AudioData(samples=audio_samples,
-                              sample_rate=audio_sample_rate)
-        except ValueError as e:
-            if "No audio stream found" in str(e):
-                logger.warning(
-                    "Video has no audio track, skipping audio extraction.")
-            else:
-                raise
-
-    return VideoData(frames=loaded_frames, metadata=metadata, audio=audio)
 
 
 def load_base64_video(video: str) -> BytesIO:
@@ -593,14 +213,6 @@ async def async_load_video(video: str,
                                        extract_audio=extract_audio)
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
-
-
-def _normalize_file_uri(uri: str) -> str:
-    """Strip the file:// scheme and unquote percent-encoded characters."""
-    parsed = urlparse(uri)
-    if parsed.scheme == "file":
-        return unquote(parsed.path)
-    return uri
 
 
 def load_audio(
@@ -762,7 +374,7 @@ class MultimodalDataTracker:
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
-        # time; see `resolve_media_io_kwargs` in `serve/chat_utils.py`.
+        # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
 
     @property

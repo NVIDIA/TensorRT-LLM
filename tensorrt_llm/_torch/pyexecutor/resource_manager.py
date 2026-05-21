@@ -29,7 +29,7 @@ from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig)
+    GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManager as KVCacheManagerPy
@@ -695,7 +695,7 @@ class KVCacheManager(BaseResourceManager):
                 'cp_type']
 
             for req in scheduled_batch.context_requests:
-                req_beam_width = req.sampling_config.beam_width
+                req_beam_width = req.py_beam_width
                 if is_star_cp:
                     if req.ctx_iters == 0:
                         seq_len = sum(
@@ -3097,9 +3097,10 @@ class KVCacheManagerV2(BaseResourceManager):
                          input_tokens: Sequence[TokenIdExt] | None,
                          cache_salt_id: int | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
-        kv_cache = self.impl.create_kv_cache(lora_task_id,
-                                             input_tokens,
-                                             cache_salt_id=cache_salt_id)
+        kv_cache = self.impl.create_kv_cache(
+            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
+            input_tokens,
+        )
         self.kv_cache_map[request_id] = kv_cache
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):

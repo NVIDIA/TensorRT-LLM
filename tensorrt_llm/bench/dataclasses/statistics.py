@@ -121,6 +121,7 @@ class BenchmarkStatistics(BaseModel):
     # Token-related Properties
     total_output_tokens: int
     total_input_tokens: int
+    batch_full_output_throughput_tok_ns: Optional[float] = None
 
     # General Information
     num_requests: int

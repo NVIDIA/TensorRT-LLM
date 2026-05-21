@@ -1,5 +1,10 @@
 import transformers
 
+# Importing _torch.configs triggers AutoConfig registration for TRT-LLM-only
+# model_types (deepseek_v32, kimi_k2) so AutoTokenizer.from_pretrained works
+# under transformers >= 5.5; see _torch/configs/__init__.py.
+import tensorrt_llm._torch.configs  # noqa: F401
+
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
@@ -14,6 +19,7 @@ from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
+from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
@@ -54,6 +60,7 @@ __all__ = [
     "HCXVisionForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
+    "KimiK25ForConditionalGeneration",
     "LlamaForCausalLM",
     "LlavaNextModel",
     "Mistral3VLM",

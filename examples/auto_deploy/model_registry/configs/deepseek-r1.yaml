@@ -47,8 +47,6 @@ transforms:
     enabled: true
   gather_logits_before_lm_head:
     enabled: true
-# TODO: Enable once pwcudagraph + multi stream error fixed
-# (Relevant PR: https://github.com/NVIDIA/TensorRT-LLM/pull/13396)
-#  compile_model:
-#    piecewise_enabled: true
-#    piecewise_num_tokens: [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192]
+  compile_model:
+    piecewise_enabled: true
+    piecewise_num_tokens: [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192]

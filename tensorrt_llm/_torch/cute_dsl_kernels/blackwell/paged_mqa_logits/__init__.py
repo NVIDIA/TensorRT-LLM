@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .fp4_paged_mqa_logits import FP4MQALogitsKernel
 from .fp8_paged_mqa_logits import FP8MQALogitsKernel
 
 __all__ = [
+    "FP4MQALogitsKernel",
     "FP8MQALogitsKernel",
 ]
