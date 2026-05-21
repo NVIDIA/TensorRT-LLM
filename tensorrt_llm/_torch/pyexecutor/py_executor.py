@@ -61,7 +61,7 @@ from .hang_detector import HangDetector
 from .kv_cache_transceiver import (KvCacheTransceiver,
                                    is_disagg_inflight_cancel_enabled)
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse)
+                          LlmResponse, get_draft_token_length)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
@@ -2351,10 +2351,11 @@ class PyExecutor:
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
-            # simultaneously. If some requests are stuck in INIT state and the
-            # scheduler could not allocate KV for any of them, the benchmark
-            # will hang forever because in-progress generation requests won't
-            # release their KV cache.
+            # simultaneously because generation requests do not release their
+            # KV until the full benchmark batch can run. If the scheduler
+            # cannot fit any INIT request after all benchmark requests have
+            # been fetched, the fill gate would never open; raise an explicit
+            # error instead of hanging forever.
             if (self.benchmark_req_queues_size > 0 and not self.is_warmup
                     and not fitting_disagg_gen_init_requests):
                 stuck_init_requests = [
@@ -2408,42 +2409,83 @@ class PyExecutor:
 
     def _is_benchmark_disagg_fill_complete(
             self, scheduled_batch: ScheduledRequests) -> bool:
-        """Check whether all benchmark disagg requests have completed KV transfer.
+        """State-based fill-complete predicate for benchmark disagg mode.
 
-        With ADP, generation requests are distributed across TP ranks, so an
-        allgather is needed to obtain the global count.  Without ADP every
-        request is local, and we can compare directly.
+        The gate opens when all three conditions hold globally:
+
+        (A) The executor has fetched at least ``benchmark_req_queues_size``
+            requests cumulatively.
+        (B) Every request in ``active_requests`` on this rank is past the
+            KV-transfer phase (not in INIT or TRANS_IN_PROGRESS).
+        (C) The KV cache transceiver has no pending receive sessions.
+
+        For ADP, (B) and (C) are AND-ed across TP ranks via allgather.
 
         This method must only be called when ``is_benchmark_disagg`` is True.
 
         Args:
-            scheduled_batch: The current iteration's scheduled requests,
-                used to count generation requests that have completed
-                KV transfer.
+            scheduled_batch: Passed for API compatibility with callers
+                but no longer used by this predicate.
 
         Returns:
-            True when the total number of generation-ready requests
-            reaches ``benchmark_req_queues_size``.
+            True when the fill phase is complete and the first forward
+            pass can proceed.
         """
         if not self.is_benchmark_disagg:
             raise RuntimeError(
-                "_is_benchmark_disagg_fill_complete() should not be called outside benchmark "
-                "disagg mode.  This is an unexpected error.")
-        local_gen_count = sum(1 for req in scheduled_batch.generation_requests
-                              if not req.is_attention_dp_dummy)
-        if self.enable_attention_dp:
-            total_gen_count = sum(self.dist.tp_allgather(local_gen_count))
-        else:
-            total_gen_count = local_gen_count
+                "_is_benchmark_disagg_fill_complete() should not be called "
+                "outside benchmark disagg mode.")
 
-        if total_gen_count >= self.benchmark_req_queues_size:
-            return True
+        # (A) All benchmark requests have been fetched from the queue.
+        if self.num_fetch_requests < self.benchmark_req_queues_size:
+            if self.dist.rank == 0:
+                logger.debug(
+                    f"Benchmark disagg fill: fetching "
+                    f"{self.num_fetch_requests}/{self.benchmark_req_queues_size}"
+                )
+            return False
+
+        # (B) Every active request on this rank is past KV-transfer states.
+        local_all_past_transfer = not any(
+            req.is_disagg_generation_init_state
+            or req.is_disagg_generation_transmission_in_progress
+            for req in self.active_requests)
+
+        # Also require the transceiver's async receive bookkeeping to be
+        # drained before opening the fill gate.
+        local_no_inflight = (
+            self.kv_cache_transceiver is None
+            or self.kv_cache_transceiver.check_gen_transfer_complete())
+
+        local_ok = int(local_all_past_transfer and local_no_inflight)
+
+        if self.enable_attention_dp:
+            all_ranks_ok = self.dist.tp_allgather(local_ok)
+        else:
+            all_ranks_ok = [local_ok]
+        global_ok = min(all_ranks_ok) == 1
+
         if self.dist.rank == 0:
-            logger.debug(
-                f"Benchmark disagg fill in progress: "
-                f"num_fetched={self.num_fetch_requests}, "
-                f"total_gen_count={total_gen_count} (local={local_gen_count})")
-        return False
+            if global_ok:
+                logger.info(
+                    f"Benchmark disagg fill complete: "
+                    f"{len(self.active_requests)} active requests ready, "
+                    f"gate opening.")
+            else:
+                blocked_ranks = [
+                    rank for rank, ok in enumerate(all_ranks_ok) if not ok
+                ]
+                num_init = sum(1 for req in self.active_requests
+                               if req.is_disagg_generation_init_state)
+                num_in_progress = sum(
+                    1 for req in self.active_requests
+                    if req.is_disagg_generation_transmission_in_progress)
+                logger.debug(
+                    f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
+                    f"(rank {self.dist.rank} local: {num_init} INIT, "
+                    f"{num_in_progress} in-progress, "
+                    f"inflight={not local_no_inflight})")
+        return global_ok
 
     def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
                                      can_forward: bool) -> tuple[bool, bool]:
@@ -3206,6 +3248,16 @@ class PyExecutor:
             total_max = self.max_num_active_requests
 
         max_new_requests = total_max - total_num_active_requests
+
+        # Benchmark disagg fill-phase admission throttle: a preloaded queue
+        # (concurrency == total_max) would otherwise pop all requests into
+        # DISAGG_GENERATION_INIT in one iter, tripping PR #12206's fail-fast
+        # under ADP-router imbalance and growing the recv-buffer fallback
+        # faster than transfers drain.  Cap at `tp_size` (≈ pre-#12208
+        # blocking fill rate).  Verified on Kimi-K2 8k1k ctx8/gen1 con=8192.
+        if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
+                and not self.is_warmup):
+            max_new_requests = min(max_new_requests, self.dist.tp_size)
 
         return get_from_waiting_queue(
             waiting_queue,

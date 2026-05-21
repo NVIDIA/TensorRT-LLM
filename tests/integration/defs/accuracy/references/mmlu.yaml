@@ -407,6 +407,14 @@ GPT-OSS/MXFP4:
     accuracy: 75.50
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 75.50
+poolside/laguna-XS.2:
+  - accuracy: 74.93
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 75.19
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 73.66
 mistralai/Mistral-Nemo-12b-Base:
   - accuracy: 69.66
   - quant_algo: FP8
