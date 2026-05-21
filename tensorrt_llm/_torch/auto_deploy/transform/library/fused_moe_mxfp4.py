@@ -212,14 +212,11 @@ def _register_mxfp4_expert_params(
     dn_blocks_name = "down_proj_blocks"
     dn_scales_name = "down_proj_scales"
 
-    # Uninitialized placeholders — the state_dict load hook overwrites them.
-    # Reuse the existing param's device (meta in the normal meta-device build)
-    # so we don't materialize giant CPU buffers before load.
-    param_device = gu_w.device
-    gu_blocks = torch.empty((E, 2 * In, H_blk, 16), dtype=torch.uint8, device=param_device)
-    gu_scales = torch.empty((E, 2 * In, H_blk), dtype=torch.uint8, device=param_device)
-    dn_blocks = torch.empty((E, H, I_blk, 16), dtype=torch.uint8, device=param_device)
-    dn_scales = torch.empty((E, H, I_blk), dtype=torch.uint8, device=param_device)
+    # Zero-init tensors (uint8 for blocks/scales)
+    gu_blocks = torch.zeros((E, 2 * In, H_blk, 16), dtype=torch.uint8)
+    gu_scales = torch.zeros((E, 2 * In, H_blk), dtype=torch.uint8)
+    dn_blocks = torch.zeros((E, H, I_blk, 16), dtype=torch.uint8)
+    dn_scales = torch.zeros((E, H, I_blk), dtype=torch.uint8)
 
     experts_mod.register_parameter(gu_blocks_name, nn.Parameter(gu_blocks, requires_grad=False))
     experts_mod.register_parameter(gu_scales_name, nn.Parameter(gu_scales, requires_grad=False))
@@ -832,24 +829,17 @@ class QuantizeMXFP4MOE(BaseTransform):
                 ("down_proj_scales", (e_local, H, i_blk_local), torch.uint8),
                 ("down_proj_bias", (e_local, H), torch.bfloat16),
             ]
-            # Reuse the existing placeholder's device (meta in the normal
-            # meta-device build) so we don't materialize giant CPU buffers
-            # before load_weights runs.
-            param_device = gu_w_t.device
             for name, shape, dtype in raw_specs:
                 experts_mod.register_parameter(
                     name,
-                    nn.Parameter(
-                        torch.empty(shape, dtype=dtype, device=param_device),
-                        requires_grad=False,
-                    ),
+                    nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False),
                 )
 
             # SwiGLU constants. These are NOT in HF safetensors, so we set
             # them with their numeric defaults here (matches gpt-oss config:
             # alpha=1.702, beta=1.0, limit=7.0). The kernel expects fp32
             # tensors of length ``num_local_experts``.
-            a, b, c = make_swiglu_param_tensors(num_local_experts, device=param_device)
+            a, b, c = make_swiglu_param_tensors(num_local_experts)
             experts_mod.register_parameter(
                 "swiglu_alpha_trtllm", nn.Parameter(a, requires_grad=False)
             )
