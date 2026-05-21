@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, Iterator, cast
 
 from .. import rawref
-from .._block_radix_tree import BlockRadixTree, ReuseScope
+from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
@@ -399,14 +399,41 @@ class KVCacheManager:
         if reuse_scope is None:
             reuse_scope = ReuseScope()
         assert type(reuse_scope) is ReuseScope
+        if expected_prompt_length is None and input_tokens is not None:
+            expected_prompt_length = len(input_tokens)
+        reuse_match = (
+            self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
+        )
         return _KVCache(
             self,
             reuse_scope,
-            input_tokens,
+            reuse_match,
             id,
             custom_priority_callback,
             expected_prompt_length=expected_prompt_length,
         )
+
+    def _match_reuse(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+    ) -> ReuseMatch:
+        return self._radix_tree.match(reuse_scope, input_tokens, self.enable_partial_match)
+
+    def probe_reuse(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> int:
+        """
+        Return the currently reusable prefix length without holding pages.
+
+        The returned length is advisory because no page ownership is acquired.
+        """
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
+        assert type(reuse_scope) is ReuseScope
+        if input_tokens is None:
+            input_tokens = ()
+        return self._match_reuse(reuse_scope, input_tokens).num_tokens
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """
