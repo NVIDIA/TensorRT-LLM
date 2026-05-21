@@ -1596,9 +1596,8 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         os.write(write_fd, ipc_hmac_key.encode("ascii"))
         os.close(write_fd)
         write_fd = -1
-        non_mpi_env[
-            LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD.
-            value] = str(read_fd)
+        non_mpi_env[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD.
+                    value] = str(read_fd)
         _child_p_global = subprocess.Popen(
             command,
             env=non_mpi_env,
