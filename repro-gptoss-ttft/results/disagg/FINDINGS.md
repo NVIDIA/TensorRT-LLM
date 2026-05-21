@@ -14,18 +14,58 @@ disagg proxy. Bench top-level via `benchmark_serving.py` against
 
 ## Bench-level result
 
-| metric          | agg p50 | disagg p50 | disagg − agg | cookbook delta (rep1 vs rep6) |
-|-----------------|--------:|-----------:|-------------:|------------------------------:|
-| TTFT            | 166 ms  | 202 ms     | +36 ms       | +963 ms                       |
-| TTFT p99        | 187 ms  | 223 ms     | +36 ms       | n/a                           |
-| TPOT            | 1.09 ms | 2.61 ms    | +1.52 ms     | n/a                           |
-| ITL median      | 3.7 ms  | 369 ms     | +365 ms      | n/a                           |
-| E2EL median     | 373 ms  | 575 ms     | +202 ms      | n/a                           |
+All TTFT/TPOT/ITL/E2EL numbers below are at conc=1, 32 random-IDs prompts,
+ISL=13576 / OSL=144, cold ctx KV cache (see "KV cache reuse note" below).
+
+| metric       | agg p50 (seed=42) | disagg round_robin p50 (seed=42) | disagg kv_aware p50 (seed=43) | round_robin − agg | kv_aware − round_robin | cookbook rep1 → rep6 |
+|--------------|------------------:|---------------------------------:|------------------------------:|------------------:|-----------------------:|---------------------:|
+| TTFT         | 166 ms            | 202 ms                           | 202 ms                        | +36 ms            | ~0 ms                  | +963 ms              |
+| TTFT p99     | 187 ms            | 223 ms                           | 207 ms                        | +36 ms            | −16 ms                 | n/a                  |
+| TPOT         | 1.09 ms           | 2.61 ms                          | 2.40 ms                       | +1.52 ms          | −0.2 ms                | n/a                  |
+| ITL median   | 3.7 ms            | 369 ms                           | 341 ms                        | +365 ms           | −28 ms                 | n/a                  |
+| E2EL median  | 373 ms            | 575 ms                           | 547 ms                        | +202 ms           | −28 ms                 | n/a                  |
 
 The ~365 ms ITL inflation on disagg is consistent with the gen worker's
 `stream_interval: 100` setting: the worker batches 100 decode iters between
 SSE chunks, so the first chunk after TTFT carries ~100 iters × 4 ms ≈
 400 ms.
+
+**Router observation.** At conc=1 with 1 ctx + 1 gen server, switching
+from `round_robin` to `kv_cache_aware` has no measurable effect on TTFT.
+With a single ctx server the router has no real routing decision to make,
+so the per-request `AutoTokenizer.apply_chat_template` + block-hash work
+on the proxy thread (~13k tokens) is either fast enough to be lost in the
+TTFT noise floor, or fully hidden by the network/dispatch path. The minor
+TPOT/ITL/E2EL improvements likely reflect spec acceptance variance across
+different prompt sets rather than router behaviour.
+
+## KV cache reuse note (important when comparing runs)
+
+`benchmark_serving.py --random-ids --seed N` generates 32 prompts
+deterministically from N. Same seed → identical token IDs across runs.
+With `enable_block_reuse: true` on the ctx worker, running two benches
+in a row against the same server with the same seed makes the second run
+hit the KV cache on every prompt, which lowers the reported TTFT to
+near-zero prefill cost.
+
+Concrete example from this experiment: the first kv_aware run (with the
+same seed=42 as the prior round_robin run, against still-warm workers)
+reported TTFT p50 = 76 ms. The ctx iter log showed `num_ctx_tokens = 1`
+on every iter — i.e. the entire 14k-token prefill was served from the
+KV pool the round_robin run had populated. We re-ran with seed=43 to get
+an uncached measurement (202 ms shown above).
+
+Rule of thumb when chaining benches:
+
+| run | TTFT meaning |
+|-----|--------------|
+| first run after worker launch (any seed) | cold ctx, full prefill |
+| later run with a **new seed** | cold ctx, full prefill |
+| later run with the **same seed** against still-warm workers | warm ctx, mostly KV reuse |
+
+Defaults: `scripts/bench_ttft.sh` uses `SEED=42` unless overridden. For
+back-to-back runs without restarting workers, pass `SEED=43`, `SEED=44`,
+... per run.
 
 ## What the iter logs show (ctx + gen, independent of /perf_metrics)
 
@@ -107,13 +147,15 @@ investigating):
    server, gen server, RWLT client) with steady-clock alignment in their
    measurement framework. Any skew or polling pause that lands inside
    those windows shows up in those buckets.
-2. **`kv_cache_aware` router on the proxy.** Cookbook used
-   `kv_cache_aware`; we used `round_robin` (the kv_cache_aware path tries
-   `AutoTokenizer.from_pretrained("openai/gpt-oss-120b")` on the proxy,
-   which currently fails under `HF_HUB_OFFLINE=1` for the served-model id
-   we used). With a working tokenizer the router runs the tokenizer + a
-   block-hash computation per request on the proxy's event loop, which
-   for a 13k-token prompt is non-trivial.
+2. ~~**`kv_cache_aware` router on the proxy.**~~ **Tested.** Cookbook
+   used `kv_cache_aware`; our first disagg run used `round_robin`. With
+   the router switched to `kv_cache_aware` (after pointing the request
+   `model` field at the local checkpoint so the proxy tokenizer load
+   resolves from disk under `HF_HUB_OFFLINE=1`), TTFT p50 stays at
+   202 ms — same as round_robin. With one ctx server the per-request
+   `apply_chat_template` + block-hash work on the proxy thread either
+   completes within the TTFT noise floor or is hidden by the network /
+   dispatch path. Probably not the cookbook's source.
 3. **`torch_compile_config` + `enable_piecewise_cuda_graph: true`** with
    the 157-entry `capture_num_tokens` list. Present in both setups; we
    haven't independently isolated whether it adds per-request graph
@@ -138,10 +180,8 @@ investigating):
    same configs but `cuda_graph_config: null` on ctx and no
    `torch_compile_config` (matches the perf-sanity disagg pattern). If
    delta stays at +36 ms, current config is well-understood at conc=1.
-2. **Re-run with `kv_cache_aware` router** with a working tokenizer
-   (pass `--tokenizer /local/path` to `trtllm-serve disaggregated`) and
-   measure how much the per-request tokenize+hash step on the proxy adds
-   to TTFT.
+2. ~~Re-run with `kv_cache_aware` router~~ — done; no measurable TTFT
+   change vs round_robin at this topology.
 3. **High-concurrency repro.** Dynamo's report was at conc=48. Run
    conc=8/16/48 on our setup to see whether the gen-worker first-iter
    stall remains hidden by ctx prefill or starts contributing to TTFT.

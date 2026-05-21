@@ -8,17 +8,24 @@ Uses only `trtllm-serve` + `benchmark_serving.py` + server-side
 
 ## TL;DR finding
 
-| metric         | this repro p50 | cookbook (single request) |
-|----------------|---------------:|--------------------------:|
-| agg TTFT       | 166 ms         | 950 ms (server lane)      |
-| disagg TTFT    | 202 ms         | 2629 ms                   |
-| disagg − agg   | +36 ms         | +963 ms                   |
+| run                           | TTFT p50 | TTFT p99 | TPOT  | E2EL  | notes |
+|-------------------------------|---------:|---------:|------:|------:|---|
+| agg, TP1, 1 GPU               | 166 ms   | 187 ms   | 1.09 ms | 373 ms | fresh ctx, seed=42 |
+| disagg round_robin, 2 GPUs    | 202 ms   | 223 ms   | 2.61 ms | 575 ms | fresh ctx, seed=42 |
+| disagg kv_cache_aware, 2 GPUs | 202 ms   | 207 ms   | 2.40 ms | 547 ms | fresh ctx, seed=43 |
+| cookbook agg (rep1, 1 GPU)    | 950 ms (server lane) | n/a | n/a | 1680 ms | single request, KV reuse from warmup |
+| cookbook disagg (rep6, 2 GPUs)| 2629 ms  | n/a      | n/a   | n/a   | single request, separate steady-clock alignment across 3 processes |
+
+At conc=1 with the cookbook configs (TP1, Eagle3-v3, fp8 KV, torch.compile
++ piecewise CUDA graph, default DEFAULT/NIXL transceiver), this repro
+measures **+36 ms TTFT going from agg to disagg**, and **router choice
+makes no measurable TTFT difference** at the 1ctx+1gen topology.
 
 See [results/agg/FINDINGS.md](results/agg/FINDINGS.md) and
 [results/disagg/FINDINGS.md](results/disagg/FINDINGS.md) for the per-stage
-breakdowns and a side-by-side discussion of the differences (cross-process
-clock alignment, kv_cache_aware router, KV-cache reuse from the cookbook's
-warmup pass, etc.).
+breakdowns plus side-by-side discussion of differences vs the cookbook
+report (cross-process clock alignment in the cookbook's measurement
+framework, KV-cache reuse pattern on the cookbook's warmup pass, etc.).
 
 ## Layout
 
@@ -63,23 +70,52 @@ Defaults (override via env vars before invocation):
 |---|---|
 | `MODEL`               | `/home/scratch.trt_llm_data_ci/llm-models/gpt_oss/gpt-oss-120b` |
 | `EAGLE_CKPT`          | `/home/scratch.simengl_sw_3/trt_repos/hf_models/nvidia/gpt-oss-120b-Eagle3-v3` |
-| `SERVED_MODEL_NAME`   | `openai/gpt-oss-120b` (so bench client model id is stable) |
+| `SERVED_MODEL_NAME`   | `openai/gpt-oss-120b` (stable bench-client model id) |
 | `NUM_PROMPTS`         | 32 |
 | `CONCURRENCY`         | 1 |
 | `ISL` / `OSL`         | 13576 / 144 (matches the cookbook prompt size) |
+| `SEED`                | 42 (override per run when chaining benches — see Caveats) |
 
 ## Caveats
 
-- `HF_HUB_OFFLINE=1` is set by the launchers, so the proxy's
-  `kv_cache_aware` router cannot load `openai/gpt-oss-120b` from HF and
-  crashes on first request. Use `repro_disagg_proxy_round_robin.yaml`
-  instead, or pass `--tokenizer <local path>` to `trtllm-serve disaggregated`.
+### KV cache reuse — change the seed between runs
+
+`benchmark_serving.py --random-ids --seed N` generates 32 prompts
+deterministically from N. With `enable_block_reuse: true` on the ctx
+worker, two back-to-back runs against the same server with the same seed
+make the second run hit the KV cache on every prompt and report an
+artificially low TTFT.
+
+Confirmed in this experiment: a kv_aware disagg run that reused
+`seed=42` immediately after a `seed=42` round_robin run reported
+TTFT p50 = 76 ms with `num_ctx_tokens = 1` per ctx iter (i.e. 100% KV
+reuse). Re-running with `SEED=43` produced an uncached TTFT p50 = 202 ms.
+
+**Rule**: when chaining benches against the same workers, pass a new
+`SEED` per invocation (`SEED=43 scripts/bench_ttft.sh ...`) or restart
+the workers first. `benchmark_serving.py`'s "Initial test run" also
+sends the first prompt as a warmup before measurement, so the first
+main-loop request always hits cache; `scripts/parse_iter_log.py` and
+`scripts/cookbook_breakdown.py` drop the warmup request(s) by default.
+
+### Router (`kv_cache_aware` vs `round_robin`)
+
+- The `kv_cache_aware` router tries `AutoTokenizer.from_pretrained(model)`
+  on the proxy where `model` is the request body's `model` field. Under
+  `HF_HUB_OFFLINE=1` it fails if the requested id is an HF-only name like
+  `openai/gpt-oss-120b`. Workarounds: send the bench with
+  `MODEL=/local/checkpoint` so the request's `model` field is a local
+  path the proxy can resolve, or use `repro_disagg_proxy_round_robin.yaml`.
+- At conc=1 with 1 ctx + 1 gen server, the router choice has no
+  measurable TTFT impact (we tested it). With multiple ctx servers it
+  would, but that's not exercised here.
+
+### `/perf_metrics` plumbing
+
 - `/perf_metrics` on the disagg proxy needs `TRTLLM_KVCACHE_TIME_OUTPUT_PATH`
   set on **all three** processes plus the env-gated per-request
   `sampling_params.return_perf_metrics=True` path (chat completions
   doesn't set it; completions does — see
-  `tensorrt_llm/serve/openai_server.py:1383`).
-- benchmark_serving's "Initial test run" pre-sends prompt 0 as a warmup;
-  with `enable_block_reuse: true` the first measured request is a 100% KV
-  hit. `scripts/parse_iter_log.py` and `scripts/cookbook_breakdown.py`
-  both drop the warmup request(s) by default.
+  `tensorrt_llm/serve/openai_server.py:1383`). If you manually restart
+  the proxy without re-exporting the env var, the endpoint returns an
+  empty list.
