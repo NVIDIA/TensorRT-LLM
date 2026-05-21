@@ -240,6 +240,12 @@ def parse_args():
         "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument(
+        "--ring_size",
+        type=int,
+        default=1,
+        help="Ring Attention parallel size. Cannot be combined with --attn2d_row_size / --attn2d_col_size.",
+    )
+    parser.add_argument(
         "--parallel_vae_size",
         type=int,
         default=1,
@@ -328,9 +334,21 @@ def main():
         raise ValueError(
             "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
+    if args.ring_size > 1 and attn2d_size > 1:
+        raise ValueError(
+            "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
 
     if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
+        num_heads = 40
+        logger.info(
+            f"Using Ulysses sequence parallelism: "
+            f"{num_heads} heads / {args.ulysses_size} ranks = "
+            f"{num_heads // args.ulysses_size} heads per GPU"
+        )
+
+    if args.ulysses_size > 1 or args.ring_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size}), Ring(size={args.ring_size})"
     elif attn2d_size > 1:
         parallel_str = (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
@@ -370,6 +388,7 @@ def main():
             "dit_attn2d_row_size": args.attn2d_row_size,
             "dit_attn2d_col_size": args.attn2d_col_size,
             "parallel_vae_size": args.parallel_vae_size,
+            "dit_ring_size": args.ring_size,
         },
         torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
