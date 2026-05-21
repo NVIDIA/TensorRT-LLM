@@ -1456,9 +1456,8 @@ def _handle_prefill_thop_cached_kv(
         tokens_per_block,
         max_num_requests,
         max_context_length,
-        max_context_length,
-        0,
-        1,
+        max_context_length,  # attention_window_size
+        1,  # beam_width
         int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
         quant_mode,
         q_scaling,
