@@ -163,7 +163,7 @@ def _flatten_block_dim(blocks_4d: torch.Tensor) -> torch.Tensor:
     if blocks_4d.dim() == 3:
         return blocks_4d
     if blocks_4d.dim() == 4:
-        return blocks_4d.contiguous().view(*blocks_4d.shape[:-2], -1)
+        return blocks_4d.reshape(*blocks_4d.shape[:-2], -1)
     raise ValueError(f"Unexpected MXFP4 weight rank {blocks_4d.dim()}; expected 3 or 4.")
 
 
@@ -192,26 +192,6 @@ def _pad_per_expert_2d(
     return out
 
 
-def _shuffle_one_expert(
-    slc: torch.Tensor,
-    permute_fn,
-    num_elts_per_sf: int | None,
-    is_scale: bool,
-) -> torch.Tensor:
-    """Single-expert TMA-layout shuffle (looped per-expert because PT's permute-index helpers
-    derive indices from a 2-D shape).
-
-    ``permute_fn``: gated (w3/w1) vs non-gated (w2). ``is_scale=True`` chains
-    ``block_scale_interleave`` for the kernel's scale layout.
-    """
-    slc = slc.contiguous()
-    perm = permute_fn(slc, _PERMUTE_CACHE, _EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf)
-    shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
-    if is_scale:
-        shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
-    return shuffled.view(slc.dtype)
-
-
 def _shuffle_per_expert(
     stacked: torch.Tensor,
     permute_fn,
@@ -220,22 +200,36 @@ def _shuffle_per_expert(
     is_scale: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-expert TMA-layout shuffle (weights, scales, biases all share this).
+    """Batched TMA-layout shuffle on a stacked ``[E, M, ...]`` tensor (weights, scales, biases).
 
-    Biases use the SAME row permute as their weights so ``bias[i]`` aligns with ``weight_row[i]``
-    post-shuffle — mismatch → kernel epilogue adds the wrong bias and MoE output is garbage.
-    ``out=None`` returns a fresh stacked tensor; otherwise per-expert results are ``copy_``-ed
-    into caller-provided storage.
+    Derives the row permute ONCE on expert 0 (gpt-oss guarantees same per-expert shape, and
+    ``_PERMUTE_CACHE`` is keyed by shape so the per-expert loop would return the same index
+    every iteration anyway), then applies it to the whole stack via ``torch.index_select`` on
+    the M axis (= dim=1). When ``is_scale``, chains ``block_scale_interleave`` for the kernel's
+    scale layout.
+
+    Biases use the SAME row permute as their weights so ``bias[i]`` aligns with
+    ``weight_row[i]`` post-shuffle — mismatch → kernel epilogue adds the wrong bias and MoE
+    output is garbage.
+
+    ``out=None`` returns a fresh tensor; otherwise the result is ``copy_``-ed into the
+    caller-provided storage (used by :class:`MXFP4PrepScratch` to avoid per-layer transients).
     """
-    e = stacked.size(0)
-    per_expert = (
-        _shuffle_one_expert(stacked[i], permute_fn, num_elts_per_sf, is_scale) for i in range(e)
-    )
+    # Derive permute once on expert 0 — equivalent to per-expert calls because
+    # _PERMUTE_CACHE keys on shape and all experts share shape.
+    perm = permute_fn(
+        stacked[0], _PERMUTE_CACHE, _EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf
+    ).to(stacked.device)
+
+    shuffled = torch.index_select(stacked, 1, perm)
+    if is_scale:
+        shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(stacked.shape)
+    shuffled = shuffled.view(stacked.dtype)
+
     if out is None:
-        return torch.stack(list(per_expert), dim=0).contiguous()
-    assert out.shape[0] == e
-    for i, shuffled in enumerate(per_expert):
-        out[i].copy_(shuffled)
+        return shuffled.contiguous()
+    assert out.shape[0] == stacked.size(0)
+    out.copy_(shuffled)
     return out
 
 
