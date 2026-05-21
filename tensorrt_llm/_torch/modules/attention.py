@@ -1780,6 +1780,11 @@ class MLA(nn.Module):
             float(self.q_b_layernorm.variance_epsilon),
             self._quant_scale_qkv,
         )
+        # Both buffers must be live for the fused path; the downstream
+        # absorption-context op switches on `quant_scale_qkv is not None`
+        # to enable the C++ fusion (see trtllm.py `thop.attention` call).
+        assert self._quant_scale_qkv is not None, (
+            "fused FP8-Q quant requires _quant_scale_qkv to be set")
         return q_proj, quant_q_buffer, q_pe, self._quant_scale_qkv
 
     def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
@@ -3140,15 +3145,15 @@ class MLA(nn.Module):
         # Fused FP8-Q path: forward the pre-quantized buffers stashed in
         # `_q_branch`; the C++ op enables fusion when both are non-None.
         quant_q_buffer = getattr(self, "_fused_quant_q_buffer", None)
-        q_pe_fused = getattr(self, "_fused_q_pe", None)
+        fused_q_pe = getattr(self, "_fused_q_pe", None)
         quant_scale_qkv = getattr(self, "_quant_scale_qkv", None)
         use_fused_q_fp8 = (self.is_deepseek_v4 and quant_q_buffer is not None
-                           and q_pe_fused is not None
+                           and fused_q_pe is not None
                            and quant_scale_qkv is not None)
 
         if use_fused_q_fp8:
             # Defensive prefix slicing — context-only batches today, mixed-batch later.
-            q_pe = q_pe_fused[:num_tokens]
+            q_pe = fused_q_pe[:num_tokens]
             quant_q_buffer = quant_q_buffer[:num_tokens].view(
                 num_tokens, self.num_heads_tp,
                 self.kv_lora_rank + self.qk_rope_head_dim)

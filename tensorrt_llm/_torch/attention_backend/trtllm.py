@@ -1470,6 +1470,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 global_layer_idx=self.layer_idx,
             )
         else:
+            # The fused DSv4 FP8-Q-quant path requires both `quant_q_buffer`
+            # and `quant_scale_qkv` to reach the C++ op together. Without the
+            # scale the C++ side silently drops back to the BF16 quant kernel
+            # while Python keeps feeding it the pre-LayerNorm placeholder Q,
+            # producing garbage outputs (see CI #39174).
+            assert (forward_args.quant_q_buffer is None) == (
+                forward_args.quant_scale_qkv is None
+            ), ("quant_q_buffer and quant_scale_qkv must be provided together")
             thop.attention(
                 q,
                 k,
@@ -1560,6 +1568,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
+                quant_scale_qkv=forward_args.quant_scale_qkv,
             )
 
         if self.print_skip_softmax_stat:
