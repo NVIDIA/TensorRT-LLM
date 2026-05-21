@@ -79,7 +79,6 @@ def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
 
     key_fd = os.environ.pop(
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD, None)
-    os.environ.pop("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY", None)
     if key_fd is not None:
         _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
             _read_spawn_proxy_process_ipc_hmac_key_fd(key_fd))

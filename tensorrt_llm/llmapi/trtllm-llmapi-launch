@@ -40,7 +40,6 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 export tllm_mpi_size=$(mpi_world_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
-unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 unset TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD
 ipc_hmac_key=$(openssl rand -hex 32)
 

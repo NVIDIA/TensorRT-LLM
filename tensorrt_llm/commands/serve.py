@@ -1407,7 +1407,6 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     free_ipc_addr = find_free_ipc_addr()
     ipc_hmac_key = secrets.token_hex(32)
     set_spawn_proxy_process_ipc_hmac_key(ipc_hmac_key)
-    os.environ.pop("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY", None)
     os.environ.pop(
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD.value, None)
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
@@ -1428,7 +1427,6 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
-    assert "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY" not in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
 
