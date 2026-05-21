@@ -61,8 +61,8 @@ from .deepseek_v4 import (
     is_overlap_compressor,
 )
 
-# Keep DSV4 scratch reuse opt-in so per-layer block tables can be tested
-# without scratch-page remapping in the default path.
+# Keep the env override so per-layer block tables can still be tested
+# without scratch-page remapping when needed.
 DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV = "TRTLLM_DSV4_ENABLE_SWA_SCRATCH_REUSE"
 
 
@@ -120,7 +120,7 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 
 
 def _enable_swa_scratch_reuse_from_env() -> bool:
-    value = os.environ.get(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "0")
+    value = os.environ.get(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
     return value.strip() == "1"
 
 
