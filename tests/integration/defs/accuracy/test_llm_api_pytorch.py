@@ -6291,6 +6291,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                                     enable_block_reuse=False)
     cuda_graph_config = CudaGraphConfig(enable_padding=True)
 
+    @skip_pre_hopper
     def test_bf16(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B"
         with LLM(model_path,
