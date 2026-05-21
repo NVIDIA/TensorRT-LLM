@@ -157,6 +157,8 @@ class Eagle3MLAttention(MLA):
                 use_custom_cublas_mm=True,
             )
 
+        self.sliding_window = getattr(config, "sliding_window", None)
+
 
 class Eagle3DecoderLayer(DecoderLayer):
     """
@@ -193,10 +195,21 @@ class Eagle3DecoderLayer(DecoderLayer):
             self.self_attn = Eagle3Attention(model_config, layer_idx,
                                              self._next_layer_regular)
 
-        attention_window_size = getattr(self.self_attn, "sliding_window", None)
+        sliding_window = getattr(self.self_attn, "sliding_window", None)
         self._attn_kwargs = {}
-        if attention_window_size is not None:
-            self._attn_kwargs["attention_window_size"] = attention_window_size
+        if sliding_window is not None:
+            forward_params = inspect.signature(self.self_attn.forward).parameters
+            if "attention_window_size" in forward_params:
+                self._attn_kwargs[
+                    "attention_window_size"] = sliding_window
+            else:
+                logger.warning(
+                    "sliding_window=%s is configured on %s but its forward "
+                    "method does not accept attention_window_size; ignoring "
+                    "sliding window for this attention module.",
+                    sliding_window,
+                    type(self.self_attn).__name__,
+                )
 
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp

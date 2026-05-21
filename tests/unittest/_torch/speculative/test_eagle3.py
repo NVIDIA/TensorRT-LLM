@@ -99,34 +99,57 @@ def test_kv_lens_runtime_with_eagle3_one_model():
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
 
 
+@pytest.mark.parametrize("use_mla", [False, True])
 @pytest.mark.parametrize("sliding_window", [None, 64])
-def test_eagle3_sliding_window_wiring(sliding_window):
+def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
     """Verify Eagle3 forwards ``config.sliding_window`` to Attention as
     ``attention_window_size``.
 
     The Eagle3 SWA wiring lives in two places in
     ``tensorrt_llm/_torch/models/modeling_speculative.py``:
 
-    1. ``Eagle3Attention.__init__`` reads ``sliding_window`` from the
-       pretrained config and stores it on the module.
+    1. ``Eagle3Attention`` / ``Eagle3MLAttention`` read ``sliding_window``
+       from the pretrained config and store it on the module.
     2. ``Eagle3DecoderLayer.__init__`` copies it into ``self._attn_kwargs``
-       so it is forwarded as ``attention_window_size`` via ``**kwargs`` to
-       ``self.self_attn(...)`` on every forward.
+       when the attention ``forward`` accepts ``attention_window_size``, so it
+       is forwarded via ``**kwargs`` to ``self.self_attn(...)`` on every
+       forward.
 
     This is a focused unit test (no GPU / no model weights). It mirrors
     ``test_mistral_attention_swa_wiring`` in
     ``tests/unittest/_torch/modeling/test_modeling_mistral.py``.
     """
-    config = transformers.LlamaConfig(
-        hidden_size=128,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=256,
-        max_position_embeddings=2048,
-        rms_norm_eps=1e-5,
-        attention_bias=False,
-        sliding_window=sliding_window,
-    )
+    if use_mla:
+        config = transformers.PretrainedConfig(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            intermediate_size=256,
+            max_position_embeddings=2048,
+            rms_norm_eps=1e-5,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=8,
+            v_head_dim=16,
+            rope_scaling={
+                "type": "yarn",
+                "factor": 64.0,
+                "original_max_position_embeddings": 2048,
+            },
+            sliding_window=sliding_window,
+        )
+    else:
+        config = transformers.LlamaConfig(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=256,
+            max_position_embeddings=2048,
+            rms_norm_eps=1e-5,
+            attention_bias=False,
+            sliding_window=sliding_window,
+        )
     config.torch_dtype = torch.bfloat16
 
     mc = model_config_lib.ModelConfig(
@@ -138,18 +161,20 @@ def test_eagle3_sliding_window_wiring(sliding_window):
     layer = Eagle3DecoderLayer(mc,
                                layer_idx=0,
                                is_first_layer=True,
-                               use_mla=False)
+                               use_mla=use_mla)
 
-    # (1) Eagle3Attention picks up sliding_window from the pretrained config.
+    # (1) Eagle3 attention picks up sliding_window from the pretrained config.
     assert layer.self_attn.sliding_window == sliding_window
 
-    # (2) Eagle3DecoderLayer only injects attention_window_size when it is set,
-    # otherwise the kwargs dict is empty so the parent Attention.forward
-    # receives its default (None).
-    expected_kwargs = ({
-        "attention_window_size": sliding_window
-    } if sliding_window is not None else {})
-    assert layer._attn_kwargs == expected_kwargs
+    # (2) Eagle3DecoderLayer only injects attention_window_size when the
+    # attention forward accepts it; MLA does not, so kwargs stay empty.
+    if use_mla:
+        assert layer._attn_kwargs == {}
+    else:
+        expected_kwargs = ({
+            "attention_window_size": sliding_window
+        } if sliding_window is not None else {})
+        assert layer._attn_kwargs == expected_kwargs
 
 
 @pytest.mark.parametrize(
