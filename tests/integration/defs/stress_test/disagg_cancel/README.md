@@ -37,8 +37,8 @@ tests/integration/defs/stress_test/disagg_cancel/
 ├── test_disagg_cancel_stress.py    (pytest entry point)
 └── configs/
     ├── README.md                   (YAML schema + how to add a config)
-    ├── marathon_a_v1_cpp_deepseek.yaml
-    └── marathon_b_v2_py_qwen.yaml   (placeholder; not yet parametrized)
+    ├── marathon_cpp_v1_deepseek.yaml
+    └── marathon_python_v2_qwen.yaml   (placeholder; not yet parametrized)
 ```
 
 Future additions:
@@ -72,7 +72,7 @@ and the YAMLs parse.
 ### Local marathon (once thread bodies are wired)
 
 Once thread bodies are implemented, the same command will run the
-full 2-hour marathon against Marathon A. To run a shorter smoke
+full 2-hour marathon against the C++ marathon config. To run a shorter smoke
 during development, set `duration_min: 10` and trim
 `injections:` in the YAML.
 
@@ -107,7 +107,7 @@ For now, when the skeleton test fails:
 
 1. Confirm the YAML parses:
    ```bash
-   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_a_v1_cpp_deepseek.yaml').validate()"
+   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_cpp_v1_deepseek.yaml').validate()"
    ```
 2. Check the `failure_reason` field in `collect_results()` output.
 3. Look at the pytest stdout for harness `logger` lines (each thread

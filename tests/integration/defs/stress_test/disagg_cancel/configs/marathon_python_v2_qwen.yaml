@@ -1,12 +1,18 @@
-# Marathon A: V1 KV cache + C++ transceiver + NIXL, DeepSeek-class MLA.
+# Python transceiver marathon: V2 KV cache + Python transceiver + NIXL, Qwen-class GQA.
 #
-# Exercises the legacy C++-backed disagg path (BindKvCacheTransceiver
-# + V1 KVCacheManager + NIXL backend) — the configuration NVBug
-# 6104831 was filed against and that PR #13713 stabilizes. Schema
+# Exercises the pure-Python disagg path (KvCacheTransceiverV2 +
+# KVCacheManagerV2 + NIXL backend) on a non-MLA, GQA-style model so
+# the marathon coverage is symmetric across the two supported
+# (KV-cache manager × transceiver runtime) backends. Schema
 # documentation lives in ../README.md.
+#
+# This YAML is intentionally not parametrized in
+# `_MARATHON_CONFIGS` yet; it ships as a ready-to-wire template that
+# becomes active once canary references for Qwen2.5-7B-Instruct are
+# recorded.
 
 hostname: localhost
-model: DeepSeek-V3-Lite/bf16
+model: Qwen2.5-7B-Instruct
 backend: pytorch
 
 context_servers:
@@ -21,12 +27,12 @@ context_servers:
     enable_block_reuse: true        # block reuse ON
     enable_partial_reuse: true
     free_gpu_memory_fraction: 0.3
-    use_kv_cache_manager_v2: false  # V1 KV cache (default)
+    use_kv_cache_manager_v2: true   # V2 KV cache
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: CPP        # C++ transceiver (default; explicit for clarity)
+    transceiver_runtime: PYTHON     # Python transceiver
     max_tokens_in_buffer: 16384
-    kv_transfer_timeout_ms: 60000   # production default
+    kv_transfer_timeout_ms: 60000
 
 generation_servers:
   num_instances: 3
@@ -40,24 +46,18 @@ generation_servers:
     enable_block_reuse: true
     enable_partial_reuse: true
     free_gpu_memory_fraction: 0.3
-    use_kv_cache_manager_v2: false
+    use_kv_cache_manager_v2: true
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: CPP
+    transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384
     kv_transfer_timeout_ms: 60000
 
-# ============================================================================
-# Stress harness configuration (consumed by harness.py::StressConfig).
-# Schema documented in ../README.md.
-# ============================================================================
 stress_config:
-  duration_min: 120                  # 2 h marathon
+  duration_min: 120
 
-  # Backend-knob axis selectors. Must match
-  # context_servers / generation_servers above.
-  kv_cache_manager: v1               # V1 (legacy C++) KV cache manager
-  transceiver: cpp                   # C++-backed transceiver (BindKvCacheTransceiver)
+  kv_cache_manager: v2
+  transceiver: python
 
   base_concurrency: 64
   client_cancel_rate: 0.10
@@ -126,4 +126,4 @@ stress_config:
       - "0xffffffffffffffff"
       - "Poisoned .* cache transfer buffer"
 
-  kv_cache_growth_max: 0.10   # final utilization ≤ baseline + 10 percentage points
+  kv_cache_growth_max: 0.10

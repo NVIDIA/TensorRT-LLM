@@ -29,15 +29,31 @@ from pathlib import Path
 
 import pytest
 
-from .harness import DisaggCancellationStressHarness
+from .harness import DisaggCancellationStressHarness, StressConfig
 
 _CONFIG_DIR = Path(__file__).parent / "configs"
 
 # Marathon configurations exercised by the parametrized test below.
 # Add a new entry here to wire an additional YAML into the suite.
 _MARATHON_CONFIGS: list[str] = [
-    "marathon_a_v1_cpp_deepseek.yaml",
+    "marathon_cpp_v1_deepseek.yaml",
 ]
+
+
+def test_all_marathon_yamls_parse_and_validate() -> None:
+    """Every ``marathon_*.yaml`` in ``configs/`` must parse and validate.
+
+    Catches YAML-syntax and schema-validity regressions in marathon
+    configs that are not yet parametrized into ``_MARATHON_CONFIGS``
+    (e.g. configs whose canary references are still being recorded).
+    Without it, broken-but-not-yet-wired YAMLs sit undetected until
+    the day they are parametrized, which can be PRs away.
+    """
+    marathon_yamls = sorted(_CONFIG_DIR.glob("marathon_*.yaml"))
+    assert marathon_yamls, f"no marathon_*.yaml configs found under {_CONFIG_DIR}"
+    for path in marathon_yamls:
+        cfg = StressConfig.from_yaml_path(path)
+        cfg.validate()
 
 
 @pytest.mark.parametrize("config_filename", _MARATHON_CONFIGS)
