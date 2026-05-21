@@ -32,14 +32,18 @@ class DatasetFormatError(ValueError):
 
 # Tokenizer classes that ship only a slow `PreTrainedTokenizer` implementation
 # and rely on a model-specific pre-tokenization regex. transformers >= 5
-# tries to auto-convert them to Fast tokenizers via a generic
+# silently converts them to a Fast `TokenizersBackend` via a generic
 # "SentencePiece-then-TikToken" fallback that mis-segments text (e.g.
 # Kimi-K2/K2.5's `TikTokenTokenizer`, whose `pat_str` uses CJK-aware regex
-# alternatives that the fallback does not honor). For these we force
-# `use_fast=False` so the model's own slow tokenizer is used.
+# alternatives that the fallback does not honor). Passing `use_fast=False`
+# to `AutoTokenizer.from_pretrained` is a no-op in 5.x. Instead, we load
+# the slow class directly from the model repo's `auto_map` entry via
+# `get_class_from_dynamic_module`, bypassing AutoTokenizer's conversion.
 # See https://huggingface.co/moonshotai/Kimi-K2.5/discussions/7 and
 # https://huggingface.co/moonshotai/Kimi-K2.6 (transformers < 5.0.0).
-_REQUIRES_SLOW_TOKENIZER = {"TikTokenTokenizer"}
+_DYNAMIC_TOKENIZER_LOAD = {
+    "TikTokenTokenizer": "tokenization_kimi.TikTokenTokenizer",
+}
 
 
 def _tokenizer_class_from_config(
@@ -107,14 +111,34 @@ def initialize_tokenizer(model_name: str,
                 f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
                 "Expected alias or 'module.path.ClassName'.") from e
     else:
-        # Force the slow tokenizer for known-incompatible classes so we don't
-        # silently fall back to transformers' generic Fast converter.
-        use_fast = (_tokenizer_class_from_config(model_name)
-                    not in _REQUIRES_SLOW_TOKENIZER)
-        tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                                  padding_side="left",
-                                                  trust_remote_code=True,
-                                                  use_fast=use_fast)
+        detected_class = _tokenizer_class_from_config(model_name)
+        dynamic_ref = _DYNAMIC_TOKENIZER_LOAD.get(detected_class)
+        if dynamic_ref is not None:
+            # Bypass AutoTokenizer's auto-Fast conversion (which silently
+            # mis-segments text on transformers >= 5) by loading the slow
+            # class directly from the model repo's remote code.
+            from transformers.dynamic_module_utils import (
+                get_class_from_dynamic_module)
+            try:
+                tok_cls = get_class_from_dynamic_module(
+                    dynamic_ref,
+                    str(model_name),
+                )
+                tokenizer = tok_cls.from_pretrained(
+                    model_name,
+                    padding_side="left",
+                    trust_remote_code=True,
+                )
+            except (OSError, ValueError, ImportError, AttributeError):
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    padding_side="left",
+                    trust_remote_code=True,
+                )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(model_name,
+                                                      padding_side="left",
+                                                      trust_remote_code=True)
 
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
