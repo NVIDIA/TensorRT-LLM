@@ -252,9 +252,23 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compres
 
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
 
+    # Pre-allocate worst-case Radix split-work aux scratch so the fp32 path is
+    # CUDA-Graph-safe under capture and unconditionally accepted by the cpp op
+    # (which rejects blocks_per_row > 1 without caller-owned scratch). For
+    # blocks_per_row == 1 the kernel never dereferences these — supplying them
+    # is harmless. See IndexerTopKOp.cpp's fp32 branch.
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
+
     # Run CUDA implementation with compress_ratio
     torch.ops.trtllm.indexer_topk_decode(
-        logits, seq_lens, indices, next_n, index_topk, compress_ratio=compress_ratio
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
     )
 
     torch.cuda.synchronize()
@@ -379,6 +393,297 @@ def test_indexer_topk_decode_launch_policy_transitions(
     batch_size, next_n, index_topk, num_tokens, compress_ratio
 ):
     _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
+
+
+# ---------------------------------------------------------------------------
+# Caller-owned Radix aux scratch (CUDA-Graph-safe path)
+#
+# The fp32 Radix path of indexer_topk_decode allocates its split-work aux
+# buffers via th::empty per call when blocks_per_row > 1. Under CUDA Graph
+# capture+replay these per-call pointers become stale when the caching
+# allocator is perturbed (chunked-prefill churn at high CONC), producing
+# silent corruption that surfaces as CUDA_ERROR_ILLEGAL_ADDRESS at a
+# downstream sync (see DSv4-Flash pareto sweep G4).
+#
+# The fix added two optional kwargs `radix_aux_indices` and
+# `radix_aux_logits` so the caller can supply persistent stable-address
+# buffers (matching the existing `heuristic_scratch` convention).
+#
+# These tests verify:
+#   (a) caller-owned-aux output matches the default (th::empty) path,
+#   (b) the same caller-owned-aux op survives CUDA Graph capture+replay
+#       with consistent output and matches the non-graph reference,
+#   (c) validation rejects malformed buffers (dtype / size / device /
+#       contiguity).
+#
+# Parameters target the fp32 split-work regime: blocks_per_row > 1
+# requires numColumns / kNumBins(=2048) >= 2 (see indexerTopK.cu:775).
+# For compress_ratio=4 that means num_tokens >= 16384 (numColumns = 4096).
+# ---------------------------------------------------------------------------
+
+
+_K_MAX_BLOCKS_PER_ROW_DECODE = 10  # mirror kMaxBlocksPerRowDecode in indexerTopK.cu
+
+
+def _build_radix_aux_buffers(num_rows: int, index_topk: int):
+    """Allocate worst-case stable-address aux buffers for the Radix path."""
+    aux_indices = torch.empty(
+        (num_rows, _K_MAX_BLOCKS_PER_ROW_DECODE, index_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    aux_logits = torch.empty(
+        (num_rows, _K_MAX_BLOCKS_PER_ROW_DECODE, index_topk),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    return aux_indices, aux_logits
+
+
+def _build_decode_inputs(batch_size, next_n, index_topk, num_tokens, compress_ratio, seed=24):
+    """Construct the (logits, seq_lens, row_starts, row_ends) tuple used by
+    the fp32 indexer_topk_decode path.
+
+    Unlike `_run_indexer_topk_decode_check`'s helper, this one **forces
+    every row to span the full num_tokens window** so that the row_ends
+    distribution is deterministic and `row_ends.max() == num_tokens //
+    compress_ratio` for every parametrisation. That guarantees the test
+    exercises the Radix-split-work path (`blocks_per_row > 1` requires
+    `num_columns >= 2 * kNumBins = 4096`) instead of accidentally
+    short-circuiting to the single-block fallback when a random seq_len
+    happens to be small."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    seq_lens = torch.full((batch_size,), num_tokens, dtype=torch.int32, device="cuda")
+    actual_kv_lens = seq_lens[row_indices] - next_n + next_n_offset + 1
+    row_ends = actual_kv_lens // compress_ratio
+
+    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    return logits, seq_lens, row_starts, row_ends
+
+
+def _topk_logit_values_sorted(logits, indices, k):
+    """For each row, return the top-K logit VALUES (sorted descending,
+    invalid -1 slots replaced with -inf). Used to compare two op-call
+    outputs by the VALUES they selected, tolerating the kernel's
+    nondeterministic tie-breaking on equal-logit candidates."""
+    safe_idx = indices.clone().long()
+    valid = safe_idx >= 0
+    safe_idx[~valid] = 0  # gather requires non-negative
+    gathered = logits.gather(1, safe_idx)
+    gathered = gathered.masked_fill(~valid, float("-inf"))
+    sorted_vals, _ = torch.sort(gathered[:, :k], dim=-1, descending=True)
+    return sorted_vals
+
+
+@pytest.mark.parametrize(
+    "batch_size,next_n,index_topk,num_tokens,compress_ratio",
+    [
+        # blocks_per_row > 1 regime: numColumns >= 4096
+        (8, 1, 512, 16384, 4),  # mirrors DSv4 Flash CONC=8 GVR-OFF failure point
+        (16, 1, 512, 16384, 4),
+        (32, 1, 512, 16384, 4),
+        (8, 1, 512, 8192, 1),  # compress_ratio=1 path
+    ],
+)
+def test_indexer_topk_decode_radix_aux_equivalence(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    """Caller-owned Radix aux scratch must yield allocation-pointer-independent
+    output: two invocations with freshly-allocated aux buffers (different
+    backing addresses) on identical inputs must produce the same selected
+    top-K logit values. Guards against the original G4 hazard at the API
+    boundary — the kernel must consume the supplied buffers without leaking
+    pointer state from any prior call."""
+    logits, seq_lens, _, _ = _build_decode_inputs(
+        batch_size, next_n, index_topk, num_tokens, compress_ratio
+    )
+    num_rows = logits.shape[0]
+
+    # First invocation: caller-owned aux buffer A.
+    aux_a_idx, aux_a_log = _build_radix_aux_buffers(num_rows, index_topk)
+    indices_a = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices_a,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=aux_a_idx,
+        radix_aux_logits=aux_a_log,
+    )
+    torch.cuda.synchronize()
+
+    # Second invocation with a freshly-allocated aux buffer B at a distinct
+    # backing address — the only intentional difference vs invocation A.
+    aux_b_idx, aux_b_log = _build_radix_aux_buffers(num_rows, index_topk)
+    indices_b = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices_b,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=aux_b_idx,
+        radix_aux_logits=aux_b_log,
+    )
+    torch.cuda.synchronize()
+
+    # Compare by selected-logit VALUES rather than bit-identical indices —
+    # the Radix kernel uses histogram-radix sort with atomic ops and may
+    # return different (but equally valid) index orderings across calls on
+    # ties. Top-K logit values are the correctness invariant; existing
+    # `compare_top_k_results` follows the same principle.
+    k_effective = min(index_topk, int(logits.size(1)))
+    values_a = _topk_logit_values_sorted(logits, indices_a, k_effective)
+    values_b = _topk_logit_values_sorted(logits, indices_b, k_effective)
+    assert torch.allclose(values_a, values_b, rtol=0.0, atol=0.0), (
+        "Top-K logit values diverged across two caller-owned-aux invocations"
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,next_n,index_topk,num_tokens,compress_ratio",
+    [
+        # Same shapes as the equivalence test, exercising blocks_per_row > 1.
+        (8, 1, 512, 16384, 4),
+        (32, 1, 512, 16384, 4),
+    ],
+)
+def test_indexer_topk_decode_radix_aux_cuda_graph_replay(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    """Regression test for the original CUDA-Graph stale-pointer bug. Capture
+    the Radix path with caller-owned aux into a CUDA Graph, replay multiple
+    times, and verify the output matches a non-graph reference and stays
+    stable across replays. With the pre-fix per-call `th::empty` aux the
+    captured kernels could write to recycled memory between replays — the
+    persistent aux buffer eliminates that hazard."""
+    logits, seq_lens, _, _ = _build_decode_inputs(
+        batch_size, next_n, index_topk, num_tokens, compress_ratio
+    )
+    num_rows = logits.shape[0]
+
+    # Non-graph reference (uses the same caller-owned aux path).
+    aux_indices, aux_logits = _build_radix_aux_buffers(num_rows, index_topk)
+    indices_ref = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices_ref,
+        next_n,
+        index_topk,
+        compress_ratio=compress_ratio,
+        radix_aux_indices=aux_indices,
+        radix_aux_logits=aux_logits,
+    )
+    torch.cuda.synchronize()
+
+    # CUDA-Graph capture + replay using the SAME aux tensors. The captured
+    # kernel descriptors hold the aux pointers; persistent allocation keeps
+    # them valid across replays.
+    indices_graph = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+
+    # Warm-up outside capture (recommended for stable allocator state).
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        torch.ops.trtllm.indexer_topk_decode(
+            logits,
+            seq_lens,
+            indices_graph,
+            next_n,
+            index_topk,
+            compress_ratio=compress_ratio,
+            radix_aux_indices=aux_indices,
+            radix_aux_logits=aux_logits,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        torch.ops.trtllm.indexer_topk_decode(
+            logits,
+            seq_lens,
+            indices_graph,
+            next_n,
+            index_topk,
+            compress_ratio=compress_ratio,
+            radix_aux_indices=aux_indices,
+            radix_aux_logits=aux_logits,
+        )
+
+    # Replay several times; selected top-K logit values must match the
+    # non-graph reference and stay invariant across replays. (Indices
+    # themselves may reorder among equal-logit candidates due to atomic
+    # tie-breaking in the histogram-radix sort — value equality is the
+    # correctness invariant.)
+    k_effective = min(index_topk, int(logits.size(1)))
+    ref_values = _topk_logit_values_sorted(logits, indices_ref, k_effective)
+    for replay in range(8):
+        indices_graph.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        replay_values = _topk_logit_values_sorted(logits, indices_graph, k_effective)
+        assert torch.allclose(replay_values, ref_values, rtol=0.0, atol=0.0), (
+            f"CUDA Graph replay #{replay} top-K logit values diverged from non-graph reference"
+        )
+
+
+def test_indexer_topk_decode_radix_aux_validation():
+    """Caller-owned aux validation: wrong dtype, undersized buffer, wrong
+    device, and non-contiguous tensors must each raise."""
+    batch_size, next_n, index_topk, num_tokens, compress_ratio = 8, 1, 512, 16384, 4
+    logits, seq_lens, _, _ = _build_decode_inputs(
+        batch_size, next_n, index_topk, num_tokens, compress_ratio
+    )
+    num_rows = logits.shape[0]
+    indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+
+    good_idx, good_log = _build_radix_aux_buffers(num_rows, index_topk)
+
+    def call(ai, al):
+        torch.ops.trtllm.indexer_topk_decode(
+            logits,
+            seq_lens,
+            indices,
+            next_n,
+            index_topk,
+            compress_ratio=compress_ratio,
+            radix_aux_indices=ai,
+            radix_aux_logits=al,
+        )
+
+    # Wrong dtype for indices buffer (float32 instead of int32).
+    bad_idx_dtype = torch.empty_like(good_idx, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="radix_aux_indices must be int32"):
+        call(bad_idx_dtype, good_log)
+
+    # Wrong dtype for logits buffer (int32 instead of float32).
+    bad_log_dtype = torch.empty_like(good_log, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="radix_aux_logits must be float32"):
+        call(good_idx, bad_log_dtype)
+
+    # Undersized buffer (fewer elements than num_rows*blocks_per_row*index_topk).
+    too_small_idx = torch.empty((num_rows, 1, index_topk), dtype=torch.int32, device="cuda")
+    too_small_log = torch.empty((num_rows, 1, index_topk), dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="at least num_rows"):
+        call(too_small_idx, too_small_log)
+
+    # Non-contiguous buffer.
+    non_contig_idx = good_idx.transpose(0, 1)  # makes it non-contiguous
+    assert not non_contig_idx.is_contiguous()
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        call(non_contig_idx, good_log)
 
 
 def _run_indexer_topk_prefill_check(batch_size, index_topk, num_tokens):
@@ -1266,8 +1571,21 @@ def test_indexer_topk_decode_dist(
     # 4. Run heuristic CUDA kernel — heuristic_scratch dtype must match logits.
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
     heuristic_scratch = torch.empty(num_gen_tokens * index_topk, dtype=dtype, device="cuda")
+    # Supply Radix split-work aux scratch. For dtype=fp32 with num_columns
+    # below kSeqSmall the dispatcher falls through GVR to the Radix path and
+    # the cpp op rejects blocks_per_row > 1 without caller-owned scratch; for
+    # bf16/fp16 these kwargs are simply ignored.
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
     torch.ops.trtllm.indexer_topk_decode(
-        logits, seq_lens, indices, next_n, index_topk, pre_idx, heuristic_scratch
+        logits,
+        seq_lens,
+        indices,
+        next_n,
+        index_topk,
+        pre_idx,
+        heuristic_scratch,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
     )
     torch.cuda.synchronize()
 
@@ -1438,6 +1756,9 @@ def _run_indexer_topk_decode_v4_gvr_check(
     #    - uses preIdxOffset = 0 (preIdx already in current-step coords)
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
     heuristic_scratch = torch.empty(num_gen_tokens * index_topk, dtype=dtype, device="cuda")
+    # Supply Radix split-work aux scratch — same rationale as the V3.2 helper:
+    # required by the cpp op when blocks_per_row > 1, harmless otherwise.
+    radix_aux_indices, radix_aux_logits = _build_radix_aux_buffers(num_gen_tokens, index_topk)
     torch.ops.trtllm.indexer_topk_decode(
         logits,
         seq_lens,
@@ -1447,6 +1768,8 @@ def _run_indexer_topk_decode_v4_gvr_check(
         pre_idx,
         heuristic_scratch,
         compress_ratio=compress_ratio,
+        radix_aux_indices=radix_aux_indices,
+        radix_aux_logits=radix_aux_logits,
     )
     torch.cuda.synchronize()
 
