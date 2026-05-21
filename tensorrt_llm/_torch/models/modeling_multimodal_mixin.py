@@ -33,7 +33,7 @@ from .modeling_multimodal_utils import (
 class MultimodalEncoderOutput:
     """Output produced by a model-owned multimodal encoder hook.
 
-    This mixin currently supports a strict primary tensor output:
+    Contract:
     - `embeddings` contains all multimodal embedding rows for the supplied
       `multimodal_params`.
     - Rows are concatenated in the same order as `multimodal_params`.
@@ -41,10 +41,13 @@ class MultimodalEncoderOutput:
       metadata when that metadata is available.
     - Special multimodal tokens occupy token positions but do not have rows in
       this tensor.
+
+    The single-tensor shape is required for chunked-prefill embedding reuse,
+    which lets later chunks skip the encoder. See
+    `modeling_multimodal_utils.py` for the caching machinery.
     """
 
     embeddings: torch.Tensor
-    cacheable: bool = True
 
 
 @dataclass(frozen=True)
@@ -239,8 +242,6 @@ class MultimodalModelMixin:
                 raise TypeError("encode_multimodal_inputs must return MultimodalEncoderOutput.")
             if not isinstance(encoder_output.embeddings, torch.Tensor):
                 raise TypeError("MultimodalEncoderOutput.embeddings must be a torch.Tensor.")
-            if not encoder_output.cacheable:
-                raise ValueError("MultimodalModelMixin requires cacheable encoder outputs.")
             return [encoder_output.embeddings]
 
         embeddings = get_multimodal_embeddings(
@@ -252,7 +253,7 @@ class MultimodalModelMixin:
         # Validate post-gather so cached-only paths (KV reuse, all-cached chunked
         # prefill) are also checked, not just paths that ran the encoder.
         self._validate_primary_embedding_rows(primary, multimodal_params)
-        return MultimodalEncoderOutput(embeddings=primary, cacheable=True)
+        return MultimodalEncoderOutput(embeddings=primary)
 
     def _find_active_multimodal_embeddings(
         self,
