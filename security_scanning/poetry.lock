@@ -1569,14 +1569,14 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.10"
+version = "0.6.11"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.10-py3-none-any.whl", hash = "sha256:8bdfc2db80e462c41a1bc35dffeae9c6b4d012dee75e0766432c8efbdfd4398d"},
-    {file = "flashinfer_python-0.6.10.tar.gz", hash = "sha256:a1a20634fd7ebaa8ea62d4501cfc4133cf74a86c80cfe99c33b634d0af8b70ec"},
+    {file = "flashinfer_python-0.6.11-py3-none-any.whl", hash = "sha256:6f8db337a869ddb2ae08bbefe2368055854b626f9a22b7765080fe15ebcc8548"},
+    {file = "flashinfer_python-0.6.11.tar.gz", hash = "sha256:5d0df7fc39486de6b6849aecdc00db7d27263981f0dc62ceb2dad3964e74d479"},
 ]
 
 [package.dependencies]
@@ -1587,7 +1587,7 @@ einops = "*"
 ninja = "*"
 numpy = "*"
 nvidia-cudnn-frontend = ">=1.13.0"
-nvidia-cutlass-dsl = ">=4.4.2"
+nvidia-cutlass-dsl = ">=4.5.0"
 nvidia-ml-py = "*"
 packaging = ">=24.2"
 requests = "*"
@@ -1596,8 +1596,8 @@ torch = "*"
 tqdm = "*"
 
 [package.extras]
-cu12 = ["nvidia-cutlass-dsl (>=4.4.2)"]
-cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.4.2)"]
+cu12 = ["nvidia-cutlass-dsl (>=4.5.0)"]
+cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.5.0)"]
 
 [[package]]
 name = "fonttools"
@@ -3735,44 +3735,71 @@ files = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.4.2"
+version = "4.5.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cutlass_dsl-4.4.2-py3-none-any.whl", hash = "sha256:7cfb9ef19062b055b9372c7a627004724e2755e4c8b16c3cc88807d64501a4ae"},
+    {file = "nvidia_cutlass_dsl-4.5.0-py3-none-any.whl", hash = "sha256:3b051fe02ca69422ab840e64d9865667aba288a3984a7ca4ccd038a82aef1344"},
 ]
 
 [package.dependencies]
-nvidia-cutlass-dsl-libs-base = "4.4.2"
+nvidia-cutlass-dsl-libs-base = "4.5.0"
+nvidia-cutlass-dsl-libs-cu13 = {version = "4.5.0", optional = true, markers = "extra == \"cu13\""}
 
 [package.extras]
-cu13 = ["nvidia-cutlass-dsl-libs-cu13 (==4.4.2)"]
+cu13 = ["nvidia-cutlass-dsl-libs-cu13 (==4.5.0)"]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-base"
-version = "4.4.2"
+version = "4.5.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:06acb3acff3dcf4bf6630476efac7de94de30b988ded4fa00b647bbcec4224ff"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:916bf612fba5fbc5162e300fe18196e960dac2328c1c1360c0939d3be05c7c71"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:261832dafe7579dc83cd3816ab9ea845e3de3737d876c215f01fb4edff1f4473"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:40c2352b2fcc80789a216cbeb9b2ee10c85c15de839cda8f5c1d18166b8249df"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:2ec8812eeadcbb6fe20bda2e295ed9c00653f8253b78e33cf0ab65a47b829e73"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:22e37b58f7a6f2f43bba533c4df8a088012122e0b4e9a632eca23937adeafb39"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:b59a052cbfb9a25747d1b6d413615456bea38d1f377da085af07c0d86a4c8b39"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:8e3324a33afa7424e93beae7e54a311e80db82b9e4ed4bba2aeeda1d6c888cd9"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:af96c1170569138b3cb965202907fbf5ab95d7c1dcc210952d00cdf9ab7b859a"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.4.2-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:95db0c8d1d56992e2f5c2dcd5b3baab0297bedc0cbcefc1e70b57acd934e7b23"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:c78b18f2b44ca10a91bc76380ebd65bb7b86aa97a9330bae9b73eb0a1bc51d55"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:5cfdf52bea8feede5e512a094484956693cb87adaafa310991d2876653b1a88e"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:f8635ad1e0a670323cc729f167067fa880cb56577ec2e79afb80a35ab371912e"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:7bb6de91b00a2b392cd834fec174a1461bf0f10a9b6d28086c8f4885aed27218"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:3f7c133d31fa82ae7db697fd6943a5f9a2c97c8a40ee1056c67ef29fe00974d8"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:bd18322d9247f8c033a10ed4e519c4985ca6b4fb578ade382e5a264422ebd915"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:90a4d802a03963fa36eb287fbc9b40a1374590fc7e8cc1b9673dee8872f75713"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:8e58b016da5bb09bd1d809d0c025433edb36b279adfbcd107e96361b214bd8bc"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:2e121b20f0a48122c9b48227d00a7d681189e1de2fd4d211f9661a4e1658f066"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.5.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:0a60dfce3349984315306ef719ed1edf0e225527158f26019a5cf266e06cc45d"},
 ]
 
 [package.dependencies]
 cuda-python = ">=12.8"
 numpy = "*"
+typing-extensions = "*"
+
+[[package]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.0"
+description = "NVIDIA CUTLASS Python DSL"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:b95cd78ca5f3440cd488ea03c30d394ca07e491e5bd6bb274f8f26d4f4713439"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:145cf5563b2d0d347c722d84a3b74541da5a1ec5b46821b54acc202693ce56ae"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:dadddab5bfe11973f8a0dfa66645a42ccb587287abb0766992e0e69da621dc82"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:35726dddb6f6e63c767caf7533d583b4462e2c6b90df7fa67738d58b2eede742"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:a799eb9d65ba03095444907b8bf617b5a8bd7d03d1b95cec9637c558af6d0b60"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:fc0b5a81ff591db72489134ca206ae886f0cce43f20863010a7f30fcfe484a7b"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:f2b821671add2e69a1377e7fd87e6261995db281b2f8e516ddae2fd6b7a6c1d0"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:554b775069d093f308949a65880bf9c9bfd48b1f4b2fd0e0d97aa2f608e6eea1"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:652e34d8a78accceab321da0232157e493b113e417306269d700a297a7d62447"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:3d460d03d6ea0a463e262ee07964ccafffde8eeefe058c9615d77da1ddd6d003"},
+]
+
+[package.dependencies]
+cuda-python = ">=12.8"
+numpy = "*"
+nvidia-cutlass-dsl-libs-base = "4.5.0"
 typing-extensions = "*"
 
 [[package]]
@@ -7304,4 +7331,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6138be7bcfa5c0a04a402a080963774d8eb4d31953898b4f2a6f22f37df494cc"
+content-hash = "9a5c5c83a790c6250c94dcc36c5c7838c84282474bef4e2d8c008104563b4f81"

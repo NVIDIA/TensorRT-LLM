@@ -988,6 +988,8 @@ class RocketKVCacheManager(KVCacheManager):
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
+        if requests is None:
+            return None
         if prepare_resource:
             for req in requests:
                 request_id = req.py_request_id

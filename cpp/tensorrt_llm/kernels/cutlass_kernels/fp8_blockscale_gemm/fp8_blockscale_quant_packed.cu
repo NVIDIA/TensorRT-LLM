@@ -25,6 +25,7 @@
 #include "fp8_blockscale_quant_packed.h"
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -61,8 +62,15 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
     int const lane_id = static_cast<int>(threadIdx.x) & 31;
     int const m_idx = static_cast<int>(blockIdx.y) * WarpsPerBlock + warp_id;
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
     if (m_idx >= m)
     {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
         return;
     }
 
@@ -175,6 +183,10 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
         // Layout: packed_scale[packed_sf_k_idx, m_idx]
         packed_scale_output[static_cast<int64_t>(packed_sf_k_idx) * scale_leading_dim_uint32 + m_idx] = packed;
     }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 } // namespace
@@ -187,8 +199,10 @@ void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32
     int const m_blocks = (m + kWarpsPerBlock - 1) / kWarpsPerBlock;
     dim3 const grid(num_packed_sf_k, m_blocks, 1);
     dim3 const block(kWarpsPerBlock * 32, 1, 1);
-    fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock>
-        <<<grid, block, 0, stream>>>(fp8_output, packed_scale_output, input, m, k, scale_leading_dim_uint32);
+
+    tensorrt_llm::common::launchWithPdlWhenEnabled("fp8_quantize_1x128_packed_kernel_impl",
+        fp8_quantize_1x128_packed_kernel_impl<kWarpsPerBlock>, grid, block, 0, stream, fp8_output, packed_scale_output,
+        input, m, k, scale_leading_dim_uint32);
 }
 
 } // namespace kernels::fp8_blockscale_gemm
