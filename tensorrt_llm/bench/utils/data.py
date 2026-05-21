@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
 from functools import partial
-from typing import List, TextIO, Tuple
+from typing import List, Optional, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
@@ -27,6 +28,50 @@ from tensorrt_llm.inputs import default_multimodal_input_loader
 
 class DatasetFormatError(ValueError):
     """Raised when the input dataset stream is empty, corrupted, or incorrectly formatted."""
+
+
+# Tokenizer classes that ship only a slow `PreTrainedTokenizer` implementation
+# and rely on a model-specific pre-tokenization regex. transformers >= 5
+# tries to auto-convert them to Fast tokenizers via a generic
+# "SentencePiece-then-TikToken" fallback that mis-segments text (e.g.
+# Kimi-K2/K2.5's `TikTokenTokenizer`, whose `pat_str` uses CJK-aware regex
+# alternatives that the fallback does not honor). For these we force
+# `use_fast=False` so the model's own slow tokenizer is used.
+# See https://huggingface.co/moonshotai/Kimi-K2.5/discussions/7 and
+# https://huggingface.co/moonshotai/Kimi-K2.6 (transformers < 5.0.0).
+_REQUIRES_SLOW_TOKENIZER = {"TikTokenTokenizer"}
+
+
+def _tokenizer_class_from_config(
+        model_name_or_path: str) -> Optional[str]:
+    """Read ``tokenizer_class`` from ``tokenizer_config.json`` without
+    instantiating the tokenizer.
+
+    Returns ``None`` if the file is unavailable or the field is missing.
+    """
+    cfg_path: Optional[str] = None
+    if os.path.isdir(model_name_or_path):
+        candidate = os.path.join(model_name_or_path, "tokenizer_config.json")
+        if os.path.isfile(candidate):
+            cfg_path = candidate
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+            cfg_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="tokenizer_config.json",
+            )
+        except (OSError, ValueError, ImportError):
+            return None
+
+    if cfg_path is None:
+        return None
+
+    try:
+        with open(cfg_path, "r") as f:
+            return json.load(f).get("tokenizer_class")
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def initialize_tokenizer(model_name: str,
@@ -62,9 +107,14 @@ def initialize_tokenizer(model_name: str,
                 f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
                 "Expected alias or 'module.path.ClassName'.") from e
     else:
+        # Force the slow tokenizer for known-incompatible classes so we don't
+        # silently fall back to transformers' generic Fast converter.
+        use_fast = (_tokenizer_class_from_config(model_name)
+                    not in _REQUIRES_SLOW_TOKENIZER)
         tokenizer = AutoTokenizer.from_pretrained(model_name,
                                                   padding_side="left",
-                                                  trust_remote_code=True)
+                                                  trust_remote_code=True,
+                                                  use_fast=use_fast)
 
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})

@@ -1025,20 +1025,34 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             **kwargs,
         )
         self._config = config
+        # Kimi K2.5 ships only the slow ``TikTokenTokenizer`` (see the model
+        # repo's ``tokenization_kimi.py``). transformers >= 5 otherwise tries
+        # to auto-convert it to a Fast tokenizer via a SentencePiece-then-
+        # TikToken fallback that does not honor the original ``pat_str``
+        # (CJK-aware), producing ~+20% more tokens for multilingual content
+        # vs. the slow path. Force ``use_fast=False`` here so the model's own
+        # tokenizer is used regardless of the transformers version. See
+        # https://huggingface.co/moonshotai/Kimi-K2.5/discussions/7.
         self._tokenizer = (
             tokenizer
             if tokenizer is not None
             else AutoTokenizer.from_pretrained(
                 model_path,
                 trust_remote_code=trust_remote_code,
-                use_fast=self.use_fast,
+                use_fast=False,
             )
         )
+        # ``use_fast`` here only affects the image processor selection
+        # (Fast vs. slow image processor); leave it as configured. We pin the
+        # processor's tokenizer to ``self._tokenizer`` below so any text-path
+        # through the processor sees the same slow tokenizer.
         self._processor = AutoProcessor.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast,
         )
+        if hasattr(self._processor, "tokenizer"):
+            self._processor.tokenizer = self._tokenizer
         self._model_path = model_path
 
         # Resolve dtype from text_config
