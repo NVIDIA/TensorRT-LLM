@@ -6981,14 +6981,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 w_2d = weights.reshape(B, N).t()
 
-            # Flatten fused KV to [num_phys_blocks, block_bytes].
-            # The compiled DSL kernel's TVM-FFI binding asserts
-            # `kv_flat.stride(0) == phys_block_kv * (D//2 + 4)`. Force a
-            # contiguous tensor so the row stride matches even when
-            # `kv_fused` is a non-contiguous view of a larger buffer
-            # (e.g. an FP4 indexer-K cache slice with row stride > row
-            # width). See nvbugs/6186880.
-            kv_flat = kv_fused.reshape(num_phys_blocks, -1).contiguous()
+            # Flatten fused KV to [num_phys_blocks, block_bytes]
+            kv_flat = kv_fused.reshape(num_phys_blocks, -1)
 
             # Allocate output with alignment padding
             SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2
