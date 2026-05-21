@@ -13,14 +13,121 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.modules.embedding import LMHead
-from tensorrt_llm._torch.modules.linear import W4A16NVFP4LinearMethod, get_quant_method
+from tensorrt_llm._torch.modules.linear import (
+    W4A16NVFP4LinearMethod,
+    get_quant_method,
+    get_sm_version,
+)
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+
+def _run_w4a16_cutlass3_reference_case(m: int, n: int, k: int, dtype: torch.dtype) -> None:
+    assert k % 32 == 0
+    assert n % 32 == 0
+    act, weight, weight_scale, weight_scale_2 = _make_w4a16_nvfp4_case(m, n, k, dtype)
+
+    expected = torch.empty((m, n), device="cuda", dtype=dtype)
+    for start in range(0, m, 16):
+        stop = min(start + 16, m)
+        expected[start:stop, :] = torch.ops.trtllm.w4a16_nvfp4_gemm(
+            act[start:stop, :],
+            weight,
+            weight_scale,
+            weight_scale_2,
+            dtype,
+            bias=None,
+        )
+
+    actual = torch.ops.trtllm.w4a16_nvfp4_cutlass_gemm(
+        act,
+        weight,
+        weight_scale,
+        weight_scale_2,
+        dtype,
+        bias=None,
+    )
+    torch.testing.assert_close(actual, expected, atol=0.08, rtol=0.08)
+
+
+def _make_w4a16_nvfp4_case(m: int, n: int, k: int, dtype: torch.dtype):
+    act = torch.randn((m, k), device="cuda", dtype=dtype)
+    weight = torch.empty((n, k // 2), device="cuda", dtype=fp4_utils.float4_e2m1x2)
+    weight_u8 = torch.randint(
+        0,
+        256,
+        (n, k // 2),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    weight.copy_(weight_u8.view(fp4_utils.float4_e2m1x2))
+
+    scale_cols = fp4_utils.pad_up(k // 16, 4)
+    scale_rows = fp4_utils.pad_up(n, 128)
+    weight_scale_linear = torch.randint(
+        1,
+        120,
+        (scale_rows, scale_cols),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale_linear).view(
+        fp4_utils.float4_sf_dtype
+    )
+    weight_scale_2 = torch.ones((1,), device="cuda", dtype=torch.float32)
+    return act, weight, weight_scale, weight_scale_2
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() not in (120, 121),
+    reason="requires CUDA SM120/121",
+)
+@pytest.mark.parametrize(
+    "shape",
+    [(32, 256, 256), (128, 512, 1024), (256, 1024, 2048)],
+)
+def test_w4a16_nvfp4_cutlass3_bf16_matches_cuda_core(shape):
+    m, n, k = shape
+    _run_w4a16_cutlass3_reference_case(m, n, k, torch.bfloat16)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() not in (120, 121),
+    reason="requires CUDA SM120/121",
+)
+def test_w4a16_nvfp4_gemm_large_m_chunks_cuda_core():
+    m, n, k = 32, 64, 64
+    act, weight, weight_scale, weight_scale_2 = _make_w4a16_nvfp4_case(m, n, k, torch.bfloat16)
+    expected = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    for start in range(0, m, 16):
+        stop = min(start + 16, m)
+        expected[start:stop, :] = torch.ops.trtllm.w4a16_nvfp4_gemm(
+            act[start:stop, :],
+            weight,
+            weight_scale,
+            weight_scale_2,
+            torch.bfloat16,
+            bias=None,
+        )
+
+    actual = torch.ops.trtllm.w4a16_nvfp4_gemm(
+        act,
+        weight,
+        weight_scale,
+        weight_scale_2,
+        torch.bfloat16,
+        bias=None,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0.08, rtol=0.08)
 
 
 def test_get_quant_method_returns_w4a16_nvfp4_linear_method():
@@ -97,7 +204,7 @@ def test_w4a16_nvfp4_linear_restores_high_rank_input_shape():
     assert output.shape == (2, 3, 5)
 
 
-def test_w4a16_nvfp4_linear_falls_back_to_w4a4_nvfp4_for_large_m():
+def test_w4a16_nvfp4_linear_uses_chunked_w4a16_op_for_large_m():
     method = W4A16NVFP4LinearMethod()
     input_tensor = torch.ones((17, 16), dtype=torch.bfloat16)
     module = SimpleNamespace(
@@ -107,62 +214,194 @@ def test_w4a16_nvfp4_linear_falls_back_to_w4a4_nvfp4_for_large_m():
         dtype=torch.bfloat16,
         out_features=3,
         pre_quant_scale=None,
-        input_scale=None,
-        alpha=None,
-        force_dynamic_quantization=False,
-        scaling_vector_size=16,
-        nvfp4_allowed_backends=["cuda_core"],
-        all_reduce=None,
-        mapping=None,
     )
     captured = {}
 
-    def fail_w4a16_gemm(*args, **kwargs):
-        raise AssertionError("large-M dense fallback must not call w4a16_nvfp4_gemm")
-
-    def fake_fp4_quantize(input_arg, input_scale, scaling_vector_size, is_sf_swizzled):
-        captured["quant_input"] = input_arg
-        captured["input_scale"] = input_scale
-        captured["scaling_vector_size"] = scaling_vector_size
-        captured["is_sf_swizzled"] = is_sf_swizzled
-        return torch.empty(
-            (input_arg.shape[0], input_arg.shape[1] // 2), dtype=torch.uint8
-        ), torch.empty((input_arg.shape[0], 4), dtype=torch.uint8)
-
-    def fake_nvfp4_gemm(
-        act_fp4,
-        weight,
-        act_sf,
-        weight_scale,
-        alpha,
-        out_dtype,
-        output_buffer_kind=0,
-        allowed_backends="",
-        group=None,
+    def fake_w4a16_nvfp4_gemm(
+        input_arg, weight, weight_scale, weight_scale_2, out_dtype, bias=None
     ):
-        captured["act_fp4"] = act_fp4
+        captured["input"] = input_arg
         captured["weight"] = weight
-        captured["act_sf"] = act_sf
         captured["weight_scale"] = weight_scale
-        captured["alpha"] = alpha
+        captured["weight_scale_2"] = weight_scale_2
         captured["out_dtype"] = out_dtype
-        captured["allowed_backends"] = allowed_backends
-        captured["group"] = group
-        return torch.ones((act_fp4.shape[0], weight.shape[0]), dtype=out_dtype)
+        captured["bias"] = bias
+        return torch.ones((input_arg.shape[0], weight.shape[0]), dtype=out_dtype)
 
-    with patch("torch.ops.trtllm.w4a16_nvfp4_gemm", side_effect=fail_w4a16_gemm, create=True):
-        with patch("torch.ops.trtllm.fp4_quantize", side_effect=fake_fp4_quantize, create=True):
-            with patch("torch.ops.trtllm.nvfp4_gemm", side_effect=fake_nvfp4_gemm, create=True):
-                output = method.apply(module, input_tensor, bias=None)
+    def fail_fp4_quantize(*args, **kwargs):
+        raise AssertionError("large-M W4A16 path must not quantize activations")
 
-    assert captured["quant_input"] is input_tensor
-    assert captured["scaling_vector_size"] == 16
-    assert captured["is_sf_swizzled"] is False
+    with patch("torch.ops.trtllm.w4a16_nvfp4_gemm", side_effect=fake_w4a16_nvfp4_gemm, create=True):
+        with patch("torch.ops.trtllm.fp4_quantize", side_effect=fail_fp4_quantize, create=True):
+            output = method.apply(module, input_tensor, bias=None)
+
+    assert captured["input"] is input_tensor
     assert captured["weight"] is module.weight
     assert captured["weight_scale"] is module.weight_scale
+    assert captured["weight_scale_2"] is module.weight_scale_2
     assert captured["out_dtype"] is torch.bfloat16
-    assert captured["allowed_backends"] == "cuda_core"
-    assert captured["group"] is None
+    assert output.shape == (17, 3)
+
+
+def test_w4a16_nvfp4_linear_uses_cutlass3_op_for_large_bf16_m_when_enabled():
+    method = W4A16NVFP4LinearMethod()
+    input_tensor = torch.ones((17, 32), dtype=torch.bfloat16)
+    module = SimpleNamespace(
+        weight=torch.empty((32, 16), dtype=torch.uint8),
+        weight_scale=torch.empty((128 * 4,), dtype=torch.uint8),
+        weight_scale_2=torch.tensor([0.5], dtype=torch.float32),
+        dtype=torch.bfloat16,
+        out_features=3,
+        pre_quant_scale=None,
+    )
+    captured = {}
+
+    def fake_w4a16_nvfp4_cutlass_gemm(
+        input_arg, weight, weight_scale, weight_scale_2, out_dtype, bias=None
+    ):
+        captured["input"] = input_arg
+        captured["weight"] = weight
+        captured["weight_scale"] = weight_scale
+        captured["weight_scale_2"] = weight_scale_2
+        captured["out_dtype"] = out_dtype
+        captured["bias"] = bias
+        return torch.ones((input_arg.shape[0], weight.shape[0]), dtype=out_dtype)
+
+    def fail_w4a16_gemm(*args, **kwargs):
+        raise AssertionError("CUTLASS3 W4A16 prefill must not call the default W4A16 op")
+
+    def fail_fp4_quantize(*args, **kwargs):
+        raise AssertionError("CUTLASS3 W4A16 prefill must not quantize activations")
+
+    with patch.dict(os.environ, {"TRTLLM_W4A16_NVFP4_CUTLASS3": "1"}):
+        with patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=120):
+            with patch(
+                "torch.ops.trtllm.w4a16_nvfp4_gemm", side_effect=fail_w4a16_gemm, create=True
+            ):
+                with patch(
+                    "torch.ops.trtllm.w4a16_nvfp4_cutlass_gemm",
+                    side_effect=fake_w4a16_nvfp4_cutlass_gemm,
+                    create=True,
+                ):
+                    with patch(
+                        "torch.ops.trtllm.fp4_quantize", side_effect=fail_fp4_quantize, create=True
+                    ):
+                        output = method.apply(module, input_tensor, bias=None)
+
+    assert captured["input"] is input_tensor
+    assert captured["weight"] is module.weight
+    assert captured["weight_scale"] is module.weight_scale
+    assert captured["weight_scale_2"] is module.weight_scale_2
+    assert captured["out_dtype"] is torch.bfloat16
+    assert captured["bias"] is None
+    assert output.shape == (17, 3)
+
+
+def test_w4a16_nvfp4_linear_cutlass3_restores_high_rank_input_shape():
+    method = W4A16NVFP4LinearMethod()
+    input_tensor = torch.ones((2, 9, 32), dtype=torch.bfloat16)
+    bias = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+    module = SimpleNamespace(
+        weight=torch.empty((32, 16), dtype=torch.uint8),
+        weight_scale=torch.empty((128 * 4,), dtype=torch.uint8),
+        weight_scale_2=torch.tensor([0.5], dtype=torch.float32),
+        dtype=torch.bfloat16,
+        out_features=3,
+        pre_quant_scale=None,
+    )
+    captured = {}
+
+    def fake_w4a16_nvfp4_cutlass_gemm(
+        input_arg, weight, weight_scale, weight_scale_2, out_dtype, bias=None
+    ):
+        captured["input_shape"] = input_arg.shape
+        return torch.ones((input_arg.shape[0], weight.shape[0]), dtype=out_dtype)
+
+    def fail_w4a16_gemm(*args, **kwargs):
+        raise AssertionError("large-M CUTLASS3 path must not call the default W4A16 op")
+
+    with patch.dict(os.environ, {"TRTLLM_W4A16_NVFP4_CUTLASS3": "1"}):
+        with patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=120):
+            with patch(
+                "torch.ops.trtllm.w4a16_nvfp4_gemm", side_effect=fail_w4a16_gemm, create=True
+            ):
+                with patch(
+                    "torch.ops.trtllm.w4a16_nvfp4_cutlass_gemm",
+                    side_effect=fake_w4a16_nvfp4_cutlass_gemm,
+                    create=True,
+                ):
+                    output = method.apply(module, input_tensor, bias=bias)
+
+    assert captured["input_shape"] == (18, 32)
+    assert output.shape == (2, 9, 3)
+    expected = torch.tensor([2.0, 3.0, 4.0], dtype=torch.bfloat16).expand(2, 9, 3)
+    torch.testing.assert_close(output, expected)
+
+
+def test_w4a16_nvfp4_cutlass3_prefill_requires_supported_shape():
+    method = W4A16NVFP4LinearMethod()
+    input_tensor = torch.ones((17, 32), dtype=torch.bfloat16)
+    module = SimpleNamespace(
+        weight=torch.empty((6, 16), dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+
+    with patch.dict(os.environ, {"TRTLLM_W4A16_NVFP4_CUTLASS3": "1"}):
+        with patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=120):
+            assert not method._can_use_cutlass3_w4a16_prefill(module, input_tensor, m=17)
+
+
+def test_w4a16_nvfp4_linear_cutlass3_unsupported_shape_uses_default_w4a16_op():
+    method = W4A16NVFP4LinearMethod()
+    input_tensor = torch.ones((17, 32), dtype=torch.bfloat16)
+    module = SimpleNamespace(
+        weight=torch.empty((6, 16), dtype=torch.uint8),
+        weight_scale=torch.empty((128 * 4,), dtype=torch.uint8),
+        weight_scale_2=torch.tensor([0.5], dtype=torch.float32),
+        dtype=torch.bfloat16,
+        out_features=3,
+        pre_quant_scale=None,
+    )
+    captured = {}
+
+    def fake_w4a16_nvfp4_gemm(
+        input_arg, weight, weight_scale, weight_scale_2, out_dtype, bias=None
+    ):
+        captured["input"] = input_arg
+        captured["weight"] = weight
+        captured["weight_scale"] = weight_scale
+        captured["weight_scale_2"] = weight_scale_2
+        captured["out_dtype"] = out_dtype
+        captured["bias"] = bias
+        return torch.ones((input_arg.shape[0], weight.shape[0]), dtype=out_dtype)
+
+    def fail_cutlass_gemm(*args, **kwargs):
+        raise AssertionError("unsupported CUTLASS3 shape must use the default W4A16 op")
+
+    def fail_fp4_quantize(*args, **kwargs):
+        raise AssertionError("unsupported CUTLASS3 W4A16 path must not quantize activations")
+
+    with patch.dict(os.environ, {"TRTLLM_W4A16_NVFP4_CUTLASS3": "1"}):
+        with patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=120):
+            with patch(
+                "torch.ops.trtllm.w4a16_nvfp4_gemm", side_effect=fake_w4a16_nvfp4_gemm, create=True
+            ):
+                with patch(
+                    "torch.ops.trtllm.w4a16_nvfp4_cutlass_gemm",
+                    side_effect=fail_cutlass_gemm,
+                    create=True,
+                ):
+                    with patch(
+                        "torch.ops.trtllm.fp4_quantize", side_effect=fail_fp4_quantize, create=True
+                    ):
+                        output = method.apply(module, input_tensor, bias=None)
+
+    assert captured["input"] is input_tensor
+    assert captured["bias"] is None
+    assert captured["weight"] is module.weight
+    assert captured["weight_scale"] is module.weight_scale
+    assert captured["weight_scale_2"] is module.weight_scale_2
+    assert captured["out_dtype"] is torch.bfloat16
     assert output.shape == (17, 3)
 
 
@@ -201,7 +440,7 @@ def test_lm_head_uses_w4a16_nvfp4_quant_method_for_packed_lm_head():
     assert lm_head.weight_scale_2.shape == (1,)
 
 
-def test_lm_head_w4a16_nvfp4_forward_dispatches_to_dense_op():
+def test_lm_head_w4a16_nvfp4_forward_dispatches_to_w4a16_op():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
     lm_head = LMHead(
         num_embeddings=3, embedding_dim=16, dtype=torch.float16, quant_config=quant_config

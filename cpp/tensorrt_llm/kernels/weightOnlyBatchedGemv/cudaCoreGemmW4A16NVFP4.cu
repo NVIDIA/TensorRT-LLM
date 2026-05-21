@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/cudaCoreGemmW4A16NVFP4.h"
+#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/nvfp4ScaleLayout.h"
 
 #include <cub/cub.cuh>
 
@@ -65,13 +66,12 @@ __device__ void cudaCoreGemmImpl(ActType const* __restrict__ act, __nv_fp4_e2m1 
     using CvtSrcType = typename Converter::source_type;
     using CvtResType = typename Converter::result_type;
 
-    static constexpr SizeType32 kNvfp4ScaleGranularity = 16;
     static constexpr SizeType32 kStepK = 32;
-    static constexpr SizeType32 kStepKScale = kStepK / kNvfp4ScaleGranularity;
+    static constexpr SizeType32 kStepKScale = kStepK / w4a16_nvfp4::kScaleGranularity;
     static constexpr SizeType32 kTileK = kStepK * kBlockSize;
     static constexpr SizeType32 kCvtCount = static_cast<SizeType32>(sizeof(VecType) / sizeof(CvtSrcType));
 
-    static_assert(kStepK % kNvfp4ScaleGranularity == 0);
+    static_assert(kStepK % w4a16_nvfp4::kScaleGranularity == 0);
 
     auto const tileIdM = static_cast<SizeType32>(blockIdx.x * kTileM);
     auto const tileIdN = static_cast<SizeType32>(blockIdx.y * kTileN);
@@ -97,9 +97,6 @@ __device__ void cudaCoreGemmImpl(ActType const* __restrict__ act, __nv_fp4_e2m1 
     cudaGridDependencySynchronize();
 #endif
 
-    SizeType32 const numColsSf = k / kNvfp4ScaleGranularity;
-    SizeType32 const numSfTilesK = (numColsSf + 4 - 1) / 4;
-
     for (SizeType32 idxK = tid * kStepK; idxK < k; idxK += kTileK)
     {
 #pragma unroll
@@ -118,9 +115,8 @@ __device__ void cudaCoreGemmImpl(ActType const* __restrict__ act, __nv_fp4_e2m1 
         for (SizeType32 j = 0; j < kTileN; ++j)
         {
             SizeType32 const rowIdx = tileIdN + j;
-            SizeType32 const colIdx = idxK / kNvfp4ScaleGranularity;
-            SizeType32 const tileOffset = ((rowIdx / 128) * numSfTilesK + colIdx / 4) * 512;
-            SizeType32 const dstIdx = tileOffset + (rowIdx % 32) * 16 + ((rowIdx % 128) / 32) * 4 + colIdx % 4;
+            SizeType32 const colIdx = idxK / w4a16_nvfp4::kScaleGranularity;
+            SizeType32 const dstIdx = w4a16_nvfp4::getScaleIndex(rowIdx, colIdx, k);
             auto const tileWeightScaleFp8x2 = reinterpret_cast<ScaleVecType const*>(weightScale + dstIdx)[0];
             char2 const tmp = reinterpret_cast<char2 const&>(tileWeightScaleFp8x2);
             tileWeightScale[j * kStepKScale + 0] = static_cast<float>(reinterpret_cast<__nv_fp8_e4m3 const&>(tmp.x));
@@ -143,7 +139,7 @@ __device__ void cudaCoreGemmImpl(ActType const* __restrict__ act, __nv_fp4_e2m1 
                 for (SizeType32 l = 0; l < kStepK; ++l)
                 {
                     float const scaledWeight = tileWeight[j * kStepK + l]
-                        * tileWeightScale[j * kStepKScale + l / kNvfp4ScaleGranularity] * weightGlobalScale;
+                        * tileWeightScale[j * kStepKScale + l / w4a16_nvfp4::kScaleGranularity] * weightGlobalScale;
                     acc[i * kTileN + j] = fma(tileAct[l], scaledWeight, acc[i * kTileN + j]);
                 }
             }

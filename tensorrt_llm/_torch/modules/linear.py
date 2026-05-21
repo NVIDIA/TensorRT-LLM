@@ -1864,6 +1864,25 @@ class NVFP4LinearMethod(LinearMethodBase):
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
 
     CUDA_CORE_MAX_M: ClassVar[int] = 16
+    CUTLASS3_ENV: ClassVar[str] = "TRTLLM_W4A16_NVFP4_CUTLASS3"
+
+    def _can_use_cutlass3_w4a16_prefill(self, module: Linear,
+                                        input: torch.Tensor, m: int) -> bool:
+        if os.environ.get(self.CUTLASS3_ENV, "0") != "1":
+            return False
+        if m <= self.CUDA_CORE_MAX_M:
+            return False
+        if get_sm_version() not in (120, 121):
+            return False
+        if input.dtype != torch.bfloat16:
+            return False
+        if module.dtype != torch.bfloat16:
+            return False
+        if input.shape[-1] % 32 != 0:
+            return False
+        if module.weight.shape[0] % 32 != 0:
+            return False
+        return True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -1957,8 +1976,8 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             m = math.prod(input.shape[:-1])
         else:
             m = input.shape[0]
-        if m > self.CUDA_CORE_MAX_M:
-            return super().apply(module, input, bias)
+        use_cutlass3_prefill = self._can_use_cutlass3_w4a16_prefill(
+            module, input, m)
 
         original_shape = None
         if input.dim() > 2:
@@ -1969,7 +1988,9 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
             input = input * module.pre_quant_scale
 
-        output = torch.ops.trtllm.w4a16_nvfp4_gemm(
+        gemm_op = (torch.ops.trtllm.w4a16_nvfp4_cutlass_gemm if
+                   use_cutlass3_prefill else torch.ops.trtllm.w4a16_nvfp4_gemm)
+        output = gemm_op(
             input,
             module.weight,
             module.weight_scale,
