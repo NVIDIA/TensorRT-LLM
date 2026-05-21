@@ -17,12 +17,9 @@ from cutlass.cute.runtime import from_dlpack
 
 
 # cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-# Compat across CuTe DSL versions:
-#   4.4.x              : nvvm.RoundingModeKind.RN (enum, accepted by cute.arch.*)
-#   4.5.0+ / internal  : nvvm.RoundingModeKind removed; cute.arch.* strictly require
-#                        the string literal 'rn' (passing FPRoundingMode.RN enum
-#                        raises TypeError per nvvm_wrappers.from_str).
-_RND_RN = getattr(getattr(nvvm, "RoundingModeKind", None), "RN", None) or "rn"
+# CuTe DSL CUDA 13 validates rounding modes as string literals. The string
+# form is also accepted by older wrappers, so keep it version-independent.
+_RND_RN = "rn"
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=_RND_RN)
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=_RND_RN)
 add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=_RND_RN)
@@ -732,9 +729,7 @@ def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
-    xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
-    )
+    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -733,8 +733,8 @@ class PersistentDenseGemmKernel:
 
                     # Fence and barrier
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     epilog_threads = 32 * len(self.epilogue_warp_id)
                     cute.arch.barrier(
