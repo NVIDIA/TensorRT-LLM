@@ -3,7 +3,7 @@ import pickle  # nosec B403
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import lru_cache, wraps
-from typing import List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -330,122 +330,315 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
             raise RuntimeError(f"Deserialization failed: {str(e)}") from e
 
 
-def safe_gather(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
-    """
-    Safely gather potentially large objects by splitting into fixed-size chunks,
-    using raw-byte MPI.Gatherv. This variant uses Allgather on lengths so every
-    rank can compute sizes/displacements/total locally, removing extra broadcasts.
+def _serialize_and_exchange_lengths(
+    comm: Any,
+    obj: Any,
+) -> Tuple[int, int, np.ndarray, np.ndarray, np.ndarray]:
+    """Serialize *obj* and exchange payload lengths across all ranks.
+
+    Uses buffer-based ``MPI_Allgather`` (uppercase) for the length
+    exchange — a single MPI collective with no pickle overhead, which
+    is the same work that mpi4py does internally inside
+    ``comm.allgather(obj)``.
 
     Args:
-        comm: communicator to gather
-        obj: Python object to gather
-        root: Rank that receives the gathered objects
-        chunk_size: Per-round max bytes each rank contributes (default: 4MB)
+        comm: MPI communicator (``MPI.Comm`` instance).
+        obj: Python object to transfer (must be picklable).
 
     Returns:
-        On root: list of deserialized objects (len == comm.size)
-        On non-root: None
+        Tuple of ``(rank, size, lengths, displs, sendbuf)`` where:
+
+        - **rank** (*int*) — this process's rank in *comm*.
+        - **size** (*int*) — total number of ranks in *comm*.
+        - **lengths** (*np.ndarray[int64]*) — per-rank serialized payload
+          sizes.  A value of ``-1`` signals a serialization failure.
+        - **displs** (*np.ndarray[int64]*) — per-rank byte offsets into a
+          concatenated receive buffer.
+        - **sendbuf** (*np.ndarray[uint8]*) — this rank's serialized
+          payload as a contiguous byte array (empty when serialization
+          failed).
+    """
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    local_ser_error = None
+    try:
+        payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        local_len = np.array([len(payload)], dtype=np.int64)
+    except Exception as exc:
+        payload = b""
+        local_len = np.array([-1], dtype=np.int64)
+        local_ser_error = exc
+
+    # Buffer-based Allgather: 1 MPI collective, no pickle overhead.
+    lengths = np.empty(size, dtype=np.int64)
+    comm.Allgather([local_len, MPI.INT64_T], [lengths, MPI.INT64_T])
+
+    if (lengths < 0).any():
+        raise RuntimeError(
+            f"Rank {rank}: serialization failed on at least one rank "
+            f"(lengths={lengths})") from local_ser_error
+
+    displs = np.zeros(size, dtype=np.int64)
+    if size > 1:
+        displs[1:] = np.cumsum(lengths[:-1])
+
+    sendbuf = np.frombuffer(payload, dtype=np.uint8)
+    return rank, size, lengths, displs, sendbuf
+
+
+def _chunked_transfer_loop(
+    comm: Any,
+    rank: int,
+    size: int,
+    lengths: np.ndarray,
+    displs: np.ndarray,
+    sendbuf: np.ndarray,
+    num_rounds: int,
+    chunk_size: int,
+    recvbuf: Optional[np.ndarray],
+    collective_fn: Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+                            None],
+) -> None:
+    """Run the chunked MPI transfer loop used by safe_gather/safe_allgather.
+
+    Each round transfers at most ``chunk_size`` bytes per rank using a
+    per-round temporary receive buffer with 0-based int32 displacements,
+    then copies the received data into ``recvbuf`` at the correct absolute
+    offsets using 64-bit Python-level indexing.
+
+    Args:
+        comm: MPI communicator (``MPI.Comm`` instance).
+        rank: This rank's index in *comm*.
+        size: Total number of ranks in *comm*.
+        lengths: Per-rank serialized payload sizes (int64 array of shape
+            ``(size,)``).
+        displs: Per-rank byte offsets into *recvbuf* (int64 array of shape
+            ``(size,)``).
+        sendbuf: This rank's serialized payload (uint8 array).
+        num_rounds: Number of chunked transfer rounds to execute.
+        chunk_size: Per-round max bytes each rank contributes.
+        recvbuf: Final contiguous receive buffer (uint8 array), or
+            ``None`` for non-root ranks in gather mode (copy-back is
+            skipped).
+        collective_fn: Callable that performs the per-round MPI
+            collective.  Signature: ``collective_fn(send_part,
+            round_recvbuf, counts_this_round, round_displs)``.
+    """
+    for r in range(num_rounds):
+        round_offs = r * chunk_size
+        counts_this_round = np.minimum(np.maximum(lengths - round_offs, 0),
+                                       chunk_size).astype(np.int32)
+        sent_so_far = np.minimum(lengths, round_offs)
+
+        round_recvbuf = (np.empty(counts_this_round.sum(), dtype=np.uint8)
+                         if recvbuf is not None else None)
+        round_displs = np.zeros(size, dtype=np.int32)
+        if size > 1:
+            round_displs[1:] = np.cumsum(counts_this_round[:-1])
+
+        send_part = sendbuf[sent_so_far[rank]:sent_so_far[rank] +
+                            counts_this_round[rank]]
+
+        collective_fn(send_part, round_recvbuf, counts_this_round, round_displs)
+
+        # Copy received chunks into the final buffer at correct
+        # absolute offsets (using 64-bit Python-level indexing).
+        if recvbuf is not None:
+            src_offset = 0
+            for i in range(size):
+                n = counts_this_round[i]
+                if n > 0:
+                    dst = displs[i] + sent_so_far[i]
+                    recvbuf[dst:dst +
+                            n] = (round_recvbuf[src_offset:src_offset + n])
+                src_offset += n
+
+
+def _deserialize_recvbuf(
+    recvbuf: np.ndarray,
+    lengths: np.ndarray,
+    displs: np.ndarray,
+    size: int,
+) -> List[Any]:
+    """Deserialize gathered payloads from a contiguous receive buffer.
+
+    Args:
+        recvbuf: Contiguous receive buffer (uint8 array) containing the
+            concatenated serialized payloads from all ranks.
+        lengths: Per-rank serialized payload sizes (int64 array of shape
+            ``(size,)``).
+        displs: Per-rank byte offsets into *recvbuf* (int64 array of shape
+            ``(size,)``).
+        size: Total number of ranks.
+
+    Returns:
+        List of deserialized Python objects (``len == size``). Ranks whose
+        payload length is zero are represented as ``None``.
+    """
+    # Zero-length payloads (e.g. from pickling None) are returned as None
+    # without calling pickle.loads, which would fail on empty bytes.
+    return [
+        pickle.loads(recvbuf[displs[i]:displs[i] + lengths[i]])  # nosec B301
+        if lengths[i] > 0 else None for i in range(size)
+    ]
+
+
+def safe_gather(
+    comm: Any,
+    obj: Any,
+    root: int = 0,
+    chunk_size: int = 4 * 1024 * 1024,
+) -> Optional[List[Any]]:
+    """Safely gather potentially large objects by splitting into fixed-size
+    chunks, using raw-byte MPI.Gatherv with a per-round temp buffer to
+    keep counts and displacements within int32.
+
+    The function serializes *obj* once with ``pickle.dumps``, exchanges
+    payload lengths via buffer-based ``MPI_Allgather`` (1 MPI collective),
+    then transfers the raw bytes with ``MPI_Gatherv`` (1 MPI collective).
+    This matches the number of MPI collectives that mpi4py's
+    ``comm.gather(obj)`` performs internally, while adding chunking
+    safety for payloads whose total exceeds the int32 displacement
+    limit (~2 GB).
+
+    Args:
+        comm: MPI communicator (``MPI.Comm`` instance) to gather over.
+        obj: Python object to gather (must be picklable).
+        root: Rank that receives the gathered objects.
+        chunk_size: Per-round max bytes each rank contributes (default:
+            4 MB).
+
+    Returns:
+        On *root*: list of deserialized objects (``len == comm.size``).
+        On non-root ranks: ``None``.
     """
     if not ENABLE_MULTI_DEVICE:
         return [obj]
-    if ENABLE_MULTI_DEVICE and MPI is None:
+    if MPI is None:
         raise RuntimeError(
             "mpi4py is required when ENABLE_MULTI_DEVICE is True")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
 
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be > 0")
+    # Step 1: serialize once and exchange lengths (1 MPI collective).
+    rank, size, lengths, displs, sendbuf = \
+        _serialize_and_exchange_lengths(comm, obj)
 
-    # -- Serialize locally --
-    try:
-        payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-        my_n = np.int64(len(payload))
-    except Exception as e:
-        # Keep collectives aligned: every rank must call Allgather exactly once
-        _ = comm.allgather(int(-1))
-        raise RuntimeError(f"Rank {rank} serialization failed: {e}") from e
-
-    # -- Allgather lengths so all ranks know sizes and can compute displacements --
-    # We allgather just the int64 length to minimize traffic.
-    lengths = np.array(comm.allgather(int(my_n)),
-                       dtype=np.int64)  # shape (size,)
-    if (lengths < 0).any():
-        raise RuntimeError(f"Serialization failed on at least one rank")
-    # Every rank computes displacements & total locally and identically:
-    displs = np.zeros(size, dtype=np.int64)
-    if size > 1:
-        displs[1:] = np.cumsum(lengths[:-1])
     total = int(lengths.sum())
+    int32_max = np.iinfo(np.int32).max
 
-    # -- Prepare buffers --
-    sendbuf_full = np.frombuffer(payload, dtype=np.uint8, count=len(payload))
-    if rank == root:
-        recvbuf = np.empty(total,
-                           dtype=np.uint8)  # single contiguous receive buffer
-    else:
-        recvbuf = None
+    # Step 2a: total fits in int32 — single Gatherv (1 MPI collective).
+    if total < int32_max:
+        counts = lengths.astype(np.int32)
+        displs32 = displs.astype(np.int32)
+        if rank == root:
+            recvbuf = np.empty(total, dtype=np.uint8)
+            comm.Gatherv([sendbuf, MPI.BYTE],
+                         [recvbuf, counts, displs32, MPI.BYTE],
+                         root=root)
+            return _deserialize_recvbuf(recvbuf, lengths, displs, size)
+        else:
+            comm.Gatherv([sendbuf, MPI.BYTE], None, root=root)
+            return None
 
-    # -- Chunked Gatherv loop --
-    # IMPORTANT: All ranks must execute the same number of Gatherv rounds.
-    # Using a deterministic schedule based only on (lengths, chunk_size):
-    #   num_rounds = ceil(max(lengths)/chunk_size)
-    max_len = int(lengths.max()) if size > 0 else 0
-    num_rounds = (max_len + chunk_size - 1) // chunk_size if max_len > 0 else 0
+    # Step 2b: total exceeds int32 — chunked Gatherv.
+    logger.info(
+        "safe_gather: total payload %d bytes exceeds int32 limit, "
+        "using chunked Gatherv (size=%d)", total, size)
+    max_safe_chunk = int32_max // size
+    chunk_size = min(chunk_size, max_safe_chunk)
+    max_len = int(lengths.max())
+    num_rounds = math.ceil(max_len / chunk_size) if max_len > 0 else 0
 
-    for r in range(num_rounds):
-        # Each rank contributes up to chunk_size bytes from its remaining payload
-        # this round. Round-local offset is r * chunk_size.
-        round_offs = r * chunk_size
-        # Per-rank count this round:
-        #   count = max(0, min(chunk, length - round_offs))
-        remaining = lengths - round_offs
-        remaining = np.maximum(remaining, 0)
-        counts64 = np.minimum(remaining, chunk_size).astype(np.int64)
+    recvbuf = np.empty(total, dtype=np.uint8) if rank == root else None
 
-        # Target displacements this round are base displs + round_offs (where count>0)
-        round_displs64 = displs + np.minimum(np.maximum(lengths, 0), round_offs)
-
-        # Many MPI impls expect 32-bit ints for counts/displs in Gatherv
-        counts32 = counts64.astype(np.int32)
-        displs32 = round_displs64.astype(np.int32)
-
-        # Local slice to send this round (may be zero-length)
-        send_start = min(round_offs, int(my_n))
-        send_len = int(counts32[rank])
-        send_part = sendbuf_full[send_start:send_start + send_len]
-
+    def _gatherv(send_part, round_recvbuf, counts, round_displs):
         if rank == root:
             comm.Gatherv([send_part, MPI.BYTE],
-                         [recvbuf, counts32, displs32, MPI.BYTE],
+                         [round_recvbuf, counts, round_displs, MPI.BYTE],
                          root=root)
         else:
             comm.Gatherv([send_part, MPI.BYTE], None, root=root)
 
-    # Note: ranks with zero data (my_n == 0) still participate in every Gatherv
-    # round with count=0. This is required to keep the collectives matched.
+    _chunked_transfer_loop(comm, rank, size, lengths, displs, sendbuf,
+                           num_rounds, chunk_size, recvbuf, _gatherv)
 
-    # -- Reconstruct on root --
     if rank == root:
-        out = []
-        for i in range(size):
-            sz = int(lengths[i])
-            if sz == 0:
-                # Deserialize a canonical empty/None. Adjust to your needs.
-                out.append(None)  # None
-                continue
-            start = int(displs[i])
-            blob = recvbuf[start:start + sz].tobytes()
-            try:
-                out.append(pickle.loads(blob))  # nosec B301
-            except Exception as e:
-                raise RuntimeError(
-                    f"Deserialization failed for rank {i}: {e}") from e
-        return out
-
+        return _deserialize_recvbuf(recvbuf, lengths, displs, size)
     return None
+
+
+def safe_allgather(
+    comm: Any,
+    obj: Any,
+    chunk_size: int = 4 * 1024 * 1024,
+) -> List[Any]:
+    """Safely allgather potentially large objects by splitting into
+    fixed-size chunks, using raw-byte MPI.Allgatherv.
+
+    The function serializes *obj* once with ``pickle.dumps``, exchanges
+    payload lengths via buffer-based ``MPI_Allgather`` (1 MPI collective),
+    then transfers the raw bytes with ``MPI_Allgatherv`` (1 MPI
+    collective).  This matches the number of MPI collectives that
+    mpi4py's ``comm.allgather(obj)`` performs internally, while adding
+    chunking safety for payloads whose total exceeds the int32
+    displacement limit (~2 GB) and avoiding mpi4py's pickle5
+    out-of-band buffers that can cause unexpected memory spikes.
+
+    Args:
+        comm: MPI communicator (``MPI.Comm`` instance) to allgather over.
+        obj: Python object to allgather (must be picklable).
+        chunk_size: Per-round max bytes each rank contributes (default:
+            4 MB).
+
+    Returns:
+        List of deserialized objects from all ranks
+        (``len == comm.size``).
+    """
+    if not ENABLE_MULTI_DEVICE:
+        return [obj]
+    if MPI is None:
+        raise RuntimeError(
+            "mpi4py is required when ENABLE_MULTI_DEVICE is True")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+
+    # Step 1: serialize once and exchange lengths (1 MPI collective).
+    rank, size, lengths, displs, sendbuf = \
+        _serialize_and_exchange_lengths(comm, obj)
+
+    total = int(lengths.sum())
+    int32_max = np.iinfo(np.int32).max
+
+    # Step 2a: total fits in int32 — single Allgatherv (1 MPI collective).
+    if total < int32_max:
+        counts = lengths.astype(np.int32)
+        displs32 = displs.astype(np.int32)
+        recvbuf = np.empty(total, dtype=np.uint8)
+        comm.Allgatherv([sendbuf, MPI.BYTE],
+                        [recvbuf, counts, displs32, MPI.BYTE])
+        return _deserialize_recvbuf(recvbuf, lengths, displs, size)
+
+    # Step 2b: total exceeds int32 — chunked Allgatherv.
+    logger.info(
+        "safe_allgather: total payload %d bytes exceeds int32 limit, "
+        "using chunked Allgatherv (size=%d)", total, size)
+    max_safe_chunk = int32_max // size
+    chunk_size = min(chunk_size, max_safe_chunk)
+    max_len = int(lengths.max())
+    num_rounds = math.ceil(max_len / chunk_size) if max_len > 0 else 0
+
+    recvbuf = np.empty(total, dtype=np.uint8)
+
+    def _allgatherv(send_part, round_recvbuf, counts, round_displs):
+        comm.Allgatherv([send_part, MPI.BYTE],
+                        [round_recvbuf, counts, round_displs, MPI.BYTE])
+
+    _chunked_transfer_loop(comm, rank, size, lengths, displs, sendbuf,
+                           num_rounds, chunk_size, recvbuf, _allgatherv)
+
+    return _deserialize_recvbuf(recvbuf, lengths, displs, size)
 
 
 class MPIDist(Distributed):
@@ -530,8 +723,9 @@ class MPIDist(Distributed):
             self._cp_comm = mpi_comm().Create_group(new_group)
         return self._cp_comm
 
-    def cp_allgather(self, obj):
-        return self.cp_comm.allgather(obj)
+    def cp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.cp_comm
+        return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def cp_broadcast(self,
                      obj,
@@ -541,8 +735,9 @@ class MPIDist(Distributed):
         comm = self.cp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
-    def tp_allgather(self, obj):
-        return self.tp_comm.allgather(obj)
+    def tp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.tp_comm
+        return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = self.tp_comm
@@ -556,11 +751,13 @@ class MPIDist(Distributed):
         comm = self.tp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
-    def pp_allgather(self, obj):
-        return self.pp_comm.allgather(obj)
+    def pp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.pp_comm
+        return safe_allgather(comm, obj, chunk_size=chunk_size)
 
-    def pp_gather(self, obj, root=0):
-        return self.pp_comm.gather(obj, root=root)
+    def pp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.pp_comm
+        return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)

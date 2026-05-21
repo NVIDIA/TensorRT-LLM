@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,8 +36,22 @@ from typing import Dict, Optional, Tuple
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+# ============================================================================
+# Flash Attention 4 availability
+# ============================================================================
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    _flash_attn_fwd_import_error as _fa4_import_error,
+)
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    SageAttentionConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+
+_flash_attn4_available = _fa4_fwd is not None
 
 # NVTX support for profiling
 try:
@@ -132,6 +146,7 @@ def create_model_config(
     head_dim: int,
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
+    sage_attention_config: "SageAttentionConfig | None" = None,
 ) -> DiffusionModelConfig:
     """Create a mock DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(
@@ -143,8 +158,14 @@ def create_model_config(
 
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
-        attention=AttentionConfig(backend=attn_backend),
+        attention=AttentionConfig(
+            backend=attn_backend,
+            sage_attention_config=sage_attention_config,
+        ),
         skip_create_weights_in_init=False,
+    )
+    config.attention_metadata_state = (
+        create_attention_metadata_state() if attn_backend == "TRTLLM" else None
     )
     return config
 
@@ -176,6 +197,13 @@ def generate_rope_embeddings(
         freqs_sin = torch.sin(position * div_term).unsqueeze(0).unsqueeze(2)
 
     return freqs_cos, freqs_sin
+
+
+def _is_sage_attention_enabled(model: Attention) -> bool:
+    """Return whether the created attention model is using SageAttention."""
+    attention_backend = getattr(model, "attn", None)
+    inner_backend = getattr(attention_backend, "inner_backend", attention_backend)
+    return getattr(inner_backend, "sage_attention_config", None) is not None
 
 
 # ============================================================================
@@ -228,11 +256,33 @@ class WanAttentionPerformanceBenchmark:
         self.backends = ["VANILLA", "TRTLLM"]
 
     def create_attention_model(
-        self, hidden_size: int, num_heads: int, head_dim: int, backend: str
+        self,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
+        backend: str,
+        sage_attention_config: "SageAttentionConfig | None" = None,
     ) -> Attention:
         """Create a WAN self-attention model with specified backend."""
-        config = create_model_config(hidden_size, num_heads, head_dim, attn_backend=backend)
+        config = create_model_config(
+            hidden_size,
+            num_heads,
+            head_dim,
+            attn_backend=backend,
+            sage_attention_config=sage_attention_config,
+        )
         model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=config).to(
+            self.device
+        )
+        model.eval()
+        return model
+
+    def create_cross_attention_model(
+        self, hidden_size: int, num_heads: int, head_dim: int, backend: str
+    ) -> Attention:
+        """Create a WAN cross-attention model with specified backend."""
+        config = create_model_config(hidden_size, num_heads, head_dim, attn_backend=backend)
+        model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=config).to(
             self.device
         )
         model.eval()
@@ -261,6 +311,78 @@ class WanAttentionPerformanceBenchmark:
         # Attention matrix can be O(S^2) but flash attention avoids materializing it
         return (input_bytes + qkv_bytes + output_bytes) / (1024**3)
 
+    def benchmark_cross_attn_single(
+        self,
+        batch_size: int,
+        num_heads: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+        head_dim: int,
+        backend: str,
+        verbose: bool = True,
+    ) -> Optional[Dict]:
+        """Benchmark a single cross-attention configuration.
+
+        Returns:
+            Dict with timing statistics or None if test failed/skipped
+        """
+        hidden_size = num_heads * head_dim
+
+        try:
+            model = self.create_cross_attention_model(hidden_size, num_heads, head_dim, backend)
+
+            hidden_states = torch.randn(
+                batch_size, seq_len_q, hidden_size, device=self.device, dtype=self.dtype
+            )
+            encoder_hidden_states = torch.randn(
+                batch_size, seq_len_kv, hidden_size, device=self.device, dtype=self.dtype
+            )
+
+            # Warmup
+            with torch.no_grad():
+                for _ in range(self.warmup_iterations):
+                    _ = model(hidden_states, encoder_hidden_states=encoder_hidden_states)
+
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+
+            # Benchmark
+            times = []
+            with torch.no_grad():
+                for i in range(self.benchmark_iterations):
+                    with cuda_timer(self.device) as get_time:
+                        _ = model(hidden_states, encoder_hidden_states=encoder_hidden_states)
+                    times.append(get_time())
+
+            times_tensor = torch.tensor(times)
+            stats = {
+                "avg_ms": times_tensor.mean().item(),
+                "min_ms": times_tensor.min().item(),
+                "max_ms": times_tensor.max().item(),
+                "std_ms": times_tensor.std().item(),
+                "median_ms": times_tensor.median().item(),
+                "p95_ms": torch.quantile(times_tensor, 0.95).item(),
+                "p99_ms": torch.quantile(times_tensor, 0.99).item(),
+            }
+
+            total_ops = batch_size * num_heads * seq_len_q * seq_len_kv * head_dim
+            stats["throughput_tops"] = (total_ops / 1e12) / (stats["avg_ms"] / 1000)
+
+            if verbose:
+                print(
+                    f"  {backend} (cross S_q={seq_len_q}, S_kv={seq_len_kv}): "
+                    f"avg={stats['avg_ms']:.3f}ms, "
+                    f"median={stats['median_ms']:.3f}ms, "
+                    f"throughput={stats['throughput_tops']:.2f} TOPS"
+                )
+
+            return stats
+
+        except (RuntimeError, torch.cuda.CudaError) as e:
+            if verbose:
+                print(f"  {backend} (cross): ERROR - {e}")
+            return None
+
     def benchmark_single(
         self,
         batch_size: int,
@@ -269,6 +391,7 @@ class WanAttentionPerformanceBenchmark:
         head_dim: int,
         backend: str,
         verbose: bool = True,
+        sage_attention_config: "SageAttentionConfig | None" = None,
     ) -> Optional[Dict]:
         """Benchmark a single configuration.
 
@@ -286,7 +409,9 @@ class WanAttentionPerformanceBenchmark:
 
         try:
             # Create model and data
-            model = self.create_attention_model(hidden_size, num_heads, head_dim, backend)
+            model = self.create_attention_model(
+                hidden_size, num_heads, head_dim, backend, sage_attention_config
+            )
             hidden_states, freqs = self.create_test_data(batch_size, seq_len, hidden_size, head_dim)
 
             # Warmup
@@ -320,6 +445,8 @@ class WanAttentionPerformanceBenchmark:
                 "median_ms": times_tensor.median().item(),
                 "p95_ms": torch.quantile(times_tensor, 0.95).item(),
                 "p99_ms": torch.quantile(times_tensor, 0.99).item(),
+                "times_ms": times,
+                "uses_sage": _is_sage_attention_enabled(model),
             }
 
             # Calculate throughput (approximate TOPS)
@@ -517,20 +644,26 @@ class TestWanAttentionPerformance:
             benchmark_iterations=20,
         )
 
-    @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+    @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FA4"])
     def test_self_attention_perf(self, backend: str):
         """Test that attention backend runs without errors."""
+        if backend == "FA4" and not _flash_attn4_available:
+            pytest.fail(
+                "FlashAttention 4 backend is required for FA4 self-attention perf test"
+                + (f": {_fa4_import_error}" if _fa4_import_error else "")
+            )
+
         batch_size, num_heads, seq_len, head_dim = 1, 24, 1024, 64
 
         result = self.benchmark.benchmark_single(
             batch_size, num_heads, seq_len, head_dim, backend, verbose=True
         )
 
-        if result is not None:
-            assert result["avg_ms"] > 0, "Average time should be positive"
-            assert result["min_ms"] <= result["avg_ms"], "Min should be <= avg"
-            assert result["max_ms"] >= result["avg_ms"], "Max should be >= avg"
-            print(f"  {backend}: avg={result['avg_ms']:.3f}ms OK")
+        assert result is not None, f"{backend} benchmark failed to produce results"
+        assert result["avg_ms"] > 0, "Average time should be positive"
+        assert result["min_ms"] <= result["avg_ms"], "Min should be <= avg"
+        assert result["max_ms"] >= result["avg_ms"], "Max should be >= avg"
+        print(f"  {backend}: avg={result['avg_ms']:.3f}ms OK")
 
     @pytest.mark.parametrize(
         "batch_size,num_heads,seq_len,head_dim",
@@ -567,8 +700,382 @@ class TestWanAttentionPerformance:
 
 
 # ============================================================================
+# Flash Attention 4 performance tests
+# ============================================================================
+
+
+class TestFlashAttn4Performance:
+    """Performance benchmarks comparing FA4 and VANILLA attention backends."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Setup benchmark with FA4 and VANILLA backends."""
+        if not _flash_attn4_available:
+            pytest.fail("FlashAttention 4 backend is required for TestFlashAttn4Performance")
+        self.benchmark = WanAttentionPerformanceBenchmark(
+            warmup_iterations=5,
+            benchmark_iterations=20,
+        )
+        # Override backends so benchmark_comparison covers VANILLA and FA4
+        self.benchmark.backends = ["VANILLA", "FA4"]
+
+    @pytest.mark.parametrize(
+        "model_name,batch,seq_len,num_heads,head_dim",
+        [
+            # WAN 1.3B (num_attention_heads=12, attention_head_dim=128)
+            ("wan_1.3b_480p_33f", 1, 14040, 12, 128),  # 480x832x33f
+            ("wan_1.3b_480p_81f", 1, 32760, 12, 128),  # 480x832x81f
+            # WAN 14B (num_attention_heads=40, attention_head_dim=128)
+            ("wan_14b_480p_33f", 1, 14040, 40, 128),  # 480x832x33f
+            ("wan_14b_480p_81f", 1, 32760, 40, 128),  # 480x832x81f
+            ("wan_14b_720p_81f", 1, 75600, 40, 128),  # 720x1280x81f
+        ],
+    )
+    def test_fa4_vs_vanilla_wan_shapes(
+        self,
+        model_name: str,
+        batch: int,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ):
+        """Compare FA4 vs VANILLA timing on real WAN model shapes.
+
+        Seq lens computed from VAE scale factors (spatial=8, temporal=4) and
+        patch_size=[1,2,2]:
+          480x832x33f  -> seq_len  14,040
+          480x832x81f  -> seq_len  32,760
+          720x1280x81f -> seq_len  75,600
+        """
+        results = self.benchmark.benchmark_comparison(
+            batch,
+            num_heads,
+            seq_len,
+            head_dim,
+            description=f"FA4 vs VANILLA {model_name}",
+            verbose=True,
+        )
+
+        vanilla = results.get("VANILLA")
+        fa4 = results.get("FA4")
+
+        assert vanilla is not None, f"VANILLA benchmark failed for {model_name}"
+        assert fa4 is not None, f"FA4 benchmark failed for {model_name}"
+
+        speedup = vanilla["avg_ms"] / fa4["avg_ms"]
+        print(
+            f"\n  {model_name}: FA4 speedup={speedup:.2f}x "
+            f"({'faster' if speedup > 1 else 'slower'})"
+        )
+        print(f"    VANILLA: avg={vanilla['avg_ms']:.3f}ms  p95={vanilla['p95_ms']:.3f}ms")
+        print(f"    FA4:     avg={fa4['avg_ms']:.3f}ms  p95={fa4['p95_ms']:.3f}ms")
+
+
+# ============================================================================
 # Main entry point
 # ============================================================================
+
+
+class TestFlashAttn4CrossAttnPerformance:
+    """Performance benchmarks for FA4 cross-attention vs VANILLA."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Setup benchmark with FA4 and VANILLA backends."""
+        if not _flash_attn4_available:
+            pytest.fail("FlashAttention 4 backend is required for TestFlashAttn4Performance")
+        self.benchmark = WanAttentionPerformanceBenchmark(
+            warmup_iterations=5,
+            benchmark_iterations=20,
+        )
+        self.device = self.benchmark.device
+        self.dtype = self.benchmark.dtype
+
+    @pytest.mark.parametrize(
+        "model_name,batch,seq_len_q,seq_len_kv,num_heads,head_dim",
+        [
+            # WAN 1.3B cross-attention: visual tokens attend to 512 text tokens
+            ("wan_1.3b_480p_33f_cross", 1, 14040, 512, 12, 128),
+            ("wan_1.3b_480p_81f_cross", 1, 32760, 512, 12, 128),
+            # WAN 14B cross-attention
+            ("wan_14b_480p_33f_cross", 1, 14040, 512, 40, 128),
+            ("wan_14b_720p_81f_cross", 1, 75600, 512, 40, 128),
+        ],
+    )
+    def test_fa4_vs_vanilla_cross_attn_wan_shapes(
+        self,
+        model_name: str,
+        batch: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+        num_heads: int,
+        head_dim: int,
+    ):
+        """Compare FA4 vs VANILLA cross-attention on real WAN model shapes."""
+        results = {}
+        for backend in ["VANILLA", "FA4"]:
+            results[backend] = self.benchmark.benchmark_cross_attn_single(
+                batch, num_heads, seq_len_q, seq_len_kv, head_dim, backend, verbose=True
+            )
+
+        vanilla = results.get("VANILLA")
+        fa4 = results.get("FA4")
+
+        assert vanilla is not None, f"VANILLA cross-attn benchmark failed for {model_name}"
+        assert fa4 is not None, f"FA4 cross-attn benchmark failed for {model_name}"
+
+        speedup = vanilla["avg_ms"] / fa4["avg_ms"]
+        print(
+            f"\n  {model_name}: FA4 cross-attn speedup={speedup:.2f}x "
+            f"({'faster' if speedup > 1 else 'slower'})"
+        )
+        print(f"    VANILLA: avg={vanilla['avg_ms']:.3f}ms  p95={vanilla['p95_ms']:.3f}ms")
+        print(f"    FA4:     avg={fa4['avg_ms']:.3f}ms  p95={fa4['p95_ms']:.3f}ms")
+
+    @pytest.mark.parametrize(
+        "batch,seq_len_q,seq_len_kv,num_heads,head_dim",
+        [
+            (1, 1024, 512, 12, 128),
+            (1, 2048, 512, 12, 128),
+            (2, 1024, 512, 12, 128),
+        ],
+    )
+    def test_fa4_cross_attn_quick(
+        self,
+        batch: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+        num_heads: int,
+        head_dim: int,
+    ):
+        """Quick FA4 cross-attention correctness and timing check."""
+        for backend in ["VANILLA", "FA4"]:
+            result = self.benchmark.benchmark_cross_attn_single(
+                batch, num_heads, seq_len_q, seq_len_kv, head_dim, backend, verbose=True
+            )
+            assert result is not None, f"{backend} cross-attn failed"
+            assert result["avg_ms"] > 0
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+
+# ============================================================================
+# SageAttention performance tests
+# ============================================================================
+
+_sm100_only = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="SageAttention cubins require SM100 (Blackwell).",
+)
+
+# All five supported (num_elts_per_blk_q, num_elts_per_blk_k, num_elts_per_blk_v, qk_int8) tuples.
+_SAGE_CONFIGS = [
+    SageAttentionConfig(
+        num_elts_per_blk_q=1, num_elts_per_blk_k=1, num_elts_per_blk_v=1, qk_int8=False
+    ),
+    SageAttentionConfig(
+        num_elts_per_blk_q=1, num_elts_per_blk_k=4, num_elts_per_blk_v=1, qk_int8=False
+    ),
+    SageAttentionConfig(
+        num_elts_per_blk_q=1, num_elts_per_blk_k=1, num_elts_per_blk_v=1, qk_int8=True
+    ),
+    SageAttentionConfig(
+        num_elts_per_blk_q=1, num_elts_per_blk_k=4, num_elts_per_blk_v=1, qk_int8=True
+    ),
+    SageAttentionConfig(
+        num_elts_per_blk_q=1, num_elts_per_blk_k=16, num_elts_per_blk_v=1, qk_int8=True
+    ),
+]
+
+# Human-readable labels for the five configs.
+_SAGE_CONFIG_IDS = ["fp8_k1", "fp8_k4", "int8_k1", "int8_k4", "int8_k16"]
+
+
+@_sm100_only
+class TestSageAttentionPerformance:
+    """Performance benchmarks comparing VANILLA, TRTLLM, and TRTLLM+SageAttention.
+
+    All tests use WAN model dimensions (head_dim=128, num_heads=12) because the
+    SM100 SageAttention cubins are generated for head_dim=128 only.
+    """
+
+    # WAN-realistic seq_lens (VAE 8x spatial, 4x temporal, patch [1,2,2])
+    WAN_SEQ_LENS = [
+        (1, 12, 14040, 128, "wan_1.3b_480p_33f"),
+        (1, 12, 32760, 128, "wan_1.3b_480p_81f"),
+        (1, 40, 14040, 128, "wan_14b_480p_33f"),
+        (1, 40, 32760, 128, "wan_14b_480p_81f"),
+        (1, 40, 75600, 128, "wan_14b_720p_81f"),
+    ]
+
+    # Smaller sizes used by quick/CI tests.
+    QUICK_SEQ_LENS = [
+        (1, 12, 1024, 128, "quick_1k"),
+        (1, 12, 4096, 128, "quick_4k"),
+        (2, 12, 1024, 128, "quick_batch2"),
+    ]
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.benchmark = WanAttentionPerformanceBenchmark(
+            warmup_iterations=5,
+            benchmark_iterations=20,
+        )
+
+    def _bench(
+        self,
+        batch: int,
+        num_heads: int,
+        seq_len: int,
+        head_dim: int,
+        sage_cfg: SageAttentionConfig,
+        verbose: bool = True,
+    ) -> Optional[Dict]:
+        return self.benchmark.benchmark_single(
+            batch,
+            num_heads,
+            seq_len,
+            head_dim,
+            backend="TRTLLM",
+            verbose=verbose,
+            sage_attention_config=sage_cfg,
+        )
+
+    # ------------------------------------------------------------------
+    # Quick / CI tests
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("sage_cfg,cfg_id", zip(_SAGE_CONFIGS, _SAGE_CONFIG_IDS))
+    @pytest.mark.parametrize(
+        "batch,num_heads,seq_len,head_dim,desc",
+        QUICK_SEQ_LENS,
+    )
+    def test_sage_runs_and_times(
+        self,
+        batch: int,
+        num_heads: int,
+        seq_len: int,
+        head_dim: int,
+        desc: str,
+        sage_cfg: SageAttentionConfig,
+        cfg_id: str,
+    ):
+        """Verify every sage config produces a valid timing result at quick sizes."""
+        if sage_cfg.qk_int8 and torch.cuda.get_device_capability()[1] == 3:
+            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+
+        result = self._bench(batch, num_heads, seq_len, head_dim, sage_cfg)
+        assert result is not None, f"sage {cfg_id} failed for {desc}"
+        assert result["uses_sage"], f"sage {cfg_id} fell back unexpected for {desc}"
+        assert result["avg_ms"] > 0
+        print(
+            f"  sage {cfg_id} ({desc}): avg={result['avg_ms']:.3f}ms  p95={result['p95_ms']:.3f}ms"
+        )
+
+    @pytest.mark.parametrize("sage_cfg,cfg_id", zip(_SAGE_CONFIGS, _SAGE_CONFIG_IDS))
+    def test_sage_vs_vanilla_quick(self, sage_cfg: SageAttentionConfig, cfg_id: str):
+        """Compare SageAttention timing against VANILLA at a quick size.
+
+        Does not assert a minimum speedup — the goal is to catch regressions
+        where sage unexpectedly becomes much slower than plain SDPA.
+        """
+        if sage_cfg.qk_int8 and torch.cuda.get_device_capability()[1] == 3:
+            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+
+        batch, num_heads, seq_len, head_dim = 1, 12, 4096, 128
+
+        vanilla = self.benchmark.benchmark_single(
+            batch, num_heads, seq_len, head_dim, backend="VANILLA", verbose=False
+        )
+        trtllm = self.benchmark.benchmark_single(
+            batch, num_heads, seq_len, head_dim, backend="TRTLLM", verbose=False
+        )
+        sage = self._bench(batch, num_heads, seq_len, head_dim, sage_cfg)
+
+        assert vanilla is not None, "VANILLA benchmark failed"
+        assert trtllm is not None, "TRTLLM benchmark failed"
+        assert sage is not None, f"SageAttention {cfg_id} benchmark failed"
+        assert sage["uses_sage"], f"SageAttention {cfg_id} fell back unexpected at S={seq_len}"
+
+        speedup_vs_vanilla = vanilla["avg_ms"] / sage["avg_ms"]
+        speedup_vs_trtllm = trtllm["avg_ms"] / sage["avg_ms"]
+        print(
+            f"\n  sage {cfg_id} at S={seq_len}: "
+            f"avg={sage['avg_ms']:.3f}ms  "
+            f"vs_vanilla={speedup_vs_vanilla:.2f}x  "
+            f"vs_trtllm={speedup_vs_trtllm:.2f}x"
+        )
+
+    # ------------------------------------------------------------------
+    # Full WAN-shape benchmarks
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("sage_cfg,cfg_id", zip(_SAGE_CONFIGS, _SAGE_CONFIG_IDS))
+    @pytest.mark.parametrize(
+        "batch,num_heads,seq_len,head_dim,model_name",
+        WAN_SEQ_LENS,
+    )
+    def test_sage_vs_trtllm_wan_shapes(
+        self,
+        batch: int,
+        num_heads: int,
+        seq_len: int,
+        head_dim: int,
+        model_name: str,
+        sage_cfg: SageAttentionConfig,
+        cfg_id: str,
+    ):
+        """SageAttention vs TRTLLM on real WAN model sequence lengths."""
+        if sage_cfg.qk_int8 and torch.cuda.get_device_capability()[1] == 3:
+            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+
+        trtllm = self.benchmark.benchmark_single(
+            batch, num_heads, seq_len, head_dim, backend="TRTLLM", verbose=False
+        )
+        sage = self._bench(batch, num_heads, seq_len, head_dim, sage_cfg)
+
+        assert trtllm is not None, f"TRTLLM failed for {model_name}"
+        assert sage is not None, f"sage {cfg_id} failed for {model_name}"
+        assert sage["uses_sage"], f"sage {cfg_id} fell back unexpected for {model_name}"
+
+        speedup = trtllm["avg_ms"] / sage["avg_ms"]
+        print(
+            f"\n  {model_name} sage={cfg_id}: "
+            f"trtllm={trtllm['avg_ms']:.3f}ms  "
+            f"sage={sage['avg_ms']:.3f}ms  "
+            f"speedup={speedup:.2f}x ({'faster' if speedup > 1 else 'slower'})"
+        )
+
+
+def _run_fa4_benchmark(benchmark: WanAttentionPerformanceBenchmark) -> None:
+    """Run FA4 vs VANILLA comparison benchmark and print summary table."""
+    benchmark.backends = ["VANILLA", "FA4"]
+
+    print("\n" + "=" * 70)
+    print("FLASH ATTENTION 4 vs VANILLA BENCHMARK")
+    print("=" * 70)
+    print(f"{'Configuration':<40} {'VANILLA (ms)':<15} {'FA4 (ms)':<15} {'Speedup':<10}")
+    print("-" * 70)
+
+    for batch_size, num_heads, seq_len, head_dim, desc in benchmark.TEST_SIZES:
+        results = benchmark.benchmark_comparison(
+            batch_size, num_heads, seq_len, head_dim, desc, verbose=False
+        )
+        vanilla = results.get("VANILLA")
+        fa4 = results.get("FA4")
+
+        vanilla_str = f"{vanilla['avg_ms']:.2f}" if vanilla else "N/A"
+        fa4_str = f"{fa4['avg_ms']:.2f}" if fa4 else "N/A"
+        if vanilla and fa4:
+            speedup = vanilla["avg_ms"] / fa4["avg_ms"]
+            speedup_str = f"{speedup:.2f}x"
+        else:
+            speedup_str = "N/A"
+
+        print(f"{desc:<40} {vanilla_str:<15} {fa4_str:<15} {speedup_str:<10}")
 
 
 def main():
@@ -601,15 +1108,25 @@ def main():
         benchmark_iterations=50,
     )
 
-    # Run full benchmark
+    # Run full benchmark (VANILLA vs TRTLLM)
     print("\n" + "=" * 70)
-    print("FULL BENCHMARK")
+    print("FULL BENCHMARK (VANILLA vs TRTLLM)")
     print("=" * 70)
     all_results = benchmark.run_full_benchmark(use_quick_sizes=False)
 
     # Memory test
     if torch.cuda.is_available():
         benchmark.test_memory_usage(batch_size=1, num_heads=24, seq_len=4096, head_dim=64)
+
+    # FA4 benchmark (if available)
+    if _flash_attn4_available:
+        fa4_benchmark = WanAttentionPerformanceBenchmark(
+            warmup_iterations=10,
+            benchmark_iterations=50,
+        )
+        _run_fa4_benchmark(fa4_benchmark)
+    else:
+        print("\nSkipping FA4 benchmark (FlashAttention 4 not installed)")
 
     print("\n" + "=" * 70)
     print("BENCHMARK COMPLETE")

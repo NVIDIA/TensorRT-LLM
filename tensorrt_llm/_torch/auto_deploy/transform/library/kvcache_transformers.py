@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """A simple wrapper transform to build a model via the model factory."""
 
 import types
@@ -159,7 +173,10 @@ def get_cached_attn(
         elif attention_layout != "bnsd":
             raise ValueError(f"Unsupported attention layout: {attention_layout}")
 
-        attn_output = attn_descriptor.get_cached_attention_op()(
+        cached_attn_op = module._node_ref.meta.get(
+            "cached_attn_op", attn_descriptor.get_cached_attention_op()
+        )
+        attn_output = cached_attn_op(
             query,
             key,
             value,
@@ -238,14 +255,17 @@ class HFReplaceCachedAttn(_InsertCachedOperator):
         self,
         gm: GraphModule,
         attn_node: Node,
+        cached_attn_op,
         qkv_nodes: List[Node],
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
         constants: List[Constant],
+        prepared_attn_mask: Optional[Node] = None,
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
         # store reference to metadata, caches, and constants for this attn node
+        attn_node.meta["cached_attn_op"] = cached_attn_op
         attn_node.meta["metadata_cache_keys"] = (*meta_nodes_std, *meta_nodes_extra, *cache_nodes)
         attn_node.meta["constants"] = constants
 

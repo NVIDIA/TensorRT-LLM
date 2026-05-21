@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -146,7 +147,11 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -170,6 +175,9 @@ public:
         , mMultimodalPositions(std::move(multimodalPositions))
         , mMultimodalLengths(std::move(multimodalLengths))
         , mMultimodalUuids(std::move(multimodalUuids))
+        , mMultimodalItemRunCuOffsets(std::move(multimodalItemRunCuOffsets))
+        , mMultimodalRunPositions(std::move(multimodalRunPositions))
+        , mMultimodalRunLengths(std::move(multimodalRunLengths))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
@@ -178,7 +186,8 @@ public:
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(std::move(lookaheadConfig))
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        , mContextChunkSize{mPromptLen}
+        , mContextChunkSizeTarget{mPromptLen}
+        , mContextChunkSizeDraft{mPromptLen}
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
@@ -205,6 +214,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
+        , mAgentHierarchy(std::move(agent_hierarchy))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -256,7 +266,8 @@ public:
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(lookaheadConfig)
-        , mContextChunkSize(mPromptLen)
+        , mContextChunkSizeTarget(mPromptLen)
+        , mContextChunkSizeDraft(mPromptLen)
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(std::make_shared<VecTokens>(draftTokens.value_or(VecTokens())))
@@ -293,7 +304,8 @@ public:
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(mSamplingConfig.beamWidth, 0)
         , mMaxSentTokenLen(mPromptLen)
-        , mContextChunkSize{mPromptLen}
+        , mContextChunkSizeTarget{mPromptLen}
+        , mContextChunkSizeDraft{mPromptLen}
         , mLogProbs(mSamplingConfig.beamWidth)
         , mCumLogProbs(mSamplingConfig.beamWidth)
         , mDraftTokens(std::make_shared<VecTokens>())
@@ -330,10 +342,14 @@ public:
 
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnGenerationLogits)
         {
+            // In streaming mode with beam search, intermediate logits are returned before finalization,
+            // so they cannot be reordered to match the final beam paths. Non-streaming mode handles
+            // reordering in postProcessRequest() after gatherTree finalization.
             TLLM_LOG_WARNING(
                 "Returning generation logits when streaming is enabled and beamWidth > 1 is not allowed. "
-                "This is because the logits may appear in irrelevant order when the beams are gathered, "
-                "since logits are not. Disabling returnGenerationLogits.");
+                "This is because intermediate logits cannot be reordered to match the final beam paths "
+                "until finalization. Use non-streaming mode for correct generation logits with beam search. "
+                "Disabling returnGenerationLogits.");
             mReturnGenerationLogits = false;
         }
 
@@ -387,6 +403,32 @@ public:
         {
             mMropeRotaryCosSin = executor::detail::toITensor(mRopeConfig.value().getMRopeRotaryCosSin());
             mMropePositionDeltas = mRopeConfig.value().getMRopePositionDeltas();
+        }
+
+        auto multimodalInput = req.getMultimodalInput();
+        if (multimodalInput)
+        {
+            mMultimodalHashes
+                = std::make_shared<std::vector<std::vector<SizeType32>>>(multimodalInput->getMultimodalHashes());
+            mMultimodalPositions = std::make_shared<std::vector<SizeType32>>(multimodalInput->getMultimodalPositions());
+            mMultimodalLengths = std::make_shared<std::vector<SizeType32>>(multimodalInput->getMultimodalLengths());
+            if (auto const& multimodalUuids = multimodalInput->getMultimodalUuids())
+            {
+                mMultimodalUuids = std::make_shared<std::vector<std::optional<std::string>>>(multimodalUuids.value());
+            }
+            if (auto const& multimodalItemRunCuOffsets = multimodalInput->getMultimodalItemRunCuOffsets())
+            {
+                mMultimodalItemRunCuOffsets
+                    = std::make_shared<std::vector<SizeType32>>(multimodalItemRunCuOffsets.value());
+            }
+            if (auto const& multimodalRunPositions = multimodalInput->getMultimodalRunPositions())
+            {
+                mMultimodalRunPositions = std::make_shared<std::vector<SizeType32>>(multimodalRunPositions.value());
+            }
+            if (auto const& multimodalRunLengths = multimodalInput->getMultimodalRunLengths())
+            {
+                mMultimodalRunLengths = std::make_shared<std::vector<SizeType32>>(multimodalRunLengths.value());
+            }
         }
 
         auto loraConfig = req.getLoraConfig();
@@ -861,7 +903,9 @@ public:
         mContextCurrentPositionDraft = 0;
         mPrepopulatedPromptLenTarget = 0;
         mPrepopulatedPromptLenDraft = 0;
-        mContextChunkSize = mPromptLen;
+        mContextChunkSizeTarget = mPromptLen;
+        mContextChunkSizeDraft = mPromptLen;
+        mEstimatedReusableTokens = 0;
         mSeqSlot.reset();
     }
 
@@ -914,6 +958,21 @@ public:
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> getMultimodalUuids() const
     {
         return mMultimodalUuids;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalItemRunCuOffsets() const
+    {
+        return mMultimodalItemRunCuOffsets;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalRunPositions() const
+    {
+        return mMultimodalRunPositions;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalRunLengths() const
+    {
+        return mMultimodalRunLengths;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
@@ -1129,6 +1188,23 @@ public:
                     "by the number of tokens per block, except for the last chunk.");
             }
         }
+    }
+
+    /// @brief Get the estimated number of reusable tokens from the KV cache.
+    /// @details Set by the capacity scheduler so the micro batch scheduler can
+    ///          account for cached tokens in its token budget. For subsequent
+    ///          context chunks, this returns 0 because contextRemainingLength
+    ///          already reflects the advancement from setPrepopulatedPromptLen.
+    [[nodiscard]] SizeType32 getEstimatedReusableTokens() const noexcept
+    {
+        return mEstimatedReusableTokens;
+    }
+
+    /// @brief Set the estimated number of reusable tokens. Const because
+    ///        the field is mutable (it's a scheduling cache, not request state).
+    void setEstimatedReusableTokens(SizeType32 estimatedReusableTokens) const noexcept
+    {
+        mEstimatedReusableTokens = estimatedReusableTokens;
     }
 
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
@@ -1590,7 +1666,7 @@ public:
         TLLM_CHECK_WITH_INFO(
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "getContextChunkSize is only possible during the context phase or generation init phase.");
-        return mContextChunkSize;
+        return mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
     }
 
     /// To set the context chunk size, throw an exception when the chunk size is negative. If the chunk
@@ -1602,7 +1678,8 @@ public:
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
-        mContextChunkSize = std::min(size, getContextRemainingLength());
+        auto& contextChunkSize = mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
+        contextChunkSize = std::min(size, getContextRemainingLength());
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
@@ -1625,9 +1702,10 @@ public:
     {
         TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
 
-        mContextCurrentPositionDraft += getContextChunkSize();
-        mContextCurrentPositionTarget += getContextChunkSize();
-        setContextChunkSize(0);
+        mContextCurrentPositionDraft += mContextChunkSizeDraft;
+        mContextCurrentPositionTarget += mContextChunkSizeTarget;
+        mContextChunkSizeDraft = 0;
+        mContextChunkSizeTarget = 0;
     }
 
     [[nodiscard]] executor::PriorityType priority() const noexcept
@@ -1689,7 +1767,8 @@ public:
 
     [[nodiscard]] bool isFinished() const noexcept
     {
-        return isGenerationCompleteState() || mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS;
+        return isGenerationCompleteState() || mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS
+            || isDisaggContextCompleteState();
     }
 
     /// Returns true if finished_reason is length for all beams
@@ -1703,6 +1782,16 @@ public:
     {
         return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
             [](auto reason) { return reason == executor::FinishReason::kCANCELLED; });
+    }
+
+    [[nodiscard]] bool isFinishedWithoutError() const noexcept
+    {
+        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
+            [](auto reason)
+            {
+                return reason == executor::FinishReason::kEND_ID || reason == executor::FinishReason::kSTOP_WORDS
+                    || reason == executor::FinishReason::kLENGTH;
+            });
     }
 
     [[nodiscard]] bool isTimedOut() const
@@ -1910,6 +1999,11 @@ public:
         return maybeToGlobalSteadyClock(std::chrono::steady_clock::now());
     }
 
+    [[nodiscard]] std::optional<std::vector<std::tuple<std::string, int>>> const& getAgentHierarchy() const
+    {
+        return mAgentHierarchy;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1958,6 +2052,15 @@ protected:
     SizeType32 mPrepopulatedPromptLenTarget{0};
     SizeType32 mPrepopulatedPromptLenDraft{0};
 
+    // Estimated number of reusable tokens from the KV cache radix tree.
+    // Set by the capacity scheduler (during getNeededBlocksOneStep /
+    // getRemainingBlocksToCompletion) so that the micro batch scheduler
+    // can account for cached tokens when computing the token budget.
+    // Marked mutable because it is a cache/estimate set during const
+    // capacity-scheduler queries. Reset to 0 after addSequenceBatch sets
+    // the authoritative mPrepopulatedPromptLen and advances context position.
+    mutable SizeType32 mEstimatedReusableTokens{0};
+
     SizeType32 mMaxSentTokenLen;
 
     std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
@@ -1972,6 +2075,9 @@ protected:
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> mMultimodalUuids{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalItemRunCuOffsets{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunPositions{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunLengths{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
@@ -1987,7 +2093,8 @@ protected:
     // Paged-KV-Cache must be enabled while enabling Chunked-Context.
     // The size of the context chunk must be multiple of the KV-Cache block size except the last one.
     // Value `0` means Chunked-Context is disabled.
-    SizeType32 mContextChunkSize{0};
+    SizeType32 mContextChunkSizeTarget{0};
+    SizeType32 mContextChunkSizeDraft{0};
     SizeType32 mContextCurrentPositionTarget{0};
     SizeType32 mContextCurrentPositionDraft{0};
 
@@ -2091,6 +2198,8 @@ protected:
 
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
+
+    std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
 private:
     void initialize(
@@ -2285,7 +2394,11 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2319,7 +2432,16 @@ public:
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime)
+            arrivalTime, std::move(agent_hierarchy),
+            multimodalItemRunCuOffsets.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            multimodalRunPositions.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunPositions.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            multimodalRunLengths.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt))
     {
     }
 

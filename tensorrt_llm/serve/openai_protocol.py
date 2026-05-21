@@ -37,17 +37,27 @@ from pydantic import (BaseModel, ConfigDict, Field, field_validator,
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.sampling_params import check_logprobs_limit
+from tensorrt_llm.scheduling_params import AgentHierarchy
 
 
-def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
-                                  vocab_size: int) -> Optional[torch.Tensor]:
+def _logit_bias_to_embedding_bias(
+        logit_bias: Optional[Dict[str, float]],
+        vocab_size: Optional[int]) -> Optional[torch.Tensor]:
     """Convert OpenAI logit_bias dict to embedding_bias tensor for sampling."""
     if logit_bias is None:
         return None
+    if vocab_size is None:
+        raise ValueError(
+            "logit_bias requires a tokenizer, but the server was started "
+            "without one (e.g. num_postprocess_workers > 0). "
+            "Remove logit_bias from your request or set num_postprocess_workers=0."
+        )
 
     # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
     embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
@@ -127,6 +137,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
+    conversation_id: Optional[str] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -220,8 +231,12 @@ def _response_format_to_guided_decoding_params(
             raise ValueError(
                 f"response_format.json_schema is required for response_format.type == {response_format.type!r}, but got None."
             )
-        guided_decoding_params = GuidedDecodingParams(
-            json=response_format.json_schema)
+        # OpenAI API spec wraps the actual JSON schema under a "schema" key.
+        # Extract the actual schema if the wrapper format is used.
+        json_schema = response_format.json_schema
+        if isinstance(json_schema, dict) and "schema" in json_schema:
+            json_schema = json_schema["schema"]
+        guided_decoding_params = GuidedDecodingParams(json=json_schema)
     elif response_format.type == "json_object":
         guided_decoding_params = GuidedDecodingParams(json_object=True)
     elif response_format.type == "regex":
@@ -385,12 +400,25 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
-                           vocab_size: int = 32000,
+                           vocab_size: Optional[int] = None,
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
+        sampling_logprobs = None
+        return_log_probs = False
+        if self.logprobs:
+            if backend == "pytorch" or gather_generation_logits:
+                sampling_logprobs = self.logprobs
+            elif self.logprobs > 1:
+                raise ValueError(
+                    "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
+                )
+            else:
+                return_log_probs = True
+
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
+            logprobs=sampling_logprobs,
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -428,25 +456,14 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if self.logprobs:
-            if backend == "pytorch":
-                sampling_params.logprobs = self.logprobs
-            else:
-                if gather_generation_logits:
-                    sampling_params.logprobs = self.logprobs
-                elif self.logprobs > 1:
-                    raise ValueError(
-                        "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
-                    )
-                else:
-                    sampling_params._return_log_probs = True
+        if return_log_probs:
+            sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if (logprobs := data.get("logprobs")) is not None and logprobs < 0:
-            raise ValueError("logprobs must be positive or zero")
+        check_logprobs_limit("logprobs", data.get("logprobs"))
         return data
 
     @model_validator(mode="before")
@@ -504,7 +521,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    top_logprobs: List[ChatCompletionLogProb] = None
+    top_logprobs: Optional[List[ChatCompletionLogProb]] = None
 
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
@@ -543,6 +560,9 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     """Assistant message that includes reasoning tokens."""
     reasoning: Optional[str]
+    # NOTE: some older benchmarks and chat templates assume the below, which has been deprecated
+    # in other inference frameworks in favor of the above `reasoning` field.
+    reasoning_content: Optional[str]
 
 
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
@@ -611,6 +631,7 @@ class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -728,6 +749,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "Will be accessible by the chat template."),
     )
 
+    media_io_kwargs: Optional[Dict[MediaModality, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Per-request override for the server's `--media_io_kwargs`. "
+            "Shape: `{modality: {kwarg: value}}` with modality in "
+            "{\"image\", \"video\", \"audio\"}; unknown modality keys are "
+            "rejected. Per modality, request kwargs are shallow-merged "
+            "onto the server defaults (request wins per key). For "
+            "`video`, overriding only one of `fps`/`num_frames` drops "
+            "the other from the server default so the loader's built-in "
+            "is used. "
+            "Example: `{\"video\": {\"num_frames\": 32}}`."),
+    )
+
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
@@ -740,15 +775,32 @@ class ChatCompletionRequest(OpenAIBaseModel):
          "to limit the kv cache reuse on with the requests having the same string."
          ))
 
+    agent_hierarchy: Optional[AgentHierarchy] = Field(
+        default=None, description="Agent hierarchy ")
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self,
-                           vocab_size: int = 32000,
+                           vocab_size: Optional[int] = None,
                            gather_generation_logits: bool = False,
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
+        sampling_logprobs = None
+        return_log_probs = False
+        if self.logprobs:
+            logprobs = 1 if not self.top_logprobs else self.top_logprobs
+            if backend == "pytorch" or gather_generation_logits:
+                sampling_logprobs = logprobs
+            elif self.top_logprobs:
+                raise ValueError(
+                    "`gather_generation_logits` must be `True` to use `top_logprobs`"
+                )
+            else:
+                return_log_probs = True
+
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
+            logprobs=sampling_logprobs,
             max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -785,19 +837,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if self.logprobs:
-            logprobs = 1 if not self.top_logprobs else self.top_logprobs
-            if backend == "pytorch":
-                sampling_params.logprobs = logprobs
-            else:
-                if gather_generation_logits:
-                    sampling_params.logprobs = logprobs
-                elif self.top_logprobs:
-                    raise ValueError(
-                        "`gather_generation_logits` must be `True` to use `top_logprobs`"
-                    )
-                else:
-                    sampling_params._return_log_probs = True
+        if return_log_probs:
+            sampling_params._return_log_probs = True
         return sampling_params
 
     @model_validator(mode='before')
@@ -823,8 +864,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @classmethod
     def check_logprobs(cls, data):
         if (top_logprobs := data.get("top_logprobs")) is not None:
-            if top_logprobs < 0:
-                raise ValueError("top_logprobs must be positive or zero")
+            check_logprobs_limit("top_logprobs", top_logprobs)
             if not data.get("logprobs"):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
@@ -846,6 +886,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "Parameter 'cache_salt' must be a non-empty string if provided."
                 )
         return v
+
+
+class KVCacheTruncateRequest(OpenAIBaseModel):
+    model: str
+    messages: List[ChatCompletionMessageParam] = []
+    messages_to_retain: List[ChatCompletionMessageParam] = []
+    tools: Optional[List[ChatCompletionToolsParam]] = None
+    add_generation_prompt: Optional[bool] = True
+    documents: Optional[list] = None
+    chat_template: Optional[str] = None
+    chat_template_kwargs: Optional[dict] = None
+    reasoning_effort: Optional[str] = None
+    tool_choice: Optional[str] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
@@ -1379,6 +1432,14 @@ class VideoGenerationRequest(OpenAIBaseModel):
         description="Text describing what to avoid in the generated video.")
     seed: Optional[int] = Field(default=None,
                                 description="Random seed for reproducibility.")
+    output_format: Literal["mp4", "avi", "auto"] = Field(
+        default="auto",
+        description=(
+            "Video encode format. "
+            "'mp4' for H.264 encoding (requires ffmpeg installed on server), "
+            "'avi' for MJPEG encoding (always available, no audio support), "
+            "'auto' to use best available (H.264 if ffmpeg installed, "
+            "otherwise MJPEG)."))
 
     @field_validator("size")
     @classmethod
@@ -1427,6 +1488,8 @@ class VideoJob(OpenAIBaseModel):
                                 description="Video dimensions in 'WxH' format")
     output_path: Optional[str] = Field(
         default=None, description="Actual path where the video file was saved")
+    output_paths: Optional[List[str]] = Field(
+        default=None, description="Paths for all generated videos when n > 1")
 
 
 class VideoJobList(OpenAIBaseModel):

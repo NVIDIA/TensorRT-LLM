@@ -23,10 +23,11 @@ TensorRT LLM delivers breakthrough performance on the latest NVIDIA GPUs:
 
 ### 🎯 **Comprehensive Model Support**
 
-TensorRT LLM supports the latest and most popular LLM [architectures](https://nvidia.github.io/TensorRT-LLM/models/supported-models.html).
+TensorRT LLM supports the latest and most popular LLM and DiT architectures. See [complete list](./models/supported-models.md).
 
 - **Language Models**: GPT-OSS, Deepseek-R1/V3, Llama 3/4, Qwen2/3, Gemma 3, Phi 4...
 - **Multi-modal Models**: LLaVA-NeXT, Qwen2-VL, VILA, Llama 3.2 Vision...
+- **[Visual Generation](./models/visual-generation.md) Models**: FLUX, Wan2.1/2.2 for image and video generation.
 
 TensorRT LLM strives to support the most popular models on **Day 0**.
 

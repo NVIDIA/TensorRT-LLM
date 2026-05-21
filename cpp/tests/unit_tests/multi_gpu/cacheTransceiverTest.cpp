@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -215,15 +216,14 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
-            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
-            dataType, sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, CacheType::kSELF,
+            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dataType,
+            sinkTokenLength, stream, maxAttentionWindow, maxAttentionWindow, enableBlockReuse, CacheType::kSELF,
             std::nullopt, nullptr, true);
         auto attentionLayerNumPerPP = std::vector<SizeType32>{numLayers};
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
@@ -333,7 +333,8 @@ protected:
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         if (isSender)
         {
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -408,6 +409,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     mFutures.clear();
     for (auto& request : requests)
     {
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
         mManager->removeSequence(request->mRequestId, request);
     }
     requests.clear();
@@ -446,13 +448,11 @@ struct CPMetaData
         mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
         mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(
             cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
-        mSeqLenOnThisCPRank = totalSeqLen;
+        // For round-robin distribution of blocks among CP ranks, the last block (which may have padded tokens)
+        // belongs to the CP rank with index (mTotalNumBlocksAcrossCPRanks - 1) % cpSize.
         int numPaddedTokensLastBlock = 0;
-        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(),
-            "Round-robin block distribution for CP needs further adjustments.");
-        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of
-        // blocks.
-        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0)
+        int const lastBlockOwnerCPRank = (mTotalNumBlocksAcrossCPRanks - 1) % cpSize;
+        if (cpRank == lastBlockOwnerCPRank && totalSeqLen % numTokensPerBlock != 0)
         {
             numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
         }
@@ -460,8 +460,8 @@ struct CPMetaData
         mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
         for (int i = 0; i < mNumBlocksThisCPRank; i++)
         {
-            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(
-                i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+            // Round-robin distribution: localBlockIdx i on cpRank maps to global blockId (i * cpSize + cpRank).
+            mGlobalBlockIds[i] = i * cpSize + cpRank;
         }
     }
 };
@@ -649,7 +649,6 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         CacheType cacheType = CacheType::kSELF;
         if (kvFactor == 1)
         {
@@ -689,10 +688,11 @@ protected:
         }
         TLLM_LOG_DEBUG(" cacheManager isWindowAttention: %d", mIsWindowAttention);
         mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
-            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, std::nullopt, dataType,
-            sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr,
-            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, /*kvCacheConnectorManager=*/nullptr,
-            /*enableIndexerKCache=*/isIndexerKCache, /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
+            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, dataType, sinkTokenLength, stream,
+            maxAttentionWindow, maxAttentionWindow, enableBlockReuse, cacheType, std::nullopt, nullptr,
+            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
+            /*kvCacheConnectorManager=*/nullptr, /*enableIndexerKCache=*/isIndexerKCache,
+            /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
             /*indexerKCacheIndexHeadDim=*/indexerDimPerHead);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
@@ -767,13 +767,17 @@ protected:
 
                 setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
 
-                mConnectionManager
-                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(bufferManagers, *mCacheState, "nixl");
+                std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
+                    bufferManagers.begin(), bufferManagers.end());
+                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                    baseBufferManagers, *mCacheState, "nixl");
             }
             else if (isMooncake)
             {
+                std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
+                    bufferManagers.begin(), bufferManagers.end());
                 mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
-                    bufferManagers, *mCacheState, "mooncake");
+                    baseBufferManagers, *mCacheState, "mooncake");
             }
             else
             {
@@ -925,7 +929,8 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
 
         int const numPools = mManager->getBlockManager().getNumPools(
@@ -956,7 +961,7 @@ protected:
             auto indexerKCacheBlockRange = blockRange.getBlockRangeForWindow(windowSizes[0], true);
             for (auto it = indexerKCacheBlockRange.begin(); it != indexerKCacheBlockRange.end(); ++it)
             {
-                fillBlockData(*it, blockIdx, llmRequest->getPromptLen(), windowSizes[0], true);
+                fillBlockData(*it, blockIdx, initial, windowSizes[0], true);
                 blockIdx++;
             }
         }
@@ -977,7 +982,8 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         return mRequester->receiveAsync(*llmRequest);
     }
 
@@ -1024,11 +1030,20 @@ protected:
         }
         if (mManager->isEnableIndexerKCache())
         {
+            size_t indexerInitial = llmRequest->getPromptLen();
+            std::vector<int> indexerGlobalBlockIds;
+            if (request->mCPMetaData.has_value())
+            {
+                auto const& cpData = request->mCPMetaData.value();
+                indexerInitial = cpData.mTotalSeqLenAcrossCPRanks;
+                indexerGlobalBlockIds = cpData.mGlobalBlockIds;
+            }
             auto indexerKCacheBlockRange = blockRange.getBlockRangeForWindow(windowSizes[0], true);
             blockIdx = 0;
             for (auto it = indexerKCacheBlockRange.begin(); it != indexerKCacheBlockRange.end(); ++it)
             {
-                verifyBlockData(*it, llmRequest->getPromptLen(), blockIdx, windowSizes[0], true);
+                verifyBlockData(*it, indexerInitial,
+                    indexerGlobalBlockIds.empty() ? blockIdx : indexerGlobalBlockIds[blockIdx], windowSizes[0], true);
                 blockIdx++;
             }
         }
@@ -1071,8 +1086,10 @@ protected:
         {
             TLLM_CHECK(mCacheState->getIndexerKCacheQuantBlockSize() != 0);
             TLLM_CHECK(mCacheState->getIndexerDimPerHead() % mCacheState->getIndexerKCacheQuantBlockSize() == 0);
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1165,8 +1182,10 @@ protected:
         int sizePerHead;
         if (isIndexerKCache)
         {
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1393,6 +1412,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
                 mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();
@@ -1830,7 +1850,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & PP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
@@ -1849,7 +1872,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP on gen side for GQA/MHA.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForGQA, AsymmetricalCacheTest,
@@ -1906,7 +1932,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLAUnevenLayer, Asymmetrical
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests high context PP with PP and CP on gen side with uneven layer distribution.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
@@ -1925,7 +1954,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, Asymmetrical
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests high context PP with pure CP on gen side with uneven layer distribution.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
@@ -1944,7 +1976,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, Asymmetrical
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheTestWithDP,
@@ -1963,7 +1998,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheT
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(true),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial DP on context side while non-trivial CP & DP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheTestWithDP,
@@ -1982,7 +2020,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheT
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(true),
         /*generationDP*/ testing::Values(true),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side for GQA/MHA.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForGQA0, AsymmetricalCacheTestWithDP,

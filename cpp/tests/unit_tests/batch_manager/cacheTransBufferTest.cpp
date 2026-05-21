@@ -41,6 +41,7 @@ protected:
         auto const stream = std::make_shared<CudaStream>();
 
         auto kvMaxNumTokens = tokensPerBlock * maxBlocksPerSeq;
+        auto maxSequenceLength = kvMaxNumTokens;
         auto maxAttentionWindow = kvMaxNumTokens;
         auto inputLength = kvMaxNumTokens - tokensPerBlock - 1;
         auto numSharedBlocks = inputLength / tokensPerBlock;
@@ -50,7 +51,6 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = true;
-        auto constexpr onboardBlocks = true;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -58,7 +58,7 @@ protected:
 
         mCacheManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            std::nullopt, dataType, sinkTokenLength, stream, kvMaxNumTokens, enableBlockReuse, onboardBlocks, cacheType,
+            dataType, sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse, cacheType,
             std::nullopt, nullptr, true);
 
         mCacheManager->allocatePools(false);

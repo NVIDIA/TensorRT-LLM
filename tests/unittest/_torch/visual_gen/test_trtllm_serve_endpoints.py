@@ -25,10 +25,10 @@ import torch
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
-from tensorrt_llm.serve.media_storage import MediaStorage
 from tensorrt_llm.serve.openai_protocol import VideoJob
+from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
+from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -74,7 +74,13 @@ def _run_async(coro):
 
 
 class MockVisualGen:
-    """Lightweight stand-in for VisualGen that avoids GPU / model loading."""
+    """Lightweight stand-in for VisualGen that avoids GPU / model loading.
+
+    When *batch_aware* is True (default), ``generate()`` and
+    ``generate_async()`` inspect ``params.num_images_per_prompt`` and expand
+    the stored single-item tensors into batched tensors ``(N, ...)`` so
+    callers can test batch handling end-to-end.
+    """
 
     def __init__(
         self,
@@ -82,32 +88,66 @@ class MockVisualGen:
         video_output: Optional[torch.Tensor] = None,
         audio_output: Optional[torch.Tensor] = None,
         should_fail: bool = False,
+        batch_aware: bool = True,
     ):
         self._image = image_output
         self._video = video_output
         self._audio = audio_output
         self._should_fail = should_fail
+        self._batch_aware = batch_aware
         self._healthy = True
-        self.req_counter = 0
+        self._req_counter = 0
+        # Captured arguments of the most recent generate / generate_async call,
+        # used by tests to assert forwarded VisualGenParams fields.
+        self.last_inputs = None
+        self.last_params = None
+
+    def _maybe_batch(self, tensor, n):
+        """Replicate a single tensor along a new leading batch dimension."""
+        if tensor is None or n <= 1 or not self._batch_aware:
+            return tensor
+        return tensor.unsqueeze(0).expand(n, *tensor.shape).contiguous()
 
     # --- VisualGen interface ---
 
-    def generate(self, inputs=None, params=None) -> MediaOutput:
+    def generate(self, inputs=None, params=None) -> VisualGenOutput:
+        self.last_inputs = inputs
+        self.last_params = params
         if self._should_fail:
             raise RuntimeError("Generation intentionally failed")
-        return MediaOutput(
-            image=self._image,
-            video=self._video,
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
+        return VisualGenOutput(
+            request_id=self._next_request_id(),
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
             audio=self._audio,
+            metrics=VisualGenMetrics(),
         )
 
-    def generate_async(self, inputs=None, params=None) -> "MockDiffusionGenerationResult":
-        return MockDiffusionGenerationResult(
-            image=self._image,
-            video=self._video,
+    def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
+        self.last_inputs = inputs
+        self.last_params = params
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
+        return MockVisualGenResult(
+            request_id=self._next_request_id(),
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
             audio=self._audio,
             should_fail=self._should_fail,
         )
+
+    def _next_request_id(self) -> int:
+        rid = self._req_counter
+        self._req_counter += 1
+        return rid
+
+    @property
+    def default_params(self):
+        """Stand-in for VisualGen.default_params — parse_visual_gen_params
+        seeds request params from this, so it must return a fresh instance."""
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        return VisualGenParams()
 
     def _check_health(self) -> bool:
         return self._healthy
@@ -119,28 +159,51 @@ class MockVisualGen:
         pass
 
 
-class MockDiffusionGenerationResult:
-    """Mock future-like result for generate_async."""
+class MockVisualGenResult:
+    """Mock future-like result for generate_async.
+
+    Mirrors the real :class:`VisualGenResult` surface enough for the server:
+    ``__await__``, ``aresult``, and a sync ``result``. Resolves to a
+    :class:`VisualGenOutput` (single-prompt path).
+    """
 
     def __init__(
         self,
+        request_id: int = 0,
         image: Optional[torch.Tensor] = None,
         video: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         should_fail: bool = False,
     ):
+        self.request_id = request_id
         self._image = image
         self._video = video
         self._audio = audio
         self._should_fail = should_fail
 
-    async def result(self, timeout=None):
+    def __await__(self):
+        return self.aresult().__await__()
+
+    async def aresult(self, timeout=None):
         if self._should_fail:
             raise RuntimeError("Async generation intentionally failed")
-        return MediaOutput(
+        return VisualGenOutput(
+            request_id=self.request_id,
             image=self._image,
             video=self._video,
             audio=self._audio,
+            metrics=VisualGenMetrics(),
+        )
+
+    def result(self, timeout=None):
+        if self._should_fail:
+            raise RuntimeError("Async generation intentionally failed")
+        return VisualGenOutput(
+            request_id=self.request_id,
+            image=self._image,
+            video=self._video,
+            audio=self._audio,
+            metrics=VisualGenMetrics(),
         )
 
 
@@ -166,7 +229,10 @@ def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> 
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,
         )
-    return TestClient(server.app)
+    client = TestClient(server.app)
+    # Expose the mock so tests can assert captured generate() arguments.
+    client.mock_gen = generator
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -227,19 +293,23 @@ def _clear_video_store():
 
 @pytest.fixture(autouse=True)
 def _mock_video_encoding():
-    """Mock MP4 encoding to avoid PyAV dependency in unit tests.
+    """Mock video encoding to avoid ffmpeg dependency in unit tests.
 
-    Replaces MediaStorage._save_mp4 with a stub that writes a small
-    dummy file so FileResponse can serve it.
+    Replaces ``tensorrt_llm.media.encoding._save_encoded_video`` with a stub
+    that writes a small dummy file so FileResponse can serve it; also mocks
+    ffmpeg availability so ``resolve_video_format`` always resolves to mp4.
     """
 
-    def _dummy_save_mp4(video, audio, output_path, frame_rate):
+    def _dummy_save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate=24000):
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
         with open(str(output_path), "wb") as f:
             f.write(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 32)
         return str(output_path)
 
-    with patch.object(MediaStorage, "_save_mp4", staticmethod(_dummy_save_mp4)):
+    with (
+        patch("tensorrt_llm.media.encoding._save_encoded_video", _dummy_save_encoded_video),
+        patch("tensorrt_llm.media.encoding._check_ffmpeg_available", return_value=True),
+    ):
         yield
 
 
@@ -286,6 +356,15 @@ class TestImageGeneration:
         data = resp.json()
         assert data["size"] == "128x64"
 
+        # Verify openai_server/parse_visual_gen_params forwarded every field.
+        params = image_client.mock_gen.last_params
+        assert image_client.mock_gen.last_inputs == "Sunset over ocean"
+        assert params.width == 128
+        assert params.height == 64
+        assert params.num_inference_steps == 20
+        assert params.guidance_scale == 7.5
+        assert params.negative_prompt == "blurry"
+
     def test_image_generation_url_format_not_supported(self, image_client):
         resp = image_client.post(
             "/v1/images/generations",
@@ -330,7 +409,7 @@ class TestImageGeneration:
         assert resp.status_code == 400
 
     def test_image_generation_null_output(self, tmp_path):
-        """Generator returns MediaOutput with image=None."""
+        """Generator returns VisualGenOutput with image=None."""
         gen = MockVisualGen(image_output=None)
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         client = _create_server(gen)
@@ -376,6 +455,72 @@ class TestImageGeneration:
         )
         assert resp.status_code == 400
 
+    def test_image_generation_b64_no_save_image_no_disk_write(self, image_client, tmp_path):
+        """Regression guard for NVBug 6064029.
+
+        The b64_json hot path must not call ``save_image()``, which caused a
+        redundant PNG encode plus an unnecessary disk write before fix #12903.
+        """
+        with patch("tensorrt_llm.media.encoding.save_image") as mock_save:
+            resp = image_client.post(
+                "/v1/images/generations",
+                json={
+                    "prompt": "A cat sitting on a mat",
+                    "response_format": "b64_json",
+                    "size": "64x64",
+                },
+            )
+        assert resp.status_code == 200
+        mock_save.assert_not_called()
+        assert list(tmp_path.glob("*.png")) == []
+
+    def test_image_generation_b64_with_4d_batch_pipeline_output(self, tmp_path):
+        """NVBug 6064029: when the pipeline returns a 4D (B, H, W, C)
+        tensor (e.g. FLUX2), all B images must be expanded, encoded once
+        each, and returned in order. Pre-fix, save_image silently kept
+        only image[0], so the response would drop every batch entry but
+        the first."""
+        # Use deterministic distinct images (all-zeros vs all-255) so
+        # we can verify per-image output mapping, not just call counts.
+        from tensorrt_llm.media.encoding import image_to_bytes
+
+        img0 = torch.zeros((64, 64, 3), dtype=torch.uint8)
+        img1 = torch.full((64, 64, 3), 255, dtype=torch.uint8)
+        batch = torch.stack([img0, img1])  # (2, H, W, C)
+        expected_b64 = [
+            base64.b64encode(image_to_bytes(img)).decode("utf-8") for img in (img0, img1)
+        ]
+
+        gen = MockVisualGen(image_output=batch)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            client = _create_server(gen)
+            with (
+                patch(
+                    "tensorrt_llm.serve.openai_server.image_to_bytes",
+                    wraps=image_to_bytes,
+                ) as mock_cvt,
+                patch("tensorrt_llm.media.encoding.save_image") as mock_save,
+            ):
+                resp = client.post(
+                    "/v1/images/generations",
+                    json={
+                        "prompt": "two cats",
+                        "response_format": "b64_json",
+                        "size": "64x64",
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            assert len(data) == 2
+            assert mock_cvt.call_count == 2
+            mock_save.assert_not_called()
+            # Content + order match: proves each batch entry maps to
+            # its own b64 output, not just "encoded twice on image[0]".
+            assert [entry["b64_json"] for entry in data] == expected_b64
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
 
 # =========================================================================
 # POST /v1/images/edits
@@ -383,7 +528,16 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    def test_basic_image_edit(self, image_client):
+    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+
+    No in-tree pipeline implements image editing: Flux/Flux2 are
+    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+    video, not edited images. Restore the full happy-path coverage when an
+    edit-capable pipeline lands.
+    """
+
+    def test_image_edit_returns_not_implemented(self, image_client):
+        """Valid request body still short-circuits to 501 NotImplemented."""
         b64_img = _b64_white_png_1x1()
         resp = image_client.post(
             "/v1/images/edits",
@@ -393,70 +547,14 @@ class TestImageEdit:
                 "num_inference_steps": 10,
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "data" in data
-        assert len(data["data"]) >= 1
-        assert data["data"][0]["b64_json"] is not None
-
-    def test_image_edit_with_list_images(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": [b64_img, b64_img],
-                "prompt": "Merge them",
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 200
-
-    def test_image_edit_with_mask(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        b64_mask = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Remove object",
-                "mask": b64_mask,
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 200
-
-    def test_image_edit_with_optional_params(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Enhance colors",
-                "size": "128x128",
-                "guidance_scale": 8.0,
-                "num_inference_steps": 15,
-                "seed": 42,
-                "negative_prompt": "dark",
-            },
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["size"] == "128x128"
-
-    def test_image_edit_failure(self, failing_client):
-        b64_img = _b64_white_png_1x1()
-        resp = failing_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Edit this",
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 500
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body.get("type") == "NotImplementedError"
+        assert "not supported" in body.get("message", "").lower()
 
     def test_missing_image_for_edit(self, image_client):
-        """Missing required field → RequestValidationError → custom handler → 400."""
+        """Missing required field is rejected by FastAPI request validation
+        (400) before the 501 short-circuit, so this contract is unchanged."""
         resp = image_client.post(
             "/v1/images/edits",
             json={
@@ -464,6 +562,36 @@ class TestImageEdit:
             },
         )
         assert resp.status_code == 400
+
+
+# =========================================================================
+# _normalize_image_output helper (NVBug 6064029)
+# =========================================================================
+
+
+class TestNormalizeImageOutput:
+    """Coverage for the helper added by the NVBug 6064029 fix."""
+
+    def test_list_input_passthrough(self):
+        t1 = _make_dummy_image_tensor()
+        t2 = _make_dummy_image_tensor()
+        out = _normalize_image_output([t1, t2])
+        assert len(out) == 2
+        assert out[0] is t1 and out[1] is t2
+
+    def test_3d_tensor_wrapped_as_single(self):
+        t = _make_dummy_image_tensor()  # (H, W, C)
+        assert t.dim() == 3
+        out = _normalize_image_output(t)
+        assert len(out) == 1 and out[0] is t
+
+    def test_4d_batch_tensor_expanded(self):
+        batch = torch.stack([_make_dummy_image_tensor() for _ in range(3)])
+        assert batch.dim() == 4 and batch.shape[0] == 3
+        out = _normalize_image_output(batch)
+        assert len(out) == 3
+        for i in range(3):
+            assert torch.equal(out[i], batch[i])
 
 
 # =========================================================================
@@ -506,6 +634,17 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
+        params = video_client.mock_gen.last_params
+        assert video_client.mock_gen.last_inputs == "Ocean waves"
+        assert params.width == 64
+        assert params.height == 64
+        assert params.num_inference_steps == 10
+        assert params.guidance_scale == 5.0
+        assert params.seed == 42
+        assert params.negative_prompt == "blurry"
+        assert params.frame_rate == 8
+        assert params.num_frames == int(2.0 * 8)
+
     def test_sync_video_generation_multipart(self, video_client):
         # Use files={} with a dummy file to ensure multipart/form-data
         dummy_file = BytesIO(b"")
@@ -542,6 +681,13 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
+        # input_reference should have been written to media storage and passed
+        # through as params.image (a filesystem path).
+        params = video_client.mock_gen.last_params
+        assert isinstance(params.image, str)
+        assert params.image.endswith("_reference.png")
+        assert os.path.exists(params.image)
+
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
             "/v1/videos/generations",
@@ -553,10 +699,10 @@ class TestVideoGenerationSync:
             },
             headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 500
 
     def test_sync_video_null_output(self, tmp_path):
-        """Generator returns MediaOutput with video=None."""
+        """Generator returns VisualGenOutput with video=None."""
         gen = MockVisualGen(video_output=None)
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         client = _create_server(gen)
@@ -594,6 +740,22 @@ class TestVideoGenerationSync:
             files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
         )
         assert resp.status_code == 400
+
+    def test_sync_video_batch_n2(self, video_client):
+        """Sync video with n=2 should succeed and return the first video."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "Batch rockets",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
 
 
 # =========================================================================
@@ -679,6 +841,65 @@ class TestVideoGenerationAsync:
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 400
+
+    def test_async_video_forwards_params(self, video_client):
+        """Ensure async video endpoint forwards VisualGenParams to generate_async."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Rainy street",
+                "size": "128x64",
+                "seconds": 2.0,
+                "fps": 10,
+                "num_inference_steps": 12,
+                "guidance_scale": 6.0,
+                "seed": 7,
+                "negative_prompt": "noise",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        # The background task calls generate_async lazily — drive the event
+        # loop via status polling until the job completes.
+        import time as _time
+
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            meta = video_client.get(f"/v1/videos/{video_id}").json()
+            if meta.get("status") in ("completed", "failed"):
+                break
+            _time.sleep(0.05)
+
+        params = video_client.mock_gen.last_params
+        assert video_client.mock_gen.last_inputs == "Rainy street"
+        assert params.width == 128
+        assert params.height == 64
+        assert params.num_inference_steps == 12
+        assert params.guidance_scale == 6.0
+        assert params.seed == 7
+        assert params.negative_prompt == "noise"
+        assert params.frame_rate == 10
+        assert params.num_frames == int(2.0 * 10)
+
+    def test_async_video_batch_n2(self, video_client):
+        """Async video with n=2 should accept the request and return 202."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Batch fireworks",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["id"].startswith("video_")
 
 
 # =========================================================================
@@ -826,8 +1047,8 @@ class TestDeleteVideo:
         )
         video_id = create_resp.json()["id"]
 
-        # Write a dummy video file
-        (tmp_path / f"{video_id}.mp4").write_bytes(b"\x00" * 32)
+        # Write a dummy video file matching the batch naming convention.
+        (tmp_path / f"{video_id}_0.mp4").write_bytes(b"\x00" * 32)
 
         resp = client.delete(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
@@ -839,7 +1060,7 @@ class TestDeleteVideo:
         assert resp.status_code == 404
 
         # Verify file is deleted
-        assert not (tmp_path / f"{video_id}.mp4").exists()
+        assert not (tmp_path / f"{video_id}_0.mp4").exists()
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
     def test_delete_video_not_found(self, video_client):

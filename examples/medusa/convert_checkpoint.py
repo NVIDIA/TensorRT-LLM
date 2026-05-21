@@ -12,7 +12,8 @@ from transformers import (LlamaConfig, LlamaForCausalLM, LlamaTokenizer,
                           Qwen2Config)
 
 import tensorrt_llm
-from tensorrt_llm._utils import numpy_to_torch
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
+from tensorrt_llm._utils import get_hf_rope_theta, numpy_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import (LLaMAForCausalLM, PretrainedConfig,
@@ -179,6 +180,7 @@ def parse_arguments():
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
@@ -207,7 +209,7 @@ def main():
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.n_positions = hf_config.max_position_embeddings
-        args.rotary_base = hf_config.rope_theta
+        args.rotary_base = get_hf_rope_theta(hf_config, 10000.0)
         args.rotary_scaling = hf_config.rope_scaling
 
     elif args.meta_ckpt_dir is not None:

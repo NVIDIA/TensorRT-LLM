@@ -19,6 +19,7 @@
 #include "trtllm/gen/DtypeDecl.h"
 #include "trtllm/gen/MmaDecl.h"
 #include <iostream>
+#include <sstream>
 
 #ifdef TLLM_ENABLE_CUDA
 #include <cuda.h>

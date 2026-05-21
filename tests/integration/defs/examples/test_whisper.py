@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import pytest
 from defs.common import convert_weights, venv_check_call
 from defs.conftest import get_sm_version, llm_models_root, skip_post_blackwell
@@ -135,4 +137,77 @@ def test_llm_whisper_general(llm_venv, engine_dir, data_type,
     # https://nvbugs/4658787
     # WAR before whisper tests can work offline
     env = {"HF_DATASETS_OFFLINE": "0"}
+    venv_check_call(llm_venv, run_cmd, env=env)
+
+
+@skip_post_blackwell
+@pytest.mark.parametrize("num_beams", [4],
+                         ids=lambda num_beams: f'nb:{num_beams}')
+@pytest.mark.parametrize("whisper_model_root", ['large-v3'], indirect=True)
+def test_whisper_beam_search_generation_logits(llm_venv, engine_dir,
+                                               whisper_example_root,
+                                               whisper_model_root, num_beams,
+                                               whisper_example_audio_file):
+    """Verify that generation_logits are reordered to match the final beam paths.
+
+    With beam search (num_beams > 1), generation_logits must be reindexed by
+    parentIds so that argmax(generation_logits[beam][t]) == output_ids[beam][t]
+    at every position. Without reordering, logits are indexed by beam slot
+    rather than by the final beam path, producing incorrect probabilities.
+    """
+    tllm_model_name, model_ckpt_dir = whisper_model_root
+
+    whisper_engine_dir = f"{engine_dir}/{tllm_model_name}/float16_disable_weight_only"
+
+    converted_weight_dir = convert_weights(llm_venv=llm_venv,
+                                           example_root=whisper_example_root,
+                                           cmodel_dir=whisper_engine_dir,
+                                           model=tllm_model_name,
+                                           model_path=model_ckpt_dir,
+                                           use_weight_only=False,
+                                           weight_only_precision=None)
+
+    print("Build engines for beam search generation logits test...")
+    for component in ["encoder", "decoder"]:
+        build_cmd = [
+            "trtllm-build",
+            f"--checkpoint_dir={converted_weight_dir}/{component}",
+            f"--output_dir={whisper_engine_dir}/{component}",
+            "--paged_kv_cache=enable",
+            "--remove_input_padding=enable",
+            "--moe_plugin=disable",
+            "--max_batch_size=1",
+        ]
+        if component == "encoder":
+            build_cmd.append("--max_input_len=3000")
+            build_cmd.append("--max_seq_len=3000")
+        if component == "decoder":
+            build_cmd.append("--max_input_len=14")
+            build_cmd.append("--max_seq_len=114")
+            build_cmd.append("--max_encoder_input_len=3000")
+            build_cmd.append(f"--max_beam_width={num_beams}")
+            build_cmd.append("--gemm_plugin=float16")
+            build_cmd.append("--bert_attention_plugin=float16")
+            build_cmd.append("--gpt_attention_plugin=float16")
+
+        check_call(build_cmd, env=llm_venv._new_env)
+
+    print("Run generation logits beam search validation...")
+    validation_script = os.path.join(os.path.dirname(__file__),
+                                     "validate_whisper_beam_logits.py")
+    run_cmd = [
+        validation_script,
+        f"--engine_dir={whisper_engine_dir}",
+        f"--assets_dir={model_ckpt_dir}",
+        f"--input_file={whisper_example_audio_file}",
+        f"--num_beams={num_beams}",
+    ]
+    env = {
+        "HF_DATASETS_OFFLINE":
+        "0",
+        "PYTHONPATH":
+        os.pathsep.join(
+            filter(None, [whisper_example_root,
+                          os.environ.get("PYTHONPATH")])),
+    }
     venv_check_call(llm_venv, run_cmd, env=env)

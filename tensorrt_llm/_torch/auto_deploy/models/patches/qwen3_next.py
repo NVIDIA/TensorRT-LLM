@@ -1,9 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Patches for Qwen3Next to make it compatible with torch.export and reduce export time.
 
 Includes:
   - MoE patch: replaces Qwen3NextSparseMoeBlock.forward with torch_moe op
   - GDN patch: replaces Qwen3NextGatedDeltaNet.forward with autodeploy custom ops
-    (torch_causal_conv1d, torch_l2norm, torch_gated_delta_rule)
+    (torch_causal_conv1d, torch_gated_delta_rule)
   - Mask/cache patches: simplify _update_linear_attn_mask and DynamicCache.__bool__
     for torch.export compatibility
 
@@ -16,12 +30,21 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_next.modeling_qwen3_next import (
-    Qwen3NextDynamicCache,
     Qwen3NextGatedDeltaNet,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     apply_mask_to_padding_states,
 )
+
+# transformers 5.5+ removed the model-specific Qwen3NextDynamicCache and routes
+# qwen3_next through the generic DynamicCache from cache_utils. Fall back to the
+# old symbol when running against transformers 5.3.x so this file still imports.
+try:
+    from transformers.models.qwen3_next.modeling_qwen3_next import (
+        Qwen3NextDynamicCache as _Qwen3NextCache,
+    )
+except ImportError:
+    from transformers.cache_utils import DynamicCache as _Qwen3NextCache
 
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
@@ -34,24 +57,29 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states = hidden_states.view(-1, hidden_dim)
 
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
+    # In transformers 5.x, gate returns (router_logits, routing_weights, selected_experts).
+    # The routing logic (softmax, topk, normalization) is now inside the gate.
+    _, routing_weights, selected_experts = self.gate(hidden_states)
 
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    if self.norm_topk_prob:
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
-    routing_weights = routing_weights.to(hidden_states.dtype)
+    # In transformers 5.x, self.experts is a fused object with stacked weight tensors
+    # (Parameters directly, not modules with .weight).
+    # Use torch_moe_fused directly since weights are already stacked.
+    gate_up_param = self.experts.gate_up_proj
+    gate_up = gate_up_param.weight if hasattr(gate_up_param, "weight") else gate_up_param
+    down_param = self.experts.down_proj
+    down = down_param.weight if hasattr(down_param, "weight") else down_param
 
-    # Routed experts via torch_moe
-    final_hidden_states = torch.ops.auto_deploy.torch_moe(
+    # HF format: gate_up is [E, 2*I, H] with gate(w1) first, up(w3) second.
+    # TRT-LLM format: w3_w1 is [E, 2*I, H] with up(w3) first, gate(w1) second.
+    half = gate_up.shape[1] // 2
+    w3_w1_stacked = torch.cat([gate_up[:, half:, :], gate_up[:, :half, :]], dim=1)
+
+    final_hidden_states = torch.ops.auto_deploy.torch_moe_fused(
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.gate_proj.weight for expert in self.experts],
-        w2_weight=[expert.down_proj.weight for expert in self.experts],
-        w3_weight=[expert.up_proj.weight for expert in self.experts],
+        w3_w1_stacked_weight=w3_w1_stacked,
+        w2_stacked_weight=down,
     )
 
     # Shared expert path (unique to Qwen3Next vs Qwen3MoE)
@@ -60,7 +88,7 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     final_hidden_states = final_hidden_states + shared_expert_output
 
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
+    return final_hidden_states
 
 
 @ExportPatchRegistry.register("hf_qwen3_next_moe")
@@ -91,7 +119,7 @@ class Qwen3NextMoePatch(BaseExportPatch):
 def _patched_gdn_forward(
     self: Qwen3NextGatedDeltaNet,
     hidden_states: torch.Tensor,
-    cache_params: Optional[Qwen3NextDynamicCache] = None,
+    cache_params: Optional[_Qwen3NextCache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
 ):
@@ -99,8 +127,8 @@ def _patched_gdn_forward(
 
     Removes cache-dependent control flow and uses autodeploy custom ops:
       - torch_causal_conv1d for the depthwise causal convolution
-      - torch_l2norm for L2 normalization of Q and K
       - torch_gated_delta_rule for the core gated delta rule computation
+        (L2 norm, GQA expansion, and gating are handled inside the op)
     """
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
     batch_size, seq_len, _ = hidden_states.shape
@@ -143,25 +171,13 @@ def _patched_gdn_forward(
     key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
     value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-    # 3. L2 normalize Q and K via autodeploy op
-    query = torch.ops.auto_deploy.torch_l2norm(query)
-    key = torch.ops.auto_deploy.torch_l2norm(key)
+    # 3. Gated Delta Rule via autodeploy custom op
+    # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
+    core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+        query, key, value, a, b, self.A_log, self.dt_bias
+    )
 
-    # 4. Compute beta and gating
-    beta = b.sigmoid()  # [B, S, num_v_heads]
-    # If the model is loaded in fp16, without the .float() here, A might be -inf
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
-
-    # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
-    if self.num_v_heads // self.num_k_heads > 1:
-        query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-        key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-    # 5. Gated Delta Rule via autodeploy custom op
-    # Op expects [B, S, H, D] layout (bsnd convention)
-    core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
-
-    # 6. Gated RMSNorm
+    # 5. Gated RMSNorm
     z_shape_og = z.shape
     core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
     z = z.reshape(-1, z.shape[-1])
@@ -169,7 +185,7 @@ def _patched_gdn_forward(
     core_attn_out = core_attn_out.reshape(z_shape_og)
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-    # 7. Output projection
+    # 6. Output projection
     output = self.out_proj(core_attn_out)
     return output
 
@@ -215,12 +231,13 @@ class Qwen3NextGDNPatch(BaseExportPatch):
         self.original_values["Qwen3NextModel._update_linear_attn_mask"] = (
             Qwen3NextModel._update_linear_attn_mask
         )
-        # NOTE: Qwen3NextDynamicCache does not have __bool__ by default
-        # (it inherits from object), so we just set it and delete on revert.
+        # NOTE: the cache class (Qwen3NextDynamicCache pre-5.5 / generic
+        # DynamicCache 5.5+) does not define its own __bool__ — both fall back
+        # to Cache.__len__ — so we just set it and delete on revert.
 
         Qwen3NextGatedDeltaNet.forward = _patched_gdn_forward  # type: ignore
         Qwen3NextModel._update_linear_attn_mask = _patched_update_linear_attn_mask  # type: ignore
-        Qwen3NextDynamicCache.__bool__ = _cache_bool  # type: ignore
+        _Qwen3NextCache.__bool__ = _cache_bool  # type: ignore
 
     def _revert_patch(self):
         """Revert the GDN, mask, and cache patches."""
@@ -230,4 +247,4 @@ class Qwen3NextGDNPatch(BaseExportPatch):
         Qwen3NextModel._update_linear_attn_mask = self.original_values[  # type: ignore
             "Qwen3NextModel._update_linear_attn_mask"
         ]
-        del Qwen3NextDynamicCache.__bool__
+        del _Qwen3NextCache.__bool__

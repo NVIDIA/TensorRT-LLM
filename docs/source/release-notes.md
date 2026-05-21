@@ -31,6 +31,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Known Issues
 
 - **DGX Spark:** DGX Spark support is in beta. Only single-node configurations and the models listed above have been validated in this release.
+- **Disaggregated Serving:** A hang may occur in disaggregated serving with context pipeline parallelism and generation tensor parallelism configurations.
 
 ## TensorRT-LLM Release 1.1
 

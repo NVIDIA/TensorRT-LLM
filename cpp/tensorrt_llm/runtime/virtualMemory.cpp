@@ -402,32 +402,30 @@ using AllocConf = CudaVirtualMemoryAllocator::Configuration;
 
 AllocConf AllocConf::backgroundConfiguration{getVirtualMemoryManager(), "", NONE, nullptr, true};
 
-static const std::shared_ptr<AllocConf> bgConf{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration};
-
-static std::shared_mutex currentConfMutex;
-static std::shared_ptr<AllocConf> currentConf = bgConf;
+static std::shared_mutex sConfMutex;
+static std::shared_ptr<AllocConf> sCurrentConf{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration};
+static std::vector<std::shared_ptr<AllocConf>> sConfStack;
 
 CudaVirtualMemoryAllocator getVirtualMemoryAllocator()
 {
-    std::shared_lock lock(currentConfMutex);
-    return CudaVirtualMemoryAllocator{currentConf};
+    std::shared_lock lock(sConfMutex);
+    return CudaVirtualMemoryAllocator{sCurrentConf};
 }
 
-void setVirtualMemoryAllocator(
+void pushVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
 {
-    std::unique_lock lock(currentConfMutex);
-
-    TLLM_CHECK_WITH_INFO(currentConf == bgConf,
-        "An active virtual memory allocator (tag: %s, mode: %d, stream: %p) is already present",
-        currentConf->mTag.c_str(), currentConf->mMode, currentConf->mBackStream.get());
-    currentConf = std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream);
+    std::unique_lock lock(sConfMutex);
+    sCurrentConf.swap(
+        sConfStack.emplace_back(std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream)));
 }
 
-void clearVirtualMemoryAllocator()
+void popVirtualMemoryAllocator()
 {
-    std::unique_lock lock(currentConfMutex);
-    currentConf = bgConf;
+    std::unique_lock lock(sConfMutex);
+    TLLM_CHECK_WITH_INFO(!sConfStack.empty(), "popVirtualMemoryAllocator called with empty stack");
+    sCurrentConf.swap(sConfStack.back());
+    sConfStack.pop_back();
 }
 
 } // namespace tensorrt_llm::runtime

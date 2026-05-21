@@ -14,8 +14,10 @@
 # limitations under the License.
 import logging
 import os
+import re
 import tempfile
 import time
+from typing import Dict
 from urllib.request import urlopen
 
 import pytest
@@ -31,17 +33,23 @@ logger = logging.getLogger(__name__)
 
 @pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
 def model_name():
+    """Return the HuggingFace model path used for all tests in this module."""
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
 @pytest.fixture(scope="module")
 def temp_extra_llm_api_options_file(request):
+    """Create a temporary YAML file with extra LLM API options for metrics collection."""
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
         extra_llm_api_options_dict = {
             "return_perf_metrics": True,
-            "enable_iter_perf_stats": True
+            "enable_iter_perf_stats": True,
+            "kv_cache_config": {
+                "enable_block_reuse": True,
+                "iteration_stats_interval": 1,
+            },
         }
 
         with open(temp_file_path, 'w') as f:
@@ -56,6 +64,7 @@ def temp_extra_llm_api_options_file(request):
 @pytest.fixture(scope="module")
 def server(model_name: str,
            temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
+    """Start a RemoteOpenAIServer with the PyTorch backend and metrics enabled."""
     model_path = get_model_path(model_name)
     args = ["--backend", "pytorch", "--tp_size", "1"]
     args.extend(["--extra_llm_api_options", temp_extra_llm_api_options_file])
@@ -65,8 +74,68 @@ def server(model_name: str,
         logger.info("Tests completed, shutting down server")
 
 
+def _parse_prometheus_sample(data: str, metric_name: str) -> float | None:
+    """Parse Prometheus exposition text and return the sample value for a metric.
+
+    Matches a single sample line in the Prometheus text format, e.g.:
+        trtllm_kv_cache_hit_rate{model_name="llama"} 0.5
+        trtllm_kv_cache_hit_rate 0.5
+    Comment lines (# HELP, # TYPE) are naturally skipped because they
+    do not match the pattern.
+
+    Args:
+        data: Raw Prometheus exposition text from the /prometheus/metrics endpoint.
+        metric_name: Fully qualified metric name to search for (e.g.
+            "trtllm_kv_cache_hit_rate").
+
+    Returns:
+        The float value of the first matching sample, or None if not found.
+    """
+
+    # '^'  # anchor to start of line
+    # r'(?:\{[^}]*\})?' for  optional {label="value",...} block (non-capturing)
+    # r'\s+' for whitespace separating metric name from value
+    # r'(\S+)' for capture the numeric sample value
+    # re.MULTILINE so '^' matches each line start, not just the start of `data`
+    pattern = re.compile(
+        r'^' + re.escape(metric_name) + r'(?:\{[^}]*\})?' + r'\s+' + r'(\S+)',
+        re.MULTILINE)
+    match = pattern.search(data)
+    return float(match.group(1)) if match else None
+
+
+def _parse_all_kv_metrics(data: str, prefix: str) -> Dict[str, float | None]:
+    """Parse and return sample values for all KV cache Prometheus metrics.
+
+    Args:
+        data: Raw Prometheus exposition text.
+        prefix: Metric name prefix (e.g. "trtllm_").
+
+    Returns:
+        Dict mapping each fully qualified metric name to its parsed sample
+        value, or None if that metric was not found in the data.
+    """
+    names = [
+        prefix + "kv_cache_hit_rate",
+        prefix + "kv_cache_iter_reused_blocks_total",
+        prefix + "kv_cache_iter_missed_blocks_total",
+        prefix + "kv_cache_iter_reuse_rate",
+        prefix + "kv_cache_utilization",
+    ]
+    return {name: _parse_prometheus_sample(data, name) for name in names}
+
+
 def test_metrics_endpoint(server: RemoteOpenAIServer):
-    metric_prefix = "trtllm_"
+    """Verify that Prometheus metrics are correctly exposed after serving requests.
+
+    Sends two identical completion requests, then polls the /prometheus/metrics
+    endpoint until iteration-level KV cache metrics appear. Asserts that:
+    - Request-level metrics (success count, latencies) are present.
+    - KV cache metrics have sample values (not just HELP/TYPE lines).
+    - Post-warmup values are correct: the second identical request reuses
+      1 block and misses 1 block, yielding a 0.5 hit rate.
+    """
+    METRIC_PREFIX = "trtllm_"
 
     client = server.get_client()
     # Need to send at least 2 requests to get iteration stats computed
@@ -93,11 +162,14 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
 
         data = response.read().decode("utf-8")
 
-        # Check if iteration stats metrics are present
-        if (metric_prefix + "kv_cache_hit_rate" in data
-                and metric_prefix + "kv_cache_utilization" in data):
-            iteration_stats_metrics_found = True
-            break
+        # Check if iteration stats metrics have sample values
+        kv_metrics = _parse_all_kv_metrics(data, METRIC_PREFIX)
+        if all(v is not None for v in kv_metrics.values()):
+            hit_rate = kv_metrics[METRIC_PREFIX + "kv_cache_hit_rate"]
+            if hit_rate > 0.0:
+                # Wait until we have some kv cache reuse to check on iteration stats
+                iteration_stats_metrics_found = True
+                break
 
         logger.info(
             f"Iteration stats not yet available, waiting {poll_interval}s...")
@@ -109,13 +181,34 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
     data = response.read().decode("utf-8")
 
     # Assert request-level metrics (these should be available immediately)
-    assert metric_prefix + "request_success_total" in data
-    assert metric_prefix + "e2e_request_latency_seconds" in data
-    assert metric_prefix + "time_to_first_token_seconds" in data
-    assert metric_prefix + "request_queue_time_seconds" in data
+    assert METRIC_PREFIX + "request_success_total" in data
+    assert METRIC_PREFIX + "e2e_request_latency_seconds" in data
+    assert METRIC_PREFIX + "time_to_first_token_seconds" in data
+    assert METRIC_PREFIX + "request_queue_time_seconds" in data
 
-    # Assert iteration stats metrics (collected by background task)
+    # Assert iteration stats metrics are eventually available
     assert iteration_stats_metrics_found, \
-        f"Iteration stats metrics not found after waiting {max_wait_time}s"
-    assert metric_prefix + "kv_cache_hit_rate" in data
-    assert metric_prefix + "kv_cache_utilization" in data
+        f"Iteration stats metrics not found or cache hit rate is always 0 after waiting {max_wait_time}s"
+    kv_metrics = _parse_all_kv_metrics(data, METRIC_PREFIX)
+    for name, value in kv_metrics.items():
+        assert value is not None, f"No sample value found for {name}"
+
+    # Verify post-warmup values are populated and non-zero.
+    # Exact values are non-deterministic because counters accumulate across
+    # all scheduler iterations between request completion and metric scrape.
+    hit_rate = kv_metrics[METRIC_PREFIX + "kv_cache_hit_rate"]
+    reused = kv_metrics[METRIC_PREFIX + "kv_cache_iter_reused_blocks_total"]
+    missed = kv_metrics[METRIC_PREFIX + "kv_cache_iter_missed_blocks_total"]
+    utilization = kv_metrics[METRIC_PREFIX + "kv_cache_utilization"]
+
+    assert hit_rate > 0, \
+        f"Expected kv_cache_hit_rate > 0, got {hit_rate}"
+    assert reused > 0, \
+        f"Expected kv_cache_iter_reused_blocks_total > 0, got {reused}"
+    assert missed > 0, \
+        f"Expected kv_cache_iter_missed_blocks_total > 0, got {missed}"
+    assert utilization >= 0, \
+        f"Expected kv_cache_utilization >= 0, got {utilization}"
+
+    assert METRIC_PREFIX + "kv_cache_hit_rate" in data
+    assert METRIC_PREFIX + "kv_cache_iter_reuse_rate" in data

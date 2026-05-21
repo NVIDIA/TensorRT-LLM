@@ -33,11 +33,19 @@ from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 
-from ..attention_interface import AttentionRegistry, MHACallable
+from ..attention_interface import (
+    AttentionRegistry,
+    BatchInfo,
+    MHACallable,
+    SpecCausalConvResourceHandler,
+)
 from .causal_conv_common import BaseCausalConvDescriptor
 
 
-@torch.library.custom_op("auto_deploy::triton_cached_causal_conv1d", mutates_args={"input"})
+@torch.library.custom_op(
+    "auto_deploy::triton_cached_causal_conv1d",
+    mutates_args=("input", "conv_state_cache", "intermediate_conv_state_cache"),
+)
 def _triton_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)
     input: torch.Tensor,  # [b, s, c_in]
@@ -53,6 +61,9 @@ def _triton_cached_causal_conv1d(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
+    intermediate_conv_state_cache: Optional[
+        torch.Tensor
+    ],  # [spec_state_size, max_draft_len+1, c_in, k-1]
     # CONSTANTS
     stride: int,
     padding: int,
@@ -72,9 +83,11 @@ def _triton_cached_causal_conv1d(
     """
     b, s = input.shape[:2]
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
+    num_prefill_tokens, num_extend_tokens, num_decode_tokens = batch_info.get_num_tokens()
+    num_seq = num_prefill + num_extend + num_decode
+    num_total_tokens = num_prefill_tokens + num_extend_tokens + num_decode_tokens
 
     # Flatten tokens
     bs = b * s
@@ -112,9 +125,52 @@ def _triton_cached_causal_conv1d(
         # Scatter outputs back to input buffer
         inp_flat[:num_prefill_tokens] = y_varlen.transpose(0, 1)
 
+    # EXTEND: use the update kernel so extend tokens write the intermediate state cache.
+    if num_extend > 0:
+        # num_extend_tokens == num_extend * (max_draft_len + 1) for static draft lengths
+        # (dynamic lengths not supported)
+        tokens_per_extend = num_extend_tokens // num_extend
+        if intermediate_conv_state_cache.size(1) < tokens_per_extend:
+            raise RuntimeError(
+                "triton_cached_causal_conv1d received an intermediate_conv_state_cache "
+                "that is too small for the extend branch"
+            )
+
+        slot_idx_extend = slot_idx[num_prefill : num_prefill + num_extend].to(torch.int32)
+
+        # The intermediate state cache will be stored in these indices and read by the mamba_cache_manager,
+        # which expects them in the indices arange(num_extend). They are not used across requests, so we
+        # do not need consistent slot indices.
+        intermediate_state_indices = torch.arange(
+            num_extend, dtype=torch.int32, device=slot_idx_extend.device
+        )
+
+        x_extend = (
+            inp_flat[num_prefill_tokens : num_prefill_tokens + num_extend_tokens]
+            .view(num_extend, tokens_per_extend, -1)
+            .transpose(1, 2)
+        )
+        y_extend = causal_conv1d_update(
+            x_extend,
+            conv_state_cache,
+            w2d,
+            bias,
+            activation=activation,
+            cache_seqlens=None,
+            conv_state_indices=slot_idx_extend,
+            intermediate_conv_window=intermediate_conv_state_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            pad_slot_id=PAD_SLOT_ID,
+        )
+        inp_flat[num_prefill_tokens : num_prefill_tokens + num_extend_tokens] = y_extend.transpose(
+            1, 2
+        ).view(-1, inp_flat.shape[1])
+
     # DECODE: batch update for single-token sequences
     if num_decode > 0:
-        x_decode = inp_flat[num_prefill_tokens:num_total_tokens]  # [num_decode, C_in]
+        x_decode = inp_flat[
+            num_prefill_tokens + num_extend_tokens : num_total_tokens
+        ]  # [num_decode_tokens, C_in]
 
         # Note: Triton causal_conv1d_update returns a new tensor (not in-place like CUDA version)
         # so we need to capture the output and write it back
@@ -125,10 +181,14 @@ def _triton_cached_causal_conv1d(
             bias,
             activation=activation,
             cache_seqlens=None,
-            conv_state_indices=slot_idx[num_prefill:num_seq].to(torch.int32),
+            conv_state_indices=slot_idx[num_prefill + num_extend : num_seq].to(torch.int32),
             pad_slot_id=PAD_SLOT_ID,
         )
-        inp_flat[num_prefill_tokens:num_total_tokens] = y_decode
+        inp_flat[num_prefill_tokens + num_extend_tokens : num_total_tokens] = y_decode
+
+    # Zero padding positions beyond valid tokens (for piecewise CUDA graph)
+    if num_total_tokens < bs:
+        inp_flat[num_total_tokens:].zero_()
 
 
 @_triton_cached_causal_conv1d.register_fake
@@ -147,6 +207,9 @@ def _triton_cached_causal_conv1d_fake(
     #
     # CACHES
     conv_state_cache: torch.Tensor,  # [max_batch_size, c_in, k-1]
+    intermediate_conv_state_cache: Optional[
+        torch.Tensor
+    ],  # [spec_state_size, max_draft_len+1, c_in, k-1]
     # CONSTANTS
     stride: int,
     padding: int,
@@ -170,6 +233,14 @@ class TritonBackendCausalConv(BaseCausalConvDescriptor):
     Inherits shared methods from BaseCausalConvDescriptor.
     Overrides get_standard_metadata_args to include seq_len (used directly by Triton kernel).
     """
+
+    @classmethod
+    def get_cache_initializers(cls, source_attn_node, cache_config):
+        ret = super().get_cache_initializers(source_attn_node, cache_config)
+        ret["intermediate_conv_state_cache"] = SpecCausalConvResourceHandler.from_base(
+            ret["conv_state_cache"]
+        )
+        return ret
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:

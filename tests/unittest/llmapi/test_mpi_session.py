@@ -46,10 +46,10 @@ def simple_task(x):
     print(f"simple_task {x} returns {res}")
 
 
-def run_client(server_addr, values_to_process):
+def run_client(server_addr, values_to_process, hmac_key: bytes):
     """Function to run in a separate process that creates a client and submits tasks"""
     try:
-        client = RemoteMpiCommSessionClient(server_addr)
+        client = RemoteMpiCommSessionClient(server_addr, hmac_key=hmac_key)
 
         for val in values_to_process:
             print(f"Client Submitting task for value {val}")
@@ -125,7 +125,7 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
     Test that the trtllm-llmapi-launch can run multiple tasks.
     """
     cur_dir = os.path.dirname(os.path.abspath(__file__))
-    test_file = os.path.join(cur_dir, "_run_multi_llm_tasks.py")
+    test_file = os.path.join(cur_dir, task_script)
     assert os.path.exists(test_file), f"Test file {test_file} does not exist"
     command = [
         "mpirun", "-n", "2", "--allow-run-as-root", "trtllm-llmapi-launch",

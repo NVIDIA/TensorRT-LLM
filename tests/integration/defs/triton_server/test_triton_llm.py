@@ -1962,7 +1962,7 @@ def test_gpt_350m_speculative_decoding_return_logits(
 @pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
 @pytest.mark.parametrize("DECODING_MODE", [""])
 @pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
-@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
+@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["True", "False"])
 @pytest.mark.parametrize("USE_DRAFT_LOGITS_VALUES", ["True", "False"])
 def test_gpt_speculative_decoding_bls(
     E2E_MODEL_NAME,
@@ -2082,6 +2082,9 @@ def test_gpt_speculative_decoding_bls(
         "--num-draft-tokens=5",
         "--verbose",
     ]
+
+    if EXCLUDE_INPUT_IN_OUTPUT == "True":
+        run_cmd += ["--exclude-input-in-output"]
 
     if USE_DRAFT_LOGITS_VALUES == "True":
         run_cmd += [
@@ -3972,13 +3975,13 @@ def test_tiny_llama_ifb_token_counts(
         if DECOUPLED_MODE == "False":
             assert "Output token count: [[33]]" in output
         else:
-            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+            assert "Output token count: [[1]]" in output and "Output token count: [[20]]" not in output
     elif TOKEN_COUNT_TEST == "both":
         assert "Input token count: [[13]]" in output
         if DECOUPLED_MODE == "False":
             assert "Output token count: [[33]]" in output
         else:
-            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+            assert "Output token count: [[1]]" in output and "Output token count: [[20]]" not in output
     print_info(
         f"Successfully tested token count functionality for {TOKEN_COUNT_TEST} mode"
     )

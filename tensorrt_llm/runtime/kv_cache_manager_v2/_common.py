@@ -34,7 +34,17 @@ class CacheTier(enum.IntEnum):
     DISK = 2
 
 
+class PageIndexMode(enum.IntEnum):
+    # Converted index list is shared across layers in the same LayerGroup.
+    # Base pointer is per-layer (includes attr.offset).
+    SHARED = 0
+    # Converted index list is per-layer.
+    # Base pointer is shared (pool group base, no attr.offset).
+    PER_LAYER = 1
+
+
 CacheLevel = NewType("CacheLevel", int)
+
 
 GPU_LEVEL: Final[CacheLevel] = CacheLevel(0)
 
@@ -48,8 +58,10 @@ TokenId = NewType("TokenId", int)
 #      If we do this, we can't skip the encoder.
 TokenIdExt = TokenId | bytes
 
+
 BlockOrdinal = NewType("BlockOrdinal", int)
 BlockOrdinalT = type(BlockOrdinal(0))
+BAD_BLOCK_ORDINAL: Final[BlockOrdinal] = BlockOrdinal(-1)
 
 LayerId = NewType("LayerId", int)
 

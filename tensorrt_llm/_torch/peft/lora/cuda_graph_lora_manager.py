@@ -30,6 +30,7 @@ class CudaGraphLoraManager:
         model: torch.nn.Module,
         lora_model_config: Optional[LoraModelConfig],
         device: str = "cuda",
+        max_tokens_per_seq: int = 1,
     ):
         """
         Initialize the CUDA Graph LoRA manager.
@@ -41,12 +42,14 @@ class CudaGraphLoraManager:
             model: Model to get layerwise LoRA info
             lora_model_config: LoRA model configuration
             device: Device to allocate tensors on
+            max_tokens_per_seq: Maximum number of tokens per sequence (>1 for spec decode)
         """
         self.max_lora_size = max_lora_size
         self.max_batch_size = max_batch_size
         self.max_lora_rank = max_lora_rank
         self.device = device
 
+        self.max_tokens_per_seq = max_tokens_per_seq
         self.adapter_slot_manager = AdapterSlotManager(max_lora_size)
         self.lora_model_config = lora_model_config
         lora_target_modules = lora_model_config.lora_target_modules
@@ -74,6 +77,7 @@ class CudaGraphLoraManager:
             max_rank=self.max_lora_rank,
             layer_info=self.layer_info,
             device=self.device,
+            max_tokens_per_seq=self.max_tokens_per_seq,
         )
 
     def _initialize_from_model(self, model: torch.nn.Module):
@@ -127,6 +131,7 @@ class CudaGraphLoraManager:
         scheduled_requests: "ScheduledRequests",
         attn_metadata: "AttentionMetadata",
         peft_cache_manager: PeftCacheManager,
+        tokens_per_seq: int = 1,
     ) -> Optional[Dict]:
         """
         Prepare LoRA parameters from scheduled requests.
@@ -134,14 +139,15 @@ class CudaGraphLoraManager:
         Args:
             scheduled_requests: The scheduled requests for the current batch
             attn_metadata: Attention metadata containing batch information
-            peft_table: PEFT table from cache manager mapping task_id to layer-module-configs
+            peft_cache_manager: PEFT cache manager
+            tokens_per_seq: Number of tokens per sequence (for spec decode > 1)
 
         Returns:
             LoRA parameters dictionary.
         """
-        assert len(scheduled_requests.context_requests) == 0, (
+        assert scheduled_requests.num_context_requests == 0, (
             "Context requests are not supported with LoRA CUDA Graph path. "
-            f"Have {len(scheduled_requests.context_requests)} context requests"
+            f"Have {scheduled_requests.num_context_requests} context requests"
         )
         request_list = scheduled_requests.generation_requests
 
@@ -151,7 +157,7 @@ class CudaGraphLoraManager:
         request_slot_ids = self.adapter_slot_manager.update_slots(request_list, peft_cache_manager)
 
         cuda_graph_lora_params = self.cuda_graph_lora_params
-        cuda_graph_lora_params.update_sorted_indices(request_slot_ids)
+        cuda_graph_lora_params.update_sorted_indices(request_slot_ids, tokens_per_seq)
 
         # Get current slot to task mapping
         slot2task = self.adapter_slot_manager.get_slot_to_task_mapping()
@@ -162,7 +168,9 @@ class CudaGraphLoraManager:
             self.adapter_slot_manager.reset_slots_changed()
 
         # Update GEMM sizes and prefix sums using batch
-        cuda_graph_lora_params.update_slots_params(batch_slot_ids=request_slot_ids)
+        cuda_graph_lora_params.update_slots_params(
+            batch_slot_ids=request_slot_ids, tokens_per_seq=tokens_per_seq
+        )
 
         lora_params = {
             "cuda_graph_params": cuda_graph_lora_params,

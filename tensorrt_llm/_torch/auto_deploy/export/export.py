@@ -1,10 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Main export functionality with utilities for torch.export."""
 
 import re
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.export as te
@@ -14,11 +28,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from ..utils._graph import canonicalize_graph, lift_to_meta, load_buffers_and_params, tree_to
 from ..utils.logger import ad_logger
-from ..utils.node_utils import is_op
+from ..utils.node_utils import get_op_schema, is_op
 from .interface import apply_export_patches
-
-if TYPE_CHECKING:
-    from ..llm_args import LlmArgs
 
 try:
     from modelopt.torch.quantization.utils import export_torch_mode as torch_export_context
@@ -276,7 +287,7 @@ def _expand_moe_experts_in_graph(
         # Collect indices of List[Tensor] arguments from the op schema – these
         # are the per-expert weight / scale lists.
         op = node.target
-        schema = op._schema if hasattr(op, "_schema") else next(iter(op._schemas.values()))
+        schema = get_op_schema(op)
         _tensor_list_types = ("Tensor[]", "List[Tensor]")
         list_arg_indices = [
             i
@@ -730,57 +741,3 @@ def torch_export_to_gm(
     ad_logger.debug("exported graph: " + str(egm))
 
     return egm
-
-
-def export_onnx(ad_config: "LlmArgs") -> nn.Module:
-    """Export model to ONNX using InferenceOptimizer directly.
-
-    This is a lightweight export path that avoids initializing the full LLM executor,
-    which requires KVCacheManager and other runtime components not needed for ONNX export.
-
-    Args:
-        ad_config: The AutoDeploy configuration for the model. Should use a mode like
-            "export_edgellm_onnx" that includes the export_to_onnx transform.
-
-    Returns:
-        The transformed model after running through the inference optimizer pipeline.
-
-    Example:
-        >>> from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
-        >>> from tensorrt_llm._torch.auto_deploy.export import export_onnx
-        >>>
-        >>> ad_config = LlmArgs(
-        ...     model="meta-llama/Llama-2-7b-hf",
-        ...     mode="export_edgellm_onnx",
-        ...     max_batch_size=13,
-        ...     max_seq_len=4,
-        ...     device="cpu",
-        ... )
-        >>> ad_config.transforms["export_to_onnx"]["output_dir"] = "/tmp/onnx_output"
-        >>> model = export_onnx(ad_config)
-    """
-    # Import here to avoid circular imports
-    from ..shim.interface import CachedSequenceInterface
-    from ..transform.optimizer import InferenceOptimizer
-
-    # 1. Create factory from config
-    factory = ad_config.create_factory()
-
-    # 2. Create CachedSequenceInterface (lightweight, no KVCacheManager initialization)
-    cache_seq_interface = CachedSequenceInterface(
-        max_seq_len=ad_config.max_seq_len,
-        max_batch_size=ad_config.max_batch_size,
-        device=ad_config.device,
-        kv_cache_config=ad_config.kv_cache_config,
-        max_num_tokens=ad_config.max_num_tokens,
-        vocab_size_padded=factory.vocab_size_padded,
-    )
-
-    # 3. Create InferenceOptimizer with transform config
-    inference_optimizer = InferenceOptimizer(
-        factory=factory,
-        config=ad_config.transforms,
-    )
-
-    # 4. Run the transform pipeline (includes export_to_onnx transform)
-    return inference_optimizer(cache_seq_interface)

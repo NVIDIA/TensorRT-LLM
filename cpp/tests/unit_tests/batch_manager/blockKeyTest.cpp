@@ -1,4 +1,23 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "tensorrt_llm/batch_manager/blockKey.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/executor/executor.h"
 
 #include <gtest/gtest.h>
 
@@ -6,6 +25,14 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 
 class BlockKeyTest : public ::testing::Test
 {
+protected:
+    // Convenience: build an MmKey with a recognisable hash byte pattern.
+    static MmKey makeMmKey(uint8_t fill, SizeType32 startOffset)
+    {
+        std::array<uint8_t, 32> hashBytes{};
+        hashBytes.fill(fill);
+        return MmKey{hashBytes, startOffset};
+    }
 };
 
 TEST_F(BlockKeyTest, PartialMatch)
@@ -19,5 +46,262 @@ TEST_F(BlockKeyTest, PartialMatch)
     auto ptr = reinterpret_cast<char*>(bk1.uniqueTokens.data());
     std::fill(ptr, ptr + bk1.uniqueTokens.capacity() * sizeof(UniqueToken), 0);
 
-    EXPECT_EQ(bk0.partialMatch(bk1), 1);
+    EXPECT_EQ(bk0.numMatchingTokens(bk1), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Equality
+// ---------------------------------------------------------------------------
+
+TEST_F(BlockKeyTest, EqualityIdentical)
+{
+    BlockKey bk0(false, std::nullopt, {{1, 0}, {2, 0}});
+    BlockKey bk1(false, std::nullopt, {{1, 0}, {2, 0}});
+    EXPECT_EQ(bk0, bk1);
+}
+
+TEST_F(BlockKeyTest, EqualityDiffersInUsesExtraIds)
+{
+    BlockKey bk0(false, std::nullopt, {{1, 0}});
+    BlockKey bk1(true, std::nullopt, {{1, 0}});
+    EXPECT_FALSE(bk0 == bk1);
+}
+
+TEST_F(BlockKeyTest, EqualityDiffersInLoraTaskId)
+{
+    BlockKey bk0(false, static_cast<LoraTaskIdType>(1), {{1, 0}});
+    BlockKey bk1(false, static_cast<LoraTaskIdType>(2), {{1, 0}});
+    EXPECT_FALSE(bk0 == bk1);
+}
+
+TEST_F(BlockKeyTest, EqualityDiffersInTokens)
+{
+    BlockKey bk0(false, std::nullopt, {{1, 0}, {2, 0}});
+    BlockKey bk1(false, std::nullopt, {{1, 0}, {3, 0}});
+    EXPECT_FALSE(bk0 == bk1);
+}
+
+TEST_F(BlockKeyTest, EqualityDiffersInExtraKeys)
+{
+    BlockKey bk0(false, std::nullopt, {{1, 0}}, {makeMmKey(0xAA, 0)});
+    BlockKey bk1(false, std::nullopt, {{1, 0}}, {makeMmKey(0xBB, 0)});
+    EXPECT_FALSE(bk0 == bk1);
+}
+
+TEST_F(BlockKeyTest, EqualityIdenticalWithExtraKeys)
+{
+    // Two keys that are bit-for-bit identical including extraKeys must compare equal.
+    BlockKey bk0(false, std::nullopt, {{1, 0}}, {makeMmKey(0xAA, 5)});
+    BlockKey bk1(false, std::nullopt, {{1, 0}}, {makeMmKey(0xAA, 5)});
+    EXPECT_EQ(bk0, bk1);
+}
+
+// ---------------------------------------------------------------------------
+// shorten
+// ---------------------------------------------------------------------------
+
+TEST_F(BlockKeyTest, ShortenReducesTokens)
+{
+    VecUniqueTokens tokens = {{1, 0}, {2, 0}, {3, 0}, {4, 0}};
+    BlockKey bk(false, static_cast<LoraTaskIdType>(42), tokens);
+    auto shortened = bk.shorten(2);
+
+    EXPECT_EQ(shortened.getNumTokens(), 2);
+    EXPECT_EQ(shortened.uniqueTokens[0].tokenId, 1);
+    EXPECT_EQ(shortened.uniqueTokens[1].tokenId, 2);
+    // Non-token fields must be preserved.
+    ASSERT_TRUE(shortened.loraTaskId.has_value());
+    EXPECT_EQ(shortened.loraTaskId.value(), static_cast<LoraTaskIdType>(42));
+    EXPECT_EQ(shortened.usesExtraIds, false);
+}
+
+TEST_F(BlockKeyTest, ShortenToZero)
+{
+    BlockKey bk(false, std::nullopt, {{1, 0}, {2, 0}});
+    auto shortened = bk.shorten(0);
+    EXPECT_EQ(shortened.getNumTokens(), 0);
+}
+
+TEST_F(BlockKeyTest, ShortenWithExtraKeysFails)
+{
+    // shorten() must assert when extraKeys is non-empty, because such keys
+    // have supportsPartialMatching()==false and must never be shortened.
+    BlockKey bk(false, std::nullopt, {{1, 0}, {2, 0}}, {makeMmKey(0x01, 0)});
+    EXPECT_THROW(bk.shorten(1), std::exception);
+}
+
+// ---------------------------------------------------------------------------
+// supportsPartialMatching
+// ---------------------------------------------------------------------------
+
+TEST_F(BlockKeyTest, SupportsPartialMatchingNoExtraKeys)
+{
+    BlockKey bk(false, std::nullopt, {{0, 0}});
+    EXPECT_TRUE(bk.supportsPartialMatching());
+}
+
+TEST_F(BlockKeyTest, SupportsPartialMatchingWithExtraKeys)
+{
+    BlockKey bk(false, std::nullopt, {{0, 0}}, {makeMmKey(0x01, 0)});
+    EXPECT_FALSE(bk.supportsPartialMatching());
+}
+
+// ---------------------------------------------------------------------------
+// BlockKeyHasher
+// ---------------------------------------------------------------------------
+
+TEST_F(BlockKeyTest, HashIsConsistent)
+{
+    BlockKey bk(false, std::nullopt, {{1, 0}, {2, 0}});
+    EXPECT_EQ(BlockKeyHasher::hash(bk), BlockKeyHasher::hash(bk));
+}
+
+TEST_F(BlockKeyTest, HashDiffersForDifferentTokens)
+{
+    BlockKey bk0(false, std::nullopt, {{1, 0}, {2, 0}});
+    BlockKey bk1(false, std::nullopt, {{1, 0}, {3, 0}});
+    EXPECT_FALSE(BlockKeyHasher::hash(bk0) == BlockKeyHasher::hash(bk1));
+}
+
+TEST_F(BlockKeyTest, HashWithExtraKeys)
+{
+    // Two keys with identical tokens but different multimodal hashes must differ.
+    BlockKey bk0(false, std::nullopt, {{1, 0}}, {makeMmKey(0xAA, 0)});
+    BlockKey bk1(false, std::nullopt, {{1, 0}}, {makeMmKey(0xBB, 0)});
+    EXPECT_FALSE(BlockKeyHasher::hash(bk0) == BlockKeyHasher::hash(bk1));
+}
+
+TEST_F(BlockKeyTest, GenerateExtraKeysUsesExactMultimodalRuns)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{4},
+        /*multimodalUuids=*/std::vector<std::optional<std::string>>{std::string("item-0")},
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 2},
+        /*multimodalRunPositions=*/std::vector<SizeType32>{1, 8},
+        /*multimodalRunLengths=*/std::vector<SizeType32>{2, 2});
+
+    Request executorRequest({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(), /*endId=*/std::nullopt, /*padId=*/std::nullopt,
+        /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
+        /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInput);
+    LlmRequest llmRequest(/*requestId=*/0, executorRequest);
+
+    auto firstRunKeys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(firstRunKeys.size(), 1);
+    EXPECT_EQ(firstRunKeys[0].startOffset, 0);
+    ASSERT_TRUE(firstRunKeys[0].uuid.has_value());
+    EXPECT_EQ(firstRunKeys[0].uuid.value(), "item-0");
+
+    auto gapKeys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/3, /*endTokenIdx=*/8);
+    EXPECT_TRUE(gapKeys.empty());
+
+    auto secondRunKeys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/7, /*endTokenIdx=*/10);
+    ASSERT_EQ(secondRunKeys.size(), 1);
+    EXPECT_EQ(secondRunKeys[0].startOffset, 2);
+    ASSERT_TRUE(secondRunKeys[0].uuid.has_value());
+    EXPECT_EQ(secondRunKeys[0].uuid.value(), "item-0");
+}
+
+TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForIncompleteRunMetadata)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInputA({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
+    MultimodalInput multimodalInputB({{8, 7, 6, 5, 4, 3, 2, 1}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
+
+    Request executorRequestA({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(),
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInputA);
+    Request executorRequestB({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(),
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInputB);
+    LlmRequest llmRequestA(/*requestId=*/0, executorRequestA);
+    LlmRequest llmRequestB(/*requestId=*/1, executorRequestB);
+
+    auto keysA = generateBlockHashExtraKeys(llmRequestA, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    auto keysB = generateBlockHashExtraKeys(llmRequestB, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(keysA.size(), 1);
+    ASSERT_EQ(keysB.size(), 1);
+    EXPECT_EQ(keysA[0].startOffset, 0);
+    EXPECT_EQ(keysB[0].startOffset, 0);
+    EXPECT_NE(keysA[0].hash, keysB[0].hash);
+}
+
+TEST_F(BlockKeyTest, GenerateExtraKeysFallsBackToLegacyForInvalidRunRange)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{2},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1},
+        /*multimodalRunPositions=*/std::vector<SizeType32>{1},
+        /*multimodalRunLengths=*/std::vector<SizeType32>{-1});
+
+    Request executorRequest({101, 32000, 32000, 102, 103}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(),
+        OutputConfig(), /*endId=*/std::nullopt, /*padId=*/std::nullopt,
+        /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt, /*stopWords=*/std::nullopt,
+        /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInput);
+    LlmRequest llmRequest(/*requestId=*/0, executorRequest);
+
+    auto keys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/0, /*endTokenIdx=*/4);
+    ASSERT_EQ(keys.size(), 1);
+    EXPECT_EQ(keys[0].startOffset, 0);
+}
+
+// ---------------------------------------------------------------------------
+// numMatchingTokens edge cases
+// ---------------------------------------------------------------------------
+
+TEST_F(BlockKeyTest, NumMatchingTokensLoraIdMismatch)
+{
+    // Differing loraTaskId → 0 matching tokens regardless of token content.
+    BlockKey bk0(false, static_cast<LoraTaskIdType>(1), {{0, 0}, {1, 0}});
+    BlockKey bk1(false, static_cast<LoraTaskIdType>(2), {{0, 0}, {1, 0}});
+    EXPECT_EQ(bk0.numMatchingTokens(bk1), 0);
+}
+
+TEST_F(BlockKeyTest, NumMatchingTokensExtraKeysMismatch)
+{
+    // Differing extraKeys → 0 matching tokens regardless of token content.
+    BlockKey bk0(false, std::nullopt, {{0, 0}, {1, 0}}, {makeMmKey(0xAA, 0)});
+    BlockKey bk1(false, std::nullopt, {{0, 0}, {1, 0}}, {makeMmKey(0xAA, 1)});
+    EXPECT_EQ(bk0.numMatchingTokens(bk1), 0);
+}
+
+TEST_F(BlockKeyTest, NumMatchingTokensFullMatch)
+{
+    BlockKey bk0(false, std::nullopt, {{0, 0}, {1, 0}, {2, 0}});
+    BlockKey bk1(false, std::nullopt, {{0, 0}, {1, 0}, {2, 0}});
+    EXPECT_EQ(bk0.numMatchingTokens(bk1), 3);
 }

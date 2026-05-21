@@ -38,10 +38,8 @@ import json
 import os
 import time
 
-from output_handler import OutputHandler
-
-from tensorrt_llm import logger
-from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
+from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
+from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
 
 logger.set_level("info")
 
@@ -109,15 +107,89 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # TeaCache
-    parser.add_argument(
+    # Diffusion cache acceleration (TeaCache and Cache-DiT; mutually exclusive)
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument(
         "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
+    )
+    cache_group.add_argument(
+        "--enable_cache_dit",
+        action="store_true",
+        help=(
+            "Enable Cache-DiT per-block acceleration (requires the cache_dit package; "
+            "see https://github.com/vipshop/cache-dit). Incompatible with --enable_teacache."
+        ),
     )
     parser.add_argument(
         "--teacache_thresh",
         type=float,
-        default=0.2,
-        help="TeaCache similarity threshold (rel_l1_thresh)",
+        default=None,
+        help="TeaCache similarity threshold (default: 0.6 for FLUX.1, 0.2 for FLUX.2); "
+        "ignored when using --enable_cache_dit",
+    )
+    parser.add_argument(
+        "--use_ret_steps",
+        action="store_true",
+        help="Use ret_steps mode for TeaCache. "
+        "Using Retention Steps will result in faster generation speed and better generation quality. "
+        "Ignored when using --enable_cache_dit.",
+    )
+
+    # Cache-DiT overrides (only apply with --enable_cache_dit; omitted fields use CacheDiTConfig defaults)
+    parser.add_argument(
+        "--cache_dit_fn_compute_blocks",
+        type=int,
+        default=None,
+        help="DBCache Fn_compute_blocks (default: from CacheDiTConfig).",
+    )
+    parser.add_argument(
+        "--cache_dit_bn_compute_blocks",
+        type=int,
+        default=None,
+        help="DBCache Bn_compute_blocks (default: from CacheDiTConfig).",
+    )
+    parser.add_argument(
+        "--cache_dit_max_warmup_steps",
+        type=int,
+        default=None,
+        help="DBCache max_warmup_steps (default: from CacheDiTConfig).",
+    )
+    parser.add_argument(
+        "--cache_dit_max_cached_steps",
+        type=int,
+        default=None,
+        help="DBCache max_cached_steps (-1 = no cap; default: from CacheDiTConfig).",
+    )
+    parser.add_argument(
+        "--cache_dit_residual_threshold",
+        type=float,
+        default=None,
+        help="DBCache residual_diff_threshold (default: from CacheDiTConfig).",
+    )
+    parser.add_argument(
+        "--cache_dit_enable_taylorseer",
+        action="store_true",
+        help="Enable TaylorSeer calibrator (default: off).",
+    )
+    parser.add_argument(
+        "--cache_dit_taylorseer_order",
+        type=int,
+        default=None,
+        choices=[1, 2, 3, 4],
+        help="TaylorSeer order; implies TaylorSeer on if set. Default order from CacheDiTConfig.",
+    )
+    parser.add_argument(
+        "--cache_dit_scm_mask_policy",
+        type=str,
+        default=None,
+        help="SCM steps_mask policy name (e.g. fast, medium, slow, ultra). Omit to disable SCM.",
+    )
+    parser.add_argument(
+        "--cache_dit_scm_steps_policy",
+        type=str,
+        default=None,
+        choices=["dynamic", "static"],
+        help="SCM steps_computation_policy (default: dynamic if not overridden).",
     )
 
     # Quantization
@@ -137,9 +209,15 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM"],
-        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
-        "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
+        choices=["VANILLA", "TRTLLM", "FA4"],
+        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
+        "FA4: Flash Attention 4). "
+        "Note: TRTLLM falls back to VANILLA for cross-attention.",
+    )
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
     )
 
     # Parallelism
@@ -147,7 +225,25 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses (sequence) parallel size within each CFG group.",
+        help="Ulysses (head-sharding) parallel size within each CFG group. "
+        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
     )
 
     # CUDA graph
@@ -194,62 +290,114 @@ def load_prompts(prompts_file, num_prompts=None):
     return prompts
 
 
-def build_diffusion_config(args):
-    """Build diffusion_config dict from parsed args."""
-    quant_config = None
-    if args.linear_type == "trtllm-fp8-per-tensor":
-        quant_config = {"quant_algo": "FP8", "dynamic": True}
-    elif args.linear_type == "trtllm-fp8-blockwise":
-        quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
-    elif args.linear_type == "trtllm-nvfp4":
-        quant_config = {"quant_algo": "NVFP4", "dynamic": True}
+def _linear_type_to_quant_config(linear_type: str):
+    """Map --linear_type CLI shortcut to quant_config dict for VisualGenArgs."""
+    mapping = {
+        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
+        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
+    }
+    return mapping.get(linear_type)
 
-    diffusion_config = {
-        "revision": args.revision,
-        "attention": {
-            "backend": args.attention_backend,
-        },
-        "teacache": {
-            "enable_teacache": args.enable_teacache,
-            "teacache_thresh": args.teacache_thresh,
-        },
-        "parallel": {
-            "dit_cfg_size": args.cfg_size,
+
+def _teacache_config_from_args(args) -> TeaCacheConfig:
+    """Build TeaCacheConfig from CLI args; unset options keep Pydantic defaults."""
+    kwargs: dict = {"use_ret_steps": args.use_ret_steps}
+    if args.teacache_thresh is not None:
+        kwargs["teacache_thresh"] = args.teacache_thresh
+    return TeaCacheConfig(**kwargs)
+
+
+def _cache_dit_config_from_args(args) -> CacheDiTConfig:
+    """Subset of CacheDiTConfig from CLI; unset options keep Pydantic defaults."""
+    overrides: dict = {}
+    if args.cache_dit_fn_compute_blocks is not None:
+        overrides["Fn_compute_blocks"] = args.cache_dit_fn_compute_blocks
+    if args.cache_dit_bn_compute_blocks is not None:
+        overrides["Bn_compute_blocks"] = args.cache_dit_bn_compute_blocks
+    if args.cache_dit_max_warmup_steps is not None:
+        overrides["max_warmup_steps"] = args.cache_dit_max_warmup_steps
+    if args.cache_dit_max_cached_steps is not None:
+        overrides["max_cached_steps"] = args.cache_dit_max_cached_steps
+    if args.cache_dit_residual_threshold is not None:
+        overrides["residual_diff_threshold"] = args.cache_dit_residual_threshold
+    if args.cache_dit_enable_taylorseer or args.cache_dit_taylorseer_order is not None:
+        overrides["enable_taylorseer"] = True
+    if args.cache_dit_taylorseer_order is not None:
+        overrides["taylorseer_order"] = args.cache_dit_taylorseer_order
+    if args.cache_dit_scm_mask_policy is not None:
+        overrides["scm_steps_mask_policy"] = args.cache_dit_scm_mask_policy
+    if args.cache_dit_scm_steps_policy is not None:
+        overrides["scm_steps_policy"] = args.cache_dit_scm_steps_policy
+    return CacheDiTConfig(**overrides)
+
+
+def build_diffusion_args(args) -> VisualGenArgs:
+    """Build VisualGenArgs from parsed CLI args."""
+    if args.enable_cache_dit:
+        cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
+    elif args.enable_teacache:
+        cache_kwargs = {"cache": _teacache_config_from_args(args)}
+    else:
+        cache_kwargs = {}
+
+    attention_cfg: dict = {"backend": args.attention_backend}
+    if args.enable_sage_attention:
+        attention_cfg["sage_attention_config"] = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 16,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+        logger.info("SageAttention: INT8 Q/K, blocks (1, 16, 1)")
+
+    kwargs = dict(
+        revision=args.revision,
+        attention=attention_cfg,
+        **cache_kwargs,
+        parallel={
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
         },
-        "torch_compile": {
+        torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
-        "cuda_graph": {
-            "enable_cuda_graph": args.enable_cudagraph,
-        },
-        "pipeline": {
-            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
-        },
-    }
-
+        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
+        pipeline={"enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker},
+    )
+    quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
-        diffusion_config["quant_config"] = quant_config
-
-    return diffusion_config
+        kwargs["quant_config"] = quant_config
+    return VisualGenArgs(**kwargs)
 
 
 def main():
     args = parse_args()
 
-    n_workers = args.cfg_size * args.ulysses_size
-    diffusion_config = build_diffusion_config(args)
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
 
-    logger.info(
-        f"Initializing VisualGen: world_size={n_workers} "
-        f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
-    )
+    diffusion_args = build_diffusion_args(args)
+
+    if args.ulysses_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size})"
+    elif attn2d_size > 1:
+        parallel_str = (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
+        )
+    else:
+        parallel_str = "None"
+    logger.info(f"Initializing VisualGen: parallelism={parallel_str}")
     visual_gen = VisualGen(
-        model_path=args.model_path,
-        n_workers=n_workers,
-        diffusion_config=diffusion_config,
+        model=args.model_path,
+        args=diffusion_args,
     )
 
     try:
@@ -280,7 +428,7 @@ def main():
 
                 elapsed = time.time() - start_time
                 output_path = os.path.join(args.output_dir, f"{i:02d}.png")
-                OutputHandler.save(output, output_path)
+                output.save(output_path)
                 logger.info(f"  Saved {output_path} ({elapsed:.1f}s)")
 
                 timing_records.append(
@@ -338,7 +486,7 @@ def main():
 
             logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-            OutputHandler.save(output, args.output_path)
+            output.save(args.output_path)
 
     finally:
         visual_gen.shutdown()

@@ -136,14 +136,22 @@ template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typenam
 __device__ __forceinline__ void fused_op(
     PackedType const& val, int access_id, int token_id, int access_id_in_token, AllReduceFusionParams& params)
 {
-    float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
     float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
-    residual_val = add128<DType>(val, residual_val);
-    if constexpr (ResidualOut)
+    float4 norm_input;
+    if (params.residual_in)
     {
-        reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
+        float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
+        norm_input = add128<DType>(val, residual_val);
+        if constexpr (ResidualOut)
+        {
+            reinterpret_cast<float4*>(params.residual_out)[access_id] = norm_input;
+        }
     }
-    float4 norm_val = rms_norm<DType>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+    else
+    {
+        norm_input = val;
+    }
+    float4 norm_val = rms_norm<DType>(norm_input, gamma_val, params.rms_eps, params.hidden_dim);
     if constexpr (NormOut)
     {
         reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
@@ -443,7 +451,7 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }
 
-    TLLM_CHECK(params.residual_in && params.rms_gamma);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input
         && params.moe_reduction_token_input);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
@@ -731,6 +739,7 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
     }
 
     TLLM_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
     if (params.residual_out && not params.norm_out && params.quant_out)
@@ -768,7 +777,17 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
         MOE_FINALIZE_DISPATCH0(8, true, true, true);
         MOE_FINALIZE_DISPATCH0(16, true, true, true);
     }
-    TLLM_CHECK_WITH_INFO(false, "moefinalize_allreduce_fusion_op: unsupported pattern!");
+    // Reaching here means none of the above branches dispatched. Spell out the actual params so
+    // a future dtype/scale_dtype mismatch (e.g. bf16 hidden + fp32 expert weights, see PR #13328)
+    // is debuggable from the assert message alone.
+    TLLM_CHECK_WITH_INFO(false,
+        "moefinalize_allreduce_fusion_op: unsupported pattern! "
+        "nranks=%d, dtype=%d, scale_dtype=%d, "
+        "residual_out=%d, norm_out=%d, quant_out=%d. "
+        "Supported dispatch requires nranks in {2,4,8,16}, dtype==scale_dtype in {kHALF, kBF16}, "
+        "and (residual_out, norm_out, quant_out) in {(1,0,1),(0,1,0),(1,1,0),(1,1,1)}.",
+        params.nranks, static_cast<int>(params.dtype), static_cast<int>(params.scale_dtype),
+        params.residual_out != nullptr, params.norm_out != nullptr, params.quant_out != nullptr);
 #undef MOE_FINALIZE_DISPATCH0
 #undef MOE_FINALIZE_DISPATCH1
 }

@@ -1,4 +1,4 @@
-"""Multi-process test for PyNativeCacheTransceiver (V2 backend).
+"""Multi-process test for KvCacheTransceiverV2 (V2 backend).
 
 This test uses torch.multiprocessing to spawn multiple processes simulating
 ctx and gen instances with different TP/PP configurations.
@@ -7,6 +7,7 @@ ctx and gen instances with different TP/PP configurations.
 import os
 import signal
 import sys
+import time
 import uuid
 
 import pytest
@@ -20,10 +21,10 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings import DataType, LlmRequestState
+from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
-
-AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -102,7 +103,7 @@ def find_free_port():
 class TorchDistributedWrapper:
     """A wrapper that provides the Distributed interface using torch.distributed.
 
-    This is used to create a compatible Distributed object for PyNativeCacheTransceiver
+    This is used to create a compatible Distributed object for KvCacheTransceiverV2
     in multi-process tests.
     """
 
@@ -206,8 +207,18 @@ def worker_fn(
     ctx_enable_dp: bool = False,
     gen_enable_dp: bool = False,
     is_mla: bool = False,
+    ctx_gen_workflow: str = "ctx_first",
 ):
-    """Worker function for each process."""
+    """Worker function for each process.
+
+    When gen_first=False (default, context-first): the context instance sends
+    KV cache data first, then the generation instance receives it.
+
+    When gen_first=True (generation-first): the generation instance sends a
+    REQUEST_DATA message first. The context side uses prepare_context_requests()
+    to create a TxSession eagerly and waits for peer request info, then sends
+    KV cache + auxiliary (first-gen / draft) tokens.
+    """
 
     # Signal handler for graceful termination
     def signal_handler(signum, frame):
@@ -260,6 +271,8 @@ def worker_fn(
     max_batch_size = 4
     dtype = DataType.FLOAT
 
+    is_gen_first = ctx_gen_workflow.startswith("gen_first")
+
     # Cache type: SELFKONLY for MLA, SELF otherwise
     cache_type = (
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY
@@ -267,10 +280,8 @@ def worker_fn(
         else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
     )
 
-    # Import PyNativeCacheTransceiver
-    from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import (
-        PyNativeCacheTransceiver,
-    )
+    # Import KvCacheTransceiverV2
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     # ===== Create all TP/PP groups in the same order for all ranks =====
     # dist.new_group is a collective operation - ALL ranks must call it in the same order!
@@ -302,7 +313,8 @@ def worker_fn(
             if gen_pp_rank == 0:  # Only create once per tp_rank
                 gen_pp_groups[gen_tp_rank] = dist.new_group(ranks=pp_ranks)
 
-    print(f"[Rank {rank}] All TP/PP groups created", flush=True)
+    mode_str = ctx_gen_workflow
+    print(f"[Rank {rank}] All TP/PP groups created ({mode_str})", flush=True)
 
     # ===== Now create instance-specific resources =====
     # Initialize variables that will be used in nested functions
@@ -375,18 +387,17 @@ def worker_fn(
             backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
         )
 
-        # Create PyNativeCacheTransceiver
-        attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
+        # Create KvCacheTransceiverV2
         print(f"[Rank {rank}] CTX: Creating transceiver...", flush=True)
-        transceiver = PyNativeCacheTransceiver(
+        transceiver = KvCacheTransceiverV2(
             mapping=mapping,
             dist=dist_wrapper,
             kv_cache_manager=kv_cache_manager,
-            attention_type=attention_type,
             cache_transceiver_config=cache_transceiver_config,
         )
         print(f"[Rank {rank}] CTX: Transceiver created", flush=True)
-        ctx_info_endpoint = transceiver.context_info_endpoint if local_rank == 0 else None
+        endpoints = transceiver.get_disaggregated_params().get("ctx_info_endpoint") or []
+        ctx_info_endpoint = endpoints[0] if (local_rank == 0 and endpoints) else None
 
     else:  # gen process
         # Create gen mapping
@@ -443,14 +454,12 @@ def worker_fn(
             backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
         )
 
-        # Create PyNativeCacheTransceiver
-        attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
+        # Create KvCacheTransceiverV2
         print(f"[Rank {rank}] GEN: Creating transceiver...", flush=True)
-        transceiver = PyNativeCacheTransceiver(
+        transceiver = KvCacheTransceiverV2(
             mapping=mapping,
             dist=dist_wrapper,
             kv_cache_manager=kv_cache_manager,
-            attention_type=attention_type,
             cache_transceiver_config=cache_transceiver_config,
         )
         print(f"[Rank {rank}] GEN: Transceiver created", flush=True)
@@ -469,6 +478,8 @@ def worker_fn(
 
     # Filter out lengths that are too short
     request_lengths = [length for length in request_lengths if length > 0]
+
+    schedule_style = DisaggScheduleStyle.GENERATION_FIRST if is_gen_first else None
 
     # Helper: create request with given parameters
     def create_request(
@@ -495,7 +506,10 @@ def worker_fn(
                 is_streaming=False,
                 llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
             )
-            request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+            request.py_disaggregated_params = DisaggregatedParams(
+                disagg_request_id=unique_rid,
+                schedule_style=schedule_style,
+            )
         else:
             request = LlmRequest(
                 request_id=gen_request_id,
@@ -512,6 +526,7 @@ def worker_fn(
                 ctx_dp_rank=actual_ctx_dp_rank,
                 ctx_info_endpoint=ctx_info_endpoint,
                 disagg_request_id=unique_rid,
+                schedule_style=schedule_style,
             )
         return request
 
@@ -573,7 +588,7 @@ def worker_fn(
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Gather block data from all ranks to local_rank 0, then verify on world rank 0.
 
-        All ranks have all requests' block data (via add_sequence), so gather is simple.
+        All ranks have all requests' block data (via add_sequence_batch), so gather is simple.
         In DP mode, merge_block_data knows which ranks have valid (transferred) data.
         """
         blocks = kv_cache_manager.get_batch_cache_indices([request.py_request_id])[0]
@@ -667,19 +682,142 @@ def worker_fn(
             # Generation DP: only handle if request_index % gen_tp == tp_rank
             should_handle = i % gen_tp == tp_rank
 
-        # All ranks add_sequence so they have block data for verification
+        # All ranks add_sequence_batch so they have block data for verification
         # But only ranks that should_handle will submit to transceiver
-        kv_cache_manager.impl.add_sequence(request.py_request_id, request.prompt_len, 1, request)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(request.py_request_id, request.prompt_len, 1)], [request]
+        )
 
         if should_handle:
             my_requests.append((i, request))  # Store index and request for transfer
 
     print(
-        f"[Rank {rank}] Created {len(all_requests)} requests, handling {len(my_requests)}, "
-        f"{'CTX' if is_ctx else 'GEN'} mode, tp_rank={tp_rank}",
+        f"[Rank {rank}] Created {len(all_requests)} requests ({mode_str}), "
+        f"handling {len(my_requests)}, {'CTX' if is_ctx else 'GEN'} mode, tp_rank={tp_rank}",
         flush=True,
     )
 
+    # ===== Phase 2: Transfer  =====
+    if ctx_gen_workflow == "gen_first1":
+        _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests)
+    elif ctx_gen_workflow == "gen_first2":
+        _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests)
+    elif ctx_gen_workflow == "ctx_first_sync":
+        _run_ctx_first_sync_transfer(
+            rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
+        )
+    else:
+        _run_ctx_first_transfer(
+            rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
+        )
+
+    # ===== Phase 3: Wait for remaining transfers to complete =====
+    # Synchronize before checking completion
+
+    dist.barrier()
+
+    if is_ctx and my_requests:
+        transceiver.check_context_transfer_status(None)
+        print(f"[Rank {rank}] CTX: All transfers completed ({mode_str})", flush=True)
+
+    elif not is_ctx and my_requests:
+        transceiver.check_gen_transfer_status(None)
+        print(f"[Rank {rank}] GEN: All transfers completed ({mode_str})", flush=True)
+
+        if is_gen_first:
+            # verify the aux data is unpacked correctly
+            for req_idx, request in my_requests:
+                disagg_params = request.context_phase_params
+                assert disagg_params is not None, (
+                    f"Request {req_idx}: py_disaggregated_params is None after gen-first transfer"
+                )
+                assert disagg_params.first_gen_tokens is not None, (
+                    f"Request {req_idx}: py_first_gen_tokens is None after gen-first transfer"
+                )
+                print(
+                    f"[Rank {rank}] GEN: Request {req_idx} aux tokens: "
+                    f"first_gen={disagg_params.first_gen_tokens}, "
+                    f"draft={disagg_params.draft_tokens}",
+                    flush=True,
+                )
+
+    # Synchronize before verification
+
+    dist.barrier()
+
+    # ===== Phase 4: Batch verify all requests =====
+    # All ranks must participate in gather (collective op), so iterate all_requests.
+    # Verification happens on rank 0.
+    print(f"[Rank {rank}] Starting batch verification ({mode_str})...", flush=True)
+
+    all_passed = True
+    verification_results = []
+
+    for req_idx, request in enumerate(all_requests):
+        ctx_request_id = req_idx * 2
+        ctx_merged, gen_merged = gather_and_verify_request(request, ctx_request_id, req_idx)
+
+        # Only rank 0 has the merged data for verification
+        if rank == 0:
+            req_len = request_lengths[req_idx]
+            if ctx_merged.equal(gen_merged):
+                verification_results.append((ctx_request_id, req_len, True, None))
+            else:
+                # Find first mismatch for debugging
+                diff = (ctx_merged != gen_merged).nonzero()
+                first_diff = diff[0].tolist() if len(diff) > 0 else None
+                ctx_val = ctx_merged[tuple(diff[0])].item() if first_diff else None
+                gen_val = gen_merged[tuple(diff[0])].item() if first_diff else None
+                verification_results.append(
+                    (ctx_request_id, req_len, False, (first_diff, ctx_val, gen_val))
+                )
+
+    # Print results and assert on rank 0
+    if rank == 0:
+        print(f"\n[Rank {rank}] ===== Verification Results ({mode_str}) =====", flush=True)
+        for ctx_request_id, req_len, passed, debug_info in verification_results:
+            if passed:
+                print(f"  Request {ctx_request_id} (len={req_len}): PASSED", flush=True)
+            else:
+                print(f"  Request {ctx_request_id} (len={req_len}): FAILED!", flush=True)
+                if debug_info:
+                    first_diff, ctx_val, gen_val = debug_info
+                    print(f"    First mismatch at {first_diff}", flush=True)
+                    print(f"    CTX value: {ctx_val}", flush=True)
+                    print(f"    GEN value: {gen_val}", flush=True)
+                all_passed = False
+
+        if all_passed:
+            print(
+                f"\n[Rank {rank}] All {len(all_requests)} requests verified successfully!",
+                flush=True,
+            )
+        else:
+            print(f"\n[Rank {rank}] Some requests FAILED verification!", flush=True)
+
+    # Broadcast pass/fail to all ranks for assertion
+    pass_tensor = torch.tensor([1 if all_passed else 0], dtype=torch.int)
+    dist.broadcast(pass_tensor, src=0)
+    assert pass_tensor.item() == 1, "Some requests failed verification!"
+
+    dist.barrier()
+
+    # ===== Phase 5: Cleanup requests =====
+    # All ranks added all requests, so all need to remove them
+    for request in all_requests:
+        # remove_sequence(request_id, llm_request, release_blocks)
+        simulate_prefill_completion_only_use_for_testing(request)
+        kv_cache_manager.impl.remove_sequence(request.py_request_id, request, True)
+
+    if rank == 0:
+        print(f"[Rank {rank}] Cleanup completed ({mode_str})")
+
+    # Cleanup
+    dist.destroy_process_group()
+
+
+def _run_ctx_first_transfer(rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp):
+    """Context-first transfer: ctx sends first, then gen receives."""
     # ===== Phase 2a: Warmup (only when DP is disabled) =====
     do_warmup = not ctx_enable_dp and not gen_enable_dp and len(my_requests) > 0
     if do_warmup:
@@ -735,89 +873,163 @@ def worker_fn(
             f"[Rank {rank}] GEN: Submitted {len(remaining_requests)} receive requests", flush=True
         )
 
-    # ===== Phase 3: Wait for remaining transfers to complete =====
-    num_remaining = len(remaining_requests)
-    print(f"[Rank {rank}] Phase 3: Waiting for {num_remaining} transfers...", flush=True)
-    if is_ctx and remaining_requests:
-        transceiver.check_context_transfer_status(None)
-        print(f"[Rank {rank}] CTX: All {num_remaining} transfers completed", flush=True)
-    elif not is_ctx and remaining_requests:
-        transceiver.check_gen_transfer_status(None)
-        print(f"[Rank {rank}] GEN: All {num_remaining} transfers completed", flush=True)
 
-    # Synchronize before verification
-    print(f"[Rank {rank}] Before phase3 barrier", flush=True)
+def _wait_ctx_request_ready(transceiver, my_requests):
+    max_wait_s = 65
+    poll_interval_s = 0.05
+    elapsed = 0.0
+    while elapsed < max_wait_s:
+        not_ready = [req for req in my_requests if req.state != LlmRequestState.CONTEXT_INIT]
+        if not_ready:
+            transceiver.prepare_context_requests(not_ready)
+        all_ready = all(req.state == LlmRequestState.CONTEXT_INIT for req in my_requests)
+        if all_ready:
+            break
+        time.sleep(poll_interval_s)
+        elapsed += poll_interval_s
+    if not all_ready:
+        raise TimeoutError("Timeout waiting for context requests to be ready")
+    return all_ready
+
+
+def _run_ctx_first_sync_transfer(
+    rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
+):
+    """Context-first transfer using synchronous receive (request_and_receive_sync)."""
+    do_warmup = not ctx_enable_dp and not gen_enable_dp and len(my_requests) > 0
+    if do_warmup:
+        warmup_idx, warmup_request = my_requests[0]
+        remaining_requests = my_requests[1:]
+
+        if is_ctx:
+            print(f"[Rank {rank}] CTX: Submitting warmup request {warmup_idx}...", flush=True)
+            transceiver.respond_and_send_async(warmup_request)
+
+        print(f"[Rank {rank}] Before warmup barrier", flush=True)
+        dist.barrier()
+        print(f"[Rank {rank}] After warmup barrier", flush=True)
+
+        if not is_ctx:
+            print(f"[Rank {rank}] GEN: Sync-receiving warmup request {warmup_idx}...", flush=True)
+            transceiver.request_and_receive_sync(warmup_request)
+            print(f"[Rank {rank}] GEN: Warmup completed (sync)", flush=True)
+
+        if is_ctx:
+            transceiver.check_context_transfer_status(None)
+            print(f"[Rank {rank}] CTX: Warmup completed", flush=True)
+
+        print(f"[Rank {rank}] Before post-warmup barrier", flush=True)
+        dist.barrier()
+        print(f"[Rank {rank}] After post-warmup barrier", flush=True)
+    else:
+        remaining_requests = my_requests
+
+    if is_ctx:
+        for req_idx, request in remaining_requests:
+            print(f"[Rank {rank}] CTX: Submitting request {req_idx}...", flush=True)
+            transceiver.respond_and_send_async(request)
+        print(f"[Rank {rank}] CTX: Submitted {len(remaining_requests)} send requests", flush=True)
+
+    print(f"[Rank {rank}] Before phase2 barrier", flush=True)
     dist.barrier()
-    print(f"[Rank {rank}] After phase3 barrier", flush=True)
+    print(f"[Rank {rank}] After phase2 barrier", flush=True)
 
-    # ===== Phase 4: Batch verify all requests =====
-    # All ranks must participate in gather (collective op), so iterate all_requests.
-    # Verification happens on rank 0.
-    print(f"[Rank {rank}] Starting batch verification...", flush=True)
+    if not is_ctx:
+        for req_idx, request in remaining_requests:
+            print(f"[Rank {rank}] GEN: Sync-receiving request {req_idx}...", flush=True)
+            transceiver.request_and_receive_sync(request)
+        print(f"[Rank {rank}] GEN: Sync-received {len(remaining_requests)} requests", flush=True)
 
-    all_passed = True
-    verification_results = []
 
-    for req_idx, request in enumerate(all_requests):
-        ctx_request_id = req_idx * 2
-        ctx_merged, gen_merged = gather_and_verify_request(request, ctx_request_id, req_idx)
+def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests):
+    """Generation-first transfer: ctx prepares first, then gen receives and ctx sends."""
+    # Step 1: Context side calls prepare_context_requests, no kvcache request is sent, thus no request
+    # can reach CONTEXT_INIT state.
+    if is_ctx:
+        ctx_my_requests = [req for _, req in my_requests]
 
-        # Only rank 0 has the merged data for verification
-        if rank == 0:
-            req_len = request_lengths[req_idx]
-            if ctx_merged.equal(gen_merged):
-                verification_results.append((ctx_request_id, req_len, True, None))
-            else:
-                # Find first mismatch for debugging
-                diff = (ctx_merged != gen_merged).nonzero()
-                first_diff = diff[0].tolist() if len(diff) > 0 else None
-                ctx_val = ctx_merged[tuple(diff[0])].item() if first_diff else None
-                gen_val = gen_merged[tuple(diff[0])].item() if first_diff else None
-                verification_results.append(
-                    (ctx_request_id, req_len, False, (first_diff, ctx_val, gen_val))
-                )
+        transceiver.prepare_context_requests(ctx_my_requests)
+        print(f"[Rank {rank}] CTX: Called prepare_context_requests", flush=True)
 
-    # Print results and assert on rank 0
-    if rank == 0:
-        print(f"\n[Rank {rank}] ===== Verification Results =====", flush=True)
-        for ctx_request_id, req_len, passed, debug_info in verification_results:
-            if passed:
-                print(f"  Request {ctx_request_id} (len={req_len}): PASSED", flush=True)
-            else:
-                print(f"  Request {ctx_request_id} (len={req_len}): FAILED!", flush=True)
-                if debug_info:
-                    first_diff, ctx_val, gen_val = debug_info
-                    print(f"    First mismatch at {first_diff}", flush=True)
-                    print(f"    CTX value: {ctx_val}", flush=True)
-                    print(f"    GEN value: {gen_val}", flush=True)
-                all_passed = False
+        for req in ctx_my_requests:
+            assert req.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+        print(f"[Rank {rank}] CTX: All requests are waiting for being scheduled", flush=True)
 
-        if all_passed:
+    dist.barrier()
+
+    # Step 2: Generation side submits receive requests
+    if not is_ctx:
+        for req_idx, request in my_requests:
             print(
-                f"\n[Rank {rank}] All {len(all_requests)} requests verified successfully!",
+                f"[Rank {rank}] GEN: Submitting gen-first receive for request {req_idx}...",
                 flush=True,
             )
-        else:
-            print(f"\n[Rank {rank}] Some requests FAILED verification!", flush=True)
-
-    # Broadcast pass/fail to all ranks for assertion
-    pass_tensor = torch.tensor([1 if all_passed else 0], dtype=torch.int)
-    dist.broadcast(pass_tensor, src=0)
-    assert pass_tensor.item() == 1, "Some requests failed verification!"
-
+            transceiver.request_and_receive_async(request)
+        print(
+            f"[Rank {rank}] GEN: Submitted {len(my_requests)} gen-first receive requests",
+            flush=True,
+        )
     dist.barrier()
 
-    # ===== Phase 5: Cleanup requests =====
-    # All ranks added all requests, so all need to remove them
-    for request in all_requests:
-        # remove_sequence(request_id, llm_request, release_blocks)
-        kv_cache_manager.impl.remove_sequence(request.py_request_id, request, True)
+    if is_ctx:
+        # Poll until all requests reach CONTEXT_INIT (peer info arrived)
+        transceiver.prepare_context_requests(ctx_my_requests)
+        _wait_ctx_request_ready(transceiver, ctx_my_requests)
 
-    if rank == 0:
-        print(f"[Rank {rank}] Cleanup completed")
+        for req_idx, request in my_requests:
+            print(
+                f"[Rank {rank}] CTX: Sending gen-first data for request {req_idx}...",
+                flush=True,
+            )
+            transceiver.respond_and_send_async(request)
+        print(f"[Rank {rank}] CTX: Submitted {len(my_requests)} send requests", flush=True)
 
-    # Cleanup
-    dist.destroy_process_group()
+
+def _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests):
+    """Generation-first transfer: gen receives first, then ctx prepares and sends."""
+    # Step 1: Generation side submits receive requests, now context side doesn't know the requests
+    # but gets kvcache requests first
+    if not is_ctx:
+        for req_idx, request in my_requests:
+            print(
+                f"[Rank {rank}] GEN: Submitting gen-first receive for request {req_idx}...",
+                flush=True,
+            )
+            transceiver.request_and_receive_async(request)
+        print(
+            f"[Rank {rank}] GEN: Submitted {len(my_requests)} gen-first receive requests",
+            flush=True,
+        )
+    dist.barrier()
+    time.sleep(3)  # wait for the receive requests to be submitted
+    # Step 2: Context side calls prepare_context_requests, now context side knows the requests
+    # all requests can reach CONTEXT_INIT state directly.
+    if is_ctx:
+        ctx_my_requests = [req for _, req in my_requests]
+
+        transceiver.prepare_context_requests(ctx_my_requests)
+        print(f"[Rank {rank}] CTX: Called prepare_context_requests", flush=True)
+        _wait_ctx_request_ready(transceiver, ctx_my_requests)
+
+    dist.barrier()
+    # Step 3: Context side sends the data
+    if is_ctx:
+        for req_idx, request in my_requests:
+            print(
+                f"[Rank {rank}] CTX: Sending gen-first data for request {req_idx}...",
+                flush=True,
+            )
+            transceiver.respond_and_send_async(request)
+        print(f"[Rank {rank}] CTX: Submitted {len(my_requests)} send requests", flush=True)
+
+
+# ===== Launchers and test configs =====
+
+
+def _is_port_conflict_error(exc: Exception) -> bool:
+    """Check if an exception is caused by a port conflict (EADDRINUSE)."""
+    msg = str(exc).lower()
+    return "eaddrinuse" in msg or "address already in use" in msg
 
 
 def run_v2_transceiver_mp(
@@ -828,12 +1040,13 @@ def run_v2_transceiver_mp(
     ctx_enable_dp: bool = False,
     gen_enable_dp: bool = False,
     is_mla: bool = False,
+    ctx_gen_workflow: str = "ctx_first",
+    max_port_retries: int = 5,
 ):
-    """Multi-process test for PyNativeCacheTransceiver using mp.spawn."""
+    """Multi-process test for KvCacheTransceiverV2 using mp.spawn."""
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
-    master_port = find_free_port()
 
     dp_str = (
         f", ctx_dp={ctx_enable_dp}, gen_dp={gen_enable_dp}"
@@ -841,33 +1054,51 @@ def run_v2_transceiver_mp(
         else ""
     )
     mla_str = ", MLA" if is_mla else ""
-    print(
-        f"Starting {world_size} processes for V2 transceiver test: "
-        f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}{dp_str}{mla_str}"
-    )
+    mode_str = ", " + ctx_gen_workflow
 
-    mp.spawn(
-        worker_fn,
-        args=(
-            world_size,
-            master_addr,
-            master_port,
-            ctx_tp,
-            ctx_pp,
-            gen_tp,
-            gen_pp,
-            ctx_enable_dp,
-            gen_enable_dp,
-            is_mla,
-        ),
-        nprocs=world_size,
-        join=True,
-    )
+    for attempt in range(max_port_retries):
+        master_port = find_free_port()
+
+        print(
+            f"Starting {world_size} processes for V2 transceiver test: "
+            f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
+            f"{dp_str}{mla_str}{mode_str}"
+            f" (port={master_port}, attempt {attempt + 1}/{max_port_retries})"
+        )
+
+        try:
+            mp.spawn(
+                worker_fn,
+                args=(
+                    world_size,
+                    master_addr,
+                    master_port,
+                    ctx_tp,
+                    ctx_pp,
+                    gen_tp,
+                    gen_pp,
+                    ctx_enable_dp,
+                    gen_enable_dp,
+                    is_mla,
+                    ctx_gen_workflow,
+                ),
+                nprocs=world_size,
+                join=True,
+            )
+            break  # success
+        except Exception as e:
+            if _is_port_conflict_error(e) and attempt < max_port_retries - 1:
+                print(
+                    f"Port {master_port} conflict on attempt {attempt + 1}/{max_port_retries}, "
+                    f"retrying with a new port..."
+                )
+                continue
+            raise
 
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 
 
-# Test configurations as pytest parameters
+# Context-first test configurations
 # Reference: cpp/tests/unit_tests/multi_gpu/cacheTransceiverTest.cpp
 MP_TEST_CONFIGS = [
     # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, test_id)
@@ -897,8 +1128,14 @@ MP_TEST_CONFIGS = [
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in MP_TEST_CONFIGS],
     ids=[c[7] for c in MP_TEST_CONFIGS],
 )
-def test_v2_transceiver_mp(ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla):
-    """Test PyNativeCacheTransceiver with multi-process configurations."""
+@pytest.mark.parametrize(
+    "workflow",
+    ["ctx_first", "ctx_first_sync", "gen_first1", "gen_first2"],
+)
+def test_v2_transceiver_mp(
+    ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow
+):
+    """Test KvCacheTransceiverV2 with context-first multi-process configurations."""
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
@@ -912,4 +1149,5 @@ def test_v2_transceiver_mp(ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_en
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
+        ctx_gen_workflow=workflow,
     )

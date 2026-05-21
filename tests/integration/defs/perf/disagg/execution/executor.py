@@ -829,12 +829,18 @@ class JobManager:
             result["error"] = error_msg
             return result
 
-        # Parse metrics and save to CSV
+        # Parse metrics and save to CSV (LogParser reads file once, also extracts failed/total)
         log_parser = LogParser(benchmark_type, config, metrics_config, result_dir)
         parse_result = log_parser.parse(model_name, timestamps=timestamps, test_name=test_name)
 
+        failed_requests = parse_result.get("failed_requests", 0)
+        total_requests = parse_result.get("total_requests", 0)
+
         if not parse_result["status"]:
-            result["error"] = "Failed to parse benchmark logs"
+            error_msg = "Failed to parse benchmark logs"
+            if failed_requests > 0:
+                error_msg += f" ({failed_requests}/{total_requests} requests failed)"
+            result["error"] = error_msg
             return result
 
         # Check if df is None
@@ -854,6 +860,15 @@ class JobManager:
 
         result["success"] = True
         result["status"] = "SUCCESS"
+
+        # Override success if any requests failed (metrics still saved for analysis)
+        if failed_requests > 0:
+            error_msg = f"Benchmark had {failed_requests}/{total_requests} failed requests"
+            logger.error(error_msg)
+            result["success"] = False
+            result["status"] = "FAILED"
+            result["error"] = error_msg
+
         return result
 
     @staticmethod

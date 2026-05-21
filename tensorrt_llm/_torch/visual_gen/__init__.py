@@ -5,22 +5,24 @@ from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionRequest,
     DiffusionResponse,
 )
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 
 # Checkpoint loading
 from .checkpoints import WeightLoader
 from .config import (
     AttentionConfig,
+    CacheDiTConfig,
     CudaGraphConfig,
-    DiffusionArgs,
     DiffusionModelConfig,
     ParallelConfig,
     PipelineComponent,
     PipelineConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VisualGenArgs,
     discover_pipeline_components,
 )
+from .mapping import VisualGenMapping
 from .models import AutoPipeline, BasePipeline, WanPipeline
 from .pipeline_loader import PipelineLoader
 
@@ -28,7 +30,8 @@ __all__ = [
     # Config classes
     "TorchCompileConfig",
     "CudaGraphConfig",
-    "DiffusionArgs",
+    "VisualGenArgs",
+    "CacheDiTConfig",
     "DiffusionModelConfig",
     "ParallelConfig",
     "PipelineComponent",
@@ -41,7 +44,9 @@ __all__ = [
     "DiffusionExecutor",
     "DiffusionRequest",
     "DiffusionResponse",
-    "MediaOutput",
+    "PipelineOutput",
+    # Mapping
+    "VisualGenMapping",
     # Pipelines
     "AutoPipeline",
     "BasePipeline",

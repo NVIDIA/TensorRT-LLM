@@ -1,0 +1,36 @@
+version: 0.0.1
+l0_verl:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: verl
+      orchestrator: mpi
+  tests:
+  - verl/test_verl_cases.py::test_placement_group_with_sub_ray_resource_pool
+  - verl/test_verl_cases.py::test_placement_group_with_ray_resource_pool
+  - verl/test_verl_cases.py::test_placement_group_multi_node_ray_resource_pool
+  - verl/test_verl_cases.py::test_placement_group_multi_node_multi_replica
+  - verl/test_verl_cases.py::test_async_generate
+  - verl/test_verl_cases.py::test_async_memory_management
+  - verl/test_verl_cases.py::test_make_async_request_get_method
+  - verl/test_verl_cases.py::test_make_async_request_post_method
+  - verl/test_verl_cases.py::test_make_async_request_http_error
+  - verl/test_verl_cases.py::test_make_async_request_max_attempts_exceeded
+  - verl/test_verl_cases.py::test_init_without_device_mesh
+  - verl/test_verl_cases.py::test_unimodal_generate
+  - verl/test_verl_cases.py::test_unimodal_batch_generate
+  - verl/test_verl_cases.py::test_multimodal_generate_with_image
+  - verl/test_verl_cases.py::test_multimodal_different_image_sizes
+  - verl/test_verl_cases.py::test_multimodal_text_only_fallback
+  - verl/test_verl_cases.py::test_wake_sleep_cycle
+  - verl/test_verl_cases.py::test_inter_node_trtllm_rollout
+  - verl/test_verl_cases.py::test_trtllm_abort

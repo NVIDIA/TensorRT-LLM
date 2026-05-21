@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -432,19 +433,40 @@ class Glm4MoE(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
+            if not isinstance(shared_output, torch.Tensor):
+                final_hidden_states = shared_output + routed_output
+                if not self.use_dp and self.mapping.tp_size > 1:
+                    final_hidden_states = self.allreduce(
+                        final_hidden_states, all_reduce_params=final_all_reduce_params
+                    )
+                return final_hidden_states
+            output_tensor = None
+            if not self.use_dp and self.mapping.tp_size > 1:
+                w, actual_kind = torch.ops.trtllm.allocate_output(
+                    shared_output, self.allreduce.output_buffer_kind, self.mapping.tp_group
+                )
+                if actual_kind == int(BufferKind.NCCL_WINDOW):
+                    output_tensor = w
             if routed_output.dim() == 3:
                 assert shared_output.numel() * self.top_k == routed_output.numel(), (
                     "unmatched tensor shape"
                 )
-                final_hidden_states = moe_reduce_add_shared_output(routed_output, shared_output)
+                final_hidden_states = moe_reduce_add_shared_output(
+                    routed_output, shared_output, out=output_tensor
+                )
             else:
                 assert shared_output.size() == routed_output.size(), "unmatched tensor shape"
-                final_hidden_states = shared_output + routed_output
+                if output_tensor is not None:
+                    final_hidden_states = torch.add(shared_output, routed_output, out=output_tensor)
+                else:
+                    # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                    final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
@@ -864,6 +886,7 @@ class Glm4MTP(Glm4DecoderLayer):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
         # Split hidden_states columnwise based on TP
@@ -1001,7 +1024,7 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
             model_config.spec_config is not None
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."

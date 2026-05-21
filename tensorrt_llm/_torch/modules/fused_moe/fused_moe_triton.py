@@ -103,7 +103,7 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         shifted = tl.where(start_bit == 0, v1,
                            (v1 >> start_bit) | (v2 << (32 - start_bit)))
 
-        # write back in place; bits past the region are already zero
+        # write back in place; _routing_clear_bitmatrix zeroes stale bits after
         tl.store(Bitmatrix + pid_m * stride_bm + w * stride_bn,
                  shifted.to(tl.int32),
                  mask=dst_mask)
@@ -123,38 +123,61 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         tl.store(ptr, yi, mask=mask_i)
 
 
+# After shifting the bitmatrix so that the local expert slice starts at bit 0,
+# clear all bits at positions >= cutoff (n_expts_local).  Without this, stale
+# bits from out-of-slice experts remain set and corrupt the subsequent
+# compaction and routing.
+# This kernel was removed from triton_kernels in 3.6.0, so we keep a local
+# copy here.
+@triton.jit
+def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn, cutoff,
+                             BLOCK_N: tl.constexpr):
+    pid_m = tl.program_id(0)
+    cutoff_word = cutoff // 32
+    cutoff_bit = cutoff % 32
+    cutoff_mask = (1 << (cutoff_bit)) - 1
+    for start_n in range(0, shape_bn, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        values = tl.load(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                         mask=offs_n < shape_bn)
+        values = tl.where(offs_n == cutoff_word, values & cutoff_mask, values)
+        values = tl.where(offs_n > cutoff_word, 0, values)
+        tl.store(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                 values,
+                 mask=offs_n < shape_bn)
+
+
 class TritonEPRouter():
 
     def prune_routing_ep(self, expt_scal, expt_indx, bitmatrix, n_expts_tot,
                          slice_start, slice_end):
         from triton_kernels.compaction import compaction
-        from triton_kernels.routing import _routing_clear_bitmatrix
         n_tokens_pad = expt_scal.shape[0]
+        bitmask_data = bitmatrix.mask.storage.data
         _routing_shift_bitmatrix_range[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
             expt_indx,
             expt_indx.stride(0),
             expt_indx.stride(1),
-            bitmatrix.storage.data.shape[1],
+            bitmask_data.shape[1],
             expt_indx.shape[1],
             slice_start,
             slice_end,
             BLOCK_N=512,
         )
         _routing_clear_bitmatrix[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
-            bitmatrix.storage.data.shape[1],
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
+            bitmask_data.shape[1],
             slice_end - slice_start,
             BLOCK_N=512,
         )
-        # perform compaction to update expt_scal / expt_indx
-        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
+        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix.mask)
         n_expts_tot = slice_end - slice_start
-        bitmatrix.shape[-1] = n_expts_tot
+        bitmatrix.mask.shape[-1] = n_expts_tot
         return expt_scal, expt_indx, bitmatrix
 
     def __call__(self,
@@ -165,30 +188,62 @@ class TritonEPRouter():
                  ep=1,
                  node_idx=0,
                  n_rows=None):
+        from triton_kernels.matmul_ogs import (GatherIndx, RoutingData,
+                                               ScatterIndx)
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+        from triton_kernels.topk import topk
+
         n_expts_tot = logits.shape[-1]
         n_expts_local = n_expts_tot // ep
         slice_start = node_idx * n_expts_local
         slice_end = slice_start + n_expts_local
 
-        from triton_kernels.routing import routing_from_bitmatrix
-        from triton_kernels.topk import topk
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
-        expt_scal, expt_indx, bitmatrix = topk(logits,
-                                               n_expts_act,
-                                               apply_softmax=not sm_first,
-                                               y_indx=expt_indx,
-                                               n_rows=n_rows)
-        # mutate bitmatrix
+
+        bitmatrix = topk(logits,
+                         n_expts_act,
+                         apply_softmax=not sm_first,
+                         y_indx=expt_indx,
+                         n_rows=n_rows)
+        expt_scal = bitmatrix.vals
+        expt_indx = bitmatrix.indx
+
         if ep > 1:
             expt_scal, expt_indx, bitmatrix = self.prune_routing_ep(
                 expt_scal, expt_indx, bitmatrix, n_expts_tot, slice_start,
                 slice_end)
-        return routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx,
-                                      n_expts_local, n_expts_act)
+            # mask_metadata was computed eagerly in SparseMatrix.__post_init__
+            # before pruning mutated the bitmatrix.  Recompute it now.
+            from triton_kernels.tensor_details.bitmatrix import \
+                make_bitmatrix_metadata
+            metadata = make_bitmatrix_metadata(expt_indx, bitmatrix.mask)
+        else:
+            metadata = bitmatrix.mask_metadata
+
+        expt_data = make_ragged_tensor_metadata(metadata.col_sum,
+                                                logits.shape[0] * n_expts_act)
+        gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
+
+        rdata = RoutingData(
+            gate_scal=gate_scal_sorted,
+            expt_hist=metadata.col_sum,
+            n_expts_tot=n_expts_local,
+            n_expts_act=n_expts_act,
+            expt_data=expt_data,
+        )
+        gather_indx = GatherIndx(
+            src_indx=metadata.col_sorted_indx,
+            dst_indx=metadata.row_sorted_indx,
+        )
+        scatter_indx = ScatterIndx(
+            src_indx=metadata.row_sorted_indx,
+            dst_indx=metadata.col_sorted_indx,
+        )
+        return rdata, gather_indx, scatter_indx
 
 
-def maybe_update_stride(weight):
+def update_weight_stride(weight):
     assert weight.dim() == 3
     # For the latest Triton kernels, w.stride(-2)==1 works universally
     return weight.transpose(1, 2).contiguous().transpose(1, 2)
@@ -307,8 +362,9 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -346,8 +402,9 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -531,8 +588,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -581,8 +639,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -631,6 +690,20 @@ class TritonMXFP4FusedMoEQuantScales(NamedTuple):
     fc2_input_dequant: torch.Tensor
 
 
+def is_swizzling_supported() -> bool:
+    """Return whether the MXFP4 swizzled value/scale layouts work on the current CUDA device.
+
+    The swizzled layouts produced by ``make_default_matmul_mxfp4_w_layout`` /
+    ``make_default_matmul_mxfp4_w_scale_layout`` are broken on the H20 family
+    (e.g. ``NVIDIA H20``, ``NVIDIA H20-3e``), so callers must fall back to
+    ``StridedLayout`` there. H200 uses substring exclusion because its device
+    name also contains ``H20``. This is a WAR. For proper fix, see nvbugs/6026676.
+    """
+    name = torch.cuda.get_device_name()
+    is_h20_family = "H20" in name and "H200" not in name
+    return not is_h20_family
+
+
 def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     # (num_experts, in_dim//2, out_dim)
     w_shape = w.shape
@@ -639,7 +712,17 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[0] == w_scale_shape[0]
     assert w_shape[1] * 2 == w_scale_shape[1] * 32
     assert w_shape[2] == w_scale_shape[2]
-    w = maybe_update_stride(w)
+
+    # OOM fix: free the original storage after update_weight_stride, but only
+    # if .contiguous() actually created a new copy. When the input is already
+    # contiguous in the transposed layout, .contiguous() is a no-op and shares
+    # the same storage — resizing it would destroy the tensor we need.
+    original_w_storage = w.data.untyped_storage()
+    w = update_weight_stride(w)
+    if w.data.untyped_storage().data_ptr() != original_w_storage.data_ptr():
+        original_w_storage.resize_(0)
+        torch.cuda.empty_cache()
+    del original_w_storage
     #num_warps = 4 if batch <= 512 else 8
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
@@ -648,8 +731,7 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
         mx_axis=1)
     scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=1, num_warps=num_warps)
-    # swizzling path is broken for H20
-    if torch.cuda.get_device_name() == "NVIDIA H20":
+    if not is_swizzling_supported():
         from triton_kernels.tensor_details.layout_details.strided import \
             StridedLayout
         value_layout = StridedLayout
@@ -1052,6 +1134,32 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
         dst_w2_weight_scale.copy_(w2_weight_scale, non_blocking=True)
 
+    @staticmethod
+    def _swizzle_and_replace(module, weight_name, scale_name, weight_data,
+                             scale_data):
+        new_weight, new_scale = swizzle_weight_and_scale(
+            weight_data, scale_data)
+        replacement_storage_ptrs = {
+            new_weight.data.untyped_storage().data_ptr(),
+            new_scale.data.untyped_storage().data_ptr(),
+        }
+        for name in (weight_name, scale_name):
+            old_param = module._parameters.pop(name, None)
+            assert old_param is not None, \
+                f"Expected {name} to be a registered parameter before swizzling MXFP4 weights."
+            old_storage = old_param.data.untyped_storage()
+            # H20 uses StridedLayout as an MXFP4 swizzle fallback. That
+            # conversion can alias the original scale storage, unlike the
+            # Hopper swizzled layout path, so only release storage that is no
+            # longer backing the replacement tensor.
+            old_storage_ptr = old_storage.data_ptr()
+            if (old_storage.nbytes() > 0
+                    and old_storage_ptr not in replacement_storage_ptrs):
+                old_storage.resize_(0)
+        torch.cuda.empty_cache()
+        setattr(module, weight_name, new_weight)
+        setattr(module, scale_name, new_scale)
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Step1: Load input scales.
         if self.activation_dtype == torch.float8_e4m3fn:
@@ -1118,27 +1226,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight_scale = shuffle_weight_for_activation_kernel(
             tmp_w3_w1_weight_scale)
 
-        # Handle w3_w1_weight
-        tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
-            module.w3_w1_weight.data, tmp_w3_w1_weight_scale)
-
-        module._parameters.pop('w3_w1_weight', None)
-        module._parameters.pop('fc31_dequant', None)
-        torch.cuda.empty_cache()
-
-        module.w3_w1_weight = tmp_w3_w1_weight
-        module.fc31_dequant = tmp_w3_w1_weight_scale
-
-        # Handle w2_weight
-        tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
-            module.w2_weight.data, tmp_w2_weight_scale)
-
-        module._parameters.pop('w2_weight', None)
-        module._parameters.pop('fc2_dequant', None)
-        torch.cuda.empty_cache()
-
-        module.w2_weight = tmp_w2_weight
-        module.fc2_dequant = tmp_w2_weight_scale
+        self._swizzle_and_replace(module, 'w3_w1_weight', 'fc31_dequant',
+                                  module.w3_w1_weight.data,
+                                  tmp_w3_w1_weight_scale)
+        self._swizzle_and_replace(module, 'w2_weight', 'fc2_dequant',
+                                  module.w2_weight.data, tmp_w2_weight_scale)
 
         if self.activation_dtype == torch.float8_e4m3fn:
             if max_fc31_input_scale is None or max_fc2_input_scale is None:
@@ -1214,8 +1306,9 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         hidden_states = _maybe_pad_activation(hidden_states)
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
 
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
@@ -1274,6 +1367,22 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         gemm2_output = _maybe_remove_padding(gemm2_output, module.hidden_size)
 
         return gemm2_output
+
+    def post_load_weights(self, module: torch.nn.Module):
+        if 'w3_w1_weight' in module._parameters:
+            w31_scale = shuffle_weight_for_activation_kernel(
+                module.fc31_dequant.data)
+            self._swizzle_and_replace(module, 'w3_w1_weight', 'fc31_dequant',
+                                      module.w3_w1_weight.data, w31_scale)
+            self._swizzle_and_replace(module, 'w2_weight', 'fc2_dequant',
+                                      module.w2_weight.data,
+                                      module.fc2_dequant.data)
+
+            if self.activation_dtype == torch.float8_e4m3fn:
+                module.fc31_input_dequant = None
+                module.fc2_input_dequant = None
+
+        super().post_load_weights(module)
 
 
 class TritonFusedMoE(MoE):

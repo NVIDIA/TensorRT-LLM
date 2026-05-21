@@ -25,8 +25,14 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionArgs, PipelineConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    PipelineConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._utils import get_free_port
 
 
 def _llm_models_root() -> str:
@@ -155,7 +161,7 @@ class TestFluxPipelineLoading:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_load_flux1_pipeline_basic(self, flux1_checkpoint_exists):
         """Test loading FLUX.1 pipeline."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -176,7 +182,7 @@ class TestFluxPipelineLoading:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_load_flux2_pipeline_basic(self, flux2_checkpoint_exists):
         """Test loading FLUX.2 pipeline."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX2_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -197,7 +203,7 @@ class TestFluxPipelineLoading:
     @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
     def test_load_flux1_with_attention_backend(self, flux1_checkpoint_exists, backend: str):
         """Test loading FLUX.1 with different attention backends."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -226,7 +232,7 @@ class TestFluxQuantization:
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_load_flux1_with_quantization(self, flux1_checkpoint_exists, quant_algo: str):
         """Test loading FLUX.1 with FP8 quantization and verify FP8 weights."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -270,7 +276,7 @@ class TestFluxQuantization:
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_load_flux2_with_quantization(self, flux2_checkpoint_exists, quant_algo: str):
         """Test loading FLUX.2 with FP8 quantization and verify FP8 weights."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=FLUX2_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -331,7 +337,7 @@ class TestFluxFP8NumericalCorrectness:
         """
         # Load BF16 pipeline (reference)
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -341,7 +347,7 @@ class TestFluxFP8NumericalCorrectness:
 
         # Load FP8 pipeline
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -413,7 +419,7 @@ class TestFluxFP8NumericalCorrectness:
         """
         # Load BF16 transformer (reference)
         print("\n[E2E] Loading BF16 transformer...")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -424,7 +430,7 @@ class TestFluxFP8NumericalCorrectness:
 
         # Load FP8 transformer
         print(f"[E2E] Loading {quant_algo} transformer...")
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -528,7 +534,7 @@ class TestFluxFP8Memory:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -548,7 +554,7 @@ class TestFluxFP8Memory:
         # Load FP8
         torch.cuda.reset_peak_memory_stats()
 
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -596,7 +602,7 @@ class TestFluxAttentionBackend:
         # Run VANILLA first, save output, then free before loading TRTLLM
         # (two full transformers don't fit in GPU memory simultaneously)
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -619,7 +625,7 @@ class TestFluxAttentionBackend:
 
         # Load and run TRTLLM backend
         print("[Attention Backend Test] Loading TRTLLM transformer...")
-        args_trtllm = DiffusionArgs(
+        args_trtllm = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -704,8 +710,8 @@ class TestFluxE2E:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 2. Load TRT-LLM pipeline (full, no skip_components)
-        args = DiffusionArgs(
+        # 2. Load TRT-LLM pipeline
+        args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -722,7 +728,7 @@ class TestFluxE2E:
             guidance_scale=3.5,
             seed=42,
         )
-        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+        native_image = result.image[0].cpu().numpy()  # (H, W, 3) uint8
 
         # 4. Compute PSNR
         mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
@@ -757,8 +763,8 @@ class TestFluxE2E:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 2. Load TRT-LLM pipeline (full, no skip_components)
-        args = DiffusionArgs(
+        # 2. Load TRT-LLM pipeline
+        args = VisualGenArgs(
             checkpoint_path=FLUX2_CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -775,7 +781,7 @@ class TestFluxE2E:
             guidance_scale=3.5,
             seed=42,
         )
-        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+        native_image = result.image[0].cpu().numpy()  # (H, W, 3) uint8
 
         # 4. Compute PSNR
         mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
@@ -790,16 +796,115 @@ class TestFluxE2E:
         torch.cuda.empty_cache()
 
 
+class TestFluxBatchGeneration:
+    """Batch generation tests for FLUX pipelines.
+
+    Uses class-scoped fixtures to avoid redundant model loads across batch tests.
+    Separated from TestFluxE2E because HF+TRT-LLM pipelines don't fit in memory
+    simultaneously for large models (FLUX.2).
+    """
+
+    @pytest.fixture(scope="class")
+    def flux1_pipeline(self):
+        """Load FLUX.1 TRT-LLM pipeline once for all FLUX.1 batch tests."""
+        if not FLUX1_CHECKPOINT_PATH or not os.path.exists(FLUX1_CHECKPOINT_PATH):
+            pytest.skip(
+                f"FLUX.1 checkpoint not found at {FLUX1_CHECKPOINT_PATH}. "
+                "Set FLUX1_MODEL_PATH or LLM_MODELS_ROOT."
+            )
+        args = VisualGenArgs(
+            checkpoint_path=FLUX1_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        yield pipeline
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.fixture(scope="class")
+    def flux2_pipeline(self):
+        """Load FLUX.2 TRT-LLM pipeline once for all FLUX.2 batch tests."""
+        if not FLUX2_CHECKPOINT_PATH or not os.path.exists(FLUX2_CHECKPOINT_PATH):
+            pytest.skip(
+                f"FLUX.2 checkpoint not found at {FLUX2_CHECKPOINT_PATH}. "
+                "Set FLUX2_MODEL_PATH or LLM_MODELS_ROOT."
+            )
+        args = VisualGenArgs(
+            checkpoint_path=FLUX2_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        yield pipeline
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_batch_generation(self, flux1_pipeline):
+        """FLUX.1 batch generation: list of prompts produces (B, H, W, C) output."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+
+        # Single prompt → (H, W, C)
+        single = flux1_pipeline.forward(
+            prompt=prompts[0],
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+        )
+        assert single.image.dim() == 4, f"Expected 4D, got {single.image.shape}"
+        assert single.image.shape[0] == 1
+
+        # Batch prompts → (B, H, W, C)
+        batch = flux1_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+        )
+        assert batch.image.dim() == 4, f"Expected 4D, got {batch.image.shape}"
+        assert batch.image.shape[0] == 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_batch_generation(self, flux2_pipeline):
+        """FLUX.2 batch generation: list of prompts produces (B, H, W, C) output."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+
+        # Batch prompts → (B, H, W, C)
+        batch = flux2_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+        )
+        assert batch.image.dim() == 4, f"Expected 4D, got {batch.image.shape}"
+        assert batch.image.shape == (2, 256, 256, 3), f"Unexpected shape: {batch.image.shape}"
+
+        # Verify per-sample seeding: images should differ (different prompts + seeds)
+        mse = ((batch.image[0].float() - batch.image[1].float()) ** 2).mean().item()
+        assert mse > 100, f"Batch images are too similar (MSE={mse:.1f}), seeding may be broken"
+        print(f"\n[Batch FLUX.2] Inter-image MSE = {mse:.1f} (images differ as expected)")
+
+
 # =============================================================================
 # Multi-GPU Parallelism Tests (Ulysses sequence parallelism)
 # =============================================================================
 
 
-def _setup_distributed(rank, world_size, backend="nccl"):
+def _setup_distributed(rank, world_size, master_port, backend="nccl"):
     """Initialize distributed process group for multi-GPU tests."""
     os.environ["TLLM_DISABLE_MPI"] = "1"
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
@@ -813,19 +918,19 @@ def _cleanup_distributed():
         dist.destroy_process_group()
 
 
-def _run_ulysses_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+def _run_ulysses_worker(rank, world_size, master_port, checkpoint_path, inputs_cpu, return_dict):
     """Worker function for Ulysses multi-GPU test.
 
     Must be module-level for multiprocessing.spawn() pickling.
     """
     try:
-        _setup_distributed(rank, world_size)
+        _setup_distributed(rank, world_size, master_port)
 
-        from tensorrt_llm._torch.visual_gen.config import DiffusionArgs, ParallelConfig
+        from tensorrt_llm._torch.visual_gen.config import ParallelConfig, VisualGenArgs
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
         # Load pipeline with Ulysses parallelism
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -885,7 +990,7 @@ class TestFluxParallelism:
 
         # Load single-GPU reference
         print("\n[1/3] Loading single-GPU reference (ulysses_size=1) on GPU 0...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
@@ -920,9 +1025,10 @@ class TestFluxParallelism:
         manager = mp.Manager()
         return_dict = manager.dict()
 
+        master_port = get_free_port()
         mp.spawn(
             _run_ulysses_worker,
-            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            args=(2, master_port, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
             nprocs=2,
             join=True,
         )
@@ -957,32 +1063,33 @@ class TestFluxParallelism:
         torch.cuda.empty_cache()
 
 
-def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+def _run_all_optimizations_worker(
+    rank, world_size, master_port, checkpoint_path, inputs_cpu, return_dict
+):
     """Worker for combined optimizations test (FP8 + TeaCache + TRTLLM + Ulysses).
 
     Must be module-level for multiprocessing.spawn() pickling.
     """
     try:
-        _setup_distributed(rank, world_size)
+        _setup_distributed(rank, world_size, master_port)
 
         from tensorrt_llm._torch.visual_gen.config import (
             AttentionConfig,
-            DiffusionArgs,
             ParallelConfig,
             TeaCacheConfig,
+            VisualGenArgs,
         )
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
         from tensorrt_llm.quantization.mode import QuantAlgo
 
         # Load pipeline with ALL optimizations
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
+            cache=TeaCacheConfig(
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
@@ -993,11 +1100,14 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
-        assert pipeline.model_config.parallel.dit_ulysses_size == world_size, (
+        assert pipeline.model_config.visual_gen_mapping.ulysses_size == world_size, (
             "Ulysses parallel not enabled"
         )
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"
-        assert hasattr(pipeline, "cache_backend"), "TeaCache not enabled"
+        assert (
+            getattr(pipeline, "cache_accelerator", None) is not None
+            and pipeline.cache_accelerator.is_enabled()
+        ), "TeaCache not enabled"
         assert transformer.transformer_blocks[0].attn.attn_backend == "TRTLLM", "TRTLLM not enabled"
 
         if rank == 0:
@@ -1008,8 +1118,8 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
             print(f"    - Ulysses: ulysses_size={world_size}")
 
         # Initialize TeaCache for single-step inference
-        if hasattr(pipeline, "cache_backend") and pipeline.cache_backend:
-            pipeline.cache_backend.refresh(num_inference_steps=1)
+        if getattr(pipeline, "cache_accelerator", None) and pipeline.cache_accelerator.is_enabled():
+            pipeline.cache_accelerator.refresh(num_inference_steps=1)
 
         # Load inputs on this GPU
         inputs = {k: v.to(f"cuda:{rank}") for k, v in inputs_cpu.items()}
@@ -1062,7 +1172,7 @@ class TestFluxCombinedOptimizations:
 
         # Load baseline on GPU 0 (no optimizations)
         print("\n[1/3] Loading baseline on GPU 0 (BF16, no optimizations)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
@@ -1099,9 +1209,10 @@ class TestFluxCombinedOptimizations:
         manager = mp.Manager()
         return_dict = manager.dict()
 
+        master_port = get_free_port()
         mp.spawn(
             _run_all_optimizations_worker,
-            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            args=(2, master_port, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
             nprocs=2,
             join=True,
         )

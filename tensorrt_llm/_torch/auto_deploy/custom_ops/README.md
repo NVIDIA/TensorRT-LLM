@@ -19,8 +19,6 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.flashinfer_attention_mha_with_cache` | FlashInfer multi-head attention with KV cache support |
 | `torch.ops.auto_deploy.flashinfer_attention_prepare_metadata` | FlashInfer attention metadata preparation |
 | `torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache` | Triton flattened MHA with cache |
-| `torch.ops.auto_deploy.torch_onnx_attention_plugin` | Fused attention with RoPE placeholder for ONNX export |
-| `torch.ops.auto_deploy.torch_onnx_gather_nd` | N-dimensional gather operation for ONNX export |
 
 #### MLA (Multi-head Latent Attention)
 
@@ -29,6 +27,7 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.torch_mla` | Multi-head Latent Attention (MLA) implementation |
 | `torch.ops.auto_deploy.torch_cached_mla_with_cache` | PyTorch backend cached MLA with KV cache |
 | `torch.ops.auto_deploy.flashinfer_mla_with_cache` | FlashInfer MLA with cache |
+| `torch.ops.auto_deploy.flashinfer_trtllm_mla_with_cache` | FlashInfer TRTLLM-gen MLA with paged cache |
 | `torch.ops.auto_deploy.flashinfer_mla_prepare_metadata` | FlashInfer MLA metadata preparation |
 
 #### RoPE (Rotary Position Embedding)
@@ -131,4 +130,4 @@ The table below lists the operators grouped by category.
 | Operator Name | Description |
 |--------------|-------------|
 | `torch.ops.auto_deploy.triton_utils_fused_gather_scatter` | Triton fused gather + scatter for overlap scheduling input_ids reordering |
-| `torch.ops.auto_deploy.gather_logits_before_lm_head` | Gather hidden states using logits indices before LM head |
+| `torch.ops.auto_deploy.gather_tokens` | Gather hidden states using token indices before LM head |

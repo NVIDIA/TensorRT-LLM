@@ -3,65 +3,72 @@ import contextlib
 import copy
 import json
 import os
-import subprocess
-from typing import Generator, List, Optional, Tuple
+import tempfile
+from typing import List
 
 import aiohttp
 import pytest
 import yaml
-from defs.common import revise_disagg_config_file_with_free_ports
+from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import skip_no_hopper
-from defs.trt_test_alternative import popen
+from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
+                               run_ctx_worker, run_disagg_server,
+                               run_gen_worker, terminate,
+                               wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (KvCacheAwareRouter,
+from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
                                        KvCacheAwareServerState, ServerRole,
                                        block_key_hasher)
 
 
-def get_ctx_gen_server_urls_from_cfg(config_file: str):
-    with open(config_file, 'r') as file:
-        config = yaml.safe_load(file)
-    ctx_servers = []
-    gen_servers = []
-    for server in config["context_servers"]["urls"]:
-        ctx_servers.append("http://" + server)
-    for server in config["generation_servers"]["urls"]:
-        gen_servers.append("http://" + server)
-    return ctx_servers, gen_servers
+def build_worker_config(base_config, server_type_config, disagg_cluster):
+    """Build worker configuration by merging base config with server-type specific config.
 
+    Args:
+        base_config: Full YAML config (top-level)
+        server_type_config: context_servers or generation_servers section
+        disagg_cluster: Service discovery config
 
-def run_disaggregated_workers(
-    config_file: str,
-    stdout=None,
-    env: Optional[dict] = None,
-    cwd: Optional[str] = None,
-    num_ranks: Optional[int] = None
-) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
+    Returns:
+        dict: Worker configuration for trtllm-serve
+    """
+    EXCLUDE_FROM_WORKER = {
+        'hostname',
+        'port',
+        'num_instances',
+        'urls',
+        'router',
+        'model',
+        'context_servers',
+        'generation_servers',
+        'conditional_disagg_config',
+    }
 
-    config_file = revise_disagg_config_file_with_free_ports(config_file)
-    ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
+    worker_config = {
+        k: v
+        for k, v in base_config.items() if k not in EXCLUDE_FROM_WORKER
+    }
 
-    # TODO: auto detect num_ranks
-    assert num_ranks is not None
+    worker_config.update({
+        k: v
+        for k, v in server_type_config.items() if k not in EXCLUDE_FROM_WORKER
+    })
 
-    # Start workers
-    workers_cmd = [
-        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
-        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
-        config_file
-    ]
-    logger.info(f"Running workers with command: {' '.join(workers_cmd)}")
-    workers_proc = popen(workers_cmd,
-                         stdout=stdout,
-                         stderr=subprocess.STDOUT,
-                         env=env,
-                         cwd=cwd)
-    return workers_proc, ctx_servers, gen_servers
+    if 'free_gpu_memory_fraction' in worker_config:
+        frac = worker_config.pop('free_gpu_memory_fraction')
+        if 'kv_cache_config' not in worker_config:
+            worker_config['kv_cache_config'] = {}
+        worker_config['kv_cache_config'].setdefault('free_gpu_memory_fraction',
+                                                    frac)
+
+    worker_config['disagg_cluster'] = disagg_cluster
+
+    return worker_config
 
 
 DEFAULT_TIMEOUT_SERVER_START = 900
@@ -399,9 +406,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             gen_server_prev = gen_server
             response = await self.send_disagg_request(session, ctx_server,
                                                       gen_server, request)
-            await asyncio.gather(
-                self.ctx_router.finish_request(openai_request, session),
-                self.gen_router.finish_request(openai_request, session))
+            await asyncio.gather(self.ctx_router.finish_request(openai_request),
+                                 self.gen_router.finish_request(openai_request))
             logger.info(
                 f"Received response {i}: {repr(response['choices'][0]['text'])}"
             )
@@ -416,18 +422,22 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                                        init_prompts: List[str],
                                        max_rounds: int = 8,
                                        warm_up_rounds: int = 4):
-        async with await self.new_session() as session:
-            chat_threads = [
-                self.multi_round_request(session, prompt, warm_up_rounds, False)
-                for prompt in init_prompts
-            ]
-            prompts = await asyncio.gather(*chat_threads)
-            logger.info("Warm up done")
-            chat_threads = [
-                self.multi_round_request(session, prompt, max_rounds, True)
-                for prompt in prompts
-            ]
-            await asyncio.gather(*chat_threads)
+        try:
+            async with await self.new_session() as session:
+                chat_threads = [
+                    self.multi_round_request(session, prompt, warm_up_rounds,
+                                             False) for prompt in init_prompts
+                ]
+                prompts = await asyncio.gather(*chat_threads)
+                logger.info("Warm up done")
+                chat_threads = [
+                    self.multi_round_request(session, prompt, max_rounds, True)
+                    for prompt in prompts
+                ]
+                await asyncio.gather(*chat_threads)
+        finally:
+            await self.ctx_router.close()
+            await self.gen_router.close()
 
     async def test_eviction(self):
         async with await self.new_session() as session:
@@ -512,27 +522,100 @@ def load_default_prompts(disaggregated_example_root: str):
 
 
 @contextlib.contextmanager
-def background_workers(llm_venv, config_file: str, num_ranks: int = None):
+def background_workers(llm_venv, config_file: str):
     cwd = llm_venv.get_working_directory()
     os.chdir(cwd)
-    with open(os.path.join(cwd, 'output_workers.log'), 'w+') as log_file:
-        workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
-            config_file=config_file,
-            stdout=log_file,
-            env=llm_venv._new_env,
-            cwd=cwd,
-            num_ranks=num_ranks)
-        try:
-            with workers_proc as proc:
-                yield ctx_servers, gen_servers
-        except Exception:
-            log_file.seek(0)
-            logger.error("-------- Worker output --------")
-            logger.error(log_file.read())
-            raise
-        finally:
-            proc.terminate()
-            proc.wait()
+    env = llm_venv._new_env
+
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)
+
+    model = config.get("model")
+    ctx_server_cfg = config.get("context_servers", {})
+    gen_server_cfg = config.get("generation_servers", {})
+    num_ctx = ctx_server_cfg.get("num_instances", 1)
+    num_gen = gen_server_cfg.get("num_instances", 1)
+
+    disagg_port = get_free_port()
+    work_dir = tempfile.mkdtemp()
+    disagg_cluster = {
+        "cluster_uri": f"http://localhost:{disagg_port}",
+        "cluster_name": "test_cluster",
+        "heartbeat_interval_sec": HEARTBEAT_INTERVAL,
+        "inactive_timeout_sec": INACTIVE_TIMEOUT,
+        "minimal_instances": {
+            "context_servers": num_ctx,
+            "generation_servers": num_gen,
+        },
+    }
+
+    ctx_worker_config = build_worker_config(config, ctx_server_cfg,
+                                            disagg_cluster)
+    gen_worker_config = build_worker_config(config, gen_server_cfg,
+                                            disagg_cluster)
+
+    gpus_per_ctx = (ctx_server_cfg.get("tensor_parallel_size", 1) *
+                    ctx_server_cfg.get("pipeline_parallel_size", 1))
+    gpus_per_gen = (gen_server_cfg.get("tensor_parallel_size", 1) *
+                    gen_server_cfg.get("pipeline_parallel_size", 1))
+
+    ctx_workers = []
+    gen_workers = []
+    ctx_urls = []
+    gen_urls = []
+    next_device = 0
+
+    import torch
+    num_gpus = torch.cuda.device_count()
+
+    for i in range(num_ctx):
+        port = get_free_port()
+        ctx_urls.append(f"http://localhost:{port}")
+        ctx_workers.append(
+            run_ctx_worker(model,
+                           ctx_worker_config,
+                           work_dir,
+                           port=port,
+                           device=next_device % num_gpus,
+                           env=env))
+        next_device += gpus_per_ctx
+
+    for i in range(num_gen):
+        port = get_free_port()
+        gen_urls.append(f"http://localhost:{port}")
+        gen_workers.append(
+            run_gen_worker(model,
+                           gen_worker_config,
+                           work_dir,
+                           port=port,
+                           device=next_device % num_gpus,
+                           env=env))
+        next_device += gpus_per_gen
+
+    server_config = {
+        "hostname": "localhost",
+        "port": disagg_port,
+        "disagg_cluster": disagg_cluster,
+        "context_servers": {
+            "router": ctx_server_cfg.get("router", {})
+        },
+        "generation_servers": {
+            "router": gen_server_cfg.get("router", {})
+        },
+    }
+    disagg_server = run_disagg_server(server_config,
+                                      work_dir,
+                                      disagg_port,
+                                      env=env)
+
+    try:
+        asyncio.run(wait_for_disagg_server_ready(disagg_port))
+        yield ctx_urls, gen_urls, disagg_port
+    except Exception:
+        logger.error("-------- Service discovery workers error --------")
+        raise
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
 
 
 @pytest.mark.skip(reason="https://nvbugs/5372970")
@@ -545,8 +628,8 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers, _):
         tester = ConditionalWorkerTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts))
@@ -569,8 +652,8 @@ def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers, _):
         tester = ConditionalWorkerTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts))
@@ -585,8 +668,8 @@ def test_workers_kv_cache_events(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers, _):
         tester = KvCacheEventWorkerTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 6))
@@ -602,8 +685,8 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            4) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers, _):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
         asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
@@ -627,8 +710,8 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    with background_workers(llm_venv, config_file,
-                            4) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers, _):
         tester = KvCacheAwareRouterTester(ctx_servers,
                                           gen_servers,
                                           model_name="DeepSeek-V3-Lite/bf16",
@@ -646,7 +729,190 @@ def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     prepare_llama_model(llama_model_root, llm_venv)
 
-    with background_workers(llm_venv, config_file,
-                            2) as (ctx_servers, gen_servers):
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers, _):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         asyncio.run(tester.test_eviction())
+
+
+class ConversationRouterTester(BasicWorkerTester):
+    """Tests conversation router routing via local router + worker servers."""
+
+    def __init__(self,
+                 disagg_url: str,
+                 ctx_servers: List[str],
+                 gen_servers: List[str],
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
+                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+        super().__init__(ctx_servers, gen_servers, req_timeout_secs,
+                         server_start_timeout_secs)
+        self.disagg_url = disagg_url
+        self.model_name = model_name
+        self.ctx_router = ConversationRouter(server_role=ServerRole.CONTEXT,
+                                             servers=ctx_servers,
+                                             match_threshold=0.5,
+                                             tokens_per_block=2,
+                                             hash_skip_count=8,
+                                             use_token_ids=True)
+
+    async def _send_via_disagg(self,
+                               session: aiohttp.ClientSession,
+                               request: dict,
+                               headers: dict = None) -> dict:
+        async with session.post(f"{self.disagg_url}/v1/completions",
+                                json=request,
+                                headers=headers) as response:
+            response_dict = await response.json()
+            if not response.ok:
+                logger.error(f"Received failed response {response_dict}")
+                response.raise_for_status()
+            return response_dict
+
+    async def test_explicit_conversation_id(self):
+        """Same conversation_id sticky-routes; different ids load-balance."""
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+                    total=self.req_timeout_secs)) as session:
+                # 1. Same conversation_id always routes to the same server
+                conv_id = "test-explicit-conv-id"
+                prompt = ("Hello, this is a test prompt for "
+                          "conversation routing with explicit id")
+                first_server = None
+                for i in range(6):
+                    req = CompletionRequest(
+                        model=self.model_name,
+                        prompt=prompt,
+                        disaggregated_params=DisaggregatedParams(
+                            request_type="context_only",
+                            conversation_id=conv_id))
+                    server, _ = await self.ctx_router.get_next_server(req)
+                    if first_server is None:
+                        first_server = server
+                    else:
+                        assert server == first_server, (
+                            f"Round {i}: expected {first_server}, "
+                            f"got {server}")
+                    response = await self._send_via_disagg(
+                        session, {
+                            "model": self.model_name,
+                            "prompt": prompt,
+                            "max_tokens": 32,
+                            "ignore_eos": True,
+                            "temperature": 0.0,
+                        }, {"X-Correlation-ID": conv_id})
+                    assert len(response["choices"]) > 0
+                    await self.ctx_router.finish_request(req)
+                    prompt = prompt + response["choices"][0]["text"]
+                logger.info(
+                    f"Sticky routing passed: all 6 rounds -> {first_server}")
+
+                # 2. Different conversation_ids are load-balanced across
+                #    servers (not all pinned to a single one).
+                servers_seen = set()
+                for i in range(len(self.ctx_servers) * 2):
+                    cid = f"test-diff-conv-{i}"
+                    req = CompletionRequest(
+                        model=self.model_name,
+                        prompt=f"Unique prompt number {i} for load balancing",
+                        disaggregated_params=DisaggregatedParams(
+                            request_type="context_only", conversation_id=cid))
+                    server, _ = await self.ctx_router.get_next_server(req)
+                    servers_seen.add(server)
+                    response = await self._send_via_disagg(
+                        session, {
+                            "model": self.model_name,
+                            "prompt": f"Unique prompt number {i}",
+                            "max_tokens": 1,
+                            "temperature": 0.0,
+                        }, {"X-Correlation-ID": cid})
+                    assert len(response["choices"]) > 0
+                    await self.ctx_router.finish_request(req)
+                assert len(servers_seen) > 1, (
+                    f"Different conv_ids all routed to same server: "
+                    f"{servers_seen}")
+                logger.info(
+                    f"Load balancing passed: {len(servers_seen)} servers used")
+        finally:
+            await self.ctx_router.close()
+
+    async def test_implicit_conversation_matching(self):
+        """Requests sharing a common prefix implicitly route to same server."""
+        try:
+            async with await self.new_session() as session:
+                system_prompt = ("You are a helpful assistant. "
+                                 "Please answer the following question. ")
+                prompt = system_prompt + "What is the capital of France?"
+                req = CompletionRequest(
+                    model=self.model_name,
+                    prompt=prompt,
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="context_only"))
+                first_server, _ = await self.ctx_router.get_next_server(req)
+                response = await self.send_request(
+                    session, first_server, {
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "max_tokens": 32,
+                        "ignore_eos": True,
+                        "temperature": 0.0,
+                        "disaggregated_params": {
+                            "request_type": "context_only"
+                        },
+                    })
+                await self.ctx_router.finish_request(req)
+                prompt = prompt + response["choices"][0]["text"]
+
+                match_count = 0
+                rounds = 6
+                for i in range(rounds):
+                    prompt = prompt + " Tell me more."
+                    req = CompletionRequest(
+                        model=self.model_name,
+                        prompt=prompt,
+                        disaggregated_params=DisaggregatedParams(
+                            request_type="context_only"))
+                    server, _ = await self.ctx_router.get_next_server(req)
+                    match_count += int(server == first_server)
+                    response = await self.send_request(
+                        session, server, {
+                            "model": self.model_name,
+                            "prompt": prompt,
+                            "max_tokens": 32,
+                            "ignore_eos": True,
+                            "temperature": 0.0,
+                            "disaggregated_params": {
+                                "request_type": "context_only"
+                            },
+                        })
+                    await self.ctx_router.finish_request(req)
+                    prompt = prompt + response["choices"][0]["text"]
+
+                assert match_count > rounds // 2, (
+                    f"Implicit match failed: only {match_count}/{rounds} "
+                    f"rounds matched server {first_server}")
+                logger.info(f"Implicit conversation matching test passed: "
+                            f"{match_count}/{rounds} matched")
+        finally:
+            await self.ctx_router.close()
+
+
+@skip_no_hopper
+@pytest.mark.skip_less_device(3)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_workers_conversation_router(disaggregated_test_root,
+                                     disaggregated_example_root, llm_venv,
+                                     llama_model_root):
+    config_file = os.path.join(
+        disaggregated_test_root,
+        'test_configs/disagg_config_conversation_workers.yaml')
+    prepare_llama_model(llama_model_root, llm_venv)
+
+    with background_workers(llm_venv, config_file) as (ctx_servers, gen_servers,
+                                                       disagg_port):
+        disagg_url = f"http://localhost:{disagg_port}"
+        tester = ConversationRouterTester(disagg_url, ctx_servers, gen_servers)
+        asyncio.run(tester.test_explicit_conversation_id())
+        tester = ConversationRouterTester(disagg_url, ctx_servers, gen_servers)
+        asyncio.run(tester.test_implicit_conversation_matching())

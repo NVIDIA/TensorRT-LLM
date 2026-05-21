@@ -15,4 +15,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           AUTHOR: ${{ github.actor }}
-        run: gh pr edit $PR_URL --add-assignee $AUTHOR
+        run: gh pr edit $PR_URL --add-assignee $AUTHOR || echo "Could not assign $AUTHOR (not a collaborator), skipping."

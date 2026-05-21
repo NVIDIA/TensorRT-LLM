@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,7 @@
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -153,6 +154,7 @@ void initBindings(nb::module_& m)
             nb::arg("num_tokens_per_iteration"), nb::arg("model_config"))
         .def_prop_ro("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
         .def("has_draft_tokens", &GenLlmReq::hasDraftTokens)
+        .def("discard_draft_tokens", &GenLlmReq::discardDraftTokens, nb::arg("num_tokens_to_discard"))
         .def("move_to_next_context_chunk", &GenLlmReq::moveToNextContextChunk)
         .def_prop_ro("is_last_context_chunk", &GenLlmReq::isLastContextChunk)
         .def_prop_ro("is_first_context_chunk", &GenLlmReq::isFirstContextChunk)
@@ -163,11 +165,14 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
         .def_prop_ro("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
+        .def_prop_ro("is_finished_without_error", &GenLlmReq::isFinishedWithoutError)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
         .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, nb::arg("prepopulated_prompt_len"),
             nb::arg("kv_tokens_per_block"))
+        .def_prop_rw(
+            "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
@@ -226,6 +231,36 @@ void initBindings(nb::module_& m)
                 if (self.getMultimodalLengths())
                 {
                     lengths = *self.getMultimodalLengths().value();
+                }
+                return lengths;
+            })
+        .def_prop_ro("multimodal_item_run_cu_offsets",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> offsets = std::nullopt;
+                if (self.getMultimodalItemRunCuOffsets())
+                {
+                    offsets = *self.getMultimodalItemRunCuOffsets().value();
+                }
+                return offsets;
+            })
+        .def_prop_ro("multimodal_run_positions",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> positions = std::nullopt;
+                if (self.getMultimodalRunPositions())
+                {
+                    positions = *self.getMultimodalRunPositions().value();
+                }
+                return positions;
+            })
+        .def_prop_ro("multimodal_run_lengths",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> lengths = std::nullopt;
+                if (self.getMultimodalRunLengths())
+                {
+                    lengths = *self.getMultimodalRunLengths().value();
                 }
                 return lengths;
             })
@@ -313,7 +348,11 @@ void initBindings(nb::module_& m)
                 std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
                 std::optional<executor::ContextPhaseParams> context_phase_params,
                 std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
-                std::optional<tb::LlmRequest::TimePoint> arrival_time)
+                std::optional<tb::LlmRequest::TimePoint> arrival_time,
+                std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_item_run_cu_offsets,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_positions,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                 {
@@ -354,7 +393,8 @@ void initBindings(nb::module_& m)
                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
                     guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
-                    arrival_time};
+                    arrival_time, std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
+                    multimodal_run_lengths};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -381,7 +421,9 @@ void initBindings(nb::module_& m)
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
             nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
-            nb::arg("arrival_time") = std::nullopt)
+            nb::arg("arrival_time") = std::nullopt, nb::arg("agent_hierarchy") = std::nullopt,
+            nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
+            nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),

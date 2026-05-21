@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 
@@ -24,14 +25,12 @@ namespace tensorrt_llm::executor
 KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> const& maxTokens,
     std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec,
     std::optional<SizeType32> const& sinkTokenLength, std::optional<FloatType> const& freeGpuMemoryFraction,
-    std::optional<size_t> const& hostCacheSize, bool onboardBlocks,
-    std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
-    size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
-    SizeType32 attentionDpEventsGatherPeriodMs,
+    std::optional<size_t> const& hostCacheSize, std::optional<FloatType> const& crossKvCacheFraction,
+    std::optional<RetentionPriority> secondaryOffloadMinPriority, size_t eventBufferMaxSize, bool enablePartialReuse,
+    bool copyOnPartialReuse, bool useUvm, SizeType32 attentionDpEventsGatherPeriodMs,
     std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults, uint64_t const& maxGpuTotalBytes)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
-    , mOnboardBlocks(onboardBlocks)
     , mSecondaryOffloadMinPriority(secondaryOffloadMinPriority)
     , mEventBufferMaxSize{eventBufferMaxSize}
     , mEnablePartialReuse{enablePartialReuse}
@@ -117,11 +116,6 @@ std::optional<size_t> KvCacheConfig::getHostCacheSize() const
     return mHostCacheSize;
 }
 
-bool KvCacheConfig::getOnboardBlocks() const
-{
-    return mOnboardBlocks;
-}
-
 std::optional<RetentionPriority> KvCacheConfig::getSecondaryOffloadMinPriority() const
 {
     return mSecondaryOffloadMinPriority;
@@ -175,7 +169,9 @@ void KvCacheConfig::setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentio
 {
     for (SizeType32 maxAttentionWindow : maxAttentionWindowVec)
     {
-        TLLM_CHECK(maxAttentionWindow > 0);
+        TLLM_CHECK(maxAttentionWindow > 0
+            || maxAttentionWindow
+                == batch_manager::kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
     }
     mMaxAttentionWindowVec = maxAttentionWindowVec;
 }
@@ -204,11 +200,6 @@ void KvCacheConfig::setCrossKvCacheFraction(FloatType crossKvCacheFraction)
 void KvCacheConfig::setHostCacheSize(size_t hostCacheSize)
 {
     mHostCacheSize = hostCacheSize;
-}
-
-void KvCacheConfig::setOnboardBlocks(bool onboardBlocks)
-{
-    mOnboardBlocks = onboardBlocks;
 }
 
 void KvCacheConfig::setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority)

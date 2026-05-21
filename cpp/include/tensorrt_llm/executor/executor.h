@@ -298,12 +298,18 @@ class MultimodalInput
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
         std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
-        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
     [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalItemRunCuOffsets() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunPositions() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunLengths() const;
 
 private:
     friend class Serialization;
@@ -316,6 +322,12 @@ private:
     /// @brief Optional user-provided UUIDs for multimodal items.
     /// When provided, these are returned in KV cache events instead of content hashes.
     std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
+    /// @brief Optional offsets indexing the flat exact multimodal run arrays per item.
+    std::optional<std::vector<SizeType32>> mMultimodalItemRunCuOffsets;
+    /// @brief Optional prompt start positions for flat exact multimodal token runs.
+    std::optional<std::vector<SizeType32>> mMultimodalRunPositions;
+    /// @brief Optional lengths for flat exact multimodal token runs.
+    std::optional<std::vector<SizeType32>> mMultimodalRunLengths;
 };
 
 /// @brief Configuration for mrope
@@ -671,7 +683,8 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
-    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths}
+    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths, optional
+    /// exact prompt runs}
     /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
@@ -1039,7 +1052,7 @@ public:
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
-        std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
+        std::optional<size_t> const& hostCacheSize = std::nullopt,
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
@@ -1056,7 +1069,6 @@ public:
     [[nodiscard]] std::optional<FloatType> getFreeGpuMemoryFraction() const;
     [[nodiscard]] std::optional<FloatType> getCrossKvCacheFraction() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
-    [[nodiscard]] bool getOnboardBlocks() const;
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
@@ -1072,7 +1084,6 @@ public:
     void setFreeGpuMemoryFraction(FloatType freeGpuMemoryFraction);
     void setCrossKvCacheFraction(FloatType crossKvCacheFraction);
     void setHostCacheSize(size_t hostCacheSize);
-    void setOnboardBlocks(bool onboardBlocks);
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
@@ -1115,9 +1126,6 @@ private:
     /// @brief Size of secondary memory pool in bytes. Default is 0.
     /// Having a secondary memory pool increases KV cache block reuse potential.
     std::optional<size_t> mHostCacheSize;
-
-    /// @brief Controls whether offloaded blocks should be onboarded back into primary memory before being reused.
-    bool mOnboardBlocks;
 
     /// @brief Only blocks with priority > mSecondaryOfflineMinPriority can be offloaded to secondary memory.
     std::optional<RetentionPriority> mSecondaryOffloadMinPriority;
@@ -1533,7 +1541,7 @@ public:
     static constexpr SizeType32 kDefaultRequestStatsMaxIterations = 0;
 
     explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
-        KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = true,
+        KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = false,
         SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,

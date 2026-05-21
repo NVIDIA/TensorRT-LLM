@@ -4,7 +4,7 @@
  * and https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_update.cu
  * Copyright (c) 2024, Tri Dao.
  *
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,7 +56,7 @@ struct Causal_conv1d_fwd_kernel_traits
     static constexpr int kSmemSize = kSmemIOSize + kSmemExchangeSize;
 };
 
-template <typename Ktraits>
+template <typename Ktraits, bool kHasConvStateIndices, bool kSiluActivation>
 __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(ConvParamsBase params)
 {
     constexpr int kWidth = Ktraits::kWidth;
@@ -94,13 +94,18 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
         ? false
         : reinterpret_cast<bool*>(params.has_initial_state_ptr)[batch_id];
 
-    int* cache_indices
-        = params.cache_indices_ptr == nullptr ? nullptr : reinterpret_cast<int*>(params.cache_indices_ptr);
-    int cache_index = cache_indices == nullptr ? batch_id : cache_indices[batch_id];
-    // cache_index == params.pad_slot_id is defined as padding, so we exit early
-    if (cache_index == params.pad_slot_id)
+    int cache_index;
+    if constexpr (kHasConvStateIndices)
     {
-        return;
+        cache_index = reinterpret_cast<int*>(params.cache_indices_ptr)[batch_id];
+        if (cache_index == params.pad_slot_id)
+        {
+            return;
+        }
+    }
+    else
+    {
+        cache_index = batch_id;
     }
     input_t* conv_states = params.conv_states_ptr == nullptr ? nullptr
                                                              : reinterpret_cast<input_t*>(params.conv_states_ptr)
@@ -119,6 +124,35 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
             }
         }
         smem_exchange[kNThreads - 1] = reinterpret_cast<vec_t*>(initial_state)[0];
+    }
+
+    // Save final conv_state from the tail of x directly, instead of reconstructing it
+    // from smem_exchange after the main loop.
+    if (conv_states != nullptr && tidx == 0)
+    {
+        if (seqlen >= kWidth - 1)
+        {
+#pragma unroll
+            for (int w = 0; w < kWidth - 1; ++w)
+            {
+                conv_states[w] = x[(seqlen - (kWidth - 1) + w) * params.x_l_stride];
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int w = 0; w < kWidth - 1; ++w)
+            {
+                if (w < (kWidth - 1) - seqlen)
+                {
+                    conv_states[w] = has_initial_state ? conv_states[w + seqlen] : input_t(0.0f);
+                }
+                else
+                {
+                    conv_states[w] = x[(w - ((kWidth - 1) - seqlen)) * params.x_l_stride];
+                }
+            }
+        }
     }
 
     float weight_vals[kWidth];
@@ -208,7 +242,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
             out_vals[i + 1] = acc1;
         }
 
-        if (params.silu_activation)
+        if constexpr (kSiluActivation)
         {
 #pragma unroll
             for (int i = 0; i < kNElts; i += 2)
@@ -239,90 +273,6 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
             typename Ktraits::BlockStoreT(smem_store).Store(out, out_vals_store, seqlen - chunk * kChunkSize);
         }
         out += kChunkSize;
-
-        int final_state_position = ((seqlen - (kWidth - 1)) - (n_chunks - 1) * kChunkSize);
-        // in case the final state is separated between the last "smem_exchange" and
-        // and the one before it (chunk = n_chunks - 1 and chunk = n_chunks - 2),
-        // (which occurs when `final_state_position` is a non-positive index)
-        // we load the correct data from smem_exchange from both chunks, the last chunk iteration and the one before it
-        if (conv_states != nullptr && final_state_position < 0 && seqlen > kWidth)
-        {
-            input_t vals_load[kNElts] = {0};
-            if ((chunk == n_chunks - 2) && (tidx == kNThreads - 1))
-            {
-                // chunk = n_chunks - 2, a segment of the final state sits in the last index
-                reinterpret_cast<vec_t*>(vals_load)[0] = smem_exchange[kNThreads - 1];
-#pragma unroll
-                for (int w = 0; w < -final_state_position; ++w)
-                {
-                    conv_states[w] = vals_load[kNElts + final_state_position + w];
-                }
-            }
-            if ((chunk == n_chunks - 1) && tidx == 0)
-            {
-                // chunk = n_chunks - 1, the second segment of the final state first positions
-                reinterpret_cast<vec_t*>(vals_load)[0] = smem_exchange[0];
-                for (int w = -final_state_position; w < kWidth - 1; ++w)
-                {
-                    conv_states[w] = vals_load[w + final_state_position];
-                }
-                return;
-            }
-        }
-    }
-    // Final state is stored in the smem_exchange last token slot,
-    // in case seqlen < kWidth, we would need to take the final state from the
-    // initial state which is stored in conv_states
-    // in case seqlen > kWidth, we would need to load the last kWidth - 1 data
-    // and load it into conv_state accordingly
-    int last_thread = ((seqlen - (kWidth - 1)) - (n_chunks - 1) * kChunkSize) / kNElts;
-    if (conv_states != nullptr && tidx == last_thread)
-    {
-        input_t x_vals_load[kNElts * 2] = {0};
-        // in case we are on the first kWidth tokens
-        if (last_thread == 0 && seqlen < kWidth)
-        {
-            // Need to take the initial state
-            reinterpret_cast<vec_t*>(x_vals_load)[0] = smem_exchange[0];
-            int const offset = seqlen - (kWidth - 1);
-#pragma unroll
-            for (int w = 0; w < kWidth - 1; ++w)
-            {
-                // pad the existing state
-                if ((w - seqlen) >= 0 && has_initial_state)
-                {
-                    conv_states[w - seqlen] = conv_states[w];
-                }
-                else if ((w - seqlen) >= 0 && !has_initial_state)
-                {
-                    conv_states[w - seqlen] = input_t(0.0f);
-                }
-            }
-#pragma unroll
-            for (int w = 0; w < kWidth - 1; ++w)
-            {
-                if (offset + w >= 0)
-                    conv_states[w] = x_vals_load[offset + w];
-            }
-        }
-        else
-        {
-            // in case the final state is in between the threads data
-            int const offset = ((seqlen - (kWidth - 1)) % (kNElts));
-            if ((offset + kWidth - 2) >= kNElts && (last_thread + 1 < kNThreads))
-            {
-                // In case last_thread == kNThreads - 1, accessing last_thread + 1 will result in a
-                // illegal access error on H100.
-                // Therefore, we access last_thread + 1, only if the final state data sits there
-                reinterpret_cast<vec_t*>(x_vals_load)[1] = smem_exchange[last_thread + 1];
-            }
-            reinterpret_cast<vec_t*>(x_vals_load)[0] = smem_exchange[last_thread];
-#pragma unroll
-            for (int w = 0; w < kWidth - 1; ++w)
-            {
-                conv_states[w] = x_vals_load[offset + w];
-            }
-        }
     }
 }
 
@@ -331,22 +281,56 @@ void causal_conv1d_fwd_launch(ConvParamsBase& params, cudaStream_t stream)
 {
     static constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
     bool const kVarlen = params.query_start_loc_ptr != nullptr;
-    BOOL_SWITCH(params.seqlen % kNElts == 0 && !kVarlen, kIsVecLoad,
+    // Enable vectorized 128-bit loads when total tokens are aligned. For varlen with
+    // batch==1 (common prefill), seq_start is always 0 so alignment is guaranteed.
+    bool const canVecLoad = params.seqlen % kNElts == 0 && (!kVarlen || params.batch == 1);
+    BOOL_SWITCH(canVecLoad, kIsVecLoad,
         [&]
         {
             using Ktraits = Causal_conv1d_fwd_kernel_traits<kNThreads, kWidth, kIsVecLoad, input_t, weight_t>;
             constexpr int kSmemSize = Ktraits::kSmemSize;
             dim3 grid(params.batch, params.dim);
-
-            auto kernel = &causal_conv1d_fwd_kernel<Ktraits>;
-
-            if (kSmemSize >= 48 * 1024)
-            {
-                TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-            }
-            kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+            bool const hasConvStateIdx = params.cache_indices_ptr != nullptr;
+            BOOL_SWITCH(hasConvStateIdx, kHasCSI,
+                [&]
+                {
+                    BOOL_SWITCH(params.silu_activation, kSilu,
+                        [&]
+                        {
+                            auto kernel = &causal_conv1d_fwd_kernel<Ktraits, kHasCSI, kSilu>;
+                            if (kSmemSize >= 48 * 1024)
+                            {
+                                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+                                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                            }
+                            kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+                        });
+                });
             TLLM_CUDA_KERNEL_LAUNCH_CHECK();
         });
+}
+
+template <int kWidth, typename input_t, typename weight_t>
+void causal_conv1d_fwd_dispatch(ConvParamsBase& params, cudaStream_t stream)
+{
+    bool const isVarlen = params.query_start_loc_ptr != nullptr;
+    constexpr int kNarrowThreads = 64;
+    constexpr int kWideThreads = 128;
+    constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
+    constexpr int kShortSeqThreshold = kNarrowThreads * kNElts;
+    // Pick the wider 128-thread kernel when the average per-sequence length exceeds
+    // one chunk; otherwise the narrower 64-thread kernel avoids overprovisioning.
+    int const avgSeqlen = isVarlen ? (params.seqlen / max(params.batch, 1)) : params.seqlen;
+    bool const preferNarrowKernel = avgSeqlen <= kShortSeqThreshold;
+
+    if (preferNarrowKernel)
+    {
+        causal_conv1d_fwd_launch<kNarrowThreads, kWidth, input_t, weight_t>(params, stream);
+    }
+    else
+    {
+        causal_conv1d_fwd_launch<kWideThreads, kWidth, input_t, weight_t>(params, stream);
+    }
 }
 
 template <typename input_t, typename weight_t>
@@ -354,15 +338,15 @@ void causal_conv1d_fwd_cuda(ConvParamsBase& params, cudaStream_t stream)
 {
     if (params.width == 2)
     {
-        causal_conv1d_fwd_launch<128, 2, input_t, weight_t>(params, stream);
+        causal_conv1d_fwd_dispatch<2, input_t, weight_t>(params, stream);
     }
     else if (params.width == 3)
     {
-        causal_conv1d_fwd_launch<128, 3, input_t, weight_t>(params, stream);
+        causal_conv1d_fwd_dispatch<3, input_t, weight_t>(params, stream);
     }
     else if (params.width == 4)
     {
-        causal_conv1d_fwd_launch<128, 4, input_t, weight_t>(params, stream);
+        causal_conv1d_fwd_dispatch<4, input_t, weight_t>(params, stream);
     }
 }
 
@@ -381,7 +365,7 @@ struct Causal_conv1d_update_kernel_traits
     static_assert(kNBytes == 2 || kNBytes == 4);
 };
 
-template <typename Ktraits, bool kIsCircularBuffer>
+template <typename Ktraits, bool kIsCircularBuffer, bool kHasConvStateIndices, bool kSiluActivation>
 __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kernel(ConvParamsBase params)
 {
     constexpr int kWidth = Ktraits::kWidth;
@@ -398,14 +382,18 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     input_t* x
         = reinterpret_cast<input_t*>(params.x_ptr) + batch_id * params.x_batch_stride + channel_id * params.x_c_stride;
 
-    // If params.conv_state_batch_indices is set, then the conv state is gathered from the conv state tensor
-    // along the batch axis. Otherwise, the conv state coordinate is the same as the batch id.
-    int const conv_state_batch_coord
-        = params.conv_state_indices_ptr == nullptr ? batch_id : params.conv_state_indices_ptr[batch_id];
-    // conv_state_batch_coord == params.pad_slot_id is defined as padding so we exit early
-    if (conv_state_batch_coord == params.pad_slot_id)
+    int conv_state_batch_coord;
+    if constexpr (kHasConvStateIndices)
     {
-        return;
+        conv_state_batch_coord = params.conv_state_indices_ptr[batch_id];
+        if (conv_state_batch_coord == params.pad_slot_id)
+        {
+            return;
+        }
+    }
+    else
+    {
+        conv_state_batch_coord = batch_id;
     }
     input_t* conv_state = reinterpret_cast<input_t*>(params.conv_state_ptr)
         + conv_state_batch_coord * params.conv_state_batch_stride + channel_id * params.conv_state_c_stride;
@@ -481,7 +469,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
         {
             out_val += weight_vals[j] * x_vals[j];
         }
-        if (params.silu_activation)
+        if constexpr (kSiluActivation)
         {
             out_val = out_val / (1 + expf(-out_val));
         }
@@ -495,31 +483,119 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     }
 }
 
+// Specialized kernel for the dominant decode case (seqlen=1, non-circular, silu).
+// Drops the per-token loop and circular-buffer bookkeeping from the general kernel.
+template <typename Ktraits, bool kHasConvStateIndices>
+__global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kernel_sl1(ConvParamsBase params)
+{
+    constexpr int kWidth = Ktraits::kWidth;
+    constexpr int kNThreads = Ktraits::kNThreads;
+    using input_t = typename Ktraits::input_t;
+    using weight_t = typename Ktraits::weight_t;
+
+    int const tidx = threadIdx.x;
+    int const batch_id = blockIdx.x;
+    int const channel_id = blockIdx.y * kNThreads + tidx;
+    if (channel_id >= params.dim)
+        return;
+
+    int conv_state_batch_coord;
+    if constexpr (kHasConvStateIndices)
+    {
+        conv_state_batch_coord = params.conv_state_indices_ptr[batch_id];
+        if (conv_state_batch_coord == params.pad_slot_id)
+            return;
+    }
+    else
+    {
+        conv_state_batch_coord = batch_id;
+    }
+
+    input_t* conv_state = reinterpret_cast<input_t*>(params.conv_state_ptr)
+        + conv_state_batch_coord * params.conv_state_batch_stride + channel_id * params.conv_state_c_stride;
+    weight_t* weight = reinterpret_cast<weight_t*>(params.weight_ptr) + channel_id * params.weight_c_stride;
+    input_t* x
+        = reinterpret_cast<input_t*>(params.x_ptr) + batch_id * params.x_batch_stride + channel_id * params.x_c_stride;
+
+    float w[kWidth];
+#pragma unroll
+    for (int i = 0; i < kWidth; ++i)
+        w[i] = float(__ldg(&weight[i * params.weight_width_stride]));
+
+    float s[kWidth];
+#pragma unroll
+    for (int i = 0; i < kWidth - 1; ++i)
+        s[i] = float(conv_state[i * params.conv_state_l_stride]);
+    s[kWidth - 1] = float(x[0]);
+
+    float out_val = params.bias_ptr == nullptr ? 0.f : float(reinterpret_cast<weight_t*>(params.bias_ptr)[channel_id]);
+#pragma unroll
+    for (int i = 0; i < kWidth; ++i)
+        out_val = __fmaf_rn(w[i], s[i], out_val);
+    out_val = out_val * __frcp_rn(1.0f + __expf(-out_val));
+    x[0] = input_t(out_val);
+
+    // Shift conv_state left by one and append the new token.
+#pragma unroll
+    for (int i = 0; i < kWidth - 1; ++i)
+        conv_state[i * params.conv_state_l_stride] = input_t(s[i + 1]);
+}
+
 template <int kNThreads, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_update_launch(ConvParamsBase& params, cudaStream_t stream)
 {
     using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
     dim3 grid(params.batch, (params.dim + kNThreads - 1) / kNThreads);
-    auto kernel = params.cache_seqlens == nullptr ? &causal_conv1d_update_kernel<Ktraits, false>
-                                                  : &causal_conv1d_update_kernel<Ktraits, true>;
-    kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
+    bool const hasConvStateIndices = params.conv_state_indices_ptr != nullptr;
+    bool const isCircularBuffer = params.cache_seqlens != nullptr;
+
+    // Fast path for the standard decode case (seqlen=1, non-circular, silu) when
+    // conv_state holds exactly width-1 elements (no extra trailing padding to shift).
+    if (params.seqlen == 1 && !isCircularBuffer && params.silu_activation && params.conv_state_len == params.width - 1)
+    {
+        BOOL_SWITCH(hasConvStateIndices, kHasCSI,
+            [&]
+            {
+                auto kernel = &causal_conv1d_update_kernel_sl1<Ktraits, kHasCSI>;
+                kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
+            });
+    }
+    else
+    {
+        BOOL_SWITCH(isCircularBuffer, kIsCircBuf,
+            [&]
+            {
+                BOOL_SWITCH(hasConvStateIndices, kHasCSI,
+                    [&]
+                    {
+                        BOOL_SWITCH(params.silu_activation, kSilu,
+                            [&]
+                            {
+                                auto kernel = &causal_conv1d_update_kernel<Ktraits, kIsCircBuf, kHasCSI, kSilu>;
+                                kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
+                            });
+                    });
+            });
+    }
     TLLM_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename input_t, typename weight_t>
 void causal_conv1d_update_cuda(ConvParamsBase& params, cudaStream_t stream)
 {
+    // Wider blocks (128 vs 64 threads) halve block count, reducing scheduling overhead.
+    constexpr int kNThreads = 128;
     if (params.width == 2)
     {
-        causal_conv1d_update_launch<64, 2, input_t, weight_t>(params, stream);
+        causal_conv1d_update_launch<kNThreads, 2, input_t, weight_t>(params, stream);
     }
     else if (params.width == 3)
     {
-        causal_conv1d_update_launch<64, 3, input_t, weight_t>(params, stream);
+        causal_conv1d_update_launch<kNThreads, 3, input_t, weight_t>(params, stream);
     }
     else if (params.width == 4)
     {
-        causal_conv1d_update_launch<64, 4, input_t, weight_t>(params, stream);
+        causal_conv1d_update_launch<kNThreads, 4, input_t, weight_t>(params, stream);
     }
 }
 

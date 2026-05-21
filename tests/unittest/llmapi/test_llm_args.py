@@ -1,4 +1,5 @@
 import tempfile
+from collections import defaultdict
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from utils.llm_data import llm_models_root
+from utils.util import force_ampere
 
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
@@ -18,6 +20,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -29,13 +32,15 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
+                                          ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
                                           PeftCacheConfig, PybindMirror,
-                                          RayPlacementConfig, SpeculativeConfig,
-                                          StrictBaseModel, TorchCompileConfig,
-                                          TorchLlmArgs, TrtLlmArgs,
+                                          RayPlacementConfig, SleepConfig,
+                                          SpeculativeConfig, StrictBaseModel,
+                                          TorchCompileConfig, TorchLlmArgs,
+                                          TrtLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
@@ -313,7 +318,6 @@ def test_KvCacheConfig_declaration():
                            sink_token_length=32,
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
-                           onboard_blocks=True,
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
@@ -328,7 +332,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.sink_token_length == 32
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
-    assert pybind_config.onboard_blocks == True
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
@@ -347,6 +350,88 @@ def test_ContextChunkingPolicy():
     val = ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.maybe_to_pybind(
         val) == tle.ContextChunkingPolicy.EQUAL_PROGRESS
+
+
+def test_SleepConfig_restore_modes_normalized_from_dict():
+    sleep_config = SleepConfig(
+        restore_modes={
+            ExecutorMemoryType.KV_CACHE.value: "NONE",
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
+        })
+
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+    assert isinstance(sleep_config.restore_modes[ExecutorMemoryType.SAMPLER],
+                      RestoreMode)
+
+
+def test_SleepConfig_restore_modes_normalized_from_defaultdict():
+    sleep_config = SleepConfig(restore_modes=defaultdict(
+        lambda: RestoreMode.CPU, {
+            ExecutorMemoryType.KV_CACHE: RestoreMode.NONE,
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "PINNED",
+        }))
+
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.PINNED
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
+
+
+@force_ampere
+def test_SleepConfig_is_picklable():
+    """SleepConfig with default construction must survive a pickle round-trip.
+
+    MPI worker initialisation serialises llm_args (including SleepConfig) via
+    pickle to distribute configuration to each rank.  The defaultdict inside
+    restore_modes previously used a closure lambda as its default_factory, which
+    is not picklable.  This test catches any regression to that pattern.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+    assert rt.restore_modes == cfg_default.restore_modes
+
+
+@force_ampere
+def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
+    """SleepConfig with explicit per-key overrides must survive a pickle round-trip."""
+    import pickle
+
+    cfg_custom = SleepConfig(
+        restore_modes={
+            ExecutorMemoryType.KV_CACHE.value: "NONE",
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
+        })
+    rt_custom = pickle.loads(pickle.dumps(cfg_custom))  # noqa: S301
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+
+
+@force_ampere
+def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
+    """The defaultdict default_factory must remain functional after pickle.
+
+    Missing keys should return a valid RestoreMode rather than raising
+    KeyError, proving the factory (not just the already-present entries)
+    was serialised correctly.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+
+    missing_key = ExecutorMemoryType.SAMPLER
+    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
+    assert rt.restore_modes[missing_key] == cfg_default.restore_modes[
+        missing_key]
 
 
 def test_DynamicBatchConfig_declaration():
@@ -515,6 +600,129 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
     check_nested_dict_equality(build_config_dict1, build_config_dict2)
 
 
+class TestTelemetryConfigPrecedence:
+    """Test that telemetry config follows: default < YAML < CLI precedence."""
+
+    def test_default_telemetry_config_preserved_when_no_yaml(self):
+        """Default telemetry_config survives YAML merge when YAML has none."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"max_batch_size": 8}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is False
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    def test_yaml_can_override_disabled(self):
+        """YAML telemetry_config.disabled overrides the default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is True
+
+    def test_yaml_cannot_override_usage_context(self):
+        """usage_context is coupled to the CLI entry point.
+
+        The CLI entry point (serve, eval, etc.) that first creates the
+        TelemetryConfig sets usage_context, so YAML must not override it.
+        """
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {
+            "telemetry_config": {
+                "disabled": True,
+                "usage_context": "cli_eval",
+            }
+        }
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is True
+
+    def test_cli_disabled_overrides_yaml_enabled(self):
+        """CLI --telemetry-disabled wins over YAML disabled=false."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_EVAL),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": False}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # Simulate CLI --no-telemetry (as done in eval.py / serve.py)
+        telemetry = False
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_EVAL
+
+    def test_yaml_disabled_respected_when_cli_not_set(self):
+        """When CLI doesn't set --no-telemetry, YAML disabled=true is kept."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # CLI flag not set (--telemetry is default True) — no override
+        telemetry = True
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    @pytest.mark.parametrize("yaml_value", [None, False, "invalid", 0])
+    def test_yaml_null_telemetry_config_preserves_default(self, yaml_value):
+        """YAML telemetry_config: null/false/invalid preserves the CLI default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": yaml_value}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is False
+
+
 class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):
@@ -556,6 +764,238 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.batch_sizes == CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_config.max_batch_size == 128
+
+    @pytest.mark.parametrize("max_batch_size", [64, 129, 320])
+    def test_generate_cuda_graph_batch_sizes_padding_edge_cases(
+            self, max_batch_size):
+        # All sizes must be <= max_batch_size, sorted, and include max_batch_size
+        batch_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            max_batch_size, enable_padding=True)
+        assert all(s <= max_batch_size for s in batch_sizes)
+        assert batch_sizes == sorted(batch_sizes)
+        assert max_batch_size in batch_sizes
+
+
+class TestPiecewiseCudaGraphCaptureDefaults:
+    """Piecewise CUDA graph capture-set defaults and reachable-ceiling filter.
+
+    Three invariants are exercised:
+
+    1. `TorchCompileConfig.capture_num_tokens` defaults to a fixed
+       powers-of-2 + 256-stride list when `enable_piecewise_cuda_graph`
+       is True (and stays `None` otherwise). The fixed list keeps the
+       capture set small to bound startup time and CUDA graph memory;
+       the model-engine filter (invariants 2 and 3) ensures the largest
+       reachable size is always captured even when it is not in this
+       default list.
+    2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
+       `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
+       the largest forward-pass `num_tokens` the warmup builder can
+       construct, since every in-flight request must leave room for at
+       least one decode token.
+    3. The reachable ceiling itself is always present in the returned
+       capture set (when positive), so runtime ISLs in the gap between
+       the next-largest candidate and the ceiling get a graph rather
+       than falling back to eager.
+    """
+
+    _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
+        range(256, 3073, 256))
+
+    def test_torch_compile_config_capture_num_tokens_default_when_piecewise_enabled(
+            self):
+        """Default capture set is the powers-of-2 + 256-stride list.
+
+        Keeps the capture set bounded (~20 entries) so server startup
+        time and CUDA graph memory stay predictable. The model engine
+        further filters and appends the reachable ceiling, so
+        out-of-range entries (e.g. > max_seq_len-1) are never recorded
+        and gap ISLs still get a graph.
+        """
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
+        assert config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+
+    def test_torch_compile_config_capture_num_tokens_stays_none_when_piecewise_disabled(
+            self):
+        """No default is populated when piecewise is off.
+
+        The capture set is irrelevant in this case; populating it would
+        be misleading in serialized configs.
+        """
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=False)
+        assert config.capture_num_tokens is None
+
+    def test_torch_compile_config_capture_num_tokens_user_override_preserved(
+            self):
+        """User-supplied `capture_num_tokens` is not overwritten by the default."""
+        user_list = [4, 8, 16]
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=True,
+                                    capture_num_tokens=user_list)
+        # `validate_capture_num_tokens` dedupes and reverse-sorts.
+        assert config.capture_num_tokens == sorted(set(user_list), reverse=True)
+
+    def test_torch_llm_args_capture_num_tokens_default_when_piecewise_enabled(
+            self):
+        """Same default applies when reached through `TorchLlmArgs` construction.
+
+        This is the path real users hit via `trtllm-serve` YAML.
+        """
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            max_batch_size=1,
+            max_seq_len=128,
+            max_beam_width=10,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            torch_compile_config=TorchCompileConfig(
+                enable_piecewise_cuda_graph=True),
+        )
+        assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+
+    def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
+        """Drop candidates above `max_batch_size * (max_seq_len - 1)`.
+
+        Without the cap, the warmup loop would silently skip these entries
+        and the outer padding logic would pad to a target with no captured
+        graph. They must be removed from `kept` and surfaced in
+        `unrecordable` so the warning fires. The ceiling itself is then
+        appended so ISLs in the gap still get a graph.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            128, enable_padding=True)
+        max_capturable = 1 * (128 - 1)
+        # Precondition: candidate list contains at least one entry above
+        # the reachable ceiling, otherwise the assertions below are vacuous.
+        assert any(i > max_capturable for i in candidates), (
+            "Test precondition no longer holds: cuda_graph_batch_sizes "
+            f"for max_batch_size=128 no longer contains entries above "
+            f"{max_capturable}. Update this test if CudaGraphConfig "
+            "behavior changed.")
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+        )
+
+        assert kept[-1] == max_capturable  # ceiling appended
+        assert 120 in kept  # densely-packed entries below ceiling preserved
+        assert 128 not in kept
+        assert unrecordable == [128]
+
+    def test_piecewise_filter_keeps_all_entries_when_within_ceiling(self):
+        """Keep all candidates when the largest fits within the ceiling.
+
+        Symmetric case: when `max_batch_size * (max_seq_len - 1)` is at
+        least as large as the biggest candidate, nothing is dropped and
+        `unrecordable` is empty. The ceiling (128 here) coincides with the
+        largest candidate so no extra entry is appended.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            128, enable_padding=True)
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=129,
+            max_batch_size=1,
+            max_seq_len=129,
+        )
+        assert kept[-1] == 128
+        assert 128 in kept
+        # Ceiling (128) was already in candidates, must not be duplicated.
+        assert kept.count(128) == 1
+        assert unrecordable == []
+
+    def test_piecewise_filter_subtracts_extra_decoding_steps(self):
+        """Subtract `num_extra_decoding_steps` from the ceiling.
+
+        Drafting loops consume extra decode steps; the filter must mirror
+        the `max_seq_len - 1 - num_extra_decoding_steps` constraint
+        applied when warmup requests are built. The ceiling is appended
+        whenever it is strictly greater than the largest surviving
+        candidate.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
+        # max_seq_len=128, batch=1, 5 extra decoding steps -> ceiling 122.
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+            num_extra_decoding_steps=5,
+        )
+        assert kept[-1] == 122
+        assert 120 in kept
+        assert unrecordable == []
+        # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+            num_extra_decoding_steps=9,
+        )
+        assert kept[-1] == 118
+        assert 100 in kept
+        assert 120 not in kept
+        assert unrecordable == [120]
+
+    def test_piecewise_filter_does_not_double_append_ceiling(self):
+        """Ceiling already present in candidates -> not duplicated."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, _ = _filter_piecewise_capture_num_tokens(
+            [1, 64, 128],
+            max_num_tokens=129,
+            max_batch_size=1,
+            max_seq_len=129,
+        )
+        assert kept == [1, 64, 128]
+
+    def test_piecewise_filter_returns_empty_when_ceiling_is_zero(self):
+        """`max_seq_len=1` -> ceiling 0 -> nothing captured.
+
+        With ceiling 0 every positive candidate is unrecordable and the
+        ceiling itself is not appended, so the warning "exceeds reachable
+        ceiling 0; raise max_seq_len" fires for the full candidate list.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            [1, 2, 4],
+            max_num_tokens=8,
+            max_batch_size=1,
+            max_seq_len=1,
+        )
+        assert kept == []
+        assert unrecordable == [1, 2, 4]
+
+    def test_piecewise_filter_appends_ceiling_when_only_smaller_candidates(
+            self):
+        """No candidate near the ceiling -> ceiling still appended."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, _ = _filter_piecewise_capture_num_tokens(
+            [1, 2, 4, 8],
+            max_num_tokens=1024,
+            max_batch_size=8,
+            max_seq_len=128,
+        )
+        # Ceiling: 8 * (128 - 1) = 1016.
+        assert kept == [1, 2, 4, 8, 1016]
 
 
 class TestTrtLlmArgs:
@@ -1135,8 +1575,7 @@ class TestPyTorchBackendModelDefaults:
 
     @pytest.mark.part0
     def test_empty_nested_config_preserves_defaults(self):
-        """Passing an empty nested config (e.g. KvCacheConfig()) should not
-        block model defaults from applying to that config's sub-fields.
+        """Passing an empty nested config should not block model defaults.
 
         This covers the pattern used by tests that conditionally build a
         KvCacheConfig: ``kv_cache_config=KvCacheConfig(...) if cond else
@@ -1191,11 +1630,7 @@ def _get_all_llm_args_classes():
 
 
 def _get_all_pydantic_models_from_llm_args():
-    """
-    Get all Pydantic models referenced by BaseLlmArgs and its subclasses,
-    including nested models.
-    """
-
+    """Get all Pydantic models referenced by BaseLlmArgs and its subclasses."""
     visited = set()
     models = []
 
@@ -1248,8 +1683,7 @@ def _get_qualified_name(cls: type) -> str:
 
 
 class TestPydanticBestPractices:
-    """
-    Ensure that the user-facing LlmArgs and its subfields follow Pydantic best practices.
+    """Ensure that the user-facing LlmArgs and its subfields follow Pydantic best practices.
     """
 
     # Fields exempt from Pydantic compatibility checks due to typing limitations or other edge cases.
@@ -1267,9 +1701,9 @@ class TestPydanticBestPractices:
             "checkpoint_loader",  # abstract base class type
         ],
         AutoDeployLlmArgs: [
-            "draft_checkpoint_loader",  # typed as object due to circular import
             "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
             "model_kwargs",  # typed as Dict[str, Any] for flexibility
+            "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)
             "tokenizer_kwargs",  # typed as Dict[str, Any] for flexibility
         ],
         UserProvidedDecodingConfig: [
@@ -1282,8 +1716,7 @@ class TestPydanticBestPractices:
 
     def _is_allowed_type(self, annotation, model_cls: type,
                          field_name: str) -> tuple[bool, str]:
-        """
-        Check if a type annotation is allowed for user-facing config fields.
+        """Check if a type annotation is allowed for user-facing config fields.
 
         Allowed:
         - Pydantic models (must inherit from StrictBaseModel)
@@ -1295,7 +1728,6 @@ class TestPydanticBestPractices:
 
         Returns (is_allowed, reason) tuple.
         """
-
         # Check if this field is exempt (check class and all parent classes)
         for cls in model_cls.__mro__:
             if field_name in self._COMPATIBILITY_EXEMPT_FIELDS.get(cls, []):
@@ -1381,14 +1813,17 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following fields are missing descriptions:\n" +
+                "The following fields are missing descriptions:\n" +
                 "\n".join(violations) +
                 "\n\nPlease add a description to each by using Field(description=\"...\")."
             )
 
     def test_all_fields_have_allowed_types(self):
-        """Test that all fields in LlmArgs classes (including subfields) have types that are allowed
-        (i.e. are Pydantic-compatible) according to the logic in _is_allowed_type."""
+        """Test that all fields in LlmArgs classes have allowed types.
+
+        Checks that fields (including subfields) have Pydantic-compatible
+        types according to the logic in _is_allowed_type.
+        """
         violations = []
 
         for cls in _get_all_pydantic_models_from_llm_args():
@@ -1404,7 +1839,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following user-facing fields have types that are not allowed:\n"
+                "The following user-facing fields have types that are not allowed:\n"
                 + "\n".join(violations) +
                 "\n\nPlease use Pydantic-compatible types (primitives, Pydantic models that inherit from StrictBaseModel, "
                 "or other compatible types). If this is intentional, add the field "
@@ -1447,7 +1882,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following models define forbidden methods:\n" +
+                "The following models define forbidden methods:\n" +
                 "\n".join(violations) +
                 "\n\nPydantic models should follow the recommendations above instead."
             )
@@ -1470,7 +1905,7 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following fields use mutable default values:\n" +
+                "The following fields use mutable default values:\n" +
                 "\n".join(violations) +
                 "\n\nMutable defaults are shared across instances and cause bugs. "
                 "Use Field(default_factory=...) instead.")
@@ -1497,7 +1932,82 @@ class TestPydanticBestPractices:
 
         if violations:
             pytest.fail(
-                f"The following Pydantic models define custom __init__ methods:\n"
+                "The following Pydantic models define custom __init__ methods:\n"
                 + "\n".join(violations) +
                 "\n\nThese should be replaced with alternatives like validators, model_post_init, or classmethods. See this test's docstring for more details."
             )
+
+
+class TestSkipSoftmaxAttentionConfig:
+
+    def test_resolve_computes_thresholds(self):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        formula = {
+            'prefill': {
+                'a': 7e-5,
+                'b': 7.929109
+            },
+            'decode': {
+                'a': 7e-5,
+                'b': 16.9025
+            },
+        }
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
+            'prefill': 0.5,
+            'decode': 0.5
+        })
+        resolved = cfg.resolve_for_target_sparsity(formula)
+
+        expected_prefill = 7e-5 * math.exp(7.929109 * 0.5)
+        expected_decode = 7e-5 * math.exp(16.9025 * 0.5)
+        assert resolved.threshold_scale_factor_prefill == pytest.approx(
+            expected_prefill)
+        assert resolved.threshold_scale_factor_decode == pytest.approx(
+            expected_decode)
+
+    def test_resolve_scalar_target_sparsity(self):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        formula = {
+            'prefill': {
+                'a': 7e-5,
+                'b': 7.929109
+            },
+            'decode': {
+                'a': 7e-5,
+                'b': 16.9025
+            },
+        }
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
+        resolved = cfg.resolve_for_target_sparsity(formula)
+
+        assert resolved.threshold_scale_factor_prefill == pytest.approx(
+            7e-5 * math.exp(7.929109 * 0.3))
+        assert resolved.threshold_scale_factor_decode == pytest.approx(
+            7e-5 * math.exp(16.9025 * 0.3))
+
+    def test_resolve_missing_coefficients_raises(self):
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
+            'prefill': 0.5,
+            'decode': 0.5
+        })
+        with pytest.raises(ValueError, match="missing formula coefficients"):
+            cfg.resolve_for_target_sparsity({})
+
+    def test_threshold_scale_factor_unaffected(self):
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor={
+            'prefill': 0.001,
+            'decode': 0.002
+        })
+        assert cfg.target_sparsity is None
+        assert cfg.threshold_scale_factor_prefill == pytest.approx(0.001)
+        assert cfg.threshold_scale_factor_decode == pytest.approx(0.002)

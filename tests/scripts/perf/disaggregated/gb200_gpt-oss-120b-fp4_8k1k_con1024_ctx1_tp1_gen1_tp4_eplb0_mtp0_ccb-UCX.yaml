@@ -1,0 +1,106 @@
+metadata:
+  model_name: gpt_oss_120b_fp4
+  precision: fp4
+  model_dir_name: GPT-OSS-120B-FP4
+  supported_gpus:
+  - GB200
+  script_file: disaggr_torch.slurm
+  benchmark_type: 8k1k
+  # Mirror of the Dynamo GPT-OSS-120B TRT-LLM disagg deployment recipe:
+  # https://github.com/ai-dynamo/dynamo/tree/main/recipes/gpt-oss-120b/trtllm/disagg
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 10
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '1024'
+  input_length: 8192
+  output_length: 1024
+  dataset_file: datasets/perf-ci/gpt_oss_120b-8k1k-20480-ratio-1_for_serve.json
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  # Env vars taken from the Dynamo deploy.yaml (OVERRIDE_QUANT_ALGO selects
+  # W4A8_MXFP4_MXFP8, which is the distinguishing feature of this recipe vs.
+  # existing gpt-oss perf-sanity configs; PDL / no-parallel-weight-load /
+  # disabled NCCL graph register / disabled UCC collective are preserved so
+  # the same load & runtime paths are exercised).
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes OVERRIDE_QUANT_ALGO=W4A8_MXFP4_MXFP8 TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True NCCL_GRAPH_REGISTER=0 OMPI_MCA_coll_ucc_enable=0"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+worker_config:
+  gen:
+    print_iter_log: true
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    max_batch_size: 1280
+    max_num_tokens: 20000
+    max_seq_len: 11000
+    trust_remote_code: true
+    allreduce_strategy: AUTO
+    attention_dp_config:
+      enable_balance: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 1280
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+      dtype: fp8
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      max_tokens_in_buffer: 9216
+      backend: UCX
+    disable_overlap_scheduler: false
+    num_postprocess_workers: 4
+    stream_interval: 20
+  ctx:
+    print_iter_log: true
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    max_batch_size: 64
+    max_num_tokens: 20000
+    max_seq_len: 9000
+    trust_remote_code: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 30
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+      dtype: fp8
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      max_tokens_in_buffer: 9216
+      backend: UCX
+    disable_overlap_scheduler: true
+    num_postprocess_workers: 4
+    stream_interval: 20

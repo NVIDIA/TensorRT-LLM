@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from datetime import datetime
@@ -40,7 +41,7 @@ class LogParser(object):
         """
         self.benchmark_type = benchmark_type
         self.config = config
-        self.metrics_config = metrics_config  # 保存 metrics 配置
+        self.metrics_config = metrics_config
         self.result_dir = result_dir
 
     def _extract_log(self, pattern: str, metric_names: List[str], log_content: str):
@@ -50,25 +51,68 @@ class LogParser(object):
         for match in compiled.finditer(log_content):
             logger.debug(f"Found match: {match.group(0)[:100]}...")
             logger.debug(f"All groups: {match.groups()}")
-            logger.debug(f"Number of groups: {len(match.groups())}")
 
             if len(match.groups()) < 3:
-                logger.warning(f"Expected 3 groups but got {len(match.groups())}")
+                logger.warning(f"Expected at least 3 groups but got {len(match.groups())}")
                 continue
 
             try:
                 values = [float(x) for x in match.groups()[:-1]]
-                concurrency = int(match.groups()[-1])  # Use groups()[-1] instead of group(-1)
+                concurrency = int(match.groups()[-1])
                 item = dict(zip(metric_names, values))
-                item["concurrency"] = concurrency  # Concurrency used to make test names
+                item["concurrency"] = concurrency
                 results.append(item)
                 logger.debug(
-                    f"Successfully extracted: E2EL={values[0]}, TTFT={values[1]}, concurrency={concurrency}"
+                    f"Extracted: concurrency={concurrency}, {dict(zip(metric_names, values))}"
                 )
             except (ValueError, IndexError) as e:
                 logger.warning(f"Error processing match: {e}")
                 continue
         return results
+
+    def _extract_request_counts_from_log(self, log_content: str) -> Tuple[int, int]:
+        """Extract failed/total from log via regex (TRT-LLM benchmark_serving.py format).
+
+        Sums all matches to handle multi-concurrency logs correctly.
+        """
+        failed_requests = 0
+        total_requests = 0
+        # Match "Failed requests:" (capital F) from summary block, not
+        # "Total failed requests:" (lowercase f) which can report 0 incorrectly
+        failed_matches = re.findall(r"Failed requests:\s+(\d+)", log_content)
+        total_matches = re.findall(r"Total requests:\s+(\d+)", log_content)
+        if failed_matches:
+            failed_requests = sum(int(x) for x in failed_matches)
+        if total_matches:
+            total_requests = sum(int(x) for x in total_matches)
+        return failed_requests, total_requests
+
+    def _extract_request_counts_from_json(self, concurrencies: List[int]) -> Tuple[int, int]:
+        """Extract failed/total from result.json files (bench_serving format).
+
+        Used when use_nv_sa_benchmark is true, since bench_serving logs do not
+        contain "Total requests" / "Total failed requests" fields.
+        """
+        total_requests = 0
+        failed_requests = 0
+        for concurrency in concurrencies:
+            result_json_path = os.path.join(
+                self.result_dir, f"concurrency_{concurrency}", "result.json"
+            )
+            if not os.path.exists(result_json_path):
+                logger.warning(f"result.json not found: {result_json_path}")
+                continue
+            try:
+                with open(result_json_path, "r") as f:
+                    data = json.load(f)
+                num_prompts = data.get("num_prompts", 0)
+                completed = data.get("completed", 0)
+                total_requests += num_prompts
+                failed_requests += num_prompts - completed
+            except json.JSONDecodeError as e:
+                logger.warning(f"Error reading result.json: {result_json_path}, {e}")
+                continue
+        return failed_requests, total_requests
 
     def parse(
         self,
@@ -77,28 +121,47 @@ class LogParser(object):
         test_name: Optional[str] = None,
     ):
         """Parse logs using configured metrics."""
-        # Build log file path using metrics_config.log_file
         log_file_name = os.path.join(self.result_dir, self.metrics_config.log_file)
 
         if not os.path.exists(log_file_name):
             logger.error(f"Log file not found: {log_file_name}")
-            return {"status": False, "df": None}
+            return {"status": False, "df": None, "failed_requests": 0, "total_requests": 0}
 
         with open(log_file_name, "r", encoding="utf-8", errors="replace") as log_file:
             log_content = log_file.read()
 
-        # Use metrics_config for extraction
         raw_results = self._extract_log(
             self.metrics_config.extractor_pattern, self.metrics_config.metric_names, log_content
         )
+
+        # Determine request count extraction strategy based on benchmark backend
+        use_nv_sa = False
+        if isinstance(self.config, dict):
+            use_nv_sa = self.config.get("benchmark", {}).get("use_nv_sa_benchmark", False)
+
+        if use_nv_sa:
+            concurrencies = [item.get("concurrency", 0) for item in raw_results]
+            failed_requests, total_requests = self._extract_request_counts_from_json(concurrencies)
+        else:
+            failed_requests, total_requests = self._extract_request_counts_from_log(log_content)
+
         if len(raw_results) == 0:
             logger.warning("No metrics extracted from log file")
-            return {"status": False, "df": None}
+            return {
+                "status": False,
+                "df": None,
+                "failed_requests": failed_requests,
+                "total_requests": total_requests,
+            }
 
-        # Convert to perf result format
         df = self._convert_to_perf_result_format(raw_results, model_name, timestamps, test_name)
 
-        return {"status": True, "df": df}
+        return {
+            "status": True,
+            "df": df,
+            "failed_requests": failed_requests,
+            "total_requests": total_requests,
+        }
 
     def _convert_to_perf_result_format(
         self,
@@ -107,19 +170,9 @@ class LogParser(object):
         timestamps: Optional[Dict[str, str]] = None,
         test_name: Optional[str] = None,
     ):
-        """Convert raw results to perf result format.
-
-        Each test result is expanded into multiple rows, one row per metric.
-
-        Args:
-            raw_results: Raw performance results
-            model_name: Model name
-            timestamps: Optional timestamps dict
-            test_name: Optional pytest test name (e.g., "test_benchmark[deepseek-r1_1k1k_...]")
-        """
+        """Convert raw results to perf result format (one row per metric)."""
         expanded_rows = []
-        test_prefix = test_name
-        # Use provided timestamps or fallback to current time
+
         if timestamps:
             start_time = timestamps.get(
                 "start_timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -137,53 +190,40 @@ class LogParser(object):
         lock_freq_graphics = gpu_config.get("lock_freq_graphics_mhz", 0) or 0
         lock_freq_memory = gpu_config.get("lock_freq_memory_mhz", 0) or 0
 
-        # Get precision from YAML config metadata
         if isinstance(self.config, dict):
             precision = self.config.get("metadata", {}).get("precision", "unknown")
         else:
-            # Fallback if config is not a dict (should not happen in current system)
             precision = "unknown"
 
         for item in raw_results:
             concurrency = item.get("concurrency", "1")
-            base_test_name = f"{test_prefix}_con:{concurrency}"
+            base_test_name = f"{test_name}_con:{concurrency}"
 
-            # Create a separate row for each performance metric
             for metric_name, metric_value in item.items():
                 if metric_name == "concurrency":
                     continue
 
-                # Create new row
                 row = {
-                    # Network related fields (use test_name)
                     "network_name": self._get_network_name(base_test_name),
                     "network_hash": base_test_name,
-                    # Hardware related fields (leave empty)
                     "sm_clk": lock_freq_graphics,
                     "mem_clk": lock_freq_memory,
                     "gpu_idx": np.nan,
-                    # Test related fields
                     "perf_case_name": base_test_name,
                     "test_name": base_test_name,
                     "original_test_name": base_test_name,
-                    # Performance metrics
                     "perf_metric": float(metric_value),
                     "metric_type": metric_name,
-                    # Time related fields - use actual timestamps from TestCaseTracker
                     "total_time__sec": total_time,
                     "start_timestamp": start_time,
                     "end_timestamp": end_time,
-                    # State and configuration
                     "state": "valid",
                     "command": f"disagg_benchmark --model={model_name} --{precision} --concurrency={concurrency}",
-                    # Threshold related fields
                     "threshold": np.nan,
                     "absolute_threshold": np.nan,
                 }
-
                 expanded_rows.append(row)
 
-        # Create DataFrame and ensure column order
         expected_columns = [
             "network_name",
             "network_hash",
@@ -205,13 +245,9 @@ class LogParser(object):
         ]
 
         df = pd.DataFrame(expanded_rows)
-
-        # Ensure all expected columns exist
         for col in expected_columns:
             if col not in df.columns:
                 df[col] = np.nan
-
-        # Rearrange column order
         df = df[expected_columns]
 
         return df
@@ -219,57 +255,33 @@ class LogParser(object):
     def _get_network_name(self, base_test_name: str):
         """Extract network name from test name.
 
-        Input format:
-            test_disagg_simple.py::TestDisaggBenchmark::test_benchmark[deepseek-r1_1k1k_...]-con-1
-        Output format:
-            deepseek-r1_1k1k_...-con-1
+        e.g. "...::test_benchmark[deepseek-r1_1k1k_...]-con-1" -> "deepseek-r1_1k1k_...-con-1"
         """
-        # Pattern to extract content inside brackets and the trailing -con-X
-        # Group 1: content inside []
-        # Group 2: -con-X suffix
-        pattern = r"\[([^\]]+)\](-con-\d+)"
-        match = re.search(pattern, base_test_name)
-
+        match = re.search(r"\[([^\]]+)\](-con-\d+)", base_test_name)
         if match:
-            # Combine the bracket content with -con-X suffix
             return f"{match.group(1)}{match.group(2)}"
-        else:
-            # Fallback: if pattern doesn't match, use original logic
-            return base_test_name.replace("/", "-")
+        return base_test_name.replace("/", "-")
 
 
 class ResultSaver(object):
-    """All of the benchmarks append to the same csv, add header to it each time.
-
-    No matter whether the columns are of the same count.
-    """
+    """Append benchmark results to a shared CSV file."""
 
     def __init__(self, output_path: str):
         self.output_path = output_path
 
     def append_a_df(self, df: pd.DataFrame):
-        """Seamlessly append DataFrame to CSV without headers or extra line breaks.
-
-        Ideal for unified format data where consistency is maintained across appends.
-        """
-        # Check if file exists and has content
+        """Append DataFrame to CSV, writing header only on first write."""
         file_exists = os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0
 
         if file_exists:
-            # File exists, append data only (no header)
             df.to_csv(self.output_path, mode="a", index=False, header=False)
-            logger.success(f"Seamlessly appended {len(df)} rows to {self.output_path}")
+            logger.success(f"Appended {len(df)} rows to {self.output_path}")
         else:
-            # First write, include header
             df.to_csv(self.output_path, mode="w", index=False, header=True)
             logger.success(f"Created new file with {len(df)} rows: {self.output_path}")
 
     def save_all(self, results: List[Tuple[pd.DataFrame, str]]):
-        """Save in batch manner: Append each dataframe with header.
-
-        The 2nd parameter can print to logs.
-        ex: [(df1, '1k1k'), (df2, '8k1k')]
-        """
+        """Append each (DataFrame, benchmark_type) pair to CSV."""
         for df, btype in results:
             logger.info(f"Writing benchmark type: {btype}")
             self.append_a_df(df)

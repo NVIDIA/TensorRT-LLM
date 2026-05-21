@@ -8,6 +8,8 @@ from tqdm import tqdm
 from transformers import LlamaConfig
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
+from tensorrt_llm._utils import get_hf_rope_theta
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.eagle.config import EagleConfig
 from tensorrt_llm.models.eagle.model import EagleForCausalLM
@@ -262,6 +264,7 @@ def convert_and_save_hf(config, args):
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
@@ -291,7 +294,7 @@ if __name__ == '__main__':
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.rotary_scaling = hf_config.rope_scaling
-        args.rotary_base = hf_config.rope_theta
+        args.rotary_base = get_hf_rope_theta(hf_config, 10000.0)
         args.n_positions = hf_config.max_position_embeddings
         args.dtype = str(
             hf_config.torch_dtype)[6:] if args.dtype == 'auto' else args.dtype

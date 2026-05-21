@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from . import rawref
-from ._block_radix_tree import gen_multi_modal_tokens
+from ._block_radix_tree import ReuseScope, gen_multimodal_cache_key_tokens
 from ._common import (
     NDEBUG,
     CacheLevel,
@@ -22,21 +22,33 @@ from ._common import (
     CudaStream,
     LayerId,
     MemAddress,
+    PageIndexMode,
     Priority,
     TokenId,
     TokenIdExt,
 )
 from ._config import (
     AttentionLayerConfig,
+    BatchDesc,
     BufferConfig,
     CacheTierConfig,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
+    KVCacheDesc,
     KVCacheManagerConfig,
+    SsmLayerConfig,
 )
-from ._core import DEFAULT_BEAM_INDEX, AggregatedPageDesc, BeamIndex, KVCacheManager, _KVCache
+from ._core import (
+    DEFAULT_BEAM_INDEX,
+    AggregatedPageDesc,
+    BeamIndex,
+    KVCacheManager,
+    PageIndexConverter,
+    ScratchDesc,
+    _KVCache,
+)
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
 from ._storage import BufferId
 
@@ -51,6 +63,7 @@ __all__ = [
     "DEFAULT_BEAM_INDEX",
     "LayerId",
     "Priority",
+    "ReuseScope",
     "CacheLevel",
     "CacheTier",
     "CudaStream",
@@ -58,14 +71,20 @@ __all__ = [
     "NDEBUG",
     "KVCacheManagerConfig",
     "AttentionLayerConfig",
+    "SsmLayerConfig",
     "BufferConfig",
     "DataRole",
     "DiskCacheTierConfig",
     "GpuCacheTierConfig",
     "HostCacheTierConfig",
+    "BatchDesc",
     "CacheTierConfig",
-    "gen_multi_modal_tokens",
+    "KVCacheDesc",
+    "gen_multimodal_cache_key_tokens",
     "rawref",
     "AggregatedPageDesc",
     "BufferId",
+    "PageIndexConverter",
+    "PageIndexMode",
+    "ScratchDesc",
 ]

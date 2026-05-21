@@ -125,7 +125,9 @@ class TestDisaggBenchmark:
 
             # Check results and generate report
             result = JobManager.check_result(job_id, test_config, timestamps, full_test_name)
-            assert result["success"], f"Performance test failed: {job_id}"
+            assert result["success"], (
+                f"Performance test failed: {job_id}\n{result.get('error', 'Unknown error')}"
+            )
 
         except Exception as e:
             test_tracker.end_test_case()

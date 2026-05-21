@@ -74,12 +74,18 @@ public:
         return mCacheManager;
     }
 
+    [[nodiscard]] BufferKind getBufferKind() const override
+    {
+        return mTransferIndexerKCache ? BufferKind::kKV_INDEXER : BufferKind::kKV;
+    }
+
 private:
     /// @brief Compute transfer buffer size from KV cache configuration.
     static size_t computeTransferBufferSize(KVCacheManager::BaseKVCacheManager* cacheManager,
         std::optional<size_t> maxNumTokens, bool transferIndexerKCache);
 
     KVCacheManager::BaseKVCacheManager* mCacheManager;
+    bool mTransferIndexerKCache;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

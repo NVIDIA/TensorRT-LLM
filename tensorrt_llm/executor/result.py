@@ -25,6 +25,8 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
+from ..metrics.perf_utils import \
+    process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -170,6 +172,7 @@ class GenerationResultBase:
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
+        self._error_msg: Optional[str] = None
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
@@ -177,7 +180,9 @@ class GenerationResultBase:
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
+        self._aborted = False
         self.metrics_dict = {}
+        self.candidate_metrics: list[dict] = []
         self.trace_headers: Optional[dict[str, str]] = None
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
         self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
@@ -212,6 +217,22 @@ class GenerationResultBase:
         # GenerationResultBase instances on postprocess worker processes.
         self._params_transmitted = False
 
+    def abort(self) -> None:
+        """Abort the generation request.
+
+        Base implementation sets the aborted flag. Subclasses with executor
+        access (e.g. GenerationResult) override to also cancel on the executor.
+        """
+        self._aborted = True
+
+    def aborted(self) -> bool:
+        """Return whether the generation request is aborted.
+
+        Returns:
+            bool: whether the generation request is aborted.
+        """
+        return self._aborted
+
     @property
     def outputs(self) -> List[CompletionOutput]:
         sampling_param = self.sampling_params
@@ -238,6 +259,11 @@ class GenerationResultBase:
     def disaggregated_params(self) -> Optional[DisaggregatedParams]:
         """Returns the disaggregated params."""
         return self._disaggregated_params
+
+    @property
+    def error(self) -> Optional[str]:
+        """Return the error message if this result completed with an error."""
+        return self._error_msg
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -376,9 +402,14 @@ class GenerationResultBase:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
 
-        # Only record stats and do tracing when the entire request is done
+        # Record per-candidate metrics as each sequence finishes so that
+        # GENERATION_TOKENS and TPOT are captured for every candidate when
+        # sampling_params.n > 1.
+        if sequence_is_finished:
+            self.record_stats(output, req_perf_metrics_dict, seq_idx)
+
+        # Tracing is recorded once when the entire request is done.
         if self._done:
-            self.record_stats(output, req_perf_metrics_dict)
             self.do_tracing(output, req_perf_metrics_dict)
 
     @print_traceback_on_error
@@ -418,15 +449,31 @@ class GenerationResultBase:
             if response.metrics:
                 self.metrics_dict.update(response.metrics)
 
-            if response.error:
-                if self._background_error_handler is not None and (
-                        handler := self._background_error_handler()):
-                    handler(response.error)
+            if self._done:
+                req_perf_metrics_dict = _build_perf_metrics_dict(
+                    response.request_perf_metrics)
+                # On the non-streaming path, response.res is not a CompletionOutput, so
+                # token_ids/finish_reason must be carried separately and applied here.
+                if not isinstance(response.res, CompletionOutput):
+                    if response.finish_reason is not None:
+                        self._outputs[0].finish_reason = response.finish_reason
+                    if response.num_generated_tokens is not None:
+                        self._outputs[0].token_ids = [
+                            -1
+                        ] * response.num_generated_tokens  # placeholder for tracing token_ids.length
+                self.do_tracing(self._outputs[0], req_perf_metrics_dict)
+
+            if response.should_abort and not self._aborted:
+                self.abort()
+
         elif is_llm_response(response):
             if response.has_error():
+                self._error_msg = response.error_msg
+                self._done = True
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
                     handler(response.error_msg)
+                return  # Never fall through to response.result
 
             response_result = response.result
             if hasattr(response_result, "_result") and isinstance(
@@ -518,6 +565,8 @@ class GenerationResultBase:
                     handler := self._background_error_handler()):
                 handler()
         elif isinstance(response, ErrorResponse):
+            self._error_msg = response.error_msg
+            self._done = True
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
                 handler(response.error_msg)
@@ -526,12 +575,19 @@ class GenerationResultBase:
 
     def record_stats(self,
                      output: CompletionOutput,
-                     stats: Optional[dict[str, float]] = None) -> None:
+                     stats: Optional[dict[str, float]] = None,
+                     sequence_index: int = 0) -> None:
         """Record the stats of the generation result.
+
+        Called once per candidate when it finishes.  When ``n > 1`` each
+        candidate has its own timestamps so TPOT and GENERATION_TOKENS are
+        computed independently per candidate.  PROMPT_TOKENS are only recorded
+        for ``sequence_index == 0`` to avoid double-counting the shared prompt.
 
         Args:
             output (CompletionOutput): The output of the generation result.
             stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.
+            sequence_index (int): Index of this candidate (0 for the first / only sequence). Defaults to 0.
         """
         if not stats:
             return
@@ -542,9 +598,16 @@ class GenerationResultBase:
                 output.finish_reason
             })
         processed_metrics_stat = _process_req_perf_metrics(
-            stats, len(output.token_ids), self.sampling_params.n > 1)
+            stats, len(output.token_ids))
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
+        # Record prompt tokens only for the first candidate to avoid
+        # double-counting the shared prompt across n candidates.
+        if output.finish_reason and sequence_index == 0:
+            prompt_token_ids = getattr(self, "prompt_token_ids", None)
+            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
+                metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+        self.candidate_metrics.append(metrics_stats)
         self.metrics_dict.update(metrics_stats)
 
     def do_tracing(
@@ -764,7 +827,6 @@ class GenerationResult(GenerationResultBase):
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
-        self._aborted = False
 
         # Pipelined multimodal hashes from request to result
         mm_hashes = getattr(
@@ -785,15 +847,7 @@ class GenerationResult(GenerationResultBase):
         """
         assert self._executor is not None, "The executor is not set for this result."
         self._executor().abort_request(self.request_id)
-        self._aborted = True
-
-    def aborted(self) -> bool:
-        """Return whether the generation request is aborted.
-
-        Returns:
-            bool: whether the generation request is aborted.
-        """
-        return self._aborted
+        super().abort()
 
     @property
     def finished(self) -> bool:
@@ -955,6 +1009,7 @@ def compute_logprobs(
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
+    prompt_token_ids: Optional[list[int]] = None,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -1021,8 +1076,8 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs,
-        None) if k_prompt_logprobs and context_logits is not None else None
+        context_logits, k_prompt_logprobs, prompt_token_ids
+    ) if k_prompt_logprobs is not None and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
     ) if k_logprobs is not None and generation_logits is not None else None
@@ -1031,28 +1086,37 @@ def compute_logprobs(
                           generation=generation_logprobs)
 
 
-def _process_req_perf_metrics(
-        req_perf_metrics_dict: Optional[dict[str, float]],
-        output_length: int,
-        is_multiple_response: bool = False) -> dict[MetricNames, float]:
-    stat = {}
-    if not req_perf_metrics_dict:
-        return stat
-    ttft = req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0) - \
-           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    e2e = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) - \
-          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
-                         req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    stat = {
-        MetricNames.TTFT: ttft,
-        MetricNames.E2E: e2e,
-        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
+def _build_perf_metrics_dict(
+    req_perf_metrics: tllm.RequestPerfMetrics
+) -> dict[RequestEventTiming, float]:
+    if not (req_perf_metrics and req_perf_metrics.timing_metrics):
+        return {}
+    return {
+        RequestEventTiming.ARRIVAL_TIME:
+        req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
+        RequestEventTiming.FIRST_TOKEN_TIME:
+        req_perf_metrics.timing_metrics.first_token_time.total_seconds(),
+        RequestEventTiming.FIRST_SCHEDULED_TIME:
+        req_perf_metrics.timing_metrics.first_scheduled_time.total_seconds(),
+        RequestEventTiming.LAST_TOKEN_TIME:
+        req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
+        RequestEventTiming.KV_CACHE_TRANSFER_START:
+        req_perf_metrics.timing_metrics.kv_cache_transfer_start.total_seconds(),
+        RequestEventTiming.KV_CACHE_TRANSFER_END:
+        req_perf_metrics.timing_metrics.kv_cache_transfer_end.total_seconds(),
+        RequestEventTiming.KV_CACHE_SIZE:
+        req_perf_metrics.timing_metrics.kv_cache_size,
     }
-    if output_length > 1 and not is_multiple_response:
-        tpot = (req_perf_metrics_dict.get(
-            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
-                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
-        stat.update({MetricNames.TPOT: tpot})
-    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
-    return stat
+
+
+def get_metrics_dict(
+        response: tllm.Response) -> dict[RequestEventTiming, float]:
+    req_perf_metrics = None
+    res = response.result
+    if res:
+        if hasattr(res, '_result'):
+            if result := res.get_result():
+                req_perf_metrics = result.request_perf_metrics
+        else:
+            req_perf_metrics = res.request_perf_metrics
+    return _build_perf_metrics_dict(req_perf_metrics)

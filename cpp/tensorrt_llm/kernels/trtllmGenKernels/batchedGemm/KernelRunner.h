@@ -42,7 +42,8 @@ enum class ActType
     //
     // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
     SwiGlu,
-    Relu2
+    Relu2,
+    Silu
 };
 
 // Type of the element-wise activation to apply after the Gemm
@@ -59,12 +60,19 @@ enum class EltwiseActType
     // act = relu(x0) ^ 2
     // where x0 is the output of the Gemm.
     Relu2,
+    // Silu is defined as the following operation:
+    // act = x0 * sigmoid(x0)
+    // where x0 is the output of the Gemm.
+    Silu
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions
 {
+    // Canonically, A is activation.
     batchedGemm::trtllm::gen::Dtype dtypeA;
+    // Canonically, B is weight.
     batchedGemm::trtllm::gen::Dtype dtypeB;
+    // C is output.
     batchedGemm::trtllm::gen::Dtype dtypeC;
     ActType actType{ActType::SwiGlu};
     EltwiseActType eltwiseActType{EltwiseActType::None};
@@ -72,6 +80,8 @@ struct TrtllmGenBatchedGemmRunnerOptions
     bool fusedAct{false};
     bool routeAct{false};
     bool staticBatch{false};
+    // Legacy: force transpose-only kernels. Used by fp8BatchedGemmTrtllmGen.
+    // MoE callers leave false (auto-selects transpose or non-transpose).
     bool transposeMmaOutput{false};
     int32_t tileSize{8};
     int32_t epilogueTileM{128};

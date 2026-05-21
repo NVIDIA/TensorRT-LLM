@@ -6,6 +6,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 
 from ...inputs import (
+    ContentFormat,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     register_input_processor,
@@ -42,6 +43,7 @@ from .modeling_utils import ModelConfig, register_auto_model, register_vision_en
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
+        content_format=ContentFormat.STRING,
     ),
 )
 class Qwen3MoeVLModel(Qwen3VLModelBase):

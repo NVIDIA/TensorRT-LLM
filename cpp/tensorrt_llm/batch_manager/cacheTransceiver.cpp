@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -147,10 +147,11 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         kvFactor = 1;
     }
-    mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
-        attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
-        cacheManager->isEnablePartialReuse(), cacheManager->isEnableIndexerKCache(),
-        cacheManager->getIndexerKCacheIndexHeadDim(), cacheManager->getIndexerKCacheQuantBlockSize());
+    mCacheState
+        = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig, attentionLayerNumPerPP,
+            dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(), cacheManager->isEnablePartialReuse(),
+            cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
+            cacheManager->getIndexerKCacheQuantBlockSize(), cacheManager->getIndexerKCacheUseFp4());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
@@ -185,25 +186,12 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mCacheTransBufferManagers.push_back(
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
     }
-    mCacheTransBufferManagerPtrs.clear();
-    mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size());
-    for (auto& manager : mCacheTransBufferManagers)
-    {
-        mCacheTransBufferManagerPtrs.push_back(manager.get());
-    }
 
     // RNN specific setup
     if (mRnnStateManager != nullptr)
     {
         TLLM_LOG_DEBUG("Setting up RNN cache transfer components.");
         TLLM_CHECK(!rnnLayerNumPerPP.empty());
-
-        if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
-            || backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
-        {
-            TLLM_LOG_ERROR("RNN cache transfer is not supported for NIXL and MOONCAKE yet");
-            return;
-        }
 
         mRnnCacheTransBufferManager
             = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager, maxNumTokens);
@@ -216,6 +204,17 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
 
         TLLM_LOG_INFO("RNN cache transfer components initialized.");
+    }
+
+    mCacheTransBufferManagerPtrs.clear();
+    mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size() + (mRnnCacheTransBufferManager ? 1 : 0));
+    for (auto& manager : mCacheTransBufferManagers)
+    {
+        mCacheTransBufferManagerPtrs.push_back(manager.get());
+    }
+    if (mRnnCacheTransBufferManager)
+    {
+        mCacheTransBufferManagerPtrs.push_back(mRnnCacheTransBufferManager.get());
     }
 
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
@@ -239,14 +238,18 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
+        auto rnnState
+            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "nixl");
+            mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState);
         TLLM_LOG_INFO("NIXL Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
     {
+        auto rnnState
+            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake");
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake", rnnState);
         TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
@@ -261,7 +264,15 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
 
     auto makeFormatter = [cacheManager, isMLA, this]()
-    { return createCacheFormatter(cacheManager, mCacheTransBufferManagerPtrs, isMLA); };
+    {
+        std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
+        kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
+        for (auto& mgr : mCacheTransBufferManagers)
+        {
+            kvBufferPtrs.push_back(mgr.get());
+        }
+        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
+    };
 
     auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>
     {

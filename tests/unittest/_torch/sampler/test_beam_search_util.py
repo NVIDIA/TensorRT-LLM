@@ -19,11 +19,11 @@ from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import (
-    ModelConfig,
     register_auto_model,
     register_checkpoint_weight_loader,
     register_config_loader,
@@ -32,7 +32,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 
 # Define a dummy model to create deterministic outputs for the test
 class DummyConfig(PretrainedConfig):
-    def __init__(self):
+    def __init__(self) -> None:
         self.architectures: list[str] = ["DummyModel"]
         self.torch_dtype: torch.dtype = torch.float16
         self.num_key_value_heads: int = 16
@@ -48,13 +48,13 @@ class DummyConfig(PretrainedConfig):
 
 @register_auto_model("DummyModel")
 class DummyModel(torch.nn.Module):
-    def __init__(self, model_config: ModelConfig):
+    def __init__(self, model_config: ModelConfig[DummyConfig]):
         super().__init__()
         assert model_config.pretrained_config is not None
         self.dtype = model_config.pretrained_config.torch_dtype
         self.model_config = model_config
 
-    def infer_max_seq_len(self):
+    def infer_max_seq_len(self) -> int:
         return 2048
 
     @property
@@ -125,7 +125,7 @@ class DummyModel(torch.nn.Module):
 
     def load_weights(
         self,
-        weights: dict,
+        weights: dict[str, torch.Tensor],
         weight_mapper: BaseWeightMapper | None = None,
         skip_modules: list[str] = [],
     ):
@@ -142,14 +142,14 @@ class DummyWeightLoader(BaseWeightLoader):
         Returns:
             Dictionary mapping parameter names to tensors
         """
-        weights = {}
+        weights: dict[str, Any] = {}
 
         return weights
 
 
 @register_config_loader("DUMMY_FORMAT")
 class DummyConfigLoader(BaseConfigLoader):
-    def load(self, checkpoint_dir: str, **kwargs) -> ModelConfig:
+    def load(self, checkpoint_dir: str, **kwargs) -> ModelConfig[DummyConfig]:
         """Load and parse configuration from your dummy format.
         Args:
             checkpoint_dir: Directory containing configuration files

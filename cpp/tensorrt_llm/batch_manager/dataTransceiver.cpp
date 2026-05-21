@@ -26,6 +26,7 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <chrono>
@@ -384,9 +385,10 @@ public:
         auto allCounterparts = mCacheTransferLayer.computeCounterparts(
             mSelfState.getCommState().value().getSelfIdx(), info.getTransState());
 
-        auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx(); // Index of self in peer's comm state
+        auto peerSelfIdx = info.getTransState().getCommState()->getSelfIdx();
         int peerIdx = std::distance(
             allCounterparts.begin(), std::find(allCounterparts.begin(), allCounterparts.end(), peerSelfIdx));
+
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
         {
@@ -830,15 +832,11 @@ public:
             auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
             auto lastBlockKey
                 = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
-            if (llmRequest.getInputTokensExtraIds().has_value())
-            {
-                auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-                SizeType32 startTokenIdx
-                    = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
-                SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
-                auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
-                lastBlockKey.extraKeys = std::move(extraKeys);
-            }
+            auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+            SizeType32 startTokenIdx = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
+            SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
+            auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
+            lastBlockKey.extraKeys = std::move(extraKeys);
             // Compute indexFromEnd from the number of requested blocks
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
@@ -861,6 +859,19 @@ public:
         auto allCounterparts
             = mCacheTransferLayer.computeCounterparts(mSelfState.getCommState().value().getSelfIdx(), contextState);
 
+        auto kvCounterParts = mCacheTransferLayer.getKvFormatter()->getCounterparts(
+            mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+
+        bool hasRnn = mCacheTransferLayer.getCacheState().hasRnnConfig() && destCacheState.hasRnnConfig();
+
+        std::vector<SizeType32> rnnCounterParts;
+        if (hasRnn)
+        {
+            rnnCounterParts = executor::kv_cache::targetIRanksForRnn(
+                destCacheState, mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx())
+                                  .mIRanks;
+        }
+
         auto connections = mManager->getConnections(commState);
         std::vector<executor::kv_cache::Connection const*> allConnections;
         for (auto index : allCounterparts)
@@ -869,24 +880,59 @@ public:
             allConnections.emplace_back(connection);
         }
 
-        for (size_t i = 0; i < allConnections.size(); i++)
+        for (size_t ci = 0; ci < allCounterparts.size(); ci++)
         {
-            auto const* connection = allConnections[i];
-            // if Manager is agentConnectionManager, then send request info to agent
-            auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+            auto rank = allCounterparts[ci];
+            auto const* connection = connections.at(rank);
+
+            bool isKvCounterpart
+                = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) != kvCounterParts.end();
+            bool isRnnCounterpart
+                = hasRnn && std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) != rnnCounterParts.end();
+
             if (agentConnectionManager)
             {
-                // TODO: index -> validConnectionIdx conversion
-                // TODO(shreyasm): this will not work for RNN. Will error out in the constructor if used with RNN.
-                auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
-                    allCounterparts.size(), mSelfState.getCacheState().value(),
-                    mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
-                auto validConnectionIdx = std::find(localRankIdx.begin(), localRankIdx.end(), i) - localRankIdx.begin();
+                auto idsForRank = cacheBufferIds;
+                auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
+                for (size_t i = 0; i < idsForRank.size(); i++)
+                {
+                    auto kind = managers[i]->getBufferKind();
+                    bool include = (kind != BufferKind::kRNN) ? isKvCounterpart : isRnnCounterpart;
+                    if (!include)
+                    {
+                        idsForRank[i] = std::nullopt;
+                    }
+                }
+
+                int validConnectionIdx = 0;
+                if (isKvCounterpart)
+                {
+                    auto kvCpIdx
+                        = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) - kvCounterParts.begin();
+                    auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
+                        allCounterparts.size(), mSelfState.getCacheState().value(),
+                        mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
+                    validConnectionIdx
+                        = std::find(localRankIdx.begin(), localRankIdx.end(), kvCpIdx) - localRankIdx.begin();
+                }
+                else if (isRnnCounterpart)
+                {
+                    auto rnnTargetInfo = executor::kv_cache::targetIRanksForRnn(destCacheState,
+                        mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx());
+                    auto rnnCpIdx
+                        = std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) - rnnCounterParts.begin();
+                    auto [pickUpIdx, localRankIdx] = cache_formatter_utils::pickRecvConnections(rnnCounterParts.size(),
+                        mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(),
+                        destCacheState, rnnCounterParts, rnnTargetInfo);
+                    validConnectionIdx
+                        = std::find(localRankIdx.begin(), localRankIdx.end(), rnnCpIdx) - localRankIdx.begin();
+                }
+
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
-                TLLM_CHECK(!cacheBufferIds.empty());
+
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, cacheBufferIds, validConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx);
             }
             else
             {

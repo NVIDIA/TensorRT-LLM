@@ -63,28 +63,25 @@ private:
                         (a.score > b.score) || (a.score == b.score && a.idx < b.idx)); //@TODO: check if this is correct
                 });
 
-            // Apply sigmoid to the top-k scores
+            // Apply sigmoid to top-K scores, then store results.
+            // mPtrTopKPacked stores SIGMOID scores (matching what the scores-path kernels produce).
+            // The cluster/device kernels pass these through as-is to mPtrTopKWeights.
             for (int ie = 0; ie < param.topK; ++ie)
             {
                 auto finalScore = 1.F / (1.F + std::exp(-expIdx[ie].score));
-                expIdx[ie].score = static_cast<float>(finalScore);
-            }
 
-            // convert back to io_dtype and store the topk expert results in hostData.mPtrTopKPacked
-            for (int ie = 0; ie < param.topK; ++ie)
-            {
-                PackedType si{static_cast<T>(expIdx[ie].score), expIdx[ie].idx};
+                PackedType si{static_cast<T>(finalScore), expIdx[ie].idx};
                 reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost))[it * param.topK + ie] = si;
 
                 if (param.useTopKAsInput)
                 {
                     bufferCast<int32_t>(*this->mPtrTopKIdsHost)[it * param.topK + ie]
                         = static_cast<int32_t>(expIdx[ie].idx);
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(expIdx[ie].score);
+                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(finalScore);
                 }
                 else if (param.getExpWeights)
                 {
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(expIdx[ie].score);
+                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie] = static_cast<T>(finalScore);
                 }
             }
         }
@@ -102,12 +99,18 @@ private:
     void setParams(RoutingKernelTestParam const& param, RoutingData& routingData)
     {
         RoutingKernelTest<T>::setCommonParams(param, routingData);
-        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
 
         routingData.mPtrTopKPacked = reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedDevice));
         if (param.useTopKAsInput)
         {
             routingData.mPtrTopKIds = bufferCast<int32_t>(*this->mPtrTopKIdsDevice);
+            routingData.mPtrScores = nullptr;
+        }
+        else if (param.useTopKPackedAsInput)
+        {
+            // mPtrTopKPacked is already set above; just clear scores and topKIds
+            routingData.mPtrTopKIds = nullptr;
             routingData.mPtrScores = nullptr;
         }
         else
@@ -130,69 +133,128 @@ TYPED_TEST_SUITE(RoutingLlama4KernelTest, Bf16Types);
 
 TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/3,
-        /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
-        /*requiredComputeCapability*/ 8);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(3)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withRequiredComputeCapability(8)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/10,
-        /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(10)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/300,
-        /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(300)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withRequiredComputeCapability(8)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingLlama4KernelTest, WarpLevelParallelizationTopKAsInput)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/3,
-        /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 0.0f,
-        /*requiredComputeCapability*/ 8);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(3)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withUseTopKAsInput(true)
+                     .withRequiredComputeCapability(8)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelParallelizationTopKAsInput)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/10,
-        /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(10)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withUseTopKAsInput(true)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelParallelizationTopKAsInput)
 {
-    RoutingKernelTestParam param(RoutingMethodType::Llama4, /*numTokens=*/300,
-        /*numExperts=*/128, /*topK=*/1,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
-        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 8);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(300)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withUseTopKAsInput(true)
+                     .withRequiredComputeCapability(8)
+                     .build();
+    this->runTest(param);
+};
+
+// --- Tests for useTopKPackedAsInput (mPtrTopKPacked without mPtrScores) ---
+// For Llama4, the kernels apply sigmoid_accurate to packed scores,
+// so the packed input path goes through Llama4-specific kernels (not runPostTopKPipeline).
+
+TYPED_TEST(RoutingLlama4KernelTest, WarpLevelTopKPackedAsInput)
+{
+    // Small token count -> warp-level kernel
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(3)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withUseTopKPackedAsInput(true)
+                     .withRequiredComputeCapability(8)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingLlama4KernelTest, ClusterLevelTopKPackedAsInput)
+{
+    // Medium token count -> cluster-level kernel
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(10)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withUseTopKPackedAsInput(true)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingLlama4KernelTest, DeviceLevelTopKPackedAsInput)
+{
+    // Large token count -> multi-kernel pipeline
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Llama4)
+                     .withNumTokens(300)
+                     .withNumExperts(128)
+                     .withTopK(1)
+                     .withTileTokensDim(8)
+                     .withUseTopKPackedAsInput(true)
+                     .withRequiredComputeCapability(8)
+                     .build();
     this->runTest(param);
 };
 

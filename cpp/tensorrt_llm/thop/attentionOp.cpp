@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -42,6 +43,8 @@ namespace trtllm::attention
 using tensorrt_llm::kernels::KVBlockArray;
 using tensorrt_llm::kernels::MlaParams;
 using tensorrt_llm::kernels::SparseAttentionParams;
+using tensorrt_llm::torch_ext::KvCachePoolPointers;
+using tensorrt_llm::torch_ext::buildKvCachePoolPointers;
 
 enum class AttentionInputType : int8_t
 {
@@ -88,10 +91,13 @@ public:
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
         torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
-        int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
-        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
-        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const
+        int32_t const num_sparse_topk, std::optional<torch::Tensor> sparse_mla_topk_lens,
+        std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
+        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
+        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+        std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> flash_mla_num_splits,
+        std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt) const
         = 0;
 };
 
@@ -148,10 +154,13 @@ public:
         torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_kv_indices,
         torch::optional<torch::Tensor> sparse_kv_offsets, torch::optional<torch::Tensor> sparse_attn_indices,
         torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
-        int32_t const sparse_mla_topk, std::optional<torch::Tensor> cu_q_seqlens,
-        std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
-        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
-        std::optional<torch::Tensor> quant_q_buffer) const override
+        int32_t const num_sparse_topk, std::optional<torch::Tensor> sparse_mla_topk_lens,
+        std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
+        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
+        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+        std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> flash_mla_num_splits,
+        std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -276,6 +285,14 @@ public:
 
             mla_params.workspace = workspace_ptr;
         }
+        // Extract K/V pointers for sage attention (separate Q/K/V inputs).
+        else if (is_context
+            && (op.mSageAttnNumEltsPerBlkQ > 0 || op.mSageAttnNumEltsPerBlkK > 0 || op.mSageAttnNumEltsPerBlkV > 0))
+        {
+            TORCH_CHECK(k.has_value() && v.has_value(), "SageAttention demands separate K and V buffers");
+            k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
+            v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
+        }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
         int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
@@ -315,47 +332,13 @@ public:
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
-        // Prepare block pool pointers for NVFP4 KV cache.
-        void* host_primary_pool_pointer{nullptr};
-        void* host_secondary_pool_pointer{nullptr};
-        void* host_primary_block_scale_pool_pointer{nullptr};
-        void* host_secondary_block_scale_pool_pointer{nullptr};
-
-        // Whether NVFP4 KV cache is used.
+        // Build KV cache pool pointers from the host tensor.
         bool const use_kv_cache = op.useKVCache() && host_kv_cache_pool_pointers.has_value();
-        bool const use_nvfp4_kv_cache = use_kv_cache && op.mKVCacheQuantMode.hasFp4KvCache();
-        if (use_nvfp4_kv_cache)
+        KvCachePoolPointers pool_pointers;
+        if (use_kv_cache)
         {
-            // For NVFP4 KV cache, extra block scales are stored in separate pools.
-            // The layout of host_kv_cache_pool_pointers is [num_pools, 2 (primary and secondary), 2 (data and scale)].
-            TORCH_CHECK(host_kv_cache_pool_pointers.value().dim() == 3);
-            host_primary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0, 0}).item<int64_t>())
-                + intra_pool_offset);
-            host_secondary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1, 0}).item<int64_t>())
-                + intra_pool_offset);
-            // Calculate the intra-pool offset for scaling factors.
-            // Note that NVFP4 block scaling use a fixed vector size of 16.
-            auto constexpr vector_size = 16;
-            auto const bytes_per_block_sf = block_size / vector_size * 1 /*bytes per E4M3 sf*/;
-            auto const intra_pool_offset_sf = layer_idx_in_cache_pool * kv_factor * bytes_per_block_sf;
-            host_primary_block_scale_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0, 1}).item<int64_t>())
-                + intra_pool_offset_sf);
-            host_secondary_block_scale_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1, 1}).item<int64_t>())
-                + intra_pool_offset_sf);
-        }
-        else if (use_kv_cache)
-        {
-            TORCH_CHECK(host_kv_cache_pool_pointers.value().dim() == 2);
-            host_primary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
-                + intra_pool_offset);
-            host_secondary_pool_pointer = reinterpret_cast<void*>(
-                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
-                + intra_pool_offset);
+            pool_pointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), pool_index, intra_pool_offset,
+                block_size, layer_idx_in_cache_pool, kv_factor, op.mKVCacheQuantMode.hasFp4KvCache());
         }
 
         float const* kv_scale_orig_quant_ptr = nullptr;
@@ -400,13 +383,31 @@ public:
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_block_size = sparse_attn_indices_block_size;
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_stride
             = sparse_attn_indices.has_value() ? sparse_attn_indices.value().size(-1) : 0;
-        if (op.isMLAEnabled() && op.mUseSparseAttention)
+        op.mRuntimeSparseAttentionParams.num_sparse_topk = num_sparse_topk;
+        op.mRuntimeSparseAttentionParams.sparse_mla_topk_lens
+            = sparse_mla_topk_lens.has_value() ? sparse_mla_topk_lens.value().data_ptr<int32_t>() : nullptr;
+        op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = nullptr;
+        op.mRuntimeSparseAttentionParams.sliding_window_kv_cache_pool = nullptr;
+        if (op.mUseSparseAttention && use_kv_cache)
         {
-            op.mRuntimeSparseAttentionParams.sparse_mla_topk = sparse_mla_topk;
-            if (op.useKVCache() && host_kv_cache_pool_pointers.has_value())
+            if (host_kv_cache_pool_pointers.has_value())
             {
-                op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool = reinterpret_cast<char*>(
+                auto* kvCachePool = reinterpret_cast<char*>(
                     host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+                if (sparse_mla_topk_lens.has_value())
+                {
+                    // Deepseek V4 dynamic sparse MLA always uses the SWA pool for now.
+                    op.mRuntimeSparseAttentionParams.sliding_window_kv_cache_pool = kvCachePool;
+                    if (compressed_kv_cache_pool_ptr.has_value())
+                    {
+                        op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool
+                            = reinterpret_cast<char*>(compressed_kv_cache_pool_ptr.value());
+                    }
+                }
+                else
+                {
+                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = kvCachePool;
+                }
             }
         }
 
@@ -428,10 +429,10 @@ public:
         common_enqueue_params.context_buf = context_buf;
         common_enqueue_params.context_buf_sf = context_buf_sf;
         common_enqueue_params.block_offsets = block_offsets;
-        common_enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
-        common_enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
-        common_enqueue_params.host_primary_block_scale_pool_pointer = host_primary_block_scale_pool_pointer;
-        common_enqueue_params.host_secondary_block_scale_pool_pointer = host_secondary_block_scale_pool_pointer;
+        common_enqueue_params.host_primary_pool_pointer = pool_pointers.primaryPoolPtr;
+        common_enqueue_params.host_secondary_pool_pointer = pool_pointers.secondaryPoolPtr;
+        common_enqueue_params.host_primary_block_scale_pool_pointer = pool_pointers.primaryBlockScalePoolPtr;
+        common_enqueue_params.host_secondary_block_scale_pool_pointer = pool_pointers.secondaryBlockScalePoolPtr;
         common_enqueue_params.num_tokens = num_tokens;
         common_enqueue_params.total_kv_len = total_kv_len;
         common_enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
@@ -479,6 +480,13 @@ public:
             enqueue_params.batch_size = num_seqs;
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
+            // Pass V's actual token stride so the FMHA runner handles both
+            // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
+            // kv.split() view) correctly.
+            if (v_ptr != nullptr && v.has_value())
+            {
+                enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
+            }
 
             if (op.isMLAEnabled())
             {
@@ -578,6 +586,15 @@ public:
                     TORCH_CHECK(block_ids_per_seq.has_value());
                     int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
                     mla_params.block_ids_per_seq = block_ids_per_seq_ptr;
+                    // Use pre-computed metadata if provided.
+                    if (flash_mla_tile_scheduler_metadata.has_value())
+                    {
+                        TORCH_CHECK(flash_mla_num_splits.has_value(),
+                            "flash_mla_num_splits must be provided when flash_mla_tile_scheduler_metadata is set.");
+                        mla_params.flash_mla_tile_scheduler_metadata
+                            = flash_mla_tile_scheduler_metadata->data_ptr<int>();
+                        mla_params.flash_mla_num_splits = flash_mla_num_splits->data_ptr<int>();
+                    }
                 }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
                 op.mlaGeneration<T>(mla_params, enqueue_params, stream);
@@ -637,26 +654,34 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
-    std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
+    std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim, std::optional<bool> rope_append,
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
     std::vector<std::optional<torch::Tensor>> helix_tensor_params, std::optional<int64_t> attention_chunk_size,
     std::optional<torch::Tensor> softmax_stats_tensor, std::vector<bool> spec_decoding_bool_params,
     std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
     std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
     std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
-    int64_t const sparse_attn_indices_block_size, std::optional<int64_t> sparse_mla_topk,
+    int64_t const sparse_attn_indices_block_size, std::optional<int64_t> num_sparse_topk,
+    std::optional<torch::Tensor> sparse_mla_topk_lens,
     std::optional<double> skip_softmax_threshold_scale_factor_prefill,
     std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer)
+    std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
+    std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
+    int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
+    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
+    std::optional<int64_t> compressed_kv_cache_pool_ptr)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
 
-    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv, "Only fused QKV is supported for non-MLA attention now");
+    bool const use_sage_attn
+        = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
+    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn,
+        "Context attention only allows these non-MLA cases: fused QKV; separate QKV with SageAttention");
     TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
     auto qkv_or_q = q;
     if (is_fused_qkv)
@@ -668,6 +693,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
+    }
+    if (use_sage_attn)
+    {
+        TLLM_CHECK_WITH_INFO(
+            !is_fused_qkv, "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false).");
+        TLLM_CHECK_WITH_INFO(k.has_value(), "SageAttention requires k tensor to be provided.");
+        TLLM_CHECK_WITH_INFO(v.has_value(), "SageAttention requires v tensor to be provided.");
     }
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(qkv_or_q.scalar_type());
@@ -754,7 +786,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
-    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha);
+    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
+        || use_sage_attn;
+    // SageAttention block sizes and quantization mode.
+    op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
+    op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
+    op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v);
+    op->mSageAttnQkInt8 = sage_attn_qk_int8;
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
 
@@ -774,6 +812,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
 
     op->mUseSparseAttention = false;
+    op->mUseTllmGenSparseAttentionPaged = false;
     op->mUseTllmGenSparseAttention = false;
     if ((sparse_kv_indices.has_value() && sparse_kv_indices.value().numel() > 0)
         || (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0))
@@ -781,10 +820,20 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         op->mUseSparseAttention = true;
         if (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
         {
-            op->mUseTllmGenSparseAttention = true;
+            // Dispatch based on sparse_attn_offsets presence:
+            // - sparse_attn_offsets provided → generation paged sparse attention
+            // - sparse_attn_offsets absent → context sparse attention
+            if (sparse_attn_offsets.has_value() && sparse_attn_offsets.value().numel() > 0)
+            {
+                op->mUseTllmGenSparseAttentionPaged = true;
+            }
+            else
+            {
+                op->mUseTllmGenSparseAttention = true;
+            }
         }
     }
-    int32_t const sparse_mla_topk_value = sparse_mla_topk.has_value() ? sparse_mla_topk.value() : 0;
+    int32_t const num_sparse_topk_value = num_sparse_topk.has_value() ? num_sparse_topk.value() : 0;
 
     if (is_mla_enable)
     {
@@ -793,8 +842,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
         TLLM_CHECK(host_kv_cache_pool_mapping.has_value());
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
+        bool const rope_append_value = rope_append.value_or(true);
 
-        if (sparse_mla_topk_value > 0 && sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
+        if (num_sparse_topk_value > 0 && sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
         {
             op->mUseSparseAttention = true;
         }
@@ -803,7 +853,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
             static_cast<int>(qk_nope_head_dim.value()), static_cast<int>(qk_rope_head_dim.value()),
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
-            static_cast<int>(layer_num)};
+            static_cast<int>(layer_num), static_cast<int>(rope_append_value)};
 
         op->mFP8ContextMLA
             = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
@@ -812,7 +862,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
         op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
-        op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64;
+        op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64 && head_size == 576;
 
         // The following two parameters are used to compute kvcache related parameters such as kvcache block_size. So
         // they need to be set to 1 and 512 + 64 for both context and generation. For MLA attention kernel configs,
@@ -852,20 +902,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     }
     bool const is_gen_only = attn_input_type == AttentionInputType::GenerationOnly;
 
-    int32_t num_contexts = 0;
-    // count context requests
-    for (int32_t idx = 0; idx < num_seqs; idx++)
-    {
-        if (request_types[idx] != RequestType::kCONTEXT)
-        {
-            break;
-        }
-        ++num_contexts;
-    }
-    int32_t const num_generations = num_seqs - num_contexts;
+    int32_t const num_generations = num_seqs - static_cast<int32_t>(num_contexts);
     int32_t const num_tokens = qkv_or_q.size(0);
-    int32_t const num_ctx_tokens = host_context_lengths.slice(0, 0, num_contexts).sum().item<int32_t>();
-    int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - num_ctx_tokens;
+    int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - static_cast<int32_t>(num_ctx_tokens);
     auto const ctx_total_kv_len = host_total_kv_lens.index({0}).item<int32_t>();
     auto const gen_total_kv_len = host_total_kv_lens.index({1}).item<int32_t>();
 
@@ -912,8 +951,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
-            sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
-            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
+            cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
+            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -930,8 +970,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_tensor_params, softmax_stats_tensor,
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
-            sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, cu_q_seqlens, cu_kv_seqlens,
-            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer);
+            sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, sparse_mla_topk_lens,
+            cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
+            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -986,7 +1027,107 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     return op->supportsNvFp4Output();
 }
 
+KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
+    int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache)
+{
+    KvCachePoolPointers pointers;
+    if (isFp4KvCache)
+    {
+        // For NVFP4 KV cache, extra block scales are stored in separate pools.
+        // The layout of host_kv_cache_pool_pointers is [num_pools, 2 (primary and secondary), 2 (data and scale)].
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 3);
+        pointers.primaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 0}).item<int64_t>())
+            + intraPoolOffset);
+        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 0}).item<int64_t>())
+            + intraPoolOffset);
+        // NVFP4 block scaling uses a fixed vector size of 16.
+        auto constexpr vectorSize = 16;
+        auto const bytesPerBlockSf = blockSize / vectorSize * 1 /*bytes per E4M3 sf*/;
+        auto const intraPoolOffsetSf = layerIdxInCachePool * kvFactor * bytesPerBlockSf;
+        pointers.primaryBlockScalePoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 1}).item<int64_t>())
+            + intraPoolOffsetSf);
+        pointers.secondaryBlockScalePoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 1}).item<int64_t>())
+            + intraPoolOffsetSf);
+    }
+    else
+    {
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
+        pointers.primaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0}).item<int64_t>()) + intraPoolOffset);
+        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1}).item<int64_t>()) + intraPoolOffset);
+    }
+    return pointers;
+}
+
+common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
+    std::optional<torch::Tensor> const& kv_cache_block_offsets,
+    std::optional<torch::Tensor> const& host_kv_cache_pool_pointers,
+    std::optional<torch::Tensor> const& host_kv_cache_pool_mapping, common::QuantMode quantMode, int64_t layer_idx,
+    int64_t batch_size, int64_t tokens_per_block, int64_t kv_head_num, int64_t size_per_head,
+    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t sink_token_length,
+    int64_t beam_width, int64_t seq_offset, bool is_mla_enable, size_t elem_size)
+{
+    using kernels::KVBlockArray;
+
+    bool const useKvCache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
+        && host_kv_cache_pool_mapping.has_value();
+    if (!useKvCache)
+    {
+        return {};
+    }
+
+    int32_t const poolIndex = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 0}).item<int32_t>();
+    int32_t const layerIdxInCachePool
+        = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 1}).item<int32_t>();
+    auto* blockOffsets = static_cast<KVBlockArray::DataType*>(
+        kv_cache_block_offsets->index({poolIndex, static_cast<int64_t>(seq_offset)}).data_ptr());
+
+    int cacheElemBits = common::op::AttentionOp::getKvCacheElemSizeInBits(quantMode, elem_size);
+
+    auto const blockSize = tokens_per_block * kv_head_num * size_per_head;
+    auto const bytesPerBlock = blockSize * cacheElemBits / CHAR_BIT;
+    int32_t const kvFactor = is_mla_enable ? 1 : 2;
+    auto const intraPoolOffset = layerIdxInCachePool * kvFactor * bytesPerBlock;
+    auto const sizePerToken = static_cast<int32_t>(kv_head_num * size_per_head * cacheElemBits / 8);
+
+    auto poolPointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers.value(), poolIndex, intraPoolOffset,
+        blockSize, layerIdxInCachePool, kvFactor, quantMode.hasFp4KvCache());
+
+    int32_t const maxBlocksPerSequence = static_cast<int32_t>(kv_cache_block_offsets->size(-1));
+    return common::op::buildKvCacheBuffers<kernels::KVBlockArray>(static_cast<int32_t>(batch_size),
+        maxBlocksPerSequence, static_cast<int32_t>(tokens_per_block), sizePerToken,
+        static_cast<int32_t>(cyclic_attention_window_size),
+        static_cast<int32_t>(std::max(cyclic_attention_window_size, max_attention_window_size)),
+        static_cast<int32_t>(sink_token_length), beam_width > 1, poolPointers.primaryPoolPtr,
+        poolPointers.secondaryPoolPtr, poolPointers.primaryBlockScalePoolPtr, poolPointers.secondaryBlockScalePoolPtr,
+        blockOffsets, quantMode.hasFp4KvCache());
+}
+
 } // namespace torch_ext
+
+void computeFlashMlaMetadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits,
+    int64_t batch_size, int64_t s_q, int64_t num_q_heads, int64_t num_kv_heads, int64_t head_size_v)
+{
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static constexpr int block_size_n = 64;
+    static constexpr int fixed_overhead_num_blocks = 5;
+    int const num_sm_parts = tensorrt_llm::common::op::AttentionOp::getFlashMlaNumSmPartsStatic(static_cast<int>(s_q),
+        static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads), static_cast<int>(head_size_v));
+    Mla_metadata_params params = {};
+    params.seqlens_k_ptr = seqlens_k.data_ptr<int>();
+    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+    params.num_splits_ptr = num_splits.data_ptr<int>();
+    params.batch_size = static_cast<int>(batch_size);
+    params.block_size_n = block_size_n;
+    params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
+    params.num_sm_parts = num_sm_parts;
+    get_mla_metadata_func(params, stream);
+}
 
 TRTLLM_NAMESPACE_END
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <gtest/gtest.h>
 
+#include <array>
 #include <optional>
 #include <type_traits>
 #include <variant>
@@ -481,7 +482,7 @@ TEST(SerializeUtilsTest, VectorResponses)
 TEST(SerializeUtilsTest, KvCacheConfig)
 {
     texec::KvCacheConfig kvCacheConfig(
-        true, 10, std::vector(1, 100), 2, 0.1, 10000, false, 0.5, 50, 1024, false, false, true, 77);
+        true, 10, std::vector(1, 100), 2, 0.1, 10000, 0.5, 50, 1024, false, false, true, 77);
     auto kvCacheConfig2 = serializeDeserialize(kvCacheConfig);
 
     EXPECT_EQ(kvCacheConfig.getEnableBlockReuse(), kvCacheConfig2.getEnableBlockReuse());
@@ -492,7 +493,6 @@ TEST(SerializeUtilsTest, KvCacheConfig)
     EXPECT_EQ(kvCacheConfig.getSinkTokenLength(), kvCacheConfig2.getSinkTokenLength());
     EXPECT_EQ(kvCacheConfig.getFreeGpuMemoryFraction(), kvCacheConfig2.getFreeGpuMemoryFraction());
     EXPECT_EQ(kvCacheConfig.getHostCacheSize(), kvCacheConfig2.getHostCacheSize());
-    EXPECT_EQ(kvCacheConfig.getOnboardBlocks(), kvCacheConfig2.getOnboardBlocks());
     EXPECT_EQ(kvCacheConfig.getCrossKvCacheFraction(), kvCacheConfig2.getCrossKvCacheFraction());
     EXPECT_EQ(kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig2.getSecondaryOffloadMinPriority());
     EXPECT_EQ(kvCacheConfig.getEventBufferMaxSize(), kvCacheConfig2.getEventBufferMaxSize());
@@ -1204,6 +1204,10 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
                 EXPECT_EQ((*origUuids)[i], (*deserUuids)[i]);
             }
         }
+
+        EXPECT_EQ(original.getMultimodalItemRunCuOffsets(), deserialized.getMultimodalItemRunCuOffsets());
+        EXPECT_EQ(original.getMultimodalRunPositions(), deserialized.getMultimodalRunPositions());
+        EXPECT_EQ(original.getMultimodalRunLengths(), deserialized.getMultimodalRunLengths());
     };
 
     // Test MultimodalInput with UUIDs
@@ -1218,6 +1222,12 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
     std::vector<std::optional<std::string>> uuids = {std::string("image-uuid-001"), std::string("image-uuid-002")};
     MultimodalInput inputWithUuids(hashes, positions, lengths, uuids);
     verifyMultimodalInput(inputWithUuids);
+
+    std::vector<SizeType32> itemRunCuOffsets = {0, 2, 3};
+    std::vector<SizeType32> runPositions = {0, 40, 100};
+    std::vector<SizeType32> runLengths = {20, 30, 75};
+    MultimodalInput inputWithRuns(hashes, positions, lengths, uuids, itemRunCuOffsets, runPositions, runLengths);
+    verifyMultimodalInput(inputWithRuns);
 
     // Test with partial UUIDs (mixed Some and None)
     std::vector<std::optional<std::string>> partialUuids = {std::string("uuid-a"), std::nullopt};
@@ -1241,6 +1251,67 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
     verifyMultimodalInput(inputLongUuids);
 }
 
+TEST(SerializeUtilsTest, MultimodalInputKeepsLegacyStreamAligned)
+{
+    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4}};
+    std::vector<SizeType32> positions = {10};
+    std::vector<SizeType32> lengths = {20};
+    std::optional<std::vector<std::optional<std::string>>> uuids = std::nullopt;
+
+    std::ostringstream oss;
+    su::serialize(hashes, oss);
+    su::serialize(positions, oss);
+    su::serialize(lengths, oss);
+    su::serialize(uuids, oss);
+
+    std::array<char, 3> nextObjectPrefix{0, 0, 0};
+    oss.write(nextObjectPrefix.data(), nextObjectPrefix.size());
+    su::serialize(SizeType32{0x01020304}, oss);
+
+    auto bufferString = oss.str();
+    std::vector<char> buffer(bufferString.begin(), bufferString.end());
+    su::VectorWrapBuf<char> strbuf{buffer};
+    std::istream iss{&strbuf};
+    auto multimodalInput = texec::Serialization::deserializeMultimodalInput(iss);
+
+    EXPECT_EQ(multimodalInput.getMultimodalHashes(), hashes);
+    EXPECT_EQ(multimodalInput.getMultimodalPositions(), positions);
+    EXPECT_EQ(multimodalInput.getMultimodalLengths(), lengths);
+    EXPECT_EQ(multimodalInput.getMultimodalUuids(), uuids);
+    EXPECT_EQ(multimodalInput.getMultimodalItemRunCuOffsets(), std::nullopt);
+    EXPECT_EQ(multimodalInput.getMultimodalRunPositions(), std::nullopt);
+    EXPECT_EQ(multimodalInput.getMultimodalRunLengths(), std::nullopt);
+
+    std::array<char, 3> readPrefix{};
+    iss.read(readPrefix.data(), readPrefix.size());
+    EXPECT_EQ(readPrefix, nextObjectPrefix);
+    EXPECT_EQ(su::deserialize<SizeType32>(iss), SizeType32{0x01020304});
+}
+
+TEST(SerializeUtilsTest, MultimodalInputWithoutExactRunsUsesLegacyWireFormat)
+{
+    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4}};
+    std::vector<SizeType32> positions = {10};
+    std::vector<SizeType32> lengths = {20};
+    std::optional<std::vector<std::optional<std::string>>> uuids = std::nullopt;
+    texec::MultimodalInput input{hashes, positions, lengths, uuids};
+
+    std::ostringstream oss;
+    texec::Serialization::serialize(input, oss);
+    std::array<char, 3> nextObjectPrefix{'N', 'E', 'X'};
+    oss.write(nextObjectPrefix.data(), nextObjectPrefix.size());
+
+    std::istringstream iss(oss.str());
+    EXPECT_EQ(su::deserialize<std::vector<std::vector<SizeType32>>>(iss), hashes);
+    EXPECT_EQ(su::deserialize<std::vector<SizeType32>>(iss), positions);
+    EXPECT_EQ(su::deserialize<std::vector<SizeType32>>(iss), lengths);
+    EXPECT_EQ(su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(iss), uuids);
+
+    std::array<char, 3> readPrefix{};
+    iss.read(readPrefix.data(), readPrefix.size());
+    EXPECT_EQ(readPrefix, nextObjectPrefix);
+}
+
 // Connection notification tests
 namespace kv_cache = tensorrt_llm::executor::kv_cache;
 
@@ -1258,12 +1329,12 @@ T serializeDeserializeNotification(T const& val)
 
 TEST(SerializeUtilsTest, RequestAndBufferInfo)
 {
-    // Test with all fields populated
+    // Test with all fields populated including bufferKinds
     {
         kv_cache::RequestAndBufferInfo original{"testAgent", "127.0.0.1:8080",
             tensorrt_llm::batch_manager::RequestInfo{},
             std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 1024, 0}},
-            std::make_optional<std::string>("metadata"), 1};
+            std::make_optional<std::string>("metadata"), 1, {0, 2}};
 
         auto deserialized = serializeDeserializeNotification(original);
 
@@ -1276,13 +1347,14 @@ TEST(SerializeUtilsTest, RequestAndBufferInfo)
         EXPECT_EQ(original.mBufferDescs[0].getDeviceId(), deserialized.mBufferDescs[0].getDeviceId());
         EXPECT_EQ(original.mMetadata, deserialized.mMetadata);
         EXPECT_EQ(original.mValidConnectionIdx, deserialized.mValidConnectionIdx);
+        EXPECT_EQ(original.mBufferKinds, deserialized.mBufferKinds);
     }
 
-    // Test with nullopt metadata
+    // Test with nullopt metadata and empty bufferKinds
     {
         kv_cache::RequestAndBufferInfo original{"testAgent2", "192.168.1.1:9090",
             tensorrt_llm::batch_manager::RequestInfo{},
-            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 512, 0}}, std::nullopt, 2};
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 512, 0}}, std::nullopt, 2, {}};
 
         auto deserialized = serializeDeserializeNotification(original);
 
@@ -1295,6 +1367,26 @@ TEST(SerializeUtilsTest, RequestAndBufferInfo)
         EXPECT_EQ(original.mBufferDescs[0].getDeviceId(), deserialized.mBufferDescs[0].getDeviceId());
         EXPECT_EQ(original.mMetadata, deserialized.mMetadata);
         EXPECT_EQ(original.mValidConnectionIdx, deserialized.mValidConnectionIdx);
+        EXPECT_EQ(original.mBufferKinds, deserialized.mBufferKinds);
+        EXPECT_TRUE(deserialized.mBufferKinds.empty());
+    }
+
+    // Test with all three buffer kinds (KV + IndexerK + RNN)
+    {
+        kv_cache::RequestAndBufferInfo original{"testAgent3", "10.0.0.1:7070",
+            tensorrt_llm::batch_manager::RequestInfo{},
+            std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 256, 0},
+                kv_cache::MemoryDesc{nullptr, 256, 0}, kv_cache::MemoryDesc{nullptr, 128, 0}},
+            std::make_optional<std::string>("hybrid_metadata"), 3, {0, 1, 2}};
+
+        auto deserialized = serializeDeserializeNotification(original);
+
+        ASSERT_EQ(original.mBufferDescs.size(), deserialized.mBufferDescs.size());
+        ASSERT_EQ(original.mBufferKinds.size(), deserialized.mBufferKinds.size());
+        EXPECT_EQ(original.mBufferKinds, deserialized.mBufferKinds);
+        EXPECT_EQ(deserialized.mBufferKinds[0], 0);
+        EXPECT_EQ(deserialized.mBufferKinds[1], 1);
+        EXPECT_EQ(deserialized.mBufferKinds[2], 2);
     }
 }
 
@@ -1374,7 +1466,7 @@ TEST(SerializeUtilsTest, NotificationInfo)
         kv_cache::RequestAndBufferInfo requestInfo{"testAgent", "127.0.0.1:8080",
             tensorrt_llm::batch_manager::RequestInfo{},
             std::vector<kv_cache::MemoryDesc>{kv_cache::MemoryDesc{nullptr, 1024, 0}},
-            std::make_optional<std::string>("test_metadata"), 1};
+            std::make_optional<std::string>("test_metadata"), 1, {0, 2}};
 
         kv_cache::NotificationInfo original{requestInfo};
         auto deserialized = serializeDeserializeNotification(original);
@@ -1386,6 +1478,7 @@ TEST(SerializeUtilsTest, NotificationInfo)
         EXPECT_EQ(requestInfo.mRequestInfo.getRequestId(), deserializedRequestInfo.mRequestInfo.getRequestId());
         EXPECT_EQ(requestInfo.mMetadata, deserializedRequestInfo.mMetadata);
         EXPECT_EQ(requestInfo.mValidConnectionIdx, deserializedRequestInfo.mValidConnectionIdx);
+        EXPECT_EQ(requestInfo.mBufferKinds, deserializedRequestInfo.mBufferKinds);
     }
 
     // Test with NotificationSyncInfo variant
@@ -1414,6 +1507,19 @@ TEST(SerializeUtilsTest, NotificationInfo)
         EXPECT_EQ(readyInfo.mContext.getTag(), deserializedReadyInfo.mContext.getTag());
         EXPECT_EQ(readyInfo.mIsReady, deserializedReadyInfo.mIsReady);
     }
+}
+
+TEST(SerializeUtilsTest, BufferKindEnumValues)
+{
+    using tensorrt_llm::batch_manager::BufferKind;
+
+    EXPECT_EQ(static_cast<uint8_t>(BufferKind::kKV), 0);
+    EXPECT_EQ(static_cast<uint8_t>(BufferKind::kKV_INDEXER), 1);
+    EXPECT_EQ(static_cast<uint8_t>(BufferKind::kRNN), 2);
+
+    EXPECT_EQ(static_cast<BufferKind>(uint8_t{0}), BufferKind::kKV);
+    EXPECT_EQ(static_cast<BufferKind>(uint8_t{1}), BufferKind::kKV_INDEXER);
+    EXPECT_EQ(static_cast<BufferKind>(uint8_t{2}), BufferKind::kRNN);
 }
 
 TEST(SerializeUtilsTest, CacheStateIndexerKCache)

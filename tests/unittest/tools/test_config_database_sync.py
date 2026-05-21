@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,20 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.resolve()
+EXPECTED_MODEL_METADATA = {
+    "deepseek-ai/DeepSeek-R1-0528": {
+        "display_name": "DeepSeek-R1",
+        "url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
+    },
+    "nvidia/DeepSeek-R1-0528-FP4-v2": {
+        "display_name": "DeepSeek-R1 (NVFP4)",
+        "url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+    },
+    "openai/gpt-oss-120b": {
+        "display_name": "gpt-oss-120b",
+        "url": "https://huggingface.co/openai/gpt-oss-120b",
+    },
+}
 
 # Dynamically load generate_config_table module without modifying sys.path
 _spec = importlib.util.spec_from_file_location(
@@ -30,7 +44,6 @@ _spec = importlib.util.spec_from_file_location(
 _module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _module
 _spec.loader.exec_module(_module)
-generate_rst = _module.generate_rst
 generate_json = _module.generate_json
 RecipeList = _module.RecipeList
 
@@ -48,40 +61,6 @@ PERF_SANITY_DIR = _db_module.PERF_SANITY_DIR
 
 
 class TestConfigDatabaseSync(unittest.TestCase):
-    def test_config_table_sync(self):
-        """Test that the config_table.rst file is synchronized with the lookup.yaml database.
-
-        Ensures that the RST file is up-to-date with the YAML database.
-        """
-        if generate_rst is None:
-            self.skipTest("generate_config_table not available")
-
-        # Define paths
-        yaml_path = os.path.join(REPO_ROOT, "examples/configs/database/lookup.yaml")
-        rst_path = os.path.join(REPO_ROOT, "docs/source/deployment-guide/config_table.rst")
-
-        # Ensure files exist
-        self.assertTrue(os.path.exists(yaml_path), f"YAML file not found: {yaml_path}")
-        self.assertTrue(os.path.exists(rst_path), f"RST file not found: {rst_path}")
-
-        # Read existing RST content
-        with open(rst_path, "r") as f:
-            existing_content = f.read()
-
-        # Generate new RST content
-        with tempfile.NamedTemporaryFile(mode="w+", delete=True) as tmp:
-            generate_rst(yaml_path, output_file=tmp.name)
-            tmp.seek(0)
-            generated_content = tmp.read()
-
-        # Compare content
-        self.assertEqual(
-            existing_content.strip(),
-            generated_content.strip(),
-            "config_table.rst is not synchronized with lookup.yaml. "
-            "Please run 'python3 scripts/generate_config_table.py' from the repo root to update it.",
-        )
-
     def test_config_db_json_generation(self):
         """Test that config_db.json generation matches lookup.yaml entries.
 
@@ -117,6 +96,22 @@ class TestConfigDatabaseSync(unittest.TestCase):
             payload.get("source"),
             "examples/configs/database/lookup.yaml",
             "Generated JSON 'source' field is unexpected.",
+        )
+
+        expected_models = {}
+        for recipe in recipes:
+            expected_models[recipe.model] = EXPECTED_MODEL_METADATA.get(
+                recipe.model,
+                {
+                    "display_name": recipe.model,
+                    "url": "",
+                },
+            )
+
+        self.assertEqual(
+            payload.get("models"),
+            expected_models,
+            "Generated JSON 'models' field is unexpected.",
         )
 
         entries = payload.get("entries") or []

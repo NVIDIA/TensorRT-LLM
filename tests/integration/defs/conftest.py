@@ -764,7 +764,7 @@ def enc_dec_model_root(request):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
     tllm_model_name = request.param
-    if not "wmt" in tllm_model_name:
+    if "wmt" not in tllm_model_name:
         # HuggingFace root
         enc_dec_model_root = os.path.join(models_root, tllm_model_name)
     else:
@@ -1970,6 +1970,10 @@ skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")
 
+skip_no_mxfp4_swizzle = pytest.mark.skipif(
+    check_device_contain(["H20"]) and not check_device_contain(["H200"]),
+    reason="nvbugs/5446119: MXFP4 swizzle not supported on H20")
+
 skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
                                    reason="This test is for SM120")
 
@@ -2212,94 +2216,6 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
     metafunc.parametrize("case", uts, ids=lambda x: x)
 
 
-# Test cases that use enable_configurable_moe parameter and need ID conversion
-TESTS_WITH_CONFIGURABLE_MOE = [
-    "TestDeepSeekV3Lite::test_nvfp4_4gpus[",
-    "TestDeepSeekV3Lite::test_fp8_block_scales[",
-    "TestGPTOSS::test_w4_4gpus_online_eplb[",
-    "TestQwen3_30B_A3B::test_w4a8_mxfp4[",
-]
-
-
-def _convert_clean_to_original_moe_test_id(test_id):
-    """Convert clean MoE test ID back to original format for pytest collection.
-
-    Example: "test_llm_api_pytorch.py::test_foo[param]" -> "test_llm_api_pytorch.py::test_foo[-param]"
-
-    This is needed because the `enable_configurable_moe` parameter uses empty string
-    as ID when value is 0, resulting in test IDs like "test_foo[-param]".
-    We clean these up in pytest_collection_modifyitems, but pytest filters tests
-    during collection using the original IDs. So when user runs with clean test name,
-    we need to convert it back to match the original.
-    """
-    if "test_llm_api_pytorch.py" not in test_id:
-        return test_id
-
-    # Match pattern like "test_name[params]" and add leading dash after "["
-    # But only if params don't already start with "-" or "enable_configurable_moe"
-    match = re.search(r"\[([^\]]+)\]", test_id)
-    if match:
-        params = match.group(1)
-        # Skip if already has leading dash or starts with enable_configurable_moe
-        if not params.startswith("-") and not params.startswith(
-                "enable_configurable_moe"):
-            # Add leading dash to params
-            new_params = "-" + params
-            test_id = test_id.replace(f"[{params}]", f"[{new_params}]")
-
-    return test_id
-
-
-def pytest_sessionstart(session):
-    """Convert clean MoE test IDs in config.args to original format for collection.
-
-    This is needed because pytest filters tests during collection using original IDs.
-    When user runs with clean test name, we convert it back to match the original.
-    """
-    args = session.config.args
-    for i, arg in enumerate(args):
-        if "test_llm_api_pytorch.py" in arg and "[" in arg:
-            # Only apply conversion to specific tests that use enable_configurable_moe
-            should_convert = any(test_name in arg
-                                 for test_name in TESTS_WITH_CONFIGURABLE_MOE)
-            if should_convert:
-                args[i] = _convert_clean_to_original_moe_test_id(arg)
-
-
-def _clean_moe_test_ids(items):
-    """Clean up test IDs by removing leading/trailing dashes from parameter IDs.
-
-    This is needed because `enable_configurable_moe` parameter can be empty,
-    resulting in ugly test IDs like "test_foo[-True]" or "test_foo[--abc]".
-    We clean these up to "test_foo[True]" or "test_foo[abc]" so that:
-    1. Test names in waive files and test lists remain unchanged
-    2. Test reports look cleaner
-    """
-    for item in items:
-        if "test_llm_api_pytorch.py" in item.nodeid and "[" in item.nodeid:
-            # Only apply cleanup to specific tests that use enable_configurable_moe
-            should_cleanup = any(test_name in item.nodeid
-                                 for test_name in TESTS_WITH_CONFIGURABLE_MOE)
-            if should_cleanup:
-                original_nodeid = item.nodeid
-                original_name = item.name
-                nodeid = item.nodeid
-                name = item.name
-
-                # Clean up leading/trailing dashes in nodeid
-                nodeid = nodeid.replace("[-", "[")
-                nodeid = nodeid.replace("-]", "]")
-
-                # Clean up leading/trailing dashes in name
-                name = name.replace("[-", "[")
-                name = name.replace("-]", "]")
-
-                if nodeid != original_nodeid:
-                    item._nodeid = nodeid
-                if name != original_name:
-                    item.name = name
-
-
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_collection_modifyitems(session, config, items):
     testlist_path = config.getoption("--test-list")
@@ -2307,10 +2223,6 @@ def pytest_collection_modifyitems(session, config, items):
     test_prefix = config.getoption("--test-prefix")
     perf_test = config.getoption("--perf")
     test_model_suites = config.getoption("--test-model-suites")
-
-    # TODO Once the MoE refactor is complete, this should be removed.
-    # This is a temporary WAR to minimize the impact of the MoE refactor on the existing test lists.
-    _clean_moe_test_ids(items)
 
     if perf_test:
         global ALL_PYTEST_ITEMS
@@ -2360,11 +2272,14 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_configure(config):
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+        os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)

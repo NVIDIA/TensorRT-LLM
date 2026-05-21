@@ -274,6 +274,15 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
+{
+    static std::once_flag flag;
+    static bool enabled = false;
+
+    std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL"); });
+    return enabled;
+}
+
 bool getEnvUseUCXKvCache()
 {
     static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
@@ -296,12 +305,6 @@ bool getEnvUseMooncakeKvCache()
 {
     static bool const useMooncakeKvCache = getBoolEnv("TRTLLM_USE_MOONCAKE_KVCACHE");
     return useMooncakeKvCache;
-}
-
-bool getEnvUseRoundRobinBlockDistForCP()
-{
-    static bool const useRoundRobinBlockDistForCP = getBoolEnv("TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP");
-    return useRoundRobinBlockDistForCP;
 }
 
 std::string getEnvUCXInterface()

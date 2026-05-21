@@ -1,0 +1,8 @@
+text_encoder_path: google/gemma-3-12b-it
+cache:
+  cache_backend: cache_dit
+attention:
+   backend: VANILLA
+parallel:
+   dit_cfg_size: 1
+   dit_ulysses_size: 1

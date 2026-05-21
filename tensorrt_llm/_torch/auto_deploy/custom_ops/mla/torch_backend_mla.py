@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Custom ops for MultiHead Latent Attention (MLA) with FlashInfer-compatible cache.
 
 This module provides:
@@ -24,11 +38,13 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -52,6 +68,12 @@ def _update_mla_cache(
     - First kv_lora_rank dims: compressed KV latent (before kv_b_proj)
     - Last qk_rope_head_dim dims: key positional encoding
     """
+    cache_dtype = mla_cache.dtype
+    if compressed_kv.dtype != cache_dtype:
+        compressed_kv = compressed_kv.to(cache_dtype)
+    if kpe.dtype != cache_dtype:
+        kpe = kpe.to(cache_dtype)
+
     for idx in range(seq_len.shape[0]):
         start = seq_start[idx].item()
         length = seq_len[idx].item()
@@ -102,6 +124,13 @@ def _torch_mla_generate_with_absorption(
     compressed_kv_flat = compressed_kv.squeeze(1)  # [B, kv_lora_rank]
     kpe_flat = kpe.squeeze(1).squeeze(1)  # [B, qk_rope_head_dim]
 
+    # Cast to cache dtype if needed (e.g. BF16 -> FP8)
+    cache_dtype = mla_cache.dtype
+    if compressed_kv_flat.dtype != cache_dtype:
+        compressed_kv_flat = compressed_kv_flat.to(cache_dtype)
+    if kpe_flat.dtype != cache_dtype:
+        kpe_flat = kpe_flat.to(cache_dtype)
+
     for i in range(b):
         cache_idx = slot_idx[i].item()
         pos = input_pos[i].item()
@@ -122,6 +151,13 @@ def _torch_mla_generate_with_absorption(
         compressed_kv_cached = cached_data[:, :kv_lora_rank]  # [seq_len, kv_lora_rank]
         kpe_cached = cached_data[:, kv_lora_rank:]  # [seq_len, qk_rope_head_dim]
 
+        # Cast from cache dtype (e.g. FP8) to compute dtype
+        compute_dtype = q_nope.dtype
+        if compressed_kv_cached.dtype != compute_dtype:
+            compressed_kv_cached = compressed_kv_cached.to(compute_dtype)
+        if kpe_cached.dtype != compute_dtype:
+            kpe_cached = kpe_cached.to(compute_dtype)
+
         # =====================================================================
         # Weight absorption for Q_nope part
         # =====================================================================
@@ -129,7 +165,7 @@ def _torch_mla_generate_with_absorption(
         # q_nope_i: [N, qk_nope_head_dim]
         # w_k_nope: [N, qk_nope_head_dim, kv_lora_rank]
         # q_absorbed: [N, kv_lora_rank]
-        q_absorbed = torch.einsum("nd,ndk->nk", q_nope_i, w_k_nope)
+        q_absorbed = torch.einsum("nd,ndk->nk", q_nope_i.float(), w_k_nope.float())
 
         # Attention scores from absorbed Q and compressed KV
         # Compute in fp32 to match FlashInfer's use_fp16_qk_reduction=False
@@ -147,20 +183,20 @@ def _torch_mla_generate_with_absorption(
         # Combined attention scores (already in fp32)
         attn_scores = (scores_nope + scores_pe) * scale  # [N, seq_len]
 
-        # Softmax (already in fp32, convert back to input dtype)
-        attn_weights = torch.softmax(attn_scores, dim=-1).to(q_nope.dtype)  # [N, seq_len]
+        # Softmax in fp32 — keep fp32 for downstream precision
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [N, seq_len]
 
         # =====================================================================
-        # Compute output with absorbed value projection
+        # Compute output with absorbed value projection (fp32 throughout)
         # =====================================================================
         # v_out = attn_weights @ compressed_kv @ w_v^T
         # First: weighted_kv = attn_weights @ compressed_kv_cached -> [N, kv_lora_rank]
-        weighted_kv = torch.matmul(attn_weights, compressed_kv_cached)  # [N, kv_lora_rank]
+        weighted_kv = torch.matmul(attn_weights, compressed_kv_cached.float())
 
         # Then: attn_out = weighted_kv @ w_v^T -> [N, v_head_dim]
         # w_v: [N, v_head_dim, kv_lora_rank]
         # weighted_kv: [N, kv_lora_rank]
-        attn_out = torch.einsum("nk,nvk->nv", weighted_kv, w_v)  # [N, v_head_dim]
+        attn_out = torch.einsum("nk,nvk->nv", weighted_kv, w_v.float()).to(q_nope.dtype)
 
         out[i] = attn_out
 
@@ -230,13 +266,21 @@ def _torch_mla_context_with_expansion(
         compressed_kv_cached = cached_data[:, :kv_lora_rank]  # [kv_seq_len, kv_lora_rank]
         kpe_cached = cached_data[:, kv_lora_rank:]  # [kv_seq_len, qk_rope_head_dim]
 
+        # Cast from cache dtype (e.g. FP8) to compute dtype
+        compute_dtype = q_nope.dtype
+        if compressed_kv_cached.dtype != compute_dtype:
+            compressed_kv_cached = compressed_kv_cached.to(compute_dtype)
+        if kpe_cached.dtype != compute_dtype:
+            kpe_cached = kpe_cached.to(compute_dtype)
+
         # =====================================================================
         # Expand compressed_kv using kv_b_proj_weight for this sequence
         # =====================================================================
         # compressed_kv_cached: [kv_seq_len, kv_lora_rank]
         # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
         # kv_expanded: [kv_seq_len, N * (qk_nope_head_dim + v_head_dim)]
-        kv_expanded = torch.matmul(compressed_kv_cached, kv_b_proj_weight.t())
+        # fp32 to avoid bf16 accumulation error over kv_lora_rank-dim reduction
+        kv_expanded = torch.matmul(compressed_kv_cached.float(), kv_b_proj_weight.float().t())
 
         # Reshape to [kv_seq_len, N, qk_nope_head_dim + v_head_dim]
         kv_expanded = kv_expanded.view(kv_seq_len, num_heads, qk_nope_head_dim + v_head_dim)
@@ -273,15 +317,15 @@ def _torch_mla_context_with_expansion(
         )
         attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        # Softmax (already in fp32, convert back to input dtype)
-        attn_weights = torch.softmax(attn_scores, dim=-1).to(q_nope.dtype)
+        # Softmax in fp32 — keep fp32 for downstream precision
+        attn_weights = torch.softmax(attn_scores, dim=-1)
 
-        # Value: [1, N, kv_seq_len, v_head_dim]
+        # Value: [1, N, kv_seq_len, v_head_dim] (fp32 from kv_expanded)
         v_t = v_expanded.transpose(0, 1).unsqueeze(0)
 
-        # Compute output
+        # Compute output in fp32, cast back at the end
         attn_out = torch.matmul(attn_weights, v_t)  # [1, N, seq_len_i, v_head_dim]
-        attn_out = attn_out[0].transpose(0, 1)  # [seq_len_i, N, v_head_dim]
+        attn_out = attn_out[0].transpose(0, 1).to(q_nope.dtype)
 
         attn_outputs.append(attn_out)
 
@@ -294,7 +338,7 @@ def _torch_mla_context_with_expansion(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=("mla_cache",))
 def torch_backend_mla_with_cache(
     # 5 tensor args (get_num_qkv_args = 5)
     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
@@ -313,6 +357,7 @@ def torch_backend_mla_with_cache(
     # Constants
     scale: Optional[float] = None,
     kv_lora_rank: int = 512,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Torch backend MLA with FlashInfer-compatible compressed cache.
 
@@ -337,7 +382,8 @@ def torch_backend_mla_with_cache(
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
     # Get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]
@@ -350,6 +396,9 @@ def torch_backend_mla_with_cache(
 
     # Define output shape: [B, S, N, v_head_dim]
     output_shape = (b, s, num_heads, v_head_dim)
+
+    num_total_tokens = num_prefill_tokens + num_decode
+    bs = b * s
 
     if s == 1:
         # =====================================================================
@@ -373,13 +422,11 @@ def torch_backend_mla_with_cache(
             v_head_dim,
             y,
         )
-
-        return y.unsqueeze(1)  # [B, 1, N, v_head_dim]
     else:
         # =====================================================================
         # Context phase: Expand and compute normal attention
         # =====================================================================
-        bs_view = (b * s,)
+        bs_view = (bs,)
 
         q_nope_flat = q_nope.contiguous().view(*bs_view, num_heads, qk_nope_head_dim)
         q_pe_flat = q_pe.contiguous().view(*bs_view, num_heads, qk_rope_head_dim)
@@ -407,7 +454,16 @@ def torch_backend_mla_with_cache(
             y,
         )
 
-        return y.view(*output_shape)
+    if out is not None:
+        out_flat = out.view(bs, num_heads, v_head_dim)
+        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
+        if num_total_tokens < bs:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
+    if s == 1:
+        return y.unsqueeze(1)  # [B, 1, N, v_head_dim]
+    return y.view(*output_shape)
 
 
 @torch_backend_mla_with_cache.register_fake
@@ -425,8 +481,12 @@ def torch_backend_mla_with_cache_fake(
     mla_cache: torch.Tensor,
     scale: Optional[float] = None,
     kv_lora_rank: int = 512,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch_backend_mla_with_cache."""
+    if out is not None:
+        return out.new_empty(0)
+
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[-1]
     out_features = kv_b_proj_weight.shape[0]
@@ -496,12 +556,17 @@ class TorchBackendMLAAttention(AttentionDescriptor):
         kv_lora_rank = compressed_kv_fake.shape[-1]
         qk_rope_head_dim = kpe_fake.shape[-1]
 
-        # FlashInfer MLA cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
+        model_dtype = compressed_kv_fake.dtype
+        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, model_dtype)
+
+        # Torch MLA supports configured/model cache dtypes; no dtype override needed.
+
+        # MLA cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
         # No num_heads dimension - this is the key MLA optimization
         return {
             "mla_cache": UnpagedResourceHandler(
                 kv_lora_rank + qk_rope_head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype),
+                dtype=cache_dtype,
             ),
         }
 
@@ -512,7 +577,6 @@ class TorchBackendMLAAttention(AttentionDescriptor):
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
 
-        # Get scale from kwargs
-        scale = source_attn_node.kwargs.get("scale", None)
+        (scale,) = extract_op_args(source_attn_node, "scale")
 
         return [scale, kv_lora_rank]

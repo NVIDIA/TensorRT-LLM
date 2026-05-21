@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """The interface for all transforms.
 
 This module defines the base classes and interfaces for all transforms.
@@ -28,6 +42,7 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.cuda_mem_tracker import get_mem_info
+from ..utils.dist_config import DistConfig  # kept in utils to avoid circular imports
 from ..utils.graph_writer import graph_writer
 from ..utils.logger import ad_logger
 from .graph_module_visualizer import to_dot
@@ -106,7 +121,6 @@ class Stages(Enum):
     POST_LOAD_FUSION = "post_load_fusion"  # post-loading fusion and perf optimizations of the graph
     CACHE_INIT = "cache_init"  # initialization of cached attention + (KV) cache initialization
     VISUALIZE = "visualize"  # visualization of the graph
-    EXPORT_ONNX = "export_onnx"  # export the graph to onnx
     COMPILE = "compile"  # graph compilation stage using low-level compilers like torch.compile
 
     def __lt__(self, other):
@@ -126,7 +140,7 @@ class SharedConfig(BaseModel):
     }
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    mapping: Any = Field(default=None)  # Mapping object from ad_executor
+    dist_config: Optional[DistConfig] = Field(default=None)
 
 
 class TransformConfig(BaseModel):

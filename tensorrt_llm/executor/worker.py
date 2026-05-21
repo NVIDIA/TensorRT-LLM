@@ -26,7 +26,8 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
-from .utils import ErrorResponse, RequestError, WorkerCommIpcAddrs
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    WorkerCommIpcAddrs)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -46,7 +47,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
-        hmac_key: Optional[bytes] = None,
+        hmac_key: bytes = b"",
     ) -> None:
         super().__init__(
             engine=engine,
@@ -59,11 +60,16 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             llm_args=llm_args,
         )
 
+        if (self.llm_args is not None
+                and getattr(self.llm_args, "enable_resource_governor", False)):
+            self._resource_governor_queue = IntraProcessQueue()
+
         self.setup_engine()
 
         # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
         # Only set up if rpc_addr is provided (for stats RPC support)
         if rpc_addr is not None:
+            assert hmac_key, "hmac_key is required when rpc_addr is set"
             self.rpc_addr = rpc_addr
             self.hmac_key = hmac_key
             self.start_rpc_server()  # Reuse from RpcWorkerMixin
@@ -117,6 +123,15 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self._executor_config.checkpoint_loader.cleanup()
                     self._executor_config.checkpoint_loader = None
 
+        # Destroy torch distributed process groups so that NCCL communicators
+        # are torn down cleanly before MPI session shutdown and process exit.
+        # This is done here (not in PyExecutor.shutdown()) because the MPI
+        # worker owns the process group.  In the Ray path the process group
+        # belongs to RayWorkerWrapper and must not be destroyed by the engine.
+        import torch.distributed
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
@@ -152,7 +167,7 @@ def worker_main(
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[BaseLlmArgs] = None,
     rpc_addr: Optional[str] = None,
-    hmac_key: Optional[bytes] = None,
+    hmac_key: bytes = b"",
 ) -> None:
 
     def _print_stacks():
@@ -187,6 +202,7 @@ def worker_main(
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
+    resource_governor_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
@@ -215,6 +231,11 @@ def worker_main(
             is_server=False,
             socket_type=zmq.DEALER,
             name="worker_init_status_queue")
+        resource_governor_queue = IpcQueue(
+            worker_queues.resource_governor_queue_addr,
+            is_server=False,
+            name="worker_resource_governor_queue"
+        ) if worker_queues.resource_governor_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -320,6 +341,13 @@ def worker_main(
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
+                if resource_governor_queue is not None:
+                    # Swap rank 0 to the proxy IPC queue after construction.
+                    # The resource-governor flag is already enabled on all
+                    # ranks.
+                    worker.engine.set_resource_governor_queue(
+                        resource_governor_queue)
+
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
