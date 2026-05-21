@@ -1,15 +1,9 @@
-r"""Build a trace JSON augmented with per-request cache-hit metrics.
+r"""Build a trace JSON augmented with per-request offline upper-bound metrics.
 
 The output mirrors the input ``*.trace.json`` schema exactly, except every
-assistant ``message`` event that produced a scored request gets four extra
-fields copied from the corresponding request record:
-
-- ``cache_hit_tokens``
-- ``cache_miss_tokens``
-- ``cache_hit_rate``
-- ``cache_block_hit_rate``
-
-This lets downstream tools view per-event hit metrics inline without
+assistant ``message`` event that produced a scored request gets the
+``optimal_*`` upper-bound fields copied from the corresponding request
+record. Downstream tools can then view per-event UB metrics inline without
 joining against the separate ``*.cachehit.json`` summary.
 """
 
@@ -19,10 +13,10 @@ import copy
 from typing import Any, Dict
 
 ANNOTATION_FIELDS = (
-    "cache_hit_tokens",
-    "cache_miss_tokens",
-    "cache_hit_rate",
-    "cache_block_hit_rate",
+    "optimal_cache_hit_tokens",
+    "optimal_cache_miss_tokens",
+    "optimal_cache_hit_rate",
+    "optimal_cache_block_hit_rate",
 )
 
 

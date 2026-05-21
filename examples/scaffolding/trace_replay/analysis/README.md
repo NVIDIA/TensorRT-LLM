@@ -24,7 +24,7 @@ Outputs land next to each input:
 | File | What it is |
 |------|------------|
 | `<name>.cachehit.json` | Full record: per-request stats + aggregate `summary` + optional rollups. |
-| `<name>.trace.cachehit.json` | Deep copy of the original trace with `cache_hit_rate`, `cache_hit_blocks`, `cache_miss_blocks`, `cache_hit_tokens` attached to each scored assistant event. |
+| `<name>.trace.cachehit.json` | Deep copy of the original trace with `optimal_cache_hit_rate`, `optimal_cache_hit_tokens`, `optimal_cache_miss_tokens`, `optimal_cache_block_hit_rate` attached to each scored assistant event. |
 | `<dataset>.cachehit.json` | Dataset-level aggregate (only when input is a dataset). |
 
 ## Key flags
@@ -37,12 +37,10 @@ All flags use `argparse.BooleanOptionalAction`, so `--flag` enables and
 | `--tokens-per-block N` | `32` | KV block size. Match your runtime config. |
 | `--decode-kv-reuse` / `--no-decode-kv-reuse` | **on** | Insert assistant decode tokens into the cache so later turns in the same conversation can hit them. Disable to model "decode KV is dropped at request end". |
 | `--cot-pollutes-cache` / `--no-cot-pollutes-cache` | **on** | When on, store `[prompt + reasoning + content]` in the radix tree — mirrors real TRT-LLM C++ KV manager. Subsequent prompts omit prior reasoning and diverge at the reasoning-insertion block. Off = optimistic upper bound where reasoning is treated as if it never occupied KV. Only meaningful when `--decode-kv-reuse` is on. |
-| `--include-last-token-in-blocks` | off | TRT-LLM excludes a request's last token from reusable blocks. Toggle only if your block-key policy differs. |
 | `--no-rollups` | off | Skip per-(branch root / depth / system-prompt UUID) rollups. |
 
 **Default behavior** (no flags) = the most realistic model:
-`decode_kv_reuse=True`, `cot_pollutes_cache=True`,
-`exclude_last_token_from_blocks=True`, `tokens_per_block=32`.
+`decode_kv_reuse=True`, `cot_pollutes_cache=True`, `tokens_per_block=32`.
 
 ## How it works (one screen)
 
@@ -76,19 +74,17 @@ All branches in a trace share a single global cache (most permissive UB).
 |------|---------|
 | `llm_request_count` | Assistant events scored. |
 | `total_prompt_tokens` | Sum of `prompt_tokens` across requests. |
-| `total_cacheable_prompt_tokens` | Whole blocks (excluding the per-request non-cacheable tail). |
-| `total_cache_hit_tokens` / `total_cache_miss_tokens` | Hit / miss accounting in tokens. |
-| `overall_cache_hit_rate` | `hit_tokens / prompt_tokens`. |
-| `cacheable_token_hit_rate` | `hit_tokens / cacheable_prompt_tokens`. |
-| `overall_cache_block_hit_rate` | Block-granular rate. |
+| `optimal_total_cache_hit_tokens` / `optimal_total_cache_miss_tokens` | Hit / miss accounting in tokens, offline UB. |
+| `optimal_overall_cache_hit_rate` | `optimal_total_cache_hit_tokens / total_prompt_tokens`. |
+| `optimal_overall_cache_block_hit_rate` | Block-granular UB rate. |
 | `minimal_cache_blocks` / `minimal_cache_tokens` | Total distinct blocks in the radix tree at end of trace. Grows when `cot_pollutes_cache=True` (reasoning blocks get stored). |
 | `preloaded_system_blocks` | Blocks pre-inserted in phase 1. |
 
 Each entry of `requests[]` carries the same hit-rate fields plus `reasoning_tokens`, `reusable_completion_tokens`, `branch_path`, `system_prompt_id_seed`.
 
 The `algorithm` block surfaces the flags that produced the run
-(`tokens_per_block`, `exclude_last_token_from_blocks`, `decode_kv_reuse`,
-`cot_pollutes_cache`, …) so different runs are self-describing.
+(`tokens_per_block`, `decode_kv_reuse`, `cot_pollutes_cache`, …) so
+different runs are self-describing.
 
 ## File map
 
@@ -97,7 +93,7 @@ The `algorithm` block surfaces the flags that produced the run
 | `compute_cache_hit_trace.py` | CLI entry point. Thin wrapper around the package. |
 | `cache_hit.py` | Core: `compute_cache_hit_upper_bound`, the two-phase scoring loop. |
 | `streams.py` | `TokenIdAllocator`, `SystemPromptRegistry`, `ConversationSegments` — synthetic token streams and per-(branch, conversation) segment store. |
-| `blocks.py` | `BlockPrefixCache` radix tree + block-formation helpers. |
+| `blocks.py` | `TokenPrefixCache` (token-level radix tree) + engine-aligned block-count helpers. |
 | `branch_summary.py` | Per-branch / per-depth / per-system-prompt rollups. |
 | `aggregation.py` | Dataset-level aggregate across many traces. |
 | `annotate.py` | Builds the `*.trace.cachehit.json` annotated trace. |

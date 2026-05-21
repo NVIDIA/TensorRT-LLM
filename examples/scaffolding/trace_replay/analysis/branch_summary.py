@@ -72,24 +72,21 @@ def _rollup(
 
 def _group_summary(group_key: str, group: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_prompt_tokens = sum(r["prompt_tokens"] for r in group)
-    total_cacheable_prompt_tokens = sum(r["cacheable_prompt_tokens"] for r in group)
-    total_hit_blocks = sum(r["cache_hit_blocks"] for r in group)
-    total_miss_blocks = sum(r["cache_miss_blocks"] for r in group)
-    total_hit_tokens = sum(r["cache_hit_tokens"] for r in group)
-    total_miss_tokens = sum(r["cache_miss_tokens"] for r in group)
+    total_hit_blocks = sum(r["optimal_cache_hit_blocks"] for r in group)
+    total_miss_blocks = sum(r["optimal_cache_miss_blocks"] for r in group)
+    total_hit_tokens = sum(r["optimal_cache_hit_tokens"] for r in group)
+    total_miss_tokens = sum(r["optimal_cache_miss_tokens"] for r in group)
     block_total = total_hit_blocks + total_miss_blocks
     return {
         "group_key": group_key,
         "request_count": len(group),
         "total_prompt_tokens": total_prompt_tokens,
-        "total_cacheable_prompt_tokens": total_cacheable_prompt_tokens,
-        "total_cache_hit_blocks": total_hit_blocks,
-        "total_cache_miss_blocks": total_miss_blocks,
-        "total_cache_hit_tokens": total_hit_tokens,
-        "total_cache_miss_tokens": total_miss_tokens,
-        "overall_cache_hit_rate": _safe_div(total_hit_tokens, total_prompt_tokens),
-        "overall_cache_block_hit_rate": _safe_div(total_hit_blocks, block_total),
-        "cacheable_token_hit_rate": _safe_div(total_hit_tokens, total_cacheable_prompt_tokens),
+        "optimal_total_cache_hit_blocks": total_hit_blocks,
+        "optimal_total_cache_miss_blocks": total_miss_blocks,
+        "optimal_total_cache_hit_tokens": total_hit_tokens,
+        "optimal_total_cache_miss_tokens": total_miss_tokens,
+        "optimal_overall_cache_hit_rate": _safe_div(total_hit_tokens, total_prompt_tokens),
+        "optimal_overall_cache_block_hit_rate": _safe_div(total_hit_blocks, block_total),
     }
 
 
@@ -112,11 +109,10 @@ def merge_rollup_arrays(
                 {
                     "request_count": 0,
                     "total_prompt_tokens": 0,
-                    "total_cacheable_prompt_tokens": 0,
-                    "total_cache_hit_blocks": 0,
-                    "total_cache_miss_blocks": 0,
-                    "total_cache_hit_tokens": 0,
-                    "total_cache_miss_tokens": 0,
+                    "optimal_total_cache_hit_blocks": 0,
+                    "optimal_total_cache_miss_blocks": 0,
+                    "optimal_total_cache_hit_tokens": 0,
+                    "optimal_total_cache_miss_tokens": 0,
                 },
             )
             for field in slot:
@@ -124,20 +120,18 @@ def merge_rollup_arrays(
 
     summaries: List[Dict[str, Any]] = []
     for key, slot in aggregated.items():
-        block_total = slot["total_cache_hit_blocks"] + slot["total_cache_miss_blocks"]
+        block_total = (
+            slot["optimal_total_cache_hit_blocks"] + slot["optimal_total_cache_miss_blocks"]
+        )
         summaries.append(
             {
                 "group_key": key,
                 **slot,
-                "overall_cache_hit_rate": _safe_div(
-                    slot["total_cache_hit_tokens"], slot["total_prompt_tokens"]
+                "optimal_overall_cache_hit_rate": _safe_div(
+                    slot["optimal_total_cache_hit_tokens"], slot["total_prompt_tokens"]
                 ),
-                "overall_cache_block_hit_rate": _safe_div(
-                    slot["total_cache_hit_blocks"], block_total
-                ),
-                "cacheable_token_hit_rate": _safe_div(
-                    slot["total_cache_hit_tokens"],
-                    slot["total_cacheable_prompt_tokens"],
+                "optimal_overall_cache_block_hit_rate": _safe_div(
+                    slot["optimal_total_cache_hit_blocks"], block_total
                 ),
             }
         )

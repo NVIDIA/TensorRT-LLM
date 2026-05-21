@@ -16,8 +16,12 @@ r"""Per-LLM-call KV cache hit-rate trajectory, sampled across sessions.
 
 Loaded dynamically by examples/scaffolding/trace_replay/pareto/trace_replay_pareto_aggregate.py.
 
-x = LLM call index along the trace (0..n_calls-1, ordered by ``first_iter``
-    within each session, which equals the trace's assistant-event order)
+x = LLM call index along the trace (0..n_calls-1, **trace event order**).
+    Each session's i-th measured call is the entry whose
+    ``(branch_path, hop_within_branch)`` matches the i-th assistant event
+    in the trace.cachehit.json. This aligns every session's i-th sample
+    to the same trace event regardless of how the engine scheduler
+    interleaved concurrent sub-agent branches at runtime.
 y = per-call ``kv_cache_hit_rate`` (engine-measured block hit rate for the
     prefill of that call)
 
@@ -99,29 +103,39 @@ def _resolve_cachehit_path(record: Dict[str, Any]) -> Optional[Path]:
     return None
 
 
-def _optimal_per_call_hit_rates(record: Dict[str, Any]) -> List[float]:
-    """Return per-LLM-call optimal cache block hit rates extracted from the
-    paired cachehit JSON, in assistant-event order (= LLM call order along the
-    trace). Empty list if the file is missing or contains no usable rows."""
+def _trace_optimal_and_branches(
+    record: Dict[str, Any],
+) -> Tuple[List[float], List[Tuple[int, ...]]]:
+    """Return (optimal_hit_rates, trace_branches) walking the paired
+    cachehit JSON's events in trace order.
+
+    ``optimal_hit_rates[i]`` = ``optimal_cache_block_hit_rate`` at the
+    i-th assistant event. ``trace_branches[i]`` = that event's
+    ``branch_path`` as a tuple. The two lists are aligned 1:1.
+    Empty tuples on both sides if the file is missing.
+    """
     p = _resolve_cachehit_path(record)
     if p is None:
-        return []
+        return [], []
     try:
         with p.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         print(f"WARNING: could not read cachehit json {p}: {e}")
-        return []
+        return [], []
     rates: List[float] = []
+    branches: List[Tuple[int, ...]] = []
     for ev in data.get("events") or []:
         if ev.get("event_type") != "message":
             continue
         if ev.get("role") != "assistant":
             continue
-        r = ev.get("cache_block_hit_rate")
-        if isinstance(r, (int, float)):
-            rates.append(float(r))
-    return rates
+        r = ev.get("optimal_cache_block_hit_rate")
+        if not isinstance(r, (int, float)):
+            continue
+        rates.append(float(r))
+        branches.append(tuple(ev.get("branch_path") or []))
+    return rates, branches
 
 
 def _resolve_trace_label(record: Dict[str, Any]) -> str:
@@ -145,9 +159,23 @@ def _resolve_trace_label(record: Dict[str, Any]) -> str:
 
 def _sessions_with_call_curves(
     detail: List[Dict[str, Any]],
+    trace_branches: List[Tuple[int, ...]],
 ) -> List[Tuple[float, Tuple[int, int], List[float]]]:
     """Return [(start_time, (trace_idx, session_idx), [per_call_hit_rate, ...]), ...]
-    sorted by start_time ascending."""
+    sorted by start_time ascending.
+
+    Within each session the per-call list is in **trace event order**,
+    not first_iter order. Each chart x-axis slot maps to exactly the
+    same trace event across all sessions: position ``i`` always shows
+    the engine measurement for the i-th assistant event in
+    ``trace_branches`` (= the trace.cachehit.json sequence).
+
+    Mapping: group a session's detail entries by ``branch_path`` and
+    sort each group by ``first_iter`` (= hop order within that branch,
+    which is necessarily trace-respecting because hop k+1 depends on
+    hop k's decode). Then walk ``trace_branches`` in order, popping the
+    head of the corresponding branch group for each step.
+    """
     by_session: Dict[Tuple[int, int], List[Dict[str, Any]]] = defaultdict(list)
     for e in detail or []:
         si = e.get("session_index")
@@ -160,17 +188,42 @@ def _sessions_with_call_curves(
     for sid, calls in by_session.items():
         if not calls:
             continue
-        # Order calls within a session by first_iter -> matches trace
-        # assistant-event order (each session replays the trace linearly).
-        calls.sort(key=lambda c: c.get("first_iter") or 0)
+        # Bucket by branch_path; sort each bucket by first_iter to get
+        # the within-branch hop order.
+        by_branch: Dict[Tuple[int, ...], List[Dict[str, Any]]] = defaultdict(list)
+        for c in calls:
+            bp = tuple(c.get("branch_path") or [])
+            by_branch[bp].append(c)
+        for bp in by_branch:
+            by_branch[bp].sort(key=lambda c: c.get("first_iter") or 0)
+
+        # Walk trace_branches in order; for each step, take the next
+        # unused entry from this session's by_branch bucket. This yields
+        # the session's detail entries in trace event order.
+        if trace_branches:
+            consumed: Dict[Tuple[int, ...], int] = {bp: 0 for bp in by_branch}
+            ordered: List[Dict[str, Any]] = []
+            for tbp in trace_branches:
+                bucket = by_branch.get(tbp)
+                if bucket is None:
+                    continue
+                k = consumed[tbp]
+                if k < len(bucket):
+                    ordered.append(bucket[k])
+                    consumed[tbp] = k + 1
+        else:
+            # No trace_branches available; fall back to first_iter
+            # ordering (degenerate but keeps the plot usable).
+            ordered = sorted(calls, key=lambda c: c.get("first_iter") or 0)
+
         starts = [c.get("arrival_time") or c.get("server_arrival_time")
-                  for c in calls]
+                  for c in ordered]
         starts = [s for s in starts if isinstance(s, (int, float))]
         if not starts:
             continue
         start = float(min(starts))
         hit_rates: List[float] = []
-        for c in calls:
+        for c in ordered:
             r = c.get("kv_cache_hit_rate")
             if isinstance(r, (int, float)):
                 hit_rates.append(float(r))
@@ -193,7 +246,8 @@ def _render_one(
     detail = run.get("replay_assistant_generations_detail")
     if not detail:
         return None
-    sessions = _sessions_with_call_curves(detail)
+    opt_rates, trace_branches = _trace_optimal_and_branches(record)
+    sessions = _sessions_with_call_curves(detail, trace_branches)
     if not sessions:
         return None
 
@@ -218,7 +272,6 @@ def _render_one(
                 markersize=4, alpha=0.85,
                 label=f"session #{si}  t={rel_t:6.1f}s")
 
-    opt_rates = _optimal_per_call_hit_rates(record)
     if opt_rates:
         ox = list(range(len(opt_rates)))
         ax.plot(ox, opt_rates, color="tab:red", linestyle="--", linewidth=1.4,
@@ -243,7 +296,8 @@ def _render_one(
     fig.subplots_adjust(bottom=0.18)
     legend = (
         f"x = LLM call index (0..{max(len(s[2]) for s in sessions) - 1} "
-        "for this trace, ordered by first_iter within each session).    "
+        "for this trace, **trace event order**; each session's i-th sample "
+        "is aligned to the same trace event via (branch_path, hop)).    "
         "y = engine kv_cache_hit_rate per prefill.\n"
         f"Curves: every {stride}th session by start time. "
         "Dashed red = optimal per-call cache block hit rate "

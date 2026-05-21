@@ -654,6 +654,17 @@ class QueueExecutor:
                 input_tokens=input_tokens,
                 max_tokens=completion_tokens,
                 ignore_eos=True,
+                # Ask trtllm-serve to ship the actual decoded token ids in
+                # each stream chunk (``CompletionRequest.detokenize=False``).
+                # Required for KV-cache alignment: the server commits its
+                # real decode ids into the radix tree, and we need to store
+                # those same ids into the conversation's segment list so
+                # subsequent turns' prompts walk the same chain instead of
+                # sibling-forking at the prev-prompt block boundary. Without
+                # this, the RNG fallback below kicks in and every turn after
+                # one with non-empty content loses ``ceil(content/32)``
+                # blocks of cache hit relative to the ideal upper bound.
+                skip_detokenizer=True,
             )
             client_request_start_s = time.perf_counter()
             status = await self.worker.run_task(gen_task)
@@ -662,11 +673,12 @@ class QueueExecutor:
                 raise RuntimeError(f"GenerationTask failed with status {status}")
 
             # Strip leading reasoning tokens, keep only the content portion.
-            # The ``/v1/completions`` endpoint does not stream ``token_ids``
-            # with ``detokenize`` on, so fall back to synthetic ids of the
-            # length the server actually produced (``usage.completion_tokens``
-            # from the trailing usage chunk, which matches ``ignore_eos=True``
-            # + ``max_tokens=completion_tokens`` in normal replay).
+            # With ``skip_detokenizer=True`` on the GenerationTask above the
+            # server emits its actual decoded ids in each stream chunk's
+            # ``token_ids`` field, so ``gen_task.output_tokens`` is the
+            # real model output and storing ``output_tokens[reasoning:]``
+            # into the segment list keeps the next turn's prompt aligned
+            # with the server's radix tree.
             output_len = gen_task.usage_completion_tokens
             if output_len is None:
                 output_tokens = gen_task.output_tokens
@@ -676,14 +688,15 @@ class QueueExecutor:
                     output_len = int(completion_tokens)
             output_tokens = gen_task.output_tokens
             if output_tokens is None:
-                # ``/v1/completions`` does not stream token_ids when
-                # detokenize is on (the trtllm-serve default), so the worker
-                # cannot recover the server's actual generated ids.  Fall
-                # back to a synthetic draw from the per-branch RNG; this
-                # makes the placeholder sequence deterministic for the
-                # (session, branch_path) pair, which is what makes pass-2
-                # of the same session reproduce the prefix tokens pass-1
-                # committed to the radix tree.
+                # Defensive fallback: should not trigger when running
+                # against a trtllm-serve that honours ``detokenize=False``
+                # (the GenerationTask above sets it). Kept for backward
+                # compatibility with older servers that always detokenize;
+                # note this path produces an RNG placeholder that does NOT
+                # match the server's real decode ids, so subsequent turns
+                # will sibling-fork at the prev-prompt block boundary and
+                # measured per-call hit rate will fall below the upper
+                # bound by ~``ceil(prev_content/32)`` blocks per turn.
                 output_tokens = _generate_random_token_ids(int(output_len), self._rng)
             content_tokens = output_tokens[reasoning_tokens:]
             if self._generation_stats is not None:

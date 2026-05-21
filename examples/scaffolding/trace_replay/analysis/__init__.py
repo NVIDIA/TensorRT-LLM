@@ -11,7 +11,12 @@ emit per-(branch root / branch depth / system prompt) rollups.
 
 from .aggregation import DATASET_SCHEMA, aggregate_dataset_record
 from .annotate import ANNOTATION_FIELDS, build_annotated_trace
-from .blocks import BlockPrefixCache, full_blocks, reusable_token_len, validate_tokens_per_block
+from .blocks import (
+    TokenPrefixCache,
+    engine_aligned_block_count,
+    engine_aligned_hit_blocks,
+    validate_tokens_per_block,
+)
 from .branch_summary import compute_branch_rollups, merge_rollup_arrays
 from .cache_hit import SCHEMA, compute_cache_hit_upper_bound
 from .io import (
@@ -30,13 +35,13 @@ from .streams import ConversationSegments, SystemPromptRegistry, TokenIdAllocato
 __all__ = [
     "ANNOTATED_TRACE_SUFFIX",
     "ANNOTATION_FIELDS",
-    "BlockPrefixCache",
     "ConversationSegments",
     "DATASET_SCHEMA",
     "OUTPUT_SUFFIX",
     "SCHEMA",
     "SystemPromptRegistry",
     "TokenIdAllocator",
+    "TokenPrefixCache",
     "aggregate_dataset_record",
     "build_annotated_trace",
     "compute_branch_rollups",
@@ -44,12 +49,12 @@ __all__ = [
     "default_annotated_trace_path",
     "default_dataset_output_path",
     "default_output_path",
-    "full_blocks",
+    "engine_aligned_block_count",
+    "engine_aligned_hit_blocks",
     "load_trace",
     "merge_rollup_arrays",
     "resolve_input_trace_files",
     "resolve_trace_file",
-    "reusable_token_len",
     "validate_tokens_per_block",
     "write_json",
 ]

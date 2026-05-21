@@ -192,23 +192,15 @@ class ConversationSegments:
         self,
         branch_path: Sequence[int],
         conversation_id: int,
-        prompt_len: int,
     ) -> List[int]:
-        """Return synthetic prompt of length *prompt_len* for a request.
+        """Return the concatenation of all stored segments for this conv.
 
-        Concatenates stored segments. If the recorded segments fall short of
-        *prompt_len* (compact traces may omit ``tokens`` on some events),
-        pads with fresh allocator tokens so length matches what the trace
-        reports as the actual prompt length. If they overshoot, truncates.
+        This is what ``tensorrt_llm.scaffolding.replay.QueueExecutor`` sends
+        to the engine as ``prompt=List[int]`` on ``/v1/completions`` — i.e.,
+        the actual ``usage_prompt_tokens`` the engine sees.
         """
         segments = self._segments_for(branch_path, conversation_id)
         prompt: List[int] = []
         for seg in segments:
             prompt.extend(seg)
-            if len(prompt) >= prompt_len:
-                break
-        if len(prompt) > prompt_len:
-            return prompt[:prompt_len]
-        if len(prompt) < prompt_len:
-            prompt.extend(self._allocator.take(prompt_len - len(prompt)))
         return prompt

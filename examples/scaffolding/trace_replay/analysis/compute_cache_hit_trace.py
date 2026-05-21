@@ -75,15 +75,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--include-last-token-in-blocks",
-        action="store_true",
-        help=(
-            "Include the last prompt token when forming reusable blocks. By "
-            "default this script follows TRT-LLM block reuse, whose block key "
-            "does not include the request's last token."
-        ),
-    )
-    parser.add_argument(
         "--decode-kv-reuse",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -127,7 +118,6 @@ def main() -> None:
         compute_cache_hit_upper_bound(
             trace_data,
             tokens_per_block=args.tokens_per_block,
-            exclude_last_token_from_blocks=not args.include_last_token_in_blocks,
             decode_kv_reuse=args.decode_kv_reuse,
             cot_pollutes_cache=args.cot_pollutes_cache,
             include_rollups=not args.no_rollups,
@@ -172,7 +162,7 @@ def main() -> None:
         "tokens_per_block={tokens_per_block} "
         "preloaded_system_blocks={preloaded_system_blocks} "
         "minimal_cache_blocks={minimal_cache_blocks} "
-        "overall_cache_hit_rate={overall_cache_hit_rate:.6f}".format(**summary)
+        "optimal_overall_cache_hit_rate={optimal_overall_cache_hit_rate:.6f}".format(**summary)
     )
 
 

@@ -33,6 +33,7 @@ shows a real Pareto curve.
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -100,6 +101,26 @@ def _resolve_trace_label(record: Dict[str, Any]) -> str:
     return tm.get("trace_id") or "(unknown trace)"
 
 
+def _per_session_block_hit_rates(detail):
+    """Engine-measured per-session block hit rate, derived on demand."""
+    if not detail:
+        return []
+    per_session: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0])
+    for entry in detail:
+        si = entry.get("session_index")
+        if si is None:
+            continue
+        ti = int(entry.get("trace_index") or 0)
+        per_session[(ti, int(si))][0] += int(entry.get("num_reused_blocks") or 0)
+        per_session[(ti, int(si))][1] += int(entry.get("num_missed_blocks") or 0)
+    out = []
+    for (_ti, _si), (reused, missed) in per_session.items():
+        total = reused + missed
+        if total > 0:
+            out.append(reused / total)
+    return out
+
+
 def _format_point_label(r: Dict[str, Any]) -> str:
     """Pareto point label using the abbreviations documented in
     :data:`POINT_LABEL_LEGEND` (rendered as the figure caption).
@@ -107,8 +128,9 @@ def _format_point_label(r: Dict[str, Any]) -> str:
     b = r.get("max_batch_size")
     n = r.get("total_sessions")
     c = r.get("concurrency")
-    real_max = r.get("real_cache_hit_max")
-    real_avg = r.get("real_cache_hit_avg")
+    rates = _per_session_block_hit_rates(r.get("replay_assistant_generations_detail"))
+    real_max = max(rates) if rates else None
+    real_avg = (sum(rates) / len(rates)) if rates else None
     opt = r.get("optimal_cache_hit")
     rmx = f"{real_max:.3f}" if isinstance(real_max, (int, float)) else "—"
     rav = f"{real_avg:.3f}" if isinstance(real_avg, (int, float)) else "—"
@@ -118,7 +140,7 @@ def _format_point_label(r: Dict[str, Any]) -> str:
 
 POINT_LABEL_LEGEND = (
     "B = max_batch_size    N = total_sessions    C = concurrency\n"
-    "R_max / R_avg = real_cache_hit per session (max / mean across N)    "
+    "R_max / R_avg = engine-measured block hit rate per session (max / mean across N)    "
     "O = optimal_cache_hit (offline upper bound)")
 
 

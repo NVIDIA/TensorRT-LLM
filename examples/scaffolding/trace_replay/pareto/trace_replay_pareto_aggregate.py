@@ -209,76 +209,24 @@ def _trace_meta(trace_dirs: List[Path], total_sessions: int) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Cache-hit annotations stamped onto each per-step run row so the plot
-# helpers can label every Pareto point with B / N / C / real / optimal.
-#
-# real_cache_hit_max:
-#   Per step. Engine-measured KV cache block hit rate, taken as the maximum
-#   across that step's sessions of sum(num_reused_blocks) /
-#   (sum(num_reused_blocks) + sum(num_missed_blocks)) over the session's
-#   assistant LLM calls. Source: run_row.replay_assistant_generations_detail
-#   (drained from /perf_metrics and merged by trace_replay_client).
-#
 # optimal_cache_hit:
 #   Per trace (constant across ladder steps). Loaded from the offline
 #   upper-bound *.cachehit.json that lives next to each --trace_dir (the
 #   summary file, NOT *.trace.cachehit.json which is the annotated trace).
 #   When multiple traces are mixed 1:1, the per-step row carries their mean.
+#   Plot helpers compute the engine-measured per-session hit rates on
+#   demand from run_row.replay_assistant_generations_detail.
 # ---------------------------------------------------------------------------
 
 
-def _compute_per_session_block_hit_rates(
-    detail: Optional[List[Dict[str, Any]]],
-) -> List[float]:
-    """Return one block hit rate per (trace_index, session_index) group.
-
-    Each session's rate = sum(num_reused_blocks) / (sum(num_reused) +
-    sum(num_missed)) over that session's assistant LLM calls.
-    """
-    if not detail:
-        return []
-    per_session: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0])
-    for entry in detail:
-        si = entry.get("session_index")
-        if si is None:
-            continue
-        ti = int(entry.get("trace_index") or 0)
-        per_session[(ti, int(si))][0] += int(entry.get("num_reused_blocks") or 0)
-        per_session[(ti, int(si))][1] += int(entry.get("num_missed_blocks") or 0)
-    rates: List[float] = []
-    for (_ti, _si), (reused, missed) in per_session.items():
-        total = reused + missed
-        if total > 0:
-            rates.append(reused / total)
-    return rates
-
-
-def _compute_real_cache_hit_max(detail: Optional[List[Dict[str, Any]]]) -> Optional[float]:
-    rates = _compute_per_session_block_hit_rates(detail)
-    return max(rates) if rates else None
-
-
-def _compute_real_cache_hit_avg(detail: Optional[List[Dict[str, Any]]]) -> Optional[float]:
-    """Plain mean across sessions of per-session block hit rates.
-
-    Each session is weighted equally (averaged over the N dimension);
-    sessions with no cacheable blocks are skipped, matching _max.
-    """
-    rates = _compute_per_session_block_hit_rates(detail)
-    return (sum(rates) / len(rates)) if rates else None
-
-
 def _load_optimal_cache_hit_for_dir(trace_dir: Path) -> Optional[float]:
-    """Read <trace_dir>/<stem>.cachehit.json::summary.overall_cache_block_hit_rate.
+    """Read <trace_dir>/<stem>.cachehit.json::summary.optimal_overall_cache_block_hit_rate.
 
-    Skips the sibling ``*.trace.cachehit.json`` (annotated trace) and any
-    ``*.realcachehit.json`` we may have written next to the trace.
+    Skips the sibling ``*.trace.cachehit.json`` (annotated trace).
     """
     candidates = sorted(trace_dir.glob("*.cachehit.json"))
     summary_files = [
-        p for p in candidates
-        if not p.name.endswith(".trace.cachehit.json")
-        and not p.name.endswith(".realcachehit.json")
+        p for p in candidates if not p.name.endswith(".trace.cachehit.json")
     ]
     if len(summary_files) != 1:
         return None
@@ -288,7 +236,7 @@ def _load_optimal_cache_hit_for_dir(trace_dir: Path) -> Optional[float]:
     except (OSError, json.JSONDecodeError):
         return None
     summary = data.get("summary") or {}
-    val = summary.get("overall_cache_block_hit_rate")
+    val = summary.get("optimal_overall_cache_block_hit_rate")
     return float(val) if isinstance(val, (int, float)) else None
 
 
@@ -340,14 +288,12 @@ def _assemble_combined_record(
 
     for rec in step_records:
         row = dict(rec["run_row"])
-        # Stamp the two cache-hit annotations onto each row so plotters can
-        # label every Pareto point with (B, N, C, real, optimal) without
-        # having to walk the trace dir / step JSON themselves.
-        _detail = row.get("replay_assistant_generations_detail")
-        _per_session_rates = _compute_per_session_block_hit_rates(_detail)
-        row["real_cache_hit_rates_per_session"] = _per_session_rates
-        row["real_cache_hit_max"] = max(_per_session_rates) if _per_session_rates else None
-        row["real_cache_hit_avg"] = (sum(_per_session_rates) / len(_per_session_rates)) if _per_session_rates else None
+        # Stamp the offline upper-bound KV-cache-hit annotation onto each
+        # row so plotters can label every Pareto point with B / N / C /
+        # optimal_cache_hit without having to walk the trace dir / step
+        # JSON themselves. Engine-measured per-session rates are computed
+        # by the plot helpers directly from
+        # ``replay_assistant_generations_detail`` (no precomputed copy).
         row["optimal_cache_hit"] = optimal_cache_hit_aggregate
         runs.append(row)
         if oom_at_index is None and row.get("error_kind") == "out_of_memory":
@@ -465,20 +411,12 @@ def _assemble_combined_record(
         },
         "step_artifacts": [str(p) for p in step_paths],
         "cache_hit_annotation": {
-            "real_cache_hit_max_definition": (
-                "engine-measured block hit rate, taken as the max across "
-                "the step's sessions of sum(num_reused_blocks) / "
-                "(sum(num_reused_blocks) + sum(num_missed_blocks)) over each "
-                "session's assistant LLM calls"),
-            "real_cache_hit_avg_definition": (
-                "same per-session block hit rate as real_cache_hit_max, "
-                "averaged with equal weight across all sessions (mean over "
-                "the N dimension)"),
             "optimal_cache_hit_definition": (
                 "upper-bound block hit rate from the offline infinite-cache "
                 "simulator (examples/scaffolding/trace_replay/analysis/"
-                "compute_cache_hit_trace.py), summary.overall_cache_block_hit_rate "
-                "in <trace_dir>/*.cachehit.json; per-step row stamps the mean "
+                "compute_cache_hit_trace.py), "
+                "summary.optimal_overall_cache_block_hit_rate in "
+                "<trace_dir>/*.cachehit.json; per-step row stamps the mean "
                 "across all configured trace_dirs"),
             "optimal_cache_hit_aggregate": optimal_cache_hit_aggregate,
             "optimal_cache_hit_per_trace": optimal_cache_hit_per_trace,

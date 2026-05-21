@@ -6,25 +6,22 @@ from typing import Any, Dict, List, Sequence
 
 from .branch_summary import merge_rollup_arrays
 
-DATASET_SCHEMA = "scaffolding.cache_hit_dataset.v3"
+DATASET_SCHEMA = "scaffolding.cache_hit_dataset.v4"
 
 
 _TRACE_LEVEL_RATE_FIELDS = (
-    ("overall_cache_hit_rate", "trace_cache_hit_rate"),
-    ("overall_cache_block_hit_rate", "trace_cache_block_hit_rate"),
-    ("cacheable_token_hit_rate", "trace_cacheable_token_hit_rate"),
+    ("optimal_overall_cache_hit_rate", "optimal_trace_cache_hit_rate"),
+    ("optimal_overall_cache_block_hit_rate", "optimal_trace_cache_block_hit_rate"),
 )
 
 _SUMMABLE_SUMMARY_FIELDS = (
     "event_count",
     "llm_request_count",
     "total_prompt_tokens",
-    "total_cacheable_prompt_tokens",
-    "total_non_cacheable_tail_tokens",
-    "total_cache_hit_blocks",
-    "total_cache_miss_blocks",
-    "total_cache_hit_tokens",
-    "total_cache_miss_tokens",
+    "optimal_total_cache_hit_blocks",
+    "optimal_total_cache_miss_blocks",
+    "optimal_total_cache_hit_tokens",
+    "optimal_total_cache_miss_tokens",
     "minimal_cache_blocks",
     "preloaded_system_blocks",
     "distinct_system_prompts",
@@ -53,13 +50,12 @@ def aggregate_dataset_record(trace_records: Sequence[Dict[str, Any]]) -> Dict[st
         for in_field, out_field in _TRACE_LEVEL_RATE_FIELDS:
             rate_buckets[out_field].append(summary.get(in_field, 0.0))
 
-    overall_hit_rate = _safe_div(sums["total_cache_hit_tokens"], sums["total_prompt_tokens"])
-    cacheable_hit_rate = _safe_div(
-        sums["total_cache_hit_tokens"], sums["total_cacheable_prompt_tokens"]
+    optimal_overall_cache_hit_rate = _safe_div(
+        sums["optimal_total_cache_hit_tokens"], sums["total_prompt_tokens"]
     )
-    overall_block_hit_rate = _safe_div(
-        sums["total_cache_hit_blocks"],
-        sums["total_cache_hit_blocks"] + sums["total_cache_miss_blocks"],
+    optimal_overall_cache_block_hit_rate = _safe_div(
+        sums["optimal_total_cache_hit_blocks"],
+        sums["optimal_total_cache_hit_blocks"] + sums["optimal_total_cache_miss_blocks"],
     )
 
     algorithm = dict(trace_records[0]["algorithm"]) if trace_records else {}
@@ -73,14 +69,12 @@ def aggregate_dataset_record(trace_records: Sequence[Dict[str, Any]]) -> Dict[st
         "trace_count": len(trace_records),
         **{field: sums[field] for field in _SUMMABLE_SUMMARY_FIELDS},
         "tokens_per_block": algorithm.get("tokens_per_block"),
-        "exclude_last_token_from_blocks": algorithm.get("exclude_last_token_from_blocks"),
         "decode_kv_reuse": algorithm.get("decode_kv_reuse"),
         "cot_pollutes_cache": algorithm.get("cot_pollutes_cache"),
         "preloaded_system_tokens": sums["preloaded_system_blocks"] * tokens_per_block,
         "minimal_cache_tokens": sums["minimal_cache_blocks"] * tokens_per_block,
-        "overall_cache_hit_rate": overall_hit_rate,
-        "overall_cache_block_hit_rate": overall_block_hit_rate,
-        "cacheable_token_hit_rate": cacheable_hit_rate,
+        "optimal_overall_cache_hit_rate": optimal_overall_cache_hit_rate,
+        "optimal_overall_cache_block_hit_rate": optimal_overall_cache_block_hit_rate,
         "max_prompt_tokens": max_prompt_tokens,
     }
 

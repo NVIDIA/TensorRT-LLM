@@ -36,11 +36,10 @@ examples/scaffolding/trace_replay/
 │   └── django__django-16801/
 │       ├── django__django-16801.trace.json        (compact)
 │       └── django__django-16801.full.trace.json   (full)
-├── analysis/                  -- offline KV-cache hit-rate analyzers
-│   ├── compute_cache_hit_trace.py   CLI: ideal upper-bound hit rate per trace
-│   ├── compute_real_cache_hit.py    CLI: engine-measured hit rate per session
-│   ├── cache_hit.py / real_cache_hit.py / aggregation.py / annotate.py /
-│   │   blocks.py / branch_summary.py / streams.py / io.py / __init__.py
+├── analysis/                  -- offline KV-cache hit-rate upper-bound analyzer
+│   ├── compute_cache_hit_trace.py   CLI: optimal upper-bound hit rate per trace
+│   ├── cache_hit.py / aggregation.py / annotate.py / blocks.py /
+│   │   branch_summary.py / streams.py / io.py / __init__.py
 │   └── README.md
 ├── pareto/                    -- multi-config Pareto sweep over trtllm-serve
 │   ├── trace_replay_client.py             one ladder point: external server client
@@ -63,7 +62,6 @@ Four workflows are covered:
 | Replay one trace once against one serving config | `run_trace_replay.py` |
 | Sweep throughput/latency Pareto over a `(B, N, C)` ladder | `pareto/trace_replay_client.py` + `pareto/trace_replay_pareto_aggregate.py` |
 | Offline upper bound on KV-cache hit rate (no GPU) | `analysis/compute_cache_hit_trace.py` |
-| Engine-measured KV-cache hit rate from a Pareto run | `analysis/compute_real_cache_hit.py` |
 
 ## The Core Design in One Picture
 
@@ -291,34 +289,35 @@ The per-run row carries:
   `*_full_burst` mirrors.
 - per-session admission/end offsets, per-LLM-call timing offsets,
   `steady_state_included` flag on every detail entry.
-- engine-measured KV-cache hit-rate annotation (`real_cache_hit_max`,
-  `real_cache_hit_avg`, `real_cache_hit_rates_per_session`) and the
-  matching offline upper bound (`optimal_cache_hit`) loaded from
-  `<trace_dir>/*.cachehit.json` if present — stamped by the aggregator.
+- offline KV-cache hit-rate upper bound (`optimal_cache_hit`) loaded from
+  `<trace_dir>/*.cachehit.json` if present — stamped by the aggregator
+  onto each run row. Engine-measured per-session rates are derived on
+  demand at plot time from `replay_assistant_generations_detail`
+  (`num_reused_blocks` / `num_missed_blocks` per assistant LLM call), so
+  no measured-rate aggregate is cached on the row.
 
 ### KV-cache hit-rate analysis (`analysis/`)
 
-Two complementary tools:
+`compute_cache_hit_trace.py` is a pure offline simulator: it assumes an
+infinite, non-evicting cache and walks the trace in `QueueExecutor` order,
+scoring each assistant prompt against a token-level radix tree of
+synthetic IDs. Output:
 
-- **Ideal upper bound** — `compute_cache_hit_trace.py`. Pure offline
-  simulator: assumes an infinite, non-evicting cache and walks the trace
-  in `QueueExecutor` order, scoring each assistant prompt against a radix
-  tree of synthetic-token block IDs. Outputs `<name>.cachehit.json`
-  (summary + per-request stats + rollups by branch / depth / system-prompt
-  UUID) and `<name>.trace.cachehit.json` (annotated trace). Defaults
-  mirror real TRT-LLM behavior (`tokens_per_block=32`,
-  `--decode-kv-reuse`, `--cot-pollutes-cache`,
-  `--include-last-token-in-blocks` off). See `analysis/README.md` for the
-  full flag/schema reference.
-- **Engine-measured rate** — `compute_real_cache_hit.py`. Reads a Pareto
-  run's step JSON and reports per-session block hit rate computed from
-  `sum(num_reused_blocks) / (sum(num_reused_blocks) + sum(num_missed_blocks))`
-  over each session's assistant LLM calls. This is what the aggregator
-  stamps as `real_cache_hit_*` on each run row.
+- `<name>.cachehit.json` (summary + per-request stats + rollups by branch /
+  depth / system-prompt UUID) with all hit-rate fields prefixed
+  ``optimal_`` so the offline upper-bound nature is unambiguous
+  (`optimal_overall_cache_block_hit_rate`,
+  `optimal_cache_block_hit_rate` per request, …).
+- `<name>.trace.cachehit.json` (annotated trace with the same `optimal_*`
+  fields stitched onto each scored assistant event).
 
-Pair them when interpreting a Pareto frontier: the gap between
-`optimal_cache_hit` and `real_cache_hit_max` tells you how much of the
-ideal block-reuse the runtime actually captures at that `(B, N, C)` point.
+Defaults mirror real TRT-LLM behavior (`tokens_per_block=32`,
+`--decode-kv-reuse`, `--cot-pollutes-cache`). See `analysis/README.md`
+for the full flag/schema reference.
+
+Pair `optimal_cache_hit` (offline UB) with the on-demand engine-measured
+per-session rate at plot time to read how much of the ideal block-reuse
+the runtime actually captures at any `(B, N, C)` point.
 
 ### Plots (`plots/`)
 
@@ -443,12 +442,10 @@ python examples/scaffolding/trace_replay/analysis/compute_cache_hit_trace.py \
   path/to/some.trace.json
 ```
 
-Engine-measured per-session hit rate from a Pareto run's step JSON:
-
-```bash
-python examples/scaffolding/trace_replay/analysis/compute_real_cache_hit.py \
-  --step_json .../pareto_server_output/<run_stem>/step8.json
-```
+Engine-measured per-session hit rates are computed directly from each
+step JSON's `replay_assistant_generations_detail` (`num_reused_blocks` /
+`num_missed_blocks` per call) at plot time — no extra CLI step is
+required.
 
 See `analysis/README.md` for flags and output schema.
 
@@ -469,9 +466,10 @@ See `analysis/README.md` for flags and output schema.
   unsuffixed headline fields (`output_tps_aggregate`, `median_tpot_ms`,
   ...) are `None`; use the `*_full_burst` mirrors.
 - The two cache-hit numbers serve different purposes:
-  `optimal_cache_hit` is an offline upper bound, `real_cache_hit_*` is
-  the engine's measurement; their gap reflects scheduling / eviction
-  losses, not a bug.
+  `optimal_cache_hit` is an offline upper bound; the engine-measured
+  per-session block hit rate (derived on demand at plot time from
+  `num_reused_blocks` / `num_missed_blocks`) is the actual achieved
+  rate. Their gap reflects scheduling / eviction losses, not a bug.
 
 ---
 

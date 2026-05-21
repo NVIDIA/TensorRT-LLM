@@ -34,13 +34,36 @@ dashed line for reference.
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+
+
+def _per_session_block_hit_rates(detail):
+    """Engine-measured per-session block hit rate, computed from a run
+    row's ``replay_assistant_generations_detail`` on demand (no cached
+    copy in the aggregate JSON)."""
+    if not detail:
+        return []
+    per_session: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0])
+    for entry in detail:
+        si = entry.get("session_index")
+        if si is None:
+            continue
+        ti = int(entry.get("trace_index") or 0)
+        per_session[(ti, int(si))][0] += int(entry.get("num_reused_blocks") or 0)
+        per_session[(ti, int(si))][1] += int(entry.get("num_missed_blocks") or 0)
+    rates: List[float] = []
+    for (_ti, _si), (reused, missed) in per_session.items():
+        total = reused + missed
+        if total > 0:
+            rates.append(reused / total)
+    return rates
 
 PathLike = Union[str, Path]
 
@@ -94,12 +117,13 @@ def write_session_hit_pareto_png_from_json_file(
 ) -> Optional[Path]:
     """Render the per-session block hit-rate vs B plot.
 
-    Expects each successful run row to carry the fields stamped by
-    ``trace_replay_pareto_aggregate``:
-      - ``max_batch_size``                  (x value)
-      - ``total_sessions``                  (N, annotated)
-      - ``real_cache_hit_rates_per_session`` (list -> min/mean/max)
-      - ``optimal_cache_hit``               (horizontal reference line)
+    Reads:
+      - ``max_batch_size``                          (x value)
+      - ``total_sessions``                          (N, annotated)
+      - ``replay_assistant_generations_detail``     (engine measurements,
+        per-session rates derived on demand)
+      - ``optimal_cache_hit``                       (horizontal reference,
+        offline upper bound)
     """
     output_json = Path(output_json).expanduser().resolve()
     with output_json.open("r", encoding="utf-8") as f:
@@ -109,13 +133,15 @@ def write_session_hit_pareto_png_from_json_file(
     usable = []
     for r in runs:
         b = r.get("max_batch_size")
-        rates = r.get("real_cache_hit_rates_per_session") or []
+        rates = _per_session_block_hit_rates(
+            r.get("replay_assistant_generations_detail")
+        )
         if b is None or not rates:
             continue
         usable.append((int(b), r, list(rates)))
     if not usable:
         print(f"WARNING: no runs in {output_json} have max_batch_size + "
-              "real_cache_hit_rates_per_session; skipping session-hit PNG.")
+              "per-session detail; skipping session-hit PNG.")
         return None
     usable.sort(key=lambda t: t[0])
 

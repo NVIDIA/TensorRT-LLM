@@ -250,6 +250,17 @@ class OpenaiWorker(Worker):
         if task.ignore_eos:
             params["extra_body"]["ignore_eos"] = True
 
+        # Forward skip_detokenizer so trace replay can retrieve the server's
+        # actual decoded token ids in each stream chunk's ``token_ids`` field
+        # (trtllm-serve gates this behind ``CompletionRequest.detokenize``;
+        # see openai_protocol.py and postprocess_handlers.py). Without this,
+        # the replay's per-turn segment store ends up holding RNG placeholder
+        # ids that sibling-fork off the server's real decode chain in the
+        # radix tree, dropping every subsequent turn's prefix hit at the
+        # prev-prompt block boundary. See replay.py for the consequence.
+        if getattr(task, "skip_detokenizer", False):
+            params["extra_body"]["detokenize"] = False
+
         # Override parameters for deterministic inference
         if is_deterministic_mode():
             params["temperature"] = 0.0  # Deterministic sampling
@@ -302,11 +313,15 @@ class OpenaiWorker(Worker):
         pipeline emit ``1000 / median_TPOT`` per LLM call instead of a
         per-session proxy. See ``intvty_alignment_handoff.md`` §7 (Phase A).
 
-        The trtllm-serve ``/v1/completions`` backend happens to not emit
-        ``token_ids`` when ``detokenize`` is on (the default), so we do not
-        try to reconstruct a token list here; callers that care about the
-        count use ``task.usage_completion_tokens`` (authoritative, from the
-        server's ``usage`` chunk) or the known ``max_tokens`` budget.
+        The trtllm-serve ``/v1/completions`` backend emits ``token_ids`` in
+        each stream chunk only when the request opts out of detokenization
+        (``CompletionRequest.detokenize=False``). Callers that need the
+        actual decoded token ids (e.g. trace replay, which must align its
+        per-conversation segment store with the server's KV-cache radix
+        tree) should set ``task.skip_detokenizer=True`` — see
+        :meth:`convert_task_params`. Callers that only need the count use
+        ``task.usage_completion_tokens`` (authoritative, from the server's
+        ``usage`` chunk) or the known ``max_tokens`` budget.
         """
         params = self.convert_task_params(task)
         task.llm_request_params = self._request_params_for_trace(params)
