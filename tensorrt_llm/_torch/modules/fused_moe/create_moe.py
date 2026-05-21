@@ -8,7 +8,6 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
@@ -38,11 +37,6 @@ def get_moe_cls(
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
     elif moe_backend.upper() == "CUTEDSL":
-        if not IS_CUTLASS_DSL_AVAILABLE:
-            logger.warning(
-                "CuteDslFusedMoE requires CUTLASS DSL, but CUTLASS DSL is not available. "
-                "Using CutlassFusedMoE instead.")
-            return CutlassFusedMoE
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
                 or quant_config.quant_mode.has_nvfp4()):
