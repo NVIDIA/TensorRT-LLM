@@ -1300,9 +1300,9 @@ def _create_kv_cache_manager(
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False
 
-        # Use replay algorithm for mamba (default is on).
+        # Use replay algorithm for mamba (default is off).
         enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
-                                                '1') == '0'
+                                                '0') == '0'
         if enforce_disable_replay:
             logger.info(
                 "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
