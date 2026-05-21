@@ -56,6 +56,15 @@ def venv_check_output(venv, cmd, env=None, **kwargs):
     return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
+def resolve_llm_model_path(model_path: str) -> str:
+    """Resolve a model subpath relative to the test LLM model root."""
+    if os.path.isabs(model_path):
+        return model_path
+
+    from .conftest import llm_models_root
+    return os.path.join(llm_models_root(), model_path)
+
+
 def venv_mpi_check_call(venv, mpi_cmd, python_cmd, **kwargs):
     """
     This function WAR check_call() to run python_cmd with mpi.
