@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runtime artifacts from launch_*.sh / bench_ttft.sh -- not for version control.
+
+# sed-substituted runtime YAMLs produced by launch_*.sh
+configs/.runtime_*.yaml
+
+# Server logs, PID files, KV transceiver csvs (regenerated each run)
+logs/
+
+# Benchmark output (regenerated each run); keep the FINDINGS.md analyses
+results/**/*.bench.log
+results/**/*.json
+results/**/*-perf_metrics-time_diagram.html

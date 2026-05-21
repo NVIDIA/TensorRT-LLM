@@ -1,0 +1,30 @@
+# Ablation variant of repro_agg_tp1_eagle3.yaml with speculative decoding removed.
+# Tests whether the cookbook's 737 ms "executor -> server token" bucket is
+# dominated by Eagle3 postprocessing (drafter sync / target acceptance).
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+pipeline_parallel_size: 1
+enable_attention_dp: false
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.9
+moe_config:
+  backend: TRTLLM
+max_seq_len: 131072
+max_batch_size: 256
+max_num_tokens: 20000
+num_postprocess_workers: 4
+print_iter_log: true
+enable_chunked_prefill: true
+gpus_per_node: 8
+trust_remote_code: true
+enable_iter_perf_stats: true
+enable_iter_req_stats: true
+return_perf_metrics: true
+perf_metrics_max_requests: 20000
+iter_stats_max_iterations: 20000
+request_stats_max_iterations: 20000
