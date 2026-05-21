@@ -617,10 +617,15 @@ class ClientConfig:
             "b_use_chat_template",
             "b_streaming",
             "b_use_nv_sa_benchmark",
+            "b_eos",
         ]
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
+        # b_eos = True when --ignore-eos is NOT used (EOS honored). Historical
+        # rows lack this field; _match() treats missing b_* as False, so legacy
+        # baselines (which always had --ignore-eos) only match new b_eos=False
+        # rows, while spec-decoding (b_eos=True) becomes a new test case.
         db_data = {
             "s_client_name": self.name,
             "l_concurrency": self.concurrency,
@@ -634,6 +639,7 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            "b_eos": self.spec_decoding,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
