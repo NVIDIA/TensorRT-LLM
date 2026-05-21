@@ -231,7 +231,7 @@ def create_moe_backend(
     if swiglu_limit is not None or swiglu_limit_scalar is not None:
         assert moe_cls in [
             CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
-            DeepGemmFusedMoE, MegaMoEDeepGemm
+            DeepGemmFusedMoE, MegaMoEDeepGemm, CuteDslFusedMoE
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
         if moe_cls is MegaMoEDeepGemm and swiglu_limit is not None:
             raise NotImplementedError(
@@ -329,6 +329,7 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_limit=swiglu_limit,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,

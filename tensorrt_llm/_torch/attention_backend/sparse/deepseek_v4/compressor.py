@@ -153,25 +153,29 @@ class Compressor(nn.Module):
         # Determine attention types based on whether this is an indexer compressor
         if self.is_indexer:
             compress_type = DeepseekV4AttentionType.INDEXER_COMPRESS
-            state_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE
+            kv_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV
             score_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE
         else:
             compress_type = DeepseekV4AttentionType.COMPRESS
-            state_type = DeepseekV4AttentionType.COMPRESSOR_STATE
+            kv_type = DeepseekV4AttentionType.COMPRESSOR_KV
             score_type = DeepseekV4AttentionType.COMPRESSOR_SCORE
 
         # Get cache buffers
         kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx, compress_type)
-        paged_kv_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, state_type)
+        paged_kv_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_type)
         paged_score_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, score_type)
 
         # Get block tables
-        block_table = metadata.block_tables[(self.compress_ratio, compress_type)]
-        block_table_kv_state = metadata.block_tables[(self.compress_ratio, state_type)]
-        block_table_score_state = metadata.block_tables[(self.compress_ratio, score_type)]
+        local_layer_idx = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+        if self.is_indexer:
+            block_table = metadata.indexer_k_cache_block_offsets
+        else:
+            block_table = metadata.compress_block_tables[self.compress_ratio]
+        block_table_kv_state = metadata.sliding_block_tables[local_layer_idx, kv_type.value]
+        block_table_score_state = metadata.sliding_block_tables[local_layer_idx, score_type.value]
 
         # Get tokens_per_block from cache manager
-        # state_tokens_per_block: for state/score caches (used in compress kernels)
+        # state_tokens_per_block: for compressor kv/score state caches (used in compress kernels)
         # compress_tokens_per_block: for compressed KV cache (used in scatter)
         state_tokens_per_block = metadata.kv_cache_manager.tokens_per_block
         compress_tokens_per_block = metadata.kv_cache_manager.compressed_block_sizes[self.layer_idx]
