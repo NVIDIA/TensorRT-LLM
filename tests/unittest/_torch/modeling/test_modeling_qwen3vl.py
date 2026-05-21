@@ -13,7 +13,11 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase, Qwen3VLModel
+from tensorrt_llm._torch.models.modeling_qwen3vl import (
+    Qwen3VLInputProcessorBase,
+    Qwen3VLModel,
+    _triton_pos_embed_interpolate,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -347,3 +351,176 @@ def test_qwen3vl_init_preserves_caller_quant_config():
     assert model.mm_encoder.model_config.quant_config is not quant_config
     assert model.mm_encoder.model_config.quant_config.kv_cache_quant_algo is None
     assert model.mm_encoder.model_config.quant_config.quant_algo is None
+
+
+# ---------------------------------------------------------------------------
+# Accuracy tests for the fused Triton bilinear position-embedding kernel used
+# by the Qwen3-VL vision tower. Mirrors vLLM's
+# ``tests/kernels/core/test_vit_bilinear_pos_embed.py`` so the two
+# implementations stay aligned.
+# ---------------------------------------------------------------------------
+
+_VIT_POS_EMBED_DTYPES = [torch.float32, torch.bfloat16]
+# Qwen3-VL defaults
+_VIT_POS_EMBED_NUM_GRID_PER_SIDE = 48
+_VIT_POS_EMBED_SPATIAL_MERGE_SIZE = 2
+_VIT_POS_EMBED_HIDDEN_DIM = 1152
+
+_VIT_POS_EMBED_GRIDS = [
+    (1, 4, 4),
+    (1, 16, 16),
+    (1, 32, 32),
+    (1, 48, 48),
+    (1, 8, 16),
+    (1, 14, 20),
+    (1, 32, 48),
+    (1, 60, 80),
+]
+
+
+def _vit_pos_embed_native_reference(
+    embed_weight: torch.Tensor,
+    t: int,
+    h: int,
+    w: int,
+    num_grid_per_side: int,
+    m_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Eager PyTorch reference for one (t, h, w) grid — the pre-Triton
+    implementation, kept here only as the test oracle for
+    ``_triton_pos_embed_interpolate``.
+    """
+    hidden_dim = embed_weight.shape[1]
+    device = embed_weight.device
+
+    h_idxs = torch.linspace(0, num_grid_per_side - 1, h, dtype=torch.float32, device=device)
+    w_idxs = torch.linspace(0, num_grid_per_side - 1, w, dtype=torch.float32, device=device)
+
+    h_floor = h_idxs.to(torch.long)
+    w_floor = w_idxs.to(torch.long)
+    h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+    w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+    dh = h_idxs - h_floor
+    dw = w_idxs - w_floor
+
+    dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+    h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+    h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+    w11 = dh_grid * dw_grid
+    w10 = dh_grid - w11
+    w01 = dw_grid - w11
+    w00 = 1 - dh_grid - w01
+
+    h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+    w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+    h_grid_idx = h_grid * num_grid_per_side
+
+    indices = (h_grid_idx + w_grid).reshape(4, -1)
+    weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1).to(dtype)
+
+    embeds = embed_weight[indices]
+    embeds *= weights
+    combined = embeds.sum(dim=0)
+
+    combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+    combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+    return combined.expand(t, -1, -1).reshape(-1, hidden_dim).to(dtype)
+
+
+@pytest.mark.parametrize("dtype", _VIT_POS_EMBED_DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize(
+    "grid_thw",
+    _VIT_POS_EMBED_GRIDS,
+    ids=[f"{t}x{h}x{w}" for t, h, w in _VIT_POS_EMBED_GRIDS],
+)
+def test_vit_pos_embed_triton_matches_native(grid_thw, dtype):
+    """Triton kernel output must match the PyTorch reference within
+    bf16 / fp32 ULP-level rounding."""
+    t, h, w = grid_thw
+    device = "cuda"
+
+    # Scale to match the real Qwen3-VL pos_embed weight distribution
+    # (std ~ 0.23). Larger scales magnify the bf16 rounding gap between
+    # the two op orderings.
+    torch.manual_seed(42)
+    embed_weight = (
+        torch.randn(
+            _VIT_POS_EMBED_NUM_GRID_PER_SIDE * _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+            _VIT_POS_EMBED_HIDDEN_DIM,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.25
+    )
+
+    native_out = _vit_pos_embed_native_reference(
+        embed_weight,
+        t,
+        h,
+        w,
+        _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+        _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
+        dtype,
+    )
+    triton_out = _triton_pos_embed_interpolate(
+        embed_weight,
+        t,
+        h,
+        w,
+        _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+        _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
+        dtype,
+    )
+
+    assert native_out.shape == triton_out.shape
+
+    # Single-ULP differences come from the precomputed scalar h/w_scale
+    # in the Triton kernel vs ``torch.linspace`` in the reference. Match
+    # vLLM's tolerances for the same kernel.
+    atol = {torch.float32: 5e-5, torch.bfloat16: 1e-2}[dtype]
+    rtol = {torch.float32: 1e-5, torch.bfloat16: 1e-2}[dtype]
+    torch.testing.assert_close(triton_out, native_out, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", _VIT_POS_EMBED_DTYPES, ids=lambda d: str(d).split(".")[-1])
+def test_vit_pos_embed_temporal_repeat(dtype):
+    """t > 1 must repeat the (h, w) spatial pattern verbatim."""
+    device = "cuda"
+    h, w = 16, 16
+    t_single, t_multi = 1, 3
+
+    torch.manual_seed(42)
+    embed_weight = (
+        torch.randn(
+            _VIT_POS_EMBED_NUM_GRID_PER_SIDE * _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+            _VIT_POS_EMBED_HIDDEN_DIM,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.25
+    )
+
+    out_single = _triton_pos_embed_interpolate(
+        embed_weight,
+        t_single,
+        h,
+        w,
+        _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+        _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
+        dtype,
+    )
+    out_multi = _triton_pos_embed_interpolate(
+        embed_weight,
+        t_multi,
+        h,
+        w,
+        _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+        _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
+        dtype,
+    )
+
+    expected = out_single.repeat(t_multi, 1)
+    torch.testing.assert_close(out_multi, expected, atol=0, rtol=0)
