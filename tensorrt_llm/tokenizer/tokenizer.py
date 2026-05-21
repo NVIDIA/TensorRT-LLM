@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import pickle  # nosec B403
 from pathlib import Path
@@ -14,6 +15,78 @@ from ..logger import logger
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
 }
+
+# Tokenizer classes that ship only a slow ``PreTrainedTokenizer`` and rely on
+# a model-specific pre-tokenization regex. transformers >= 5 silently converts
+# them to a Fast ``TokenizersBackend`` via a generic SentencePiece-then-
+# TikToken fallback that does not honor the custom ``pat_str``. The result
+# mis-segments multilingual / CJK content (e.g. +~20% tokens on Kimi K2/K2.5
+# random-byte prompts). ``AutoTokenizer.from_pretrained(..., use_fast=False)``
+# is a no-op for this case on 5.x. For these classes we load the slow class
+# directly from the model repo's remote code via
+# ``get_class_from_dynamic_module``, bypassing AutoTokenizer's conversion.
+# See https://huggingface.co/moonshotai/Kimi-K2.5/discussions/7 and
+# https://huggingface.co/moonshotai/Kimi-K2.6 (transformers < 5.0.0).
+DYNAMIC_SLOW_TOKENIZER_MAP = {
+    "TikTokenTokenizer": "tokenization_kimi.TikTokenTokenizer",
+}
+
+
+def _read_tokenizer_class_from_config(
+        model_dir: Union[str, Path]) -> Optional[str]:
+    """Read ``tokenizer_class`` from ``tokenizer_config.json`` without
+    instantiating the tokenizer. Returns ``None`` if unavailable."""
+    cfg_path: Optional[str] = None
+    model_dir_str = str(model_dir)
+    if os.path.isdir(model_dir_str):
+        candidate = os.path.join(model_dir_str, "tokenizer_config.json")
+        if os.path.isfile(candidate):
+            cfg_path = candidate
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+            cfg_path = hf_hub_download(repo_id=model_dir_str,
+                                       filename="tokenizer_config.json")
+        except (OSError, ValueError, ImportError):
+            return None
+
+    if cfg_path is None:
+        return None
+
+    try:
+        with open(cfg_path, "r") as f:
+            return json.load(f).get("tokenizer_class")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def try_load_dynamic_slow_tokenizer(
+        model_dir: Union[str, Path],
+        **kwargs) -> Optional[PreTrainedTokenizerBase]:
+    """Load a slow tokenizer instance via ``get_class_from_dynamic_module``
+    for classes listed in :data:`DYNAMIC_SLOW_TOKENIZER_MAP`.
+
+    Returns the loaded HF tokenizer, or ``None`` if no entry matches or the
+    dynamic load fails. Callers should fall back to ``AutoTokenizer`` on
+    ``None``.
+    """
+    detected_class = _read_tokenizer_class_from_config(model_dir)
+    dynamic_ref = DYNAMIC_SLOW_TOKENIZER_MAP.get(detected_class)
+    if dynamic_ref is None:
+        return None
+    try:
+        from transformers.dynamic_module_utils import (
+            get_class_from_dynamic_module)
+        tok_cls = get_class_from_dynamic_module(dynamic_ref, str(model_dir))
+        # ``trust_remote_code`` is not accepted by ``from_pretrained`` on
+        # every slow tokenizer base; pop it so we don't pass an unknown kwarg.
+        kwargs.pop("trust_remote_code", None)
+        return tok_cls.from_pretrained(model_dir, **kwargs)
+    except (OSError, ValueError, ImportError, AttributeError) as e:
+        logger.warning(
+            f"Dynamic slow-tokenizer load of '{detected_class}' from "
+            f"{model_dir} failed: {e!r}. Falling back to AutoTokenizer.")
+        return None
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
@@ -251,6 +324,16 @@ class TransformersTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
+        # First try to bypass AutoTokenizer for classes that mis-convert
+        # under transformers >= 5 (e.g. Kimi K2/K2.5's TikTokenTokenizer).
+        tokenizer = try_load_dynamic_slow_tokenizer(pretrained_model_dir,
+                                                    **kwargs)
+        if tokenizer is not None:
+            tokenizer = maybe_fix_byte_level_tokenizer(tokenizer,
+                                                       pretrained_model_dir,
+                                                       **kwargs)
+            return cls(tokenizer)
+
         try:
             tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                       **kwargs)

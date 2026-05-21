@@ -1025,44 +1025,27 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             **kwargs,
         )
         self._config = config
-        # Kimi K2.5 ships only the slow ``TikTokenTokenizer`` (see the model
-        # repo's ``tokenization_kimi.py``). transformers >= 5 silently
-        # converts it to a Fast tokenizer via a SentencePiece-then-TikToken
-        # fallback that does not honor the original ``pat_str`` (CJK-aware),
-        # producing ~+20% more tokens for multilingual content vs. the slow
-        # path. ``AutoTokenizer.from_pretrained(..., use_fast=False)`` is a
-        # no-op for this case on 5.x. Load the slow class directly from the
-        # model repo's remote code instead. See
-        # https://huggingface.co/moonshotai/Kimi-K2.5/discussions/7.
-        if tokenizer is not None:
-            self._tokenizer = tokenizer
-        else:
-            from transformers.dynamic_module_utils import (
-                get_class_from_dynamic_module)
-            try:
-                tok_cls = get_class_from_dynamic_module(
-                    "tokenization_kimi.TikTokenTokenizer",
-                    str(model_path),
-                )
-                self._tokenizer = tok_cls.from_pretrained(
-                    model_path,
-                    trust_remote_code=trust_remote_code,
-                )
-            except (OSError, ValueError, ImportError, AttributeError):
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    model_path,
-                    trust_remote_code=trust_remote_code,
-                    use_fast=self.use_fast,
-                )
-        # ``use_fast`` here only affects the image processor selection
-        # (Fast vs. slow image processor); leave it as configured. We pin the
-        # processor's tokenizer to ``self._tokenizer`` below so any text-path
-        # through the processor sees the same slow tokenizer.
+        self._tokenizer = (
+            tokenizer
+            if tokenizer is not None
+            else AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=self.use_fast,
+            )
+        )
         self._processor = AutoProcessor.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast,
         )
+        # Pin the processor's tokenizer to ``self._tokenizer`` so any text
+        # path through ``self._processor(text=...)`` uses the same tokenizer
+        # the rest of this class uses. Without this, the processor builds
+        # its own (potentially mis-converted under transformers >= 5)
+        # tokenizer copy internally. See ``try_load_dynamic_slow_tokenizer``
+        # in ``tensorrt_llm/tokenizer/tokenizer.py`` for why this matters
+        # for Kimi-K2.5's ``TikTokenTokenizer``.
         if hasattr(self._processor, "tokenizer"):
             self._processor.tokenizer = self._tokenizer
         self._model_path = model_path
