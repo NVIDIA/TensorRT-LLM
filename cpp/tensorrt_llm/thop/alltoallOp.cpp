@@ -28,12 +28,14 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
+#include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 #include <nccl_device.h> // ncclGetPeerDevicePointer (host-side window peer-VA query)
 #endif
 
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -244,13 +246,47 @@ std::shared_ptr<ncclComm_t> getCommForCe(std::set<int> const& group, c10::intrus
     return comm;
 }
 
+// Symmetric-memory backend selector. Two backends are kept side-by-side so
+// the runtime data path (CE push + barrier) can be A/B-tested:
+//   - NCCL_WINDOW    : original path — ncclMemAlloc + ncclCommWindowRegister
+//                      + ncclGetPeerDevicePointer + NCCL device-API LSA
+//                      barrier. Needs NCCL 2.28+ runtime.
+//   - PYTORCH_CUDA_IPC : PyTorch _SymmetricMemory CUDA-IPC backend —
+//                      empty_strided_p2p + rendezvous + buffer_ptrs +
+//                      handle->barrier(channel). No NCCL version dep.
+// Env var TLLM_SYMM_MEM_BACKEND={nccl,pytorch} selects; default nccl.
+enum class SymmMemBackend
+{
+    NCCL_WINDOW,
+    PYTORCH_CUDA_IPC,
+};
+
+static SymmMemBackend getSymmMemBackendFromEnv()
+{
+    char const* v = std::getenv("TLLM_SYMM_MEM_BACKEND");
+    if (v == nullptr || std::strlen(v) == 0)
+    {
+        return SymmMemBackend::NCCL_WINDOW;
+    }
+    std::string s(v);
+    for (auto& c : s)
+    {
+        c = static_cast<char>(std::tolower(c));
+    }
+    if (s == "pytorch" || s == "pt" || s == "torch")
+    {
+        return SymmMemBackend::PYTORCH_CUDA_IPC;
+    }
+    return SymmMemBackend::NCCL_WINDOW;
+}
+
 // ============================================================================
-// AsyncUlyssesOp: async Ulysses A2A using NCCL Window symmetric memory +
-// CUDA C permute+scatter + cudaMemcpyBatchAsync peer push + NCCL 2.28+
-// device-API LSA barrier. Each rank's self segment is written directly to its
+// AsyncUlyssesOp: async Ulysses A2A using a symmetric-memory window +
+// CUDA C permute+scatter + cudaMemcpyBatchAsync peer push + LSA-style
+// release barrier. Each rank's self segment is written directly to its
 // symm-memory recv slot by the scatter kernel; peer segments are pushed to
-// each peer's slot via batched CE memcpy; cross-rank fence is the LSA barrier.
-// Requires NCCL 2.28+ runtime (LD_PRELOAD libnccl.so.2.28+).
+// each peer's slot via batched CE memcpy; cross-rank fence is the barrier.
+// Symm-memory backend is runtime-selectable (see SymmMemBackend above).
 // ============================================================================
 
 class AsyncUlyssesOp
@@ -259,6 +295,7 @@ public:
     AsyncUlyssesOp(std::set<int> group, c10::intrusive_ptr<c10d::ProcessGroup> pg)
         : mGroup(std::move(group))
         , mPg(std::move(pg))
+        , mBackend(getSymmMemBackendFromEnv())
     {
     }
 
@@ -270,6 +307,19 @@ public:
             "group size (%d) must match ProcessGroup size (%d). Pass a sub-group covering exactly the requested ranks.",
             static_cast<int>(mGroup.size()), mPg->getSize());
 
+        TLLM_LOG_INFO("AsyncUlyssesOp: symm-mem backend = %s",
+            mBackend == SymmMemBackend::NCCL_WINDOW ? "NCCL_WINDOW" : "PYTORCH_CUDA_IPC");
+
+        if (mBackend == SymmMemBackend::PYTORCH_CUDA_IPC)
+        {
+            // PyTorch _SymmetricMemory CUDA-IPC backend handles peer-access
+            // setup internally during rendezvous(). No NCCL comm bootstrap,
+            // no manual cudaDeviceEnablePeerAccess loop needed. Slot ring is
+            // populated lazily in getWindowSlot().
+            return 0;
+        }
+
+        // ---- NCCL_WINDOW backend ----
         // Reuse the PG-based NCCL comm bootstrap. The comm is only used for
         // the device-API LSA barrier (`ncclLsaBarrierSession`); data transport
         // goes through cudaMemcpyBatchAsync + CUDA C kernel, bypassing NCCL.
@@ -339,6 +389,33 @@ public:
     // PyTorch SymMem barrier).
     void emitLsaBarrier(cudaStream_t stream)
     {
+        if (mBackend == SymmMemBackend::PYTORCH_CUDA_IPC)
+        {
+            // PT _SymmetricMemory barrier picks up at::cuda::getCurrentCUDAStream()
+            // internally. Pick any allocated slot's handle (all slots in this op
+            // share the same group / barrier channel space). Caller is responsible
+            // for ensuring the current stream is the one we want the barrier on.
+            c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> h;
+            {
+                std::lock_guard<std::mutex> lock(mSlotsMutex);
+                for (auto const& s : mSlots)
+                {
+                    if (s.pt_handle)
+                    {
+                        h = s.pt_handle;
+                        break;
+                    }
+                }
+            }
+            TLLM_CHECK_WITH_INFO(h,
+                "emitLsaBarrier (PYTORCH_CUDA_IPC): no slot has been allocated yet — "
+                "rendezvous must precede the first barrier.");
+            (void) stream; // unused: PT barrier uses at::cuda::getCurrentCUDAStream()
+            h->barrier(/*channel=*/0, /*timeout_ms=*/10000);
+            return;
+        }
+
+        // ---- NCCL_WINDOW backend ----
         // Fast path: barrier already created.
         if (mLsaBarrier)
         {
@@ -376,7 +453,7 @@ public:
     std::tuple<torch::Tensor, torch::Tensor, std::vector<int64_t>, int64_t> acquire_slot_pair(
         at::IntArrayRef shape, c10::ScalarType dtype)
     {
-        TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "AsyncUlyssesOp not initialized");
+        TLLM_CHECK_WITH_INFO(mPg, "AsyncUlyssesOp not initialized (initialize() must be called first)");
 
         int64_t const elem_size = static_cast<int64_t>(c10::elementSize(dtype));
         TORCH_CHECK(elem_size > 0, "dtype must have positive itemsize");
@@ -418,7 +495,7 @@ public:
     // fused-permute kernel into recv_buf[my_rank]).
     void run_a2a_ce_push(torch::Tensor send_buf, std::vector<int64_t> const& peer_recv_ptrs, int64_t slot_bytes)
     {
-        TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "AsyncUlyssesOp not initialized");
+        TLLM_CHECK_WITH_INFO(mPg, "AsyncUlyssesOp not initialized (initialize() must be called first)");
         int const pSize = mPg->getSize();
         int const pgRank = mPg->getRank();
         TORCH_CHECK(static_cast<int>(peer_recv_ptrs.size()) == pSize, "peer_recv_ptrs size must equal world_size");
@@ -485,6 +562,23 @@ public:
 private:
     static constexpr int kNumSlots = 4;
 
+    // Register the PG's (group_name, rank, world_size, store) with PyTorch's
+    // symm-mem registry exactly once per process per group. Subsequent
+    // empty_strided_p2p + rendezvous calls in this group reuse it.
+    void ensureSymmMemGroupInfo()
+    {
+        static std::set<std::string> sRegistered;
+        static std::mutex sMutex;
+        std::string const& name = mPg->getGroupName();
+        std::lock_guard<std::mutex> lock(sMutex);
+        if (sRegistered.count(name))
+        {
+            return;
+        }
+        c10d::symmetric_memory::set_group_info(name, mPg->getRank(), mPg->getSize(), mPg->getStore());
+        sRegistered.insert(name);
+    }
+
     // Ring counter for output slot selection. Pipelined invocations must not
     // collide on the same slot before the previous one has consumed it.
     int nextSlot()
@@ -504,18 +598,21 @@ private:
     // local basePtr's remapped self-VA.
     struct WindowSlot
     {
-        void* basePtr = nullptr;     // ncclMemAlloc'd local buffer (output)
-        ncclWindow_t win = nullptr;  // SYMMETRIC-registered window handle
+        void* basePtr = nullptr;     // NCCL: ncclMemAlloc'd buf. PT: pt_tensor.data_ptr().
+        ncclWindow_t win = nullptr;  // NCCL-only: SYMMETRIC-registered window handle.
         size_t size = 0;
-        std::vector<void*> peerPtrs; // size == pSize; remapped peer-write pointers
+        std::vector<void*> peerPtrs; // size == pSize; peer-write pointers (both backends).
 
         // Per-slot local send buffer. Same byte size as basePtr (the recv
-        // buffer in our peer-WRITE scheme). Layout when viewed as a tensor:
-        // [P, B, S_local, H_local, D] bf16 contig — slot p holds bytes I will
-        // push to peer p. Local-only (no symm-mem registration); cudaMalloc'd
-        // eagerly in getWindowSlot to stay cuda_graph-capture-safe.
+        // buffer in our peer-WRITE scheme). Local-only (no symm-mem registration);
+        // cudaMalloc'd eagerly in getWindowSlot to stay cuda_graph-capture-safe.
         void* sendBuf = nullptr;
         size_t sendBufBytes = 0;
+
+        // PT-only: keep storage + handle alive across calls. basePtr aliases
+        // pt_tensor.data_ptr() and peerPtrs[i] comes from pt_handle->buffer_ptrs.
+        at::Tensor pt_tensor;
+        c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> pt_handle;
     };
 
     // Lazy collective allocator for the window slot ring. Mirrors getSlot()
@@ -532,6 +629,69 @@ private:
 
         std::lock_guard<std::mutex> lock(mSlotsMutex);
         auto& slot = mSlots[slotIdx];
+
+        if (mBackend == SymmMemBackend::PYTORCH_CUDA_IPC)
+        {
+            // ---- PT _SymmetricMemory CUDA-IPC backend ----
+            if (slot.basePtr != nullptr && slot.size >= requiredSize)
+            {
+                return slot;
+            }
+
+            // Size-up: release previous storage by dropping refs.
+            if (slot.basePtr != nullptr)
+            {
+                slot.pt_handle.reset();
+                slot.pt_tensor = at::Tensor();
+                slot.basePtr = nullptr;
+                slot.size = 0;
+                slot.peerPtrs.clear();
+            }
+
+            ensureSymmMemGroupInfo();
+            int64_t const nbytes = static_cast<int64_t>(requiredSize);
+            int currentDev = -1;
+            TLLM_CUDA_CHECK(cudaGetDevice(&currentDev));
+            c10::Device device(c10::DeviceType::CUDA, currentDev);
+            std::string const& groupName = mPg->getGroupName();
+
+            slot.pt_tensor = c10d::symmetric_memory::empty_strided_p2p(
+                /*size=*/{nbytes}, /*stride=*/{1}, /*dtype=*/at::kByte, device,
+                /*group_name=*/std::make_optional(groupName), /*alloc_id=*/std::nullopt);
+
+            // Collective; all ranks must reach in the same order.
+            slot.pt_handle = c10d::symmetric_memory::rendezvous(slot.pt_tensor, groupName);
+            TLLM_CHECK_WITH_INFO(slot.pt_handle, "rendezvous returned null handle");
+
+            slot.basePtr = slot.pt_tensor.data_ptr();
+            slot.size = requiredSize;
+
+            auto ptrs = slot.pt_handle->get_buffer_ptrs();
+            TLLM_CHECK_WITH_INFO(static_cast<int>(ptrs.size()) == pSize, "get_buffer_ptrs size %zu != world_size %d",
+                ptrs.size(), pSize);
+            slot.peerPtrs.assign(pSize, nullptr);
+            for (int p = 0; p < pSize; ++p)
+            {
+                slot.peerPtrs[p] = ptrs[p];
+            }
+
+            // sendBuf: same eager cudaMalloc as NCCL path (capture-safe).
+            if (slot.sendBuf != nullptr && slot.sendBufBytes < requiredSize)
+            {
+                (void) cudaFree(slot.sendBuf);
+                slot.sendBuf = nullptr;
+                slot.sendBufBytes = 0;
+            }
+            if (slot.sendBuf == nullptr)
+            {
+                TLLM_CUDA_CHECK(cudaMalloc(&slot.sendBuf, requiredSize));
+                slot.sendBufBytes = requiredSize;
+            }
+
+            return slot;
+        }
+
+        // ---- NCCL_WINDOW backend ----
 
         if (slot.basePtr != nullptr && slot.size >= requiredSize)
         {
@@ -600,6 +760,7 @@ private:
 
     std::set<int> mGroup;
     c10::intrusive_ptr<c10d::ProcessGroup> mPg;
+    SymmMemBackend mBackend;
     std::shared_ptr<ncclComm_t> mNcclComm;
     std::vector<int> mPeerDevIds;
 
