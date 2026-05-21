@@ -695,7 +695,14 @@ class ModelLoader:
             trust_remote_code: bool = True,
             **kwargs) -> Optional[transformers.PretrainedConfig]:
         try:
-            return transformers.PretrainedConfig.from_pretrained(
+            # Route via AutoConfig so model_types registered through
+            # transformers.models.auto.configuration_auto.CONFIG_MAPPING
+            # (e.g. deepseek_v32 / kimi_k2 via tensorrt_llm/_torch/configs/)
+            # are dispatched to their TRT-LLM-local config class. Calling
+            # PretrainedConfig.from_pretrained directly bypasses CONFIG_MAPPING
+            # and on transformers 5.5.x returns a bare PretrainedConfig that
+            # lacks attributes like max_position_embeddings.
+            return transformers.AutoConfig.from_pretrained(
                 model_dir, trust_remote_code=trust_remote_code, **kwargs)
         except Exception as e:
             logger.warning(
