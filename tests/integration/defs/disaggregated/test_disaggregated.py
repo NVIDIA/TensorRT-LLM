@@ -343,7 +343,7 @@ def setup_model_symlink(llm_venv, model_root, dest_subpath):
         os.symlink(model_root, dst, target_is_directory=True)
 
 
-def resolve_llm_model_path(model_path: str) -> str:
+def _resolve_llm_model_path(model_path: str) -> str:
     """Resolve a model subpath relative to the test LLM model root."""
     if os.path.isabs(model_path):
         return model_path
@@ -636,7 +636,7 @@ def setup_disagg_cluster(
     if isinstance(speculative_config, dict):
         speculative_model = speculative_config.get("speculative_model")
         if speculative_model:
-            speculative_config["speculative_model"] = resolve_llm_model_path(
+            speculative_config["speculative_model"] = _resolve_llm_model_path(
                 speculative_model)
 
     disagg_cluster = get_default_disagg_cluster_config()
@@ -670,7 +670,7 @@ def setup_disagg_cluster(
     # Launch workers
     model = model_name or config.get("model")
     if model:
-        model = resolve_llm_model_path(model)
+        model = _resolve_llm_model_path(model)
     ctx_workers = []
     gen_workers = []
     disagg_server = None
@@ -2317,7 +2317,7 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
 def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                                      disaggregated_example_root, llm_venv,
                                      model_path):
-    model_dir = resolve_llm_model_path(model_path)
+    model_dir = _resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
     run_disaggregated_test(disaggregated_example_root,
@@ -2407,7 +2407,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
-    model_dir = resolve_llm_model_path(model_path)
+    model_dir = _resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
     config_file = get_test_config(test_desc, disaggregated_example_root,
