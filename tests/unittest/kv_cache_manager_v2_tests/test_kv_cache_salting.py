@@ -15,6 +15,7 @@
 """Pure unit tests for KV cache reuse scopes."""
 
 import unittest
+from collections.abc import Iterator
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
@@ -43,7 +44,7 @@ class _EmptyLifeCycles:
     def ssm_life_cycle_id(self) -> None:
         return None
 
-    def attention_life_cycles(self):
+    def attention_life_cycles(self) -> Iterator[tuple[object, object]]:
         return iter(())
 
 
@@ -82,9 +83,17 @@ class TestReuseScope(unittest.TestCase):
         root = tree.add_or_get_existing(scope)
         block = Block(tokens, root)
 
-        self.assertEqual(list(tree.match(scope, tokens)), [(block, len(tokens))])
-        self.assertEqual(list(tree.match(other_scope, tokens)), [])
-        self.assertEqual(list(tree.match(other_scope, tokens[:1], enable_partial_match=True)), [])
+        match = tree.match(scope, tokens)
+        self.assertEqual(match.blocks, [block])
+        self.assertEqual(match.num_tokens, len(tokens))
+
+        match = tree.match(other_scope, tokens)
+        self.assertEqual(match.blocks, [])
+        self.assertEqual(match.num_tokens, 0)
+
+        match = tree.match(other_scope, tokens[:1], enable_partial_match=True)
+        self.assertEqual(match.blocks, [])
+        self.assertEqual(match.num_tokens, 0)
 
 
 if __name__ == "__main__":
