@@ -1807,11 +1807,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
             // The sparse MLA is in the absorption mode for the context phase.
             params.mla_param->absorption_mode = useSparseMLA();
+            // Fused FP8-Q-quant: RoPE kernel writes FP8 rope into `quant_q_buf`,
+            // so we skip the standalone invokeMLAContextFp8Quantize call below.
+            bool const useFusedQFp8 = params.mla_param->fuse_q_fp8_in_rope && mFP8ContextMLA
+                && params.mla_param->absorption_mode && cache_type == KvCacheDataType::FP8
+                && params.mla_param->quant_q_buf != nullptr && params.mla_param->quant_scale_qkv != nullptr;
             if (params.mla_param->latent_cache != nullptr)
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
             }
-            if (mFP8ContextMLA)
+            if (mFP8ContextMLA && !useFusedQFp8)
             {
                 invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
             }

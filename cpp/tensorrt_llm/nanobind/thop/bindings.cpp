@@ -174,6 +174,7 @@ void initBindings(nb::module_& m)
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
         nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
+        nb::arg("quant_scale_qkv") = std::nullopt,
         "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(

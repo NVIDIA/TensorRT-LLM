@@ -776,6 +776,10 @@ class AttentionForwardArgs:
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None
     quant_q_buffer: Optional[torch.Tensor] = None
+    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
+    # When non-None alongside `quant_q_buffer`, the C++ op skips
+    # `quantizeCopyInputToFp8Kernel`.
+    quant_scale_qkv: Optional[torch.Tensor] = None
 
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0

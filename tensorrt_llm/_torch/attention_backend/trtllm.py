@@ -1418,6 +1418,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> None:
+        # `quant_scale_qkv` only makes sense paired with `quant_q_buffer`: the
+        # C++ op interprets the buffer as the destination of a pre-quantized
+        # FP8 Q (DSv4 fused norm+RoPE path). Passing the scale without the
+        # buffer is meaningless and indicates a wiring bug.
+        # `quant_q_buffer` alone is fine: the regular FP8-KV-cache path
+        # allocates it as the output buffer for the legacy quant kernel.
+        assert (forward_args.quant_scale_qkv is None
+                or forward_args.quant_q_buffer is not None), (
+                    "quant_scale_qkv requires quant_q_buffer to be set")
+
         attention_input_type = forward_args.attention_input_type
         if not self.is_mla_enable:
             if forward_args.is_fused_qkv:
@@ -1667,6 +1677,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_mla_topk_lens=forward_args.sparse.sparse_mla_topk_lens,
                 compressed_kv_cache_pool_ptr=forward_args.sparse.
                 compressed_kv_cache_pool_ptr,
+                quant_scale_qkv=forward_args.quant_scale_qkv,
             )
 
         if self.print_skip_softmax_stat:
