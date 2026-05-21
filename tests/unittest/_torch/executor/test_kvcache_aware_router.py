@@ -206,7 +206,6 @@ class TestKVCacheAwareADPRouter:
         dist = _mock_dist(tp_rank=0, tp_size=2)
         mgr = _mock_kv_cache_manager()
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
-        router._pending_warmup_ranks = set()  # isolate scoring from warmup
 
         router._all_ranks_prefix_matches = [{1: 0}, {1: 0}]
 
@@ -225,7 +224,6 @@ class TestKVCacheAwareADPRouter:
         dist = _mock_dist(tp_rank=0, tp_size=2)
         mgr = _mock_kv_cache_manager()
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, load_balance_weight=10.0)
-        router._pending_warmup_ranks = set()  # isolate scoring from warmup
 
         router._all_ranks_prefix_matches = [{1: 80}, {1: 0}]
 
@@ -276,7 +274,6 @@ class TestKVCacheAwareADPRouter:
         # cap-relaxation behavior covered separately in
         # test_fair_share_multiplier_caps_per_rank.
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, fair_share_multiplier=1.0)
-        router._pending_warmup_ranks = set()  # isolate scoring from warmup
 
         # Requests 1,2 have cache on rank 0; requests 3,4 have no cache
         router._all_ranks_prefix_matches = [
@@ -401,7 +398,9 @@ class TestKVCacheAwareADPRouterWarmup:
     def _make_router(self, tp_size):
         dist = _mock_dist(tp_rank=0, tp_size=tp_size)
         mgr = _mock_kv_cache_manager()
-        return KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+        return KVCacheAwareADPRouter(
+            dist=dist, kv_cache_manager=mgr, cold_start_warmup=True
+        )
 
     def _no_match(self, tp_size, req_ids):
         return [{rid: 0 for rid in req_ids} for _ in range(tp_size)]
@@ -412,9 +411,16 @@ class TestKVCacheAwareADPRouterWarmup:
         ]
 
     def test_pending_initialised_in_ctor(self):
-        """__init__ should populate ``_pending_warmup_ranks`` from dist.tp_size."""
+        """``cold_start_warmup=True`` should populate ``_pending_warmup_ranks`` from dist.tp_size."""
         router = self._make_router(tp_size=4)
         assert router._pending_warmup_ranks == {0, 1, 2, 3}
+
+    def test_disabled_by_default(self):
+        """Default ``cold_start_warmup=False`` leaves the pending set empty."""
+        dist = _mock_dist(tp_rank=0, tp_size=4)
+        mgr = _mock_kv_cache_manager()
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+        assert router._pending_warmup_ranks == set()
 
     def test_first_batch_round_robins_across_ranks(self):
         """First tp_size relaxed requests dispatch to ranks 0..tp_size-1."""
@@ -485,7 +491,8 @@ class TestKVCacheAwareADPRouterWarmup:
         """Once pending is empty, routing reverts to pure scoring."""
         tp_size = 2
         router = self._make_router(tp_size=tp_size)
-        router._pending_warmup_ranks = set()  # simulate fully warmed router
+        # Drain the warmup set to simulate a fully warmed router.
+        router._pending_warmup_ranks = set()
         # Req 1 has a cache hit only on rank 1; scoring (not warmup) should
         # send it there.
         router._all_ranks_prefix_matches = [{1: 0}, {1: 80}]
