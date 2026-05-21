@@ -3,6 +3,7 @@
 """Regression tests for MambaCacheManager padding-slot behavior and
 CppMambaHybridCacheManager PP-sharding edge cases."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -383,6 +384,19 @@ def _build_hybrid_with_mamba_layer_pp(
     )
 
 
+# Skip when running under pytest --run-ray (sets TLLM_DISABLE_MPI=1). In that
+# mode ``Mapping`` resolves to ``DeviceMeshTopology``, whose ``pp_rank``
+# requires torch.distributed initialisation that isn't available in this
+# single-process unit test. The pp-sharding behaviour exercised here is
+# orthogonal to the Ray orchestrator.
+_skip_under_ray = pytest.mark.skipif(
+    os.environ.get("TLLM_DISABLE_MPI") == "1",
+    reason="pp_size>1 helper builds Mapping with world_size>1 which needs "
+    "torch.distributed under TLLM_DISABLE_MPI=1 (Ray) sessions",
+)
+
+
+@_skip_under_ray
 @skip_no_cuda
 @pytest.mark.parametrize("pp_size", [2, 4])
 def test_cpp_hybrid_recurrent_pool_scales_with_pp_size(pp_size):
