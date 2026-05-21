@@ -52,8 +52,7 @@ def test_all_marathon_yamls_parse_and_validate() -> None:
     marathon_yamls = sorted(_CONFIG_DIR.glob("marathon_*.yaml"))
     assert marathon_yamls, f"no marathon_*.yaml configs found under {_CONFIG_DIR}"
     for path in marathon_yamls:
-        cfg = StressConfig.from_yaml_path(path)
-        cfg.validate()
+        StressConfig.from_yaml_path(path)
 
 
 @pytest.mark.parametrize("config_filename", _MARATHON_CONFIGS)

@@ -107,7 +107,7 @@ For now, when the skeleton test fails:
 
 1. Confirm the YAML parses:
    ```bash
-   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_cpp_v1_deepseek.yaml').validate()"
+   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_cpp_v1_deepseek.yaml')"
    ```
 2. Check the `failure_reason` field in `collect_results()` output.
 3. Look at the pytest stdout for harness `logger` lines (each thread

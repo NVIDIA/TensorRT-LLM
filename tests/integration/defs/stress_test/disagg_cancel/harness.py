@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Callable, Optional
@@ -80,6 +81,29 @@ class StressConfig:
 
     @classmethod
     def from_yaml_path(cls, path: Path) -> "StressConfig":
+        """Parse and validate a marathon YAML in one call.
+
+        Callers that construct ``StressConfig`` directly via
+        ``__init__`` (no current consumer, but the API is left open)
+        remain responsible for invoking ``validate()`` themselves.
+
+        Args:
+            path: Path to a marathon YAML containing a top-level
+                ``stress_config:`` block. See ``configs/README.md``
+                for the schema.
+
+        Returns:
+            A validated ``StressConfig`` whose typed fields are
+            coerced from the YAML and whose ``raw`` attribute
+            carries the full ``stress_config:`` subtree.
+
+        Raises:
+            ValueError: If the YAML is missing the ``stress_config:``
+                block, or if ``validate()`` rejects the resulting
+                backend-knob combination.
+            yaml.YAMLError: If the file is not valid YAML.
+            OSError: If ``path`` cannot be opened.
+        """
         with path.open("r", encoding="utf-8") as f:
             doc = yaml.safe_load(f)
         if "stress_config" not in doc:
@@ -92,10 +116,20 @@ class StressConfig:
         for name, coerce in _STRESS_CONFIG_COERCERS.items():
             if name in sc:
                 kwargs[name] = coerce(sc[name])
-        return cls(**kwargs)
+        cfg = cls(**kwargs)
+        cfg.validate()
+        return cfg
 
     def validate(self) -> None:
-        """Reject backend-knob combinations that are not supported."""
+        """Reject backend-knob combinations that are not supported.
+
+        Raises:
+            ValueError: If ``kv_cache_manager`` is not ``"v1"`` or
+                ``"v2"``, if ``transceiver`` is not ``"cpp"`` or
+                ``"python"``, or if the pair ``(v2, cpp)`` is
+                supplied (the C++ transceiver only supports the V1
+                KV cache manager).
+        """
         if self.kv_cache_manager == "v2" and self.transceiver == "cpp":
             # The C++ transceiver (BindKvCacheTransceiver) only supports
             # the V1 KV cache manager. V2 must be paired with the Python
@@ -170,12 +204,29 @@ class _LogSource:
         patterns: list[tuple[str, re.Pattern[str]]],
         mark_failed: Callable[[str], None],
     ) -> bool:
-        """Read new content and scan; return True if a pattern hit was reported.
+        """Read new content and scan; report any pattern hit via ``mark_failed``.
 
-        Returns False if no new content was available, if no pattern
-        matched, or if the file is not yet readable (handled silently
-        so the scanner can be started before every worker has flushed
-        its first bytes).
+        Maintains a tail-byte carry (``_carry``) across calls so
+        block-buffered C++ writes (chunked rather than line-bounded)
+        reconstruct into whole lines before being matched against
+        patterns.
+
+        Args:
+            patterns: Compiled hard-zero patterns as
+                ``(source_str, regex)`` pairs. ``source_str`` is the
+                original YAML string and is embedded in the
+                ``mark_failed`` reason for debugging.
+            mark_failed: Callback invoked on the first pattern hit.
+                Treated as one-shot per ``poll()`` call (the first
+                match returns immediately without scanning the
+                remainder of the chunk).
+
+        Returns:
+            True if a pattern matched and ``mark_failed`` was
+            called; False if no new content was available, no
+            pattern matched, or the file did not yet exist (handled
+            silently so the scanner can be started before every
+            worker has flushed its first bytes).
         """
         if self._fh is None:
             if not self.path.exists():
@@ -205,6 +256,12 @@ class _LogSource:
         return False
 
     def close(self) -> None:
+        """Close the tailed file handle, if any.
+
+        Idempotent. ``OSError`` from the underlying close is logged
+        at DEBUG and swallowed — the scanner is exiting and a
+        failed close is not worth tripping fail-fast.
+        """
         if self._fh is not None:
             try:
                 self._fh.close()
@@ -214,11 +271,20 @@ class _LogSource:
 
 
 def _compile_patterns(raw_patterns: list[Any]) -> list[tuple[str, re.Pattern[str]]]:
-    """Compile the YAML's ``log_scan.hard_zero_patterns`` list.
+    """Compile the YAML's ``log_scan.hard_zero_patterns`` list to regex objects.
 
     Patterns that fail to compile are skipped with an ERROR log so
     config typos surface during the scanner's startup banner rather
     than as silent misses at marathon hour 1.5.
+
+    Args:
+        raw_patterns: Pattern entries as parsed from YAML; non-string
+            entries are skipped with an ERROR log.
+
+    Returns:
+        List of ``(source_str, compiled_regex)`` pairs.
+        ``source_str`` is the original YAML string, retained so
+        failure reasons can name which pattern matched.
     """
     compiled: list[tuple[str, re.Pattern[str]]] = []
     for entry in raw_patterns:
@@ -266,10 +332,31 @@ class DisaggCancellationStressHarness:
     asyncio event loops internally for HTTP I/O.
     """
 
-    def __init__(self, yaml_path: Path) -> None:
+    def __init__(
+        self,
+        yaml_path: Path,
+        *,
+        log_scanner_poll_interval_s: float = 0.5,
+    ) -> None:
+        """Construct a marathon harness.
+
+        Args:
+            yaml_path: Path to a marathon YAML; loaded and validated
+                eagerly via ``StressConfig.from_yaml_path``.
+            log_scanner_poll_interval_s: Poll cadence (seconds) for
+                the log-scanner thread. Default 0.5 s is reactive
+                enough for human-scale debugging without becoming a
+                measurable load source on its own; tests pass a
+                smaller value (e.g. 0.02 s) to keep real-clock
+                latency bounded.
+
+        Raises:
+            ValueError: If the YAML is malformed or its
+                ``stress_config:`` block is missing / rejects
+                validation.
+        """
         self.yaml_path: Path = yaml_path
         self.config: StressConfig = StressConfig.from_yaml_path(yaml_path)
-        self.config.validate()
 
         # Coordination primitives.
         self.stop_event: threading.Event = threading.Event()
@@ -277,11 +364,12 @@ class DisaggCancellationStressHarness:
         self._failure_reason: Optional[str] = None
         self._failure_lock = threading.Lock()
 
-        # Per-thread tunables (overridable in tests). Defaults pick a
-        # cadence that's reactive enough for human-scale debugging
-        # (~0.5 s lag from log line to fail-fast) without becoming a
-        # measurable load source on its own.
-        self._log_scanner_poll_interval_s: float = 0.5
+        # Per-thread tunables. The default cadence is reactive enough
+        # for human-scale debugging (~0.5 s lag from log line to
+        # fail-fast) without becoming a measurable load source on its
+        # own; tests pass a smaller value via the constructor to keep
+        # real-clock latency bounded.
+        self._log_scanner_poll_interval_s: float = log_scanner_poll_interval_s
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
@@ -345,20 +433,29 @@ class DisaggCancellationStressHarness:
     def wait_until_done(self, timeout_s: Optional[float] = None) -> bool:
         """Block until ``stop_event`` or ``failed_event`` is set, or timeout.
 
-        Returns True if stopped cleanly (stop_event), False if any
-        thread tripped fail-fast (failed_event) or the timeout expired
-        without either event.
-
         Stub: in this skeleton, ``start()``'s no-op threads exit
         immediately and set ``stop_event`` themselves, so this returns
-        True almost instantly.
+        ``True`` almost instantly.
+
+        Deadline is a ``time.monotonic()`` reading computed once and
+        checked on each 0.5 s poll wake-up (worst-case lateness ~0.5
+        s, well below the marathon's ``timeout_s`` scale). The earlier
+        ``threading.Timer`` approach leaked a non-daemon timer thread
+        for the residual window on early-stop.
+
+        Args:
+            timeout_s: Optional ceiling on the wait, in seconds.
+                ``None`` (the default) waits indefinitely until one
+                of the events fires.
+
+        Returns:
+            True if stopped cleanly (``stop_event``); False if any
+            thread tripped fail-fast (``failed_event``) or the
+            timeout expired without either event being set.
         """
-        deadline = None
-        if timeout_s is not None:
-            deadline = threading.Event()
-            threading.Timer(timeout_s, deadline.set).start()
+        deadline_at = None if timeout_s is None else (time.monotonic() + timeout_s)
         while not self.stop_event.is_set() and not self.failed_event.is_set():
-            if deadline is not None and deadline.is_set():
+            if deadline_at is not None and time.monotonic() >= deadline_at:
                 logger.warning("[harness] wait_until_done timed out after %ss", timeout_s)
                 return False
             # Sleep with a small poll cadence so stop()/fail-fast wake us promptly.
@@ -396,9 +493,19 @@ class DisaggCancellationStressHarness:
     def mark_failed(self, reason: str) -> None:
         """Trip the fail-fast event with a structured reason.
 
+        First-reason-wins: subsequent calls (e.g. a second worker's
+        log scan firing right after the first) are silently dropped
+        so ``failure_reason`` reflects the original root cause rather
+        than a later cascade.
+
         Called by ``log_scanner_thread`` on hard-zero pattern hit, by
         ``injector_thread`` on respawn timeout, by ``wait_until_done``
         on worker death detection, etc.
+
+        Args:
+            reason: Human-readable failure description. Logged at
+                ERROR and exposed via the ``failure_reason``
+                property.
         """
         with self._failure_lock:
             if self._failure_reason is None:
@@ -408,6 +515,12 @@ class DisaggCancellationStressHarness:
 
     @property
     def failure_reason(self) -> Optional[str]:
+        """Reason of the first ``mark_failed`` call, or ``None`` if not tripped.
+
+        Read under the failure lock so it stays consistent with
+        ``failed_event``: if ``failed_event.is_set()`` is True, this
+        is guaranteed to return a non-None string.
+        """
         with self._failure_lock:
             return self._failure_reason
 
@@ -421,6 +534,19 @@ class DisaggCancellationStressHarness:
         Stub: returns empty buckets in the skeleton. The full
         implementation computes canary error rates, recovery times,
         and KV-cache growth from ``self._canary_records``, etc.
+
+        Returns:
+            A dict with four keys (the list values are copies, safe
+            for the caller to mutate without affecting the harness):
+
+            - ``canary_records``: per-canary request outcomes.
+            - ``kv_utilization_samples``: timestamped KV-cache
+              utilization scrapes from the metrics thread.
+            - ``injection_events``: SIGSTOP / SIGCONT / SIGKILL
+              events fired by the injector thread.
+            - ``failure_reason``: ``None`` if the marathon completed
+              cleanly, otherwise the first reason passed to
+              ``mark_failed``.
         """
         return {
             "canary_records": list(self._canary_records),
@@ -545,6 +671,18 @@ class DisaggCancellationStressHarness:
     # ------------------------------------------------------------------
 
     def _all_threads(self) -> list[threading.Thread]:
+        """Return the subset of thread handles that have been instantiated.
+
+        Used by ``start()`` to launch and by ``stop()`` to join.
+        Filters out ``None`` so callers can iterate without guarding
+        (e.g. when a thread handle was never populated because
+        ``start()`` failed partway through).
+
+        Returns:
+            Thread handles in deterministic order (load, canary,
+            injector, log_scanner, metrics), skipping any not yet
+            instantiated.
+        """
         return [
             t
             for t in (

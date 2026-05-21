@@ -64,11 +64,23 @@ _DUMMY_YAML = textwrap.dedent(
 
 
 def _make_spec(role: str, index: int, log_path: Path | None) -> WorkerLaunchSpec:
-    """Tiny WorkerLaunchSpec factory for unit tests.
+    """Tiny ``WorkerLaunchSpec`` factory for unit tests.
 
-    Only ``role`` / ``index`` / ``log_path`` are scanner-relevant — the
-    other fields are placeholders that would normally be set by
+    Only ``role`` / ``index`` / ``log_path`` are scanner-relevant —
+    the other fields are placeholders that would normally be set by
     ``setup_disagg_cluster``.
+
+    Args:
+        role: Worker role tag, ``"ctx"`` or ``"gen"``. Surfaces in
+            failure reasons via ``_LogSource``.
+        index: Per-role index (``ctx_0``, ``gen_0``, ...). Surfaces
+            in failure reasons.
+        log_path: Path the scanner should tail, or ``None`` to
+            simulate ``save_log=False`` workers.
+
+    Returns:
+        A ``WorkerLaunchSpec`` with placeholder values for the
+        scanner-irrelevant fields.
     """
     return WorkerLaunchSpec(
         role=role,
@@ -87,17 +99,22 @@ def _make_spec(role: str, index: int, log_path: Path | None) -> WorkerLaunchSpec
 def harness_with_two_workers(tmp_path: Path):
     """Harness wired to two temp-file log sources (ctx_0 + gen_0).
 
-    Returns ``(harness, ctx_log, gen_log)`` where ``*_log`` are
-    ``Path`` objects the test can write to.
+    Args:
+        tmp_path: pytest-provided per-test temp dir.
+
+    Returns:
+        A 3-tuple ``(harness, ctx_log, gen_log)`` where the
+        ``*_log`` entries are ``Path`` objects the test can write
+        to. The harness is constructed with a 20 ms scanner cadence
+        so test wall-clock times stay bounded.
     """
     yaml_path = tmp_path / "stress.yaml"
     yaml_path.write_text(_DUMMY_YAML)
 
-    h = DisaggCancellationStressHarness(yaml_path)
     # Tighten the scanner cadence so the tests finish quickly. The
     # default 0.5 s makes tests slow; 20 ms keeps real-clock latency
     # bounded.
-    h._log_scanner_poll_interval_s = 0.02
+    h = DisaggCancellationStressHarness(yaml_path, log_scanner_poll_interval_s=0.02)
 
     ctx_log = tmp_path / "worker_ctx_18000.log"
     gen_log = tmp_path / "worker_gen_18001.log"
@@ -118,9 +135,20 @@ def _run_scanner_until_failure_or_timeout(
 ) -> bool:
     """Spawn the log-scanner thread; wait for ``failed_event`` or timeout.
 
-    Returns True if fail-fast tripped within the timeout, False if
-    the scanner exited cleanly without firing (e.g. no log sources,
-    or no patterns matched).
+    Args:
+        h: Configured harness with ``_worker_specs`` already
+            populated by the calling test.
+        timeout_s: Maximum wall-clock seconds to wait for the
+            scanner to trip ``failed_event``. Defaults to 2.0 s.
+        settle_s: Pause after fail-fast fires (before
+            ``stop_event.set()``) to let the scanner clean up file
+            handles. Functionally optional; cosmetic for cleaner
+            debug logs.
+
+    Returns:
+        True if fail-fast tripped within the timeout; False if the
+        scanner exited cleanly without firing (e.g. no log sources,
+        no patterns, or no matching content within the window).
     """
     t = threading.Thread(target=h._log_scanner_thread_body, name="test-log-scanner", daemon=True)
     t.start()
@@ -421,8 +449,7 @@ def test_invalid_regex_is_skipped_with_warning(tmp_path: Path, caplog):
             """
         )
     )
-    h = DisaggCancellationStressHarness(yaml_path)
-    h._log_scanner_poll_interval_s = 0.02
+    h = DisaggCancellationStressHarness(yaml_path, log_scanner_poll_interval_s=0.02)
     ctx_log = tmp_path / "worker_ctx_18000.log"
     ctx_log.write_text("Broken promise: A\n")
     h._worker_specs = [_make_spec("ctx", 0, ctx_log)]
@@ -444,6 +471,22 @@ def test_invalid_regex_is_skipped_with_warning(tmp_path: Path, caplog):
 
 
 def _consume_marks(seen: list[str]) -> Callable[[str], None]:
+    """Build a ``mark_failed``-shaped callback that appends to a test list.
+
+    Used by the standalone ``_LogSource`` tests (below the harness
+    tests) to introspect what the source would have reported,
+    without needing a full harness instance.
+
+    Args:
+        seen: Test-owned list that each invocation appends its
+            ``reason`` argument to.
+
+    Returns:
+        A single-arg callable matching the
+        ``Callable[[str], None]`` shape that ``_LogSource.poll``
+        expects for its ``mark_failed`` parameter.
+    """
+
     def _mark(reason: str) -> None:
         seen.append(reason)
 
