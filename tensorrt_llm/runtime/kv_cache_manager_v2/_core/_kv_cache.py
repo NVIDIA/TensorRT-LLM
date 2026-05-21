@@ -775,8 +775,6 @@ class _KVCache:
                     slot = slots[lc].pop()
                     self._scratch_slots[lc].append(ScratchSlotLock(slot, self, lc, skip_wait=True))
 
-            normal_slots = tuple(chain.from_iterable(slots))
-            new_slot_ready_events = tuple(slot.ready_event for slot in normal_slots)
             for beam_indices in self._base_page_indices:
                 for indices in beam_indices:
                     if type(indices) is array.array:
@@ -785,23 +783,11 @@ class _KVCache:
                     else:
                         if len(indices) < new_num_blocks:
                             raise ValueError("User-provided base page indices is too short")
-            if any(
-                type(indices) is memoryview
-                for beam_indices in self._base_page_indices
-                for indices in beam_indices
-            ):
-                # User-provided base page indices are host-visible. Do not publish
-                # a recycled slot id there until the slot is actually ready; a
-                # stream wait only orders GPU work and does not protect CPU-side
-                # metadata readers.
-                pending_ready_events = [
-                    event for event in set(new_slot_ready_events) if not event.query_complete()
-                ]
-                for event in pending_ready_events:
-                    event.synchronize()
-                for slot in normal_slots:
-                    slot.ready_event = CachedCudaEvent.NULL
-            stream_wait_events(self.cuda_stream, new_slot_ready_events)
+
+            stream_wait_events(
+                self.cuda_stream, (s.ready_event for s in chain.from_iterable(slots))
+            )
+
             # Scratch blocks use temporary shared SWA slots instead of normal
             # per-request KV pages, so they are excluded from alloc/miss stats.
             excluded_ranges = (
@@ -831,9 +817,7 @@ class _KVCache:
                             if stale_beg <= ordinal < stale_end:
                                 continue
                         slot = slots[lc].pop()
-                        # Slot ready events are already handled above: either
-                        # synchronized for host-visible page-index buffers, or
-                        # enqueued as stream waits for internal buffers.
+                        # We have already waited for ready_event of the slots.
                         block[beam_index][lc] = UncommittedPage(
                             self, ordinal, lc, GPU_LEVEL, slot, beam_index
                         ).lock(self, beam_index, ordinal, lc, skip_wait=True)
