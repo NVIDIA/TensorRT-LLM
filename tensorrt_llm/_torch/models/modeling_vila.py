@@ -940,6 +940,16 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Surface the in-vocab media token IDs so
+        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
+        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
+        ``>= vocab_size`` fallback (which would miss all positions now that
+        the OOV remap in _postprocess is gone).
+        """
+        media_ids = list(self.tokenizer.media_token_ids.values())
+        return torch.tensor(media_ids, dtype=torch.int32) if media_ids else None
+
     def model_path(self) -> str:
         return self._model_path
 
@@ -1069,15 +1079,19 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         assert mm_hidden_dim == self.config.hidden_size, "Multimodal embedding_dim must match model hidden_size"
 
         ## split input_ids into segments by isolating mm tokens
-        vocab_size = len(self.tokenizer)  # vocab including special tokens
         mm_split_positions = torch.cat(
             [mm_token_positions, mm_token_positions + 1]).unique()
         input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
         )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
+        # Use the first in-vocab media token id repeated mm_total_length times
+        # instead of unique arange(vocab_size, vocab_size + L) OOV IDs — only
+        # the predicate that distinguishes mm vs text matters downstream
+        # (fuse_input_embeds uses ``torch.isin(input_ids, mm_token_ids)``).
         mm_ids_splits = list(
-            torch.arange(vocab_size,
-                         vocab_size + mm_total_length,
-                         device=input_ids.device).split(mm_lengths_per_split)
+            torch.full((mm_total_length, ),
+                       int(mm_tokens[0]),
+                       dtype=input_ids.dtype,
+                       device=input_ids.device).split(mm_lengths_per_split)
         )  # len(mm_ids_splits) = num_mm_segments
 
         # prepend & append start/end tokens around mm ids
@@ -1218,7 +1232,17 @@ class VilaModel(PreTrainedModel):
         device = kwargs.get("device", "cuda")
         self.llm.to(device=device, dtype=self.model_dtype)
 
+        # Surface the in-vocab media token IDs (image, video, ...) to the
+        # model engine's ``_prepare_multimodal_indices``. ``init_llm`` populates
+        # ``self.tokenizer.media_token_ids`` as ``{name: id}``.
+        media_ids = list(self.tokenizer.media_token_ids.values())
+        self._mm_token_ids = torch.tensor(media_ids, dtype=torch.int32)
+
         self.post_config()
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
     @torch.inference_mode()
     def forward(
@@ -1266,6 +1290,7 @@ class VilaModel(PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
+            mm_token_ids=self.mm_token_ids,
             mm_token_indices=kwargs.get("mm_token_indices"),
             text_token_indices=kwargs.get("text_token_indices"),
         )

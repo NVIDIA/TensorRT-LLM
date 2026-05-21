@@ -67,13 +67,13 @@ def _expand_prompt_token_ids_for_mm_handoff(
     image_token_id: int,
     video_token_id: int,
     vision_start_token_id: int,
-    placeholder_id: int,
 ) -> DisaggPrefillMultimodalInputs:
     """Expand Qwen3-VL image/video placeholders and emit sparse MM layout.
 
     Qwen handoff has one coarse <image_pad> or <video_pad> token per item.
     This helper expands that one token to the number of embedding rows in the
-    handoff handle, then returns the sparse layout metadata.
+    handoff handle using the original in-vocab placeholder token, then returns
+    the sparse layout metadata.
 
     Agg gets this expansion from Qwen's HF processor taking raw images/videos
     as inputs. Reusing that would be wasteful here, hence this helper that
@@ -121,7 +121,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
         run_start = write_pos - 1 if has_leading_special else write_pos
         prompt_mm_length = mm_token_num + int(has_leading_special)
 
-        expanded_ids[write_pos : write_pos + mm_token_num] = placeholder_id
+        expanded_ids[write_pos : write_pos + mm_token_num] = token_id
         mm_token_offsets.append(run_start)
         mm_token_lengths.append(prompt_mm_length)
         multimodal_embedding_lengths.append(mm_token_num)
@@ -178,7 +178,6 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         self._processor = AutoProcessor.from_pretrained(
             model_path, use_fast=True, trust_remote_code=trust_remote_code
         )
-        self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         # temporal patch size for video frames
         self.temporal_patch_size = getattr(self.config.vision_config, "temporal_patch_size", 1)
 
@@ -205,6 +204,22 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
         return self.config.text_config.vocab_size
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Surface the in-vocab image / video placeholder IDs so that
+        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
+        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
+        ``>= vocab_size`` fallback.
+        """
+        ids = [
+            tid
+            for tid in (
+                getattr(self.config, "image_token_id", None),
+                getattr(self.config, "video_token_id", None),
+            )
+            if tid is not None
+        ]
+        return torch.tensor(ids, dtype=torch.int32) if ids else None
 
     @classmethod
     def get_rope_index(
@@ -404,10 +419,8 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         )
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        masks = (input_ids == self.config.image_token_id) | (
-            input_ids == self.config.video_token_id
-        )
-        input_ids[masks] = self.tllm_multimodal_token_id
+        # Keep image / video placeholders in-vocab; the model engine locates
+        # mm positions via ``torch.isin(input_ids, mm_token_ids)``.
         return input_ids
 
     def get_mrope_config(
@@ -518,7 +531,6 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
             vision_start_token_id=self.config.vision_start_token_id,
-            placeholder_id=self.tllm_multimodal_token_id,
         )
 
 
@@ -1086,6 +1098,16 @@ class Qwen3VLModelBase(PreTrainedModel):
         if model_config.pretrained_config.text_config.rope_scaling is None:
             model_config.pretrained_config.text_config.rope_scaling = {}
         model_config.pretrained_config.text_config.rope_scaling["type"] = "mrope"
+        # transformers 5.x renamed top-level ``torch_dtype`` -> ``dtype``; the
+        # Qwen3VLConfig wrapper exposes ``dtype`` on text_config but the
+        # backward-compat shim leaves the top-level ``torch_dtype`` as None,
+        # which trips ``PyTorchModelEngine.dtype`` -> KV cache manager. Mirror
+        # the text_config dtype up to the top-level so callers reading
+        # ``config.torch_dtype`` see a real dtype.
+        if model_config.pretrained_config.torch_dtype is None:
+            model_config.pretrained_config.torch_dtype = (
+                model_config.pretrained_config.text_config.dtype
+            )
         config = model_config.pretrained_config
 
         self._supports_sdpa = True
@@ -1118,6 +1140,23 @@ class Qwen3VLModelBase(PreTrainedModel):
         self.deepstack_num_level = (
             len(config.vision_config.deepstack_visual_indexes) if self.use_deepstack else 0
         )
+
+        # Surface the in-vocab image / video placeholder IDs to the model
+        # engine's ``_prepare_multimodal_indices`` so it selects the
+        # ``torch.isin`` predicate.
+        _mm_ids = [
+            tid
+            for tid in (
+                getattr(config, "image_token_id", None),
+                getattr(config, "video_token_id", None),
+            )
+            if tid is not None
+        ]
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
         self.post_config()
 
@@ -1281,6 +1320,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
+            mm_token_ids=self.mm_token_ids,
             extra_embeds=deepstack_embeds,
             mm_token_indices=kwargs.get("mm_token_indices"),
             text_token_indices=kwargs.get("text_token_indices"),
