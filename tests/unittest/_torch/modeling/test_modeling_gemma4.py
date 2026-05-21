@@ -3042,19 +3042,52 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
             x.dtype
         )
 
-    def test_audio_rmsnorm_inherits_from_hf_class(self):
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
+    def test_audio_rmsnorm_does_not_import_hf_class(self):
+        """The audio tower's RMSNorm must be a native re-implementation, NOT
+        a subclass of ``transformers.models.gemma4.Gemma4RMSNorm`` — per the
+        multimodal-onboarding skill, importing
+        ``transformers.models.<family>`` couples the file to a specific HF
+        release and breaks silently on upstream refactors.
+        """
+        import torch.nn as nn
 
+        from tensorrt_llm._torch.models import modeling_gemma4_audio as ma
         from tensorrt_llm._torch.models.modeling_gemma4_audio import Gemma4AudioRMSNorm
 
-        self.assertTrue(issubclass(Gemma4AudioRMSNorm, HFRMSNorm))
+        # Direct ``nn.Module`` subclass, no HF in the MRO.
+        self.assertTrue(issubclass(Gemma4AudioRMSNorm, nn.Module))
+        mro_names = [c.__module__ + "." + c.__name__ for c in Gemma4AudioRMSNorm.__mro__]
+        self.assertFalse(
+            any("transformers.models.gemma4" in name for name in mro_names),
+            f"Gemma4AudioRMSNorm MRO must not include transformers.models.gemma4: {mro_names}",
+        )
+        # Module source must not import the HF RMSNorm class.
+        src = open(ma.__file__).read()
+        self.assertNotIn(
+            "from transformers.models.gemma4",
+            src,
+            "modeling_gemma4_audio.py must not import from transformers.models.gemma4",
+        )
 
-    def test_vision_rmsnorm_inherits_from_hf_class(self):
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as HFRMSNorm
+    def test_vision_rmsnorm_does_not_import_hf_class(self):
+        """Same as above for the vision tower."""
+        import torch.nn as nn
 
+        from tensorrt_llm._torch.models import modeling_gemma4_vision as mv
         from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionRMSNorm
 
-        self.assertTrue(issubclass(Gemma4VisionRMSNorm, HFRMSNorm))
+        self.assertTrue(issubclass(Gemma4VisionRMSNorm, nn.Module))
+        mro_names = [c.__module__ + "." + c.__name__ for c in Gemma4VisionRMSNorm.__mro__]
+        self.assertFalse(
+            any("transformers.models.gemma4" in name for name in mro_names),
+            f"Gemma4VisionRMSNorm MRO must not include transformers.models.gemma4: {mro_names}",
+        )
+        src = open(mv.__file__).read()
+        self.assertNotIn(
+            "from transformers.models.gemma4",
+            src,
+            "modeling_gemma4_vision.py must not import from transformers.models.gemma4",
+        )
 
     def test_audio_rmsnorm_uses_plain_w_not_one_plus_w(self):
         """With ``weight=ones``, output must equal ``x/rms`` (plain ``w``),

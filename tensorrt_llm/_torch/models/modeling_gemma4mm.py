@@ -770,6 +770,24 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        """Dotted paths in ``multimodal_data`` that the engine should ship to
+        GPU. Anything not listed stays CPU-resident — notably
+        ``image.image_seq_lens`` / ``video.image_seq_lens`` (Python
+        ``List[int]`` carrying per-image valid-patch counts, consumed
+        host-side by ``Gemma4VisionModel.forward`` to populate
+        ``attn_metadata.prompt_lens`` without a GPU→CPU sync).
+        """
+        return [
+            "image.pixel_values",
+            "image.image_position_ids",
+            "video.pixel_values",
+            "video.image_position_ids",
+            "audio.audio_features",
+            "audio.audio_features_mask",
+        ]
+
     @nvtx_range("[Vision] process")
     def _get_image_features(
         self,

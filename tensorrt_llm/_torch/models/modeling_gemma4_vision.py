@@ -46,7 +46,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
-from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as _HFGemma4RMSNorm
 
 from tensorrt_llm._utils import maybe_pin_memory
 
@@ -58,13 +57,23 @@ from ..modules.linear import Linear
 from .modeling_utils import _load_weights_impl
 
 
-# Use HF's ``Gemma4RMSNorm`` directly instead of TRT-LLM's ``RMSNorm`` module.
-# TRT-LLM ``RMSNorm`` dispatches to ``flashinfer_rmsnorm`` whose CUTE kernel
-# rejects non-fp32 / non-contiguous strides and 1152-wide bf16 inputs from
-# SigLip. HF's class is pure PyTorch and handles ``with_scale=False`` (the
-# weightless ``v_norm`` case) via a flag.
-class Gemma4VisionRMSNorm(_HFGemma4RMSNorm):
-    """Kwarg + dtype adapter around HF ``Gemma4RMSNorm``."""
+class Gemma4VisionRMSNorm(nn.Module):
+    """Native plain RMSNorm (``w * x / rms(x)``) for the Gemma4 vision tower.
+
+    Re-implemented inline (not a thin adapter over
+    ``transformers.models.gemma4.Gemma4RMSNorm``) to keep this file free of
+    ``transformers.models.<family>`` imports — per the multimodal-onboarding
+    skill, upstream HF refactors of internal classes / signatures must not
+    silently break TRT-LLM modeling files.
+
+    Also distinct from ``..modules.rms_norm.RMSNorm`` (the TRT-LLM dispatch
+    site for ``flashinfer_rmsnorm``), whose CUTE kernel rejects non-fp32 /
+    non-contiguous strides and 1152-wide bf16 SigLip inputs. ``with_scale=False``
+    handles the weightless ``v_norm`` slot.
+
+    Math convention is Gemma4 / SigLip plain ``w * x / rms``, **not** the
+    Gemma3 LLM ``(1 + w) * x / rms`` variant.
+    """
 
     def __init__(
         self,
@@ -74,10 +83,21 @@ class Gemma4VisionRMSNorm(_HFGemma4RMSNorm):
         dtype: Optional[torch.dtype] = None,
         has_weights: bool = True,
     ):
-        super().__init__(hidden_size, eps=eps, with_scale=has_weights)
-        if dtype is not None and has_weights:
-            with torch.no_grad():
-                self.weight.data = self.weight.data.to(dtype)
+        super().__init__()
+        self.eps = eps
+        self.with_scale = has_weights
+        if has_weights:
+            self.weight = nn.Parameter(
+                torch.ones(hidden_size, dtype=dtype if dtype is not None else torch.float32)
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # fp32 accumulator for numerical stability; cast back to input dtype.
+        x32 = x.float()
+        normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + self.eps)
+        if self.with_scale:
+            normed = normed * self.weight.float()
+        return normed.to(x.dtype)
 
 
 @dataclass

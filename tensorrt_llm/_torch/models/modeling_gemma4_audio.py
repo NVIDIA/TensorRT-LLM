@@ -53,7 +53,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
-from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm as _HFGemma4RMSNorm
 
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
@@ -69,19 +68,27 @@ class AudioOutput:
 
 
 # ---------------------------------------------------------------------------
-# RMSNorm: thin kwarg/dtype adapter over HF's ``Gemma4RMSNorm`` (see module
-# docstring for why this isn't the TRT-LLM ``RMSNorm`` module).
+# RMSNorm: native plain ``w * x / rms`` (not the Gemma3 LLM ``(1 + w) * x /
+# rms`` variant). Re-implemented inline to keep this file free of
+# ``transformers.models.gemma4`` imports — see the matching docstring in
+# ``modeling_gemma4_vision.Gemma4VisionRMSNorm`` for the full rationale.
 # ---------------------------------------------------------------------------
 
 
-class Gemma4AudioRMSNorm(_HFGemma4RMSNorm):
-    """Kwarg + dtype adapter around HF ``Gemma4RMSNorm`` (``w * x / rms(x)``)."""
+class Gemma4AudioRMSNorm(nn.Module):
+    """Native plain RMSNorm for the Gemma4 audio tower (``w * x / rms(x)``)."""
 
     def __init__(self, *, hidden_size: int, eps: float, dtype: Optional[torch.dtype] = None):
-        super().__init__(hidden_size, eps=eps)
-        if dtype is not None:
-            with torch.no_grad():
-                self.weight.data = self.weight.data.to(dtype)
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(
+            torch.ones(hidden_size, dtype=dtype if dtype is not None else torch.float32)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x32 = x.float()
+        normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (normed * self.weight.float()).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
