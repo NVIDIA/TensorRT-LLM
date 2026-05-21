@@ -25,6 +25,9 @@ Key components:
     required by FX graph execution and CUDA graph capture.
   - ``_make_aux_stream_impl``: factory for building an implementation that runs
     a base op on the auxiliary CUDA stream.
+  - ``disable_multi_stream`` context manager: turn all passthroughs and aux-stream
+    impls into no-ops for code paths where multi-stream execution is unsafe
+    (e.g. piecewise CUDA graph capture/replay for prefill/mixed batches).
 """
 
 from threading import RLock
@@ -33,6 +36,40 @@ from typing import Any, Callable, Dict, List
 import torch
 
 from .logger import ad_logger
+
+# ---------------------------------------------------------------------------
+# Runtime enable/disable flag
+# ---------------------------------------------------------------------------
+# When False, all multi-stream passthroughs return ``x`` unchanged and
+# ``_make_aux_stream_impl`` impls run the base op on the caller's stream.
+# Used by the piecewise CUDA graph path to keep prefill/mixed batches on a
+# single stream — host-side ``caller_stream.synchronize()`` between captured
+# segments is incompatible with stable-address invariants required for replay.
+# Decode-only batches use the monolithic CG path and leave the flag set.
+_multi_stream_enabled: bool = True
+
+
+def is_multi_stream_enabled() -> bool:
+    return _multi_stream_enabled
+
+
+class disable_multi_stream:
+    """Context manager that disables multi-stream execution.
+
+    Nestable: saves the previous flag value on ``__enter__`` and restores it
+    on ``__exit__``.
+    """
+
+    def __enter__(self) -> "disable_multi_stream":
+        global _multi_stream_enabled
+        self._prev = _multi_stream_enabled
+        _multi_stream_enabled = False
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        global _multi_stream_enabled
+        _multi_stream_enabled = self._prev
+
 
 # ---------------------------------------------------------------------------
 # Singleton metaclass
@@ -144,6 +181,8 @@ def record_event_passthrough(
     computation, enabling overlap between the shared expert (main stream)
     and routed experts (aux stream).
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     torch.ops.auto_deploy.record_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
@@ -163,6 +202,8 @@ def begin_aux_stream_passthrough(
     interpreter will be recorded on aux until ``end_aux_stream_passthrough``
     switches back to main.
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     # Save the *actual* current stream so ``end_aux`` can restore it.
@@ -205,6 +246,8 @@ def end_aux_stream_passthrough(
     need to be synchronised (typically right before the ``add`` that merges
     shared-expert and routed-expert outputs).
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     # Record the aux-stream progress so the caller's stream can wait for it later.
@@ -238,6 +281,8 @@ def wait_aux_stream_passthrough(
     Uses ``torch.cuda.current_stream()`` rather than the stored default stream
     so that the correct stream is waited on during CUDA graph capture.
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -254,6 +299,8 @@ def _make_aux_stream_impl(base_overload: Callable) -> Callable:
     """Build an implementation that runs *base_overload* on the auxiliary CUDA stream."""
 
     def _impl(*args, **kwargs):
+        if not _multi_stream_enabled:
+            return base_overload(*args, **kwargs)
         device = torch.cuda.current_device()
         with torch.cuda.stream(
             cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)

@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     RankIterStatsPayload,
     RankState,
 )
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 
 def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):

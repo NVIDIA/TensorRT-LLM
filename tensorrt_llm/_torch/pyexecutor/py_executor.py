@@ -38,8 +38,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
-    host_profiler_context
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
+    get_global_profiler, host_profiler_context)
 
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
@@ -290,6 +290,7 @@ class PyExecutor:
             max_num_sequences: int,
             drafter: Optional[Drafter] = None,
             disable_overlap_scheduler: bool = False,
+            enable_early_first_token_response: bool = False,
             max_input_len: int = 0x7fffffff,
             max_batch_size: int = 8,
             max_beam_width: int = 1,
@@ -341,6 +342,7 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
@@ -1081,6 +1083,12 @@ class PyExecutor:
                 logger.info(
                     f"Profiling started at iteration {self.iter_counter}.")
                 enabled = True
+
+            # Notify host line profiler of iteration for iteration-aware profiling
+            host_profiler = get_global_profiler()
+            if host_profiler is not None:
+                host_profiler.notify_iteration(self.iter_counter)
+
             calibrator.pre_step(it)
             start_time = time.time()
             if it % 2 == 0:
@@ -2256,10 +2264,11 @@ class PyExecutor:
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
-            # simultaneously. If some requests are stuck in INIT state and the
-            # scheduler could not allocate KV for any of them, the benchmark
-            # will hang forever because in-progress generation requests won't
-            # release their KV cache.
+            # simultaneously because generation requests do not release their
+            # KV until the full benchmark batch can run. If the scheduler
+            # cannot fit any INIT request after all benchmark requests have
+            # been fetched, the fill gate would never open; raise an explicit
+            # error instead of hanging forever.
             if (self.benchmark_req_queues_size > 0 and not self.is_warmup
                     and not fitting_disagg_gen_init_requests):
                 stuck_init_requests = [
@@ -2313,42 +2322,83 @@ class PyExecutor:
 
     def _is_benchmark_disagg_fill_complete(
             self, scheduled_batch: ScheduledRequests) -> bool:
-        """Check whether all benchmark disagg requests have completed KV transfer.
+        """State-based fill-complete predicate for benchmark disagg mode.
 
-        With ADP, generation requests are distributed across TP ranks, so an
-        allgather is needed to obtain the global count.  Without ADP every
-        request is local, and we can compare directly.
+        The gate opens when all three conditions hold globally:
+
+        (A) The executor has fetched at least ``benchmark_req_queues_size``
+            requests cumulatively.
+        (B) Every request in ``active_requests`` on this rank is past the
+            KV-transfer phase (not in INIT or TRANS_IN_PROGRESS).
+        (C) The KV cache transceiver has no pending receive sessions.
+
+        For ADP, (B) and (C) are AND-ed across TP ranks via allgather.
 
         This method must only be called when ``is_benchmark_disagg`` is True.
 
         Args:
-            scheduled_batch: The current iteration's scheduled requests,
-                used to count generation requests that have completed
-                KV transfer.
+            scheduled_batch: Passed for API compatibility with callers
+                but no longer used by this predicate.
 
         Returns:
-            True when the total number of generation-ready requests
-            reaches ``benchmark_req_queues_size``.
+            True when the fill phase is complete and the first forward
+            pass can proceed.
         """
         if not self.is_benchmark_disagg:
             raise RuntimeError(
-                "_is_benchmark_disagg_fill_complete() should not be called outside benchmark "
-                "disagg mode.  This is an unexpected error.")
-        local_gen_count = sum(1 for req in scheduled_batch.generation_requests
-                              if not req.is_attention_dp_dummy)
-        if self.enable_attention_dp:
-            total_gen_count = sum(self.dist.tp_allgather(local_gen_count))
-        else:
-            total_gen_count = local_gen_count
+                "_is_benchmark_disagg_fill_complete() should not be called "
+                "outside benchmark disagg mode.")
 
-        if total_gen_count >= self.benchmark_req_queues_size:
-            return True
+        # (A) All benchmark requests have been fetched from the queue.
+        if self.num_fetch_requests < self.benchmark_req_queues_size:
+            if self.dist.rank == 0:
+                logger.debug(
+                    f"Benchmark disagg fill: fetching "
+                    f"{self.num_fetch_requests}/{self.benchmark_req_queues_size}"
+                )
+            return False
+
+        # (B) Every active request on this rank is past KV-transfer states.
+        local_all_past_transfer = not any(
+            req.is_disagg_generation_init_state
+            or req.is_disagg_generation_transmission_in_progress
+            for req in self.active_requests)
+
+        # Also require the transceiver's async receive bookkeeping to be
+        # drained before opening the fill gate.
+        local_no_inflight = (
+            self.kv_cache_transceiver is None
+            or self.kv_cache_transceiver.check_gen_transfer_complete())
+
+        local_ok = int(local_all_past_transfer and local_no_inflight)
+
+        if self.enable_attention_dp:
+            all_ranks_ok = self.dist.tp_allgather(local_ok)
+        else:
+            all_ranks_ok = [local_ok]
+        global_ok = min(all_ranks_ok) == 1
+
         if self.dist.rank == 0:
-            logger.debug(
-                f"Benchmark disagg fill in progress: "
-                f"num_fetched={self.num_fetch_requests}, "
-                f"total_gen_count={total_gen_count} (local={local_gen_count})")
-        return False
+            if global_ok:
+                logger.info(
+                    f"Benchmark disagg fill complete: "
+                    f"{len(self.active_requests)} active requests ready, "
+                    f"gate opening.")
+            else:
+                blocked_ranks = [
+                    rank for rank, ok in enumerate(all_ranks_ok) if not ok
+                ]
+                num_init = sum(1 for req in self.active_requests
+                               if req.is_disagg_generation_init_state)
+                num_in_progress = sum(
+                    1 for req in self.active_requests
+                    if req.is_disagg_generation_transmission_in_progress)
+                logger.debug(
+                    f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
+                    f"(rank {self.dist.rank} local: {num_init} INIT, "
+                    f"{num_in_progress} in-progress, "
+                    f"inflight={not local_no_inflight})")
+        return global_ok
 
     def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
                                      can_forward: bool) -> tuple[bool, bool]:
@@ -2806,6 +2856,18 @@ class PyExecutor:
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
+                if self.enable_early_first_token_response:
+                    if self.previous_batch is not None and should_process_previous_batch:
+                        # Early first-token emission. Must run after
+                        # `_update_requests` (so `py_decoding_iter` is current)
+                        # and `_send_kv_async` (so disagg ctx state has advanced).
+                        self._emit_first_token_responses(
+                            self.previous_batch.scheduled_requests)
+                    else:
+                        # Pair the attention-DP gather invoked by
+                        # `_emit_first_token_responses` on the active branch.
+                        self._enqueue_responses([])
+
                 # Flush outside the conditional so that all DP ranks
                 # participate in the tp_gather collective even when
                 # should_process_previous_batch differs between ranks.
@@ -2972,7 +3034,10 @@ class PyExecutor:
 
     def _process_previous_batch(self):
         self._handle_canceled_requests()
-        finished_requests = self._handle_responses()
+        # Skip iter-1 emission when `_emit_first_token_responses` already
+        # handled it.
+        finished_requests = self._handle_responses(
+            emit_first_iter=not self.enable_early_first_token_response)
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
@@ -3096,6 +3161,16 @@ class PyExecutor:
             total_max = self.max_num_active_requests
 
         max_new_requests = total_max - total_num_active_requests
+
+        # Benchmark disagg fill-phase admission throttle: a preloaded queue
+        # (concurrency == total_max) would otherwise pop all requests into
+        # DISAGG_GENERATION_INIT in one iter, tripping PR #12206's fail-fast
+        # under ADP-router imbalance and growing the recv-buffer fallback
+        # faster than transfers drain.  Cap at `tp_size` (≈ pre-#12208
+        # blocking fill rate).  Verified on Kimi-K2 8k1k ctx8/gen1 con=8192.
+        if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
+                and not self.is_warmup):
+            max_new_requests = min(max_new_requests, self.dist.tp_size)
 
         return get_from_waiting_queue(
             waiting_queue,
@@ -3621,7 +3696,7 @@ class PyExecutor:
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
-                beam_width = req.sampling_config.beam_width
+                beam_width = req.py_beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
@@ -4241,8 +4316,53 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    @nvtx_range("_emit_first_token_responses")
+    def _emit_first_token_responses(self, prev_scheduled_requests):
+        """Emit first-token responses ahead of `_sample_async` to reduce
+        TTFT. Termination, cleanup, and perf stats remain in
+        `_handle_responses`. Only invoked when
+        `enable_early_first_token_response` is set.
+        """
+        new_responses = []
+        for request in prev_scheduled_requests.all_requests():
+            if request.py_decoding_iter != 1:
+                continue
+            if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
+                continue
+            # Terminal response is issued by `_handle_responses`; an
+            # early-emitted response is never final.
+            if request.is_finished:
+                continue
+
+            logger.debug(
+                f'Send first token response for request {request.py_request_id}'
+            )
+
+            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
+                request) > 0 else []
+            request.decoding_iter = request.py_decoding_iter
+
+            # Snapshot first-token logits before `exclude_last_generation_logits`
+            # would hide them; only the first logits chunk is appended at this
+            # point. Same approach as in `_handle_first_token_response`.
+            logits_snapshot = None
+            if (self.should_exclude_last_generation_logits
+                    and request.py_return_generation_logits):
+                logits_snapshot = request.py_result.get_latest_logits_unexcluded(
+                )
+
+            response = request.create_response(False, self.dist.rank)
+            if response is None:
+                continue
+            response.result.cached_tokens = request.cached_tokens
+            if logits_snapshot is not None:
+                response.result.generation_logits = logits_snapshot
+            new_responses.append((request.py_request_id, response))
+
+        self._enqueue_responses(new_responses)
+
     @nvtx_range("_handle_responses")
-    def _handle_responses(self):
+    def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
@@ -4286,8 +4406,7 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
-            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
-                request) > 0 else []
+            request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
             self.perf_manager.append_step_metrics(
@@ -4300,8 +4419,15 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
-                    request.py_decoding_iter % self.stream_interval == 0:
+            should_emit = (request.py_decoding_iter == 1 or request.is_finished
+                           or request.py_decoding_iter % self.stream_interval
+                           == 0)
+            # The early-emit prototype issues the (non-terminal) iter-1
+            # response from `_emit_first_token_responses`; suppress it here.
+            if (not emit_first_iter and request.py_decoding_iter == 1
+                    and not request.is_finished):
+                should_emit = False
+            if should_emit:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished

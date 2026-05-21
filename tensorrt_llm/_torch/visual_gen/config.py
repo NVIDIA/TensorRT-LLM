@@ -23,7 +23,6 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
-from tensorrt_llm._torch.visual_gen.mapping import DEFAULT_DIM_ORDER
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
@@ -186,21 +185,14 @@ class ParallelConfig(StrictBaseModel):
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     # DiT Parallelism
-    dit_dp_size: int = PydanticField(1, ge=1)
+    dit_dp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
-    dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
+    dit_ring_size: int = PydanticField(1, ge=1)  # Supported
     dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
     dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
-    dit_dim_order: str = PydanticField(
-        DEFAULT_DIM_ORDER,
-        description=(
-            "Outermost-to-innermost ordering of parallelism axes for the "
-            "DeviceMesh. Innermost = most contiguous ranks."
-        ),
-    )
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
@@ -223,10 +215,12 @@ class ParallelConfig(StrictBaseModel):
         """
         attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
         if attn2d_size > 1:
-            return attn2d_size
-        if self.dit_ring_size > 1:
-            return self.dit_ring_size
-        return self.dit_ulysses_size
+            cp_size = attn2d_size
+        elif self.dit_ring_size > 1:
+            cp_size = self.dit_ring_size
+        else:
+            cp_size = 1
+        return cp_size * self.dit_ulysses_size
 
     @property
     def n_workers(self) -> int:

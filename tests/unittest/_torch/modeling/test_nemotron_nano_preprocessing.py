@@ -30,7 +30,7 @@ from tensorrt_llm.inputs.multimodal import (
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
-from tensorrt_llm.inputs.utils import AudioData
+from tensorrt_llm.inputs.multimodal_data import AudioData
 
 
 def make_tiler(**overrides):
@@ -388,11 +388,35 @@ def vision_encoder():
     return encoder
 
 
+def _wire_bucket_helpers_to_extract_feature(vision_encoder):
+    """Make `_encode_*` buckets call `extract_feature*` once per non-empty bucket.
+
+    `forward` now delegates to per-modality bucket helpers, which `MagicMock(spec=...)`
+    auto-mocks alongside the encoder. Stub the buckets so they forward to the real
+    `extract_feature*` mocks the tests configure — keeping the original
+    "did we route through the dynamic/fixed path?" assertions valid.
+    """
+
+    def _dynamic(image_data_list):
+        return [vision_encoder.extract_feature_dynamic()] if image_data_list else []
+
+    def _fixed(image_data_list):
+        return [vision_encoder.extract_feature()] if image_data_list else []
+
+    def _video(video_data_list):
+        return []
+
+    vision_encoder._encode_dynamic_image.side_effect = _dynamic
+    vision_encoder._encode_fixed_tile.side_effect = _fixed
+    vision_encoder._encode_temporal_video.side_effect = _video
+
+
 def test_forward_dynamic_path(vision_encoder):
     fake_embeds = torch.randn(1, 10, 512)
     vision_encoder.extract_feature_dynamic = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature = mock.MagicMock()
-    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
+    vision_encoder.apply_evs = mock.MagicMock(return_value=([fake_embeds], []))
+    _wire_bucket_helpers_to_extract_feature(vision_encoder)
 
     mm_data = {
         "modality_type": "image",
@@ -414,7 +438,8 @@ def test_forward_fixed_tile_path(vision_encoder):
     fake_embeds = torch.randn(2, 8, 512)
     vision_encoder.extract_feature = mock.MagicMock(return_value=fake_embeds)
     vision_encoder.extract_feature_dynamic = mock.MagicMock()
-    vision_encoder.apply_evs = mock.MagicMock(return_value=(fake_embeds, []))
+    vision_encoder.apply_evs = mock.MagicMock(return_value=([fake_embeds], []))
+    _wire_bucket_helpers_to_extract_feature(vision_encoder)
 
     mm_data = {
         "modality_type": "image",
@@ -508,6 +533,8 @@ class TestAudioInputProcessor:
         result = NanoV2VLInputProcessor._resample_audios([audio], target_sr=16000)
         np.testing.assert_array_equal(result[0], audio)
 
+    # `torch.compile` uses a thread pool to compile.
+    @pytest.mark.threadleak(enabled=False)
     def test_process_audio_returns_expected_keys(self):
         proc = _make_audio_processor()
         audio = np.random.randn(16000).astype(np.float32)

@@ -153,6 +153,27 @@ def _is_fp4_fp8_standalone_gemm_available() -> bool:
     return result
 
 
+def _is_sm103_gpu() -> bool:
+    """Return whether the current test GPU is an SM103 device such as B300."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0) == (10, 3)
+
+
+def skip_trtllm_bf16_on_sm103(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    dtype: torch.dtype,
+) -> None:
+    """Explicitly skip TRTLLM BF16 tests on SM103."""
+    if backend_type == MoeBackendType.TRTLLM and quant_algo is None and dtype == torch.bfloat16:
+        if _is_sm103_gpu():
+            pytest.skip(
+                "FIXME: TRTLLMGenFusedMoE BF16 (FlashInfer backend) is skipped on SM103 "
+                "due to CUDA errors"
+            )
+
+
 def should_skip_trtllm(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo],
@@ -162,6 +183,7 @@ def should_skip_trtllm(
     comm_method: Optional[str] = None,
     seq_len: Optional[int] = None,
     moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
 ) -> Optional[str]:
     """
     Check TRTLLM Gen backend specific constraints.
@@ -180,6 +202,9 @@ def should_skip_trtllm(
             for multi-GPU EP mode checks
         seq_len: Optional sequence length for seq_len-sensitive skip checks
         moe_tp_size: MoE TP parallelism size (default: 1, no TP sharding)
+        parallel_mode: Optional multi-GPU parallel mode label (e.g. "DEP",
+            "DTP", "TTP", "TEP"); used by parallel-mode-specific kernel-bug
+            skips that ``moe_tp_size`` alone cannot disambiguate.
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
@@ -313,14 +338,17 @@ def should_skip_trtllm(
         QuantAlgo.FP8_BLOCK_SCALES,
         QuantAlgo.W4A8_NVFP4_FP8,
         QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
-
-    if quant_algo not in trtllm_gen_quant_algos:
+    # BF16 also uses TRTLLMGen, so keep quant_algo=None in this path:
+    # apply the shared TRTLLMGen constraints, then the BF16 checks below.
+    if quant_algo is not None and quant_algo not in trtllm_gen_quant_algos:
         return None
 
     num_experts = model_config.num_experts
     top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
 
     # Check: num_experts must be divisible by 4
@@ -338,14 +366,43 @@ def should_skip_trtllm(
             f"TRTLLMGenFusedMoE requires num_experts > top_k "
             f"(got num_experts={num_experts}, top_k={top_k})"
         )
-    # W4A8_MXFP4_MXFP8 with non-128-aligned hidden_size or intermediate_size
-    # causes block_scale_interleave_reverse to fail with
-    # "rows of Interleaved block scales should be multiple of 128".
-    if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
-        hidden_size = model_config.hidden_size
+    if quant_algo is None:
+        if swiglu_gptoss_style:
+            return "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
+
         if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             return (
-                f"TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with non-128-aligned "
+                "TRTLLMGenFusedMoE BF16 path requires hidden_size and intermediate_size "
+                f"to be multiples of 128 (got h={hidden_size}, i={intermediate_size})."
+            )
+        if comm_method == "NVLINK_TWO_SIDED" and top_k % 8 != 0:
+            return (
+                "TRTLLMGenFusedMoE BF16 path with NVLinkTwoSidedFlashinfer requires "
+                f"top_k to be a multiple of 8 for 16-byte row alignment (got top_k={top_k})."
+            )
+        if moe_tp_size > 1:
+            if intermediate_size % moe_tp_size != 0:
+                return (
+                    "TRTLLMGenFusedMoE BF16 path requires intermediate_size to be "
+                    f"divisible by moe_tp_size (got i={intermediate_size}, "
+                    f"moe_tp_size={moe_tp_size})."
+                )
+            per_shard = intermediate_size // moe_tp_size
+            if per_shard % 64 != 0:
+                return (
+                    "TRTLLMGenFusedMoE BF16 path requires per-shard intermediate_size "
+                    f"to be 64-aligned for BlockMajorK weights (got {per_shard} "
+                    f"= {intermediate_size} / {moe_tp_size})."
+                )
+        return None
+
+    # W4A8_MXFP4_MXFP8 / W4A8_MXFP4_FP8 with non-128-aligned hidden_size or
+    # intermediate_size cause block_scale_interleave_reverse to fail with
+    # "rows of Interleaved block scales should be multiple of 128".
+    if quant_algo in (QuantAlgo.W4A8_MXFP4_MXFP8, QuantAlgo.W4A8_MXFP4_FP8):
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            return (
+                f"TRTLLMGenFusedMoE {quant_algo.name} with non-128-aligned "
                 f"sizes (h={hidden_size}, i={intermediate_size}) causes "
                 f"block_scale_interleave_reverse rows must be multiple of 128."
             )
@@ -425,6 +482,73 @@ def should_skip_trtllm(
                 f"swiglu_gptoss_style and top_k={top_k} has accuracy issues "
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
+
+    # W4A8_MXFP4_FP8 used to share the GatedMLP+W4A8MXFP4FP8LinearMethod
+    # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
+    # caused by the ref module's dynamic FP8 quantization being miswired to
+    # ``trtllm::w4a8_mxfp4_fp8_gemm`` (FP4GemmType.W4A8_MXFP4_MXFP8, which
+    # expects per-block activation scales with alpha=1). The reference now
+    # dequantizes the MXFP4 weights at load time AND emulates the kernel's
+    # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
+    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so the generic / default
+    # SwiGLU configs (any top_k, any model shape) see the same FP8 noise as
+    # the fused kernel and pass.
+    #
+    # The remaining failure surface is
+    # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
+    # any model shape, single- or multi-GPU). The element-wise reproducer at
+    # ``tests/unittest/_torch/modules/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
+    # holds the model config / weights / input identical and only toggles
+    # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
+    #   * default SwiGLU (alpha=1, beta=0, limit=inf):
+    #       kernel ~ ref (1.00x magnitude, 0% mismatch_frac, PASS)
+    #   * gpt-oss SwiGLU (alpha=1.702, beta=1.0, limit=7.0):
+    #       kernel ~ 600-800x SMALLER than ref (94% mismatch_frac, FAIL)
+    # Eight ref variants that toggle gate clamp single/double-sided, drop
+    # the ``+beta`` term, drop the limit clamp, or skip the FC1/FC2 FP8
+    # round-trip all stay at ~94% mismatch, so the ref activation algebra
+    # is not the source. The CUTLASS backend with the same gpt-oss SwiGLU
+    # passes (Phase B verification, 16 passed / 0 failed). The bug is
+    # therefore in the TRTLLM-Gen kernel's gpt-oss SwiGLU code path itself
+    # (likely a wrong scale wired into the gpt-oss epilogue path - see
+    # ``GemmGatedActOptions.h`` ``scaleC`` / ``dequantScaleAb`` plumbing).
+    #
+    # Skip removal must be tied to the kernel bug fix tracked in
+    # https://nvbugspro.nvidia.com/bug/6178914.
+    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style:
+        return (
+            "[Kernel Bug NVBUG-6178914] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
+            "swiglu_gptoss_style: the kernel produces output ~600-800x smaller "
+            "than the bf16 reference across all top_k / model shapes / "
+            "parallel modes, while the same kernel matches ref under default "
+            "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
+            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path."
+        )
+
+    # W4A8_MXFP4_FP8 + DEP + NVLINK MoeAllReduce produces ~97% mismatch with
+    # default SwiGLU on the TRTLLM-Gen kernel. The same kernel + quant passes
+    # under TTP+NVLINK (no DEP combine), and DEP+DEEPEP / DEP+DEEPEPLOWLATENCY
+    # also pass on the same kernel - so the MoE kernel itself is correct and
+    # the bug is in how the NVLINK MoeAllReduce combine path consumes the
+    # FP8/per-tensor-scale output of the TRTLLM-Gen kernel under DEP. Tracked
+    # in https://nvbugspro.nvidia.com/bug/6178915. The gpt-oss SwiGLU subset
+    # of this intersection is already covered by the NVBUG-6178914 skip above,
+    # so we explicitly require ``not swiglu_gptoss_style`` to avoid double
+    # accounting of the same ID under two different bug numbers.
+    if (
+        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+        and not swiglu_gptoss_style
+        and parallel_mode == "DEP"
+        and comm_method in ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED")
+    ):
+        return (
+            "[Kernel Bug NVBUG-6178915] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 in "
+            "DEP mode with NVLINK MoeAllReduce combine path produces ~97% "
+            "mismatch vs the bf16 reference (default SwiGLU). The same kernel "
+            "+ quant passes under TTP+NVLINK and under DEP+DEEPEP / "
+            "DEP+DEEPEPLOWLATENCY, so the bug is isolated to the DEP+NVLINK "
+            "MoeAllReduce combine path."
+        )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
@@ -907,6 +1031,9 @@ def get_quick_skip_reason(
                 swiglu_gptoss_style,
                 seq_len=seq_len,
             ),
+            lambda: should_skip_cutlass(
+                backend_type, quant_algo=quant_algo, model_config=model_config, dtype=dtype
+            ),
             lambda: should_skip_cutedsl(
                 backend_type, quant_algo, model_config, routing_method_cls=routing_method_cls
             ),
@@ -945,7 +1072,11 @@ def get_quick_skip_reason(
 
             if not is_hidden_128_aligned or not is_intermediate_128_aligned:
                 # TRTLLM with MXFP4 variants automatically pads to 128 alignment
-                is_mxfp4_variant = quant_algo in {QuantAlgo.W4A16_MXFP4, QuantAlgo.W4A8_MXFP4_MXFP8}
+                is_mxfp4_variant = quant_algo in {
+                    QuantAlgo.W4A16_MXFP4,
+                    QuantAlgo.W4A8_MXFP4_FP8,
+                    QuantAlgo.W4A8_MXFP4_MXFP8,
+                }
                 is_trtllm_backend = backend_type == MoeBackendType.TRTLLM
                 if not (is_trtllm_backend and is_mxfp4_variant):
                     return (
@@ -1097,7 +1228,8 @@ def should_skip_to_accelerate_ci(
     all combinations run (local exhaustive testing).
 
     Rules applied (in order):
-    0. Skip unquantized (quant=None) — quantized paths are the focus of CI
+    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
+       unquantized coverage enabled.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -1123,8 +1255,13 @@ def should_skip_to_accelerate_ci(
     if model_config is None:
         return None
 
-    # --- Rule 0: Skip gated and unquantized (quant=None) ---
-    if quant_algo is None and is_gated_activation(activation_type):
+    # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
+    # Keep TRTLLM BF16 unquantized enabled to cover FlashInfer BF16 TRTLLM MoE.
+    if (
+        quant_algo is None
+        and is_gated_activation(activation_type)
+        and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
+    ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
     # Any e256-class model_config triggers CI Rule-1 minimal coverage:

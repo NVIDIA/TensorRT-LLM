@@ -30,12 +30,21 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_next.modeling_qwen3_next import (
-    Qwen3NextDynamicCache,
     Qwen3NextGatedDeltaNet,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     apply_mask_to_padding_states,
 )
+
+# transformers 5.5+ removed the model-specific Qwen3NextDynamicCache and routes
+# qwen3_next through the generic DynamicCache from cache_utils. Fall back to the
+# old symbol when running against transformers 5.3.x so this file still imports.
+try:
+    from transformers.models.qwen3_next.modeling_qwen3_next import (
+        Qwen3NextDynamicCache as _Qwen3NextCache,
+    )
+except ImportError:
+    from transformers.cache_utils import DynamicCache as _Qwen3NextCache
 
 from ...export.interface import BaseExportPatch, ExportPatchRegistry
 
@@ -110,7 +119,7 @@ class Qwen3NextMoePatch(BaseExportPatch):
 def _patched_gdn_forward(
     self: Qwen3NextGatedDeltaNet,
     hidden_states: torch.Tensor,
-    cache_params: Optional[Qwen3NextDynamicCache] = None,
+    cache_params: Optional[_Qwen3NextCache] = None,
     cache_position: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
 ):
@@ -222,12 +231,13 @@ class Qwen3NextGDNPatch(BaseExportPatch):
         self.original_values["Qwen3NextModel._update_linear_attn_mask"] = (
             Qwen3NextModel._update_linear_attn_mask
         )
-        # NOTE: Qwen3NextDynamicCache does not have __bool__ by default
-        # (it inherits from object), so we just set it and delete on revert.
+        # NOTE: the cache class (Qwen3NextDynamicCache pre-5.5 / generic
+        # DynamicCache 5.5+) does not define its own __bool__ — both fall back
+        # to Cache.__len__ — so we just set it and delete on revert.
 
         Qwen3NextGatedDeltaNet.forward = _patched_gdn_forward  # type: ignore
         Qwen3NextModel._update_linear_attn_mask = _patched_update_linear_attn_mask  # type: ignore
-        Qwen3NextDynamicCache.__bool__ = _cache_bool  # type: ignore
+        _Qwen3NextCache.__bool__ = _cache_bool  # type: ignore
 
     def _revert_patch(self):
         """Revert the GDN, mask, and cache patches."""
@@ -237,4 +247,4 @@ class Qwen3NextGDNPatch(BaseExportPatch):
         Qwen3NextModel._update_linear_attn_mask = self.original_values[  # type: ignore
             "Qwen3NextModel._update_linear_attn_mask"
         ]
-        del Qwen3NextDynamicCache.__bool__
+        del _Qwen3NextCache.__bool__

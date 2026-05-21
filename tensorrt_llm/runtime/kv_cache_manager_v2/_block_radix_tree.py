@@ -14,36 +14,55 @@
 # limitations under the License.
 
 import hashlib
-from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, chunked, filled_list, unwrap_rawref
+from ._utils import TypedIndexList, chunked, div_up, filled_list, unwrap_rawref
 
 if TYPE_CHECKING:
     from ._page import CommittedPage
 
 BlockKey = bytes
 
-# Per-request seed for the radix tree's root-block hash. Accepts ``int | None``
-# for the plain LoRA-id path, or a pre-hashed ``bytes`` digest when callers
-# need to mix additional context (e.g. ``cache_salt_id``) into the root.
-TreeTaskId = int | bytes | None
+
+class ReuseScope(NamedTuple):
+    """Per-request namespace for prefix reuse."""
+
+    lora_id: int | None = None
+    salt: int | None = None
+
+    def _mask(self) -> bytes:
+        return sum((value is not None) << i for i, value in enumerate(self)).to_bytes(
+            div_up(len(self), 8), "little", signed=False
+        )
+
+    def to_bytes(self) -> bytes:
+        ret = self._mask()
+        for value in self:
+            if type(value) is int:
+                ret += value.to_bytes(8, "little", signed=False)
+            else:
+                assert value is None, (
+                    "Did you forget to update to_bytes() when adding new non-int fields to ReuseScope?"
+                )
+        return ret
 
 
 # id_offset is usually vocab_size
-def gen_multi_modal_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
+def gen_multimodal_cache_key_tokens(
+    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
 ) -> list[TokenIdExt]:
+    """Create synthetic tokens used only when building multimodal KV-cache keys.
+
+    Item-local token 0 carries the content digest; later offsets use deterministic IDs above the vocab.
+    """
     assert num_tokens > 0
-    # Alternatively, we could also use (multi_modal_data_digest + i.to_bytes(8, 'little')) or its hash
-    # digest as token id.
-    # The implementation below is faster and also works because KV cache reuse of a token is with a
-    # precondition that all previous tokens also match. So only the first multi-modal token id needs to
-    # be unique.
+    assert token_offset >= 0
     return [
-        multi_modal_data_digest if i == 0 else TokenId(id_offset + i) for i in range(num_tokens)
+        multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
+        for i in range(num_tokens)
     ]
 
 
@@ -80,9 +99,9 @@ TokenBlock = list[TokenIdExt]
 
 
 def sequence_to_blockchain_keys(
-    tokens_per_block: int, tree_task_id: TreeTaskId, tokens: Sequence[TokenIdExt]
+    tokens_per_block: int, reuse_scope: ReuseScope, tokens: Sequence[TokenIdExt]
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(tree_task_id).digest
+    digest = Hasher(reuse_scope.to_bytes()).digest
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -203,17 +222,17 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "tree_task_id", "__rawref__")
+    __slots__ = ("_prev", "key", "next", "reuse_scope", "__rawref__")
     key: BlockKey
-    tree_task_id: TreeTaskId
+    reuse_scope: ReuseScope
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
-    def __init__(self, tree_task_id: TreeTaskId, prev: "BlockRadixTree") -> None:
-        self.key = self.make_key(tree_task_id)
+    def __init__(self, reuse_scope: ReuseScope, prev: "BlockRadixTree") -> None:
+        self.key = self.make_key(reuse_scope)
         assert self.key not in prev.next, "Root block already exists"
-        self.tree_task_id = tree_task_id
+        self.reuse_scope = reuse_scope
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
@@ -239,8 +258,8 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(tree_task_id: TreeTaskId) -> BlockKey:
-        return Hasher(tree_task_id).digest
+    def make_key(reuse_scope: ReuseScope) -> BlockKey:
+        return Hasher(reuse_scope.to_bytes()).digest
 
 
 class Block:
@@ -378,11 +397,11 @@ class BlockRadixTree:
     def __del__(self) -> None:
         self.__rawref__.invalidate()
 
-    def add_or_get_existing(self, tree_task_id: TreeTaskId) -> RootBlock:
-        key = RootBlock.make_key(tree_task_id)
+    def add_or_get_existing(self, reuse_scope: ReuseScope) -> RootBlock:
+        key = RootBlock.make_key(reuse_scope)
         if key in self.next:
             return self.next[key]
-        return RootBlock(tree_task_id, self)
+        return RootBlock(reuse_scope, self)
 
     @property
     def tokens_per_block(self) -> int:
@@ -410,14 +429,14 @@ class BlockRadixTree:
     # tokens_per_block except the last one.
     def match(
         self,
-        tree_task_id: TreeTaskId,
+        reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
         for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, tree_task_id, tokens
+            self._tokens_per_block, reuse_scope, tokens
         ):
             if key in block.next:
                 block = block.next[key]
