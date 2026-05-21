@@ -21,7 +21,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 _VALID_DIM_NAMES = frozenset({"cfg", "tp", "cp", "ulysses"})
-DEFAULT_DIM_ORDER = "cfg-tp-cp-ulysses"
+# Outermost-to-innermost for init_device_mesh
+_DEVICE_MESH_DIM_ORDER = "cfg-tp-cp-ulysses"
 
 
 class VisualGenMapping(DeviceMeshTopologyImpl):
@@ -34,9 +35,10 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
     Parallelism Hierarchy:
         total_workers = cfg × sp
-        sp (sequence parallelism) = cp × ulysses  [mutually exclusive today; TODO to combine]
-        cp (context parallelism)  = ring           [ring attention, not yet implemented]
-                                  | attn2d         [Attention2D 2D mesh, row_size × col_size]
+        sp (sequence parallelism) = cp × ulysses
+        cp (context parallelism)  = ring           [ring attention, 1D cp group]
+                                  | attn2d         [Attention2D 2D mesh, row_size × col_size.
+                                                    Cannot be combined with Ulysses right now.]
 
         cfg:     Splits positive/negative CFG prompts across GPUs (independent streams).
         tp:      Tensor parallelism all-reduce within tp groups.
@@ -46,16 +48,19 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             attn2d: 2D mesh; Q all-gathered within row group, K/V within col group.
           ulysses: Shards heads via all-to-all (head-sharding, not sequence-sharding).
 
-    Ordering rationale (default ``"cfg-tp-cp-ulysses"``):
+    Fixed mesh axis ordering (implementation detail, see
+    ``_DEVICE_MESH_DIM_ORDER``):
     - Ulysses innermost: all-to-all is latency-sensitive, contiguous ranks
     - CP next: KV streaming (ring) or sequence shard communication (Attention2D)
     - TP next: all-reduce for Linear
     - CFG outermost: independent until final all-gather
 
-    The *order* string maps directly to ``init_device_mesh``'s
-    ``mesh_shape`` tuple (first = outermost / slowest-varying, last =
-    innermost / most contiguous).
+    Callers should use rank and process-group properties only, not mesh layout.
     """
+
+    # Flattened (cp, ulysses) mesh, cached after build_mesh().  Shared
+    # across instances via the class object.
+    seq_mesh = None
 
     def __init__(
         self,
@@ -67,7 +72,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         ulysses_size: int = 1,
         attn2d_row_size: int = 1,
         attn2d_col_size: int = 1,
-        order: str = DEFAULT_DIM_ORDER,
+        parallel_vae_size: int = 1,
     ):
         # cp_size unifies ring and Attention2D under one context-parallelism mesh dimension.
         # Ring and Attention2D are mutually exclusive: both shard the sequence axis.
@@ -77,32 +82,38 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 "Ring and Attention2D are mutually exclusive: both shard the sequence "
                 f"dimension. Got ring_size={ring_size}, attn2d={attn2d_row_size}x{attn2d_col_size}."
             )
-        cp_size = attn2d_size if attn2d_size > 1 else ring_size
-        if cp_size > 1 and ulysses_size > 1:
-            raise NotImplementedError(
-                "Combining CP and Ulysses is not yet supported. "
-                "They are orthogonal (CP shards sequence; Ulysses shards heads) "
-                "but the combined wrapper is not implemented."
-            )
-        if attn2d_size > 1 and tp_size > 1:
-            raise NotImplementedError(
-                "Combining Attention2D and TP is not yet supported. "
-                "The row/col group construction in _build_attn2d_groups does not account "
-                "for TP ranks."
-            )
+        if attn2d_size > 1:
+            cp_size = attn2d_size
+            if ulysses_size > 1:
+                raise NotImplementedError(
+                    "Combining Attention2D and Ulysses is not yet supported. "
+                    "They are orthogonal (Attention2D shards sequence; Ulysses shards heads) "
+                    "but the combined wrapper is not implemented."
+                )
+            if tp_size > 1:
+                raise NotImplementedError(
+                    "Combining Attention2D and TP is not yet supported. "
+                    "The row/col group construction in _build_attn2d_groups does not account "
+                    "for TP ranks."
+                )
+        else:
+            cp_size = ring_size
+
         product = cfg_size * tp_size * cp_size * ulysses_size
         if product != world_size:
             raise ValueError(
                 f"cfg({cfg_size}) * tp({tp_size}) * cp({cp_size}) * "
                 f"ulysses({ulysses_size}) = {product} != world_size({world_size})"
             )
-
-        dims = order.split("-")
-        if set(dims) != _VALID_DIM_NAMES or len(dims) != len(_VALID_DIM_NAMES):
+        if parallel_vae_size < 1:
+            raise ValueError(f"parallel_vae_size ({parallel_vae_size}) must be >= 1")
+        if parallel_vae_size > world_size:
             raise ValueError(
-                f"order must be a '-'-separated permutation of "
-                f"{sorted(_VALID_DIM_NAMES)}, got '{order}'"
+                f"parallel_vae_size ({parallel_vae_size}) cannot exceed world_size ({world_size})"
             )
+
+        dims = _DEVICE_MESH_DIM_ORDER.split("-")
+        assert set(dims) == _VALID_DIM_NAMES and len(dims) == len(_VALID_DIM_NAMES)
 
         self.world_size = world_size
         self._rank = rank
@@ -113,9 +124,12 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self.ulysses_size = ulysses_size
         self.attn2d_row_size = attn2d_row_size
         self.attn2d_col_size = attn2d_col_size
+        self.parallel_vae_size = parallel_vae_size
+        self._vae_ranks = list(range(self.parallel_vae_size))
+        self._vae_group: Optional[ProcessGroup] = None
+        self._vae_adj_groups: list[Optional[ProcessGroup]] = []
         self._attn2d_row_group: Optional[ProcessGroup] = None
         self._attn2d_col_group: Optional[ProcessGroup] = None
-        self._order = order
         self._dim_names = tuple(dims)
         # cp_size covers both ring (1D) and Attention2D (2D, row_size * col_size).
         # For Attention2D, _build_attn2d_groups() creates row/col sub-groups;
@@ -129,13 +143,25 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if dist.is_initialized() and world_size > 1:
             self.build_mesh()
+            self._build_vae_group()
 
     # ------------------------------------------------------------------
     # Mesh construction
     # ------------------------------------------------------------------
     def build_mesh(self):
         cls = DeviceMeshTopologyImpl
+        expected_shape = tuple(self._dim_sizes[d] for d in self._dim_names)
         if cls.device_mesh is not None:
+            cached_dim_names = tuple(cls.device_mesh.mesh_dim_names)
+            cached_shape = tuple(int(x) for x in cls.device_mesh.mesh.shape)
+            if cached_dim_names != self._dim_names or cached_shape != expected_shape:
+                raise RuntimeError(
+                    "VisualGenMapping.build_mesh reusing incompatible cached device_mesh: "
+                    f"cached dims={cached_dim_names}, shape={cached_shape}; "
+                    f"requested dims={self._dim_names}, shape={expected_shape}. "
+                    "Create a mesh cache keyed by (dim_names, dim_sizes) or reset "
+                    "DeviceMeshTopologyImpl.device_mesh before constructing a different topology."
+                )
             return
 
         shape = tuple(self._dim_sizes[d] for d in self._dim_names)
@@ -148,6 +174,22 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             f"VisualGenMapping.build_mesh: dims={self._dim_names}, "
             f"shape={shape}, mesh={cls.device_mesh}"
         )
+
+        # Combined sequence-parallel mesh (cp × ulysses) for token sharding (e.g. WAN).
+        # ``_flatten`` is collective; every rank must call with the same dim names/order.
+        # Requires ``cp`` and ``ulysses`` adjacent in ``_DEVICE_MESH_DIM_ORDER``.
+        if self.cp_size * self.ulysses_size > 1:
+            cp_idx = self._dim_names.index("cp")
+            uly_idx = self._dim_names.index("ulysses")
+            if abs(cp_idx - uly_idx) != 1:
+                raise RuntimeError(
+                    "seq_group requires cp and ulysses adjacent; "
+                    f"fix _DEVICE_MESH_DIM_ORDER (got {self._dim_names!r})"
+                )
+            # Linearisation: seq_rank = cp_rank * ulysses_size + ulysses_rank (cp outer).
+            VisualGenMapping.seq_mesh = cls.device_mesh["cp", "ulysses"]._flatten(
+                mesh_dim_name="seq"
+            )
 
         if self.attn2d_row_size * self.attn2d_col_size > 1:
             self._build_attn2d_groups()
@@ -196,6 +238,61 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             f"VisualGenMapping._build_attn2d_groups: row_size={row_size}, col_size={col_size}"
         )
 
+    def _validate_vae_ranks_share_cfg_group(self) -> None:
+        """Ensure all ``vae_ranks`` share one cfg coordinate (or span the full world).
+
+        Today ``_vae_ranks = list(range(parallel_vae_size))`` only sits inside
+        one CFG group when ``cfg`` is the outermost axis of ``dit_dim_order``.
+        """
+        if self.parallel_vae_size <= 1 or self.cfg_size <= 1:
+            return
+        if self.parallel_vae_size == self.world_size:
+            return
+
+        # Row-major stride along the cfg axis from the mesh order.
+        stride, cfg_stride = 1, None
+        for dim in reversed(self._dim_names):
+            if dim == "cfg":
+                cfg_stride = stride
+                break
+            stride *= self._dim_sizes[dim]
+        assert cfg_stride is not None  # 'cfg' is always present in _dim_names
+
+        cfg_coords = {(r // cfg_stride) % self.cfg_size for r in self._vae_ranks}
+        if len(cfg_coords) > 1:
+            raise NotImplementedError(
+                f"vae_ranks={self._vae_ranks} straddle CFG groups "
+                f"(cfg coordinates={sorted(cfg_coords)}) under order='{self._order}'. "
+                "VAE ranks must share a single CFG group, or span the full world. "
+                "_vae_ranks is currently hardcoded to list(range(parallel_vae_size)), "
+                "which only lands in one CFG group when 'cfg' is the outermost axis "
+                "of dit_dim_order. Either pick parallel_vae_size <= ranks_per_cfg_group "
+                "or derive _vae_ranks from the mesh."
+            )
+
+    def _build_vae_group(self) -> None:
+        """Create the process group used by parallel VAE."""
+        if self.parallel_vae_size <= 1:
+            return
+
+        self._validate_vae_ranks_share_cfg_group()
+
+        # use_local_synchronization=False since new_group is world-collective, so every
+        # rank (including non-VAE ranks) must participate or the next world-wide
+        # collective deadlocks.
+        pg = dist.new_group(self._vae_ranks, use_local_synchronization=False)
+        if self._rank in self._vae_ranks:
+            self._vae_group = pg
+
+        adj_groups: list[Optional[ProcessGroup]] = [None] * (self.parallel_vae_size - 1)
+        for i in range(self.parallel_vae_size - 1):
+            ranks = [self._vae_ranks[i], self._vae_ranks[i + 1]]
+            pg = dist.new_group(ranks, use_local_synchronization=False)
+            if self._rank in ranks:
+                adj_groups[i] = pg
+        if self._rank in self._vae_ranks:
+            self._vae_adj_groups = adj_groups
+
     # ------------------------------------------------------------------
     # Rank decomposition
     # ------------------------------------------------------------------
@@ -221,10 +318,29 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     def ulysses_rank(self) -> int:
         return self._local_rank("ulysses")
 
+    # Combined sequence-parallel dimension: cp × ulysses (cp is ring when
+    # Attention2D is off).  This is the dimension along which the *input token
+    # sequence* is sharded.  Ring and Ulysses then re-shard internally, but from
+    # the transformer's point of view there is one group of size
+    # ``cp_size * ulysses_size``.
+    @property
+    def seq_size(self) -> int:
+        return self.cp_size * self.ulysses_size
+
+    @property
+    def seq_rank(self) -> int:
+        # Must match the linearisation used by ``_flatten("cp", "ulysses")``:
+        # cp is outer (slower-varying), ulysses is inner (faster-varying).
+        return self.cp_rank * self.ulysses_size + self.ulysses_rank
+
+    @property
+    def ring_rank(self) -> int:
+        return self.cp_rank
+
     @property
     def attn2d_mesh_rank(self) -> int:
         """Rank within the Attention2D CP group (same as cp_rank)."""
-        return self._local_rank("cp")
+        return self.cp_rank
 
     @property
     def is_cfg_conditional(self) -> bool:
@@ -258,6 +374,11 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         return self._group("cfg")
 
     @property
+    def ring_group(self) -> Optional[ProcessGroup]:
+        """Process group for RingAttention (1D ``cp`` mesh when ``ring_size > 1``)."""
+        return self.cp_group
+
+    @property
     def attn2d_row_group(self) -> Optional[ProcessGroup]:
         return self._attn2d_row_group
 
@@ -268,7 +389,34 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     @property
     def attn2d_mesh_group(self) -> Optional[ProcessGroup]:
         """Full CP group for Attention2D (same as cp_group)."""
-        return self._group("cp")
+        return self.cp_group
+
+    @property
+    def vae_ranks(self) -> list[int]:
+        return self._vae_ranks
+
+    @property
+    def vae_group(self) -> Optional[ProcessGroup]:
+        return self._vae_group
+
+    @property
+    def vae_adj_groups(self) -> list[Optional[ProcessGroup]]:
+        return self._vae_adj_groups
+
+    def seq_group(self) -> Optional[ProcessGroup]:
+        """Process group spanning (cp × ulysses) for combined sequence-axis sharding."""
+        cls = DeviceMeshTopologyImpl
+        if cls.device_mesh is None:
+            if self.world_size == 1:
+                return SingleProcessGroup.get_group()
+            return None
+        if self.cp_size * self.ulysses_size == 1:
+            # Degenerate: single rank along both dims.  Fall back to the
+            # ulysses group (equivalent at size-1) to keep call sites simple.
+            return self._group("ulysses")
+        if VisualGenMapping.seq_mesh is None:
+            return None
+        return VisualGenMapping.seq_mesh.get_group()
 
     # ------------------------------------------------------------------
     # Bridge to LLM Mapping (for Linear layers)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -234,6 +234,36 @@ void initBindings(nb::module_& m)
                 }
                 return lengths;
             })
+        .def_prop_ro("multimodal_item_run_cu_offsets",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> offsets = std::nullopt;
+                if (self.getMultimodalItemRunCuOffsets())
+                {
+                    offsets = *self.getMultimodalItemRunCuOffsets().value();
+                }
+                return offsets;
+            })
+        .def_prop_ro("multimodal_run_positions",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> positions = std::nullopt;
+                if (self.getMultimodalRunPositions())
+                {
+                    positions = *self.getMultimodalRunPositions().value();
+                }
+                return positions;
+            })
+        .def_prop_ro("multimodal_run_lengths",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> lengths = std::nullopt;
+                if (self.getMultimodalRunLengths())
+                {
+                    lengths = *self.getMultimodalRunLengths().value();
+                }
+                return lengths;
+            })
         .def_prop_ro("position_ids",
             [](GenLlmReq& self)
             {
@@ -319,7 +349,10 @@ void initBindings(nb::module_& m)
                 std::optional<executor::ContextPhaseParams> context_phase_params,
                 std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
                 std::optional<tb::LlmRequest::TimePoint> arrival_time,
-                std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy)
+                std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_item_run_cu_offsets,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_positions,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                 {
@@ -360,7 +393,8 @@ void initBindings(nb::module_& m)
                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
                     guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
-                    arrival_time, std::move(agent_hierarchy)};
+                    arrival_time, std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
+                    multimodal_run_lengths};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -387,7 +421,9 @@ void initBindings(nb::module_& m)
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
             nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
-            nb::arg("arrival_time") = std::nullopt, nb::arg("agent_hierarchy") = std::nullopt)
+            nb::arg("arrival_time") = std::nullopt, nb::arg("agent_hierarchy") = std::nullopt,
+            nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
+            nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),

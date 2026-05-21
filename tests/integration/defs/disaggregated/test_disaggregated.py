@@ -61,7 +61,13 @@ def get_ucx_tls():
 
     Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
     """
-    if get_sm_version() < 90:
+    sm = get_sm_version()
+    """
+    ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
+    """
+    if sm == 103:
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
     return "^ib,gdr_copy"
 
@@ -183,8 +189,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
         f"{test_configs_root}/disagg_config_metrics.yaml",
-        "trtllm_sampler":
-        f"{test_configs_root}/disagg_config_trtllm_sampler.yaml",
         "load_balance":
         f"{test_configs_root}/disagg_config_load_balance.yaml",
         "cache_aware_balance":
@@ -315,7 +319,7 @@ def get_client_test_set(test_desc):
                              verify_streaming_completion=True,
                              verify_chat=False,
                              verify_streaming_chat=False)
-    if test_desc.startswith("overlap") or test_desc == "trtllm_sampler":
+    if test_desc.startswith("overlap"):
         return ClientTestSet(completion=True,
                              completion_streaming=True,
                              chat=True,
@@ -607,10 +611,13 @@ def run_disaggregated_test(example_dir,
             "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
         )
 
+    run_env = env.copy() if env else os.environ.copy()
+    run_env["UCX_TLS"] = get_ucx_tls()
+
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=env, cwd=cwd,
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              schedule_style=disagg_schedule_style)
 
     server_host = config.get("hostname", "localhost")
@@ -637,7 +644,7 @@ def run_disaggregated_test(example_dir,
             client_config_file,
             test_desc,
             num_iters,
-            env,
+            run_env,
             300,  # timeout
             prompt_file,
             extra_endpoints_test,
@@ -781,6 +788,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
+    env["UCX_TLS"] = get_ucx_tls()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
@@ -1042,21 +1050,6 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                 assert float(sample_recv[1]) <= float(sample[1])
                 break
         assert matched
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
-                                      disaggregated_example_root,
-                                      llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "trtllm_sampler",
-                           env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -2356,7 +2349,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
@@ -2520,8 +2513,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
-    # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = get_ucx_tls()
     e2el, ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         config_file,

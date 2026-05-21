@@ -23,7 +23,6 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
-from tensorrt_llm._torch.visual_gen.mapping import DEFAULT_DIM_ORDER
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
@@ -178,25 +177,22 @@ class ParallelConfig(StrictBaseModel):
            2x2 mesh: Q gathered across row group, K/V gathered across col group
     """
 
-    enable_parallel_vae: bool = True
+    parallel_vae_size: int = PydanticField(
+        1,
+        ge=1,
+        description="Number of ranks used for VAE parallelism. 1 disables parallel VAE.",
+    )
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     # DiT Parallelism
-    dit_dp_size: int = PydanticField(1, ge=1)
+    dit_dp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
-    dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
+    dit_ring_size: int = PydanticField(1, ge=1)  # Supported
     dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
     dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
-    dit_dim_order: str = PydanticField(
-        DEFAULT_DIM_ORDER,
-        description=(
-            "Outermost-to-innermost ordering of parallelism axes for the "
-            "DeviceMesh. Innermost = most contiguous ranks."
-        ),
-    )
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
@@ -219,10 +215,12 @@ class ParallelConfig(StrictBaseModel):
         """
         attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
         if attn2d_size > 1:
-            return attn2d_size
-        if self.dit_ring_size > 1:
-            return self.dit_ring_size
-        return self.dit_ulysses_size
+            cp_size = attn2d_size
+        elif self.dit_ring_size > 1:
+            cp_size = self.dit_ring_size
+        else:
+            cp_size = 1
+        return cp_size * self.dit_ulysses_size
 
     @property
     def n_workers(self) -> int:
@@ -486,8 +484,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the learned LatentUpsampler checkpoint (.safetensors). "
-            "Required for LTX-2 two-stage pipelines. When provided, the "
-            "pipeline auto-selects LTX2TwoStagesPipeline."
+            "Optional for LTX-2 two-stage pipelines. When provided, the "
+            "pipeline auto-selects LTX2TwoStagesPipeline. If omitted, "
+            "TensorRT-LLM tries to discover it in the checkpoint directory."
         ),
     )
 
@@ -496,8 +495,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the distilled LoRA checkpoint (.safetensors) used in "
-            "the stage 2 refinement pass. The LoRA weights are merged into "
-            "the transformer for stage 2 denoising and un-merged afterwards."
+            "the stage 2 refinement pass. If omitted, TensorRT-LLM tries to "
+            "discover it in the checkpoint directory. The LoRA weights are "
+            "merged into the transformer for stage 2 denoising and un-merged afterwards."
         ),
     )
 
@@ -672,10 +672,6 @@ class DiffusionModelConfig(BaseModel):
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
-
-    # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
-    enable_parallel_vae: bool = True
-    parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     dynamic_weight_quant: bool = False
 
@@ -943,11 +939,11 @@ class DiffusionModelConfig(BaseModel):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # Propagate two-stage paths into extra_attrs for pipeline use
-        if args and args.spatial_upsampler_path:
-            extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
-        if args and args.distilled_lora_path:
-            extra_attrs["distilled_lora_path"] = args.distilled_lora_path
+        if args:
+            if args.spatial_upsampler_path:
+                extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
+            if args.distilled_lora_path:
+                extra_attrs["distilled_lora_path"] = args.distilled_lora_path
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
@@ -987,6 +983,8 @@ class DiffusionModelConfig(BaseModel):
             if native_config is not None:
                 transformer_dict = native_config.get("transformer", {})
                 pretrained_config = SimpleNamespace(**transformer_dict)
+                if not getattr(pretrained_config, "_name_or_path", None):
+                    pretrained_config._name_or_path = str(checkpoint_path)
                 extra_attrs["monolithic_safetensors_config"] = native_config
 
                 # quantization_config lives as a separate safetensors metadata

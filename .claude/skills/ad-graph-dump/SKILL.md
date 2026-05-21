@@ -31,6 +31,7 @@ This file is part of **trtllm-agent-toolkit**. Commands and paths such as `examp
 
 | Skill | Use it for |
 |-------|------------|
+| **ad-layer-visualizer** | Extracting and visualizing a single decoder layer from a dump as a DOT/PNG diagram. |
 | **ad-add-fusion-transformation** | Implementing or reviewing fusion passes once you know what the graphs show. |
 | **trtllm-codebase-exploration** | Searching the TRT-LLM tree for transforms, custom ops, and patterns. |
 | **trtllm-code-contribution** | Tests and contribution hygiene after you change TRT-LLM. |

@@ -49,6 +49,10 @@ FUSED_MOE_MXFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
 FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
+# TRTLLM-Gen MatrixLayout enum values.
+TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_K = 0
+TRTLLM_GEN_WEIGHT_LAYOUT_MAJOR_MN = 1
+TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K = 2
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):
@@ -649,6 +653,91 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         module.quant_scales = tuple()
 
 
+class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
+    # BlockMajorK uses 128-byte K blocks. BF16 has 2 bytes per element.
+    block_k = 64
+    use_shuffled_weight = True
+    weight_layout = TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
+    _cache_permute_indices: Dict[tuple[tuple[int, ...], str, int],
+                                 torch.Tensor] = {}
+
+    def create_weights(self, module: torch.nn.Module):
+        super().create_weights(module)
+        module._trtllm_gen_layout_transform_pending = True
+
+    def _get_w3_w1_permute_indices(
+            self,
+            w3_w1_weight: torch.Tensor,
+            is_gated_act_gemm: bool = True) -> torch.Tensor:
+        return trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            w3_w1_weight.view(torch.uint8),
+            self._cache_permute_indices,
+            epilogue_tile_m=128,
+            is_gated_act_gemm=is_gated_act_gemm)
+
+    def _get_w2_permute_indices(self, w2_weight: torch.Tensor) -> torch.Tensor:
+        return trtllmgen_maybe_get_cached_w2_permute_indices(
+            w2_weight.view(torch.uint8),
+            self._cache_permute_indices,
+            epilogue_tile_m=128)
+
+    def _convert_to_block_major_k_layout(
+            self, input_tensor: torch.Tensor) -> torch.Tensor:
+        if input_tensor.dim() != 2:
+            raise ValueError(
+                f"input_tensor must be 2D for BlockMajorK conversion, got shape={tuple(input_tensor.shape)}"
+            )
+        m, k = input_tensor.shape
+        if k % self.block_k != 0:
+            raise ValueError(
+                f"K dimension ({k}) must be divisible by block_k ({self.block_k}) for BlockMajorK layout."
+            )
+        return input_tensor.view(m, k // self.block_k,
+                                 self.block_k).permute(1, 0, 2).contiguous()
+
+    def _prepare_bf16_weight_for_trtllm_gen(
+            self, weight: torch.Tensor,
+            permute_indices: torch.Tensor) -> torch.Tensor:
+        shuffled_weight = weight[permute_indices.to(weight.device)].contiguous()
+        if self.weight_layout == TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K:
+            return self._convert_to_block_major_k_layout(shuffled_weight)
+        raise ValueError(
+            f"Unsupported TRTLLM-Gen BF16 weight_layout={self.weight_layout}")
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        if module.w3_w1_weight.numel() == 0 or module.w2_weight.numel() == 0:
+            module._trtllm_gen_layout_transform_pending = False
+            return
+
+        w3_w1_permute_indices = self._get_w3_w1_permute_indices(
+            module.w3_w1_weight.data[0],
+            is_gated_act_gemm=getattr(module, "is_gated_activation", True))
+        w2_permute_indices = self._get_w2_permute_indices(
+            module.w2_weight.data[0])
+
+        processed_w3_w1 = torch.stack([
+            self._prepare_bf16_weight_for_trtllm_gen(expert,
+                                                     w3_w1_permute_indices)
+            for expert in module.w3_w1_weight.data
+        ])
+        processed_w2 = torch.stack([
+            self._prepare_bf16_weight_for_trtllm_gen(expert, w2_permute_indices)
+            for expert in module.w2_weight.data
+        ])
+
+        replace_parameter_and_save_metadata(module, "w3_w1_weight",
+                                            processed_w3_w1,
+                                            module.rebuild_tensor_metadata)
+        replace_parameter_and_save_metadata(module, "w2_weight", processed_w2,
+                                            module.rebuild_tensor_metadata)
+        module._trtllm_gen_layout_transform_pending = False
+
+    def post_load_weights(self, module: torch.nn.Module):
+        if getattr(module, "_trtllm_gen_layout_transform_pending", False):
+            self.process_weights_after_loading(module)
+        super().post_load_weights(module)
+
+
 def load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
                                          dst_fc31_input_scale: torch.Tensor):
     if w1_input_scale is not None and w1_input_scale.numel() != 0:
@@ -1148,9 +1237,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
             logger.debug("Resmoothing FP8 weights in post_load_weights")
             resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
-            replace_parameter_and_save_metadata(module, "w3_w1_weight",
-                                                resmoothed_w3_w1_weight,
-                                                module.rebuild_tensor_metadata)
+            module.w3_w1_weight.data.copy_(resmoothed_w3_w1_weight)
             replace_parameter_and_save_metadata(module,
                                                 "w3_w1_weight_scaling_factor",
                                                 transformed_w3_w1_scale,
@@ -1158,9 +1245,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
             resmoothed_w2_weight, transformed_w2_scale = resmooth_and_transform_fp8_scale(
                 module.w2_weight, module.w2_weight_scaling_factor)
-            replace_parameter_and_save_metadata(module, "w2_weight",
-                                                resmoothed_w2_weight,
-                                                module.rebuild_tensor_metadata)
+            module.w2_weight.data.copy_(resmoothed_w2_weight)
             replace_parameter_and_save_metadata(module,
                                                 "w2_weight_scaling_factor",
                                                 transformed_w2_scale,

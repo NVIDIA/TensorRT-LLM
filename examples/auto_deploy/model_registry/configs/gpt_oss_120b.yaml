@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenAI GPT-OSS-120B (128 experts, top-4, MXFP4 quantized) — standalone AD serving config.
+# 36 layers (alternating sliding/full), GQA (64 Q / 8 KV heads), head_dim=64, hidden=2880.
+# Weights are stored in MXFP4 on HF; AD's quantize_mxfp4_moe transform handles it.
+runtime: trtllm
+model_factory: AutoModelForCausalLM
+attn_backend: trtllm
+compile_backend: torch-cudagraph
+skip_loading_weights: false
+world_size: 4
+max_batch_size: 128
+max_seq_len: 4096
+max_num_tokens: 8192
+enable_chunked_prefill: true
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
