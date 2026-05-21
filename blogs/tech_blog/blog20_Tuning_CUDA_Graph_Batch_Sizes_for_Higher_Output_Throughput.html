@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc14';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc14" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -459,6 +459,9 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
@@ -549,7 +552,7 @@
                   
   <section class="tex2jax_ignore mathjax_ignore" id="tuning-cuda-graph-batch-sizes-for-higher-output-throughput">
 <h1>Tuning CUDA Graph Batch Sizes for Higher Output Throughput<a class="headerlink" href="#tuning-cuda-graph-batch-sizes-for-higher-output-throughput" title="Link to this heading">#</a></h1>
-<p>By NVIDIA TensorRT-LLM Team</p>
+<p>By NVIDIA TensorRT LLM Team</p>
 <p>CUDA graphs reduce per-step GPU launch overhead by pre-recording sequences of GPU operations and replaying them as a single unit. In TensorRT-LLM, CUDA graphs are captured for a fixed set of batch sizes; when CUDA graph padding is enabled, an incoming batch is padded to the next available captured size, wasting some compute on empty slots. The default configuration captures only 23 batch sizes using a roughly-doubling progression, leaving gaps of up to 1024 between consecutive sizes in the high-concurrency range. This post investigates the throughput impact of filling those gaps with finer-grained batch size sets, and characterizes the resulting GPU memory and server startup time overhead.</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
@@ -628,7 +631,7 @@
 <p>In aggregated mode, we measure the TPS improvement of the +64 config over the default x2 config across various concurrencies for each model. Improvements are concentrated in the concurrency range above 128, where the +64 config introduces intermediate sizes that reduce padding waste.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog20_aggr_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in aggregated mode across all four models" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_aggr_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in aggregated mode across all four models" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Relative output throughput improvement (%) of the +64 config over x2 in aggregated mode for all four models.</em></sub></p>
@@ -639,7 +642,7 @@
 <p>In disaggregated mode, we use 4 to 8 GPUs for the context server and 4 for the generation server, with EP for the MoE layers. We again test the four models under various concurrencies.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog20_disagg_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in disaggregated mode across all four models" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_disagg_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in disaggregated mode across all four models" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Relative output throughput improvement (%) of the +64 config over x2 in disaggregated mode for all four models. C8G4 denotes 8 context GPUs and 4 generation GPUs; C4G4 denotes 4 context and 4 generation GPUs.</em></sub></p>
@@ -698,7 +701,7 @@
 <h3>Throughput Results<a class="headerlink" href="#throughput-results" title="Link to this heading">#</a></h3>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog20_p8_all_models.png" alt="TPS vs. concurrency for all four models in disaggregated mode comparing +8, +64, default, and no-padding configurations" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_p8_all_models.png" alt="TPS vs. concurrency for all four models in disaggregated mode comparing +8, +64, default, and no-padding configurations" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. TPS vs. concurrency in disaggregated mode for all four models, comparing +8 (blue), +64 (red), default (yellow), and no-padding (green) configs.</em></sub></p>
@@ -929,9 +932,9 @@ DeepSeek-R1 and Qwen3-235B show some improvement with the +8 config over +64, wi
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 06, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/93cb651">93cb651</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       

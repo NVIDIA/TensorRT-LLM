@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -74,12 +74,12 @@
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
     <link rel="next" title="Optimizing MoE Communication with One-Sided AlltoAll Over NVLink" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html" />
-    <link rel="prev" title="Introduction to KV Cache Transmission" href="../../developer-guide/kv-transfer.html" />
+    <link rel="prev" title="Tuning CUDA Graph Batch Sizes for Higher Output Throughput" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12.post1" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -338,9 +338,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
@@ -459,6 +459,11 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -592,7 +597,7 @@
 <p>This leads to the key design question behind DWDP: can we remove collective synchronization and let each rank progress independently?</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_sync_overhead_in_dep.png" alt="Synchronization overhead caused by workload imbalance in DEP" width="600">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Synchronization overhead caused by workload imbalance in DEP for DeepSeek-R1 on GB200 with <code>ISL/OSL = 8K/1</code> and input ratio <code>0.8</code>.</em></sub></p>
@@ -608,7 +613,7 @@
 <p>DWDP also provides greater flexibility in expert placement. Because each rank only needs to fetch the weights for one layer before executing its MoE block, DWDP does not require the number of experts to be exactly divisible by the DWDP group size, and it does not require a perfectly disjoint expert partition across ranks. Instead, ranks can be configured with the same number of local experts while allowing redundant expert placement when necessary, for example to support group sizes that do not evenly divide the number of experts. This weaker placement constraint enables resource provisioning at single-rank granularity. When memory permits, the same redundancy can also reduce remote prefetch overhead by increasing the number of local experts on each rank.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_overview.png" alt="Overview of DWDP with DWDP group size 4" width="650">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Overview of DWDP with DWDP group size 4.</em></sub></p>
@@ -703,7 +708,7 @@ Accordingly, the marginal speedup of DWDP decreases as ISL grows further.</p>
 <h3>Runtime Flow<a class="headerlink" href="#runtime-flow" title="Link to this heading">#</a></h3>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_dwdp_runtime_flow.png" alt="DWDP runtime flow" width="700">
 </figure>
 </div>
 <p>In the current DWDP code path, the runtime flow can be summarized by the diagram above.</p>
@@ -762,7 +767,7 @@ Accordingly, the marginal speedup of DWDP decreases as ISL grows further.</p>
 <p>One mitigation is to split each remote-weight transfer into fixed-size slices and schedule those slices in a round-robin order across active destination ranks. This reduces random communication delay by time-multiplexing the source-side copy engine more evenly across competing pulls.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_async_comm_contention.png" alt="Nsight Systems trace showing many-to-one source-side communication contention in DWDP" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Nsight Systems trace showing many-to-one source-side communication contention in DWDP under a short compute-window setting.</em></sub></p>
@@ -849,7 +854,7 @@ Unless otherwise stated, the results in this section do not include the addition
 <p>The end-to-end study uses the SemiAnalysis dataset with ISL=<code class="docutils literal notranslate"><span class="pre">8K</span></code>, OSL=<code class="docutils literal notranslate"><span class="pre">1K</span></code>, and input ratio <code class="docutils literal notranslate"><span class="pre">0.8</span></code>. The generation server configuration is kept fixed, and DWDP is applied only to the context server. The comparison is made against Pareto points from the DEP baseline.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog19_e2e_pareto_frontier.png" alt="End-to-end Pareto frontier comparison between baseline and DWDP" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. End-to-end Pareto frontier comparison between baseline and DWDP.</em></sub></p>
@@ -1002,12 +1007,12 @@ python3<span class="w"> </span>examples/dwdp/reproduce.py<span class="w"> </span
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../../developer-guide/kv-transfer.html"
+       href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Introduction to KV Cache Transmission</p>
+        <p class="prev-next-title">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</p>
       </div>
     </a>
     <a class="right-next"
@@ -1171,9 +1176,9 @@ python3<span class="w"> </span>examples/dwdp/reproduce.py<span class="w"> </span
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 15, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       

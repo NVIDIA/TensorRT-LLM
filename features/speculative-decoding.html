@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12.post1" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -338,9 +338,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
@@ -459,6 +459,11 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -571,7 +576,7 @@
 <section id="eagle-3">
 <h3>EAGLE 3<a class="headerlink" href="#eagle-3" title="Link to this heading">#</a></h3>
 <p>The EAGLE 3 algorithm is described in the paper <a class="reference external" href="https://arxiv.org/pdf/2503.01840">EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test</a>.
-TRT-LLM supports a modified version of the algorithm presented in the paper: tree structures for draft sequences are not supported. Instead, each request uses a single sequence of draft tokens with length <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>.</p>
+By default, each request uses a single sequence (linear chain) of draft tokens with length <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>. Optionally, dynamic tree draft generation can be enabled to improve acceptance rates — see <a class="reference internal" href="#dynamic-tree-mode">Dynamic Tree Mode</a> below.</p>
 <p>The following draft model checkpoints can be used for EAGLE 3:</p>
 <ul class="simple">
 <li><p>Llama 3 variants: <a class="reference external" href="https://huggingface.co/yuhuili">use the checkpoints from the authors of the original EAGLE 3 paper</a>.</p></li>
@@ -591,6 +596,34 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 </pre></div>
 </div>
 <p>EAGLE 3 can be combined with the <a class="reference internal" href="#suffix-automaton-sa-enhancement">Suffix Automaton enhancement</a> for improved acceptance rates on repetitive content. See the SA section below for details.</p>
+<section id="dynamic-tree-mode">
+<h4>Dynamic Tree Mode<a class="headerlink" href="#dynamic-tree-mode" title="Link to this heading">#</a></h4>
+<p>Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.</p>
+<p>To enable dynamic tree mode, set <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code> on the <code class="docutils literal notranslate"><span class="pre">Eagle3DecodingConfig</span></code> and provide the following parameters:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">use_dynamic_tree</span></code> (<code class="docutils literal notranslate"><span class="pre">bool</span></code>): Enables dynamic tree draft generation. Mutually exclusive with <code class="docutils literal notranslate"><span class="pre">eagle_choices</span></code> (static tree).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">dynamic_tree_max_topK</span></code> (<code class="docutils literal notranslate"><span class="pre">int</span></code>): Maximum number of tokens to expand per node at each draft layer.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_total_draft_tokens</span></code> (<code class="docutils literal notranslate"><span class="pre">int</span></code>, optional): Total draft token budget for the tree. Must satisfy <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">&lt;=</span> <span class="pre">max_total_draft_tokens</span> <span class="pre">&lt;=</span> <span class="pre">dynamic_tree_max_topK</span> <span class="pre">*</span> <span class="pre">max_draft_len</span></code>. Defaults to <code class="docutils literal notranslate"><span class="pre">dynamic_tree_max_topK</span> <span class="pre">*</span> <span class="pre">max_draft_len</span></code> if not set.</p></li>
+</ul>
+<p>When <code class="docutils literal notranslate"><span class="pre">use_dynamic_tree=True</span></code>, the dynamic tree CUDA buffers are pre-allocated based on the <code class="docutils literal notranslate"><span class="pre">LLM</span></code>’s <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, which is propagated internally and must not be passed directly to <code class="docutils literal notranslate"><span class="pre">Eagle3DecodingConfig</span></code>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">Eagle3DecodingConfig</span>
+
+<span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span>
+    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">6</span><span class="p">,</span>
+    <span class="n">speculative_model</span><span class="o">=</span><span class="s2">&quot;yuhuili/EAGLE3-LLaMA3.1-Instruct-8B&quot;</span><span class="p">,</span>
+    <span class="n">use_dynamic_tree</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">dynamic_tree_max_topK</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
+    <span class="n">max_total_draft_tokens</span><span class="o">=</span><span class="mi">60</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/target_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Dynamic tree mode is currently <strong>not supported</strong> for models that use sliding window attention or MLA (Multi-Latent Attention), such as DeepSeek and gpt-oss models.</p>
+</div>
+</section>
 </section>
 <section id="ngram">
 <h3>NGram<a class="headerlink" href="#ngram" title="Link to this heading">#</a></h3>
@@ -624,8 +657,7 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 </ul>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">MTPDecodingConfig</span>
 
-<span class="n">speculative_config</span> <span class="o">=</span> <span class="n">MTPDecodingConfig</span><span class="p">(</span>
-    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">num_nextn_predict_layers</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<span class="n">speculative_config</span> <span class="o">=</span> <span class="n">MTPDecodingConfig</span><span class="p">(</span><span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
 
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/deepseek_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
 </pre></div>
@@ -650,6 +682,25 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 </pre></div>
 </div>
 <p>PARD can be combined with the <a class="reference internal" href="#suffix-automaton-sa-enhancement">Suffix Automaton enhancement</a> for improved acceptance rates on repetitive content. See the SA section below for details.</p>
+</section>
+<section id="dflash">
+<h3>DFlash<a class="headerlink" href="#dflash" title="Link to this heading">#</a></h3>
+<p>DFlash is a target-dependent speculative decoding method that uses hidden states from specific target model layers as cross-attention context in the draft model to predict multiple draft tokens in parallel.</p>
+<p>Reference: <a class="reference external" href="https://arxiv.org/pdf/2602.06036">DFlash: Distilled Flash Speculative Decoding</a></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>: Maximum draft candidate length.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">speculative_model</span></code>: Path or HuggingFace model ID for the DFlash draft model.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mask_token_id</span></code>: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">target_layer_ids</span></code>: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.</p></li>
+</ul>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">DFlashDecodingConfig</span>
+
+<span class="n">speculative_config</span> <span class="o">=</span> <span class="n">DFlashDecodingConfig</span><span class="p">(</span>
+    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">speculative_model</span><span class="o">=</span><span class="s2">&quot;/path/to/dflash_model&quot;</span><span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/target_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
+</pre></div>
+</div>
 </section>
 <section id="user-provided-drafting">
 <h3>User-provided drafting<a class="headerlink" href="#user-provided-drafting" title="Link to this heading">#</a></h3>
@@ -713,6 +764,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li><p><code class="docutils literal notranslate"><span class="pre">NGram</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">DraftTarget</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">PARD</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">DFlash</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">SA</span></code></p></li>
 </ul>
 <blockquote>
@@ -731,6 +783,17 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle3</span>
 <span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
 <span class="w">  </span><span class="nt">speculative_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/draft/model</span>
+</pre></div>
+</div>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># Dynamic tree mode</span>
+<span class="nt">speculative_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle3</span>
+<span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">6</span>
+<span class="w">  </span><span class="nt">speculative_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/eagle3_model</span>
+<span class="w">  </span><span class="nt">use_dynamic_tree</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">dynamic_tree_max_topK</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span>
+<span class="w">  </span><span class="nt">max_total_draft_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">60</span>
+<span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
 </pre></div>
 </div>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># SA combination: enable Suffix Automaton enhancement with any supported technique</span>
@@ -806,10 +869,14 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick Start</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-target">Draft/Target</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#eagle-3">EAGLE 3</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#eagle-3">EAGLE 3</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dynamic-tree-mode">Dynamic Tree Mode</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ngram">NGram</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp">MTP</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#pard">PARD</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dflash">DFlash</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#user-provided-drafting">User-provided drafting</a></li>
 </ul>
 </li>
@@ -906,9 +973,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 15, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       

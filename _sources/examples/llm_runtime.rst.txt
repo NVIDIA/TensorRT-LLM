@@ -1,6 +1,6 @@
 Runtime Configuration Examples
 ==============================
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/11e16cd71e5898aae29798a0bfeb86109e796cea/examples/llm-api/llm_runtime.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/c72d43d8968211635e1eca2aff88ebb080cd3b3e/examples/llm-api/llm_runtime.py.
 
 .. literalinclude:: ../../../examples/llm-api/llm_runtime.py
     :lines: 4-144

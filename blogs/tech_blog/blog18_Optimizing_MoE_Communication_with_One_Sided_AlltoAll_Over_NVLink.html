@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12.post1" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -338,9 +338,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
@@ -459,6 +459,11 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -560,24 +565,28 @@
 <ul>
 <li><p><a class="reference internal" href="#nvlink-symmetric-memory">NVLink Symmetric Memory</a></p></li>
 <li><p><a class="reference internal" href="#one-sided-communication">One-Sided Communication</a></p></li>
-<li><p><a class="reference internal" href="#token-major-data-layout">Token-Major Data Layout</a></p></li>
+<li><p><a class="reference internal" href="#rank-major-buffer-layout">Rank-Major Buffer Layout</a></p></li>
+<li><p><a class="reference internal" href="#interface-between-communication-and-moe">Interface Between Communication and MoE</a></p></li>
 <li><p><a class="reference internal" href="#quantization-agnostic-communication">Quantization-Agnostic Communication</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#implementation-details">Implementation Details</a></p>
 <ul>
-<li><p><a class="reference internal" href="#interface-between-communication-and-moe">Interface Between Communication and MoE</a></p></li>
-<li><p><a class="reference internal" href="#dispatch-put-and-combine-get">Dispatch Put and Combine Get</a></p></li>
+<li><p><a class="reference internal" href="#dispatch-kernel">Dispatch Kernel</a></p></li>
+<li><p><a class="reference internal" href="#combine-kernel">Combine Kernel</a></p></li>
 <li><p><a class="reference internal" href="#synchronization">Synchronization</a></p></li>
 <li><p><a class="reference internal" href="#saturating-nvlink-bandwidth">Saturating NVLink Bandwidth</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#performance-benchmark">Performance Benchmark</a></p>
 <ul>
+<li><p><a class="reference internal" href="#methodology">Methodology</a></p></li>
+<li><p><a class="reference internal" href="#scaling-with-batch-size-and-ep-size">Scaling With Batch Size and EP Size</a></p></li>
+<li><p><a class="reference internal" href="#post-quant-dispatch">Post-Quant Dispatch</a></p></li>
 <li><p><a class="reference internal" href="#reproduction">Reproduction</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#future-work-and-conclusion">Future Work And Conclusion</a></p></li>
+<li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
 </ul>
 </li>
 </ul>
@@ -591,54 +600,49 @@
 </section>
 <section id="design-overview">
 <h2>Design Overview<a class="headerlink" href="#design-overview" title="Link to this heading">#</a></h2>
-<p>NVLinkOneSided AlltoAll is built around three key design ideas: a shared memory substrate for direct GPU-to-GPU access, a one-sided communication model that eliminates intermediate copies, and a token-major data layout that enables deduplication. We discuss each in turn.</p>
+<p>NVLinkOneSided AlltoAll rests on three design ideas:</p>
+<ul class="simple">
+<li><p><strong>One-sided data movement</strong> — each kernel only reads OR only writes peer memory, eliminating cooperative send/recv and the extra copies it implies.</p></li>
+<li><p><strong>Rank-major recv buffer</strong> — slots are indexed by source rank with no <code class="docutils literal notranslate"><span class="pre">top_k</span></code> duplication, shrinking buffer size and saving redundant communication.</p></li>
+<li><p><strong>Flexible interface</strong> — quantization-agnostic data path, with a small API that exposes the recv buffer directly to the MoE module.</p></li>
+</ul>
+<p>The remainder of this section walks through the NVLink symmetric memory substrate that the kernels are built on, then each of the three ideas in turn.</p>
 <section id="nvlink-symmetric-memory">
 <h3>NVLink Symmetric Memory<a class="headerlink" href="#nvlink-symmetric-memory" title="Link to this heading">#</a></h3>
-<p>Communication across GPUs is enabled by CUDA’s Virtual Memory Management (VMM) APIs. Each GPU allocates a piece of physical memory and exports a shareable handle for its allocation. These handles are then exchanged across all participating GPUs, allowing each GPU to import the remote handles and map the remote memory into its own virtual address space. The result is a <strong>symmetric memory workspace</strong>: any GPU can read from or write to any other GPU’s portion of this workspace via NVLink using standard instructions in kernels, as if they were normal global memory pointers. This works within a single NVLink domain — 8 GPUs on a DGX B200, or all 72 GPUs on a GB200 NVL72 rack.</p>
+<p>Communication across GPUs is enabled by CUDA’s Virtual Memory Management (VMM) APIs. Each GPU allocates a piece of physical memory and exports a shareable handle for its allocation. These handles are then exchanged across all participating GPUs, allowing each GPU to import the remote handles and map the remote memory into its own virtual address space. The result is <strong>symmetric memory</strong>: any GPU can read from or write to any other GPU’s portion of it via NVLink using standard instructions in kernels, as if they were normal global memory pointers. This works within a single NVLink domain — 8 GPUs on a DGX B200, or all 72 GPUs on a GB200 NVL72 rack.</p>
 <p align="center"><img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_symmetric_memory.png" alt="Symmetric memory across GPUs" width="600"/></p>
 <p align="center"><em>Symmetric memory registration across GPUs. (Image courtesy: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 Blog</a>)</em></p>
 </section>
 <section id="one-sided-communication">
 <h3>One-Sided Communication<a class="headerlink" href="#one-sided-communication" title="Link to this heading">#</a></h3>
-<p>Typically, collective communication employs a <strong>two-sided</strong> model: each rank acts as both sender and receiver. The sender loads data from local memory and stores it into a FIFO buffer in the receiver’s local memory. The receiver then loads the data from the FIFO and stores it into its local output buffer. This has two shortcomings:</p>
+<p>NVLinkOneSided eliminates the send/recv pairing typical of collective communication.</p>
+<p><strong>Two-sided communication</strong> uses a send/recv model: the sender and receiver must cooperate. With direct NVLink put, the sender writes into the target rank’s symmetric memory, but the receiver still has to perform an <strong>additional data movement</strong> before the data lands in its final recv buffer. Common reasons for this extra step include:</p>
 <ul class="simple">
-<li><p><strong>Extra data movement.</strong> The receiver performs additional data movement after the data has already arrived over NVLink and resides in the target GPU’s memory.</p></li>
-<li><p><strong>Data dependency.</strong> The receiver’s work depends on the arrival of the sender’s data. For example, the FIFO has a fixed capacity, so the sender (producer) or receiver (consumer) may block when the FIFO is full or empty.</p></li>
+<li><p><strong>Layout reconciliation.</strong> The data lands in symmetric memory in an intermediate layout; the receiver re-permutes or repacks it into the final layout the downstream kernel expects.</p></li>
+<li><p><strong>FIFO drain.</strong> Symmetric memory may be too small to hold the entire recv buffer, so it is used as a fixed-capacity FIFO; the receiver continuously drains it into local memory.</p></li>
 </ul>
-<p><strong>NVLinkOneSided</strong> eliminates both issues by simplifying the communication model:</p>
-<ul class="simple">
-<li><p>The <strong>dispatch</strong> kernel only <em>puts</em>: it loads token data from local memory and writes it directly into the target rank’s workspace.</p></li>
-<li><p>The <strong>combine</strong> kernel only <em>gets</em>: it reads data from source ranks’ workspaces, reduces, and writes to local memory.</p></li>
-</ul>
-<p>The workspace itself serves as the recv buffer — no intermediate FIFO, no extra copy on the receiver side. The dispatch OP returns <strong>tensor views</strong> directly into the workspace rather than allocating new tensors, so the MoE module could directly take the data on the workspace as input. Each direction of communication involves one less data movement step compared to two-sided.</p>
+<p><strong>One-sided communication</strong> drops the cooperation entirely. Symmetric memory <strong>is</strong> the recv buffer, and the dispatch op returns <strong>tensor views</strong> directly into symmetric memory rather than allocating new tensors, so the MoE module consumes the dispatched data in place. In this way, extra local data movement on the receiver side is eliminated.</p>
 <p align="center">
 <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_one_sided_vs_two_sided.png" alt="One-sided vs two-sided communication" width="700"/>
 </p>
 </section>
-<section id="token-major-data-layout">
-<h3>Token-Major Data Layout<a class="headerlink" href="#token-major-data-layout" title="Link to this heading">#</a></h3>
-<p>Some AlltoAll implementations (e.g., <a class="reference external" href="https://github.com/deepseek-ai/DeepEP">DeepEP Low Latency</a>) use an <strong>expert-major layout</strong>: the recv buffer is shaped as <code class="docutils literal notranslate"><span class="pre">[num_experts_per_rank,</span> <span class="pre">max_num_tokens,</span> <span class="pre">...]</span></code>, so that each expert gets its assigned tokens. If a token routes to multiple experts on the same rank, it is sent and stored multiple times — once per expert. Note that <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span> <span class="pre">=</span> <span class="pre">ep_size</span> <span class="pre">*</span> <span class="pre">max_tokens_per_rank</span></code>, which is enough for accommodating tokens from all the ranks.</p>
-<p>NVLinkOneSided uses a <strong>token-major layout</strong>: the recv buffer is shaped as <code class="docutils literal notranslate"><span class="pre">[max_num_tokens,</span> <span class="pre">...]</span></code>, indexed by source rank. The transformation from token-major to expert-major layout is known as expert <strong>permutation</strong>. By directly employing token-major layout, the recv buffer size is shrunk by <code class="docutils literal notranslate"><span class="pre">num_experts_per_rank</span></code>. When a token routes to multiple experts on the same rank, the token data is <strong>sent only once</strong>. This deduplication reduces communication volume, which is especially beneficial when <code class="docutils literal notranslate"><span class="pre">top_k</span></code> is large, e.g., if <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">&gt;</span> <span class="pre">ep_size</span></code> then duplication is guaranteed to occur. The figure below shows the permutation from token-major to expert-major layout for 6 tokens routed to 4 experts with <code class="docutils literal notranslate"><span class="pre">top_k=2</span></code>. NVLinkOneSided requires only <code class="docutils literal notranslate"><span class="pre">1/num_experts_per_rank</span></code> of the pre-allocated recv buffer compared to expert-major implementations like DeepEP Low Latency.</p>
+<section id="rank-major-buffer-layout">
+<h3>Rank-Major Buffer Layout<a class="headerlink" href="#rank-major-buffer-layout" title="Link to this heading">#</a></h3>
+<p>NVLinkOneSided uses a <strong>rank-major</strong> recv buffer: a tensor of shape <code class="docutils literal notranslate"><span class="pre">[ep_size,</span> <span class="pre">max_tokens_per_rank,</span> <span class="pre">...]</span></code> split by source rank, where each rank’s slice holds the tokens that source sent to this rank. Each token is sent <strong>at most once per (src → tgt) pair</strong> — even if multiple of its <code class="docutils literal notranslate"><span class="pre">top_k</span></code> experts land on the same target rank — so within a slice, no token appears more than once. Some slots may be empty after dispatch, depending on routing.</p>
+<p>The figure below contrasts this layout against the <strong>expert-major</strong> layout used by some other implementations (e.g. <a class="reference external" href="https://github.com/deepseek-ai/DeepEP">DeepEP Low Latency</a>) on a small example: <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">=</span> <span class="pre">2</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">2</span></code>, 3 tokens per rank, 2 experts per rank. T2 is routed to one expert on each rank, so the rank-major recv buffer (left) holds it once, while the expert-major recv buffer (right) duplicates it across both expert sub-rows.</p>
 <p align="center">
-<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_token_major_vs_expert_major.png" alt="Token-major vs expert-major layout" width="700"/>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_rank_major_vs_expert_major.png" alt="Rank-major vs expert-major recv buffer layout" width="700"/>
 </p>
-<p>The MoE module directly consumes the token-major recv buffer, and it is up to the MoE module to decide whether expert permutation is needed for GroupGEMM. For example, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py">trtllm-gen MoE</a> can efficiently operate on token-major input without additional permutation.</p>
-</section>
-<section id="quantization-agnostic-communication">
-<h3>Quantization-Agnostic Communication<a class="headerlink" href="#quantization-agnostic-communication" title="Link to this heading">#</a></h3>
-<p>NVLinkOneSided is <strong>quantization-agnostic</strong>. It does not perform any quantization internally — instead, the quantization happens <em>before</em> dispatch (post-quant dispatch). This design has two advantages:</p>
+<p>Rank-major layout has two advantages:</p>
 <ul class="simple">
-<li><p><strong>Flexibility.</strong> Any quantization recipe works — FP8 block scales, NVFP4, or no quantization at all. The AlltoAll kernel does not need to change when the quantization format changes.</p></li>
-<li><p><strong>Bandwidth savings.</strong> Communicating quantized data (e.g., NVFP4 reduces data to ~28% of BF16) directly reduces the bytes transferred over NVLink, unlike implementations that must communicate in BF16 and quantize afterward.</p></li>
+<li><p><strong>Smaller buffer.</strong> The pre-allocated recv buffer is <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">/</span> <span class="pre">num_experts_per_rank</span></code> of an expert-major buffer.</p></li>
+<li><p><strong>Save duplicated communication.</strong> When <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">&gt;</span> <span class="pre">ep_size</span></code> it is impossible to avoid duplication in an expert-major layout.</p></li>
 </ul>
-<p>Note that pre-dispatch quantization is naturally aligned with the model’s quantization recipe — the activations need to be quantized anyway before the MoE GEMMs. Pre-combine quantization, on the other hand, would be an additional step that alters the model’s numerical output. For this reason, combine currently communicates in BF16. Optionally, FP8 static per-tensor quantization can be applied before combine — this is fast and introduces minimal accuracy impact.</p>
+<p>The MoE module consumes the rank-major recv buffer directly, and it is up to the MoE module to decide whether explicit expert permutation is needed for GroupGEMM. For example, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py">trtllm-gen MoE</a> can efficiently load tokens from the raw rank-major buffer without additional permutation.</p>
 </section>
-</section>
-<section id="implementation-details">
-<h2>Implementation Details<a class="headerlink" href="#implementation-details" title="Link to this heading">#</a></h2>
 <section id="interface-between-communication-and-moe">
 <h3>Interface Between Communication and MoE<a class="headerlink" href="#interface-between-communication-and-moe" title="Link to this heading">#</a></h3>
-<p>In TensorRT LLM, the MoE module takes 4 payloads as input. The dispatch kernel communicates all of them to target ranks at once; the combine kernel performs the reverse — gathering results back and reducing them with router weights:</p>
+<p>Dispatch feeds the MoE module; combine collects its outputs. In TensorRT LLM, the MoE module takes 4 payloads as input. The dispatch kernel communicates all of them to target ranks at once; the combine kernel performs the reverse — gathering results back and reducing them with router weights:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Dispatch: scatter local tokens to all ranks</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">dispatch</span><span class="p">(</span>
     <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>          <span class="c1"># [local_num_tokens, hidden_size]</span>
@@ -651,10 +655,10 @@
 </pre></div>
 </div>
 <p>Here <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code> is the (possibly quantized) activation tensor with <code class="docutils literal notranslate"><span class="pre">hidden_size</span></code> elements per token (or packed elements for certain quantization schemes — e.g., FP4 packs two elements per byte). <code class="docutils literal notranslate"><span class="pre">hidden_states_sf</span></code> carries the optional blockwise quantization scales. <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code> contains the <code class="docutils literal notranslate"><span class="pre">top_k</span></code> routed expert ids per token, and <code class="docutils literal notranslate"><span class="pre">token_final_scales</span></code> holds the corresponding router weights.</p>
-<p>The recv buffer is pre-allocated with <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">*</span> <span class="pre">max_tokens_per_rank</span></code> slots to accommodate the maximum number of tokens from all ranks, as described in <a class="reference internal" href="#token-major-data-layout">Token-Major Data Layout</a>. The MoE module then performs GroupGEMM on the received payloads. Two points are worth noting:</p>
+<p>The dispatch outputs are <strong>tensor views</strong> into symmetric memory — no allocation, no copy. The recv buffer is pre-allocated with <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">*</span> <span class="pre">max_tokens_per_rank</span></code> slots to accommodate the maximum number of tokens from all ranks, as described in <a class="reference internal" href="#rank-major-buffer-layout">Rank-Major Buffer Layout</a>. The MoE module then performs GroupGEMM on the received payloads. Two points are worth noting:</p>
 <ul class="simple">
 <li><p>The MoE module only computes the experts on the local rank. For example, if a token’s <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code> is <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1,</span> <span class="pre">4,</span> <span class="pre">7]</span></code> and only experts <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1,</span> <span class="pre">2,</span> <span class="pre">3]</span></code> reside locally, the MoE output for that token is the weighted sum of experts <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1]</span></code> only.</p></li>
-<li><p>Some slots are empty after dispatch. The dispatch kernel sets <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code> of empty slots to an invalid expert id (<code class="docutils literal notranslate"><span class="pre">-1</span></code>), so the MoE module knows to skip them.</p></li>
+<li><p>Some slots are empty after dispatch. The dispatch kernel sets <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code> of empty slots to an invalid expert id (<code class="docutils literal notranslate"><span class="pre">-1</span></code>), so the MoE module knows to skip them. (For instance, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py">trtllm-gen MoE</a> consumes the raw-token recv buffer directly without re-permutation.)</p></li>
 </ul>
 <p>The MoE module writes its output for each token to the same slot in the recv buffer. To obtain the final result, each rank combines the partial results from peer ranks.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Combine: gather results back to local tokens</span>
@@ -666,26 +670,56 @@
 </pre></div>
 </div>
 </section>
-<section id="dispatch-put-and-combine-get">
-<h3>Dispatch Put and Combine Get<a class="headerlink" href="#dispatch-put-and-combine-get" title="Link to this heading">#</a></h3>
-<p>The dispatch and combine kernels have complementary data movement patterns.</p>
-<p><strong>Dispatch (put).</strong> For each payload tensor, the recv buffer on each rank has shape <code class="docutils literal notranslate"><span class="pre">[ep_size,</span> <span class="pre">max_num_tokens,</span> <span class="pre">...]</span></code>. The split <code class="docutils literal notranslate"><span class="pre">[src_rank,</span> <span class="pre">:,</span> <span class="pre">:]</span></code> stores data received from <code class="docutils literal notranslate"><span class="pre">src_rank</span></code>, so different source ranks never race when writing to the same peer. Each CTA handles one token. For each of the <code class="docutils literal notranslate"><span class="pre">top_k</span></code> routed experts, the kernel computes <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> (the rank owning that expert, derived from <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code>) and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> (the slot index within the <code class="docutils literal notranslate"><span class="pre">src_rank</span></code> split). To obtain a unique <code class="docutils literal notranslate"><span class="pre">target_indices</span></code>, the kernel maintains atomic counters <code class="docutils literal notranslate"><span class="pre">send_counters[ep_size]</span></code> that track how many tokens have been sent from the local rank to each target rank — an atomic increment yields the next available slot. In this way, the unique slot assignment can be accomplished while the rank does not need to know how are the tokens on other ranks are routed.</p>
-<p>If multiple of a token’s <code class="docutils literal notranslate"><span class="pre">top_k</span></code> experts map to the same rank, only the first gets a valid entry; duplicates are assigned <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> of <code class="docutils literal notranslate"><span class="pre">-1</span></code>. For each payload, the kernel loads the token data from local memory once and stores it to up to <code class="docutils literal notranslate"><span class="pre">top_k</span></code> remote workspaces — one per unique target rank.</p>
-<p><strong>Combine (get).</strong> Each CTA handles one token in the reverse direction. The combine kernel reuses the <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> recorded during dispatch to read from the exact same workspace slots. For each payload element, it loads from up to <code class="docutils literal notranslate"><span class="pre">top_k</span></code> remote workspaces into registers, performs a weighted reduction, and stores the result to local memory once. The reduction uses a pairwise tree pattern rather than sequential accumulation, keeping the dependency chain shallow.
-The MoE module can write its output directly into the symmetric memory workspace, so that the combine kernel can read peer ranks’ MoE output without an intermediate copy. This <strong>zero-copy</strong> path avoids a staging copy before the combine kernel starts; it requires small modifications to the MoE ops to accept a provided output buffer instead of allocating their own in PyTorch.</p>
-<p>The following diagram illustrates the complete dispatch → MoE → combine flow with <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">=</span> <span class="pre">2</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">2</span></code> and <code class="docutils literal notranslate"><span class="pre">batch_size</span> <span class="pre">=</span> <span class="pre">3</span></code>. Dispatch computes <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> to put tokens into the correct slots in the recv buffer; combine reuses the same routing to get results back. Dashed arrows indicate deduplicated entries in the dispatch phase.</p>
+<section id="quantization-agnostic-communication">
+<h3>Quantization-Agnostic Communication<a class="headerlink" href="#quantization-agnostic-communication" title="Link to this heading">#</a></h3>
+<p>NVLinkOneSided is <strong>quantization-agnostic</strong>. The AlltoAll kernel transports opaque bytes — quantization happens <em>before</em> dispatch (post-quant dispatch), and any recipe (FP8 block scales, MXFP8, NVFP4, BF16, …) plugs into the same code path. This has two consequences:</p>
+<ul class="simple">
+<li><p><strong>Flexibility.</strong> The kernel does not need to change when the quantization format changes; the model’s recipe drives the dispatch payload size directly.</p></li>
+<li><p><strong>Bandwidth savings.</strong> Communicating quantized data (e.g., NVFP4 reduces dispatch payload to ~28% of BF16) directly reduces the bytes transferred over NVLink, unlike implementations that must communicate in BF16 and quantize afterward.</p></li>
+</ul>
+<p>Pre-dispatch quantization is naturally aligned with the model’s quantization recipe — the activations need to be quantized anyway before the MoE GEMMs. The combine path, by contrast, communicates in BF16 by default to match the kernel’s reduction behavior; pre-combine quantization would alter the model’s numerical output. Additionally, an optional <strong>low-precision combine</strong> path is available: the sender quantizes to FP8 before pushing into combine and the receiver dequantizes after pull, recovering most of the bandwidth saving with a small numerical impact from the round-trip quantization.</p>
+</section>
+</section>
+<section id="implementation-details">
+<h2>Implementation Details<a class="headerlink" href="#implementation-details" title="Link to this heading">#</a></h2>
+<section id="dispatch-kernel">
+<h3>Dispatch Kernel<a class="headerlink" href="#dispatch-kernel" title="Link to this heading">#</a></h3>
+<p>The dispatch kernel <strong>pushes</strong> tokens from local memory into the target rank’s symmetric memory. For each payload tensor, the recv buffer on each rank has shape <code class="docutils literal notranslate"><span class="pre">[ep_size,</span> <span class="pre">max_tokens_per_rank,</span> <span class="pre">...]</span></code>. The slice <code class="docutils literal notranslate"><span class="pre">[src_rank,</span> <span class="pre">:,</span> <span class="pre">:]</span></code> stores data received from <code class="docutils literal notranslate"><span class="pre">src_rank</span></code>, so different source ranks never race when writing to the same peer.</p>
+<p>Each CTA handles one token. For each of the <code class="docutils literal notranslate"><span class="pre">top_k</span></code> routed experts, the kernel computes:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">target_rank</span></code> — the rank owning that expert, derived from <code class="docutils literal notranslate"><span class="pre">token_selected_experts</span></code>;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">target_index</span></code> — the slot index within the <code class="docutils literal notranslate"><span class="pre">src_rank</span></code> slice of the destination’s recv buffer.</p></li>
+</ul>
+<p>To obtain a unique <code class="docutils literal notranslate"><span class="pre">target_index</span></code>, the kernel maintains atomic counters <code class="docutils literal notranslate"><span class="pre">send_counters[ep_size]</span></code> that track how many tokens have been sent from the local rank to each target rank — an atomic increment yields the next available slot. The slot assignment is local (decided by the sender’s atomic state) and does not require knowing how tokens on other ranks are routed.</p>
+<p>If multiple of a token’s <code class="docutils literal notranslate"><span class="pre">top_k</span></code> experts map to the same rank, only the first gets a valid entry; duplicates are assigned <code class="docutils literal notranslate"><span class="pre">(target_rank,</span> <span class="pre">target_index)</span> <span class="pre">=</span> <span class="pre">(-1,</span> <span class="pre">-1)</span></code> and the kernel skips transmission for those entries. For each payload, the kernel loads the token data from local memory once and stores it to up to <code class="docutils literal notranslate"><span class="pre">top_k</span></code> peers’ symmetric memory — one per unique target rank.</p>
+</section>
+<section id="combine-kernel">
+<h3>Combine Kernel<a class="headerlink" href="#combine-kernel" title="Link to this heading">#</a></h3>
+<p>The combine kernel <strong>pulls</strong> MoE outputs from peers’ symmetric memory in the reverse direction. Each CTA handles one (reduced) token. The combine kernel reuses the <code class="docutils literal notranslate"><span class="pre">(target_rank,</span> <span class="pre">target_index)</span></code> pairs recorded during dispatch to read from the exact same slots — no routing computation is repeated. For each payload element, it loads from up to <code class="docutils literal notranslate"><span class="pre">top_k</span></code> peers’ symmetric memory into registers, performs the reduction, and stores the result to local memory once. The reduction uses a pairwise tree pattern rather than sequential accumulation, keeping the dependency chain shallow.</p>
+<p>The MoE module writes its output directly into symmetric memory, so that the combine kernel can read peer ranks’ MoE output without an intermediate copy. This <strong>zero-copy</strong> path avoids a staging copy before the combine kernel starts; it requires small modifications to the MoE ops to accept a provided output buffer instead of allocating their own in PyTorch.</p>
+<p>The diagram below illustrates the complete dispatch → MoE → combine flow with <code class="docutils literal notranslate"><span class="pre">ep_size</span> <span class="pre">=</span> <span class="pre">2</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">2</span></code>, and <code class="docutils literal notranslate"><span class="pre">batch_size</span> <span class="pre">=</span> <span class="pre">3</span></code>. Dispatch computes <code class="docutils literal notranslate"><span class="pre">target_ranks</span></code> and <code class="docutils literal notranslate"><span class="pre">target_indices</span></code> to push tokens into the correct slots in the recv buffer; combine reuses the same routing to pull results back. Dashed arrows indicate deduplicated entries in the dispatch phase.</p>
 <p align="center">
 <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_dispatch_moe_combine.png" alt="Dispatch, MoE, and combine data flow with index calculation and deduplication" width="900"/>
 </p>
 </section>
 <section id="synchronization">
 <h3>Synchronization<a class="headerlink" href="#synchronization" title="Link to this heading">#</a></h3>
-<p>One-sided communication requires explicit synchronization at two points:</p>
-<p><strong>End of dispatch.</strong> Before the MoE module can consume the dispatched data, all source ranks must have finished writing to the workspace.
-<strong>Beginning of combine.</strong> Before getting data from peer workspaces, the MoE module on each rank must have finished writing its output.</p>
-<p>We implement <strong>flag-based synchronization</strong>. Each dispatch-combine round increments a monotonically increasing epoch counter, so flags never need to be reset between rounds — a rank simply waits until the polled value equals the current epoch.</p>
-<p>At the <strong>end of dispatch</strong>, the kernel issues a release fence to ensure all preceding stores (token data written to peer workspaces) are globally visible, then writes the epoch value to every peer’s flag entry. It then spin-polls its own flag entries until all peers have signaled completion — at that point, every rank has finished writing and the MoE module can safely consume the dispatched data.</p>
-<p>A similar barrier is used at the <strong>start of combine</strong>: each rank signals readiness and polls until every peer has done the same. An acquire fence follows the polling loop to ensure that subsequent loads (reading MoE output from peer workspaces) observe the data written before each peer’s release fence.</p>
+<p>One-sided communication requires two producer-consumer barriers, scoped to the operations they belong to:</p>
+<ul class="simple">
+<li><p><strong>Tail of dispatch.</strong> Before the MoE module can consume the dispatched data, all source ranks must have finished writing to symmetric memory.</p></li>
+<li><p><strong>Head of combine.</strong> Before pulling MoE outputs from peer symmetric memory, every rank’s MoE module must have finished writing its output.</p></li>
+</ul>
+<p>Both barriers share a common write+poll structure built on <strong>flag-based synchronization</strong>. Each rank holds an array of <code class="docutils literal notranslate"><span class="pre">ep_size</span></code> flag slots in its symmetric memory and a monotonically increasing epoch counter. To enter a barrier:</p>
+<ol class="arabic simple">
+<li><p>Each rank writes its current epoch into every peer’s flag slot for itself.</p></li>
+<li><p>Each rank polls its own local flag slots until all <code class="docutils literal notranslate"><span class="pre">ep_size</span></code> peers have written the current epoch.</p></li>
+</ol>
+<p>The two barriers differ only in their <strong>memory-fence semantics</strong>:</p>
+<ul class="simple">
+<li><p>The <strong>dispatch barrier</strong> issues a <em>release</em> membar BEFORE writing the flags, ensuring that all preceding peer-bound stores (token data written into peer symmetric memory) are globally visible by the time the flag store lands.</p></li>
+<li><p>The <strong>combine barrier</strong> issues an <em>acquire</em> membar AFTER the polling loop completes, ensuring that subsequent loads (reading MoE output from peer symmetric memory) observe the data written before each peer’s release membar.</p></li>
+</ul>
+<p>Together the release/acquire pair gives the producer-consumer ordering required between dispatch writes and MoE reads (and, symmetrically, between MoE writes and combine reads).</p>
 </section>
 <section id="saturating-nvlink-bandwidth">
 <h3>Saturating NVLink Bandwidth<a class="headerlink" href="#saturating-nvlink-bandwidth" title="Link to this heading">#</a></h3>
@@ -693,18 +727,24 @@ The MoE module can write its output directly into the symmetric memory workspace
 <ul class="simple">
 <li><p><strong>Vectorized load/store.</strong> The kernel uses the widest vector type (up to 128-bit) allowed by the payload data’s alignment.</p></li>
 <li><p><strong>Dispatch:</strong> Load from local memory once, store to remote memory <code class="docutils literal notranslate"><span class="pre">top_k</span></code> times. The <code class="docutils literal notranslate"><span class="pre">top_k</span></code> loop is unrolled via template instantiation.</p></li>
-<li><p><strong>Combine:</strong> load from <code class="docutils literal notranslate"><span class="pre">top_k</span></code> remote workspaces (unrolled, kept in registers), reduce pairwise in a tree fashion rather than sequentially, and store to local memory once.</p></li>
+<li><p><strong>Combine:</strong> load from <code class="docutils literal notranslate"><span class="pre">top_k</span></code> peers’ symmetric memory (unrolled, kept in registers), reduce pairwise in a tree fashion rather than sequentially, and store to local memory once.</p></li>
 </ul>
 </section>
 </section>
 <section id="performance-benchmark">
 <h2>Performance Benchmark<a class="headerlink" href="#performance-benchmark" title="Link to this heading">#</a></h2>
-<p>We benchmark the dispatch+combine communication kernels on <strong>GB200 NVL72</strong> using the DeepSeek-V3 model profile: <code class="docutils literal notranslate"><span class="pre">hidden_size=7168</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k=8</span></code>, 256 total experts, FP8 blockwise quantization.</p>
-<p>The tables below report the dispatch and combine kernel latency (µs) and achieved NVLink bandwidth (GB/s) for <strong>NVLinkOneSided</strong> across varying EP sizes and batch sizes. The achieved bandwidth is computed as:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>bandwidth = batch_size × min(ep_size, top_k) × bytes_per_token / latency
+<p>We benchmark the dispatch+combine communication kernels on <strong>GB200 NVL72</strong> using the DeepSeek-V3 model profile: <code class="docutils literal notranslate"><span class="pre">hidden_size=7168</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k=8</span></code>, 256 total experts.</p>
+<section id="methodology">
+<h3>Methodology<a class="headerlink" href="#methodology" title="Link to this heading">#</a></h3>
+<p>For each (ep_size, batch_size) configuration we report the dispatch and combine kernel latency (µs) and achieved NVLink bandwidth (GB/s). The achieved bandwidth is computed as:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>bandwidth = batch_size × min(ep_size, top_k) × bytes_per_token / latency
 </pre></div>
 </div>
-<p>where <code class="docutils literal notranslate"><span class="pre">bytes_per_token</span></code> takes the quantization into account. We neglect the smaller payloads (quantization scaling factors, expert IDs, and expert scales) as they are small compared to the hidden states. The <code class="docutils literal notranslate"><span class="pre">min(ep_size,</span> <span class="pre">top_k)</span></code> factor reflects deduplication.</p>
+<p>where <code class="docutils literal notranslate"><span class="pre">bytes_per_token</span></code> covers the activation payload <strong>plus its scaling factors when present</strong>. We neglect the smaller payloads (expert IDs and router weights) since they are an order of magnitude smaller than the hidden states. The <code class="docutils literal notranslate"><span class="pre">min(ep_size,</span> <span class="pre">top_k)</span></code> factor reflects the deduplication described in the <a class="reference internal" href="#rank-major-buffer-layout">Rank-Major Buffer Layout</a> section. Following the convention used by other MoE communication libraries (e.g. DeepEP), the reported bandwidth is <strong>logical</strong> — it includes the local-rank fraction of the traffic that does not actually traverse NVLink.</p>
+</section>
+<section id="scaling-with-batch-size-and-ep-size">
+<h3>Scaling With Batch Size and EP Size<a class="headerlink" href="#scaling-with-batch-size-and-ep-size" title="Link to this heading">#</a></h3>
+<p>We sweep ep_size ∈ {8, 16, 32, 64} with BF16 dispatch and combine:</p>
 <p><strong>ep_size=8:</strong></p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -718,73 +758,73 @@ The MoE module can write its output directly into the symmetric memory workspace
 <tbody>
 <tr class="row-even"><td class="text-center"><p>1</p></td>
 <td class="text-center"><p>18.9</p></td>
-<td class="text-center"><p>3.03</p></td>
+<td class="text-center"><p>6.07</p></td>
 <td class="text-center"><p>31.0</p></td>
 <td class="text-center"><p>3.70</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2</p></td>
 <td class="text-center"><p>18.4</p></td>
-<td class="text-center"><p>6.24</p></td>
+<td class="text-center"><p>12.47</p></td>
 <td class="text-center"><p>31.1</p></td>
 <td class="text-center"><p>7.36</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>4</p></td>
 <td class="text-center"><p>18.1</p></td>
-<td class="text-center"><p>12.67</p></td>
+<td class="text-center"><p>25.34</p></td>
 <td class="text-center"><p>31.4</p></td>
 <td class="text-center"><p>14.59</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>8</p></td>
 <td class="text-center"><p>17.6</p></td>
-<td class="text-center"><p>26.11</p></td>
+<td class="text-center"><p>52.22</p></td>
 <td class="text-center"><p>31.4</p></td>
 <td class="text-center"><p>29.23</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>16</p></td>
 <td class="text-center"><p>18.5</p></td>
-<td class="text-center"><p>49.67</p></td>
+<td class="text-center"><p>99.34</p></td>
 <td class="text-center"><p>32.6</p></td>
 <td class="text-center"><p>56.31</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>32</p></td>
 <td class="text-center"><p>18.2</p></td>
-<td class="text-center"><p>100.86</p></td>
+<td class="text-center"><p>201.72</p></td>
 <td class="text-center"><p>32.7</p></td>
 <td class="text-center"><p>112.25</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>64</p></td>
 <td class="text-center"><p>22.3</p></td>
-<td class="text-center"><p>164.34</p></td>
+<td class="text-center"><p>328.68</p></td>
 <td class="text-center"><p>34.1</p></td>
 <td class="text-center"><p>215.18</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>128</p></td>
 <td class="text-center"><p>31.7</p></td>
-<td class="text-center"><p>231.20</p></td>
+<td class="text-center"><p>462.40</p></td>
 <td class="text-center"><p>38.1</p></td>
 <td class="text-center"><p>384.96</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>256</p></td>
 <td class="text-center"><p>50.8</p></td>
-<td class="text-center"><p>289.09</p></td>
+<td class="text-center"><p>578.18</p></td>
 <td class="text-center"><p>53.0</p></td>
 <td class="text-center"><p>554.44</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>512</p></td>
 <td class="text-center"><p>89.5</p></td>
-<td class="text-center"><p>328.12</p></td>
+<td class="text-center"><p>656.24</p></td>
 <td class="text-center"><p>91.7</p></td>
 <td class="text-center"><p>640.56</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>1024</p></td>
 <td class="text-center"><p>166.3</p></td>
-<td class="text-center"><p>353.17</p></td>
+<td class="text-center"><p>706.34</p></td>
 <td class="text-center"><p>175.6</p></td>
 <td class="text-center"><p>668.62</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2048</p></td>
 <td class="text-center"><p>311.8</p></td>
-<td class="text-center"><p>376.64</p></td>
+<td class="text-center"><p>753.28</p></td>
 <td class="text-center"><p>322.6</p></td>
 <td class="text-center"><p>728.20</p></td>
 </tr>
@@ -804,73 +844,73 @@ The MoE module can write its output directly into the symmetric memory workspace
 <tbody>
 <tr class="row-even"><td class="text-center"><p>1</p></td>
 <td class="text-center"><p>18.8</p></td>
-<td class="text-center"><p>3.05</p></td>
+<td class="text-center"><p>6.10</p></td>
 <td class="text-center"><p>30.8</p></td>
 <td class="text-center"><p>3.72</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2</p></td>
 <td class="text-center"><p>19.1</p></td>
-<td class="text-center"><p>6.01</p></td>
+<td class="text-center"><p>12.02</p></td>
 <td class="text-center"><p>31.4</p></td>
 <td class="text-center"><p>7.31</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>4</p></td>
 <td class="text-center"><p>18.5</p></td>
-<td class="text-center"><p>12.42</p></td>
+<td class="text-center"><p>24.84</p></td>
 <td class="text-center"><p>31.6</p></td>
 <td class="text-center"><p>14.54</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>8</p></td>
 <td class="text-center"><p>18.9</p></td>
-<td class="text-center"><p>24.31</p></td>
+<td class="text-center"><p>48.62</p></td>
 <td class="text-center"><p>31.8</p></td>
 <td class="text-center"><p>28.86</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>16</p></td>
 <td class="text-center"><p>18.4</p></td>
-<td class="text-center"><p>49.75</p></td>
+<td class="text-center"><p>99.50</p></td>
 <td class="text-center"><p>33.0</p></td>
 <td class="text-center"><p>55.61</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>32</p></td>
 <td class="text-center"><p>20.2</p></td>
-<td class="text-center"><p>90.99</p></td>
+<td class="text-center"><p>181.98</p></td>
 <td class="text-center"><p>34.2</p></td>
 <td class="text-center"><p>107.46</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>64</p></td>
 <td class="text-center"><p>24.1</p></td>
-<td class="text-center"><p>152.45</p></td>
+<td class="text-center"><p>304.90</p></td>
 <td class="text-center"><p>35.6</p></td>
 <td class="text-center"><p>206.35</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>128</p></td>
 <td class="text-center"><p>34.6</p></td>
-<td class="text-center"><p>212.05</p></td>
+<td class="text-center"><p>424.10</p></td>
 <td class="text-center"><p>39.9</p></td>
 <td class="text-center"><p>367.72</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>256</p></td>
 <td class="text-center"><p>54.8</p></td>
-<td class="text-center"><p>267.92</p></td>
+<td class="text-center"><p>535.84</p></td>
 <td class="text-center"><p>57.0</p></td>
 <td class="text-center"><p>514.83</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>512</p></td>
 <td class="text-center"><p>97.1</p></td>
-<td class="text-center"><p>302.27</p></td>
+<td class="text-center"><p>604.54</p></td>
 <td class="text-center"><p>98.2</p></td>
 <td class="text-center"><p>597.79</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>1024</p></td>
 <td class="text-center"><p>181.2</p></td>
-<td class="text-center"><p>324.00</p></td>
+<td class="text-center"><p>648.00</p></td>
 <td class="text-center"><p>188.2</p></td>
 <td class="text-center"><p>624.15</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2048</p></td>
 <td class="text-center"><p>343.3</p></td>
-<td class="text-center"><p>342.05</p></td>
+<td class="text-center"><p>684.10</p></td>
 <td class="text-center"><p>348.4</p></td>
 <td class="text-center"><p>674.15</p></td>
 </tr>
@@ -890,73 +930,73 @@ The MoE module can write its output directly into the symmetric memory workspace
 <tbody>
 <tr class="row-even"><td class="text-center"><p>1</p></td>
 <td class="text-center"><p>19.8</p></td>
-<td class="text-center"><p>2.89</p></td>
+<td class="text-center"><p>5.78</p></td>
 <td class="text-center"><p>31.4</p></td>
 <td class="text-center"><p>3.65</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2</p></td>
 <td class="text-center"><p>19.7</p></td>
-<td class="text-center"><p>5.82</p></td>
+<td class="text-center"><p>11.64</p></td>
 <td class="text-center"><p>31.3</p></td>
 <td class="text-center"><p>7.34</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>4</p></td>
 <td class="text-center"><p>19.6</p></td>
-<td class="text-center"><p>11.72</p></td>
+<td class="text-center"><p>23.44</p></td>
 <td class="text-center"><p>31.4</p></td>
 <td class="text-center"><p>14.60</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>8</p></td>
 <td class="text-center"><p>19.4</p></td>
-<td class="text-center"><p>23.64</p></td>
+<td class="text-center"><p>47.28</p></td>
 <td class="text-center"><p>32.2</p></td>
 <td class="text-center"><p>28.53</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>16</p></td>
 <td class="text-center"><p>18.9</p></td>
-<td class="text-center"><p>48.58</p></td>
+<td class="text-center"><p>97.16</p></td>
 <td class="text-center"><p>33.4</p></td>
 <td class="text-center"><p>54.89</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>32</p></td>
 <td class="text-center"><p>21.1</p></td>
-<td class="text-center"><p>86.79</p></td>
+<td class="text-center"><p>173.58</p></td>
 <td class="text-center"><p>34.6</p></td>
 <td class="text-center"><p>105.95</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>64</p></td>
 <td class="text-center"><p>26.2</p></td>
-<td class="text-center"><p>139.83</p></td>
+<td class="text-center"><p>279.66</p></td>
 <td class="text-center"><p>36.4</p></td>
 <td class="text-center"><p>201.45</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>128</p></td>
 <td class="text-center"><p>37.8</p></td>
-<td class="text-center"><p>193.93</p></td>
+<td class="text-center"><p>387.86</p></td>
 <td class="text-center"><p>41.1</p></td>
 <td class="text-center"><p>356.77</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>256</p></td>
 <td class="text-center"><p>61.5</p></td>
-<td class="text-center"><p>238.55</p></td>
+<td class="text-center"><p>477.10</p></td>
 <td class="text-center"><p>59.7</p></td>
 <td class="text-center"><p>492.00</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>512</p></td>
 <td class="text-center"><p>109.6</p></td>
-<td class="text-center"><p>267.97</p></td>
+<td class="text-center"><p>535.94</p></td>
 <td class="text-center"><p>102.5</p></td>
 <td class="text-center"><p>572.90</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>1024</p></td>
 <td class="text-center"><p>197.5</p></td>
-<td class="text-center"><p>297.37</p></td>
+<td class="text-center"><p>594.74</p></td>
 <td class="text-center"><p>197.5</p></td>
 <td class="text-center"><p>594.69</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2048</p></td>
 <td class="text-center"><p>373.7</p></td>
-<td class="text-center"><p>314.27</p></td>
+<td class="text-center"><p>628.54</p></td>
 <td class="text-center"><p>369.5</p></td>
 <td class="text-center"><p>635.66</p></td>
 </tr>
@@ -976,73 +1016,73 @@ The MoE module can write its output directly into the symmetric memory workspace
 <tbody>
 <tr class="row-even"><td class="text-center"><p>1</p></td>
 <td class="text-center"><p>27.8</p></td>
-<td class="text-center"><p>2.06</p></td>
+<td class="text-center"><p>4.12</p></td>
 <td class="text-center"><p>32.6</p></td>
 <td class="text-center"><p>3.52</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2</p></td>
 <td class="text-center"><p>24.8</p></td>
-<td class="text-center"><p>4.62</p></td>
+<td class="text-center"><p>9.24</p></td>
 <td class="text-center"><p>32.2</p></td>
 <td class="text-center"><p>7.13</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>4</p></td>
 <td class="text-center"><p>29.1</p></td>
-<td class="text-center"><p>7.87</p></td>
+<td class="text-center"><p>15.74</p></td>
 <td class="text-center"><p>33.0</p></td>
 <td class="text-center"><p>13.92</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>8</p></td>
 <td class="text-center"><p>20.4</p></td>
-<td class="text-center"><p>22.51</p></td>
+<td class="text-center"><p>45.02</p></td>
 <td class="text-center"><p>33.3</p></td>
 <td class="text-center"><p>27.53</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>16</p></td>
 <td class="text-center"><p>20.6</p></td>
-<td class="text-center"><p>44.57</p></td>
+<td class="text-center"><p>89.14</p></td>
 <td class="text-center"><p>35.0</p></td>
 <td class="text-center"><p>52.46</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>32</p></td>
 <td class="text-center"><p>23.1</p></td>
-<td class="text-center"><p>79.60</p></td>
+<td class="text-center"><p>159.20</p></td>
 <td class="text-center"><p>36.1</p></td>
 <td class="text-center"><p>101.68</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>64</p></td>
 <td class="text-center"><p>28.8</p></td>
-<td class="text-center"><p>127.62</p></td>
+<td class="text-center"><p>255.24</p></td>
 <td class="text-center"><p>37.7</p></td>
 <td class="text-center"><p>194.70</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>128</p></td>
 <td class="text-center"><p>41.6</p></td>
-<td class="text-center"><p>176.35</p></td>
+<td class="text-center"><p>352.70</p></td>
 <td class="text-center"><p>44.5</p></td>
 <td class="text-center"><p>330.08</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>256</p></td>
 <td class="text-center"><p>65.3</p></td>
-<td class="text-center"><p>224.88</p></td>
+<td class="text-center"><p>449.76</p></td>
 <td class="text-center"><p>62.9</p></td>
 <td class="text-center"><p>466.65</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>512</p></td>
 <td class="text-center"><p>115.7</p></td>
-<td class="text-center"><p>253.67</p></td>
+<td class="text-center"><p>507.34</p></td>
 <td class="text-center"><p>106.7</p></td>
 <td class="text-center"><p>550.16</p></td>
 </tr>
 <tr class="row-even"><td class="text-center"><p>1024</p></td>
 <td class="text-center"><p>209.4</p></td>
-<td class="text-center"><p>280.38</p></td>
+<td class="text-center"><p>560.76</p></td>
 <td class="text-center"><p>199.2</p></td>
 <td class="text-center"><p>589.48</p></td>
 </tr>
 <tr class="row-odd"><td class="text-center"><p>2048</p></td>
 <td class="text-center"><p>399.2</p></td>
-<td class="text-center"><p>294.17</p></td>
+<td class="text-center"><p>588.34</p></td>
 <td class="text-center"><p>372.1</p></td>
 <td class="text-center"><p>631.18</p></td>
 </tr>
@@ -1055,10 +1095,58 @@ The MoE module can write its output directly into the symmetric memory workspace
 </p>
 <p><strong>Key observations:</strong></p>
 <ul class="simple">
-<li><p>Given sufficient batch size, the combine kernel achieves <strong>~80%</strong> of the peak NVLink bandwidth.</p></li>
-<li><p>The achieved bandwidth of dispatch is lower than that of combine, since the dispatch kernel also performs token routing and slot index computation. The combine kernel, by contrast, is more communication-centric.</p></li>
-<li><p>At small batch sizes, latency dominates the kernel execution time.</p></li>
+<li><p>Given sufficient batch size, both dispatch and combine reach <strong>~80%</strong> of the peak NVLink bandwidth at <code class="docutils literal notranslate"><span class="pre">ep_size=8</span></code>. Dispatch lands slightly higher than combine at large batches despite carrying the routing/slot-index work, because combine does a top_k-way reduction on top of the same payload.</p></li>
+<li><p>Bandwidth slightly degrades as EP grows, because of the increased synchronization overhead inside the larger communication domain.</p></li>
 </ul>
+</section>
+<section id="post-quant-dispatch">
+<h3>Post-Quant Dispatch<a class="headerlink" href="#post-quant-dispatch" title="Link to this heading">#</a></h3>
+<p>We test the perf benefit of post-quant dispatch, with FP8 and FP4 respectively:</p>
+<p align="left">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_post_quant_dispatch.png" alt="Post-quant dispatch on B200" width="700"/>
+</p>
+<p>At <code class="docutils literal notranslate"><span class="pre">bsz</span> <span class="pre">=</span> <span class="pre">2048</span></code>:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>Recipe</p></th>
+<th class="head text-center"><p>bytes/token</p></th>
+<th class="head text-center"><p>byte-ratio vs BF16</p></th>
+<th class="head text-center"><p>Disp µs</p></th>
+<th class="head text-center"><p>Disp GB/s</p></th>
+<th class="head text-center"><p>Speedup vs BF16</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p>BF16</p></td>
+<td class="text-center"><p>14336</p></td>
+<td class="text-center"><p>1.00×</p></td>
+<td class="text-center"><p>311.8</p></td>
+<td class="text-center"><p>753.3</p></td>
+<td class="text-center"><p>1.00×</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p>MXFP8</p></td>
+<td class="text-center"><p>7392</p></td>
+<td class="text-center"><p>1.94×</p></td>
+<td class="text-center"><p>172.2</p></td>
+<td class="text-center"><p>703.4</p></td>
+<td class="text-center"><p><strong>1.81×</strong></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p>NVFP4</p></td>
+<td class="text-center"><p>4032</p></td>
+<td class="text-center"><p>3.56×</p></td>
+<td class="text-center"><p>101.7</p></td>
+<td class="text-center"><p>649.3</p></td>
+<td class="text-center"><p><strong>3.06×</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Key observations:</strong></p>
+<ul class="simple">
+<li><p>Quantization mainly helps at large batch size, where the communication is bandwidth bound.</p></li>
+<li><p>Dispatch speedup tracks the byte-ratio asymptote — quantization translates almost directly into faster dispatch.</p></li>
+</ul>
+</section>
 <section id="reproduction">
 <h3>Reproduction<a class="headerlink" href="#reproduction" title="Link to this heading">#</a></h3>
 <p>The benchmark is available in the TensorRT LLM repository. Example command:</p>
@@ -1068,97 +1156,9 @@ The MoE module can write its output directly into the symmetric memory workspace
 <p><code class="docutils literal notranslate"><span class="pre">srun</span></code> is required for multi-node NVLink benchmarking. See <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">tests/microbenchmarks/bench_moe_comm.py</span> <span class="pre">--help</span></code> for the full set of options.</p>
 </section>
 </section>
-<section id="future-work-and-conclusion">
-<h2>Future Work And Conclusion<a class="headerlink" href="#future-work-and-conclusion" title="Link to this heading">#</a></h2>
-<p>At small batch sizes, the performance bottleneck of NVLinkOneSided shifts from data movement bandwidth to <strong>latency</strong>. Besides the data movement itself, the flag writes and memory fences also contribute to this latency floor. To quantify the synchronization cost, we measure kernel latency with the barrier disabled (note: this breaks correctness due to potential data races):</p>
-<p><strong>ep_size=8:</strong></p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head text-center"><p>Batch Size</p></th>
-<th class="head text-center"><p>Dispatch w/ sync (µs)</p></th>
-<th class="head text-center"><p>Dispatch w/o sync (µs)</p></th>
-<th class="head text-center"><p>Combine w/ sync (µs)</p></th>
-<th class="head text-center"><p>Combine w/o sync (µs)</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td class="text-center"><p>1</p></td>
-<td class="text-center"><p>18.9</p></td>
-<td class="text-center"><p>11.3</p></td>
-<td class="text-center"><p>31.0</p></td>
-<td class="text-center"><p>28.1</p></td>
-</tr>
-<tr class="row-odd"><td class="text-center"><p>2</p></td>
-<td class="text-center"><p>18.4</p></td>
-<td class="text-center"><p>11.1</p></td>
-<td class="text-center"><p>31.1</p></td>
-<td class="text-center"><p>29.2</p></td>
-</tr>
-<tr class="row-even"><td class="text-center"><p>4</p></td>
-<td class="text-center"><p>18.1</p></td>
-<td class="text-center"><p>11.5</p></td>
-<td class="text-center"><p>31.4</p></td>
-<td class="text-center"><p>28.6</p></td>
-</tr>
-<tr class="row-odd"><td class="text-center"><p>8</p></td>
-<td class="text-center"><p>17.6</p></td>
-<td class="text-center"><p>11.3</p></td>
-<td class="text-center"><p>31.4</p></td>
-<td class="text-center"><p>29.4</p></td>
-</tr>
-<tr class="row-even"><td class="text-center"><p>16</p></td>
-<td class="text-center"><p>18.5</p></td>
-<td class="text-center"><p>11.6</p></td>
-<td class="text-center"><p>32.6</p></td>
-<td class="text-center"><p>32.2</p></td>
-</tr>
-<tr class="row-odd"><td class="text-center"><p>32</p></td>
-<td class="text-center"><p>18.2</p></td>
-<td class="text-center"><p>12.6</p></td>
-<td class="text-center"><p>32.7</p></td>
-<td class="text-center"><p>32.3</p></td>
-</tr>
-<tr class="row-even"><td class="text-center"><p>64</p></td>
-<td class="text-center"><p>22.3</p></td>
-<td class="text-center"><p>16.8</p></td>
-<td class="text-center"><p>34.1</p></td>
-<td class="text-center"><p>33.2</p></td>
-</tr>
-<tr class="row-odd"><td class="text-center"><p>128</p></td>
-<td class="text-center"><p>31.7</p></td>
-<td class="text-center"><p>25.8</p></td>
-<td class="text-center"><p>38.1</p></td>
-<td class="text-center"><p>36.2</p></td>
-</tr>
-<tr class="row-even"><td class="text-center"><p>256</p></td>
-<td class="text-center"><p>50.8</p></td>
-<td class="text-center"><p>43.8</p></td>
-<td class="text-center"><p>53.0</p></td>
-<td class="text-center"><p>50.3</p></td>
-</tr>
-<tr class="row-odd"><td class="text-center"><p>512</p></td>
-<td class="text-center"><p>89.5</p></td>
-<td class="text-center"><p>79.3</p></td>
-<td class="text-center"><p>91.7</p></td>
-<td class="text-center"><p>74.8</p></td>
-</tr>
-<tr class="row-even"><td class="text-center"><p>1024</p></td>
-<td class="text-center"><p>166.3</p></td>
-<td class="text-center"><p>149.5</p></td>
-<td class="text-center"><p>175.6</p></td>
-<td class="text-center"><p>145.3</p></td>
-</tr>
-<tr class="row-odd"><td class="text-center"><p>2048</p></td>
-<td class="text-center"><p>311.8</p></td>
-<td class="text-center"><p>291.5</p></td>
-<td class="text-center"><p>322.6</p></td>
-<td class="text-center"><p>278.5</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p>In the future, we will continue to optimize the latency-bound scenarios and explore more aggressive MoE communication-computation overlap/fusion.</p>
-<p>In conclusion, NVLinkOneSided AlltoAll is a symmetric memory-based MoE communication kernel that combines a simple one-sided design with minimal overhead and a modular, quantization-agnostic interface. It is the default communication strategy within a single NVLink domain in TensorRT LLM and delivers the best performance among known MoE communication implementations for inference.</p>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>NVLinkOneSided AlltoAll is a symmetric memory-based MoE communication kernel that combines a simple one-sided design with minimal overhead and a modular, quantization-agnostic interface. It is the default communication strategy within a single NVLink domain in TensorRT LLM and delivers the best performance among known MoE communication implementations for inference. NVLinkOneSided is also available in <a class="reference external" href="https://docs.flashinfer.ai/api/comm.html#flashinfer.comm.MoeAlltoAll">FlashInfer</a>.</p>
 </section>
 </section>
 
@@ -1216,22 +1216,26 @@ The MoE module can write its output directly into the symmetric memory workspace
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#design-overview">Design Overview</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#nvlink-symmetric-memory">NVLink Symmetric Memory</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#one-sided-communication">One-Sided Communication</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#token-major-data-layout">Token-Major Data Layout</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rank-major-buffer-layout">Rank-Major Buffer Layout</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#interface-between-communication-and-moe">Interface Between Communication and MoE</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization-agnostic-communication">Quantization-Agnostic Communication</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#implementation-details">Implementation Details</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#interface-between-communication-and-moe">Interface Between Communication and MoE</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dispatch-put-and-combine-get">Dispatch Put and Combine Get</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dispatch-kernel">Dispatch Kernel</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#combine-kernel">Combine Kernel</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#synchronization">Synchronization</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#saturating-nvlink-bandwidth">Saturating NVLink Bandwidth</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-benchmark">Performance Benchmark</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#methodology">Methodology</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#scaling-with-batch-size-and-ep-size">Scaling With Batch Size and EP Size</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#post-quant-dispatch">Post-Quant Dispatch</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reproduction">Reproduction</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work-and-conclusion">Future Work And Conclusion</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
 </ul>
   </nav></div>
 
@@ -1323,9 +1327,9 @@ The MoE module can write its output directly into the symmetric memory workspace
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 15, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       

@@ -30,6 +30,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
+| `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
@@ -112,12 +113,11 @@ TeaCache caches transformer outputs when timestep embeddings change slowly betwe
 
 ### Multi-GPU Parallelism
 
-Two parallelism modes can be combined:
+Three parallelism modes can be combined:
 
 - **CFG Parallelism** (`--cfg_size 2`): Splits positive/negative guidance prompts across GPUs.
 - **Ulysses Parallelism** (`--ulysses_size N`): Splits the sequence dimension across GPUs for longer sequences.
-
-Total GPU count = `cfg_size * ulysses_size`.
+- **Parallel VAE** (`--parallel_vae_size N`): Shards the final VAE decode along a spatial axis across GPUs, useful to reduce VAE latency and improve GPU utilization (Constraint: `parallel_vae_size ≤ world_size`). Currently only supported for WAN models.
 
 ## Developer Guide
 

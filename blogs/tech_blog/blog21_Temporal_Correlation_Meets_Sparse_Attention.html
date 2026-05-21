@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc14';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,12 +76,12 @@
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
     <link rel="next" title="Tuning CUDA Graph Batch Sizes for Higher Output Throughput" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html" />
-    <link rel="prev" title="Introduction to KV Cache Transmission" href="../../developer-guide/kv-transfer.html" />
+    <link rel="prev" title="Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc14" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -461,6 +461,9 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
@@ -625,7 +628,7 @@
 <p>The index score tensor <span class="math notranslate nohighlight">\(I_t \in \mathbb{R}^N\)</span> (where <span class="math notranslate nohighlight">\(N\)</span> is the current sequence length) estimates which past KV tokens matter most for the current query token. A Top-K operator then selects the top 2048 positions, and only those selected entries participate in sparse MLA.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_indexer_topk.png" alt="Indexer Top-K Selection" width="900" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_indexer_topk.png" alt="Indexer Top-K Selection" width="900" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Indexer Top-K selection in DeepSeek Sparse Attention. The indexer scores all historical tokens, and Top-K keeps only the most important ones for sparse MLA.</em></sub></p>
@@ -679,7 +682,7 @@
 <p>We measured this on real DeepSeek-V3.2 decode-stage indexer logits using a long-context coding prompt from <strong>SWE-bench-derived LongSeqTasks</strong>. Concretely, the prompt used here is entry 1 of the 64K bucket, built from repository files of a single SWE-bench task; its actual prompt length is 68,665 tokens, followed by 2,025 decode steps.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_hit_ratio.png" alt="Top-K Hit Ratio" width="900" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_hit_ratio.png" alt="Top-K Hit Ratio" width="900" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Raw Top-K overlap between consecutive decode steps across layers. Layers 20-60 show 35-50% average raw overlap, while Layers 0 and 1 are much lower.</em></sub></p>
@@ -701,7 +704,7 @@
 </ul>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_temporal_correlation_diagram.png" alt="Temporal Correlation and Toeplitz Structure" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_temporal_correlation_diagram.png" alt="Temporal Correlation and Toeplitz Structure" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Intuition for temporal correlation in decode-stage Top-K. The previous step's Top-K is not exact ground truth for the next step, but it remains a strong local predictor because the score landscape moves smoothly.</em></sub></p>
@@ -721,7 +724,7 @@
 </ol>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_algorithm_flow.png" alt="GVR Top-K Algorithm Flow" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_algorithm_flow.png" alt="GVR Top-K Algorithm Flow" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. Guess-Verify-Refine (GVR) pipeline. The previous step's Top-K provides the warm-start; exact selection is preserved by verification and in-shared-memory refinement.</em></sub></p>
@@ -746,7 +749,7 @@
 <p>where <span class="math notranslate nohighlight">\(C\)</span> is a bounded candidate capacity.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_secant_method.png" alt="Secant Method Threshold Search" width="750" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_secant_method.png" alt="Secant Method Threshold Search" width="750" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5. Secant-style threshold search in GVR. With a good starting estimate, the search typically converges in 1-2 iterations on real decode data.</em></sub></p>
@@ -775,7 +778,7 @@
 </ol>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_phase4_detail.png" alt="Phase 4 Histogram Detail" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_phase4_detail.png" alt="Phase 4 Histogram Detail" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6. Shared-memory refinement stage of GVR. This is where the algorithm preserves exactness while avoiding a global-memory sort.</em></sub></p>
@@ -805,7 +808,7 @@
 </ol>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_dispatch_logic.png" alt="Dispatch Logic" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_dispatch_logic.png" alt="Dispatch Logic" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7. Full decode-stage Top-K dispatch in TensorRT-LLM. GVR takes priority only when `preIdx`, scratch buffers, and hardware-aware thresholds are satisfied; otherwise dispatch falls back to the original insertion/radix-select pipeline.</em></sub></p>
@@ -886,7 +889,7 @@
 <p>On synthetic data, GVR shows the expected scaling behavior: there is fixed overhead at short sequence length, but the reduced pass count wins as <span class="math notranslate nohighlight">\(N\)</span> grows. Production dispatch uses a hardware-aware GVR gate rather than a single hard crossover: the default small-sequence lower bound is <code class="docutils literal notranslate"><span class="pre">12288</span></code>, while a hardware-aware batch threshold routes large-batch or L2-pressure cases back to radix.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_synthetic_scaling.png" alt="Synthetic Data Scaling" width="750" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_synthetic_scaling.png" alt="Synthetic Data Scaling" width="750" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8. On random synthetic data, standalone GVR reaches parity around 16K sequence length and then increasingly outperforms the production radix-select kernel as context grows. In production, the GVR dispatcher starts from the validated 12,288-token lower bound and falls back when the `(batch size, sequence length)` cell is better served by radix.</em></sub></p>
@@ -899,7 +902,7 @@
 </ul>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_real_data_bars.png" alt="Real Data Per-Layer Latency" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_real_data_bars.png" alt="Real Data Per-Layer Latency" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 9. GVR consistently outperforms the production radix-select baseline across all evaluated layers on real DeepSeek-V3.2 decode traces.</em></sub></p>
@@ -982,7 +985,7 @@
 <p>For each configuration we use 5 requests and repeat the A/B pair 3 times. The fixed-OSL figure and table below focus on the <code class="docutils literal notranslate"><span class="pre">OSL=1K</span></code> slice because it is a clean way to compare how the benefit scales with input length and speculative decoding depth without mixing in very short or very long output tails.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog21_e2e_tept8_osl1k_bar.png" alt="End-to-End TPOT Reduction at Fixed OSL=1K" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_e2e_tept8_osl1k_bar.png" alt="End-to-End TPOT Reduction at Fixed OSL=1K" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 10. End-to-end TPOT reduction at fixed OSL=1K. GVR helps more as context length grows, and the gain is diluted as MTP becomes more aggressive.</em></sub></p>
@@ -1099,12 +1102,12 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../../developer-guide/kv-transfer.html"
+       href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Introduction to KV Cache Transmission</p>
+        <p class="prev-next-title">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</p>
       </div>
     </a>
     <a class="right-next"
@@ -1263,9 +1266,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 06, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/93cb651">93cb651</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       
