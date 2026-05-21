@@ -535,11 +535,6 @@ def prepare_trtllm_gen_moe_mxfp4_weights(
     EP (expert-axis slicing) is NOT done here — the caller selects the expert subset before
     invoking.
     """
-    if tp_size > 1 and intermediate_size % tp_size != 0:
-        raise ValueError(
-            f"intermediate_size ({intermediate_size}) must be divisible by "
-            f"tp_size ({tp_size}) for TP-MoE."
-        )
     if scratch is not None and tp_size != 1:
         # Scratch path assumes inputs are already TP-sliced (load hook does
         # that). Combining scratch with tp_size > 1 would double-slice.
