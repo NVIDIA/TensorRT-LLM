@@ -74,13 +74,13 @@ def _expand_prompt_token_ids_for_mm_handoff(
     image_token_id: int,
     video_token_id: int,
     vision_start_token_id: int,
-    placeholder_id: int,
 ) -> DisaggPrefillMultimodalInputs:
     """Expand Qwen3-VL image/video placeholders and emit sparse MM layout.
 
     Qwen handoff has one coarse <image_pad> or <video_pad> token per item.
     This helper expands that one token to the number of embedding rows in the
-    handoff handle, then returns the sparse layout metadata.
+    handoff handle using the original in-vocab placeholder token, then returns
+    the sparse layout metadata.
 
     Agg gets this expansion from Qwen's HF processor taking raw images/videos
     as inputs. Reusing that would be wasteful here, hence this helper that
@@ -128,7 +128,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
         run_start = write_pos - 1 if has_leading_special else write_pos
         prompt_mm_length = mm_token_num + int(has_leading_special)
 
-        expanded_ids[write_pos : write_pos + mm_token_num] = placeholder_id
+        expanded_ids[write_pos : write_pos + mm_token_num] = token_id
         mm_token_offsets.append(run_start)
         mm_token_lengths.append(prompt_mm_length)
         multimodal_embedding_lengths.append(mm_token_num)
@@ -353,7 +353,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             image_token_id=self.config.image_token_id,
             video_token_id=self.config.video_token_id,
             vision_start_token_id=self.config.vision_start_token_id,
-            placeholder_id=self.tllm_multimodal_token_id,
         )
 
 
@@ -1150,7 +1149,23 @@ class Qwen3VLModelBase(PreTrainedModel):
                 persistent=False,
             )
 
+        # Surface the in-vocab image / video placeholder IDs to the model
+        # engine's ``_prepare_multimodal_indices`` so it selects the
+        # ``torch.isin`` predicate.
+        _mm_ids = [
+            tid
+            for tid in (
+                getattr(config, "image_token_id", None),
+                getattr(config, "video_token_id", None),
+            )
+            if tid is not None
+        ]
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
         self.post_config()
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
     def post_config(self):
         # use llm.config as config for pytorch model engine
@@ -1293,6 +1308,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
                 input_ids,
                 vocab_size=self.llm.model.embed_tokens.num_embeddings,
+                mm_token_ids=self.mm_token_ids,
             )
 
         # Expand the per-level deepstack mm embeddings into the pre-allocated

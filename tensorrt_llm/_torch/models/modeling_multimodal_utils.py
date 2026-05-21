@@ -488,6 +488,15 @@ def fuse_input_embeds(
           are expected to forward these explicitly rather than relying on a
           ``**kwargs`` splat — if they don't, this function falls back to the
           host-syncing ``filter_mm_token_from_input_ids`` on GPU ``input_ids``.
+        - In-vocab fast path: when ``mm_token_ids`` is provided, the caller is
+          declaring that mm placeholder IDs are real vocabulary entries. In
+          that case the text path skips its ``index_select`` + ``torch.empty``
+          + text scatter and embeds the full ``input_ids`` once, overwriting
+          mm rows afterwards. This is the path taken by every VLM currently
+          in tree EXCEPT Hyperclovax, which keeps the legacy ``vocab_size + 1``
+          OOV remap in its input processor and therefore passes
+          ``mm_token_ids=None`` so the OOV branch is taken — embedding an OOV
+          id would be out-of-bounds.
     """
     if len(mm_embeds) == 0:
         if extra_embeds is not None and len(extra_embeds) > 0:
@@ -508,11 +517,24 @@ def fuse_input_embeds(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
             f"but received {mm_embed.shape[0]} image embeddings.")
 
-    text_embed = embedding_layer(input_ids[text_token_indices])
-    input_embeds = torch.empty(input_ids.shape[0],
-                               mm_embed.shape[-1],
-                               device=text_embed.device,
-                               dtype=text_embed.dtype)
+    if mm_token_ids is not None:
+        # In-vocab fast path: caller declared mm tokens are real vocabulary
+        # IDs, so a single full embedding lookup is safe. Saves the
+        # ``index_select`` over text positions, the ``torch.empty`` alloc, and
+        # the text scatter (~2 GPU kernels per VLM forward) at the cost of
+        # ~mm-fraction extra embedding lookups whose result is overwritten.
+        input_embeds = embedding_layer(input_ids)
+    else:
+        # OOV path: input_ids holds placeholder IDs >= num_embeddings at mm
+        # positions (e.g. ``vocab_size + 1``), so embedding the full sequence
+        # would be out-of-bounds. Gather only the in-vocab text positions and
+        # scatter into a fresh buffer.
+        text_embed = embedding_layer(input_ids[text_token_indices])
+        input_embeds = torch.empty(input_ids.shape[0],
+                                   mm_embed.shape[-1],
+                                   device=text_embed.device,
+                                   dtype=text_embed.dtype)
+        input_embeds[text_token_indices, :] = text_embed
     if extra_embeds is not None and len(extra_embeds) > 0:
         # only support single modality for deepstack features for now
         for i, extra_feature in enumerate(extra_embeds):
@@ -525,7 +547,6 @@ def fuse_input_embeds(
             extra_embed[mm_token_indices, :] = extra_feature
             extra_embeds[i] = extra_embed
 
-    input_embeds[text_token_indices, :] = text_embed
     input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
                                                     device=input_embeds.device)
     if extra_embeds is not None and len(extra_embeds) > 0:

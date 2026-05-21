@@ -187,7 +187,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
 
-        self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         # temporal patch size for video frames
         self.temporal_patch_size = getattr(self.config.vision_config,
                                            'temporal_patch_size', 1)
@@ -443,18 +442,26 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                               **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        token_ids = [
-            tid
-            for attr in ("image_token_id", "vision_token_id", "video_token_id")
-            if (tid := getattr(self.config, attr, None)) is not None
-        ]
-        if token_ids:
-            ids_tensor = torch.tensor(token_ids,
-                                      device=input_ids.device,
-                                      dtype=input_ids.dtype)
-            input_ids[torch.isin(input_ids,
-                                 ids_tensor)] = self.tllm_multimodal_token_id
+        # Keep image / vision / video placeholders in-vocab; the model engine
+        # locates mm positions via ``torch.isin(input_ids, mm_token_ids)`` and
+        # the previous ``vocab_size + 1`` OOV remap is no longer needed.
         return input_ids
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Surface the in-vocab image / vision / video placeholder IDs so that
+        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
+        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
+        ``>= vocab_size`` fallback (which would miss all positions now that the
+        ``_postprocess`` OOV remap is gone).
+        """
+        ids = [
+            tid for tid in (
+                getattr(self.config, 'image_token_id', None),
+                getattr(self.config, 'vision_token_id', None),
+                getattr(self.config, 'video_token_id', None),
+            ) if tid is not None
+        ]
+        return torch.tensor(ids, dtype=torch.int32) if ids else None
 
     def get_mrope_config(
             self,
@@ -530,12 +537,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         prompt_token_ids = build_disagg_prefill_multimodal_inputs(
             inputs, mm_handles).prompt_token_ids
 
+        # ``build_disagg_prefill_multimodal_inputs`` already emits the in-vocab
+        # ``image_token_id`` at mm positions (no legacy OOV remap), so
+        # ``mrope_input_ids`` is fed to ``get_mrope_config`` as-is.
         mrope_input_ids = torch.tensor(prompt_token_ids,
                                        dtype=torch.long).unsqueeze(0)
-        mrope_input_ids = mrope_input_ids.clone()
-        multimodal_token_id = self.tllm_multimodal_token_id
-        mrope_input_ids[mrope_input_ids ==
-                        multimodal_token_id] = self.config.image_token_id
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_grid_thw = torch.tensor(
             [
@@ -1421,6 +1427,23 @@ class Qwen2VLModelBase(PreTrainedModel):
         else:
             self.mm_encoder = None
 
+        # Surface the in-vocab image / vision / video placeholder IDs to the
+        # model engine's ``_prepare_multimodal_indices`` so it selects the
+        # ``torch.isin`` predicate. Filter out None — some Qwen2-VL variants
+        # only define a subset of these.
+        _mm_ids = [
+            tid for tid in (
+                getattr(self.config, 'image_token_id', None),
+                getattr(self.config, 'vision_token_id', None),
+                getattr(self.config, 'video_token_id', None),
+            ) if tid is not None
+        ]
+        self._mm_token_ids = torch.tensor(_mm_ids, dtype=torch.int32)
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
+
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config
         # For VL configs (Qwen2_5_VLConfig), hidden_size etc. live in
@@ -1535,6 +1558,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
+            mm_token_ids=self.mm_token_ids,
             mm_token_indices=kwargs.get("mm_token_indices"),
             text_token_indices=kwargs.get("text_token_indices"),
         )
@@ -1649,7 +1673,10 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         final_length = len(input_ids) - num_images + total_mm_tokens
         # Create output tensor
         expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
-        placeholder_id = self.tllm_multimodal_token_id
+        # Use the in-vocab image_token_id as the placeholder repeated mm_token_num
+        # times, so the model engine can locate mm positions via
+        # ``torch.isin(input_ids, mm_token_ids)`` without the legacy OOV remap.
+        placeholder_id = image_token_index
 
         # Fill the expanded sequence
         write_pos = 0

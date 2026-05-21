@@ -1581,6 +1581,9 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         self._media_placeholder_token_id = getattr(
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
         )
+        # Backing storage for the ``mm_token_ids`` property below — built once
+        # here so the executor doesn't re-allocate per step.
+        self._mm_token_ids = torch.tensor([self._media_placeholder_token_id], dtype=torch.int32)
 
         # Align model config with the LLM backbone's text_config.
         # The executor reads eos_token_id and other generation params from
@@ -1632,12 +1635,12 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     @property
     def mm_token_ids(self) -> torch.Tensor:
         """Surface the in-vocab media placeholder to the model engine so
-        ``_prepare_multimodal_indices`` produces correct MM/text masks.
-        Without this, the executor falls back to the OOV (``>= vocab_size``)
-        predicate and misses Kimi's placeholder, forcing ``fuse_input_embeds``
-        through the ``torch.where`` host-sync path on GPU input_ids.
+        ``_prepare_multimodal_indices`` selects the ``torch.isin`` predicate
+        instead of the OOV (``>= vocab_size``) fallback (which would miss
+        Kimi's placeholder and force ``fuse_input_embeds`` through the
+        ``torch.where`` host-sync path on GPU input_ids).
         """
-        return torch.tensor([self._media_placeholder_token_id], dtype=torch.int32)
+        return self._mm_token_ids
 
     def load_weights(self, weights) -> None:
         """Load vision + projector + LLM weights from checkpoint."""
@@ -1701,8 +1704,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             # `fuse_input_embeds` itself, so the explicit check is no longer
             # needed.
             if len(mm_embeds) > 0:
-                mm_token_ids = self.mm_token_ids.to(input_ids.device,
-                                                    dtype=input_ids.dtype)
+                mm_token_ids = self.mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,

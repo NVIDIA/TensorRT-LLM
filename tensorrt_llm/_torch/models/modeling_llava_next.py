@@ -86,6 +86,15 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Surface the in-vocab image placeholder so
+        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
+        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
+        ``>= vocab_size`` fallback (which would miss all positions now that
+        the OOV remap in _expand/_postprocess/__call__ is gone).
+        """
+        return torch.tensor([self.image_token_index], dtype=torch.int32)
+
     def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
         """
         Return minimal placeholder text for the given multimodal item counts,
@@ -122,7 +131,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             mm_token_offsets (List[int]): Offset (position) in the expanded sequence where each MM token group (for each placeholder) begins.
         """
         image_token_id = self.config.image_token_index
-        placeholder_id = self.vocab_size + 1
+        # Keep the placeholder in-vocab so the model engine can locate mm
+        # positions via ``torch.isin(input_ids, mm_token_ids)``. The previous
+        # ``vocab_size + 1`` OOV remap is no longer needed — the model class
+        # exposes ``mm_token_ids = [image_token_index]`` to the engine.
+        placeholder_id = image_token_id
 
         expanded: List[int] = []
         mm_token_lengths: List[int] = []
@@ -237,10 +250,15 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             [mm_token_positions, mm_token_positions + 1]).unique()
         input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
         )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
+        # Use the in-vocab image_token_index repeated mm_total_length times
+        # (instead of unique arange(vocab_size, vocab_size + L) OOV IDs).
+        # ``fuse_input_embeds`` only needs a predicate that distinguishes mm vs
+        # text positions, not unique per-position IDs.
         mm_ids_splits = list(
-            torch.arange(self.vocab_size,
-                         self.vocab_size + mm_total_length,
-                         device=input_ids.device).split(mm_lengths_per_split)
+            torch.full((mm_total_length, ),
+                       self.config.image_token_index,
+                       dtype=input_ids.dtype,
+                       device=input_ids.device).split(mm_lengths_per_split)
         )  # len(mm_ids_splits) = num_mm_segments
 
         for i, mm_ids in enumerate(mm_ids_splits):
@@ -403,10 +421,9 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             images=images,
             do_rescale=not (images and isinstance(images[0], torch.Tensor)),
             return_tensors="pt")
-        # Postprocess
+        # Keep image_token_index in-vocab; mm positions are located by
+        # the model engine via ``torch.isin(input_ids, mm_token_ids)``.
         fused_input_ids = processed_values['input_ids'][0]
-        fused_input_ids[fused_input_ids ==
-                        self.image_token_index] = self.vocab_size + 1
 
         multimodal_data = {}
         multimodal_data["image"] = {
@@ -651,8 +668,18 @@ class LlavaNextModel(PreTrainedModel):
 
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
+        # Surface the in-vocab image placeholder to the model engine's
+        # ``_prepare_multimodal_indices``.
+        self._mm_token_ids = torch.tensor(
+            [model_config.pretrained_config.image_token_index],
+            dtype=torch.int32)
+
         self.model_config = model_config
         self.post_config()
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if isinstance(weight_mapper, LlavaNextHfWeightMapper):
@@ -718,6 +745,7 @@ class LlavaNextModel(PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
+            mm_token_ids=self.mm_token_ids,
             mm_token_indices=kwargs.get("mm_token_indices"),
             text_token_indices=kwargs.get("text_token_indices"),
         )
