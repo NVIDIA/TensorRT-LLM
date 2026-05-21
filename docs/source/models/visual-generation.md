@@ -102,7 +102,7 @@ Programmatic usage via `VisualGenArgs.quant_config`:
 from tensorrt_llm import VisualGenArgs
 
 args = VisualGenArgs(
-    checkpoint_path="/path/to/model",
+    model="/path/to/model",
     quant_config={"quant_algo": "FP8", "dynamic": True},
 )
 ```

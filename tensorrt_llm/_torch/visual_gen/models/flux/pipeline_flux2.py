@@ -39,9 +39,9 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.logger import logger
 
@@ -90,7 +90,11 @@ def format_input(prompts: List[str], system_message: str) -> List[List[dict]]:
     ]
 
 
-@register_pipeline("Flux2Pipeline")
+@register_pipeline(
+    "Flux2Pipeline",
+    hf_ids=["black-forest-labs/FLUX.2-dev"],
+    doc="Black Forest Labs FLUX.2 family (text-to-image).",
+)
 class Flux2Pipeline(BasePipeline):
     """FLUX.2 Text-to-Image Pipeline.
 
@@ -122,7 +126,7 @@ class Flux2Pipeline(BasePipeline):
             and model_config.visual_gen_mapping.cfg_size != 1
         ):
             raise ValueError(
-                "Flux2Pipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+                "Flux2Pipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
         super().__init__(model_config)

@@ -160,7 +160,7 @@ def _make_model_config(pretrained_dict, ring_size=1, ulysses_size=1, backend="FA
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
         quant_config=QuantConfig(),
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         teacache=TeaCacheConfig(),
