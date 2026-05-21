@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# OpenAI GPT-OSS-120B (128 experts, top-4, MXFP4 quantized) — standalone AD serving config.
-# 36 layers (alternating sliding/full), GQA (64 Q / 8 KV heads), head_dim=64, hidden=2880.
-# Weights are stored in MXFP4 on HF; AD's quantize_mxfp4_moe transform handles it.
+# OpenAI GPT-OSS (20B / 120B, MXFP4 quantized) — shared AD serving config.
+# - 20B: 24 layers, 32 experts, top-4
+# - 120B: 36 layers, 128 experts, top-4
+# Both share GQA (64 Q / 8 KV heads), head_dim=64, hidden=2880, and MXFP4
+# weights on HF that AD's `quantize_mxfp4_moe` transform handles.
+# world_size is set via the registry's `world_size_N.yaml` overlay — not here.
 runtime: trtllm
 model_factory: AutoModelForCausalLM
 model_kwargs:
