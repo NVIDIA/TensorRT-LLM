@@ -1,0 +1,14 @@
+# Ablation: same as repro_disagg_proxy.yaml but with round_robin router.
+# Tests whether the cookbook's kv_cache_aware router adds visible overhead
+# (it should not for a single instance, but worth verifying).
+hostname: localhost
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8002"

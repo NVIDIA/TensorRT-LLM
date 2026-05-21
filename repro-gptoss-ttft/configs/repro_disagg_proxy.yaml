@@ -1,0 +1,20 @@
+# Disagg orchestrator (proxy) config for the 1ctx + 1gen TP1 setup.
+# Schema documented in examples/disaggregated/README.md and parsed by
+# tensorrt_llm/llmapi/disagg_utils.py (extract_disagg_cfg).
+#
+# Used by: scripts/launch_disagg.sh -- "trtllm-serve disaggregated -c <this>"
+hostname: localhost
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  router:
+    type: kv_cache_aware
+  urls:
+    - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  router:
+    type: kv_cache_aware
+  urls:
+    - "localhost:8002"

@@ -61,6 +61,9 @@ class RawRequestResponseHooks(ResponseHooks):
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
         self.perf_metrics_collector = perf_metrics_collector
+        self.ctx_router_latency_ms = 0.0
+        self.gen_router_latency_ms = 0.0
+        self.pretokenize_latency_ms = 0.0
 
     def on_req_begin(self, request: UCompletionRequest):
         self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
@@ -75,7 +78,14 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
-            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
+            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(
+                self.ctx_server, gen_server, ctx_req_id,
+                self.raw_req.state.server_arrival_time,
+                self.server_first_token_time,
+                ctx_router_latency_ms=self.ctx_router_latency_ms,
+                gen_router_latency_ms=self.gen_router_latency_ms,
+                pretokenize_latency_ms=self.pretokenize_latency_ms,
+            ))
 
 
 class OpenAIDisaggServer:

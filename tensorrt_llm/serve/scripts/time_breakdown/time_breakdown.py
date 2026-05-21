@@ -33,6 +33,17 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import plotly.graph_objects as go
 
+SERVER_PROCESSING_TIMEPOINTS = (
+    'server_preprocess_start_time',
+    'server_prompt_preprocess_start_time',
+    'server_prompt_preprocess_end_time',
+    'server_input_preprocess_start_time',
+    'server_input_preprocess_end_time',
+    'server_preprocess_end_time',
+    'server_postprocess_start_time',
+    'server_postprocess_end_time',
+)
+
 
 @dataclass
 class TimingMetric:
@@ -224,6 +235,14 @@ class RequestDataParser:
                                                       float('nan'))
         gen_kv_cache_transfer_end = gen_metrics.get('kv_cache_transfer_end',
                                                     float('nan'))
+        ctx_server_processing_timepoints = {
+            f'ctx_{timepoint}': ctx_metrics.get(timepoint, float('nan'))
+            for timepoint in SERVER_PROCESSING_TIMEPOINTS
+        }
+        gen_server_processing_timepoints = {
+            f'gen_{timepoint}': gen_metrics.get(timepoint, float('nan'))
+            for timepoint in SERVER_PROCESSING_TIMEPOINTS
+        }
 
         # Disagg timing
         disagg_server_arrival_time = float('nan')
@@ -302,7 +321,7 @@ class RequestDataParser:
                     ctx_gpu_forward_time = perf_data.get('ctx_gpu_forward_time')
                     ctx_gpu_sample_time = perf_data.get('ctx_gpu_sample_time')
 
-        return {
+        parsed_request = {
             'request_index': request_id,
             'ctx_server_arrival_time': ctx_server_arrival_time,
             'ctx_arrival_time': ctx_arrival_time,
@@ -323,6 +342,9 @@ class RequestDataParser:
             'ctx_gpu_forward_time': ctx_gpu_forward_time,
             'ctx_gpu_sample_time': ctx_gpu_sample_time,
         }
+        parsed_request.update(ctx_server_processing_timepoints)
+        parsed_request.update(gen_server_processing_timepoints)
+        return parsed_request
 
 
 class RequestTimeBreakdown:

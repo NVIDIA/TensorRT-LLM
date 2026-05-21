@@ -1,0 +1,47 @@
+# Aggregated TP1 IFB Eagle3-next for gpt-oss-120b on B200
+# Exact match to:
+#   simengl/trtllm-cookbook: projects/aarwlt-gptoss/agg-vs-disagg-lifetime-20260512/
+#                            configs/agg_tp1_eagle3_next_lifetime_20260512.yaml
+# (which itself is a copy of rwlt-results/configs/gpt-oss-120b/trtllm/ifb/tp1_eagle3_next.yaml)
+#
+# Used by: scripts/launch_agg.sh
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+pipeline_parallel_size: 1
+enable_attention_dp: false
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.9
+moe_config:
+  backend: TRTLLM
+max_seq_len: 131072
+max_batch_size: 256
+max_num_tokens: 20000
+num_postprocess_workers: 4
+print_iter_log: true
+enable_chunked_prefill: true
+gpus_per_node: 8
+trust_remote_code: true
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  # Cookbook configs say "nvidia/gpt-oss-120b-Eagle3-next" which was the
+  # pre-release name of the now-released nvidia/gpt-oss-120b-Eagle3-v3.
+  # launch_agg.sh sed-substitutes this placeholder with EAGLE_CKPT
+  # (defaults to a shared local copy of Eagle3-v3).
+  speculative_model: EAGLE_CKPT_PLACEHOLDER
+  eagle3_one_model: true
+  eagle3_layers_to_capture:
+  - 23
+  - 29
+  - 35
+enable_iter_perf_stats: true
+enable_iter_req_stats: true
+return_perf_metrics: true
+perf_metrics_max_requests: 20000
+iter_stats_max_iterations: 20000
+request_stats_max_iterations: 20000

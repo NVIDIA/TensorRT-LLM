@@ -190,7 +190,15 @@ class TestRequestDataParser(unittest.TestCase):
                     'arrival_time': 1.1,
                     'first_scheduled_time': 1.2,
                     'first_token_time': 1.5,
-                    'server_first_token_time': 1.6
+                    'server_first_token_time': 1.6,
+                    'server_preprocess_start_time': 1.01,
+                    'server_prompt_preprocess_start_time': 1.02,
+                    'server_prompt_preprocess_end_time': 1.03,
+                    'server_input_preprocess_start_time': 1.04,
+                    'server_input_preprocess_end_time': 1.05,
+                    'server_preprocess_end_time': 1.06,
+                    'server_postprocess_start_time': 1.51,
+                    'server_postprocess_end_time': 1.59,
                 }
             }
         }
@@ -203,9 +211,20 @@ class TestRequestDataParser(unittest.TestCase):
         self.assertEqual(parsed['ctx_first_scheduled_time'], 1.2)
         self.assertEqual(parsed['ctx_first_token_time'], 1.5)
         self.assertEqual(parsed['ctx_server_first_token_time'], 1.6)
+        self.assertEqual(parsed['ctx_server_preprocess_start_time'], 1.01)
+        self.assertEqual(parsed['ctx_server_prompt_preprocess_start_time'],
+                         1.02)
+        self.assertEqual(parsed['ctx_server_prompt_preprocess_end_time'], 1.03)
+        self.assertEqual(parsed['ctx_server_input_preprocess_start_time'], 1.04)
+        self.assertEqual(parsed['ctx_server_input_preprocess_end_time'], 1.05)
+        self.assertEqual(parsed['ctx_server_preprocess_end_time'], 1.06)
+        self.assertEqual(parsed['ctx_server_postprocess_start_time'], 1.51)
+        self.assertEqual(parsed['ctx_server_postprocess_end_time'], 1.59)
 
         # Gen metrics should be NaN in aggregated format
         self.assertTrue(math.isnan(parsed['gen_server_arrival_time']))
+        self.assertTrue(
+            math.isnan(parsed['gen_server_preprocess_start_time']))
         self.assertTrue(math.isnan(parsed['disagg_server_arrival_time']))
 
     def test_parse_disaggregated_format(self):
@@ -221,7 +240,11 @@ class TestRequestDataParser(unittest.TestCase):
                         'arrival_time': 1.1,
                         'first_scheduled_time': 1.2,
                         'first_token_time': 1.5,
-                        'server_first_token_time': 1.6
+                        'server_first_token_time': 1.6,
+                        'server_preprocess_start_time': 1.01,
+                        'server_preprocess_end_time': 1.06,
+                        'server_postprocess_start_time': 1.51,
+                        'server_postprocess_end_time': 1.59,
                     }
                 }
             },
@@ -232,7 +255,11 @@ class TestRequestDataParser(unittest.TestCase):
                         'arrival_time': 2.1,
                         'first_scheduled_time': 2.2,
                         'first_token_time': 2.5,
-                        'server_first_token_time': 2.6
+                        'server_first_token_time': 2.6,
+                        'server_preprocess_start_time': 2.01,
+                        'server_preprocess_end_time': 2.06,
+                        'server_postprocess_start_time': 2.51,
+                        'server_postprocess_end_time': 2.59,
                     }
                 }
             },
@@ -251,6 +278,14 @@ class TestRequestDataParser(unittest.TestCase):
         # Generation metrics
         self.assertEqual(parsed['gen_server_arrival_time'], 2.0)
         self.assertEqual(parsed['gen_arrival_time'], 2.1)
+        self.assertEqual(parsed['ctx_server_preprocess_start_time'], 1.01)
+        self.assertEqual(parsed['ctx_server_preprocess_end_time'], 1.06)
+        self.assertEqual(parsed['ctx_server_postprocess_start_time'], 1.51)
+        self.assertEqual(parsed['ctx_server_postprocess_end_time'], 1.59)
+        self.assertEqual(parsed['gen_server_preprocess_start_time'], 2.01)
+        self.assertEqual(parsed['gen_server_preprocess_end_time'], 2.06)
+        self.assertEqual(parsed['gen_server_postprocess_start_time'], 2.51)
+        self.assertEqual(parsed['gen_server_postprocess_end_time'], 2.59)
 
         # Disaggregation metrics
         self.assertEqual(parsed['disagg_server_arrival_time'], 0.5)

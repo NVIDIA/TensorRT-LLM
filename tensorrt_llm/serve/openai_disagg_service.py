@@ -15,6 +15,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -46,7 +47,8 @@ from tensorrt_llm.serve.responses_utils import (
     UCompletionResponseOrGenerator,
     done_generator,
 )
-from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
+from tensorrt_llm.serve.router import (KvCacheAwareRouter, Router,
+                                       tokenize_request)
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -80,6 +82,19 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_client = None
         self._disagg_cluster_manager = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        self._pretokenize_tokenizers: dict = {}
+        self._pretokenize_model_types: dict = {}
+        self._pretokenize_custom_tokenizer = None
+        self._pretokenize_use_harmony = None
+        for router_config in (self._config.ctx_router_config,
+                              self._config.gen_router_config):
+            if router_config and router_config.args:
+                if self._pretokenize_custom_tokenizer is None:
+                    self._pretokenize_custom_tokenizer = router_config.args.get(
+                        "custom_tokenizer")
+                if self._pretokenize_use_harmony is None:
+                    self._pretokenize_use_harmony = router_config.args.get(
+                        "use_harmony")
 
         match self._config.schedule_style:
             case "generation_first":
@@ -111,6 +126,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                     "Disaggregated server currently only supports single string prompt or list of integers in request"
                 )
 
+        _t0 = time.perf_counter()
+        request = await self._pretokenize_request(request)
+        if hooks:
+            hooks.pretokenize_latency_ms = (time.perf_counter() - _t0) * 1000.0
         return await self._send_disagg_request(request, hooks)
 
     async def openai_chat_completion(
@@ -118,6 +137,10 @@ class OpenAIDisaggregatedService(OpenAIService):
     ) -> UCompletionResponseOrGenerator:
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
+        _t0 = time.perf_counter()
+        request = await self._pretokenize_request(request)
+        if hooks:
+            hooks.pretokenize_latency_ms = (time.perf_counter() - _t0) * 1000.0
         return await self._send_disagg_request(request, hooks)
 
     @staticmethod
@@ -183,7 +206,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         # empty server means client decides which server to use
         ctx_server = None
         # reserve a gen_server if conditional disagg is needed
+        _t0_cond = time.perf_counter()
         gen_server, need_ctx = await self._check_conditional_disagg(request)
+        if hooks and self.conditional_disagg_config:
+            hooks.gen_router_latency_ms = (time.perf_counter() - _t0_cond) * 1000.0
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
@@ -191,9 +217,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
+            _t0 = time.perf_counter()
             ctx_server, _ = await self._ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
+            if hooks:
+                hooks.ctx_router_latency_ms = (time.perf_counter() - _t0) * 1000.0
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
@@ -214,9 +243,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req.disaggregated_params = None
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
+                _t0 = time.perf_counter()
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
+                if hooks:
+                    hooks.gen_router_latency_ms = (time.perf_counter() - _t0) * 1000.0
             gen_result = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )
@@ -309,6 +341,31 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
 
         request.disaggregated_params.disagg_request_id = disagg_request_id
+        return request
+
+    async def _pretokenize_request(
+            self, request: UCompletionRequest) -> UCompletionRequest:
+        """Tokenize once at the disagg proxy before ctx/gen routing.
+
+        This uses the same module-level helper as the KV-cache-aware router, but
+        does not call into a router instance.  The request is rewritten to carry
+        only token IDs before any scheduling decision is made.
+        """
+        token_lists = await asyncio.to_thread(
+            tokenize_request,
+            request,
+            self._pretokenize_tokenizers,
+            self._pretokenize_model_types,
+            self._pretokenize_custom_tokenizer,
+            self._pretokenize_use_harmony,
+        )
+        if not token_lists:
+            return request
+
+        if isinstance(request, CompletionRequest):
+            request.prompt = token_lists[0] if len(token_lists) == 1 else token_lists
+        elif isinstance(request, ChatCompletionRequest):
+            request.prompt_token_ids = token_lists[0]
         return request
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
@@ -472,7 +529,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_req, gen_req = None, None
         disagg_request_id = get_global_disagg_request_id(self._config.node_id)
         if need_ctx:
+            _t0 = time.perf_counter()
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
+            if hooks:
+                hooks.ctx_router_latency_ms = (time.perf_counter() - _t0) * 1000.0
             ctx_req = self._get_ctx_request(request, disagg_request_id)
         gen_req = self._get_gen_request(
             request,

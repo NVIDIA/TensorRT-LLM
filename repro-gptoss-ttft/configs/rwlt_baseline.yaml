@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Baseline RWLT run for agg vs disagg comparison at conc=1. ~30 trajectories
+# per phase; should finish in 5-15 minutes per layout depending on prompt mix.
+#
+# Mirrors the cookbook rwlt config defaults from
+# /home/scratch.bbuddharaju_gpu/artificial-analysis/bench_sflow/configs/rwlt/base_config.yaml
+# but pinned to conc=1 (single-concurrency for direct comparison with our
+# 32-prompt benchmark_serving runs at conc=1).
+#
+# base_url and model are overridden on the command line by scripts/run_rwlt.sh.
+
+base_url: http://localhost:8000/v1
+model: openai/gpt-oss-120b
+api_key: not-required
+
+concurrencies: [1]
+phase_timeout_seconds: 1800.0
+user_spawn_rate: 1.0
+settling_time_seconds: 0
+
+min_measurement_seconds: 0.0
+min_total_trajectories: 30
+min_trajectories_per_user: 30
+
+trajectory_path: /home/scratch.shobhitv_coreai/aa-rwlt-shared-datasets/aa-rwlt_coding-agent-scenario_tuning_v2.jsonl
+trajectories_per_user: 30
+max_starting_line_offset: 10
+seed: 42
+
+timeout_seconds: 300.0
+max_tokens: 16384
+reasoning_effort: high
+
+record_err_reasons: true
+record_err_reasons_include_input: false
+tool_calls_args_only: true
