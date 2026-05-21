@@ -448,7 +448,9 @@ def check_platform_support(comm_type: str) -> Optional[str]:
 def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
     """Return skip reason string if config is infeasible, else None."""
     if config.num_experts % config.ep_size != 0 and comm_type not in (
-            COMM_NVLINK_ONE_SIDED, COMM_ALLGATHER_RS):
+        COMM_NVLINK_ONE_SIDED,
+        COMM_ALLGATHER_RS,
+    ):
         # NVLinkOneSided supports non-divisible EP natively (ceil/floor
         # partitioning); AllGatherReduceScatter is the production fallback
         # selected by CommunicationFactory for the same case. Other comm
