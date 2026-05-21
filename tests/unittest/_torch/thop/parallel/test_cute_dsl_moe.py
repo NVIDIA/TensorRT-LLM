@@ -15,14 +15,19 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import get_sm_version
 
 
-def swiglu_ref(x: torch.Tensor) -> torch.Tensor:
+def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
     x, gate = x.chunk(2, dim=-1)
+    if swiglu_limit != float("inf"):
+        gate = gate.clamp(max=swiglu_limit)
+        x = x.clamp(min=-swiglu_limit, max=swiglu_limit)
     return x * torch.nn.functional.silu(gate)
 
 
-def apply_activation_ref(x: torch.Tensor, activation_type: ActivationType) -> torch.Tensor:
+def apply_activation_ref(
+    x: torch.Tensor, activation_type: ActivationType, swiglu_limit: float = float("inf")
+) -> torch.Tensor:
     if activation_type == ActivationType.Swiglu:
-        return swiglu_ref(x)
+        return swiglu_ref(x, swiglu_limit)
     if activation_type == ActivationType.Relu2:
         return relu2(x)
     raise ValueError(f"Unsupported activation_type: {activation_type}")
@@ -613,6 +618,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
     num_tokens: int, top_k: int, ep_size: int, tile_size: int
 ):
     sf_vec_size = 16
+    swiglu_limit = 1.0
     hidden_size = 4096
     interm_size = 8192
     num_experts = 256
@@ -691,7 +697,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = swiglu_ref(c_ref)
+    c_ref = swiglu_ref(c_ref, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
@@ -710,6 +716,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
         local_expert_offset=0,
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
+        swiglu_limit=swiglu_limit,
     )
 
     match_ratio = (
@@ -753,6 +760,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     4. Quantizes output to FP4 with scale factor generation
     """
     is_gated = is_gated_activation(activation_type)
+    swiglu_limit = 1.0 if is_gated else float("inf")
     weight_n_multiplier = 2 if is_gated else 1
     sf_vec_size = 16
     hidden_size = 4096
@@ -870,7 +878,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = apply_activation_ref(c_ref, activation_type)
+    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
@@ -893,6 +901,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
         activation_type=activation_type,
+        swiglu_limit=swiglu_limit,
     )
 
     # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
