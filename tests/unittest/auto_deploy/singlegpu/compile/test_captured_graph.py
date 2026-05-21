@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import operator
 from contextlib import contextmanager
 from unittest.mock import MagicMock
@@ -233,7 +247,7 @@ class TestCapturedGraphCapture:
 
         def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             captured_shapes.append(tuple(arg.shape for arg in args))
-            return object()
+            return object(), (0,)
 
         monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
 
@@ -270,7 +284,7 @@ class TestCapturedGraphCapture:
         )
 
         def fake_capture_one_graph(self, *args, **kwargs):
-            return object()
+            return object(), (2,)
 
         monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
 
@@ -284,6 +298,265 @@ class TestCapturedGraphCapture:
         compiled_model.capture_graph(get_args_kwargs, [2])
 
         assert compiled_model.model.seen == [(2, 2)]
+
+    def test_auto_batched_inputs_keep_explicit_resources_static(self, monkeypatch):
+        class ModelWithInterleavedKwargs(nn.Module):
+            def forward(self, runtime_a, explicit_cache, runtime_b):
+                del explicit_cache
+                return runtime_a + runtime_b
+
+        compiled_model = CapturedGraph(
+            ModelWithInterleavedKwargs(),
+            resource_input_names={"explicit_cache"},
+        )
+        cache = torch.zeros(8, 2)
+        captured_kwarg_orders = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del args, refresh_args_static
+            captured_kwarg_orders.append(tuple(kwargs))
+            return object(), (4,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (), {
+                "runtime_a": torch.ones(bs, 2),
+                "explicit_cache": cache,
+                "runtime_b": torch.full((bs, 2), 2.0),
+            }
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+
+        assert compiled_model.num_batched_inputs == 2
+        assert compiled_model.dynamic_dims == [0, 0]
+        assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [(4, 2), (4, 2)]
+        assert captured_kwarg_orders == [("runtime_a", "runtime_b", "explicit_cache")]
+
+    def test_auto_batched_inputs_keep_cache_seq_interface_static(self, monkeypatch):
+        class Interface:
+            pass
+
+        class ModelWithCacheSeqInterface(nn.Module):
+            def forward(self, runtime_a, cache_seq_interface):
+                del cache_seq_interface
+                return runtime_a
+
+        compiled_model = CapturedGraph(
+            ModelWithCacheSeqInterface(),
+            resource_input_names={"cache_seq_interface"},
+        )
+        interface = Interface()
+        captured_kwarg_orders = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del args, refresh_args_static
+            captured_kwarg_orders.append(tuple(kwargs))
+            return object(), (4,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (), {
+                "runtime_a": torch.ones(bs, 2),
+                "cache_seq_interface": interface,
+            }
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+
+        assert compiled_model.num_batched_inputs == 1
+        assert compiled_model.dynamic_dims == [0]
+        assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [(4, 2)]
+        assert captured_kwarg_orders == [("runtime_a", "cache_seq_interface")]
+
+    def test_auto_batched_inputs_do_not_guess_legacy_cache_names(self, monkeypatch):
+        class ModelWithLegacyCacheName(nn.Module):
+            def forward(self, runtime_a, r0_cache, runtime_b):
+                return runtime_a + r0_cache[: runtime_a.shape[0]] + runtime_b
+
+        compiled_model = CapturedGraph(ModelWithLegacyCacheName())
+        cache = torch.zeros(8, 2)
+        captured_kwarg_orders = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del args, refresh_args_static
+            captured_kwarg_orders.append(tuple(kwargs))
+            return object(), (4,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (), {
+                "runtime_a": torch.ones(bs, 2),
+                "r0_cache": cache,
+                "runtime_b": torch.full((bs, 2), 2.0),
+            }
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+
+        assert compiled_model.num_batched_inputs == 3
+        assert compiled_model.dynamic_dims == [0, 0, 0]
+        assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [
+            (4, 2),
+            (8, 2),
+            (4, 2),
+        ]
+        assert captured_kwarg_orders == [("runtime_a", "r0_cache", "runtime_b")]
+
+    def test_capture_graph_records_smaller_output_extent_from_real_cuda_graph(self):
+        class ShrinkingOutputModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_calls = 0
+
+            def forward(self, x):
+                self.forward_calls += 1
+                return x[:-1] + 1
+
+        model = ShrinkingOutputModel().eval().to("cuda")
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+        bs = 5
+        hidden_size = 2
+        capture_input = torch.zeros(bs, hidden_size, device="cuda")
+
+        def get_args_kwargs(batch_size):
+            return (capture_input[:batch_size],), {}
+
+        with torch.inference_mode():
+            compiled_model.capture_graph(get_args_kwargs, [bs])
+
+            assert compiled_model._cudagraph_output_extents[(bs, hidden_size)] == (bs - 1,)
+            calls_after_capture = model.forward_calls
+
+            replay_input = torch.arange(
+                bs * hidden_size,
+                dtype=torch.float32,
+                device="cuda",
+            ).reshape(bs, hidden_size)
+            out = compiled_model(replay_input)
+
+            assert model.forward_calls == calls_after_capture
+            assert out.shape == (bs - 1, hidden_size)
+            torch.testing.assert_close(out, replay_input[:-1] + 1)
+
+    def test_forward_uses_captured_output_extent_when_input_extent_is_larger(self, monkeypatch):
+        class GatherLikeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_calls = 0
+
+            def forward(self, x):
+                self.forward_calls += 1
+                return x[:-1] + 1
+
+        class ReplayGraph:
+            def __init__(self, compiled_model, output_extent):
+                self.compiled_model = compiled_model
+                self.output_extent = output_extent
+                self.replay_calls = 0
+
+            def replay(self):
+                self.replay_calls += 1
+                input_buffer = self.compiled_model._input_buffers[0]
+                out_buffer = self.compiled_model._out_buffer_flat[0]
+                out_buffer.narrow(0, 0, self.output_extent).copy_(
+                    input_buffer.narrow(0, 0, self.output_extent) + 1
+                )
+
+        model = GatherLikeModel()
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+        graphs = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del kwargs, refresh_args_static
+            output_extent = args[0].shape[0] - 1
+            graph = ReplayGraph(self, output_extent)
+            graphs.append(graph)
+            return graph, (output_extent,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (torch.ones(bs, 2),), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [5])
+
+        calls_after_capture = model.forward_calls
+        out = compiled_model(torch.full((5, 2), 3.0))
+
+        assert model.forward_calls == calls_after_capture
+        assert graphs[0].replay_calls == 1
+        assert out.shape == (4, 2)
+        torch.testing.assert_close(out, torch.full((4, 2), 4.0))
+
+    def test_forward_falls_back_when_captured_output_extent_exceeds_buffer(self, monkeypatch):
+        class EchoModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_calls = 0
+
+            def forward(self, x):
+                self.forward_calls += 1
+                return x + 1
+
+        class GraphShouldNotReplay:
+            def replay(self):
+                raise AssertionError("oversized runtime batch should fall back to eager")
+
+        model = EchoModel()
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del self, args, kwargs, refresh_args_static
+            return GraphShouldNotReplay(), (4,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (torch.ones(bs, 2),), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+        compiled_model._input_buffers[0] = torch.empty(5, 2)
+        compiled_model.cudagraphs[(5, 2)] = GraphShouldNotReplay()
+        compiled_model._cudagraph_output_extents[(5, 2)] = (5,)
+
+        calls_after_capture = model.forward_calls
+        out = compiled_model(torch.ones(5, 2))
+
+        assert model.forward_calls == calls_after_capture + 1
+        torch.testing.assert_close(out, torch.full((5, 2), 2.0))
+
+    @pytest.mark.parametrize(
+        ("output_extents", "error_match"),
+        [
+            (None, "output extent metadata is missing"),
+            ((2, 2), "output extent metadata does not match captured outputs"),
+        ],
+    )
+    def test_forward_raises_for_inconsistent_output_extent_metadata(
+        self, monkeypatch, output_extents, error_match
+    ):
+        model = nn.Identity()
+        compiled_model = CapturedGraph(model, num_batched_inputs=1)
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del self, args, kwargs, refresh_args_static
+            return object(), (2,)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (torch.ones(bs, 2),), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [2])
+        graph_key = (2, 2)
+        if output_extents is None:
+            del compiled_model._cudagraph_output_extents[graph_key]
+        else:
+            compiled_model._cudagraph_output_extents[graph_key] = output_extents
+
+        with pytest.raises(RuntimeError, match=error_match):
+            compiled_model(torch.ones(2, 2))
 
 
 # ============================================================================
@@ -746,6 +1019,8 @@ class TestCompileModelGraphModuleTargetCollection:
         cm.info.max_batch_size = 8
         cm.info.max_num_tokens = 64
         cm.named_args = {}
+        cm.resource_names = ("explicit_cache",)
+        cm._spec_config = None
         return cm
 
     @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
@@ -817,6 +1092,78 @@ class TestCompileModelGraphModuleTargetCollection:
         assert mod_compiled is wrapper
         assert info.skipped is False
         assert compiled_models == [wrapper.child]
+
+    def test_compile_model_passes_resource_names_to_backend(self, monkeypatch):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiler_kwargs_seen = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                del model
+                compiler_kwargs_seen.append(compiler_kwargs)
+
+            def compile(self):
+                return wrapper.child
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile",
+            backend="torch-cudagraph",
+            piecewise_enabled=True,
+        )
+        cm = self._make_cm()
+
+        transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert compiler_kwargs_seen[0]["resource_input_names"] == ("explicit_cache",)
+        assert compiler_kwargs_seen[0]["num_batched_inputs"] is None
+
+    def test_compile_model_marks_cache_seq_interface_static_for_spec_decode(self, monkeypatch):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiler_kwargs_seen = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                del model
+                compiler_kwargs_seen.append(compiler_kwargs)
+
+            def compile(self):
+                return wrapper.child
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile",
+            backend="torch-cudagraph",
+            piecewise_enabled=True,
+        )
+        cm = self._make_cm()
+        cm._spec_config = MagicMock()
+
+        transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert compiler_kwargs_seen[0]["resource_input_names"] == (
+            "explicit_cache",
+            "cache_seq_interface",
+        )
+        assert compiler_kwargs_seen[0]["num_batched_inputs"] is None
 
     @pytest.mark.parametrize(
         "backend", ["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"]

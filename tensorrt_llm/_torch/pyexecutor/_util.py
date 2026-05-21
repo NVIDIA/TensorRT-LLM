@@ -41,7 +41,8 @@ from .llm_request import ExecutorResponse
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
-                                  use_cpp_mamba_cache_manager)
+                                  use_cpp_mamba_cache_manager,
+                                  use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
@@ -75,9 +76,14 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     """Resolve the concrete KV cache manager class for ``model_config``.
 
     For hybrid mamba models the choice between ``Mixed`` (separate pools,
-    needed for disagg / TRTLLM_USE_CPP_MAMBA) and ``Cpp`` (unified pool with
-    block reuse) is made here. Callers that don't care about disagg can omit
-    ``is_disagg`` and get the unified-pool default.
+    needed for disagg / TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA) and
+    ``Cpp`` (unified pool with block reuse) is made here. Callers that don't
+    care about disagg can omit ``is_disagg`` and get the unified-pool default.
+
+    Env-var overrides (agg mode only — disagg picks its inner impl via
+    ``cache_transceiver_config.transceiver_runtime``):
+      * ``TRTLLM_USE_CPP_MAMBA=1`` — Mixed manager with CppMambaCacheManager.
+      * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
@@ -90,7 +96,8 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
-        if is_disagg or use_cpp_mamba_cache_manager():
+        if is_disagg or use_cpp_mamba_cache_manager(
+        ) or use_py_mamba_cache_manager():
             return MixedMambaHybridCacheManager
         return CppMambaHybridCacheManager
     else:
@@ -236,14 +243,16 @@ class KvCacheCreator:
                     "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
                 )
                 cls = KVCacheManager
-        # The V1-route hybrid mamba managers (disagg via TRTLLM_USE_CPP_MAMBA,
-        # or one-model speculative decoding) keep mamba state in a separate
-        # cache that doesn't honor block reuse. Warn at the routing site so
-        # users see the warning where the decision is actually made.
+        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
+        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
+        # state in a separate cache that doesn't honor block reuse. Warn at
+        # the routing site so users see the warning where the decision is
+        # actually made.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
                 and self._kv_cache_config.enable_block_reuse:
             uses_v1_mamba_route = self._is_disagg \
                 or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
                 or self._speculative_config is not None
             if uses_v1_mamba_route:
                 logger.warning(
@@ -358,7 +367,13 @@ class KvCacheCreator:
                     multimodal_hashes=multimodal_input.multimodal_hashes,
                     multimodal_positions=multimodal_input.multimodal_positions,
                     multimodal_lengths=multimodal_input.multimodal_lengths,
-                    multimodal_uuids=multimodal_input.multimodal_uuids
+                    multimodal_uuids=multimodal_input.multimodal_uuids,
+                    multimodal_item_run_cu_offsets=multimodal_input.
+                    multimodal_item_run_cu_offsets,
+                    multimodal_run_positions=multimodal_input.
+                    multimodal_run_positions,
+                    multimodal_run_lengths=multimodal_input.
+                    multimodal_run_lengths,
                 ) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
@@ -1265,6 +1280,17 @@ def _create_kv_cache_manager(
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False
 
+        # Use replay algorithm for mamba (default is on).
+        enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
+                                                '1') == '0'
+        if enforce_disable_replay:
+            logger.info(
+                "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
+            use_replay = False
+        else:
+            logger.info(
+                "Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -1672,6 +1698,8 @@ def create_py_executor_instance(
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
+        enable_early_first_token_response=llm_args.
+        enable_early_first_token_response,
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len

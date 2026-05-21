@@ -84,9 +84,6 @@ class CutlassFusedMoE(MoE):
             "dtypes": {torch.bfloat16},
         },
         # NVFP4: SM in {100, 103, 120, 121}
-        # SM 120 = desktop Blackwell (e.g. RTX 5090 / GB202)
-        # SM 121 = GB10 / DGX Spark
-        # C++ kernel: isValidSM120MOESpecialisation() supports FP4xFP4 and FP8xFP4
         QuantAlgo.NVFP4: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
@@ -111,9 +108,9 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("in", {100, 103}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # W4A8_MXFP4_MXFP8: SM in {100, 103}
+        # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
@@ -140,7 +137,7 @@ class CutlassFusedMoE(MoE):
         - W8A16: SM >= 80
         - W4A16_MXFP4: SM == 90 only
         - W4A8_MXFP4_FP8: SM in {100, 103}
-        - W4A8_MXFP4_MXFP8: SM in {100, 103}
+        - W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)

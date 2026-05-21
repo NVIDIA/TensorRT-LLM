@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     RankIterStatsPayload,
     RankState,
 )
+from tensorrt_llm.scheduling_params import SchedulingParams
 
 
 def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
@@ -202,6 +203,23 @@ class TestDefaultADPRouter:
         result, _ = router.route_requests(states, [req], max_num_active_requests=2)
         assert len(result[0]) == 1
         assert len(result[1]) == 0
+
+    def test_default_attention_dp_relax_is_relaxed(self):
+        router = DefaultADPRouter(dist=_mock_dist())
+        states = [
+            RankState(rank=0, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
+        ]
+        req_relax = _make_request_item(1, target_dp_rank=0)
+        req_relax.request.py_scheduling_params = SchedulingParams(attention_dp_rank=0)
+        req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
+
+        result, _ = router.route_requests(
+            states, [req_relax, req_strict], max_num_active_requests=1
+        )
+
+        assert result[0] == [req_strict]
+        assert req_relax in result[1]
 
     def test_favors_less_loaded_rank(self):
         router = DefaultADPRouter(dist=_mock_dist())
@@ -443,6 +461,53 @@ def test_schedule_attention_dp_requests_empty_lists(
     )
     result = all_ranks_new_requests[0]
     assert len(result) == 0
+
+
+def test_schedule_attention_dp_requests_serve_default_relax_None_does_not_crash(
+    attention_dp_config, all_ranks_num_active_requests, all_ranks_num_active_tokens
+):
+    """Regression: trtllm-serve produces SchedulingParams with attention_dp_relax=None.
+
+    openai_server.py builds ``SchedulingParams(agent_hierarchy=...)`` on every
+    chat request, leaving ``attention_dp_rank`` and ``attention_dp_relax`` at
+    their dataclass default of None. With >=2 such requests in one scheduling
+    iteration, ``sorted(new_requests, key=get_relax_value)`` previously raised
+    ``TypeError: '<' not supported between instances of 'NoneType' and
+    'NoneType'`` because the key returned None for every item.
+
+    Why prior coverage missed it:
+      * Every ADP CI E2E test calls ``LLM(...).generate`` where
+        ``request.scheduling_params`` is None, so ``base_worker`` leaves
+        ``py_scheduling_params=None`` and ``get_relax_value`` short-circuits
+        on the ``if scheduling_params is None`` branch.
+      * The mock factory in this file defaults ``attention_dp_relax=False``,
+        not None, so existing unit tests never construct the buggy shape.
+
+    Use the real ``SchedulingParams`` dataclass so the test tracks the actual
+    production default — if it ever flips back to None this stays accurate.
+    """
+    from tensorrt_llm.scheduling_params import SchedulingParams
+
+    def _make_serve_shaped_request(req_id):
+        mock_request = Mock()
+        mock_request.py_scheduling_params = SchedulingParams()
+        mock_request.input_token_ids = [1, 2, 3]
+        return RequestQueueItem(req_id, mock_request)
+
+    new_requests = [_make_serve_shaped_request(i) for i in range(4)]
+
+    # No raise = sort key is None-safe. All four items have
+    # attention_dp_rank=None so they fall into remaining_unscheduled and
+    # then balance across ranks; with capacity 8 per rank they all land.
+    all_ranks_new_requests, _ = _assign(
+        all_ranks_num_active_requests,
+        all_ranks_num_active_tokens,
+        new_requests,
+        attention_dp_config["max_num_active_requests"],
+    )
+
+    total_assigned = sum(len(reqs) for reqs in all_ranks_new_requests.values())
+    assert total_assigned == 4
 
 
 def test_schedule_attention_dp_requests_expected_num_active_calculation(
@@ -925,6 +990,19 @@ class TestKVCacheAwareADPRouterRouting:
         result, _ = router.route_requests(self._rank_states(2), [req], max_num_active_requests=10)
         assert result[0] == []
         assert result[1] == [req]
+
+    def test_default_attention_dp_relax_is_relaxed(self):
+        router = self._make_router(tp_size=2)
+        req_relax = _make_request_item(1, target_dp_rank=0)
+        req_relax.request.py_scheduling_params = SchedulingParams(attention_dp_rank=0)
+        req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
+
+        result, _ = router.route_requests(
+            self._rank_states(2), [req_relax, req_strict], max_num_active_requests=1
+        )
+
+        assert result[0] == [req_strict]
+        assert req_relax in result[1]
 
     def test_match_rate_threshold_gates_cache_affinity(self):
         """With rank 0 loaded but holding cache, and rank 1 idle with no
