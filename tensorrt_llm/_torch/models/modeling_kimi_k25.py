@@ -1630,7 +1630,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         **kwargs,
     ) -> torch.Tensor:
         num_context_requests = attn_metadata.num_contexts
-        multimodal_params = kwargs.get("multimodal_params", [])
+        multimodal_params = kwargs.pop("multimodal_params", [])
         mm_embeds: List[torch.Tensor] = []
 
         if len(multimodal_params) > 0:
@@ -1678,10 +1678,14 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             **fuse_kwargs,
         )
 
+        forward_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("mm_token_indices", "text_token_indices")
+        }
         return self.llm.forward(
             attn_metadata,
             input_ids,
             position_ids,
             inputs_embeds,
             return_context_logits,
+            **forward_kwargs,
         )

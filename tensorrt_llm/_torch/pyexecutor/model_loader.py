@@ -452,15 +452,18 @@ class ModelLoader:
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
 
-                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                    # VLM wrappers (e.g. Kimi-K2.5) keep the LLM backbone in
+                    # ``model.llm`` and the draft attributes live there.
+                    llm_backbone = getattr(model, "llm", model)
+                    draft_model_arch = llm_backbone.draft_config.pretrained_config.architectures[
                         0]
                     draft_weight_mapper = AutoCheckpointMapper.get(
                         checkpoint_loader.checkpoint_format, draft_model_arch)
                     draft_weight_mapper.init_model_and_config(
-                        model.draft_model, model.draft_config)
+                        llm_backbone.draft_model, llm_backbone.draft_config)
 
-                    self._call_load_weights(model.load_draft_weights, weights,
-                                            draft_weight_mapper)
+                    self._call_load_weights(llm_backbone.load_draft_weights,
+                                            weights, draft_weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
@@ -468,7 +471,9 @@ class ModelLoader:
                 initialize_dummy_weights(model)
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    model.draft_model.load_weights_from_target_model(model)
+                    llm_backbone = getattr(model, "llm", model)
+                    llm_backbone.draft_model.load_weights_from_target_model(
+                        llm_backbone)
 
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.
