@@ -64,6 +64,7 @@ tensorrt_llm/scripts
 docs/source/**/*.rst
 !docs/source/examples/index.rst
 !docs/source/_includes/note_sections.rst
+!docs/source/features/auto_deploy/transforms.rst
 *.swp
 .nfs*
 
