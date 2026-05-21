@@ -331,7 +331,7 @@ def launch_disaggregated_llm(
         gen_servers.append((env, gen_server_args))
 
     @contextlib.contextmanager
-    def multi_popen(server_configs, server_name="", enable_redirect_log=False):
+    def multi_popen(server_configs, server_name="", enable_redirect_log=True):
         processes = []
         log_files = []
         try:
@@ -1978,13 +1978,13 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-@skip_pre_blackwell
+# @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
     MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
 
-    def _make_configs(self, backend: str, use_python_runtime: bool = False):
+    def _make_configs(self, use_python_runtime: bool = False):
         if use_python_runtime:
             cache_transceiver_config = {
                 "backend": "NIXL",
@@ -1993,7 +1993,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             }
         else:
             cache_transceiver_config = {
-                "backend": backend,
+                "backend": "UCX",
                 "max_tokens_in_buffer": 8192,
             }
 
@@ -2001,8 +2001,9 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             "max_batch_size": 32,
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": cache_transceiver_config,
-            "tensor_parallel_size": 4,
-            "moe_expert_parallel_size": 4,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "pipeline_parallel_size": 2,
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "mamba_ssm_cache_dtype": "float16",
@@ -2057,8 +2058,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         if use_py_transceiver and block_reuse:
             pytest.skip("Python transceiver does not support block reuse")
 
-        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            "UCX", use_py_transceiver)
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         if mtp_nextn > 0:
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
             ctx_cfg["speculative_config"] = spec
@@ -2073,7 +2073,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     def test_nixl_backend(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            "NIXL", use_python_runtime=True)
+            use_python_runtime=True)
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
@@ -2081,7 +2081,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            "NIXL", use_python_runtime=True)
+            use_python_runtime=True)
         ctx_cfg["tensor_parallel_size"] = 2
         ctx_cfg["moe_expert_parallel_size"] = 2
         ctx_cfg["enable_attention_dp"] = True
@@ -2101,17 +2101,12 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
 
     def _make_configs(self, use_py_transceiver: bool):
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "max_tokens_in_buffer": 8192,
+        }
         if use_py_transceiver:
-            cache_transceiver_config = {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "PYTHON",
-            }
-        else:
-            cache_transceiver_config = {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
-            }
+            cache_transceiver_config["transceiver_runtime"] = "PYTHON"
 
         ctx_server_config = {
             "max_batch_size": 32,

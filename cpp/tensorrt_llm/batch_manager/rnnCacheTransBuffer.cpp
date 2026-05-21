@@ -110,14 +110,32 @@ size_t RnnCacheTransBufferManager::computeTransferBufferSizeFromPool(
         numLocalLayers = std::max(numLocalLayers, layerCount);
     }
 
-    size_t bufferSizePerSlot = numLocalLayers * (convBytesPerLayer + ssmBytesPerLayer);
+    size_t bufferSizePerBlock = numLocalLayers * (convBytesPerLayer + ssmBytesPerLayer);
+
+    // Compute max real blocks per request for buffer sizing.
+    // Real blocks are allocated at: every statesSnapshotInterval tokens + end-of-prompt + saveLastSnapshot.
+    auto const& blockManager = kvCacheManager->getBlockManager();
+    auto const& linearMeta = blockManager.getLinearAttentionMetadata();
+    SizeType32 maxRealBlocksPerSeq = 1; // Default: at least 1 real block (end-of-prompt)
+    if (linearMeta.has_value() && linearMeta->statesSnapshotInterval > 0)
+    {
+        auto const recurrentWs
+            = static_cast<SizeType32>(kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
+        auto const wsMeta = blockManager.getWindowSizeMetadata(recurrentWs);
+        SizeType32 maxTokenNum = wsMeta.maxTokenNum;
+        // Number of interval snapshots + end-of-prompt block + saveLastSnapshot.
+        maxRealBlocksPerSeq
+            = maxTokenNum / linearMeta->statesSnapshotInterval + 1 + (linearMeta->saveLastSnapshot ? 1 : 0);
+    }
+
+    size_t bufferSize = static_cast<size_t>(maxRealBlocksPerSeq) * bufferSizePerBlock;
 
     TLLM_LOG_DEBUG(
         "RNN computeTransferBufferSizeFromPool: numLocalLayers=%d, convBytesPerLayer=%lu, ssmBytesPerLayer=%lu, "
-        "totalPerSlot=%lu",
-        numLocalLayers, convBytesPerLayer, ssmBytesPerLayer, bufferSizePerSlot);
+        "bufferSizePerBlock=%lu, maxRealBlocksPerSeq=%d, totalBufferSize=%lu",
+        numLocalLayers, convBytesPerLayer, ssmBytesPerLayer, bufferSizePerBlock, maxRealBlocksPerSeq, bufferSize);
 
-    return bufferSizePerSlot > 0 ? bufferSizePerSlot : common::getEnvMemSizeForKVCacheTransferBuffer();
+    return bufferSize > 0 ? bufferSize : common::getEnvMemSizeForKVCacheTransferBuffer();
 }
 
 RnnCacheTransBufferManager::RnnCacheTransBufferManager(kv_cache_manager::BaseKVCacheManager* kvCacheManager,

@@ -1534,10 +1534,22 @@ void splitUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<S
         }
         else if constexpr (sizeof(T) <= 2)
         {
-            splitUnifiedPoolConvKernel<T, subWarpSize, 2>
-                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
-                    numLayers, inputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
-                    sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+            if (vecSizeByte >= 2)
+            {
+                splitUnifiedPoolConvKernel<T, subWarpSize, 2>
+                    <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev,
+                        dConvMinus1, numLayers, inputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements,
+                        numConvSections, sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev,
+                        prefixLayerNumDevPtr);
+            }
+            else if constexpr (sizeof(T) == 1)
+            {
+                splitUnifiedPoolConvKernel<T, subWarpSize, 1>
+                    <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev,
+                        dConvMinus1, numLayers, inputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements,
+                        numConvSections, sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev,
+                        prefixLayerNumDevPtr);
+            }
         }
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
@@ -1772,10 +1784,22 @@ void concatUnifiedPoolConv(runtime::ITensor::SharedPtr const& pool, std::vector<
         }
         else if constexpr (sizeof(T) <= 2)
         {
-            concatUnifiedPoolConvKernel<T, subWarpSize, 2>
-                <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev, dConvMinus1,
-                    numLayers, outputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements, numConvSections,
-                    sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev, prefixLayerNumDevPtr);
+            if (vecSizeByte >= 2)
+            {
+                concatUnifiedPoolConvKernel<T, subWarpSize, 2>
+                    <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev,
+                        dConvMinus1, numLayers, outputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements,
+                        numConvSections, sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev,
+                        prefixLayerNumDevPtr);
+            }
+            else if constexpr (sizeof(T) == 1)
+            {
+                concatUnifiedPoolConvKernel<T, subWarpSize, 1>
+                    <<<gridDim, blockDim, 0, bufferManager.getStream().get()>>>(inputPtrsDev, outputPtrsDev,
+                        dConvMinus1, numLayers, outputBlockNum, domainPPSize, layerStrideElements, ssmOffsetElements,
+                        numConvSections, sectionDimsLocalDev, sectionDimsDomainTPDev, sectionOffsetsLocalDev,
+                        prefixLayerNumDevPtr);
+            }
         }
     }
     TLLM_CUDA_CHECK(cudaGetLastError());

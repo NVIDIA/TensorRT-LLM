@@ -1155,6 +1155,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata.rnn_n_groups = self._rnn_n_groups
         self.linear_attention_metadata.rnn_conv_section_layout = conv_section_map.get(
             self._rnn_conv_section_layout, 0)
+        self.linear_attention_metadata.rnn_ssm_bytes = self.ssm_bytes
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
@@ -1537,7 +1538,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if request in self.requests:
             self.requests.remove(request)
-            self._request_id_to_state_index.pop(request.py_request_id, None)
+            # self._request_id_to_state_index.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:

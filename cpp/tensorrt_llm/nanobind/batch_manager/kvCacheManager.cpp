@@ -338,7 +338,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("rnn_d_state", &tbk::LinearAttentionMetadata::rnnDState)
         .def_rw("rnn_d_conv", &tbk::LinearAttentionMetadata::rnnDConv)
         .def_rw("rnn_n_groups", &tbk::LinearAttentionMetadata::rnnNGroups)
-        .def_rw("rnn_conv_section_layout", &tbk::LinearAttentionMetadata::rnnConvSectionLayout);
+        .def_rw("rnn_conv_section_layout", &tbk::LinearAttentionMetadata::rnnConvSectionLayout)
+        .def_rw("rnn_ssm_bytes", &tbk::LinearAttentionMetadata::rnnSsmBytes);
 
     nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
         .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
