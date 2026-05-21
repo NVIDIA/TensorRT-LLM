@@ -11,6 +11,7 @@ model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 cuda_graph_config:
   max_batch_size: 64
+  enable_padding: true
 kv_cache_config:
   # tunable mamba cache dtype
   # --> use float32 for accuracy and default (auto) for speed
