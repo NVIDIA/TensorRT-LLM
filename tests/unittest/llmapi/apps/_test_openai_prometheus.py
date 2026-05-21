@@ -18,7 +18,8 @@ import os
 import re
 import tempfile
 import time
-from typing import Dict
+from typing import Dict, Optional
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -237,6 +238,52 @@ def _wait_for_metric_line(server: RemoteOpenAIServer,
     return data
 
 
+def _wait_for_metric_regex(
+        server: RemoteOpenAIServer,
+        pattern: str,
+        timeout: float = 10.0,
+        poll_interval: float = 0.5) -> tuple[str, Optional[re.Match[str]]]:
+    """Poll /prometheus/metrics until ``pattern`` matches a sample line."""
+    compiled = re.compile(pattern, re.MULTILINE)
+    start = time.time()
+    data = ""
+    match: Optional[re.Match[str]] = None
+    while time.time() - start < timeout:
+        response = urlopen(f'{server.url_root}/prometheus/metrics')
+        assert response.status == 200
+        data = response.read().decode("utf-8")
+        match = compiled.search(data)
+        if match is not None:
+            return data, match
+        time.sleep(poll_interval)
+    return data, match
+
+
+def _trigger_validation_error_400(server: RemoteOpenAIServer) -> None:
+    """Send a request that fails Pydantic validation and returns HTTP 400.
+
+    ``truncate_prompt_tokens=0`` violates CompletionRequest's Field(ge=1)
+    constraint, which routes through the RequestValidationError handler that
+    increments trtllm_request_error_total{http_code="400"}.
+    """
+    req = Request(
+        f'{server.url_root}/v1/completions',
+        data=json.dumps({
+            "model": "Server",
+            "prompt": "Hello",
+            "truncate_prompt_tokens": 0,
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urlopen(req)
+        pytest.fail("Expected HTTP 400 RequestValidationError")
+    except HTTPError as e:
+        assert e.code == 400, f"Expected HTTP 400, got {e.code}"
+        logger.info("Validation error correctly returned: %s", e)
+
+
 def test_new_metrics_exposed(server: RemoteOpenAIServer):
     """Verify metrics added by this PR appear on the /prometheus/metrics endpoint.
 
@@ -250,6 +297,20 @@ def test_new_metrics_exposed(server: RemoteOpenAIServer):
     trtllm_request_error_total{http_code="400"}.
     """
     METRIC_PREFIX = "trtllm_"
+    error_pattern = (r'^' + re.escape(METRIC_PREFIX + "request_error_total") +
+                     r'\{[^}]*http_code="400"[^}]*\}\s+(\S+)')
+
+    # Validation errors are counted synchronously in the exception handler.
+    _trigger_validation_error_400(server)
+    data, error_match = _wait_for_metric_regex(server,
+                                               error_pattern,
+                                               timeout=10.0)
+    assert error_match is not None, (
+        f"missing {METRIC_PREFIX}request_error_total{{http_code=\"400\"}} "
+        "in metrics after validation request")
+    assert float(error_match.group(1)) >= 1.0, (
+        f"expected request_error_total{{http_code=\"400\"}} >= 1, "
+        f"got {error_match.group(1)}")
 
     client = server.get_client()
     # Issue a few identical completion requests so the KV-cache reuses blocks
@@ -262,33 +323,11 @@ def test_new_metrics_exposed(server: RemoteOpenAIServer):
             stream=False,
         )
 
-    # Trigger a RequestValidationError → 400 to populate the error counter.
-    # `truncate_prompt_tokens=0` violates the Pydantic Field(ge=1) constraint
-    # on CompletionRequest, which is what the RequestValidationError handler
-    # in openai_server.py instruments. (`max_tokens` has no Field constraint,
-    # so a negative value is accepted by Pydantic and rejected later through
-    # a different code path that doesn't hit the validation handler.)
-    req = Request(
-        f'{server.url_root}/v1/completions',
-        data=json.dumps({
-            "model": "Server",
-            "prompt": "Hello",
-            "truncate_prompt_tokens": 0,
-        }).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        urlopen(req)
-    except Exception as e:
-        # urllib raises HTTPError on 4xx — that's expected.
-        logger.info(f"Validation error correctly returned: {e}")
-
     # Wait for the background iteration stats loop to populate prefill_batch_*.
-    # Looking for the histogram count line so we know an iteration scrape happened.
+    # Histogram _count only appears after numCtxTokens > 0 on an iteration.
     data = _wait_for_metric_line(server,
                                  METRIC_PREFIX + "prefill_batch_tokens_count",
-                                 timeout=15.0)
+                                 timeout=30.0)
 
     # Per-request metrics added by this PR
     assert METRIC_PREFIX + "prompt_cached_tokens_total" in data, \
@@ -302,10 +341,8 @@ def test_new_metrics_exposed(server: RemoteOpenAIServer):
     assert METRIC_PREFIX + "prefill_batch_tokens" in data, \
         f"missing {METRIC_PREFIX}prefill_batch_tokens in metrics"
 
-    # Request-error counter (HTTP 400 series should exist after the bogus request)
-    error_total_400 = re.search(
-        r'^' + re.escape(METRIC_PREFIX + "request_error_total") +
-        r'\{[^}]*http_code="400"[^}]*\}\s+(\S+)', data, re.MULTILINE)
+    # Request-error counter should still be present after completions.
+    error_total_400 = re.search(error_pattern, data, re.MULTILINE)
     assert error_total_400 is not None, \
         f"missing {METRIC_PREFIX}request_error_total{{http_code=\"400\"}} in metrics"
     assert float(error_total_400.group(1)) >= 1.0, \
