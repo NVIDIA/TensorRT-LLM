@@ -107,9 +107,7 @@ def Field(default: Any = ...,
 
 
 class CudaGraphConfig(StrictBaseModel):
-    """
-    Configuration for CUDA graphs.
-    """
+    """Configuration for CUDA graphs."""
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
         default=None,
