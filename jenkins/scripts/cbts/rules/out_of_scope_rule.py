@@ -57,14 +57,24 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "jenkins/scripts/cbts/",
 )
 
-# Path suffixes (extensions) under tests/ with no test-execution impact.
-OUT_OF_SCOPE_TESTS_SUFFIXES: tuple[str, ...] = (".md",)
+# Path suffixes (extensions) with no test-execution impact, anywhere in
+# the tree.
+# - `.md`: docs only, not loaded by any test.
+# Excluded on purpose:
+# - `.txt`: requirements.txt / constraints.txt are runtime-relevant.
+# - `.png` / `.jpg` / `.jpeg` / `.gif` / `.svg` / `.webp`: image files
+#   under `examples/visual_gen/` are real test fixtures (e.g.
+#   `cat_piano.png`, `woman_skyline_original_720p.jpeg` loaded by
+#   `tests/unittest/_torch/visual_gen/`). Since location alone cannot
+#   distinguish a fixture from a doc diagram, image edits fall back to
+#   baseline rather than being claimed as noop here.
+OUT_OF_SCOPE_SUFFIXES: tuple[str, ...] = (".md",)
 
 
 def is_out_of_scope(path: str) -> bool:
     if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
         return True
-    if path.startswith("tests/") and path.endswith(OUT_OF_SCOPE_TESTS_SUFFIXES):
+    if path.endswith(OUT_OF_SCOPE_SUFFIXES):
         return True
     return False
 
