@@ -164,9 +164,9 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
 - **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
-- **Parallel VAE** (`parallel_vae_size: N`): Shards the final VAE decode along a spatial axis (constraint: `parallel_vae_size ≤ world_size`; WAN only).
+- **Parallel VAE** (`parallel_vae_size: N`): Shards the final VAE decode along a spatial axis (constraint: `parallel_vae_size ≤ world_size`; WAN/Cosmos3 only).
 - **Attention Parallel** — requires an LSE-capable attention backend (`FA4` and `CUTEDSL`):
-    - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (total CP degree = `N · M`; not combinable with Ulysses).
+    - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (total CP degree = `N · M`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
 ## Developer Guide
