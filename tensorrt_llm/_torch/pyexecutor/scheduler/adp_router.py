@@ -304,7 +304,8 @@ class DefaultADPRouter(ADPRouter):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
             if scheduling_params is None:
                 return True
-            return scheduling_params.attention_dp_relax
+            val = scheduling_params.attention_dp_relax
+            return True if val is None else val
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
@@ -327,9 +328,14 @@ class DefaultADPRouter(ADPRouter):
 
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
-        expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-            max(all_ranks_num_active_requests),
+        # Cap at max_num_active_requests so the per-rank target never
+        # exceeds what the rank can physically schedule.
+        expected_num_active_requests = min(
+            max(
+                (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+                max(all_ranks_num_active_requests),
+            ),
+            max_num_active_requests,
         )
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
@@ -576,7 +582,8 @@ class KVCacheAwareADPRouter(ADPRouter):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
             if scheduling_params is None:
                 return True
-            return scheduling_params.attention_dp_relax
+            val = scheduling_params.attention_dp_relax
+            return True if val is None else val
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
@@ -614,15 +621,20 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         # Loose cap at fair_share_multiplier * ceil(total / tp_size): safety
         # net against runaway concentration, still loose enough that cache
-        # affinity wins in the common case.
+        # affinity wins in the common case.  Hard-cap additionally at
+        # max_num_active_requests so the per-rank target never exceeds what
+        # the rank can physically schedule (matches DefaultADPRouter).
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
         fair_share = (
             total_num_active_requests + num_new_requests_all_ranks + tp_size - 1
         ) // tp_size
-        expected_num_active_requests = max(
-            math.ceil(self.fair_share_multiplier * fair_share),
-            max(all_ranks_num_active_requests),
+        expected_num_active_requests = min(
+            max(
+                math.ceil(self.fair_share_multiplier * fair_share),
+                max(all_ranks_num_active_requests),
+            ),
+            max_num_active_requests,
         )
         eligible_ranks = [
             rank
