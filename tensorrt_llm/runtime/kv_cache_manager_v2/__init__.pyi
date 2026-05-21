@@ -158,10 +158,6 @@ class BatchDesc:
     system_prompt_length: int = 0
 
 @dataclass(slots=True)
-class SwaScratchReuseConfig:
-    max_rewind_len: int = 0
-
-@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     vocab_size: int
@@ -172,11 +168,9 @@ class KVCacheManagerConfig:
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
     ssm_reuse_interval: int = 512
-    swa_scratch_reuse: SwaScratchReuseConfig | None = None
+    enable_swa_scratch_reuse: bool = False
     enable_stats: bool = True
     helix_config: HelixConfig | None = None
-    @property
-    def enable_swa_scratch_reuse(self) -> bool: ...
 
 # From _event_manager.py
 EventBlockHash: TypeAlias = int | str
@@ -271,11 +265,11 @@ class KVCacheEventManager:
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
 # From _block_radix_tree.py
+def gen_multi_modal_tokens(
+    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
+) -> list[TokenIdExt]: ...
 def gen_multimodal_cache_key_tokens(
-    id_offset: int,
-    multi_modal_data_digest: bytes,
-    num_tokens: int,
-    token_offset: int = 0,
+    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
 ) -> list[TokenIdExt]: ...
 
 # From _core/_kv_cache.py
@@ -293,7 +287,7 @@ class _KVCache:
         self,
         manager: "KVCacheManager",
         reuse_scope: ReuseScope,
-        reuse_match: Any | None,
+        input_tokens: Sequence[TokenIdExt] | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
         cache_salt_id: int | None = None,
@@ -346,7 +340,6 @@ class _KVCache:
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
     def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
-    def prefetch(self, target: CacheLevel) -> bool: ...
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
     @property
     def has_scratch_slots(self) -> bool: ...
@@ -434,18 +427,11 @@ class KVCacheManager:
     ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
-        lora_task_id: int | ReuseScope | None = None,
+        reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
-        cache_salt_id: int | None = None,
-        expected_prompt_length: int | None = None,
     ) -> _KVCache: ...
-    def probe_reuse(
-        self,
-        lora_task_id: int | ReuseScope | None = None,
-        input_tokens: Sequence[TokenIdExt] | None = None,
-    ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...

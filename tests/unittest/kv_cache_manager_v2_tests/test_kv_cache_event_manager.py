@@ -47,7 +47,10 @@ else:
         TokenId,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-        Block, ReuseScope, RootBlock)
+        Block,
+        ReuseScope,
+        RootBlock,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         init_cuda_once,
@@ -77,9 +80,13 @@ class _FakePageRef:
 class _FakeRootBlock:
     ordinal = -1
 
-    def __init__(self, lora_task_id=None, cache_salt_id=None):
+    def __init__(self, lora_task_id=None, cache_salt_id=None, reuse_scope=None):
+        # Support both the new ReuseScope-based shape and the legacy flat
+        # (lora_task_id, cache_salt_id) shape so tests can exercise either.
         self.lora_task_id = lora_task_id
         self.cache_salt_id = cache_salt_id
+        if reuse_scope is not None:
+            self.reuse_scope = reuse_scope
 
 
 class _FakeBlock:
@@ -392,15 +399,12 @@ def test_v2_kv_cache_event_manager_v1_hash_algo_matches_v1_block_key_hash():
 
 
 def test_v2_root_key_distinguishes_lora_from_cache_salt_id():
-    assert RootBlock.make_key(ReuseScope()) != RootBlock.make_key(
-        ReuseScope(lora_id=123))
-    assert RootBlock.make_key(ReuseScope()) != RootBlock.make_key(
-        ReuseScope(salt=123))
-    assert RootBlock.make_key(ReuseScope(lora_id=123)) != RootBlock.make_key(
-        ReuseScope(salt=123))
-    assert RootBlock.make_key(ReuseScope(lora_id=123,
-                                         salt=456)) != RootBlock.make_key(
-                                             ReuseScope(lora_id=456, salt=123))
+    assert RootBlock.make_key(ReuseScope()) != RootBlock.make_key(ReuseScope(lora_id=123))
+    assert RootBlock.make_key(ReuseScope()) != RootBlock.make_key(ReuseScope(salt=123))
+    assert RootBlock.make_key(ReuseScope(lora_id=123)) != RootBlock.make_key(ReuseScope(salt=123))
+    assert RootBlock.make_key(ReuseScope(lora_id=123, salt=456)) != RootBlock.make_key(
+        ReuseScope(lora_id=456, salt=123)
+    )
 
 
 def test_v2_kv_cache_event_manager_v1_hash_algo_mixes_cache_salt_id():
@@ -422,6 +426,43 @@ def test_v2_kv_cache_event_manager_v1_hash_algo_mixes_cache_salt_id():
         6280297290684427985,
         18177682803760873588,
     ]
+
+
+def test_v2_kv_cache_event_manager_v1_hash_reads_root_reuse_scope():
+    # Regression test: when ``RootBlock`` exposes its scope via a ReuseScope
+    # NamedTuple rather than direct ``lora_task_id`` / ``cache_salt_id``
+    # attributes, ``_root_attrs_from_root_block`` must still recover the same
+    # (lora_id, salt) — otherwise V1-compat event hashes silently collapse to
+    # (None, None) for every LoRA/salt request and Dynamo routing degrades.
+    tokens0 = [1, 2, 3, 4]
+    tokens1 = [5, 6]
+
+    def hashes_for(root):
+        event_manager = KVCacheEventManager(
+            max_kv_event_entries=8,
+            window_size=128,
+            hash_algo=KV_CACHE_HASH_ALGO_V1,
+        )
+        block0 = _FakeBlock(b"block0", tokens0, prev=root)
+        block1 = _FakeBlock(b"block1", tokens1, prev=block0)
+        event_manager.add_stored_block_event_from_block(block0)
+        event_manager.add_stored_block_event_from_block(block1)
+        return _stored_block_hashes(_flush_serialized_events(event_manager))
+
+    # ReuseScope-shaped RootBlock and legacy-shape RootBlock must produce
+    # identical event hashes for the same scope.
+    scope_root = _FakeRootBlock(reuse_scope=ReuseScope(lora_id=11, salt=22))
+    legacy_root = _FakeRootBlock(lora_task_id=11, cache_salt_id=22)
+    assert hashes_for(scope_root) == hashes_for(legacy_root)
+
+    # Different scopes must still produce different hashes (no silent collapse).
+    other_scope_root = _FakeRootBlock(reuse_scope=ReuseScope(lora_id=99, salt=22))
+    assert hashes_for(scope_root) != hashes_for(other_scope_root)
+
+    # An unsalted ReuseScope must match an unsalted legacy root.
+    empty_scope_root = _FakeRootBlock(reuse_scope=ReuseScope())
+    unsalted_legacy_root = _FakeRootBlock()
+    assert hashes_for(empty_scope_root) == hashes_for(unsalted_legacy_root)
 
 
 def test_v2_kv_cache_event_manager_v1_hash_recomputes_removed_parent():
@@ -537,9 +578,7 @@ def test_v1_and_v2_managers_emit_same_v1_hash_stored_events():
             ),
             is_streaming=False,
         )
-        manager_v1.impl.add_sequence_batch(
-            [(req.py_request_id, req.prompt_len, 1)], [req]
-        )
+        manager_v1.impl.add_sequence_batch([(req.py_request_id, req.prompt_len, 1)], [req])
         simulate_prefill_completion_only_use_for_testing(req)
         manager_v1.free_resources(req)
         manager_v1.flush_iteration_events()
@@ -880,7 +919,7 @@ def test_v2_stored_events_match_block_hash_chain():
         stored_events = _stored_events(events)
         assert len(stored_events) == 1
 
-        root_key = RootBlock.make_key(ReuseScope())
+        root_key = RootBlock.make_key(None)
         block0_key = Block.make_key(root_key, tokens[:tokens_per_block])
         block1_key = Block.make_key(block0_key, tokens[tokens_per_block:])
         expected_hashes = [block0_key.hex(), block1_key.hex()]
@@ -968,7 +1007,7 @@ def test_v2_reused_prefix_does_not_emit_duplicate_stored_events():
         reuse_events = _flush_serialized_events(event_manager)
         reused_hashes = _stored_block_hashes(reuse_events)
 
-        root_key = RootBlock.make_key(ReuseScope())
+        root_key = RootBlock.make_key(None)
         block0_key = Block.make_key(root_key, prefix_tokens[:tokens_per_block])
         block1_key = Block.make_key(block0_key, prefix_tokens[tokens_per_block:])
         block2_key = Block.make_key(block1_key, new_tokens)

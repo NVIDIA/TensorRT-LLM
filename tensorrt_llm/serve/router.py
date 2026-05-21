@@ -28,8 +28,9 @@ from tensorrt_llm.runtime import kv_cache_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     Block as V2Block
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
+    ReuseScope
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     RootBlock as V2RootBlock
-from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import _KVCache
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
@@ -739,8 +740,7 @@ def block_key_hasher(token_ids: list[int],
 def v2_sha256_block_hasher(token_ids: list[int],
                            parent_hash: Optional[str] = None,
                            cache_salt_id: Optional[int] = None) -> str:
-    tree_task_id = _KVCache._make_tree_task_id(None, cache_salt_id)
-    parent_key = (V2RootBlock.make_key(tree_task_id)
+    parent_key = (V2RootBlock.make_key(ReuseScope(salt=cache_salt_id))
                   if parent_hash is None else bytes.fromhex(parent_hash))
     return V2Block.make_key(parent_key, token_ids).hex()
 
@@ -836,11 +836,11 @@ class BlockHashMixin:
         elif hash_algo == KV_CACHE_HASH_ALGO_V2:
             block_hasher = v2_sha256_block_hasher
         elif hash_algo == KV_CACHE_HASH_ALGO_V2_SHA256_64:
-            tree_task_id = _KVCache._make_tree_task_id(None, cache_salt_id)
+            reuse_scope = ReuseScope(salt=cache_salt_id)
             block_hashes: list[list[BlockHash]] = []
             for token_list in token_lists:
                 hash_list = []
-                parent_key = V2RootBlock.make_key(tree_task_id)
+                parent_key = V2RootBlock.make_key(reuse_scope)
                 for t in range(0, len(token_list) - 1, self._tokens_per_block):
                     t_end = min(t + self._tokens_per_block, len(token_list) - 1)
                     parent_key = V2Block.make_key(parent_key,

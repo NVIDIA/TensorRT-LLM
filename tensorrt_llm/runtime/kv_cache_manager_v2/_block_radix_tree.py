@@ -15,12 +15,12 @@
 
 import hashlib
 from array import array
-from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, chunked, div_up, filled_list, find_index, unwrap_rawref
+from ._utils import TypedIndexList, chunked, div_up, filled_list, unwrap_rawref
 
 if TYPE_CHECKING:
     from ._event_manager import KVCacheEventManager
@@ -28,14 +28,9 @@ if TYPE_CHECKING:
 
 BlockKey = bytes
 
-# Per-request seed for the radix tree's root-block hash. Accepts ``int | None``
-# for the plain LoRA-id path, or a pre-hashed ``bytes`` digest when callers
-# need to mix additional context (e.g. ``cache_salt_id``) into the root.
-TreeTaskId = int | bytes | None
-
 
 class ReuseScope(NamedTuple):
-    """Compatibility namespace for callers that still pass lora/salt together."""
+    """Per-request namespace for prefix reuse."""
 
     lora_id: int | None = None
     salt: int | None = None
@@ -57,13 +52,6 @@ class ReuseScope(NamedTuple):
         return ret
 
 
-class ReuseMatch(NamedTuple):
-    """Volatile result of a KV cache prefix match."""
-
-    blocks: list["Block"]
-    num_tokens: int
-
-
 # id_offset is usually vocab_size
 def gen_multimodal_cache_key_tokens(
     id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
@@ -78,6 +66,12 @@ def gen_multimodal_cache_key_tokens(
         multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
         for i in range(num_tokens)
     ]
+
+
+def gen_multi_modal_tokens(
+    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
+) -> list[TokenIdExt]:
+    return gen_multimodal_cache_key_tokens(id_offset, multi_modal_data_digest, num_tokens)
 
 
 class Hasher:
@@ -122,16 +116,10 @@ class Hasher:
 TokenBlock = list[TokenIdExt]
 
 
-def _tree_task_hash_seed(tree_task_id: TreeTaskId | ReuseScope) -> int | bytes | None:
-    if isinstance(tree_task_id, ReuseScope):
-        return tree_task_id.to_bytes()
-    return tree_task_id
-
-
 def sequence_to_blockchain_keys(
-    tokens_per_block: int, tree_task_id: TreeTaskId | ReuseScope, tokens: Sequence[TokenIdExt]
+    tokens_per_block: int, reuse_scope: ReuseScope, tokens: Sequence[TokenIdExt]
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(_tree_task_hash_seed(tree_task_id)).digest
+    digest = Hasher(reuse_scope.to_bytes()).digest
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -267,17 +255,17 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "tree_task_id", "__rawref__")
+    __slots__ = ("_prev", "key", "next", "reuse_scope", "__rawref__")
     key: BlockKey
-    tree_task_id: TreeTaskId
+    reuse_scope: ReuseScope
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
-    def __init__(self, tree_task_id: TreeTaskId, prev: "BlockRadixTree") -> None:
-        self.key = self.make_key(tree_task_id)
+    def __init__(self, reuse_scope: ReuseScope, prev: "BlockRadixTree") -> None:
+        self.key = self.make_key(reuse_scope)
         assert self.key not in prev.next, "Root block already exists"
-        self.tree_task_id = tree_task_id
+        self.reuse_scope = reuse_scope
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
@@ -303,8 +291,8 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(tree_task_id: TreeTaskId | ReuseScope) -> BlockKey:
-        return Hasher(_tree_task_hash_seed(tree_task_id)).digest
+    def make_key(reuse_scope: ReuseScope) -> BlockKey:
+        return Hasher(reuse_scope.to_bytes()).digest
 
 
 class Block:
@@ -464,11 +452,11 @@ class BlockRadixTree:
     def __del__(self) -> None:
         self.__rawref__.invalidate()
 
-    def add_or_get_existing(self, tree_task_id: TreeTaskId) -> RootBlock:
-        key = RootBlock.make_key(tree_task_id)
+    def add_or_get_existing(self, reuse_scope: ReuseScope) -> RootBlock:
+        key = RootBlock.make_key(reuse_scope)
         if key in self.next:
             return self.next[key]
-        return RootBlock(tree_task_id, self)
+        return RootBlock(reuse_scope, self)
 
     @property
     def tokens_per_block(self) -> int:
@@ -496,31 +484,18 @@ class BlockRadixTree:
         assert not self.next
         return ret
 
-    def _num_matched_tokens(self, matched: list[tuple[Block, int]]) -> int:
-        if not matched:
-            return 0
-        return self._tokens_per_block * (len(matched) - 1) + matched[-1][1]
-
-    @staticmethod
-    def _has_pages(block: Block, lc_list: Iterable[LifeCycleId]) -> bool:
-        return all(block.storage[lc] is not None for lc in lc_list)
-
-    @staticmethod
-    def _has_page(block: Block, lc: LifeCycleId) -> bool:
-        return block.storage[lc] is not None
-
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to
     # tokens_per_block except the last one.
-    def _match_token_path(
+    def match(
         self,
-        tree_task_id: TreeTaskId,
+        reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
         for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, tree_task_id, tokens
+            self._tokens_per_block, reuse_scope, tokens
         ):
             if key in block.next:
                 block = block.next[key]
@@ -537,96 +512,6 @@ class BlockRadixTree:
             if partial_block is not None:
                 block = partial_block
                 yield block, match_len
-
-    def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
-        tokens_per_block = self._tokens_per_block
-        assert all(b[1] == tokens_per_block for b in matched[:-1])
-
-        life_cycles = self._life_cycles
-
-        # check for full attention layers
-        attn_life_cycles = list(life_cycles.attention_life_cycles())
-        if any(lc.window_size is None for _, lc in attn_life_cycles):
-            lc_list = [lc_idx for lc_idx, lc in attn_life_cycles if lc.window_size is None]
-
-            def check_no_pages(b: tuple[Block, int]) -> bool:
-                return not BlockRadixTree._has_pages(b[0], lc_list)
-
-            n = find_index(matched, check_no_pages)
-            matched = matched[:n]
-
-        swa_life_cycles = tuple(
-            (lc_idx, lc) for lc_idx, lc in attn_life_cycles if lc.window_size is not None
-        )
-        # check for SWA sink
-        for lc_idx, lc in swa_life_cycles:
-
-            def check_no_page_lc(b: tuple[Block, int]) -> bool:
-                return not BlockRadixTree._has_page(b[0], lc_idx)
-
-            n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
-            if n < lc.num_sink_blocks:
-                matched = matched[:n]
-        # Check SWA window and SSM snapshot constraints together,
-        # since SSM truncation can invalidate SWA invariants.
-        # SSM is checked first (intervals are large, so it prunes more).
-        ssm_lc_id = life_cycles.ssm_life_cycle_id
-        while matched:
-            # SSM truncation: truncate to the last block with an SSM snapshot
-            if ssm_lc_id is not None:
-                ssm_trunc = 0
-                for i in reversed(range(len(matched))):
-                    if matched[i][0].storage[ssm_lc_id] is not None:
-                        assert NDEBUG or matched[i][1] == self._tokens_per_block, (
-                            "SSM reuse snapshot must only be selected from a fully matched block"
-                        )
-                        ssm_trunc = i + 1
-                        break
-                matched = matched[:ssm_trunc]
-                if not matched:
-                    break
-            # SWA window check
-            num_tokens = self._num_matched_tokens(matched)
-            for lc_idx, lc in swa_life_cycles:
-                if lc.window_size is None:
-                    continue
-
-                def check_has_page_lc(b: tuple[Block, int]) -> bool:
-                    return BlockRadixTree._has_page(b[0], lc_idx)
-
-                n = find_index(reversed(matched), check_has_page_lc)
-                if n != 0:
-                    matched = matched[:-n]
-                    break
-                _, stale_end = lc.get_stale_range(num_tokens, tokens_per_block)
-
-                def has_no_page(b: tuple[Block, int]) -> bool:
-                    return not BlockRadixTree._has_page(b[0], lc_idx)
-
-                n = find_index(reversed(matched[stale_end:]), has_no_page)
-                if len(matched) - n > stale_end:
-                    matched = matched[: len(matched) - n - 1]
-                    break
-            else:
-                break
-        return matched
-
-    def match(
-        self,
-        tree_task_id: TreeTaskId,
-        tokens: Sequence[TokenIdExt],
-        enable_partial_match: bool = False,
-    ) -> ReuseMatch:
-        """
-        Return the currently reusable prefix match without holding pages.
-
-        The result is volatile: callers that need to reuse the returned blocks must
-        acquire ownership of the pages before depending on them.
-        """
-        matched = self._prune_match(
-            list(self._match_token_path(tree_task_id, tokens, enable_partial_match))
-        )
-        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(

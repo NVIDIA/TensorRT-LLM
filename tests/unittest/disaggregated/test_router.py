@@ -10,9 +10,8 @@ from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
                                                 hash_v1_block_key,
                                                 truncate_sha256_hash_to_int64)
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    sequence_to_blockchain_keys
-from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache import _KVCache
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+    ReuseScope, sequence_to_blockchain_keys)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
@@ -279,7 +278,7 @@ def test_v2_sha256_block_hashes_match_kv_cache_manager_v2(servers):
     expected_block_hashes = [
         block_key.hex()
         for token_block, block_key in sequence_to_blockchain_keys(
-            tokens_per_block, None, token_lists[0][:-1]) if token_block
+            tokens_per_block, ReuseScope(), token_lists[0][:-1]) if token_block
     ]
 
     assert block_hashes == [expected_block_hashes]
@@ -297,7 +296,7 @@ def test_v2_sha256_64_block_hashes_match_truncated_kv_cache_manager_v2(servers):
     expected_block_hashes = [
         truncate_sha256_hash_to_int64(block_key)
         for token_block, block_key in sequence_to_blockchain_keys(
-            tokens_per_block, None, token_lists[0][:-1]) if token_block
+            tokens_per_block, ReuseScope(), token_lists[0][:-1]) if token_block
     ]
 
     assert block_hashes == [expected_block_hashes]
@@ -330,11 +329,11 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         token_lists,
         hash_algo=KV_CACHE_HASH_ALGO_V2,
         cache_salt_id=cache_salt_id)
-    tree_task_id = _KVCache._make_tree_task_id(None, cache_salt_id)
+    reuse_scope = ReuseScope(salt=cache_salt_id)
     expected_v2_block_hashes = [
         block_key.hex()
         for token_block, block_key in sequence_to_blockchain_keys(
-            tokens_per_block, tree_task_id, token_lists[0][:-1]) if token_block
+            tokens_per_block, reuse_scope, token_lists[0][:-1]) if token_block
     ]
 
     salted_v2_64_block_hashes = router._compute_block_hashes(
@@ -344,7 +343,7 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
     expected_v2_64_block_hashes = [
         truncate_sha256_hash_to_int64(block_key)
         for token_block, block_key in sequence_to_blockchain_keys(
-            tokens_per_block, tree_task_id, token_lists[0][:-1]) if token_block
+            tokens_per_block, reuse_scope, token_lists[0][:-1]) if token_block
     ]
 
     assert salted_v1_block_hashes == [expected_v1_block_hashes]
