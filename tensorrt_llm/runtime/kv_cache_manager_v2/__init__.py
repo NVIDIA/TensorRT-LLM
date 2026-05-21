@@ -62,6 +62,7 @@ from ._event_manager import (
     UniqueToken,
 )
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
+from ._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from ._storage import BufferId
 
 __all__ = [
@@ -109,4 +110,6 @@ __all__ = [
     "PageIndexConverter",
     "PageIndexMode",
     "ScratchDesc",
+    "KVCacheIterationStatsDelta",
+    "KVCacheStatsDelta",
 ]

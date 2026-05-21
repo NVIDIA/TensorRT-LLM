@@ -39,9 +39,10 @@ from .._common import (
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
+from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
-from .._storage_manager import StorageManager
+from .._storage_manager import StorageManager, StorageStatistics
 from .._utils import (
     HalfOpenRange,
     HomoTuple,
@@ -181,6 +182,15 @@ class PageIndexConverter:
         return result
 
 
+@dataclass(slots=True, frozen=True)
+class _StorageLevelStats:
+    pool_group_stats: TypedIndexList[PoolGroupIndex, StorageStatistics]
+    max_num_blocks: int
+    free_num_blocks: int
+    used_num_blocks: int
+    allocated_bytes: int
+
+
 class KVCacheManager:
     __slots__ = (
         "_init_config",
@@ -198,6 +208,11 @@ class KVCacheManager:
         "_last_adjustment_time",
         "_last_update_num_sampled_kv_caches",
         "_event_manager",
+        "_stats_enabled",
+        "_committed_stats",
+        "_iteration_stats_by_life_cycle",
+        "_dirty_stats_kv_cache_ids",
+        "_stats_excluded_kv_cache_ids",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -221,6 +236,11 @@ class KVCacheManager:
     _last_adjustment_time: float
     _last_update_num_sampled_kv_caches: int
     _event_manager: "KVCacheEventManager | None"
+    _stats_enabled: bool
+    _committed_stats: KVCacheStatsDelta
+    _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
+    _dirty_stats_kv_cache_ids: set[int]
+    _stats_excluded_kv_cache_ids: set[int]
 
     def __init__(
         self,
@@ -254,6 +274,11 @@ class KVCacheManager:
         self._last_adjustment_time = time.monotonic()
         self._last_update_num_sampled_kv_caches = 0
         self._event_manager = event_manager
+        self._stats_enabled = config.enable_stats
+        self._committed_stats = KVCacheStatsDelta()
+        self._iteration_stats_by_life_cycle = {}
+        self._dirty_stats_kv_cache_ids = set()
+        self._stats_excluded_kv_cache_ids = set()
 
     def __del__(self) -> None:
         self.shutdown()
@@ -357,6 +382,7 @@ class KVCacheManager:
         id: int | None = None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
+        expected_prompt_length: int | None = None,
     ) -> _KVCache:
         """
         reuse_scope: namespace to match before matching any tokens.
@@ -375,12 +401,15 @@ class KVCacheManager:
         reuse_match = (
             self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
         )
+        if expected_prompt_length is None and input_tokens is not None:
+            expected_prompt_length = len(input_tokens)
         return _KVCache(
             self,
             reuse_scope,
             reuse_match,
             id,
             custom_priority_callback,
+            expected_prompt_length,
         )
 
     def _match_reuse(
@@ -426,6 +455,71 @@ class KVCacheManager:
 
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
+
+    def _get_storage_level_stats(self, cache_level: CacheLevel) -> _StorageLevelStats:
+        pool_group_stats = self._storage.get_statistics(cache_level)
+        max_num_blocks = sum(stat.total for stat in pool_group_stats)
+        free_num_blocks = sum(stat.available for stat in pool_group_stats)
+        return _StorageLevelStats(
+            pool_group_stats=pool_group_stats,
+            max_num_blocks=max_num_blocks,
+            free_num_blocks=free_num_blocks,
+            used_num_blocks=max_num_blocks - free_num_blocks,
+            allocated_bytes=self.get_quota(cache_level),
+        )
+
+    def commit_stats(
+        self,
+        stats: KVCacheStatsDelta,
+        iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta] | None = None,
+    ) -> None:
+        if not self._stats_enabled:
+            return
+        self._committed_stats.add(stats)
+        if iteration_stats_by_life_cycle is None:
+            return
+        for life_cycle, iteration_stats in iteration_stats_by_life_cycle.items():
+            if iteration_stats.empty:
+                continue
+            destination = self._iteration_stats_by_life_cycle.setdefault(
+                life_cycle, KVCacheIterationStatsDelta()
+            )
+            destination.add(iteration_stats)
+
+    def get_committed_stats(self) -> KVCacheStatsDelta:
+        return self._committed_stats.copy()
+
+    def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]:
+        stats = {
+            life_cycle: delta.copy()
+            for life_cycle, delta in self._iteration_stats_by_life_cycle.items()
+            if not delta.empty
+        }
+        self._iteration_stats_by_life_cycle.clear()
+        return stats
+
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.add(kv_cache_id)
+
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.discard(kv_cache_id)
+
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]:
+        return self._dirty_stats_kv_cache_ids.copy()
+
+    def mark_stats_excluded(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._stats_excluded_kv_cache_ids.add(kv_cache_id)
+            self.clear_stats_dirty(kv_cache_id)
+
+    def clear_stats_excluded(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._stats_excluded_kv_cache_ids.discard(kv_cache_id)
+
+    def is_stats_excluded(self, kv_cache_id: int | None) -> bool:
+        return kv_cache_id is not None and kv_cache_id in self._stats_excluded_kv_cache_ids
 
     # sorted by CacheLevel from warm to cold
     @property

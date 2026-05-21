@@ -62,6 +62,7 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
@@ -1773,34 +1774,7 @@ class PyExecutor:
                 local_dict["requestStats"] = [
                     _json.loads(r.to_json_str()) for r in req_stats
                 ]
-            if kv_iter_stats is not None:
-                local_dict["kvCacheIterationStats"] = {
-                    str(window_size): {
-                        "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                        "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                        "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                        "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                        "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                        "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                        "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                        "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                        "iterReusedBlocks": s.iter_reused_blocks,
-                        "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                        "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                        "iterMissedBlocks": s.iter_missed_blocks,
-                        "iterCacheHitRate": s.iter_cache_hit_rate,
-                        "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                        "iterOnboardBlocks": s.iter_onboard_blocks,
-                        "iterOnboardBytes": s.iter_onboard_bytes,
-                        "iterOffloadBlocks": s.iter_offload_blocks,
-                        "iterOffloadBytes": s.iter_offload_bytes,
-                        "iterIntraDeviceCopyBlocks":
-                        s.iter_intra_device_copy_blocks,
-                        "iterIntraDeviceCopyBytes":
-                        s.iter_intra_device_copy_bytes,
-                    }
-                    for window_size, s in kv_iter_stats.items()
-                }
+            append_kv_cache_iteration_stats(local_dict, kv_iter_stats)
             if host_step_time_ms is not None:
                 local_dict["hostStepTimeMS"] = host_step_time_ms
             if prev_device_step_time_ms is not None:
@@ -2167,6 +2141,7 @@ class PyExecutor:
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
+                    self._commit_kv_cache_stats(scheduled_batch)
 
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
@@ -2615,6 +2590,13 @@ class PyExecutor:
         if candidates:
             self.kv_cache_manager.prefetch_for_context_tokens(candidates)
 
+    def _commit_kv_cache_stats(self,
+                               scheduled_batch: ScheduledRequests) -> None:
+        if self._scheduler_manages_kv_suspend and isinstance(
+                self.kv_cache_manager, KVCacheManagerV2):
+            self.kv_cache_manager.commit_scheduled_kv_cache_stats(
+                scheduled_batch)
+
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -3016,6 +2998,7 @@ class PyExecutor:
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if self.enable_iter_perf_stats else None)
+                    self._commit_kv_cache_stats(scheduled_batch)
 
                     # GPU and CPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
@@ -3441,6 +3424,7 @@ class PyExecutor:
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if self.enable_iter_perf_stats else None)
+                    self._commit_kv_cache_stats(scheduled_batch)
 
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
@@ -3518,6 +3502,8 @@ class PyExecutor:
                             scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
+                    self._commit_kv_cache_stats(
+                        self.previous_batch.scheduled_requests)
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
@@ -5317,6 +5303,9 @@ class PyExecutor:
                     and not request.is_finished):
                 should_emit = False
             if should_emit:
+                if request.return_perf_metrics:
+                    # Response creation may finalize and copy scalar ctx GPU totals.
+                    self.perf_manager.compute_batch_gpu_times([request])
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
