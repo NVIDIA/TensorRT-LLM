@@ -64,8 +64,7 @@ class LogProbsResult(NamedTuple):
 
 
 class ResponseWrapper:
-    """
-    1. Wrapper of runtime response with optional outputs computed post runtime.
+    """1. Wrapper of runtime response with optional outputs computed post runtime.
     2. A workaround to pass around RequestPerfMetrics.
     """
 
@@ -164,7 +163,7 @@ class CompletionOutput:
 
 
 class GenerationResultBase:
-    ''' This holds the core logic of the GenerationResult class. '''
+    """This holds the core logic of the GenerationResult class."""
 
     def __init__(self,
                  id: int,
@@ -276,8 +275,7 @@ class GenerationResultBase:
                          logprobs_result=None,
                          req_perf_metrics_dict: Optional[dict[str,
                                                               float]] = None):
-        """ Handle a single sequence in the response. """
-
+        """Handle a single sequence in the response."""
         seq_idx = sequence_index
         src_idx = sequence_index if self.sampling_params.use_beam_search else 0
 
@@ -800,7 +798,7 @@ class GenerationResultBase:
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
-    ''' The base class for the generation result with detokenization support. '''
+    """The base class for the generation result with detokenization support."""
     # import once and avoid cyclic import
     from .postproc_worker import PostprocWorker
 
@@ -879,14 +877,13 @@ PostprocWorker = DetokenizedGenerationResultBase.PostprocWorker
 
 
 class GenerationResult(GenerationResultBase):
-    '''
-    The result of a generation request. It can be used to wait for the completion of the request.
+    """The result of a generation request. It can be used to wait for the completion of the request.
 
     Args:
         generation_request (GenerationRequest): The generation request object.
         background_error_handler (Callable, optional): The error handler to process the errors from the background threads/processes. Defaults to None.
         executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.
-    '''
+    """
 
     def __init__(
         self,
@@ -1036,8 +1033,7 @@ class GenerationResult(GenerationResultBase):
 
 
 class IterationResult:
-    """
-    Runtime results for all available iterations.
+    """Runtime results for all available iterations.
     """
 
     def __init__(self):
@@ -1059,8 +1055,7 @@ class IterationResult:
         self._done = False
 
     def get_results(self) -> List[dict]:
-        """
-        Return all runtime results in the queue.
+        """Return all runtime results in the queue.
         """
         results = []
         while not self._done:
@@ -1096,8 +1091,7 @@ def compute_logprobs(
     output_token_ids: Optional[list[int]],
     prompt_token_ids: Optional[list[int]] = None,
 ) -> LogProbsResult:
-    """
-    Compute top-K logprobs from logits when engine doesn't provide them directly.
+    """Compute top-K logprobs from logits when engine doesn't provide them directly.
 
     Used for post-processing logits into logprobs.
     - Prompt logprobs (from context_logits): always used.
