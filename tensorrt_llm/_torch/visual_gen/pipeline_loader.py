@@ -31,6 +31,7 @@ from .config import DiffusionModelConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
+from .sparse_attention import SkipSoftmaxConfig, apply_skip_softmax_overrides
 
 if TYPE_CHECKING:
     from .models import BasePipeline
@@ -273,6 +274,13 @@ class PipelineLoader:
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+
+        sparse_cfg = config.attention.sparse_attention_config
+        if isinstance(sparse_cfg, SkipSoftmaxConfig) and (
+            sparse_cfg._layer_overrides or sparse_cfg._component_configs
+        ):
+            n = apply_skip_softmax_overrides(pipeline, sparse_cfg)
+            logger.info(f"Applied skip_softmax sparse config to {n} backends")
 
         if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128

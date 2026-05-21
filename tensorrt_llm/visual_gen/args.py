@@ -26,6 +26,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 import yaml
 from pydantic import model_validator
 
+from tensorrt_llm._torch.visual_gen.sparse_attention import SkipSoftmaxConfig
 from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -90,6 +91,13 @@ class QuantAttentionConfig(StrictBaseModel):
     )
 
 
+# Discriminated union of sparse attention configs.
+SparseAttentionConfig = Annotated[
+    Union[SkipSoftmaxConfig],
+    Field(discriminator="algorithm"),
+]
+
+
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
@@ -105,6 +113,19 @@ class AttentionConfig(StrictBaseModel):
             "Quantized-attention recipe (TRTLLM backend only). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
+        ),
+    )
+    sparse_attention_config: Optional[SparseAttentionConfig] = Field(
+        None,
+        status="prototype",
+        description="Sparse attention configuration. Currently supports: skip_softmax.",
+    )
+    sparse_config_path: Optional[str] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Path to a ModelOpt sparse attention YAML config file. "
+            "Overrides auto-detection from the checkpoint directory."
         ),
     )
 
@@ -552,6 +573,8 @@ class VisualGenArgs(StrictBaseModel):
 
 __all__ = [
     "QuantAttentionConfig",
+    "SparseAttentionConfig",
+    "SkipSoftmaxConfig",
     "AttentionConfig",
     "ParallelConfig",
     "BaseCacheConfig",
