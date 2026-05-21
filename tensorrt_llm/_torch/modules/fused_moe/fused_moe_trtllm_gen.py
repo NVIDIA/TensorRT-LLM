@@ -362,6 +362,8 @@ class TRTLLMGenFusedMoE(MoE):
                     self.routing_method):
                 return False
             return True
+        if self.activation_type == ActivationType.Silu:
+            return False
         return True
         use_flashinfer = os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER",
                                         "0")
