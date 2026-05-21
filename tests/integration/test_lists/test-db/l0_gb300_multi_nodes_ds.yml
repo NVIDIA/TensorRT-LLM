@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_gb300_multi_nodes_ds:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v4_pro_gen_only[deepseek_v4_pro_tep8_gen_only-8192-1024-1] TIMEOUT (12600)
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 16
+        lte: 16
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v4_pro_gen_only[deepseek_v4_pro_dep16_gen_only-1024-1024-16384] TIMEOUT (12600)
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 24
+        lte: 24
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v4_pro_ctx2dep4_gen1dep16[conc256] TIMEOUT (12600)

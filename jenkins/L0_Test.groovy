@@ -3363,9 +3363,9 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        "GB200-8_GPUs-2_Nodes-PyTorch-DS-1": ["auto:gb200-flex", "l0_gb200_multi_gpus_ds", 1, 1, 8, 2],
-        "GB200-16_GPUs-4_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_gpus_ds", 1, 1, 16, 4],
-        "GB200-24_GPUs-6_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_gpus_ds", 1, 1, 24, 6],
+        "GB300-8_GPUs-2_Nodes-PyTorch-DS-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_ds", 1, 1, 8, 2],
+        "GB300-16_GPUs-4_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_ds", 1, 1, 16, 4],
+        "GB300-24_GPUs-6_Nodes-PyTorch-DS-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_ds", 1, 1, 24, 6],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
