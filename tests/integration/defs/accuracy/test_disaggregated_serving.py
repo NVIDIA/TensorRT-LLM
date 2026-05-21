@@ -12,7 +12,8 @@ import tempfile
 import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, NamedTuple, Optional, Union
+from typing import (Any, Dict, Iterator, List, NamedTuple, Optional, Protocol,
+                    Union)
 
 import openai
 import pytest
@@ -524,8 +525,24 @@ def launch_disaggregated_llm(
                     pass  # process already gone
 
 
+class VideoMMECompatibleLLM(Protocol):
+    """LLM surface consumed by the VideoMME evaluator."""
+
+    args: Any
+    model: str
+    _hf_model_dir: str
+    tokenizer: Any
+    input_processor: Any
+
+    def generate_async(self,
+                       inputs: Dict[str, Any],
+                       sampling_params: Optional[SamplingParams] = None,
+                       streaming: bool = False) -> Any:
+        ...
+
+
 class MultimodalEncoderPDDuckLLM:
-    """Duck LLM that runs VideoMME through TRT-LLM's llmapi E/PD path."""
+    """Adapter that runs VideoMME dict inputs through llmapi E/PD."""
 
     def __init__(self, encoder: MultimodalEncoder, pd_llm: LLM,
                  thread_pool: MyThreadPoolExecutor) -> None:
@@ -538,15 +555,9 @@ class MultimodalEncoderPDDuckLLM:
         self.tokenizer = pd_llm.tokenizer
         self.input_processor = pd_llm.input_processor
 
-    def _generate(self, inputs: Union[str, Dict[str, Any]],
+    def _generate(self, inputs: Dict[str, Any],
                   sampling_params: Optional[SamplingParams],
                   streaming: bool) -> RequestOutput:
-        if isinstance(inputs, str):
-            return self._pd_llm.generate_async(
-                inputs,
-                sampling_params=sampling_params,
-                streaming=streaming,
-            ).result()
         if not isinstance(inputs, dict):
             raise TypeError(
                 f"Unsupported E/PD request input type: {type(inputs)}")
@@ -569,7 +580,7 @@ class MultimodalEncoderPDDuckLLM:
         ).result()
 
     def generate_async(self,
-                       inputs: Union[str, Dict[str, Any]],
+                       inputs: Dict[str, Any],
                        sampling_params: Optional[SamplingParams] = None,
                        streaming: bool = False):
         future = self._thread_pool.submit(self._generate, inputs,
@@ -579,50 +590,28 @@ class MultimodalEncoderPDDuckLLM:
 
 
 @contextlib.contextmanager
-def patched_environment(updates: Dict[str, str],
-                        removals: Optional[List[str]] = None):
-    # In-process LLMs read env directly. Patch it only for this test scope.
-    keys = set(updates)
-    if removals:
-        keys.update(removals)
-    previous = {key: os.environ.get(key) for key in keys}
-    previous_tempdir = tempfile.tempdir
-    try:
-        os.environ.update(updates)
-        if "TMPDIR" in updates:
-            # tempfile caches TMPDIR. Keep the cache in sync with the env.
-            tempfile.tempdir = updates["TMPDIR"]
-        if removals:
-            for key in removals:
-                os.environ.pop(key, None)
-        yield
-    finally:
-        # No env leaks into later tests.
-        tempfile.tempdir = previous_tempdir
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
-@contextlib.contextmanager
 def launch_multimodal_encoder_pd_llm(
     encoder_llm_config: Dict[str, Any],
     pd_llm_config: Dict[str, Any],
     model_name: str,
     max_workers: int = 16,
     extra_env: Optional[Dict[str, str]] = None,
-):
+) -> Iterator[VideoMMECompatibleLLM]:
     """Launch separate encoder and combined prefill/decode llmapi instances."""
     env_updates = dict(extra_env or {})
     # Tell PD to consume encoder handles, not raw multimodal payloads.
     env_updates["TLLM_MULTIMODAL_DISAGGREGATED"] = "1"
     with (
-            # Stale context role would make PD accept raw MM as local.
-            patched_environment(env_updates, removals=["TRTLLM_DISAGG_ROLE"]),
+            pytest.MonkeyPatch.context() as monkeypatch,
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
     ):
+        for key, value in env_updates.items():
+            monkeypatch.setenv(key, value)
+        if "TMPDIR" in env_updates:
+            # tempfile caches TMPDIR. Keep the cache in sync with the env.
+            monkeypatch.setattr(tempfile, "tempdir", env_updates["TMPDIR"])
+        # Stale context role would make PD accept raw MM as local.
+        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
         encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
         pd_llm = LLM(model=model_name, **pd_llm_config)
         with encoder, pd_llm:
@@ -637,7 +626,7 @@ class VideoMMEEPDTestConfig(NamedTuple):
     sampling_params: SamplingParams
     extra_evaluator_kwargs: Dict[str, Any]
     max_workers: int
-    expected_quant_algo: Optional[QuantAlgo]
+    expected_quant_algo: QuantAlgo
 
 
 def make_videomme_epd_test_config(
@@ -645,20 +634,13 @@ def make_videomme_epd_test_config(
     model_path: str,
     kv_cache_config: KvCacheConfig,
     max_batch_size: int,
-    expected_quant_algo: Optional[QuantAlgo],
-    encoder_llm_config_overrides: Optional[Dict[str, Any]] = None,
-    pd_llm_config_overrides: Optional[Dict[str, Any]] = None,
-    sampling_params: Optional[SamplingParams] = None,
-    extra_evaluator_kwargs: Optional[Dict[str, Any]] = None,
-    max_workers: int = VideoMME.MAX_BATCH_SIZE,
+    expected_quant_algo: QuantAlgo,
 ) -> VideoMMEEPDTestConfig:
     encoder_llm_config = {
         "trust_remote_code": True,
         "max_batch_size": max_batch_size,
         "cuda_graph_config": None,
     }
-    if encoder_llm_config_overrides is not None:
-        encoder_llm_config.update(encoder_llm_config_overrides)
 
     pd_llm_config = {
         "backend": "pytorch",
@@ -670,22 +652,18 @@ def make_videomme_epd_test_config(
         "max_batch_size": max_batch_size,
         "cuda_graph_config": None,
     }
-    if pd_llm_config_overrides is not None:
-        pd_llm_config.update(pd_llm_config_overrides)
 
-    if sampling_params is None:
-        sampling_params = SamplingParams(
-            max_tokens=VideoMME.MAX_OUTPUT_LEN,
-            truncate_prompt_tokens=VideoMME.MAX_INPUT_LEN,
-            temperature=0.0,
-            top_k=1,
-        )
-    if extra_evaluator_kwargs is None:
-        extra_evaluator_kwargs = {
-            "chat_template_kwargs": {
-                "enable_thinking": False,
-            },
-        }
+    sampling_params = SamplingParams(
+        max_tokens=VideoMME.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=VideoMME.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    extra_evaluator_kwargs = {
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
+    }
 
     return VideoMMEEPDTestConfig(
         model_name=model_name,
@@ -694,7 +672,7 @@ def make_videomme_epd_test_config(
         pd_llm_config=pd_llm_config,
         sampling_params=sampling_params,
         extra_evaluator_kwargs=extra_evaluator_kwargs,
-        max_workers=max_workers,
+        max_workers=VideoMME.MAX_BATCH_SIZE,
         expected_quant_algo=expected_quant_algo,
     )
 
@@ -749,8 +727,7 @@ def test_disaggregated_videomme_vlm_epd(test_config: VideoMMEEPDTestConfig, ):
             max_workers=test_config.max_workers,
             extra_env={"TMPDIR": "/tmp"},
     ) as llm:
-        if test_config.expected_quant_algo is not None:
-            assert llm.args.quant_config.quant_algo == test_config.expected_quant_algo
+        assert llm.args.quant_config.quant_algo == test_config.expected_quant_algo
         task = VideoMME(test_config.model_name)
         task.evaluate(
             llm,
