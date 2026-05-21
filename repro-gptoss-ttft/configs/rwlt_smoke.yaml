@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Quick smoke run of RWLT against a local trtllm-serve agg or disagg endpoint.
+# Single concurrency, a handful of trajectories, ~1-3 minutes wall time.
+# Use this to validate the toolchain before kicking off the longer baseline run.
+#
+# base_url and model are overridden on the command line by scripts/run_rwlt.sh.
+
+base_url: http://localhost:8000/v1
+model: openai/gpt-oss-120b
+api_key: not-required
+
+concurrencies: [1]
+phase_timeout_seconds: 600.0
+user_spawn_rate: 1.0
+settling_time_seconds: 0
+
+min_measurement_seconds: 0.0
+min_total_trajectories: 4
+min_trajectories_per_user: 4
+
+trajectory_path: /home/scratch.shobhitv_coreai/aa-rwlt-shared-datasets/aa-rwlt_coding-agent-scenario_tuning_v2.jsonl
+trajectories_per_user: 4
+max_starting_line_offset: 0
+seed: 42
+
+timeout_seconds: 300.0
+max_tokens: 16384
+reasoning_effort: high
+
+record_err_reasons: true
+record_err_reasons_include_input: false
+tool_calls_args_only: true

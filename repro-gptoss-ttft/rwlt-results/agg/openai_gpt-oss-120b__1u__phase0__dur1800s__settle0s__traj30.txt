@@ -1,0 +1,39 @@
+
+============================================================
+Phase 0 Results (concurrency=1)
+============================================================
+  Total requests: 1172
+  Measured requests: 1172 (1172 ok, 0 err)
+  Measurement window: 579.3s
+
+  Token Counts (server-reported):
+    Input tokens:        42,690,591
+    Output tokens:       291,164
+    Cached tokens:       40,792,654
+    Cache hit rate:      95.6%
+    Avg input tokens/request:   36425.4
+    Avg output tokens/request:  248.4
+    Median output tokens/request:  93.0
+
+  System Throughput (Output tokens/sec) (client-estimated): 450.7
+  System Throughput (Output tokens/sec) (server-reported):  502.6
+  System Throughput (Total tokens/sec)  (server-reported):  74199.4
+
+  TTFT (time to first token):
+    p50: 0.088s
+    p95: 0.166s
+    p99: 0.329s
+
+  Output Speed (per-request local, tok/s):
+    p5:  356.3 tok/s
+    p25: 437.8 tok/s
+    p50: 498.5 tok/s
+    p95:  666.1 tok/s
+
+  Output Speed (per-request SSE, tok/s):
+    p5:  500.8 tok/s
+    p25: 559.9 tok/s
+    p50: 599.2 tok/s
+    p95:  773.0 tok/s
+
+============================================================

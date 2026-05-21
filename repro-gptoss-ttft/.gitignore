@@ -13,3 +13,9 @@ logs/
 results/**/*.bench.log
 results/**/*.json
 results/**/*-perf_metrics-time_diagram.html
+
+# RWLT raw trajectory replay (1-2 MB per run; not needed for re-analysis --
+# rwlt_requests.jsonl already has the per-turn metrics we use).
+rwlt-results/**/openai_*phase*.jsonl
+# RWLT client stdout, regenerable on rerun.
+rwlt-results/**/*.rwlt.log
