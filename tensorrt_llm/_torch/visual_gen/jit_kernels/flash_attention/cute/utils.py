@@ -329,7 +329,6 @@ def fmax(
 ) -> Float32:
     return Float32(
         nvvm.fmax(
-            T.f32(),
             Float32(a).ir_value(loc=loc, ip=ip),
             Float32(b).ir_value(loc=loc, ip=ip),
             c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
