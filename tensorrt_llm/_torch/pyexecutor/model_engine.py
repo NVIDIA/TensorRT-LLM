@@ -1679,6 +1679,7 @@ class PyTorchModelEngine(ModelEngine):
                     inputs['position_ids'][0, num_ctx_tokens:] += (
                         self.
                         previous_pos_id_offsets_cuda[:previous_batch_tokens])
+
                 if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
@@ -1726,6 +1727,7 @@ class PyTorchModelEngine(ModelEngine):
                     inputs['position_ids'][0, num_ctx_tokens:] -= (
                         self.
                         previous_pos_id_offsets_cuda[:previous_batch_tokens])
+
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:

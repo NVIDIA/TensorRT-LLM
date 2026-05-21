@@ -74,6 +74,7 @@ class Attention(nn.Module):
 
         # Select compute backend (orthogonal to parallelism)
         vgm = config.visual_gen_mapping
+        ring_size = vgm.ring_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
@@ -161,13 +162,17 @@ class Attention(nn.Module):
                 row_process_group=vgm.attn2d_row_group,
                 col_process_group=vgm.attn2d_col_group,
             )
-        elif use_ulysses:
-            from ..attention_backend.parallel import UlyssesAttention
+        else:
+            # Wrap with parallelism strategies (orthogonal to backend choice)
+            if (ring_size > 1 or ulysses_size > 1) and self.qkv_mode != QKVMode.SEPARATE_QKV:
+                if ring_size > 1:
+                    from ..attention_backend.parallel import RingAttention
 
-            self.attn = UlyssesAttention(
-                inner_backend=self.attn,
-                process_group=vgm.ulysses_group,
-            )
+                    self.attn = RingAttention(self.attn, process_group=vgm.ring_group)
+                if ulysses_size > 1:
+                    from ..attention_backend.parallel import UlyssesAttention
+
+                    self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
 
     def _init_qkv_proj(self) -> None:
         if self.qkv_mode == QKVMode.FUSE_QKV:
