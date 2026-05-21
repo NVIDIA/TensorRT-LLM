@@ -28,6 +28,13 @@ try:
 except ImportError:
     from cuda import cuda
 
+# Torch schema parsing rejects ``inf`` as a default value.
+SWIGLU_LIMIT_DISABLED = -1.0
+
+
+def _canonicalize_swiglu_limit(swiglu_limit: float) -> float:
+    return float("inf") if swiglu_limit < 0 else swiglu_limit
+
 
 class GroupedGemmInputsHelper:
     """Base helper class for grouped GEMM input preparation and tuning.
@@ -2374,7 +2381,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      num_local_experts: int,
                      local_expert_offset: int,
                      tile_size: int,
-                     scaling_vector_size: int = 16):
+                     scaling_vector_size: int = 16,
+                     swiglu_limit: float = float("inf")):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -2382,6 +2390,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.local_expert_offset = local_expert_offset
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
+            self.swiglu_limit = swiglu_limit
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -2401,6 +2410,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.local_expert_offset,
                 self.tile_size,
                 self.scaling_vector_size,
+                self.swiglu_limit,
             )
 
         def get_valid_tactics(
@@ -2555,13 +2565,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn)
+                         cluster_shape_mn, self.swiglu_limit)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     vectorized_f32=True,
+                    swiglu_limit=self.swiglu_limit,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -2631,12 +2642,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        swiglu_limit: float = SWIGLU_LIMIT_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         tuner = AutoTuner.get()
+        swiglu_limit = _canonicalize_swiglu_limit(swiglu_limit)
 
         runner = Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size)
+            tile_size, scaling_vector_size, swiglu_limit)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, num_non_exiting_tiles, global_sf
@@ -2668,6 +2681,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        swiglu_limit: float = SWIGLU_LIMIT_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = input.size(0)
         n = weight.size(1)
@@ -2698,7 +2712,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      scaling_vector_size: int = 16,
                      b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
-                     activation_type: ActivationType = ActivationType.Swiglu):
+                     activation_type: ActivationType = ActivationType.Swiglu,
+                     swiglu_limit: float = float("inf")):
             """Initialize the runner.
 
             Args:
@@ -2706,6 +2721,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     None for single-B mode. Used for kernel cache key.
                 activation_type: ``ActivationType`` for the fused epilogue. Only
                     ``Swiglu`` (gated) and ``Relu2`` (non-gated) are supported.
+                swiglu_limit: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -2721,6 +2737,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
             self.b_tensor_l_sizes = b_tensor_l_sizes
+            self.swiglu_limit = swiglu_limit
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -2742,6 +2759,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.scaling_vector_size,
                 self.b_tensor_l_sizes,
                 self.activation_type,
+                self.swiglu_limit,
             )
 
         def get_valid_tactics(
@@ -2955,7 +2973,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         b_tensor_l_sizes, self.activation_type)
+                         b_tensor_l_sizes, self.activation_type,
+                         self.swiglu_limit)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -2967,6 +2986,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raster_along_m=raster_along_m,
                     b_tensor_l_sizes=b_tensor_l_sizes,
                     activation_type=self.activation_type,
+                    swiglu_limit=self.swiglu_limit,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -3049,6 +3069,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
+        swiglu_limit: float = SWIGLU_LIMIT_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (multi-B list interface).
 
@@ -3060,14 +3081,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             weight_scale: List of scale tensors, matching weight.
             alpha: List of alpha tensors, matching weight.
             activation_type: ``ActivationType`` value selecting the fused activation.
+            swiglu_limit: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
         """
         tuner = AutoTuner.get()
+        swiglu_limit = _canonicalize_swiglu_limit(swiglu_limit)
 
         b_tensor_l_sizes = tuple(w.size(0) for w in weight)
 
         runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size, b_tensor_l_sizes, activation_type)
+            tile_size, scaling_vector_size, b_tensor_l_sizes, activation_type,
+            swiglu_limit)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -3106,6 +3130,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
+        swiglu_limit: float = SWIGLU_LIMIT_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight[0].size(1)
@@ -3142,6 +3167,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
+        swiglu_limit: float = SWIGLU_LIMIT_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (single-B tensor interface).
 
@@ -3167,6 +3193,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             scaling_vector_size,
             activation_type,
+            swiglu_limit,
         )
 
     @torch.library.register_fake(
@@ -3189,6 +3216,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
+        swiglu_limit: float = SWIGLU_LIMIT_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)

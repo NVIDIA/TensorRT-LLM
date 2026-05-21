@@ -384,6 +384,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     for req, ctx_len in zip(requests, context_lengths):
         req.context_current_position = ctx_len
         req.add_new_token(ctx_len, 0)
+    cache_manager.update_context_resources(scheduled_batch)
     cache_manager.update_resources(scheduled_batch)
     cache_manager.shutdown()
 

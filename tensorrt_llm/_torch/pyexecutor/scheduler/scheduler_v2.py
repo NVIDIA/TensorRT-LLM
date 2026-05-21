@@ -445,7 +445,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.kv_cache_manager.resize_context(
             req,
             req.context_remaining_length + get_draft_token_length(req),
-            history_length=req.context_remaining_length,
+            history_length=req.context_current_position,
         ):
             return ScheduleAction.SKIP, 0
 
