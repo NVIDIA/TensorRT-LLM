@@ -274,6 +274,14 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvEnableCascadeMmha()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
+    return enable;
+}
+
+
+
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
 {
     static std::once_flag flag;
