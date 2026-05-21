@@ -210,11 +210,23 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         """Upper bound on per-encoder request count across all test scenarios.
 
         Mirrors the engine's `encoder_batch_size * max_requests_per_item`
-        product but with generous fixed defaults that cover every scenario in
-        this test harness (multi-image, multi-frame video, etc.). Subclasses
-        may override if their encoder needs more.
+        product but with a generous fixed default that covers every scenario
+        in this test harness (multi-image, multi-frame video, windowed
+        attention fan-out, etc.). Subclasses may override if their encoder
+        needs more.
+
+        Matches the legacy 8192 floor that
+        ``Qwen2_5_VisionModel.setup_attn_metadata`` and
+        ``CLIPVisionModel.setup_attn_metadata`` previously applied
+        internally: the production engine derives this number from
+        ``encoder_max_batch_size * get_max_requests_per_mm_item`` at runtime,
+        but the test harness does not load an input processor when sizing
+        the encoder, so we keep an upper-bound fixed value here. Multi-image
+        / video scenarios at Qwen2/2.5-VL's windowed attention have been
+        observed to need ~200+ sequences; 8192 covers that with headroom at
+        negligible buffer cost.
         """
-        return 64
+        return 8192
 
     def get_encoder_max_num_tokens(self) -> int:
         """Upper bound on per-encoder token count across all test scenarios."""
