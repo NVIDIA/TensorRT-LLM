@@ -143,6 +143,7 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-wideep_accuracy-kimi-k2-thinking-f
 
 # stress cases
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_wideep_stress-deepseek-r1-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_wideep_stress-deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_ccb-NIXL]
 
 # aggregated multi-node (ctx_only and gen_only reuse disagg config yamls)
 
