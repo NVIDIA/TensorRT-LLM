@@ -45,6 +45,7 @@ class PageIndexMode(enum.IntEnum):
 
 CacheLevel = NewType("CacheLevel", int)
 
+
 GPU_LEVEL: Final[CacheLevel] = CacheLevel(0)
 
 # Normal token id that falls in the tokenizer vocabulary.
@@ -56,6 +57,7 @@ TokenId = NewType("TokenId", int)
 #   3. Hash the multi-modal token embedding data and use the digest as TokenIdExt for every multi-modal token.
 #      If we do this, we can't skip the encoder.
 TokenIdExt = TokenId | bytes
+
 
 BlockOrdinal = NewType("BlockOrdinal", int)
 BlockOrdinalT = type(BlockOrdinal(0))
