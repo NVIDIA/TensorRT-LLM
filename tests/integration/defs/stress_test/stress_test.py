@@ -932,6 +932,13 @@ def create_aiperf_command(model_name,
     Returns:
         List of command-line arguments for aiperf
     """
+    # Per-run subdir matching the `<model>-openai-completions-<concurrency>`
+    # pattern that extract_stress_test_metrics() iterates over. Without a
+    # unique subdir per invocation, aiperf overwrites profile_export_aiperf.json
+    # in the shared ARTIFACTS_DIR and stage 2 analysis finds no model dirs.
+    output_dir = os.path.join(
+        ARTIFACTS_DIR, f"{model_name}-openai-completions-{concurrency}")
+
     # --no-server-metrics: trtllm-serve exposes /metrics as a JSON
     # iteration-stats endpoint (see openai_server.get_iteration_stats),
     # not a Prometheus exposition. aiperf's ServerMetricsManager hangs
@@ -964,7 +971,7 @@ def create_aiperf_command(model_name,
         "--concurrency",
         str(concurrency),
         "--output-artifact-dir",
-        ARTIFACTS_DIR,
+        output_dir,
         # "--verbose",
     ]
 
