@@ -407,7 +407,11 @@ class PyResult:
                                        mm_embedding_lengths,
                                        dim=0)
 
-        # Create a SharedTensorContainer handle for each split
+        # NOTE: These dicts are CUDA IPC handles, not copies of the embeddings.
+        # They are valid only while the encoder-side producer process keeps the
+        # shared storage alive. Python tensor GC is not the known failure mode;
+        # producer exit or stale handle reuse is. If future evidence requires
+        # PyResult-held tensor refs too, add those refs here and expose properties.
         self._mm_embeddings = [
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
@@ -419,6 +423,8 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
+        # NOTE: mRoPE handles follow the same lifetime contract as MM embeddings:
+        # producer-side shared storage must outlive consumer-side handle use.
         self._mrope_position_ids = (SharedTensorContainer.from_tensor(
             mrope_position_ids).dump_to_dict())
         self._mrope_position_deltas = (SharedTensorContainer.from_tensor(

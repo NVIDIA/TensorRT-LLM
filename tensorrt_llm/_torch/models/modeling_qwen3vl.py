@@ -1308,6 +1308,10 @@ class Qwen3VLModelBase(PreTrainedModel):
 
     def _get_requests_with_mm_data(self, multimodal_params):
         mm_multimodal_params = []
+        # TODO: This returns one batch-wide "has raw pixels/video" flag. That is
+        # safe only when a batch is all raw-MM or all attached embeddings. If a
+        # scheduler can mix both, split raw requests from attached-embedding
+        # requests and merge outputs back by request index.
         has_raw_image_or_video_data = False
         for multimodal_param in multimodal_params:
             data = multimodal_param.multimodal_data

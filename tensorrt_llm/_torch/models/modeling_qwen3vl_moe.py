@@ -62,7 +62,7 @@ class Qwen3MoeVLModel(Qwen3VLModelBase):
         ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if hasattr(self, "mm_encoder"):
+        if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         weight_mapper = Qwen3VLMoeHfWeightMapper()

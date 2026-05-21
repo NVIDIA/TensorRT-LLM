@@ -367,6 +367,11 @@ def launch_server(
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
+            # TODO: Direct service-registry launches pass --server_role, but the
+            # PyTorch model is constructed here before OpenAIServer sees that
+            # role. If raw multimodal P/D uses this path, set TRTLLM_DISAGG_ROLE
+            # from server_role before model construction. Config-file disagg
+            # launcher already sets the env var.
             llm = PyTorchLLM(**llm_args)
         elif backend == '_autodeploy':
             from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
