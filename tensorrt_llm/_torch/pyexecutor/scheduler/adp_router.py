@@ -190,6 +190,7 @@ class ADPRouter(ABC):
                 load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
                 match_rate_threshold=attention_dp_config.kv_cache_routing_match_rate_threshold,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
+                cold_start_warmup=attention_dp_config.kv_cache_routing_cold_start_warmup,
                 async_transfer_manager=async_transfer_manager,
             )
 
@@ -442,6 +443,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         load_balance_weight: float = 1.0,
         match_rate_threshold: float = 0.1,
         fair_share_multiplier: float = 2.0,
+        cold_start_warmup: bool = False,
         async_transfer_manager=None,
     ):
         super().__init__(dist)
@@ -451,8 +453,10 @@ class KVCacheAwareADPRouter(ADPRouter):
         self.fair_share_multiplier = fair_share_multiplier
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
         # Cold-start warmup: ranks not yet targeted through this router.
-        # See ``route_requests``.
-        self._pending_warmup_ranks: Set[int] = set(range(self.dist.tp_size))
+        # Empty set disables warmup; see ``route_requests``.
+        self._pending_warmup_ranks: Set[int] = (
+            set(range(self.dist.tp_size)) if cold_start_warmup else set()
+        )
         # Requests still sending KV to GEN are invisible in active_requests;
         # fold them back in via the transfer manager (see create_rank_state).
         self.async_transfer_manager = async_transfer_manager
