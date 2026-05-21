@@ -468,6 +468,28 @@ function(setup_cuda_architectures)
     endif()
   endforeach()
 
+  # Backport from upstream #13542: emit EXCLUDE_SM_<ARCH>F for family
+  # architectures (sm100/sm120) that are not enabled. fmha_cubin.cpp guards
+  # sm100/sm120 entries on EXCLUDE_SM_<ARCH>F (with F suffix); without this,
+  # those entries leak undefined symbols into libtensorrt_llm.so when the
+  # build is configured for only a subset of Blackwell.
+  set(ARCHITECTURE_FAMILIES_WITH_KERNELS 100 120)
+  foreach(FAMILY_ARCH IN LISTS ARCHITECTURE_FAMILIES_WITH_KERNELS)
+    set(FAMILY_ARCH_ENABLED FALSE)
+    if(CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY LESS 9999)
+      if("${FAMILY_ARCH}f" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
+        set(FAMILY_ARCH_ENABLED TRUE)
+      endif()
+    elseif(${FAMILY_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      set(FAMILY_ARCH_ENABLED TRUE)
+    endif()
+
+    if(NOT FAMILY_ARCH_ENABLED)
+      add_definitions("-DEXCLUDE_SM_${FAMILY_ARCH}F")
+      message(STATUS "Excluding SM ${FAMILY_ARCH}F")
+    endif()
+  endforeach()
+
   set(CMAKE_CUDA_ARCHITECTURES
       ${CMAKE_CUDA_ARCHITECTURES_NORMALIZED}
       PARENT_SCOPE)

@@ -1462,6 +1462,7 @@ private:
 template <int NumStages,
           bool UsesCpAsyncBarrierArrive = false,
           bool UsesFenceBeforeProdCommit = false,
+          bool UsesUmmaProducerCommit = false,
           class AtomThrShapeMNK = cute::Shape<cute::_1, cute::_1, cute::_1>>
 class CutlassUmmaConsumerAsyncPipeline {
   // The CUTLASS pipeline.

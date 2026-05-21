@@ -339,9 +339,15 @@ public:
         bool isLlama70bFp4Tp4 = options.mHeadDimQk == 128 && options.mHeadDimV == 128
             && options.mDtypeK == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
 
+        // SuperV3 120B-A12B at WS=4 has 8 Q heads, 2 KV heads, headDim=128, FP8 KV cache.
+        // This config lacks a precompiled Sm100a cubin for Q16 decode, and NVRTC fails
+        // on this environment due to CUTLASS UMMA header incompatibility. Fall back to cubin.
+        bool isSuperV3Fp8Ws4 = options.mHeadDimQk == 128 && options.mHeadDimV == 128
+            && options.mDtypeK == tg::Dtype::E4m3 && options.mNumHeadsQ == 8 && options.mNumHeadsQPerKv == 4;
+
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
             && options.mDtypeK != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
-            && !isTokenSparse(options.mSparseType);
+            && !isSuperV3Fp8Ws4 && !isTokenSparse(options.mSparseType);
 
         if (shouldUseNvrtc)
         {
