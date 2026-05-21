@@ -50,8 +50,17 @@ def save_worker_config(worker_config, output_path):
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
-    """Calculate required nodes based on world size and server count."""
-    return math.ceil(world_size * num_servers / gpus_per_node)
+    """Required node count under per-worker whole-node ownership.
+
+    Mirrors assign_server_round_robin: each worker consumes
+    ceil(world_size / gpus_per_node) whole nodes, with no node sharing
+    across workers. Pooling all GPUs and rounding once under-counts
+    nodes whenever world_size is not a multiple of gpus_per_node
+    (e.g. world_size=1, num_servers=2, gpus_per_node=4: pooled gives 1,
+    but the allocator needs 2). compact_packing computes nodes
+    separately because it does share nodes across workers.
+    """
+    return num_servers * math.ceil(world_size / gpus_per_node)
 
 
 def allocate_gpus(
@@ -710,7 +719,7 @@ def submit_job(config, log_dir, dry_run):
     client_slurm_prefix = [
         f"srun -l --container-name={container_name}",
         f"--container-mounts={container_mount_str}",
-        f"--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
+        "--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
     ]
     # Append benchmark commands
     if benchmark_config.get('enable_benchmark', True):
