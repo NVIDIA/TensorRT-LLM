@@ -1734,6 +1734,59 @@ class MLA(nn.Module):
             q, self.num_heads_tp, self.qk_head_dim,
             float(self.q_b_layernorm.variance_epsilon))
 
+    def _is_fused_q_fp8_quant_enabled(self, num_generations: int = 0) -> bool:
+        # Context-only batches: the fused path leaves a placeholder bf16 q_buf
+        # that forward_generation_sparse_mla would read uninitialized, so
+        # mixed/gen batches must take the legacy unfused path.
+        if not self.is_deepseek_v4:
+            return False
+        if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
+            return False
+        if num_generations > 0:
+            return False
+        return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
+
+    def _deepseek_v4_q_b_layernorm_fused_fp8(self, q_proj: torch.Tensor):
+        # Returns (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv).
+        # `placeholder_q` keeps the [num_tokens, num_heads*head_dim] bf16 layout
+        # the downstream `forward_absorption_context` needs for its `q.shape[0]`
+        # check and `q.view().split()` call. Its contents are never read on the
+        # fused FP8 path: the nope segment lives in `quant_q_buffer`, the rope
+        # segment is passed in `q_pe`, and the split's `q_nope`/`q_pe` outputs
+        # are either overridden by the caller or discarded by the DSv4 branch.
+        # Reusing `q_proj` (q_b_proj output) avoids a ~num_tokens × hidden bf16
+        # allocation per forward.
+        assert q_proj.dim() == 2
+        assert q_proj.shape[1] == self.num_heads_tp * self.qk_head_dim
+        if getattr(self, "_quant_scale_qkv", None) is None:
+            self._quant_scale_qkv = torch.tensor([1.0],
+                                                 dtype=torch.float32,
+                                                 device=q_proj.device)
+        # Allocate the interleaved [N, H*head_dim] FP8 buffer (nope filled by
+        # this op, rope slot left for applyMLARopeAndAssignQKVKernelOptContext) and the bf16 rope buffer.
+        num_tokens = q_proj.shape[0]
+        rope_dim = self.qk_head_dim - self.kv_lora_rank
+        quant_q_buffer = q_proj.new_empty(
+            (num_tokens, self.num_heads_tp * self.qk_head_dim),
+            dtype=torch.float8_e4m3fn)
+        q_pe = q_proj.new_empty((num_tokens, self.num_heads_tp * rope_dim))
+        torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+            q_proj,
+            quant_q_buffer,
+            q_pe,
+            self.num_heads_tp,
+            self.qk_head_dim,
+            self.kv_lora_rank,  # nope_dim
+            float(self.q_b_layernorm.variance_epsilon),
+            self._quant_scale_qkv,
+        )
+        # Both buffers must be live for the fused path; the downstream
+        # absorption-context op switches on `quant_scale_qkv is not None`
+        # to enable the C++ fusion (see trtllm.py `thop.attention` call).
+        assert self._quant_scale_qkv is not None, (
+            "fused FP8-Q quant requires _quant_scale_qkv to be set")
+        return q_proj, quant_q_buffer, q_pe, self._quant_scale_qkv
+
     def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
@@ -2209,6 +2262,16 @@ class MLA(nn.Module):
 
         def _q_branch():
             q_proj = self.q_b_proj(q)
+            if self._is_fused_q_fp8_quant_enabled(
+                    num_generations=num_generations):
+                (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv
+                 ) = self._deepseek_v4_q_b_layernorm_fused_fp8(q_proj)
+                self._fused_quant_q_buffer = quant_q_buffer
+                self._fused_q_pe = q_pe
+                self._quant_scale_qkv = quant_scale_qkv
+                return placeholder_q
+            self._fused_quant_q_buffer = None
+            self._fused_q_pe = None
             return self._deepseek_v4_q_b_layernorm(q_proj)
 
         def _compressor_branch():
@@ -3078,6 +3141,26 @@ class MLA(nn.Module):
 
         # Use generation_only for generation phase and context_only for context phase in DSA attention
         attention_input_type = AttentionInputType.context_only
+
+        # Fused FP8-Q path: forward the pre-quantized buffers stashed in
+        # `_q_branch`; the C++ op enables fusion when both are non-None.
+        quant_q_buffer = getattr(self, "_fused_quant_q_buffer", None)
+        fused_q_pe = getattr(self, "_fused_q_pe", None)
+        quant_scale_qkv = getattr(self, "_quant_scale_qkv", None)
+        use_fused_q_fp8 = (self.is_deepseek_v4 and quant_q_buffer is not None
+                           and fused_q_pe is not None
+                           and quant_scale_qkv is not None)
+
+        if use_fused_q_fp8:
+            # Defensive prefix slicing — context-only batches today, mixed-batch later.
+            q_pe = fused_q_pe[:num_tokens]
+            quant_q_buffer = quant_q_buffer[:num_tokens].view(
+                num_tokens, self.num_heads_tp,
+                self.kv_lora_rank + self.qk_rope_head_dim)
+        else:
+            quant_q_buffer = None
+            quant_scale_qkv = None
+
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
             fused_q,
@@ -3089,11 +3172,15 @@ class MLA(nn.Module):
             out_scale=self.out_scale,
             output=output if self.is_deepseek_v4 else None,
             latent_cache=latent_cache,  # kvcache and k_pe
-            q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
+            quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
+            quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
             topk_indices=topk_indices,  # used by DSA attention
             is_generation=False,  # used by DSA attention
         )
         fused_q = None
+        self._fused_quant_q_buffer = None
+        self._fused_q_pe = None
 
         if self.is_deepseek_v4:
             if self.mapping.has_cp_helix():
