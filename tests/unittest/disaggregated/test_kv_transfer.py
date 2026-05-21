@@ -1,5 +1,6 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import os
 import random
 import time
 import uuid
@@ -41,6 +42,13 @@ KV_TRANSFER_TEST_NUM_THREADS = 4
 @pytest.fixture(autouse=True)
 def _set_kv_transfer_num_threads(monkeypatch):
     monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", KV_TRANSFER_TEST_NUM_THREADS)
+
+
+# Disable NIXL backend worker threads — each agent otherwise spawns 8 UCX
+# threads, and with 4-6 agents per test the cumulative init time + system-wide
+# UCX contention can push the 120s test timeout (matches sibling tests
+# test_cache_transceiver_single_process.py and test_deepseek_v4_kv_transfer.py).
+os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
 
 
 @dataclass
@@ -764,8 +772,14 @@ def add_and_verify_request(
             for ctx_transfer_worker in valid_ctx_transfer_workers
         ]
 
-        time.sleep(0.1)
-
+        # Wait for the RX side's REQUEST_DATA to push every TX session out of
+        # INIT. Under heavy concurrent load (xdist -n 8) the ZMQ round-trip
+        # can exceed a fixed 100ms sleep — poll with a generous deadline.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if all(s.status != SessionStatus.INIT for s in sender_sessions):
+                break
+            time.sleep(0.05)
         for sender_session in sender_sessions:
             assert sender_session.status != SessionStatus.INIT
 
@@ -966,7 +980,7 @@ WINDOW_SIZE_TEST_CONFIGS = [
 ]
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PARALLEL_TEST_CONFIGS],
@@ -1000,7 +1014,7 @@ def test_transfer_worker_v1(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
             worker.shutdown()
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla",
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in PARALLEL_TEST_CONFIGS],
@@ -1034,7 +1048,7 @@ def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
             worker.shutdown()
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,max_attention_window_vec",
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in WINDOW_SIZE_TEST_CONFIGS],
@@ -1070,7 +1084,7 @@ def test_transfer_worker_v2_with_window(
             worker.shutdown()
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(180)
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 def test_transfer_with_gen_prefix_offset(use_v2):
     """Verify that only suffix blocks are transferred when gen has a prefix offset.
