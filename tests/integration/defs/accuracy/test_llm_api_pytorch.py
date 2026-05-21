@@ -3050,12 +3050,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_nvfp4_multi_gpus_sm120(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, max_batch_size,
-                                    moe_backend):
+                                    moe_backend, mocker):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
+        # SM120 (96 GB GPUs) is tight on memory for this DeepSeek-R1 NVFP4 config;
+        # expandable_segments avoids OOM from cache fragmentation when the autotuner
+        # asks for a large contiguous workspace after kv_cache allocation.
+        patch_mpi_pool_session_for_env(
+            mocker, {"PYTORCH_ALLOC_CONF": "expandable_segments:True"})
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
