@@ -12,10 +12,10 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
+from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
-from .fused_moe_flashinfer_nvfp4_sm12x import FlashInferNvfp4Sm12xFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -34,24 +34,24 @@ def get_moe_cls(
     if override_quant_config is not None:
         quant_config = override_quant_config
     if moe_backend.upper() == "CUTLASS":
-        # Auto-promote to FlashInferNvfp4Sm12xFusedMoE (hybrid CUTLASS-prefill
+        # Auto-promote to CuteDslB12xFusedMoE (hybrid CUTLASS-prefill
         # / b12x-decode) on SM120 / SM121 + NVFP4 when flashinfer is available.
         # Falls back to plain CutlassFusedMoE otherwise.
         if quant_config is not None and quant_config.quant_mode.has_nvfp4():
             from tensorrt_llm._utils import get_sm_version
             sm_version = get_sm_version()
-            if sm_version in FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS:
+            if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
                 try:
                     import flashinfer  # noqa: F401
                     logger.info(
-                        "Auto-selecting FlashInferNvfp4Sm12xFusedMoE for hybrid "
+                        "Auto-selecting CuteDslB12xFusedMoE for hybrid "
                         "CUTLASS-prefill / b12x-decode (SM%d + NVFP4).",
                         sm_version,
                     )
-                    return FlashInferNvfp4Sm12xFusedMoE
+                    return CuteDslB12xFusedMoE
                 except ImportError:
                     logger.warning(
-                        "FlashInferNvfp4Sm12xFusedMoE eligible (SM%d + NVFP4) "
+                        "CuteDslB12xFusedMoE eligible (SM%d + NVFP4) "
                         "but flashinfer is not importable; using CutlassFusedMoE.",
                         sm_version,
                     )
@@ -302,9 +302,10 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif moe_cls in (CutlassFusedMoE, FlashInferNvfp4Sm12xFusedMoE):
-        # CuteDslFusedMoE and DeepGemmFusedMoE also subclass CutlassFusedMoE but
-        # have narrower constructors, so they take their own branches below.
+    elif moe_cls is CutlassFusedMoE:
+        # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
+        # also subclass CutlassFusedMoE but have narrower constructors, so
+        # they take their own branches below.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -355,7 +356,9 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation_type=activation_type,
         )
-    elif moe_cls == CuteDslFusedMoE:
+    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
+        # CuteDslB12xFusedMoE subclasses CuteDslFusedMoE and shares
+        # its narrower constructor (no bias / swiglu_alpha-beta-limit args).
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
