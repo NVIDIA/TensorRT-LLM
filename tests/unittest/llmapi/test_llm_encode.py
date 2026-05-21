@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import CudaGraphConfig
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig
 from tensorrt_llm.llmapi.llm import EncoderOutput
 
 # isort: off
@@ -47,7 +47,7 @@ def bert_encode_llm():
 def bert_encode_llm_cuda_graph():
     """BERT encode_only LLM with a tight encoder CUDA graph bucket grid."""
     model_dir = get_model_path(BERT_MODEL_PATH)
-    cgc = CudaGraphConfig(
+    cgc = EncodeCudaGraphConfig(
         batch_sizes=[1, 4],
         num_tokens=[16, 64],
         seq_lens=[8, 32],

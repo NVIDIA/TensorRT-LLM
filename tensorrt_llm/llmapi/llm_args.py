@@ -106,8 +106,8 @@ def Field(default: Any = ...,
     return PydanticField(default, **kwargs)
 
 
-class CudaGraphConfig(StrictBaseModel):
-    """Configuration for CUDA graphs."""
+class BaseCudaGraphConfig(StrictBaseModel):
+    """Common configuration for CUDA graphs."""
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
         default=None,
@@ -122,38 +122,8 @@ class CudaGraphConfig(StrictBaseModel):
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
     )
 
-    # Encoder CUDA graph settings — only consumed by encode-only paths.
-    # For decoder models these fields are ignored.
-    num_tokens: Optional[List[PositiveInt]] = Field(
-        default=None,
-        min_length=1,
-        description=
-        "List of total token counts (sum of all per-request sequence lengths "
-        "in a batch) to create encoder CUDA graphs for. Only used for "
-        "encode-only paths.")
-
-    max_num_token: NonNegativeInt = Field(
-        default=0,
-        description="Maximum total number of tokens for encoder CUDA graphs. If "
-        "`num_tokens` is provided, must equal max(num_tokens); otherwise "
-        "`num_tokens` is generated from this value.")
-
-    seq_lens: Optional[List[PositiveInt]] = Field(
-        default=None,
-        min_length=1,
-        description=
-        "List of max per-request sequence lengths to create encoder CUDA "
-        "graphs for. Only used for encode-only paths.")
-
-    max_seq_len: NonNegativeInt = Field(
-        default=0,
-        description=
-        "Maximum per-request sequence length for encoder CUDA graphs. If "
-        "`seq_lens` is provided, must equal max(seq_lens); otherwise "
-        "`seq_lens` is generated from this value.")
-
     @model_validator(mode='after')
-    def validate_cuda_graph_config(self) -> 'CudaGraphConfig':
+    def validate_base_cuda_graph_config(self) -> 'BaseCudaGraphConfig':
         """Validate CUDA graph configuration.
 
         Ensures that:
@@ -178,47 +148,10 @@ class CudaGraphConfig(StrictBaseModel):
                     f"CudaGraphConfig.max_batch_size: {self.max_batch_size}")
         else:
             max_batch_size = self.max_batch_size or 128
-            generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            generated_sizes = self._generate_cuda_graph_batch_sizes(
                 max_batch_size, self.enable_padding)
             self.batch_sizes = generated_sizes
             self.max_batch_size = max_batch_size
-
-        # Encoder fields — only generate defaults when the user opted in by
-        # setting at least one of num_tokens / max_num_token. Leaving both at
-        # the defaults keeps encoder CUDA graphs disabled. Same for seq_lens / max_seq_len.
-        if self.num_tokens:
-            self.num_tokens = sorted(self.num_tokens)
-            derived_max_nt = max(self.num_tokens)
-            if self.max_num_token == 0:
-                self.max_num_token = derived_max_nt
-            elif self.max_num_token != derived_max_nt:
-                raise ValueError(
-                    "CudaGraphConfig.max_num_token is incompatible with "
-                    "CudaGraphConfig.num_tokens. When both are provided, "
-                    "max_num_token must equal max(num_tokens).\n"
-                    f"CudaGraphConfig.num_tokens: {self.num_tokens}, "
-                    f"max(num_tokens): {derived_max_nt}, "
-                    f"CudaGraphConfig.max_num_token: {self.max_num_token}")
-        elif self.max_num_token > 0:
-            self.num_tokens = CudaGraphConfig._generate_cuda_graph_num_tokens(
-                self.max_num_token, self.enable_padding)
-
-        if self.seq_lens:
-            self.seq_lens = sorted(self.seq_lens)
-            derived_max_sl = max(self.seq_lens)
-            if self.max_seq_len == 0:
-                self.max_seq_len = derived_max_sl
-            elif self.max_seq_len != derived_max_sl:
-                raise ValueError(
-                    "CudaGraphConfig.max_seq_len is incompatible with "
-                    "CudaGraphConfig.seq_lens. When both are provided, "
-                    "max_seq_len must equal max(seq_lens).\n"
-                    f"CudaGraphConfig.seq_lens: {self.seq_lens}, "
-                    f"max(seq_lens): {derived_max_sl}, "
-                    f"CudaGraphConfig.max_seq_len: {self.max_seq_len}")
-        elif self.max_seq_len > 0:
-            self.seq_lens = CudaGraphConfig._generate_cuda_graph_seq_lens(
-                self.max_seq_len, self.enable_padding)
 
         return self
 
@@ -256,6 +189,126 @@ class CudaGraphConfig(StrictBaseModel):
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
+
+
+class DecodeCudaGraphConfig(BaseCudaGraphConfig):
+    """CUDA graph configuration for decode requests."""
+
+    mode: Literal["decode"] = Field(
+        default="decode", description="CUDA graph configuration mode.")
+
+    @staticmethod
+    def _merge_schedule_keys(batch_sizes: List[int],
+                             schedule: dict[int, int]) -> List[int]:
+        """Merge draft_len_schedule keys into batch_sizes so that each schedule threshold has a corresponding CUDA graph.
+
+        e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300
+        into batch_sizes.
+
+        Args:
+            batch_sizes: Sorted list of existing CUDA graph batch sizes.
+            schedule: draft_len_schedule mapping batch-size thresholds to
+                draft lengths.
+
+        Returns:
+            Sorted, deduplicated list of batch sizes.
+        """
+        max_bs = batch_sizes[-1]
+        extra = sorted(bs for bs in schedule if bs <= max_bs)
+        if not extra:
+            return batch_sizes
+
+        merged = []
+        i, j = 0, 0
+        while i < len(batch_sizes) and j < len(extra):
+            if batch_sizes[i] < extra[j]:
+                merged.append(batch_sizes[i])
+                i += 1
+            elif batch_sizes[i] > extra[j]:
+                merged.append(extra[j])
+                j += 1
+            else:
+                merged.append(batch_sizes[i])
+                i += 1
+                j += 1
+        merged.extend(batch_sizes[i:])
+        merged.extend(extra[j:])
+        return merged
+
+
+class EncodeCudaGraphConfig(BaseCudaGraphConfig):
+    """CUDA graph configuration for encode-only requests."""
+
+    mode: Literal["encode"] = Field(
+        default="encode", description="CUDA graph configuration mode.")
+
+    num_tokens: Optional[List[PositiveInt]] = Field(
+        default=None,
+        min_length=1,
+        description=
+        "List of total token counts (sum of all per-request sequence lengths "
+        "in a batch) to create encoder CUDA graphs for.")
+
+    max_num_token: NonNegativeInt = Field(
+        default=0,
+        description="Maximum total number of tokens for encoder CUDA graphs. If "
+        "`num_tokens` is provided, must equal max(num_tokens); otherwise "
+        "`num_tokens` is generated from this value.")
+
+    seq_lens: Optional[List[PositiveInt]] = Field(
+        default=None,
+        min_length=1,
+        description=
+        "List of max per-request sequence lengths to create encoder CUDA "
+        "graphs for.")
+
+    max_seq_len: NonNegativeInt = Field(
+        default=0,
+        description=
+        "Maximum per-request sequence length for encoder CUDA graphs. If "
+        "`seq_lens` is provided, must equal max(seq_lens); otherwise "
+        "`seq_lens` is generated from this value.")
+
+    @model_validator(mode='after')
+    def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
+        # Encoder fields — only generate defaults when the user opted in by
+        # setting at least one of num_tokens / max_num_token. Leaving both at
+        # the defaults keeps encoder CUDA graphs disabled. Same for seq_lens / max_seq_len.
+        if self.num_tokens:
+            self.num_tokens = sorted(self.num_tokens)
+            derived_max_nt = max(self.num_tokens)
+            if self.max_num_token == 0:
+                self.max_num_token = derived_max_nt
+            elif self.max_num_token != derived_max_nt:
+                raise ValueError(
+                    "CudaGraphConfig.max_num_token is incompatible with "
+                    "CudaGraphConfig.num_tokens. When both are provided, "
+                    "max_num_token must equal max(num_tokens).\n"
+                    f"CudaGraphConfig.num_tokens: {self.num_tokens}, "
+                    f"max(num_tokens): {derived_max_nt}, "
+                    f"CudaGraphConfig.max_num_token: {self.max_num_token}")
+        elif self.max_num_token > 0:
+            self.num_tokens = self._generate_cuda_graph_num_tokens(
+                self.max_num_token, self.enable_padding)
+
+        if self.seq_lens:
+            self.seq_lens = sorted(self.seq_lens)
+            derived_max_sl = max(self.seq_lens)
+            if self.max_seq_len == 0:
+                self.max_seq_len = derived_max_sl
+            elif self.max_seq_len != derived_max_sl:
+                raise ValueError(
+                    "CudaGraphConfig.max_seq_len is incompatible with "
+                    "CudaGraphConfig.seq_lens. When both are provided, "
+                    "max_seq_len must equal max(seq_lens).\n"
+                    f"CudaGraphConfig.seq_lens: {self.seq_lens}, "
+                    f"max(seq_lens): {derived_max_sl}, "
+                    f"CudaGraphConfig.max_seq_len: {self.max_seq_len}")
+        elif self.max_seq_len > 0:
+            self.seq_lens = self._generate_cuda_graph_seq_lens(
+                self.max_seq_len, self.enable_padding)
+
+        return self
 
     @staticmethod
     def _generate_cuda_graph_num_tokens(max_num_token: int,
@@ -326,49 +379,20 @@ class CudaGraphConfig(StrictBaseModel):
             sizes.append(p)
             p *= 2
 
-        sizes = sorted(set(s for s in sizes if s <= max_seq_len))
+        sizes = sorted(set[Any | int](s for s in sizes if s <= max_seq_len))
         if not sizes or sizes[-1] != max_seq_len:
             sizes.append(max_seq_len)
 
         return sizes
 
-    @staticmethod
-    def _merge_schedule_keys(batch_sizes: List[int],
-                             schedule: dict[int, int]) -> List[int]:
-        """Merge draft_len_schedule keys into batch_sizes so that each schedule threshold has a corresponding CUDA graph.
 
-        e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300
-        into batch_sizes.
+# For CudaGraphConfig's backward compatibility
+CudaGraphConfig = DecodeCudaGraphConfig
 
-        Args:
-            batch_sizes: Sorted list of existing CUDA graph batch sizes.
-            schedule: draft_len_schedule mapping batch-size thresholds to
-                draft lengths.
-
-        Returns:
-            Sorted, deduplicated list of batch sizes.
-        """
-        max_bs = batch_sizes[-1]
-        extra = sorted(bs for bs in schedule if bs <= max_bs)
-        if not extra:
-            return batch_sizes
-
-        merged = []
-        i, j = 0, 0
-        while i < len(batch_sizes) and j < len(extra):
-            if batch_sizes[i] < extra[j]:
-                merged.append(batch_sizes[i])
-                i += 1
-            elif batch_sizes[i] > extra[j]:
-                merged.append(extra[j])
-                j += 1
-            else:
-                merged.append(batch_sizes[i])
-                i += 1
-                j += 1
-        merged.extend(batch_sizes[i:])
-        merged.extend(extra[j:])
-        return merged
+CudaGraphConfigType: TypeAlias = Annotated[
+    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
+    Field(discriminator="mode"),
+]
 
 
 class GuidedDecodingConfig(StrictBaseModel):
@@ -3970,7 +3994,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
-    cuda_graph_config: Optional[CudaGraphConfig] = Field(
+    cuda_graph_config: Optional[CudaGraphConfigType] = Field(
         default_factory=CudaGraphConfig,
         description="CUDA graph config. If true, use CUDA graphs for decoding. \
         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes, \
@@ -3979,6 +4003,18 @@ class TorchLlmArgs(BaseLlmArgs):
         since the input shapes are a function of the sequence lengths).\
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
+
+    @field_validator('cuda_graph_config', mode='before')
+    @classmethod
+    def infer_cuda_graph_config_mode(cls, v):
+        if isinstance(v, dict) and "mode" not in v:
+            encoder_keys = {
+                "num_tokens", "max_num_token", "seq_lens", "max_seq_len"
+            }
+            v = dict(v)
+            v["mode"] = "encode" if any(k in v and v[k] not in (None, 0)
+                                        for k in encoder_keys) else "decode"
+        return v
 
     attention_dp_config: Optional[AttentionDpConfig] = Field(
         default=None,

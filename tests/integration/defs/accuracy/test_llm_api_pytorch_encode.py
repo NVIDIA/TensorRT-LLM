@@ -29,7 +29,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import CudaGraphConfig
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig
 
 from ..conftest import llm_models_root
 from .accuracy_core import LlmapiAccuracyTestHarness
@@ -168,7 +168,7 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 
         # Resolve the checkpoint's native precision.
         torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
-        cgc = None if graph_kwargs is None else CudaGraphConfig(**graph_kwargs)
+        cgc = None if graph_kwargs is None else EncodeCudaGraphConfig(**graph_kwargs)
 
         with LLM(model_path, encode_only=True, dtype=llm_dtype, cuda_graph_config=cgc) as llm:
             outs = llm.encode(PROMPTS)
@@ -203,7 +203,7 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 
         with LLM(model_path, encode_only=True, dtype=llm_dtype) as llm_eager:
             eager_outs = llm_eager.encode(PROMPTS)
-        cgc = CudaGraphConfig(
+        cgc = EncodeCudaGraphConfig(
             batch_sizes=[1, 4],
             num_tokens=[64],
             seq_lens=[32],
@@ -442,7 +442,7 @@ class TestDecoderEncode(LlmapiAccuracyTestHarness):
         with LLM(model_path, encode_only=True, dtype=llm_dtype) as llm_eager:
             eager_outs = llm_eager.encode(self.PROMPTS)
 
-        cgc = CudaGraphConfig(
+        cgc = EncodeCudaGraphConfig(
             batch_sizes=[1, 4],
             num_tokens=[32, 64],
             seq_lens=[16, 32],

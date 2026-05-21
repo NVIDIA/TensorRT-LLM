@@ -23,8 +23,9 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             check_mm_embed_cumsum_if_needed)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
-from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
-                                          TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig,
+                                          EncodeCudaGraphConfig,
+                                          TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -366,14 +367,13 @@ class PyTorchModelEngine(ModelEngine):
         cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
             'enable_padding'].default
 
-        # Encode-only CUDA graph detection. These fields are only consumed
-        # when `_is_encode_only` is True below; decoder paths ignore.
-        # num_tokens/seq_lens may be None when the user creates a
-        # CudaGraphConfig without specifying encoder fields — normalize to [].
-        cuda_graph_num_tokens = (self.cuda_graph_config.num_tokens
-                                 if self.cuda_graph_config else None) or []
-        cuda_graph_seq_lens = (self.cuda_graph_config.seq_lens
-                               if self.cuda_graph_config else None) or []
+        # Encode-only CUDA graph detection. Decode configs do not define these
+        # encoder-specific bucket fields.
+        cuda_graph_num_tokens = []
+        cuda_graph_seq_lens = []
+        if isinstance(self.cuda_graph_config, EncodeCudaGraphConfig):
+            cuda_graph_num_tokens = self.cuda_graph_config.num_tokens or []
+            cuda_graph_seq_lens = self.cuda_graph_config.seq_lens or []
 
         self._is_encode_only = (self.llm_args.encode_only
                                 and not self.llm_args.mm_encoder_only)
@@ -390,7 +390,7 @@ class PyTorchModelEngine(ModelEngine):
                 f"{' and '.join(missing)} not set. Encoder CUDA graphs "
                 f"require both. Encoder CUDA graphs will be disabled. "
                 f"To enable them, specify e.g. "
-                f"CudaGraphConfig(max_batch_size=64, num_tokens=[128, 256, "
+                f"EncodeCudaGraphConfig(max_batch_size=64, num_tokens=[128, 256, "
                 f"512], max_seq_len=128, enable_padding=True).")
 
         self.torch_compile_config = self.llm_args.torch_compile_config

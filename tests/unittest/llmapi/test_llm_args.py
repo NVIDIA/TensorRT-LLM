@@ -28,10 +28,13 @@ from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CalibConfig, ContextChunkingPolicy,
-                                          CudaGraphConfig, DecodingBaseConfig,
+                                          CudaGraphConfig,
+                                          DecodeCudaGraphConfig,
+                                          DecodingBaseConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
+                                          EncodeCudaGraphConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
@@ -763,6 +766,55 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.batch_sizes == CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_config.max_batch_size == 128
+
+    def test_cuda_graph_config_legacy_alias_uses_decode_config(self):
+        config = CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True)
+
+        assert isinstance(config, DecodeCudaGraphConfig)
+        assert config.mode == "decode"
+        assert config.batch_sizes == [1, 2, 4]
+
+    def test_cuda_graph_config_accepts_encoder_config(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            cuda_graph_config=EncodeCudaGraphConfig(
+                                batch_sizes=[1, 4],
+                                num_tokens=[16, 64],
+                                seq_lens=[8, 32],
+                                enable_padding=True,
+                            ))
+
+        assert isinstance(args.cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.cuda_graph_config.mode == "encode"
+        assert args.cuda_graph_config.num_tokens == [16, 64]
+        assert args.cuda_graph_config.max_num_token == 64
+        assert args.cuda_graph_config.seq_lens == [8, 32]
+        assert args.cuda_graph_config.max_seq_len == 32
+
+    def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            cuda_graph_config={
+                "batch_sizes": [1, 4],
+                "num_tokens": [16, 64],
+                "seq_lens": [8, 32],
+                "enable_padding": True,
+            },
+        )
+
+        assert isinstance(args.cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.cuda_graph_config.mode == "encode"
+
+    def test_cuda_graph_config_infers_decode_mode_from_raw_dict(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            cuda_graph_config={
+                "batch_sizes": [1, 4],
+                "enable_padding": True,
+            },
+        )
+
+        assert isinstance(args.cuda_graph_config, DecodeCudaGraphConfig)
+        assert args.cuda_graph_config.mode == "decode"
 
     @pytest.mark.parametrize("max_batch_size", [64, 129, 320])
     def test_generate_cuda_graph_batch_sizes_padding_edge_cases(
