@@ -260,8 +260,15 @@ class GvrTopKKernel:
         local_cnt = cutlass.Int32(0)
 
         # Stride loop over preIdx with pre_idx_offset shift.
-        i = tidx
-        while i < pre_idx_count:
+        # pre_idx_count comes from pre_idx.shape[1] which is a compile-time
+        # constant (top_k baked into the JIT cache key). Supported top_k ∈
+        # {512, 1024, 2048} are all multiples of num_threads (512). Fully
+        # unroll into pre_idx_count // num_threads ∈ {1, 2, 4} iters so
+        # cute emits straight-line code (no BRA / ISETP / counter update).
+        # Mirrors nvcc/ptxas auto-partial-unroll on the CUDA side.
+        n_iters = cutlass.const_expr(pre_idx_count // self.num_threads)
+        for u in cutlass.range_constexpr(n_iters):
+            i = tidx + cutlass.Int32(u * self.num_threads)
             raw = pre_idx_row[i]
             idx = raw + pre_idx_offset
             if idx >= 0 and idx < N:
@@ -271,7 +278,6 @@ class GvrTopKKernel:
                 local_min = _fmin_f32_inline(local_min, v)
                 local_sum = local_sum + v
                 local_cnt = local_cnt + 1
-            i = i + self.num_threads
 
         # Warp-level reductions.
         wmin = self.warp_reduce_min_f32(local_min)
@@ -383,6 +389,7 @@ class GvrTopKKernel:
             src_ptr = cute.make_ptr(
                 self.dtype,
                 row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                cute.AddressSpace.gmem,
                 assumed_align=16,
             )
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
@@ -725,6 +732,7 @@ class GvrTopKKernel:
             src_ptr_p3 = cute.make_ptr(
                 self.dtype,
                 row_addr_p3 + cutlass.Int64(ic2) * cutlass.Int64(elem_bytes_p3),
+                cute.AddressSpace.gmem,
                 assumed_align=16,
             )
             src_p3 = cute.make_tensor(src_ptr_p3, cute.make_layout((vec_w_p3,)))
