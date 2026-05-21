@@ -239,6 +239,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
         mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, rnnPoolDtype, rnnPoolDtype);
 
+        // Create RnnCacheTransBufferManager for unified pool path.
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(cacheManager, *mCacheState, maxNumTokens);
+
         TLLM_LOG_INFO(
             "Unified pool RNN config: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
             "nGroups=%d, hiddenSize=%d, convSectionLayout=%d",
@@ -314,11 +318,17 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
     };
 
-    auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>
+    auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
     {
         if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
         {
+            // Slot-based path (CppMambaCacheManager)
             return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+        }
+        // Unified pool path (CppMambaHybridCacheManager)
+        if (mCacheState->hasRnnConfig() && mRnnCacheTransBufferManager != nullptr)
+        {
+            return std::make_unique<RnnCacheFormatter>(cacheManager, mRnnCacheTransBufferManager.get());
         }
         return nullptr;
     };

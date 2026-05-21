@@ -18,8 +18,11 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
@@ -39,7 +42,40 @@ RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStat
     TLLM_CHECK(mRnnCacheTransBufferManager != nullptr);
 }
 
+RnnCacheFormatter::RnnCacheFormatter(kv_cache_manager::BaseKVCacheManager* kvCacheManager,
+    rnn_state_manager::RnnCacheTransBufferManager* rnnCacheTransBufferManager)
+    : mRnnCacheTransBufferManager{rnnCacheTransBufferManager}
+    , mKvCacheManager{kvCacheManager}
+{
+    TLLM_CHECK(mKvCacheManager != nullptr);
+    TLLM_CHECK(mRnnCacheTransBufferManager != nullptr);
+}
+
 void RnnCacheFormatter::format(TransferSession& session)
+{
+    if (isUnifiedPoolMode())
+    {
+        formatUnifiedPoolMode(session);
+    }
+    else
+    {
+        formatSlotMode(session);
+    }
+}
+
+void RnnCacheFormatter::unformat(TransferSession& session)
+{
+    if (isUnifiedPoolMode())
+    {
+        unformatUnifiedPoolMode(session);
+    }
+    else
+    {
+        unformatSlotMode(session);
+    }
+}
+
+void RnnCacheFormatter::formatSlotMode(TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_format);
     session.setTime(TransferSession::kTimeFormatter);
@@ -198,7 +234,7 @@ void RnnCacheFormatter::format(TransferSession& session)
         mpi::MpiComm::world().getRank(), "End sending RNN state for request ID: %ld.", llmRequest.mRequestId);
 }
 
-void RnnCacheFormatter::unformat(TransferSession& session)
+void RnnCacheFormatter::unformatSlotMode(TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_unformat);
     session.setTime(TransferSession::kTimeFormatter);
@@ -477,6 +513,410 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End receiving RNN state for request ID: %ld.", llmRequest.mRequestId);
+}
+
+void RnnCacheFormatter::formatUnifiedPoolMode(TransferSession& session)
+{
+    NVTX3_SCOPED_RANGE(RnnCacheFormatter_formatUnifiedPool);
+    session.setTime(TransferSession::kTimeFormatter);
+
+    auto const& llmRequest = session.getLlmRequest();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start sending unified pool RNN state for request ID: %ld.",
+        llmRequest.mRequestId);
+    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
+
+    auto const& connections = session.getConnections();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& bufferManager = session.getBufferManager();
+
+    auto targetInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
+    if (!cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx, targetInfo))
+    {
+        return;
+    }
+
+    auto rnnSendConns = cache_formatter_utils::pickSendConnections(
+        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), targetInfo);
+    if (rnnSendConns.empty())
+    {
+        TLLM_LOG_DEBUG("No targets to send unified pool RNN state to for request ID: %ld", llmRequest.mRequestId);
+        return;
+    }
+
+    // Get block range for sending (same as KV formatter would).
+    auto& blockManager = mKvCacheManager->getBlockManager();
+    auto const& lastBlockKey = session.getLastBlockKey();
+    auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
+    auto const indexFromEnd = session.getIndexFromEnd();
+    auto blockRange = kv_cache_manager::getBlockRangeForSending(
+        mKvCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+
+    auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+    auto const allWindowSizes = blockRange.getWindowSizes();
+
+    bool const tpMismatch
+        = selfConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mTensorParallelism;
+
+    for (auto const& ws : allWindowSizes)
+    {
+        if (!kv_cache_manager::LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            continue;
+        }
+        auto it = blockIdsPerWindow.find(ws);
+        if (it == blockIdsPerWindow.end() || it->second.empty())
+        {
+            continue;
+        }
+
+        // Find pool for this window size.
+        runtime::ITensor::SharedPtr pool;
+        auto const totalPools = blockManager.getNumPools(false, false);
+        for (SizeType32 poolIdx = 0; poolIdx < totalPools; ++poolIdx)
+        {
+            if (blockManager.getPoolWindowSize(poolIdx) == ws)
+            {
+                pool = blockManager.getPrimaryPool(poolIdx);
+                break;
+            }
+        }
+        TLLM_CHECK_WITH_INFO(pool != nullptr, "Could not find pool for recurrent state window");
+
+        SizeType32 const numLayers = pool->getShape().d[0];
+
+        if (!tpMismatch || !selfConfig.hasRnnConfig())
+        {
+            // Same TP topology: send as opaque blobs.
+            SizeType32 realBlockCount = 0;
+            size_t totalBytesSent = 0;
+            for (auto const& blockId : it->second)
+            {
+                auto const& block = blockManager.getBlockById(blockId, ws);
+                if (block->isPlaceholder())
+                {
+                    continue;
+                }
+                ++realBlockCount;
+                auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
+                for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+                {
+                    auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
+                    for (size_t i = 0; i < rnnSendConns.size(); i++)
+                    {
+                        totalBytesSent += blockTensor->getSizeInBytes();
+                        session.send(rnnSendConns[i], blockTensor->data(), blockTensor->getSizeInBytes());
+                    }
+                }
+            }
+            TLLM_LOG_DEBUG(
+                "RnnCacheFormatter::formatUnifiedPool (same-TP): windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, "
+                "numLayers=%d, totalBytesSent=%zu, requestId=%lu",
+                ws, it->second.size(), realBlockCount, numLayers, totalBytesSent, llmRequest.mRequestId);
+        }
+        else
+        {
+            // TP mismatch: use split kernels.
+            auto const& rnnState = selfConfig.getRnnCacheState();
+            auto const& rnnModel = rnnState.mModelConfig;
+            auto const selfTPNum = selfConfig.getParallelConfig().mTensorParallelism;
+            auto const selfDPSize = selfConfig.getParallelConfig().mDPsize;
+            auto const selfTPPerDP
+                = selfConfig.getParallelConfig().mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+
+            int const numHeadsLocal = rnnModel.mNumHeads / selfTPPerDP;
+            size_t const ssmElements = static_cast<size_t>(numHeadsLocal) * rnnModel.mHeadDim * rnnModel.mDState;
+            size_t const ssmBytes = ssmElements * common::getDTypeSize(rnnState.mSsmStateDataType);
+
+            int convDimLocal = 0;
+            auto const globalSectionDims = rnnModel.getConvSectionDims();
+            for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+            {
+                convDimLocal += globalSectionDims[s] / selfTPPerDP;
+            }
+            size_t const convElements = static_cast<size_t>(convDimLocal) * (rnnModel.mDConv - 1);
+            size_t const convBytes = convElements * common::getDTypeSize(rnnState.mConvStateDataType);
+            size_t const blockSizeBytes = ssmBytes + convBytes;
+
+            // Collect real block indices
+            std::vector<SizeType32> realBlockIndices;
+            for (auto const& blockId : it->second)
+            {
+                auto const& block = blockManager.getBlockById(blockId, ws);
+                if (!block->isPlaceholder())
+                {
+                    realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
+                }
+            }
+
+            if (realBlockIndices.empty())
+            {
+                continue;
+            }
+
+            auto const numTargets = targetInfo.mIRanks.size() / targetInfo.mPeerDupHeadFactor;
+
+            // Allocate output SSM buffers per target
+            int const headNumDomainTP = numHeadsLocal / (targetInfo.mDomainTPSize / targetInfo.mPeerDupHeadFactor);
+            std::vector<runtime::ITensor::SharedPtr> ssmOutputBuffers(numTargets);
+            for (size_t t = 0; t < numTargets; ++t)
+            {
+                SizeType32 layersForTarget = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(t));
+                size_t ssmBufBytes = realBlockIndices.size() * layersForTarget * headNumDomainTP * rnnModel.mHeadDim
+                    * rnnModel.mDState * common::getDTypeSize(rnnState.mSsmStateDataType);
+                ssmOutputBuffers[t] = bufferManager.gpu(
+                    runtime::ITensor::makeShape({static_cast<int64_t>(ssmBufBytes)}), nvinfer1::DataType::kUINT8);
+            }
+
+            // Allocate output conv buffers per target
+            int convDimDomainTPTotal = 0;
+            for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+            {
+                int sectionLocal = globalSectionDims[s] / selfTPPerDP;
+                convDimDomainTPTotal += sectionLocal / (targetInfo.mDomainTPSize / targetInfo.mPeerDupHeadFactor);
+            }
+            std::vector<runtime::ITensor::SharedPtr> convOutputBuffers(numTargets);
+            for (size_t t = 0; t < numTargets; ++t)
+            {
+                SizeType32 layersForTarget = targetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(t));
+                size_t convBufBytes = realBlockIndices.size() * layersForTarget * convDimDomainTPTotal
+                    * (rnnModel.mDConv - 1) * common::getDTypeSize(rnnState.mConvStateDataType);
+                convOutputBuffers[t] = bufferManager.gpu(
+                    runtime::ITensor::makeShape({static_cast<int64_t>(convBufBytes)}), nvinfer1::DataType::kUINT8);
+            }
+
+            // Run split kernels
+            executor::rnn_cache::splitUnifiedPoolSsmDispatch(pool, realBlockIndices, ssmOutputBuffers, destConfig,
+                selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mSsmStateDataType, bufferManager);
+            executor::rnn_cache::splitUnifiedPoolConvDispatch(pool, realBlockIndices, convOutputBuffers, destConfig,
+                selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mConvStateDataType, bufferManager);
+
+            bufferManager.getStream().synchronize();
+
+            // Send split buffers: SSM then conv for each target
+            size_t totalBytesSent = 0;
+            for (size_t t = 0; t < numTargets; ++t)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    t < rnnSendConns.size(), "RNN target index %zu >= rnnSendConns size %zu", t, rnnSendConns.size());
+                size_t connIdx = rnnSendConns[t];
+                totalBytesSent += ssmOutputBuffers[t]->getSizeInBytes();
+                session.send(connIdx, ssmOutputBuffers[t]->data(), ssmOutputBuffers[t]->getSizeInBytes());
+                totalBytesSent += convOutputBuffers[t]->getSizeInBytes();
+                session.send(connIdx, convOutputBuffers[t]->data(), convOutputBuffers[t]->getSizeInBytes());
+            }
+
+            TLLM_LOG_DEBUG(
+                "RnnCacheFormatter::formatUnifiedPool (TP-mismatch): windowSize=0x%x, realBlocks=%zu, numTargets=%zu, "
+                "totalBytesSent=%zu, requestId=%lu",
+                ws, realBlockIndices.size(), numTargets, totalBytesSent, llmRequest.mRequestId);
+        }
+    }
+
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End sending unified pool RNN state for request ID: %ld.",
+        llmRequest.mRequestId);
+}
+
+void RnnCacheFormatter::unformatUnifiedPoolMode(TransferSession& session)
+{
+    NVTX3_SCOPED_RANGE(RnnCacheFormatter_unformatUnifiedPool);
+    session.setTime(TransferSession::kTimeFormatter);
+
+    auto const& llmRequest = session.getLlmRequest();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "Start receiving unified pool RNN state for request ID: %ld.",
+        llmRequest.mRequestId);
+    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
+
+    auto const& connections = session.getConnections();
+    auto const& selfConfig = session.getSelfState().getCacheState().value();
+    auto const& destConfig = session.getOtherState().getCacheState().value();
+    auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& bufferManager = session.getBufferManager();
+
+    if (!selfConfig.hasRnnConfig() || !destConfig.hasRnnConfig())
+    {
+        return;
+    }
+
+    // Compute RNN-specific recv connections.
+    auto rnnTargetInfo = executor::kv_cache::targetIRanksForRnn(destConfig, selfConfig, selfIdx);
+    auto rnnRecvResult = cache_formatter_utils::pickRecvConnections(
+        connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks(), rnnTargetInfo);
+    auto rnnRecvConns = std::get<0>(rnnRecvResult);
+
+    if (rnnRecvConns.empty())
+    {
+        TLLM_LOG_DEBUG("No sources to receive unified pool RNN state from for request ID: %ld", llmRequest.mRequestId);
+        return;
+    }
+
+    // Get block range for receiving.
+    auto& blockManager = mKvCacheManager->getBlockManager();
+    auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
+    bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
+    auto blockRange = kv_cache_manager::getBlockRangeForReceiving(mKvCacheManager, llmRequest,
+        destConfig.getEnableBlockReuse(), destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize);
+
+    auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+    auto const allWindowSizes = blockRange.getWindowSizes();
+
+    bool const tpMismatch
+        = selfConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mTensorParallelism;
+
+    for (auto const& ws : allWindowSizes)
+    {
+        if (!kv_cache_manager::LinearAttentionMetadata::hasRecurrentStatesCache(ws))
+        {
+            continue;
+        }
+        auto it = blockIdsPerWindow.find(ws);
+        if (it == blockIdsPerWindow.end() || it->second.empty())
+        {
+            continue;
+        }
+
+        // Find pool for this window size.
+        runtime::ITensor::SharedPtr pool;
+        auto const totalPools = blockManager.getNumPools(false, false);
+        for (SizeType32 poolIdx = 0; poolIdx < totalPools; ++poolIdx)
+        {
+            if (blockManager.getPoolWindowSize(poolIdx) == ws)
+            {
+                pool = blockManager.getPrimaryPool(poolIdx);
+                break;
+            }
+        }
+        TLLM_CHECK_WITH_INFO(pool != nullptr, "Could not find pool for recurrent state window");
+
+        SizeType32 const numLayers = pool->getShape().d[0];
+
+        if (!tpMismatch || !selfConfig.hasRnnConfig())
+        {
+            // Same TP topology: receive as opaque blobs.
+            SizeType32 realBlockCount = 0;
+            size_t totalBytesRecv = 0;
+            for (auto const& blockId : it->second)
+            {
+                auto const& block = blockManager.getBlockById(blockId, ws);
+                if (block->isPlaceholder())
+                {
+                    continue;
+                }
+                ++realBlockCount;
+                auto const blockIdx = static_cast<runtime::ITensor::DimType64>(block->getMemoryPoolBlockIndex());
+                for (SizeType32 layerIdx = 0; layerIdx < numLayers; ++layerIdx)
+                {
+                    auto blockTensor = runtime::ITensor::slice(pool, {layerIdx, blockIdx}, 1);
+                    for (size_t i = 0; i < rnnRecvConns.size(); i++)
+                    {
+                        totalBytesRecv += blockTensor->getSizeInBytes();
+                        llmRequest.updateKvCacheSize(blockTensor->getSizeInBytes());
+                        session.recv(rnnRecvConns[i], blockTensor->data(), blockTensor->getSizeInBytes());
+                    }
+                }
+            }
+            TLLM_LOG_DEBUG(
+                "RnnCacheFormatter::unformatUnifiedPool (same-TP): windowSize=0x%x, totalBlockIds=%zu, realBlocks=%d, "
+                "numLayers=%d, totalBytesRecv=%zu, requestId=%lu",
+                ws, it->second.size(), realBlockCount, numLayers, totalBytesRecv, llmRequest.mRequestId);
+        }
+        else
+        {
+            // TP mismatch: receive split buffers and concat into pool.
+            auto const& rnnState = selfConfig.getRnnCacheState();
+            auto const& rnnModel = rnnState.mModelConfig;
+            auto const selfTPNum = selfConfig.getParallelConfig().mTensorParallelism;
+            auto const selfDPSize = selfConfig.getParallelConfig().mDPsize;
+            auto const selfTPPerDP
+                = selfConfig.getParallelConfig().mEnableAttentionDP ? selfTPNum / selfDPSize : selfTPNum;
+
+            int const numHeadsLocal = rnnModel.mNumHeads / selfTPPerDP;
+            size_t const ssmElements = static_cast<size_t>(numHeadsLocal) * rnnModel.mHeadDim * rnnModel.mDState;
+            size_t const ssmBytes = ssmElements * common::getDTypeSize(rnnState.mSsmStateDataType);
+
+            int convDimLocal = 0;
+            auto const globalSectionDims = rnnModel.getConvSectionDims();
+            for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+            {
+                convDimLocal += globalSectionDims[s] / selfTPPerDP;
+            }
+            size_t const convElements = static_cast<size_t>(convDimLocal) * (rnnModel.mDConv - 1);
+            size_t const convBytes = convElements * common::getDTypeSize(rnnState.mConvStateDataType);
+            size_t const blockSizeBytes = ssmBytes + convBytes;
+
+            // Collect real block indices
+            std::vector<SizeType32> realBlockIndices;
+            for (auto const& blockId : it->second)
+            {
+                auto const& block = blockManager.getBlockById(blockId, ws);
+                if (!block->isPlaceholder())
+                {
+                    realBlockIndices.push_back(static_cast<SizeType32>(block->getMemoryPoolBlockIndex()));
+                }
+            }
+
+            if (realBlockIndices.empty())
+            {
+                continue;
+            }
+
+            auto const numSources = rnnTargetInfo.mIRanks.size() / rnnTargetInfo.mPeerDupHeadFactor;
+
+            // Compute per-source buffer sizes
+            int const headNumDomainTP
+                = numHeadsLocal / (rnnTargetInfo.mDomainTPSize / rnnTargetInfo.mPeerDupHeadFactor);
+            int convDimDomainTPTotal = 0;
+            for (int s = 0; s < executor::kv_cache::CacheState::RnnModelConfig::kNumConvSections; ++s)
+            {
+                int sectionLocal = globalSectionDims[s] / selfTPPerDP;
+                convDimDomainTPTotal += sectionLocal / (rnnTargetInfo.mDomainTPSize / rnnTargetInfo.mPeerDupHeadFactor);
+            }
+
+            // Allocate and receive SSM + conv buffers from each source
+            std::vector<runtime::ITensor::SharedPtr> ssmInputBuffers(numSources);
+            std::vector<runtime::ITensor::SharedPtr> convInputBuffers(numSources);
+            size_t totalBytesRecv = 0;
+            for (size_t t = 0; t < numSources; ++t)
+            {
+                SizeType32 layersFromSource = rnnTargetInfo.getPeerPPDomainLayerNum(static_cast<SizeType32>(t));
+                size_t ssmBufBytes = realBlockIndices.size() * layersFromSource * headNumDomainTP * rnnModel.mHeadDim
+                    * rnnModel.mDState * common::getDTypeSize(rnnState.mSsmStateDataType);
+                ssmInputBuffers[t] = bufferManager.gpu(
+                    runtime::ITensor::makeShape({static_cast<int64_t>(ssmBufBytes)}), nvinfer1::DataType::kUINT8);
+
+                size_t convBufBytes = realBlockIndices.size() * layersFromSource * convDimDomainTPTotal
+                    * (rnnModel.mDConv - 1) * common::getDTypeSize(rnnState.mConvStateDataType);
+                convInputBuffers[t] = bufferManager.gpu(
+                    runtime::ITensor::makeShape({static_cast<int64_t>(convBufBytes)}), nvinfer1::DataType::kUINT8);
+
+                TLLM_CHECK_WITH_INFO(t < rnnRecvConns.size(),
+                    "unformatUnifiedPool: source index %zu >= rnnRecvConns size %zu", t, rnnRecvConns.size());
+                size_t connIdx = rnnRecvConns[t];
+                session.recv(connIdx, ssmInputBuffers[t]->data(), ssmBufBytes);
+                totalBytesRecv += ssmBufBytes;
+                session.recv(connIdx, convInputBuffers[t]->data(), convBufBytes);
+                totalBytesRecv += convBufBytes;
+            }
+
+            // Concat received buffers into the pool
+            executor::rnn_cache::concatUnifiedPoolSsmDispatch(pool, realBlockIndices, ssmInputBuffers, destConfig,
+                selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mSsmStateDataType, bufferManager);
+            executor::rnn_cache::concatUnifiedPoolConvDispatch(pool, realBlockIndices, convInputBuffers, destConfig,
+                selfConfig, selfIdx, ssmBytes, blockSizeBytes, rnnState.mConvStateDataType, bufferManager);
+
+            bufferManager.getStream().synchronize();
+
+            TLLM_LOG_DEBUG(
+                "RnnCacheFormatter::unformatUnifiedPool (TP-mismatch): windowSize=0x%x, realBlocks=%zu, "
+                "numSources=%zu, totalBytesRecv=%zu, requestId=%lu",
+                ws, realBlockIndices.size(), numSources, totalBytesRecv, llmRequest.mRequestId);
+        }
+    }
+
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End receiving unified pool RNN state for request ID: %ld.",
+        llmRequest.mRequestId);
 }
 
 bool RnnCacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const

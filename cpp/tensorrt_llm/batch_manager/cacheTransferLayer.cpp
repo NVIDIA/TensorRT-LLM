@@ -54,7 +54,8 @@ void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& p
 
     if (mRnnFormatter && selfHasRnn)
     {
-        // Separate RnnStateManager path (CppMambaCacheManager)
+        // Both slot-based (CppMambaCacheManager) and unified pool (CppMambaHybridCacheManager)
+        // paths now use RnnCacheFormatter.
         if (peerHasRnn)
         {
             TLLM_CHECK_WITH_INFO(mRnnFormatter->inquireSupport(mCacheState, peerState.getCacheState().value()),
@@ -68,9 +69,6 @@ void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& p
     }
     else if (!selfHasRnn && peerHasRnn)
     {
-        // Self truly has no RNN config at all — warn.
-        // Note: unified pool path (CppMambaHybridCacheManager) has selfHasRnn=true
-        // and mRnnFormatter=nullptr, which is handled by CacheFormatter internally.
         TLLM_LOG_WARNING("Peer has RNN state but self does not. RNN transfer will be skipped.");
     }
 }
