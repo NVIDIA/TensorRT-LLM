@@ -185,10 +185,10 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     auto const m_aligned = (m_padded + kTmaAlignedUint32Elems - 1) / kTmaAlignedUint32Elems * kTmaAlignedUint32Elems;
 
     // Allocate physical buffer [num_packed_sf_k, m_aligned] (K-major in memory).
+    // The kernel writes packed=0 for the [m, m_aligned) tail rows itself, so no
+    // host-side zero-init is needed.
     at::Tensor packedBuf = at::detail::empty_cuda(
         {num_packed_sf_k, m_aligned}, at::ScalarType::Int, self.device(), /* stride */ std::nullopt);
-    // Zero-fill so the [m, m_aligned) tail and out-of-range scale slots are deterministic.
-    packedBuf.zero_();
 
     auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
 
