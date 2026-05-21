@@ -2234,7 +2234,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm, is_integration_test=True)
 
 
-@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@pytest.mark.timeout(14400)
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
 class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
@@ -2246,7 +2246,8 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # FP8 weights ~71 GB/rank at TP=4 → ~142 GB/rank at TP=2; requires
         # ≥140 GB per GPU (fits on B300 288 GB, tight on B200 178 GB).
-        # WIDEEP backend: CUTLASS FP8 block-scale path is Hopper-only.
+        # TRTLLM backend: WIDEEP's FP8 block-scale path is Hopper-only.
+        # Compact batching keeps KV cache ~1 GB/rank (default ~100 GB requires fully-clean GPU memory).
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
         # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
         cache_transceiver_config = {
@@ -2258,6 +2259,8 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
             "disable_overlap_scheduler": True,
+            "max_batch_size": 16,
+            "max_num_tokens": 4096,
             "max_seq_len": 4096,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
@@ -2269,9 +2272,11 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "enable_attention_dp": True,
             "disable_overlap_scheduler": True,
+            "max_batch_size": 16,
+            "max_num_tokens": 4096,
             "max_seq_len": 4096,
             "moe_config": {
-                "backend": "WIDEEP",
+                "backend": "TRTLLM",
             },
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
