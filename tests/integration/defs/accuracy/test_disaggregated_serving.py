@@ -2278,6 +2278,57 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.skip_less_device(4)
+    def test_gen_first(self):
+        """Gen-first quick validation for DSv4-Flash on KVCacheManagerV2 + NIXL python."""
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "max_seq_len": 4096,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "max_seq_len": 4096,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+            "schedule_style": "generation_first",
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
 
 @pytest.mark.timeout(14400)
 @skip_pre_blackwell
