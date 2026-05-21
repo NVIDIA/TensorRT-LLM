@@ -614,6 +614,12 @@ class KVCacheEventManager:
 
     @staticmethod
     def _root_attrs_from_root_block(root: Any) -> tuple[int | None, int | None]:
+        # Read from the new location first; fall back to the legacy attribute
+        # names so V1-compat event hashes still resolve for any in-memory
+        # RootBlock predating the refactor.
+        scope = getattr(root, "reuse_scope", None)
+        if scope is not None:
+            return getattr(scope, "lora_id", None), getattr(scope, "salt", None)
         return getattr(root, "lora_task_id", None), getattr(root, "cache_salt_id", None)
 
     @staticmethod
