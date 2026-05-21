@@ -1237,9 +1237,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
             logger.debug("Resmoothing FP8 weights in post_load_weights")
             resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
-            replace_parameter_and_save_metadata(module, "w3_w1_weight",
-                                                resmoothed_w3_w1_weight,
-                                                module.rebuild_tensor_metadata)
+            module.w3_w1_weight.data.copy_(resmoothed_w3_w1_weight)
             replace_parameter_and_save_metadata(module,
                                                 "w3_w1_weight_scaling_factor",
                                                 transformed_w3_w1_scale,
@@ -1247,9 +1245,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
             resmoothed_w2_weight, transformed_w2_scale = resmooth_and_transform_fp8_scale(
                 module.w2_weight, module.w2_weight_scaling_factor)
-            replace_parameter_and_save_metadata(module, "w2_weight",
-                                                resmoothed_w2_weight,
-                                                module.rebuild_tensor_metadata)
+            module.w2_weight.data.copy_(resmoothed_w2_weight)
             replace_parameter_and_save_metadata(module,
                                                 "w2_weight_scaling_factor",
                                                 transformed_w2_scale,

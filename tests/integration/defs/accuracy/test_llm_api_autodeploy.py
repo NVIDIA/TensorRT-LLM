@@ -311,8 +311,10 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("world_size", [2, 4])
+    @pytest.mark.parametrize("world_size", [
+        pytest.param(2, marks=pytest.mark.skip_less_device(2)),
+        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
+    ])
     def test_attention_dp(self, world_size):
         """Test attention data parallelism mode where TP sharding is disabled."""
         kwargs = self.get_default_kwargs(enable_chunked_prefill=True)
