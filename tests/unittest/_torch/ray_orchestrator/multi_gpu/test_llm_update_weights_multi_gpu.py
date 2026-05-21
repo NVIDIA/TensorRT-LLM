@@ -25,6 +25,7 @@ from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
 
+@pytest.mark.part0
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "model_dir, fp8_model_dir",
@@ -85,6 +86,7 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
     compare_logits(llm_logits, ref_logits)
 
 
+@pytest.mark.part1
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "model_dir, fp8_model_dir",
@@ -434,6 +436,7 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         return ret
 
 
+@pytest.mark.part2
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "model_dir",
@@ -496,6 +499,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
         compare_logits(llm_logits, ref_logits, threshold=0.8)
 
 
+@pytest.mark.part3
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "model_dir",

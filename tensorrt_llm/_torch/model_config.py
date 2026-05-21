@@ -660,8 +660,14 @@ class ModelConfig(Generic[TConfig]):
                 return None
 
         # Some checkpoints lack torch_dtype, populate with dtype
-        pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
-                                                None)
+        dtype = getattr(pretrained_config, 'dtype', None)
+        # For composite VLM configs the dtype lives inside ``text_config``
+        # because the top-level config has no ``dtype`` field.
+        if dtype is None:
+            text_config = getattr(pretrained_config, 'text_config', None)
+            if text_config is not None:
+                dtype = getattr(text_config, 'dtype', None)
+        pretrained_config.torch_dtype = dtype
 
         # Prior to transformers 5, composite configs (e.g. Qwen2_5_VLConfig) delegated attribute
         # lookups to their text sub-config, so accesses like `config.vocab_size` /

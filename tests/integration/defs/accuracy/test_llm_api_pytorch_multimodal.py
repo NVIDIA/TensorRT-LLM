@@ -100,6 +100,39 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.5-33B"
+    MODEL_PATH = f"{llm_models_root()}/EXAONE-4.5-33B"
+    MAX_NUM_TOKENS = 16384
+
+    # EXAONE 4.5 ends each assistant turn with `<|endofturn|>`.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endofturn|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
 class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
     MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b-hf"
