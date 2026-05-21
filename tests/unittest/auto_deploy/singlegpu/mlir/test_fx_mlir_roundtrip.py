@@ -27,6 +27,11 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm  # noqa: E
 from tensorrt_llm._torch.auto_deploy.mlir.fx_to_mlir import FXToMLIRConverter  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.mlir.mlir_to_fx import MLIRToFXConverter  # noqa: E402
 
+
+def _single_output_fused_stub(x):
+    return (x,)
+
+
 # ---------------------------------------------------------------------------
 # Test models
 # ---------------------------------------------------------------------------
@@ -81,9 +86,73 @@ def _export_model(model, *inputs):
     return torch_export_to_gm(model, args=inputs, dynamic_shapes=ds, clone=True)
 
 
+def _build_single_output_fused_mlir_module():
+    from xdsl.dialects.builtin import BFloat16Type, ModuleOp, StringAttr, TensorType
+    from xdsl.ir import Block, Region
+
+    from tensorrt_llm._torch.auto_deploy.mlir.dialect import AdGraphInput, AdGraphOutput, AdOpaque
+
+    tensor_type = TensorType(BFloat16Type(), [2, 4])
+    block = Block()
+
+    input_op = AdGraphInput.build(
+        attributes={"input_name": StringAttr("x")},
+        result_types=[tensor_type],
+    )
+    block.add_op(input_op)
+
+    fused_op = AdOpaque.build(
+        operands=[[input_op.output]],
+        attributes={
+            "op_name": StringAttr("mlir_fused_single"),
+            "node_key": StringAttr("mlir_fused_single"),
+        },
+        result_types=[[tensor_type]],
+    )
+    block.add_op(fused_op)
+
+    output_op = AdGraphOutput.build(operands=[[fused_op.outputs[0]]])
+    block.add_op(output_op)
+
+    return ModuleOp(Region([block]))
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_mlir_to_fx_propagates_single_output_fused_getitem_meta():
+    import operator
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    graph.output(x)
+    original_gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    fake_val = torch.empty((2, 4), dtype=torch.bfloat16, device="meta")
+    metadata = {
+        "x": {"val": fake_val},
+        "mlir_fused_single": {
+            "_original_target": _single_output_fused_stub,
+            "_args_template": (("__mlir_operand__", 0),),
+            "_kwargs_template": {},
+            "val": fake_val,
+        },
+    }
+
+    new_gm = MLIRToFXConverter(original_gm).convert(
+        _build_single_output_fused_mlir_module(), metadata
+    )
+
+    getitem_nodes = [
+        n for n in new_gm.graph.nodes if n.op == "call_function" and n.target is operator.getitem
+    ]
+
+    assert len(getitem_nodes) == 1
+    assert "val" in getitem_nodes[0].meta
+    assert tuple(getitem_nodes[0].meta["val"].shape) == tuple(fake_val.shape)
+    assert getitem_nodes[0].meta["val"].dtype == fake_val.dtype
 
 
 def test_fx_to_mlir_basic():

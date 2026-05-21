@@ -432,6 +432,8 @@ class MLIRToFXConverter:
                 getitem_node = graph.call_function(operator.getitem, args=(node, i))
                 if isinstance(node_val, (tuple, list)) and i < len(node_val):
                     getitem_node.meta["val"] = node_val[i]
+                elif len(op.outputs) == 1 and node_val is not None:
+                    getitem_node.meta["val"] = node_val
                 self._map_value(res, getitem_node)
 
     # ------------------------------------------------------------------
