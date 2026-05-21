@@ -489,7 +489,8 @@ class TestKVCacheAwareADPRouterWarmup:
         """Once pending is empty, routing reverts to pure scoring."""
         tp_size = 2
         router = self._make_router(tp_size=tp_size)
-        router._pending_warmup_ranks = set()  # simulate fully warmed router
+        # Drain the warmup set to simulate a fully warmed router.
+        router._pending_warmup_ranks = set()
         # Req 1 has a cache hit only on rank 1; scoring (not warmup) should
         # send it there.
         router._all_ranks_prefix_matches = [{1: 0}, {1: 80}]
