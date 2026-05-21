@@ -15,14 +15,19 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import get_sm_version
 
 
-def swiglu_ref(x: torch.Tensor) -> torch.Tensor:
+def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
     x, gate = x.chunk(2, dim=-1)
+    if swiglu_limit != float("inf"):
+        gate = gate.clamp(max=swiglu_limit)
+        x = x.clamp(min=-swiglu_limit, max=swiglu_limit)
     return x * torch.nn.functional.silu(gate)
 
 
-def apply_activation_ref(x: torch.Tensor, activation_type: ActivationType) -> torch.Tensor:
+def apply_activation_ref(
+    x: torch.Tensor, activation_type: ActivationType, swiglu_limit: float = float("inf")
+) -> torch.Tensor:
     if activation_type == ActivationType.Swiglu:
-        return swiglu_ref(x)
+        return swiglu_ref(x, swiglu_limit)
     if activation_type == ActivationType.Relu2:
         return relu2(x)
     raise ValueError(f"Unsupported activation_type: {activation_type}")
@@ -562,10 +567,10 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
 
     c = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
         a,
-        b,
+        [b],
         a_sf,
-        b_sf,
-        alpha,
+        [b_sf],
+        [alpha],
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,
@@ -600,6 +605,35 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     match_ratio = torch.isclose(c, c_ref, rtol=1.6e-2, atol=1e-5).sum().item() / c.numel()
     assert match_ratio > 0.99
 
+    if num_local_experts > 1:
+        split_sizes = (num_local_experts // 2, num_local_experts - num_local_experts // 2)
+        b_list = list(torch.split(b, split_sizes, dim=0))
+        b_sf_list = list(torch.split(b_sf, split_sizes, dim=0))
+        alpha_list = list(torch.split(alpha, split_sizes, dim=0))
+        c_multi = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
+            a,
+            b_list,
+            a_sf,
+            b_sf_list,
+            alpha_list,
+            tile_idx_to_group_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            token_final_scales,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            output_dtype=torch.bfloat16,
+            scaling_vector_size=sf_vec_size,
+        )
+        multi_match_ratio = (
+            torch.isclose(c_multi, c_ref, rtol=1.6e-2, atol=1e-5).sum().item() / c_ref.numel()
+        )
+        assert multi_match_ratio > 0.99
+
 
 @pytest.mark.skipif(
     get_sm_version() not in (100, 103),
@@ -613,6 +647,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
     num_tokens: int, top_k: int, ep_size: int, tile_size: int
 ):
     sf_vec_size = 16
+    swiglu_limit = 1.0
     hidden_size = 4096
     interm_size = 8192
     num_experts = 256
@@ -691,7 +726,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = swiglu_ref(c_ref)
+    c_ref = swiglu_ref(c_ref, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
@@ -710,6 +745,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
         local_expert_offset=0,
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
+        swiglu_limit_scalar=swiglu_limit,
     )
 
     match_ratio = (
@@ -753,6 +789,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     4. Quantizes output to FP4 with scale factor generation
     """
     is_gated = is_gated_activation(activation_type)
+    swiglu_limit = 1.0 if is_gated else float("inf")
     weight_n_multiplier = 2 if is_gated else 1
     sf_vec_size = 16
     hidden_size = 4096
@@ -870,17 +907,17 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         output_dtype=torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
-    c_ref = apply_activation_ref(c_ref, activation_type)
+    c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
-    # Call gather kernel (single-B)
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+    # Call gather kernel (single-B via multi_b op with single-element lists)
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
         a,
-        b_kernel,
+        [b_kernel],
         a_sf_unswizzled,
-        b_sf_kernel,
-        alpha,
+        [b_sf_kernel],
+        [alpha],
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,
@@ -893,6 +930,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
         activation_type=activation_type,
+        swiglu_limit_scalar=swiglu_limit,
     )
 
     # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
@@ -927,3 +965,47 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         c_sf_valid = torch.cat(c_sf_valid)
         c_sf_ref_valid = torch.cat(c_sf_ref_valid)
         check_accuracy(c_sf_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+
+        if num_local_experts > 1:
+            split_sizes = (
+                num_local_experts // 2,
+                num_local_experts - num_local_experts // 2,
+            )
+            b_kernel_list = list(torch.split(b_kernel, split_sizes, dim=0))
+            b_sf_kernel_list = list(torch.split(b_sf_kernel, split_sizes, dim=0))
+            alpha_list = list(torch.split(alpha, split_sizes, dim=0))
+            c_multi, c_sf_multi = (
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
+                    a,
+                    b_kernel_list,
+                    a_sf_unswizzled,
+                    b_sf_kernel_list,
+                    alpha_list,
+                    tile_idx_to_group_idx,
+                    tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles,
+                    torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_local_experts=num_local_experts,
+                    local_expert_offset=0,
+                    tile_size=tile_size,
+                    scaling_vector_size=sf_vec_size,
+                    activation_type=activation_type,
+                    swiglu_limit_scalar=swiglu_limit,
+                )
+            )
+            c_multi_valid = c_multi[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]
+            check_accuracy(c_multi_valid, c_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)
+
+            c_sf_multi_unswizzled = unswizzle_sf(
+                c_sf_multi, max_num_permuted_tokens, interm_size, sf_vec_size
+            )
+            c_sf_multi_valid = []
+            for i in range(num_valid_permuted_tokens):
+                if i >= tile_idx_to_mn_limit_list[i // tile_size]:
+                    continue
+                c_sf_multi_valid.append(c_sf_multi_unswizzled[i])
+            c_sf_multi_valid = torch.cat(c_sf_multi_valid)
+            check_accuracy(c_sf_multi_valid, c_sf_ref_valid, atol=1e-4, rtol=1e-4, percent=0.95)

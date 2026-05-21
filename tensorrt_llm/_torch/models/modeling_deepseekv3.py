@@ -942,6 +942,8 @@ class Deepseekv3MoE(nn.Module):
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
         self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
+        self.swiglu_limit = self._create_swiglu_limit_tensor(
+            model_config, num_experts)
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
             gate_cls = model_config.pretrained_config.gate_cls
@@ -977,6 +979,7 @@ class Deepseekv3MoE(nn.Module):
                     model_config,
                     layer_idx).layer_quant_mode.is_int4_weight_only_per_group()
                 else MoEWeightLoadingMode.VANILLA),
+            swiglu_limit=self.swiglu_limit,
         )
 
         self.mapping = model_config.mapping
@@ -1060,6 +1063,26 @@ class Deepseekv3MoE(nn.Module):
                 shared_output_scale = shared_tp_size / self.mapping.tp_size
 
         return shared_tp_size, shared_output_scale
+
+    @staticmethod
+    def _create_swiglu_limit_tensor(model_config: ModelConfig,
+                                    num_experts: int) -> Optional[torch.Tensor]:
+        swiglu_limit = getattr(model_config.pretrained_config, "swiglu_limit",
+                               None)
+        if swiglu_limit is None or math.isinf(float(swiglu_limit)):
+            return None
+
+        moe_load_balancer_config = model_config.moe_load_balancer
+        num_slots = num_experts
+        if (moe_load_balancer_config is not None
+                and moe_load_balancer_config.num_slots is not None):
+            num_slots = moe_load_balancer_config.num_slots
+
+        local_num_slots = num_slots // model_config.mapping.moe_ep_size
+        return torch.full((local_num_slots, ),
+                          float(swiglu_limit),
+                          dtype=torch.float32,
+                          device="cuda")
 
     @staticmethod
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
