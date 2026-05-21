@@ -377,7 +377,8 @@ public:
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> relative_attention_bias) const
+        std::optional<torch::Tensor> relative_attention_bias,
+        std::optional<torch::Tensor> quant_scale_qkv = std::nullopt) const
         = 0;
 };
 
@@ -446,7 +447,8 @@ public:
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-        std::optional<torch::Tensor> relative_attention_bias) const override
+        std::optional<torch::Tensor> relative_attention_bias,
+        std::optional<torch::Tensor> quant_scale_qkv) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -555,6 +557,12 @@ public:
                     : nullptr;
                 mla_params.quant_q_buf
                     = quant_q_buffer.has_value() ? reinterpret_cast<void*>(quant_q_buffer.value().data_ptr()) : nullptr;
+                mla_params.quant_scale_qkv = quant_scale_qkv.has_value()
+                    ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
+                    : nullptr;
+                // Request the fused FP8-Q path; common/attentionOp.cpp gates the
+                // actual skip on FP8 KV cache + absorption mode.
+                mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
             }
             mla_params.q_buf = attention_input;
             mla_params.context_buf = reinterpret_cast<T*>(context_buf);
@@ -1028,7 +1036,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
     std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens)
+    std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1326,7 +1334,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
+            quant_scale_qkv);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1348,7 +1357,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
+            quant_scale_qkv);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
